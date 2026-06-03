@@ -1536,6 +1536,9 @@ impl RendererInstance for MacosMetalRenderer {
                     self.upload_nv12(width, height, &data, pitch)?;
                 }
             }
+            RenderFrameData::Nv12Bytes { data, pitch } => {
+                self.upload_nv12(width, height, data.as_ref(), pitch)?;
+            }
             #[cfg(windows)]
             RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } => {
                 return Err(RenderError::Message(
@@ -1848,6 +1851,39 @@ mod tests {
         assert_eq!(renderer.nv12_y_texture.as_ref().unwrap().height(), 2);
         assert_eq!(renderer.nv12_uv_texture.as_ref().unwrap().width(), 1);
         assert_eq!(renderer.nv12_uv_texture.as_ref().unwrap().height(), 1);
+        assert_bgra_pixels_close(
+            &render_nv12_to_bgra_for_test(&renderer, 2, 2),
+            &[
+                0, 0, 0, 255, 255, 255, 255, 255, 76, 76, 76, 255, 150, 150, 150, 255,
+            ],
+            2,
+        );
+
+        let snapshot = renderer.snapshot();
+        assert_eq!(snapshot.uploaded_frame_count, 1);
+        assert_eq!(snapshot.last_pixel_format, Some(RenderPixelFormat::Nv12));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_renderer_accepts_nv12_bytes_frame() {
+        let mut renderer = MacosMetalRenderer::new().expect("create Metal renderer");
+
+        renderer
+            .upload_frame(RenderFrame::from_nv12_bytes(
+                2,
+                2,
+                bytes::Bytes::from_static(&[16, 235, 81, 145, 128, 128]),
+                2,
+            ))
+            .expect("upload NV12 bytes frame");
+
+        assert!(matches!(
+            renderer.active_source,
+            Some(MacosTextureSource::Nv12)
+        ));
+        assert_eq!(renderer.nv12_y_texture.as_ref().unwrap().width(), 2);
+        assert_eq!(renderer.nv12_uv_texture.as_ref().unwrap().width(), 1);
         assert_bgra_pixels_close(
             &render_nv12_to_bgra_for_test(&renderer, 2, 2),
             &[

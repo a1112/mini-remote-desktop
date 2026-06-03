@@ -401,6 +401,7 @@ fn render_frame_byte_len(frame: &RenderFrame) -> usize {
     match &frame.data {
         RenderFrameData::Rgb24(data) | RenderFrameData::Bgra32(data) => data.len(),
         RenderFrameData::Nv12 { data, .. } => data.len(),
+        RenderFrameData::Nv12Bytes { data, .. } => data.len(),
         #[cfg(windows)]
         RenderFrameData::D3D11SharedBgra { .. }
         | RenderFrameData::D3D11SharedNv12 { .. }

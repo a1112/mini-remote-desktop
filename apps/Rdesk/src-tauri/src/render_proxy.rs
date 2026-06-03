@@ -10,6 +10,8 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
+use bytes::{Bytes, BytesMut};
+#[cfg(target_os = "macos")]
 use mrd_ipc::render_proxy::{
     decode_frame_header, encode_ack, expected_payload_len, RenderProxyAck, RenderProxyPixelFormat,
     FRAME_HEADER_LEN,
@@ -696,19 +698,28 @@ async fn handle_macos_render_proxy_connection(
         if expected_len != header.payload_len as usize || expected_len > 64 * 1024 * 1024 {
             break;
         }
-        let mut payload = vec![0_u8; expected_len];
-        if stream.read_exact(&mut payload).await.is_err() {
-            break;
-        }
-
         let ack = match header.pixel_format {
-            RenderProxyPixelFormat::H264 => upload_render_proxy_h264_access_unit(&state, payload)
-                .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error)),
-            RenderProxyPixelFormat::Hevc => upload_render_proxy_hevc_access_unit(&state, payload)
-                .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error)),
-            RenderProxyPixelFormat::Rgb24
-            | RenderProxyPixelFormat::Bgra32
-            | RenderProxyPixelFormat::Nv12 => {
+            RenderProxyPixelFormat::H264 => {
+                let Ok(payload) = read_render_proxy_payload_vec(&mut stream, expected_len).await
+                else {
+                    break;
+                };
+                upload_render_proxy_h264_access_unit(&state, payload)
+                    .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error))
+            }
+            RenderProxyPixelFormat::Hevc => {
+                let Ok(payload) = read_render_proxy_payload_vec(&mut stream, expected_len).await
+                else {
+                    break;
+                };
+                upload_render_proxy_hevc_access_unit(&state, payload)
+                    .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error))
+            }
+            RenderProxyPixelFormat::Rgb24 | RenderProxyPixelFormat::Bgra32 => {
+                let Ok(payload) = read_render_proxy_payload_vec(&mut stream, expected_len).await
+                else {
+                    break;
+                };
                 let frame = match header.pixel_format {
                     RenderProxyPixelFormat::Rgb24 => RenderFrame::from_rgb24(
                         header.width as usize,
@@ -720,16 +731,26 @@ async fn handle_macos_render_proxy_connection(
                         header.height as usize,
                         payload,
                     ),
-                    RenderProxyPixelFormat::Nv12 => RenderFrame::from_nv12(
-                        header.width as usize,
-                        header.height as usize,
-                        payload,
-                        header.row_pitch.max(header.width) as usize,
-                    ),
-                    RenderProxyPixelFormat::H264 | RenderProxyPixelFormat::Hevc => {
+                    RenderProxyPixelFormat::Nv12
+                    | RenderProxyPixelFormat::H264
+                    | RenderProxyPixelFormat::Hevc => {
                         unreachable!("handled above")
                     }
                 };
+                upload_render_proxy_frame(&state, frame)
+                    .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error))
+            }
+            RenderProxyPixelFormat::Nv12 => {
+                let Ok(payload) = read_render_proxy_payload_bytes(&mut stream, expected_len).await
+                else {
+                    break;
+                };
+                let frame = RenderFrame::from_nv12_bytes(
+                    header.width as usize,
+                    header.height as usize,
+                    payload,
+                    header.row_pitch.max(header.width) as usize,
+                );
                 upload_render_proxy_frame(&state, frame)
                     .unwrap_or_else(|error| render_proxy_upload_error_ack(&header, error))
             }
@@ -738,6 +759,38 @@ async fn handle_macos_render_proxy_connection(
             break;
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn read_render_proxy_payload_vec(
+    stream: &mut UnixStream,
+    expected_len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut payload = vec![0_u8; expected_len];
+    stream.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+#[cfg(target_os = "macos")]
+async fn read_render_proxy_payload_bytes(
+    stream: &mut UnixStream,
+    expected_len: usize,
+) -> std::io::Result<Bytes> {
+    let mut payload = BytesMut::with_capacity(expected_len);
+    while payload.len() < expected_len {
+        let remaining = expected_len - payload.len();
+        let read = (&mut *stream)
+            .take(remaining as u64)
+            .read_buf(&mut payload)
+            .await?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "render proxy payload ended early",
+            ));
+        }
+    }
+    Ok(payload.freeze())
 }
 
 #[cfg(target_os = "macos")]
@@ -1346,5 +1399,30 @@ mod tests {
         std::env::set_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV, "1");
         assert!(macos_render_proxy_cv_pixel_buffer_decode_enabled());
         std::env::remove_var(MACOS_RENDER_PROXY_CVPIXELBUFFER_DECODE_ENV);
+    }
+
+    #[tokio::test]
+    async fn payload_bytes_reader_does_not_consume_trailing_frame_bytes() {
+        let (mut writer, mut reader) = UnixStream::pair().expect("create unix stream pair");
+        let payload = [1_u8, 2, 3, 4, 5];
+        let trailing = [9_u8, 8, 7, 6];
+
+        writer.write_all(&payload).await.expect("write payload");
+        writer
+            .write_all(&trailing)
+            .await
+            .expect("write trailing bytes");
+
+        let read_payload = read_render_proxy_payload_bytes(&mut reader, payload.len())
+            .await
+            .expect("read payload");
+        assert_eq!(read_payload.as_ref(), payload);
+
+        let mut read_trailing = [0_u8; 4];
+        reader
+            .read_exact(&mut read_trailing)
+            .await
+            .expect("read trailing bytes");
+        assert_eq!(read_trailing, trailing);
     }
 }

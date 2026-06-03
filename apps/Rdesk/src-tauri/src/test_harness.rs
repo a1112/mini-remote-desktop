@@ -4009,7 +4009,7 @@ fn render_input_to_preview_bgra(
             frame.width,
             frame.height,
         ),
-        RenderFrameData::Nv12 { .. } => {
+        RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
             anyhow::bail!("NV12 render preview conversion is not implemented")
         }
         #[cfg(windows)]

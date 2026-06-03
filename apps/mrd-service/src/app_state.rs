@@ -1081,9 +1081,24 @@ impl mrd_render::RendererInstance for MacosRenderProxyRenderer {
         let height = u32::try_from(frame.height)
             .map_err(|_| RenderError::Message("render proxy frame height overflow".to_string()))?;
         let (pixel_format, payload, row_pitch) = match frame.data {
-            RenderFrameData::Rgb24(data) => (RenderProxyPixelFormat::Rgb24, data, 0_usize),
-            RenderFrameData::Bgra32(data) => (RenderProxyPixelFormat::Bgra32, data, 0_usize),
-            RenderFrameData::Nv12 { data, pitch } => (RenderProxyPixelFormat::Nv12, data, pitch),
+            RenderFrameData::Rgb24(data) => (
+                RenderProxyPixelFormat::Rgb24,
+                bytes::Bytes::from(data),
+                0_usize,
+            ),
+            RenderFrameData::Bgra32(data) => (
+                RenderProxyPixelFormat::Bgra32,
+                bytes::Bytes::from(data),
+                0_usize,
+            ),
+            RenderFrameData::Nv12 { data, pitch } => (
+                RenderProxyPixelFormat::Nv12,
+                bytes::Bytes::from(data),
+                pitch,
+            ),
+            RenderFrameData::Nv12Bytes { data, pitch } => {
+                (RenderProxyPixelFormat::Nv12, data, pitch)
+            }
             #[cfg(windows)]
             RenderFrameData::D3D11SharedBgra { .. }
             | RenderFrameData::D3D11SharedNv12 { .. }
@@ -1107,7 +1122,7 @@ impl mrd_render::RendererInstance for MacosRenderProxyRenderer {
                 .map_err(|_| RenderError::Message("render proxy row pitch overflow".to_string()))?,
         };
         self.sequence = self.sequence.saturating_add(1);
-        let ack = self.send_payload_with_reconnect(&header, &payload)?;
+        let ack = self.send_payload_with_reconnect(&header, payload.as_ref())?;
         self.snapshot.uploaded_frame_count = self.snapshot.uploaded_frame_count.saturating_add(1);
         self.snapshot.presented_frame_count = self
             .snapshot

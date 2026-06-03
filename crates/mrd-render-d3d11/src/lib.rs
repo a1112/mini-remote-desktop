@@ -731,7 +731,7 @@ impl D3d11Renderer {
         let data = match &frame.data {
             RenderFrameData::Rgb24(data) => data,
             RenderFrameData::Bgra32(data) => data,
-            RenderFrameData::Nv12 { .. } => {
+            RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
                 return [0.05, 0.05, 0.05, 1.0];
             }
             #[cfg(windows)]
@@ -1502,7 +1502,7 @@ impl RendererInstance for D3d11Renderer {
                         self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
-                RenderFrameData::Nv12 { .. } => {
+                RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
                     return Err(RenderError::Message(
                         "D3D11 renderer does not accept CPU NV12 frame data".to_string(),
                     ));

@@ -1,5 +1,7 @@
 pub use mrd_pipeline_core::RuntimeStatus;
 
+use bytes::Bytes;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderPixelFormat {
     Rgb24,
@@ -27,6 +29,8 @@ pub enum RenderFrameData {
     Bgra32(Vec<u8>),
     /// CPU NV12 data with a single row pitch for both planes
     Nv12 { data: Vec<u8>, pitch: usize },
+    /// CPU NV12 data backed by a shared byte buffer.
+    Nv12Bytes { data: Bytes, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedBgra {
@@ -89,6 +93,16 @@ impl RenderFrame {
             height,
             pixel_format: RenderPixelFormat::Nv12,
             data: RenderFrameData::Nv12 { data, pitch },
+        }
+    }
+
+    /// Create a frame from CPU NV12 data without forcing Vec ownership.
+    pub fn from_nv12_bytes(width: usize, height: usize, data: Bytes, pitch: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Nv12,
+            data: RenderFrameData::Nv12Bytes { data, pitch },
         }
     }
 
@@ -175,6 +189,7 @@ impl RenderFrame {
     pub fn as_nv12(&self) -> Option<(&[u8], usize)> {
         match &self.data {
             RenderFrameData::Nv12 { data, pitch } => Some((data.as_slice(), *pitch)),
+            RenderFrameData::Nv12Bytes { data, pitch } => Some((data.as_ref(), *pitch)),
             _ => None,
         }
     }
@@ -372,7 +387,9 @@ pub fn d3d11_descriptor() -> RendererDescriptor {
 
 #[cfg(test)]
 mod tests {
-    use super::{d3d11_descriptor, RenderPixelFormat, RuntimeStatus};
+    use bytes::Bytes;
+
+    use super::{d3d11_descriptor, RenderFrame, RenderFrameData, RenderPixelFormat, RuntimeStatus};
 
     #[test]
     fn d3d11_descriptor_reports_runtime_backed_formats() {
@@ -398,6 +415,16 @@ mod tests {
         assert!(descriptor
             .supported_formats
             .contains(&RenderPixelFormat::D3D11SharedP010));
+    }
+
+    #[test]
+    fn nv12_bytes_frame_exposes_nv12_slice() {
+        let data = Bytes::from_static(&[16, 235, 81, 145, 128, 128]);
+        let frame = RenderFrame::from_nv12_bytes(2, 2, data.clone(), 2);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::Nv12);
+        assert_eq!(frame.as_nv12(), Some((data.as_ref(), 2)));
+        assert!(matches!(frame.data, RenderFrameData::Nv12Bytes { .. }));
     }
 
     #[cfg(windows)]
