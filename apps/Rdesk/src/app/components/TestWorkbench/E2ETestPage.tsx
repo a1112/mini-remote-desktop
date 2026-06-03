@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { Play, Square, Monitor, Clock, Zap, Activity, Video } from "lucide-react";
 import * as commands from "../../adapters/tauri/commands";
-import type { EnvironmentSnapshot, TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
+import type { EnvironmentSnapshot, LanPeerInfo, TestConfig, HarnessMetrics } from "../../adapters/tauri/types";
 import {
   runLanE2EAutomation,
   type CrossDeviceScenarioId,
@@ -73,6 +73,10 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
 
 function configFromLanReport(baseConfig: TestConfig, report: LanE2EAutomationReport): TestConfig {
   const profile = report.requestedProfile;
+  const macosConfig = profile && report.peer
+    ? macosConfigFromLanPeer(report.peer, profile, report.validationMode)
+    : null;
+  if (macosConfig) return macosConfig;
   return {
     ...baseConfig,
     transport_kind: report.validationMode === "webrtc_rtp" ? "webrtc" : "quic",
@@ -80,6 +84,49 @@ function configFromLanReport(baseConfig: TestConfig, report: LanE2EAutomationRep
     fps: profile?.fps ?? baseConfig.fps,
     bitrate: profile?.bitrate_mbps ? profile.bitrate_mbps * 1_000_000 : baseConfig.bitrate,
   };
+}
+
+function macosConfigFromLanPeer(
+  peer: LanPeerInfo,
+  profile: NonNullable<LanE2EAutomationReport["requestedProfile"]>,
+  validationMode: LanE2EAutomationReport["validationMode"]
+): TestConfig | null {
+  const codec = profile.codec?.toLowerCase() ?? "h264";
+  const encoderAliases =
+    codec === "hevc"
+      ? ["videotoolbox_hevc", "encode.videotoolbox_hevc"]
+      : ["videotoolbox_h264", "encode.videotoolbox_h264"];
+  const capabilityGroups = [
+    ["macos_capture", "capture.macos"],
+    encoderAliases,
+    ["videotoolbox", "decode.videotoolbox"],
+    ["macos_native_render", "render.macos"],
+  ];
+  if (codec === "hevc") {
+    capabilityGroups.push(["media.hevc_main_420_8bit"]);
+  }
+  if (!peerHasMediaCapabilities(peer, capabilityGroups)) return null;
+  return {
+    capture_type: "macos",
+    encoder_type: codec === "hevc" ? "videotoolbox_hevc" : "videotoolbox_h264",
+    decoder_type: "videotoolbox",
+    renderer_type: "macos",
+    render_display: true,
+    zero_copy: false,
+    transport_kind: validationMode === "webrtc_rtp" ? "webrtc" : "quic",
+    resolution: [profile.width, profile.height],
+    fps: profile.fps,
+    bitrate: profile.bitrate_mbps * 1_000_000,
+  };
+}
+
+function peerHasMediaCapabilities(peer: LanPeerInfo, capabilityGroups: string[][]): boolean {
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  return capabilityGroups.every((aliases) =>
+    aliases.some((capability) => mediaCapabilities.includes(capability))
+  );
 }
 
 const lanAutomationCommands: LanE2EAutomationCommands = {

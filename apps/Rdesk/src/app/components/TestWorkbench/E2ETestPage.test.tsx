@@ -443,6 +443,69 @@ describe("E2ETestPage LAN automation", () => {
     });
   });
 
+  it("records macOS LAN E2E reports with the VideoToolbox HEVC config", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock({
+      peer: {
+        device_id: "mac-agent",
+        device_name: "Agent Mac",
+        device_type: "desktop",
+        ip: "192.168.1.25",
+        discovery_port: 37777,
+        p2p_control_addr: "192.168.1.25:37778",
+        transports: [
+          "quic",
+          "quic_datagram",
+          "quic_datagram_2k144",
+          "quic_datagram_media_v3",
+          "media_profile_control_v1",
+        ],
+        protocol_version: 1,
+        service_build_id: "test-build",
+        media_protocol_version: 3,
+        media_capabilities: [
+          "quic_datagram_media_v3",
+          "macos_capture",
+          "videotoolbox_hevc",
+          "videotoolbox",
+          "media.hevc_main_420_8bit",
+          "macos_native_render",
+        ],
+        age_ms: 25,
+        p2p_available: true,
+      },
+    });
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=mac-agent&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=40&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_record_external_run",
+        expect.objectContaining({
+          record: expect.objectContaining({
+            config_snapshot: expect.objectContaining({
+              capture_type: "macos",
+              encoder_type: "videotoolbox_hevc",
+              decoder_type: "videotoolbox",
+              renderer_type: "macos",
+              zero_copy: false,
+              resolution: [2560, 1440],
+              fps: 144,
+              bitrate: 40_000_000,
+            }),
+          }),
+        })
+      );
+    });
+  });
+
   it("passes an exact autorun capture source id through to LAN automation", async () => {
     const mockInvoke = installSuccessfulLanAutomationMock();
 
@@ -504,7 +567,7 @@ describe("E2ETestPage LAN automation", () => {
   });
 });
 
-function installSuccessfulLanAutomationMock() {
+function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unknown> } = {}) {
   const mockInvoke = getMockInvoke();
   let activeProfile = {
     width: 2560,
@@ -554,39 +617,38 @@ function installSuccessfulLanAutomationMock() {
     }
     if (command === "ipc_register_device") return Promise.resolve("lan-MBLOCAL1234");
     if (command === "ipc_refresh_lan_discovery") {
+      const peer = options.peer ?? {
+        device_id: "agent-device",
+        device_name: "Agent PC",
+        device_type: "desktop",
+        ip: "192.168.1.24",
+        discovery_port: 37777,
+        p2p_control_addr: "192.168.1.24:37778",
+        transports: [
+          "quic",
+          "quic_datagram",
+          "quic_datagram_2k144",
+          "quic_datagram_media_v2",
+          "media_profile_control_v1",
+        ],
+        protocol_version: 1,
+        service_build_id: "test-build",
+        media_protocol_version: 2,
+        media_capabilities: [
+          "dxgi_capture",
+          "nvenc_h264",
+          "nvdec",
+          "d3d11_native_render",
+        ],
+        age_ms: 25,
+        p2p_available: true,
+      };
       return Promise.resolve({
         enabled: true,
         running: true,
         discovery_port: 37777,
         instance_id: "controller-instance",
-        peers: [
-          {
-            device_id: "agent-device",
-            device_name: "Agent PC",
-            device_type: "desktop",
-            ip: "192.168.1.24",
-            discovery_port: 37777,
-            p2p_control_addr: "192.168.1.24:37778",
-            transports: [
-              "quic",
-              "quic_datagram",
-              "quic_datagram_2k144",
-              "quic_datagram_media_v2",
-              "media_profile_control_v1",
-            ],
-            protocol_version: 1,
-            service_build_id: "test-build",
-            media_protocol_version: 2,
-            media_capabilities: [
-              "dxgi_capture",
-              "nvenc_h264",
-              "nvdec",
-              "d3d11_native_render",
-            ],
-            age_ms: 25,
-            p2p_available: true,
-          },
-        ],
+        peers: [peer],
       });
     }
     if (command === "ipc_start_lan_remote_session") {
