@@ -1365,6 +1365,7 @@ ignored_stages = {
 active_pixel_format = pipeline.get("active_pixel_format")
 if render_display and isinstance(active_pixel_format, str) and active_pixel_format.startswith("proxy_"):
     ignored_stages.add("receiver.decode")
+    ignored_stages.add("receiver.record")
 steady_metrics = [
     item for item in stage_metrics
     if isinstance(item, dict)
