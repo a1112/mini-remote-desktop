@@ -133,6 +133,13 @@ function macosCapabilities() {
   };
 }
 
+function macosHevcWithH264DecodeOnlyCapabilities() {
+  return {
+    ...macosCapabilities(),
+    available_decoders: ["videotoolbox_h264", "software"],
+  };
+}
+
 const remoteDisplaySource = {
   id: "windows:display-shared:0",
   platform: "windows",
@@ -2325,6 +2332,86 @@ describe("RemoteDisplayWindowPage", () => {
             renderer_target_hwnd: "0x14",
             transport_kind: "loopback",
             visual_preview: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("uses software decode for macOS HEVC local pipeline when only H.264 VideoToolbox decode is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(macosHevcWithH264DecodeOnlyCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          session_id: "local-display-test-1",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "macos_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-local-display-test-1",
+          backend: args?.enabled ? "macos" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "present_test_harness_frame_on_native_surface") {
+        return Promise.resolve(true);
+      }
+      if (command === "test_harness_stop") {
+        return Promise.resolve(null);
+      }
+      if (command === "test_start_run") {
+        return Promise.resolve("run-macos-hevc-software");
+      }
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 60,
+          frame_count: 12,
+          total_latency_p95_ms: 12,
+          error_message: null,
+        });
+      }
+      if (command === "test_get_run") {
+        return Promise.resolve({
+          run_id: "run-macos-hevc-software",
+          status: "running",
+          summary: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay("local-display-test-1");
+
+    fireEvent.click(await screen.findByRole("button", { name: "测试配置" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start local pipeline test" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "custom",
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "software",
+            renderer_type: "macos",
+            render_display: true,
+            renderer_target_hwnd: "0x14",
           }),
         })
       );

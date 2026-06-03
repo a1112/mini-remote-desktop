@@ -78,6 +78,20 @@ export function chooseCapability<T extends string>(
   return candidates[0] as T;
 }
 
+export function chooseDecoderCapabilityForConfig<T extends string>(
+  candidates: T[],
+  capabilities: EnvironmentSnapshot | null,
+  encoderId?: string | null,
+  fallback?: T
+): T {
+  const match = candidates.find((id) =>
+    decoderCapabilityAvailableForConfig(capabilities, id, encoderId)
+  );
+  if (match) return match;
+  if (fallback !== undefined) return fallback;
+  return candidates[0] as T;
+}
+
 export function decoderCapabilityAvailableForConfig(
   capabilities: EnvironmentSnapshot | null,
   decoderId: string | null | undefined,

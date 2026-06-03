@@ -80,6 +80,24 @@ function mockMacHevcCapabilities(command: string) {
   return undefined;
 }
 
+function mockMacHevcWithH264DecodeOnlyCapabilities(command: string) {
+  if (command === "test_get_capabilities") {
+    return Promise.resolve({
+      os_type: "macos",
+      cpu_brand: "",
+      cpu_cores: 8,
+      memory_gb: 32,
+      gpu_info: "",
+      available_captures: ["macos", "synthetic"],
+      available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+      available_decoders: ["videotoolbox_h264", "software"],
+      available_renderers: ["none", "macos"],
+      available_memory_modes: ["cpu"],
+    });
+  }
+  return undefined;
+}
+
 function mockLinuxCapabilities(command: string) {
   if (command === "test_get_capabilities") {
     return Promise.resolve({
@@ -505,6 +523,46 @@ describe("MatrixTestPage failure handling", () => {
     expect(await screen.findByLabelText("NVDEC")).toBeChecked();
     expect(screen.getByLabelText("FFmpeg H.264")).not.toBeChecked();
     expect(screen.getByLabelText("软件")).not.toBeChecked();
+  });
+
+  it("prefers software decode by default when macOS HEVC encode lacks a matching VideoToolbox decoder", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const macCapabilities = mockMacHevcWithH264DecodeOnlyCapabilities(command);
+      if (macCapabilities) return macCapabilities;
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage />);
+
+    expect(await screen.findByLabelText("VideoToolbox HEVC")).toBeChecked();
+    expect(screen.getByLabelText("VideoToolbox")).not.toBeChecked();
+    expect(screen.getByLabelText("软件")).toBeChecked();
+  });
+
+  it("skips macOS HEVC VideoToolbox decode rows when only the H.264 decoder is available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      const macCapabilities = mockMacHevcWithH264DecodeOnlyCapabilities(command);
+      if (macCapabilities) return macCapabilities;
+      if (command === "test_start_run") return Promise.resolve("run-should-not-start");
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    setCheckbox(await screen.findByLabelText("VideoToolbox"), true);
+    setLabeledCheckbox("软件", false);
+    setLabeledCheckbox("720p", false);
+    setLabeledCheckbox("30 FPS", false);
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(
+        screen.getByText("VideoToolbox HEVC decoder is not available for this macOS capability snapshot")
+      ).toBeInTheDocument();
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "test_start_run")).toBe(false);
   });
 
   it("allows HEVC Main matrix runs over WebRTC RTP when decoder is compatible", async () => {

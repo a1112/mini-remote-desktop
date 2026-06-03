@@ -12,7 +12,11 @@ import {
   type LanE2EStatus,
 } from "../../services/lanE2eAutomationService";
 import { externalRunRecordFromLanE2EReport } from "../../services/lanE2eTelemetryService";
-import { capabilityAvailable, chooseCapability } from "./capabilityMeta";
+import {
+  capabilityAvailable,
+  chooseCapability,
+  chooseDecoderCapabilityForConfig,
+} from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
   environmentSnapshotFromCapabilitySnapshot,
@@ -37,14 +41,14 @@ function buildDefaultConfig(capabilities: EnvironmentSnapshot | null): TestConfi
     "available_encoders",
     "openh264"
   );
-  const decoder = chooseCapability(
+  const decoder = chooseDecoderCapabilityForConfig(
     capture === "linux"
       ? ["linux_h264", "software", "none"]
       : capture === "macos"
         ? ["videotoolbox", "software", "none"]
         : ["nvdec", "software", "none"],
     capabilities,
-    "available_decoders",
+    encoder,
     "none"
   );
   const renderer = capabilityAvailable(capabilities, "available_renderers", "macos")

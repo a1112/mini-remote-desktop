@@ -166,6 +166,47 @@ describe("TransportTestPage execution targets", () => {
     });
   });
 
+  it("falls back to software when local macOS HEVC transport lacks a matching VideoToolbox decoder", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "",
+          cpu_cores: 8,
+          memory_gb: 32,
+          gpu_info: "Apple",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+          available_decoders: ["videotoolbox_h264", "software", "none"],
+          available_renderers: ["none", "macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") return Promise.resolve(null);
+      if (command === "test_start_run") return Promise.resolve("run-macos-hevc-software");
+      return Promise.resolve(null);
+    });
+
+    render(<TransportTestPage />);
+
+    await screen.findByRole("button", { name: /QUIC/ });
+    fireEvent.click(screen.getByRole("button", { name: "启动测试" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "software",
+          }),
+        })
+      );
+    });
+  });
+
   it("describes macOS cross-device transport records with VideoToolbox HEVC", () => {
     const peer = {
       device_id: "mac-agent",

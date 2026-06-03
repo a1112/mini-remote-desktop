@@ -46,6 +46,7 @@ import {
   readShowUnavailableCapabilities,
   useShowUnavailableCapabilities,
 } from "./useCapabilityVisibility";
+import { decoderCapabilityAvailableForConfig } from "./capabilityMeta";
 
 interface MatrixDimension {
   id: string;
@@ -311,14 +312,49 @@ function decoderOptionAvailable(availableDecoders: string[], decoder: string): b
   );
 }
 
+function decoderOptionAvailableForConfig(
+  availableDecoders: string[],
+  decoder: TestConfig["decoder_type"],
+  encoder: TestConfig["encoder_type"]
+): boolean {
+  return decoderCapabilityAvailableForConfig(
+    { available_decoders: availableDecoders } as EnvironmentSnapshot,
+    decoder,
+    encoder
+  );
+}
+
+function decoderCapabilityRequestForConfig(config: TestConfig): string | undefined {
+  if (config.decoder_type !== "videotoolbox") return config.decoder_type;
+  if (config.encoder_type === "videotoolbox_hevc") return "videotoolbox_hevc";
+  if (config.encoder_type === "videotoolbox_h264") return "videotoolbox_h264";
+  return config.decoder_type;
+}
+
+function defaultEncoderForAvailableCapabilities(
+  os: HostOs,
+  availableEncoders: string[]
+): TestConfig["encoder_type"] {
+  const preferred = defaultEncodersForOs(os);
+  return (
+    preferred.find((encoder) => availableEncoders.includes(encoder)) ??
+    availableEncoders[0]
+  ) as TestConfig["encoder_type"] | undefined;
+}
+
 function shouldEnableDecoderByDefault(
   option: MatrixOption,
   os: HostOs,
+  availableEncoders: string[],
   availableDecoders: string[]
 ): boolean {
   const hasNvdec = availableDecoders.includes("nvdec");
   const hasLinuxHardware = hasLinuxHardwareDecoder(availableDecoders);
-  const hasVideoToolbox = decoderOptionAvailable(availableDecoders, "videotoolbox");
+  const defaultEncoder = defaultEncoderForAvailableCapabilities(os, availableEncoders);
+  const hasVideoToolbox =
+    os === "macos" && defaultEncoder
+      ? decoderOptionAvailableForConfig(availableDecoders, "videotoolbox", defaultEncoder)
+      : decoderOptionAvailable(availableDecoders, "videotoolbox");
   const hasFfmpegH264 = availableDecoders.includes("ffmpeg_h264");
 
   if (option.id === "nvdec") return hasNvdec;
@@ -368,7 +404,7 @@ function shouldEnableOptionByDefault(
     return false;
   }
   if (dimensionId === "decoder") {
-    return shouldEnableDecoderByDefault(option, os, availableDecoders);
+    return shouldEnableDecoderByDefault(option, os, availableEncoders, availableDecoders);
   }
   return optionEnabledForOs(option, os);
 }
@@ -758,7 +794,7 @@ function matrixCapabilitySkipReason(
     {
       capture: config.capture_type,
       encoder: config.encoder_type,
-      decoder: config.decoder_type,
+      decoder: decoderCapabilityRequestForConfig(config),
       renderer:
         config.render_display && config.renderer_type === "d3d12"
           ? "d3d12_native"
@@ -779,11 +815,35 @@ function matrixCapabilitySkipReason(
   return evaluation.reasons.join("; ") || "Capability combination is not runnable";
 }
 
+function matrixEnvironmentSkipReason(
+  config: TestConfig,
+  capabilities: EnvironmentSnapshot | null
+): string | null {
+  const decoder = config.decoder_type;
+  const availableDecoders = capabilities?.available_decoders;
+  if (!decoder || !availableDecoders?.length) return null;
+  if (decoderOptionAvailableForConfig(availableDecoders, decoder, config.encoder_type)) {
+    return null;
+  }
+  if (decoder === "videotoolbox" && config.encoder_type === "videotoolbox_hevc") {
+    return "VideoToolbox HEVC decoder is not available for this macOS capability snapshot";
+  }
+  if (decoder === "videotoolbox" && config.encoder_type === "videotoolbox_h264") {
+    return "VideoToolbox H.264 decoder is not available for this macOS capability snapshot";
+  }
+  return `Decoder ${decoder} is not available for encoder ${config.encoder_type ?? "unknown"}`;
+}
+
 function staticMatrixSkipReason(
   config: TestConfig,
-  capabilitySnapshot: CapabilitySnapshot | null
+  capabilitySnapshot: CapabilitySnapshot | null,
+  capabilities: EnvironmentSnapshot | null = null
 ): string | null {
-  return matrixCapabilitySkipReason(config, capabilitySnapshot) ?? unsupportedMatrixReason(config);
+  return (
+    matrixEnvironmentSkipReason(config, capabilities) ??
+    matrixCapabilitySkipReason(config, capabilitySnapshot) ??
+    unsupportedMatrixReason(config)
+  );
 }
 
 function capabilitySkipReason(config: TestConfig, message: string): string | null {
@@ -1271,7 +1331,7 @@ function createLocalUiDebugMatrixTests(
     id: `local_ui_debug_${index}`,
     config,
     status: "pending",
-    skipReason: staticMatrixSkipReason(config, capabilitySnapshot) ?? undefined,
+    skipReason: staticMatrixSkipReason(config, capabilitySnapshot, capabilities) ?? undefined,
   }));
 }
 
@@ -1508,7 +1568,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
           id: `matrix_${combinations.length}`,
           config,
           status: "pending",
-          skipReason: staticMatrixSkipReason(config, capabilitySnapshot) ?? undefined,
+          skipReason: staticMatrixSkipReason(config, capabilitySnapshot, capabilities) ?? undefined,
         });
         return;
       }
@@ -1524,7 +1584,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
     generate(0, []);
     return { tests: combinations, truncated };
-  }, [capabilitySnapshot, scopedDimensions, selectionBlockedReason]);
+  }, [capabilities, capabilitySnapshot, scopedDimensions, selectionBlockedReason]);
 
   const waitForRunCompletion = async (runId: string, config: TestConfig): Promise<TestRun | null> => {
     const timeoutMs = Math.max(
@@ -1598,7 +1658,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       if (!test) continue;
 
       const staticSkipReason =
-        test.skipReason ?? staticMatrixSkipReason(test.config, capabilitySnapshot);
+        test.skipReason ?? staticMatrixSkipReason(test.config, capabilitySnapshot, capabilities);
       if (staticSkipReason) {
         setSkippedCount((count) => count + 1);
         setTests((prev) =>

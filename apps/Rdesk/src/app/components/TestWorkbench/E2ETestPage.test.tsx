@@ -272,6 +272,55 @@ describe("E2ETestPage LAN automation", () => {
     });
   });
 
+  it("falls back to software when macOS HEVC encode lacks a matching VideoToolbox decoder", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "Apple",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "Apple GPU",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+          available_decoders: ["videotoolbox_h264", "software"],
+          available_renderers: ["macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-macos-software-decode");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("videotoolbox_hevc")).toBeInTheDocument();
+      expect(screen.getByText("software")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.macos_local",
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "software",
+          }),
+        })
+      );
+    });
+  });
+
   it("runs LAN remote display automation through IPC commands", async () => {
     const mockInvoke = installSuccessfulLanAutomationMock();
 

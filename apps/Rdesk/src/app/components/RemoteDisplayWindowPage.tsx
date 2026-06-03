@@ -77,6 +77,7 @@ import {
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
+import { decoderCapabilityAvailableForConfig } from "./TestWorkbench/capabilityMeta";
 import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
 
@@ -1152,16 +1153,14 @@ function pickAvailable<T extends string>(
 
 function decoderOptionAvailable(
   available: readonly string[] | undefined,
-  decoder: DecoderType
+  decoder: DecoderType,
+  encoder?: EncoderType | null
 ): boolean {
-  if (!available || available.length === 0) return false;
-  if (available.includes(decoder)) return true;
-  if (decoder !== "videotoolbox") return false;
-  return (
-    available.includes("videotoolbox_h264") ||
-    available.includes("videotoolbox_hevc") ||
-    available.includes("decode.videotoolbox_h264") ||
-    available.includes("decode.videotoolbox_hevc")
+  if (!available || available.length === 0) return decoder === "none";
+  return decoderCapabilityAvailableForConfig(
+    { available_decoders: [...available] } as EnvironmentSnapshot,
+    decoder,
+    encoder
   );
 }
 
@@ -1169,11 +1168,12 @@ function pickAvailableDecoder(
   current: DecoderType,
   available: readonly string[] | undefined,
   preferred: readonly DecoderType[],
-  fallback: DecoderType
+  fallback: DecoderType,
+  encoder?: EncoderType | null
 ): DecoderType {
   if (!available || available.length === 0) return current;
-  if (decoderOptionAvailable(available, current)) return current;
-  return preferred.find((value) => decoderOptionAvailable(available, value)) ?? fallback;
+  if (decoderOptionAvailable(available, current, encoder)) return current;
+  return preferred.find((value) => decoderOptionAvailable(available, value, encoder)) ?? fallback;
 }
 
 function uniqueValues<T extends string>(values: readonly T[]): T[] {
@@ -2355,10 +2355,10 @@ export function RemoteDisplayWindowPage() {
     () =>
       capabilities?.available_decoders?.length
         ? decoderOptions.filter((option) =>
-            decoderOptionAvailable(capabilities.available_decoders, option.value)
+            decoderOptionAvailable(capabilities.available_decoders, option.value, encoder)
           )
         : decoderOptions,
-    [capabilities]
+    [capabilities, encoder]
   );
   const activeEncoderOptions =
     isLocalPipelinePreview && renderMode === "web"
@@ -2409,11 +2409,11 @@ export function RemoteDisplayWindowPage() {
         ...option,
         disabledReason:
           capabilities?.available_decoders?.length &&
-          !decoderOptionAvailable(capabilities.available_decoders, option.value)
+          !decoderOptionAvailable(capabilities.available_decoders, option.value, encoder)
             ? "当前平台能力未报告该解码器"
             : null,
       })),
-    [capabilities]
+    [capabilities, encoder]
   );
   const durationTileOptions = useMemo(
     () =>
@@ -2510,6 +2510,18 @@ export function RemoteDisplayWindowPage() {
   }, [durationMode, matrixModeEnabled]);
 
   useEffect(() => {
+    if (
+      decoder === "videotoolbox" &&
+      capabilities?.available_decoders?.length &&
+      !decoderOptionAvailable(capabilities.available_decoders, decoder, encoder)
+    ) {
+      setDecoder(
+        decoderOptionAvailable(capabilities.available_decoders, "software", encoder)
+          ? "software"
+          : "none"
+      );
+      return;
+    }
     if (isHevcEncoder(encoder) && (decoder === "software" || decoder === "linux_h264")) {
       const preferredLinuxDecoder = encoder === "nvenc_hevc_main10" ? "linux_hevc_main10" : "linux_hevc";
       setDecoder(
@@ -3429,20 +3441,20 @@ export function RemoteDisplayWindowPage() {
       setCapture((value) =>
         pickAvailable(value, capabilities.available_captures, ["macos", "synthetic"], "macos")
       );
-      setEncoder((value) =>
-        pickAvailable(
-          value,
-          capabilities.available_encoders,
-          ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
-          "videotoolbox_hevc"
-        )
+      const nextEncoder = pickAvailable(
+        encoder,
+        capabilities.available_encoders,
+        ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+        "videotoolbox_hevc"
       );
+      setEncoder(nextEncoder);
       setDecoder((value) =>
         pickAvailableDecoder(
           value,
           capabilities.available_decoders,
           ["videotoolbox", "software", "none"],
-          "videotoolbox"
+          "software",
+          nextEncoder
         )
       );
       if (isLocalPipelinePreview) {
@@ -3497,7 +3509,7 @@ export function RemoteDisplayWindowPage() {
     }
 
     setRenderMode("web");
-  }, [capabilities, isLocalPipelinePreview]);
+  }, [capabilities, encoder, isLocalPipelinePreview]);
 
   useEffect(() => {
     if (
@@ -4691,10 +4703,11 @@ export function RemoteDisplayWindowPage() {
     }
     setWebPreviewEngine("webrtc");
     if (hostOs === "macos") {
+      const nextEncoder: EncoderType = "videotoolbox_h264";
       setCapture("macos");
-      setEncoder("videotoolbox_h264");
+      setEncoder(nextEncoder);
       setDecoder(
-        decoderOptionAvailable(capabilities?.available_decoders, "videotoolbox")
+        decoderOptionAvailable(capabilities?.available_decoders, "videotoolbox", nextEncoder)
           ? "videotoolbox"
           : "software"
       );

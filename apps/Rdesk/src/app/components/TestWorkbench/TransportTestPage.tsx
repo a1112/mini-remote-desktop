@@ -13,7 +13,10 @@ import {
   type LanE2EAutomationReport,
 } from "../../services/lanE2eAutomationService";
 import { externalRunRecordFromLanE2EReport } from "../../services/lanE2eTelemetryService";
-import { chooseCapability } from "./capabilityMeta";
+import {
+  chooseCapability,
+  chooseDecoderCapabilityForConfig,
+} from "./capabilityMeta";
 import {
   buildCapabilitySnapshotFromIpc,
   capabilityForOption,
@@ -329,10 +332,10 @@ export function TransportTestPage() {
           : encoder === "nvenc_hevc"
             ? ["nvdec", "ffmpeg_hevc", "software", "none"]
             : ["nvdec", "ffmpeg_h264", "software", "none"];
-    const decoder = chooseCapability(
+    const decoder = chooseDecoderCapabilityForConfig(
       decoderCandidates,
       capabilities,
-      "available_decoders",
+      encoder,
       "none"
     );
     const config: TestConfig = {
