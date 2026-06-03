@@ -4853,12 +4853,47 @@ fn env_bool_override(value: Option<&str>) -> Option<bool> {
 
 #[cfg(target_os = "macos")]
 fn macos_render_proxy_compressed_media_enabled() -> bool {
+    macos_render_proxy_compressed_media_override().unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_proxy_compressed_media_override() -> Option<bool> {
     env_bool_override(
         std::env::var(MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV)
             .ok()
             .as_deref(),
     )
-    .unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_proxy_compressed_media_enabled_for_profile(profile: &MediaProfile) -> bool {
+    macos_render_proxy_compressed_media_enabled_for_values(
+        profile.codec.as_str(),
+        profile.width,
+        profile.height,
+        profile.fps,
+        macos_render_proxy_compressed_media_override(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_render_proxy_compressed_media_enabled_for_values(
+    codec: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    override_value: Option<bool>,
+) -> bool {
+    if let Some(enabled) = override_value {
+        return enabled;
+    }
+    !(codec.trim().eq_ignore_ascii_case("hevc")
+        && high_throughput_media_profile(width, height, fps))
+}
+
+#[cfg(target_os = "macos")]
+fn high_throughput_media_profile(width: u32, height: u32, fps: u32) -> bool {
+    fps >= 120 && u64::from(width).saturating_mul(u64::from(height)) >= 2_560_u64 * 1_440
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -5631,7 +5666,16 @@ async fn receive_quic_media_loop(
                         if matches!(
                             frame_codec,
                             LanAccessUnitCodec::H264 | LanAccessUnitCodec::Hevc
-                        ) {
+                        ) && match frame_codec {
+                            LanAccessUnitCodec::H264 => {
+                                macos_render_proxy_compressed_media_enabled()
+                            }
+                            LanAccessUnitCodec::Hevc => {
+                                macos_render_proxy_compressed_media_enabled_for_profile(
+                                    &envelope.profile,
+                                )
+                            }
+                        } {
                             let proxy_forward_started = Instant::now();
                             let proxy_result = match frame_codec {
                                 LanAccessUnitCodec::H264 => {
@@ -5991,6 +6035,9 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
         _ => return false,
     };
     normalize_lan_media_profile(&mut profile);
+    if !macos_render_proxy_compressed_media_enabled_for_profile(&profile) {
+        return false;
+    }
 
     let ready_frames = frame_orderer.push(frame);
     receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
@@ -6342,7 +6389,7 @@ async fn render_lan_h264_access_unit_frame(
     timestamp_us: u64,
     profile: &MediaProfile,
 ) -> Result<bool> {
-    if !macos_render_proxy_compressed_media_enabled() {
+    if !macos_render_proxy_compressed_media_enabled_for_profile(profile) {
         return Ok(false);
     }
     if app_state
@@ -14091,6 +14138,37 @@ mod tests {
         assert_eq!(lan_render_pacing_from_env_value(Some("off")), Some(false));
         assert_eq!(lan_render_pacing_from_env_value(Some("1")), Some(true));
         assert_eq!(lan_render_pacing_from_env_value(Some("true")), Some(true));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_compressed_proxy_defaults_away_from_high_throughput_hevc() {
+        assert!(!macos_render_proxy_compressed_media_enabled_for_values(
+            "hevc", 2560, 1440, 144, None
+        ));
+        assert!(macos_render_proxy_compressed_media_enabled_for_values(
+            "h264", 2560, 1440, 144, None
+        ));
+        assert!(macos_render_proxy_compressed_media_enabled_for_values(
+            "hevc", 1920, 1080, 144, None
+        ));
+        assert!(macos_render_proxy_compressed_media_enabled_for_values(
+            "hevc", 2560, 1440, 60, None
+        ));
+        assert!(macos_render_proxy_compressed_media_enabled_for_values(
+            "hevc",
+            2560,
+            1440,
+            144,
+            Some(true)
+        ));
+        assert!(!macos_render_proxy_compressed_media_enabled_for_values(
+            "h264",
+            2560,
+            1440,
+            144,
+            Some(false)
+        ));
     }
 
     #[cfg(any(windows, target_os = "macos"))]

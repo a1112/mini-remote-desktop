@@ -21,6 +21,7 @@ mod imp {
     const DEFAULT_H264_STARTUP_KEYFRAME_BURST_MS: u64 = 2_000;
     const DEFAULT_H264_STARTUP_KEYFRAME_INTERVAL_MS: u64 = 50;
     const DEFAULT_HEVC_STARTUP_KEYFRAME_BURST_MS: u64 = 2_000;
+    const DEFAULT_HEVC_HIGH_THROUGHPUT_STARTUP_KEYFRAME_BURST_MS: u64 = 0;
     const DEFAULT_HEVC_STARTUP_KEYFRAME_INTERVAL_MS: u64 = 50;
     const H264_STARTUP_KEYFRAME_BURST_MS_ENV: &str =
         "MRD_VIDEOTOOLBOX_H264_STARTUP_KEYFRAME_BURST_MS";
@@ -450,7 +451,9 @@ mod imp {
                 fps,
                 frame_index: 0,
                 force_next_keyframe: false,
-                startup_keyframe_burst_frames: hevc_startup_keyframe_burst_frames(fps),
+                startup_keyframe_burst_frames: hevc_startup_keyframe_burst_frames(
+                    width, height, fps,
+                ),
                 startup_keyframe_interval_frames: hevc_startup_keyframe_interval_frames(fps),
                 nv12: vec![0; nv12_len(width, height)?],
                 timestamps: VecDeque::new(),
@@ -661,13 +664,15 @@ mod imp {
         )
     }
 
-    fn hevc_startup_keyframe_burst_frames(fps: u32) -> u64 {
+    fn hevc_startup_keyframe_burst_frames(width: usize, height: usize, fps: u32) -> u64 {
+        let default = if hevc_high_throughput_profile(width, height, fps) {
+            DEFAULT_HEVC_HIGH_THROUGHPUT_STARTUP_KEYFRAME_BURST_MS
+        } else {
+            DEFAULT_HEVC_STARTUP_KEYFRAME_BURST_MS
+        };
         h264_frames_for_millis(
             fps,
-            parse_env_u64(
-                HEVC_STARTUP_KEYFRAME_BURST_MS_ENV,
-                DEFAULT_HEVC_STARTUP_KEYFRAME_BURST_MS,
-            ),
+            parse_env_u64(HEVC_STARTUP_KEYFRAME_BURST_MS_ENV, default),
         )
     }
 
@@ -690,6 +695,11 @@ mod imp {
             .checked_div(1_000)
             .unwrap_or(0)
             .max(1)
+    }
+
+    fn hevc_high_throughput_profile(width: usize, height: usize, fps: u32) -> bool {
+        let pixels = width.saturating_mul(height);
+        fps >= 120 && pixels >= 2_560 * 1_440
     }
 
     fn parse_env_u64(name: &str, default: u64) -> u64 {
@@ -2441,35 +2451,68 @@ mod imp {
         #[test]
         fn videotoolbox_hevc_startup_keyframe_burst_defaults_cover_receiver_warmup() {
             let fps = 144;
+            let width = 1_920;
+            let height = 1_080;
 
-            assert_eq!(hevc_startup_keyframe_burst_frames(fps), 288);
+            assert_eq!(hevc_startup_keyframe_burst_frames(width, height, fps), 288);
             assert_eq!(hevc_startup_keyframe_interval_frames(fps), 7);
             assert!(h264_should_force_keyframe(
                 0,
                 fps,
                 false,
-                hevc_startup_keyframe_burst_frames(fps),
+                hevc_startup_keyframe_burst_frames(width, height, fps),
                 hevc_startup_keyframe_interval_frames(fps)
             ));
             assert!(h264_should_force_keyframe(
                 7,
                 fps,
                 false,
-                hevc_startup_keyframe_burst_frames(fps),
+                hevc_startup_keyframe_burst_frames(width, height, fps),
                 hevc_startup_keyframe_interval_frames(fps)
             ));
             assert!(!h264_should_force_keyframe(
                 8,
                 fps,
                 false,
-                hevc_startup_keyframe_burst_frames(fps),
+                hevc_startup_keyframe_burst_frames(width, height, fps),
                 hevc_startup_keyframe_interval_frames(fps)
             ));
             assert!(h264_should_force_keyframe(
                 144,
                 fps,
                 false,
-                hevc_startup_keyframe_burst_frames(fps),
+                hevc_startup_keyframe_burst_frames(width, height, fps),
+                hevc_startup_keyframe_interval_frames(fps)
+            ));
+        }
+
+        #[test]
+        fn videotoolbox_hevc_2k144_defaults_disable_startup_keyframe_burst() {
+            let fps = 144;
+            let width = 2_560;
+            let height = 1_440;
+
+            assert_eq!(hevc_startup_keyframe_burst_frames(width, height, fps), 0);
+            assert_eq!(hevc_startup_keyframe_interval_frames(fps), 7);
+            assert!(h264_should_force_keyframe(
+                0,
+                fps,
+                false,
+                hevc_startup_keyframe_burst_frames(width, height, fps),
+                hevc_startup_keyframe_interval_frames(fps)
+            ));
+            assert!(!h264_should_force_keyframe(
+                7,
+                fps,
+                false,
+                hevc_startup_keyframe_burst_frames(width, height, fps),
+                hevc_startup_keyframe_interval_frames(fps)
+            ));
+            assert!(h264_should_force_keyframe(
+                144,
+                fps,
+                false,
+                hevc_startup_keyframe_burst_frames(width, height, fps),
                 hevc_startup_keyframe_interval_frames(fps)
             ));
         }
