@@ -3202,10 +3202,15 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
 }
 
 fn macos_e2e_encoder_type(config: &TestConfigData) -> &str {
-    config
+    match config
         .encoder_type
         .as_deref()
         .unwrap_or("videotoolbox_hevc")
+    {
+        "hevc" | "h265" | "h.265" => "videotoolbox_hevc",
+        "h264" | "h.264" => "videotoolbox_h264",
+        encoder_type => encoder_type,
+    }
 }
 
 fn capture_supported_on_current_platform(capture_type: &str) -> bool {
@@ -3295,7 +3300,9 @@ fn macos_videotoolbox_decoder_available_for_encoder_with(
     hevc_decoder_available: bool,
 ) -> bool {
     match encoder_type {
-        Some("videotoolbox_hevc") | Some("hevc") => hevc_decoder_available,
+        Some("videotoolbox_hevc") | Some("hevc") | Some("h265") | Some("h.265") => {
+            hevc_decoder_available
+        }
         _ => h264_decoder_available,
     }
 }
@@ -4529,6 +4536,16 @@ mod tests {
             false,
             true
         ));
+        assert!(macos_videotoolbox_decoder_available_for_encoder_with(
+            Some("h265"),
+            false,
+            true
+        ));
+        assert!(macos_videotoolbox_decoder_available_for_encoder_with(
+            Some("h.265"),
+            false,
+            true
+        ));
     }
 
     #[test]
@@ -4544,6 +4561,29 @@ mod tests {
             }),
             "videotoolbox_h264"
         );
+    }
+
+    #[test]
+    fn macos_e2e_codec_aliases_map_to_videotoolbox_encoders() {
+        for alias in ["hevc", "h265", "h.265"] {
+            assert_eq!(
+                macos_e2e_encoder_type(&TestConfigData {
+                    encoder_type: Some(alias.to_string()),
+                    ..Default::default()
+                }),
+                "videotoolbox_hevc"
+            );
+        }
+
+        for alias in ["h264", "h.264"] {
+            assert_eq!(
+                macos_e2e_encoder_type(&TestConfigData {
+                    encoder_type: Some(alias.to_string()),
+                    ..Default::default()
+                }),
+                "videotoolbox_h264"
+            );
+        }
     }
 
     #[test]
