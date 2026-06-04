@@ -4116,6 +4116,14 @@ async fn send_quic_media_loop(
             requested_codec,
         );
         if encoder_config != Some(expected_encoder_config) {
+            let peer_media_capabilities = app_state
+                .peer_media_capabilities
+                .lock()
+                .await
+                .get(&session_id)
+                .unwrap_or_default();
+            let allow_h264_fallback =
+                lan_sender_allows_h264_encoder_fallback(requested_codec, &peer_media_capabilities);
             let encoder_create_started = Instant::now();
             match create_lan_encoder(
                 requested_codec,
@@ -4123,6 +4131,7 @@ async fn send_quic_media_loop(
                 frame.height,
                 profile.fps,
                 profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
+                allow_h264_fallback,
             )
             .context("failed to create LAN media encoder")
             {
@@ -4593,6 +4602,7 @@ fn create_lan_encoder(
     height: usize,
     fps: u32,
     bitrate: u32,
+    allow_h264_fallback: bool,
 ) -> Result<LanSenderEncoder> {
     match requested_codec {
         LanAccessUnitCodec::Hevc => match create_lan_hevc_encoder(width, height, fps, bitrate) {
@@ -4602,6 +4612,11 @@ fn create_lan_encoder(
                 encoder,
             }),
             Err(hevc_error) => {
+                if !allow_h264_fallback {
+                    anyhow::bail!(
+                        "HEVC unavailable ({hevc_error}); H.264 fallback blocked because the peer does not advertise H.264 receiver capability"
+                    );
+                }
                 let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate)
                     .with_context(|| {
                         format!("HEVC unavailable ({hevc_error}); H.264 fallback also failed")
@@ -4622,6 +4637,20 @@ fn create_lan_encoder(
             })
         }
     }
+}
+
+fn lan_sender_allows_h264_encoder_fallback(
+    requested_codec: LanAccessUnitCodec,
+    peer_media_capabilities: &[String],
+) -> bool {
+    requested_codec == LanAccessUnitCodec::Hevc
+        && peer_can_receive_codec(peer_media_capabilities, LanAccessUnitCodec::H264)
+}
+
+fn peer_can_receive_codec(peer_media_capabilities: &[String], codec: LanAccessUnitCodec) -> bool {
+    let mut profile = default_media_profile();
+    profile.codec = codec.name().to_string();
+    missing_profile_receiver_media_capabilities(&profile, peer_media_capabilities).is_empty()
 }
 
 #[cfg(windows)]
@@ -12319,6 +12348,26 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("hevc decoder"));
         assert!(message.contains("decode.videotoolbox_hevc"));
+    }
+
+    #[test]
+    fn hevc_sender_h264_fallback_requires_peer_h264_receiver_capability() {
+        assert!(!lan_sender_allows_h264_encoder_fallback(
+            LanAccessUnitCodec::Hevc,
+            &["decode.videotoolbox_hevc".to_string()],
+        ));
+        assert!(lan_sender_allows_h264_encoder_fallback(
+            LanAccessUnitCodec::Hevc,
+            &["decode.videotoolbox_h264".to_string()],
+        ));
+        assert!(lan_sender_allows_h264_encoder_fallback(
+            LanAccessUnitCodec::Hevc,
+            &["decode.nvdec".to_string()],
+        ));
+        assert!(!lan_sender_allows_h264_encoder_fallback(
+            LanAccessUnitCodec::H264,
+            &["decode.videotoolbox_h264".to_string()],
+        ));
     }
 
     #[test]
