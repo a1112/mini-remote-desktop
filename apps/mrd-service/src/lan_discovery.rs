@@ -190,9 +190,10 @@ const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
 const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
 const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
-const LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT: &str = "compressed_native_high_test_pattern";
-const LAN_MEDIA_PROBE_DYNAMIC_FORMAT: &str = "compressed_h264_test_pattern";
-const LAN_MEDIA_PROBE_FORMAT_CODE: u32 = 2;
+const LAN_MEDIA_PROBE_H264_FORMAT: &str = "compressed_h264_test_pattern";
+const LAN_MEDIA_PROBE_HEVC_FORMAT: &str = "compressed_hevc_test_pattern";
+const LAN_MEDIA_PROBE_H264_FORMAT_CODE: u32 = 2;
+const LAN_MEDIA_PROBE_HEVC_FORMAT_CODE: u32 = 3;
 const LAN_MEDIA_ENVELOPE_MAGIC: &[u8; 8] = b"MRDMV2F1";
 const LAN_MEDIA_ENVELOPE_HEADER_BYTES: usize = 48;
 const LAN_MEDIA_PAYLOAD_ACCESS_UNIT: u8 = 1;
@@ -9127,13 +9128,14 @@ fn clamp_yuv_to_u8(value: i32) -> u8 {
 fn build_media_probe_frame(sequence: u64, timestamp_us: u64, profile: &MediaProfile) -> Vec<u8> {
     let media_payload = build_probe_compressed_pattern(sequence, profile);
     let payload_hash = fnv1a64(&media_payload);
+    let format_code = media_probe_format_code_for_profile(profile);
     let mut frame = Vec::with_capacity(LAN_MEDIA_PROBE_HEADER_BYTES + media_payload.len());
     frame.extend_from_slice(LAN_MEDIA_PROBE_MAGIC);
     frame.extend_from_slice(&sequence.to_le_bytes());
     frame.extend_from_slice(&timestamp_us.to_le_bytes());
     frame.extend_from_slice(&profile.width.to_le_bytes());
     frame.extend_from_slice(&profile.height.to_le_bytes());
-    frame.extend_from_slice(&LAN_MEDIA_PROBE_FORMAT_CODE.to_le_bytes());
+    frame.extend_from_slice(&format_code.to_le_bytes());
     frame.extend_from_slice(&(media_payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&payload_hash.to_le_bytes());
     frame.extend_from_slice(&profile.fps.to_le_bytes());
@@ -9170,9 +9172,7 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
             frame.len()
         );
     }
-    if format_code != LAN_MEDIA_PROBE_FORMAT_CODE {
-        anyhow::bail!("unsupported media probe format code: {format_code}");
-    }
+    let format = media_probe_format(format_code)?;
 
     let media_payload = &frame[LAN_MEDIA_PROBE_HEADER_BYTES..];
     let actual_hash = fnv1a64(media_payload);
@@ -9189,7 +9189,7 @@ fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
         target_fps,
         target_bitrate_mbps,
         payload_bytes: payload_len as u32,
-        format: media_probe_format(width, height, target_fps, target_bitrate_mbps).to_string(),
+        format: format.to_string(),
         payload_hash: format!("fnv1a64:{actual_hash:016x}"),
     })
 }
@@ -9638,20 +9638,20 @@ fn media_payload_bytes(profile: &MediaProfile) -> usize {
     ((profile.bitrate_mbps as usize * 1_000_000 / 8) / profile.fps.max(1) as usize).max(1)
 }
 
-fn media_probe_format(
-    width: u32,
-    height: u32,
-    target_fps: u32,
-    target_bitrate_mbps: u32,
-) -> &'static str {
-    if width == LAN_MEDIA_TARGET_WIDTH
-        && height == LAN_MEDIA_TARGET_HEIGHT
-        && target_fps == LAN_MEDIA_TARGET_FPS
-        && target_bitrate_mbps == LAN_MEDIA_TARGET_BITRATE_MBPS
-    {
-        LAN_MEDIA_PROBE_NATIVE_HIGH_FORMAT
+#[cfg(test)]
+fn media_probe_format_code_for_profile(profile: &MediaProfile) -> u32 {
+    if LanAccessUnitCodec::from_profile(profile) == LanAccessUnitCodec::Hevc {
+        LAN_MEDIA_PROBE_HEVC_FORMAT_CODE
     } else {
-        LAN_MEDIA_PROBE_DYNAMIC_FORMAT
+        LAN_MEDIA_PROBE_H264_FORMAT_CODE
+    }
+}
+
+fn media_probe_format(format_code: u32) -> Result<&'static str> {
+    match format_code {
+        LAN_MEDIA_PROBE_H264_FORMAT_CODE => Ok(LAN_MEDIA_PROBE_H264_FORMAT),
+        LAN_MEDIA_PROBE_HEVC_FORMAT_CODE => Ok(LAN_MEDIA_PROBE_HEVC_FORMAT),
+        _ => anyhow::bail!("unsupported media probe format code: {format_code}"),
     }
 }
 
@@ -12159,7 +12159,7 @@ mod tests {
     }
 
     #[test]
-    fn media_probe_frame_uses_native_high_compressed_profile() {
+    fn media_probe_frame_uses_hevc_compressed_profile() {
         let profile = default_media_profile();
         let frame = build_media_probe_frame(42, 123_456, &profile);
         let stats = decode_media_probe_frame(&frame).unwrap();
@@ -12169,7 +12169,7 @@ mod tests {
         assert_eq!(stats.height, 1600);
         assert_eq!(stats.target_fps, 165);
         assert_eq!(stats.target_bitrate_mbps, 120);
-        assert_eq!(stats.format, "compressed_native_high_test_pattern");
+        assert_eq!(stats.format, "compressed_hevc_test_pattern");
         assert!(stats.bytes_received < (2560_u64 * 1600 * 4));
         assert!(stats.payload_hash.starts_with("fnv1a64:"));
     }
@@ -13960,6 +13960,27 @@ mod tests {
         assert_eq!(stats.target_bitrate_mbps, 20);
         assert_eq!(stats.payload_bytes, media_payload_bytes(&profile) as u32);
         assert_eq!(stats.format, "compressed_h264_test_pattern");
+    }
+
+    #[test]
+    fn dynamic_hevc_media_probe_frame_preserves_codec() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let frame = build_media_probe_frame(7, 99_000, &profile);
+        let stats = decode_media_probe_frame(&frame).unwrap();
+
+        assert_eq!(stats.width, 1920);
+        assert_eq!(stats.height, 1080);
+        assert_eq!(stats.target_fps, 60);
+        assert_eq!(stats.target_bitrate_mbps, 20);
+        assert_eq!(stats.payload_bytes, media_payload_bytes(&profile) as u32);
+        assert_eq!(stats.format, "compressed_hevc_test_pattern");
     }
 
     #[test]
