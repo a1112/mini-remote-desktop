@@ -837,18 +837,21 @@ export function evaluateProfileProbe(
     height: probe.media_probe_height ?? 0,
     fps: probe.media_probe_target_fps ?? 0,
     bitrate_mbps: probe.media_probe_target_bitrate_mbps ?? 0,
+    codec: normalizeProbeCodec(probe.media_probe_format),
   };
+  const expectedCodec = normalizeProfileCodec(profile.codec);
   const matches =
     actual.width === profile.width &&
     actual.height === profile.height &&
     actual.fps === profile.fps &&
-    actual.bitrate_mbps === profile.bitrate_mbps;
+    actual.bitrate_mbps === profile.bitrate_mbps &&
+    (actual.codec === undefined || actual.codec === expectedCodec);
 
   if (!matches) {
     return {
       profile_id: profile.id,
       status: "failed",
-      error: `Runtime media profile mismatch: expected ${formatProfile(profile)}, got ${actual.width}x${actual.height} @ ${actual.fps} FPS / ${actual.bitrate_mbps} Mbps`,
+      error: `Runtime media profile mismatch: expected ${formatProfile(profile)}, got ${formatActualProfile(actual)}`,
     };
   }
 
@@ -888,7 +891,40 @@ function isProfileCapabilityUsable(item: CapabilityItem): boolean {
 }
 
 function formatProfile(profile: CapabilityProfile): string {
-  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+  return `${profile.width}x${profile.height} @ ${
+    profile.fps
+  } FPS / ${profile.bitrate_mbps} Mbps / ${normalizeProfileCodec(profile.codec)}`;
+}
+
+function formatActualProfile(profile: {
+  width: number;
+  height: number;
+  fps: number;
+  bitrate_mbps: number;
+  codec?: CapabilityProfile["codec"];
+}): string {
+  const codec = profile.codec ? ` / ${profile.codec}` : "";
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${
+    profile.bitrate_mbps
+  } Mbps${codec}`;
+}
+
+function normalizeProfileCodec(codec: string): CapabilityProfile["codec"] {
+  const normalized = codec.toLowerCase();
+  if (normalized === "hevc" || normalized === "h265") return "hevc";
+  if (normalized === "av1") return "av1";
+  return "h264";
+}
+
+function normalizeProbeCodec(
+  format: string | null | undefined
+): CapabilityProfile["codec"] | undefined {
+  const normalized = format?.toLowerCase() ?? "";
+  if (!normalized) return undefined;
+  if (normalized.includes("hevc") || normalized.includes("h265")) return "hevc";
+  if (normalized.includes("av1")) return "av1";
+  if (normalized.includes("h264")) return "h264";
+  return undefined;
 }
 
 function requestedCapabilityIds(request: CapabilityCombinationRequest): string[] {

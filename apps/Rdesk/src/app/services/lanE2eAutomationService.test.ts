@@ -292,7 +292,7 @@ function createCommands(
         current_fps: 165,
         bitrate_mbps: 80,
         media_probe_valid: true,
-        media_probe_format: "compressed_h264_test_pattern",
+        media_probe_format: "compressed_hevc_test_pattern",
         media_probe_width: 2560,
         media_probe_height: 1600,
         media_probe_target_fps: 165,
@@ -944,7 +944,10 @@ describe("runLanE2EAutomation", () => {
               current_fps: activeProfile.fps,
               bitrate_mbps: activeProfile.bitrate_mbps,
               media_probe_valid: true,
-              media_probe_format: "compressed_h264_test_pattern",
+              media_probe_format:
+                activeProfile.codec === "hevc"
+                  ? "compressed_hevc_test_pattern"
+                  : "compressed_h264_test_pattern",
               media_probe_width: activeProfile.width,
               media_probe_height: activeProfile.height,
               media_probe_target_fps: activeProfile.fps,
@@ -1428,6 +1431,55 @@ describe("runLanE2EAutomation", () => {
     expect(result.failureReason).toBe("media_profile_mismatch");
     expect(result.errorMessage).toContain("Runtime media profile mismatch");
     expect(result.errorMessage).toContain("2560x1600 @ 165 FPS / 80 Mbps");
+  });
+
+  it("fails when the QUIC media probe codec does not match the requested profile", async () => {
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcProbeSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            frames_received: 4,
+            frames_decoded: 3,
+            frames_dropped: 0,
+            current_fps: 165,
+            bitrate_mbps: 80,
+            media_probe_valid: true,
+            media_probe_format: "compressed_h264_test_pattern",
+            media_probe_width: 2560,
+            media_probe_height: 1600,
+            media_probe_target_fps: 165,
+            media_probe_target_bitrate_mbps: 80,
+            media_probe_payload_bytes: 55555,
+            last_media_sequence: 3,
+            last_media_timestamp_us: 123456,
+            last_media_payload_hash: "fnv1a64:abc123",
+            last_error: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: DEFAULT_REQUESTED_PROFILE,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.errorMessage).toContain("Runtime media profile mismatch");
+    expect(result.errorMessage).toContain(
+      "2560x1600 @ 165 FPS / 80 Mbps / hevc"
+    );
+    expect(result.errorMessage).toContain(
+      "2560x1600 @ 165 FPS / 80 Mbps / h264"
+    );
   });
 
   it("keeps sampling transient profile mismatches until the profile stabilizes", async () => {
