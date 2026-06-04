@@ -732,7 +732,7 @@ enum LanAccessUnitCodec {
 
 impl LanAccessUnitCodec {
     fn from_profile(profile: &MediaProfile) -> Self {
-        if profile.codec.eq_ignore_ascii_case("hevc") {
+        if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
             Self::Hevc
         } else {
             Self::H264
@@ -773,6 +773,20 @@ impl LanAccessUnitCodec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
         }
+    }
+}
+
+fn normalize_lan_codec_name(codec: &str) -> Option<&'static str> {
+    let codec = codec.trim();
+    if codec.eq_ignore_ascii_case("hevc")
+        || codec.eq_ignore_ascii_case("h265")
+        || codec.eq_ignore_ascii_case("h.265")
+    {
+        Some("hevc")
+    } else if codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("h.264") {
+        Some("h264")
+    } else {
+        None
     }
 }
 
@@ -9432,17 +9446,20 @@ fn validate_media_profile(profile: &MediaProfile) -> Result<()> {
 }
 
 fn normalize_lan_media_profile(profile: &mut MediaProfile) {
-    profile.codec = profile.codec.trim().to_ascii_lowercase();
-    if profile.codec != "h264" && profile.codec != "hevc" {
-        profile.codec = "h264".to_string();
-        profile.codec_profile = None;
-        profile.bit_depth = None;
-        profile.chroma_subsampling = None;
-        profile.pixel_format = None;
-        profile.hdr_enabled = None;
-        return;
+    match normalize_lan_codec_name(&profile.codec) {
+        Some(codec) => {
+            profile.codec = codec.to_string();
+            apply_lan_media_profile_defaults(profile);
+        }
+        None => {
+            profile.codec = "h264".to_string();
+            profile.codec_profile = None;
+            profile.bit_depth = None;
+            profile.chroma_subsampling = None;
+            profile.pixel_format = None;
+            profile.hdr_enabled = None;
+        }
     }
-    apply_lan_media_profile_defaults(profile);
 }
 
 fn lan_runtime_media_profile(
@@ -9464,7 +9481,7 @@ fn lan_runtime_media_profile(
 }
 
 fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
-    if profile.codec.eq_ignore_ascii_case("hevc") {
+    if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
         profile.codec = "hevc".to_string();
         if profile.codec_profile.is_none() {
             profile.codec_profile = Some("main".to_string());
@@ -9656,10 +9673,12 @@ fn media_probe_format(format_code: u32) -> Result<&'static str> {
 }
 
 fn decoded_video_probe_format(codec: &str) -> String {
-    match codec.trim().to_ascii_lowercase().as_str() {
-        "hevc" | "h265" => "hevc_desktop_frame".to_string(),
-        "av1" => "av1_desktop_frame".to_string(),
-        _ => "h264_desktop_frame".to_string(),
+    if normalize_lan_codec_name(codec) == Some("hevc") {
+        "hevc_desktop_frame".to_string()
+    } else if codec.trim().eq_ignore_ascii_case("av1") {
+        "av1_desktop_frame".to_string()
+    } else {
+        "h264_desktop_frame".to_string()
     }
 }
 
@@ -12222,6 +12241,33 @@ mod tests {
     }
 
     #[test]
+    fn media_profile_negotiation_normalizes_h265_aliases_to_hevc() {
+        for codec in ["h265", "H.265", " HEVC "] {
+            let negotiation = negotiate_media_profile(Some(MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: 20,
+                codec: codec.to_string(),
+                ..MediaProfile::default()
+            }))
+            .unwrap();
+
+            assert_eq!(negotiation.selected.codec, "hevc");
+            assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
+            assert_eq!(
+                negotiation.selected.chroma_subsampling.as_deref(),
+                Some("4:2:0")
+            );
+            assert_eq!(negotiation.selected.pixel_format.as_deref(), Some("nv12"));
+            assert_eq!(
+                LanAccessUnitCodec::from_profile(&negotiation.selected),
+                LanAccessUnitCodec::Hevc
+            );
+        }
+    }
+
+    #[test]
     fn media_profile_negotiation_allows_high_refresh_canary_profiles() {
         let negotiation = negotiate_media_profile(Some(MediaProfile {
             width: 1920,
@@ -13981,6 +14027,33 @@ mod tests {
         assert_eq!(stats.target_bitrate_mbps, 20);
         assert_eq!(stats.payload_bytes, media_payload_bytes(&profile) as u32);
         assert_eq!(stats.format, "compressed_hevc_test_pattern");
+    }
+
+    #[test]
+    fn dynamic_h265_alias_media_probe_frame_uses_hevc_format() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "H.265".to_string(),
+            ..MediaProfile::default()
+        };
+        let frame = build_media_probe_frame(7, 99_000, &profile);
+        let stats = decode_media_probe_frame(&frame).unwrap();
+
+        assert_eq!(
+            LanAccessUnitCodec::from_profile(&profile),
+            LanAccessUnitCodec::Hevc
+        );
+        assert_eq!(stats.format, "compressed_hevc_test_pattern");
+    }
+
+    #[test]
+    fn decoded_video_probe_format_accepts_h265_aliases() {
+        assert_eq!(decoded_video_probe_format("h265"), "hevc_desktop_frame");
+        assert_eq!(decoded_video_probe_format("H.265"), "hevc_desktop_frame");
+        assert_eq!(decoded_video_probe_format("h.264"), "h264_desktop_frame");
     }
 
     #[test]
