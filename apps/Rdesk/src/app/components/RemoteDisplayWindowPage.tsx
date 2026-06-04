@@ -1083,11 +1083,11 @@ export function buildWebRtcDiagnosticsStageRows(
 }
 
 function codecLabel(codec?: string | null, profile?: string | null) {
-  const normalized = codec?.toLowerCase();
+  const normalized = codec?.trim().toLowerCase();
   const family =
-    normalized === "hevc" || normalized === "h265"
+    normalized === "hevc" || normalized === "h265" || normalized === "h.265"
       ? "H.265"
-      : normalized === "h264"
+      : normalized === "h264" || normalized === "h.264"
         ? "H.264"
         : normalized === "av1"
           ? "AV1"

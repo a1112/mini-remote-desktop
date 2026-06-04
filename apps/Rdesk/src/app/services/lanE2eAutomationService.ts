@@ -1753,7 +1753,7 @@ function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {
 }
 
 function normalizeMediaCodec(codec: string): CapabilityProfile["codec"] {
-  const normalized = codec.toLowerCase();
+  const normalized = codec.trim().toLowerCase().replace(/\./g, "");
   if (normalized === "hevc" || normalized === "h265") return "hevc";
   if (normalized === "av1") return "av1";
   return "h264";

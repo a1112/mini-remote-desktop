@@ -910,7 +910,7 @@ function formatActualProfile(profile: {
 }
 
 function normalizeProfileCodec(codec: string): CapabilityProfile["codec"] {
-  const normalized = codec.toLowerCase();
+  const normalized = normalizeCodecKey(codec);
   if (normalized === "hevc" || normalized === "h265") return "hevc";
   if (normalized === "av1") return "av1";
   return "h264";
@@ -919,12 +919,16 @@ function normalizeProfileCodec(codec: string): CapabilityProfile["codec"] {
 function normalizeProbeCodec(
   format: string | null | undefined
 ): CapabilityProfile["codec"] | undefined {
-  const normalized = format?.toLowerCase() ?? "";
+  const normalized = normalizeCodecKey(format ?? "");
   if (!normalized) return undefined;
   if (normalized.includes("hevc") || normalized.includes("h265")) return "hevc";
   if (normalized.includes("av1")) return "av1";
   if (normalized.includes("h264")) return "h264";
   return undefined;
+}
+
+function normalizeCodecKey(value: string): string {
+  return value.trim().toLowerCase().replace(/\./g, "");
 }
 
 function requestedCapabilityIds(request: CapabilityCombinationRequest): string[] {

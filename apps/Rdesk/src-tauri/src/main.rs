@@ -860,8 +860,8 @@ fn browser_webrtc_preview_codec_from_label(codec: Option<&str>) -> Result<VideoC
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        None | Some("h264" | "avc" | "avc1") => Ok(VideoCodec::H264),
-        Some("hevc" | "h265" | "hev1" | "hvc1") => Ok(VideoCodec::Hevc),
+        None | Some("h264" | "h.264" | "avc" | "avc1") => Ok(VideoCodec::H264),
+        Some("hevc" | "h265" | "h.265" | "hev1" | "hvc1") => Ok(VideoCodec::Hevc),
         Some("av1") => Ok(VideoCodec::Av1),
         Some("vvc" | "h266" | "h.266") => {
             Err("browser WebRTC preview does not support H.266/VVC in current browsers".to_string())
@@ -882,6 +882,10 @@ mod browser_webrtc_preview_tests {
         );
         assert_eq!(
             browser_webrtc_preview_codec_from_label(Some("h265")).unwrap(),
+            VideoCodec::Hevc
+        );
+        assert_eq!(
+            browser_webrtc_preview_codec_from_label(Some("h.265")).unwrap(),
             VideoCodec::Hevc
         );
         assert_eq!(

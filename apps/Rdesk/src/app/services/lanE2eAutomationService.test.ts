@@ -474,6 +474,33 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("treats dotted H.265 requested profiles as HEVC during runtime validation", async () => {
+    const commands = createCommands();
+    const requestedProfile = {
+      ...DEFAULT_REQUESTED_PROFILE,
+      codec: "h.265",
+    };
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      requestedProfile
+    );
+  });
+
   it("uses the captured display device name when placing the receiver window", async () => {
     const dxgiDisplaySource = {
       id: "windows:display-shared:2",

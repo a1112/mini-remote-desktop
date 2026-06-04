@@ -944,6 +944,40 @@ describe("capability profiles", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("expected 2560x1440 @ 144 FPS / 64 Mbps");
   });
+
+  it("normalizes dotted H.265 codec aliases when validating runtime probes", () => {
+    const probe: ProbeSnapshot = {
+      session_id: "session-1",
+      frames_received: 30,
+      frames_decoded: 30,
+      frames_dropped: 0,
+      current_fps: 165,
+      bitrate_mbps: 80,
+      media_probe_valid: true,
+      media_probe_format: "compressed_h.265_test_pattern",
+      media_probe_width: 2560,
+      media_probe_height: 1600,
+      media_probe_target_fps: 165,
+      media_probe_target_bitrate_mbps: 80,
+      media_probe_payload_bytes: 1000,
+      last_error: null,
+    };
+
+    const result = evaluateProfileProbe(
+      {
+        id: "runtime.hevc.alias",
+        width: 2560,
+        height: 1600,
+        fps: 165,
+        bitrate_mbps: 80,
+        codec: "h.265",
+        required_capabilities: [],
+      },
+      probe
+    );
+
+    expect(result.status).toBe("passed");
+  });
 });
 
 function withAvailableCapabilities(
