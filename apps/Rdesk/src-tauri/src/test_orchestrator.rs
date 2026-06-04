@@ -587,11 +587,7 @@ impl TestOrchestrator {
             "e2e.local" => Ok(TestChain::NvencNvdec),
             "e2e.macos_local" => Ok(TestChain::Custom {
                 capture: CaptureType::Macos,
-                encoder: match config
-                    .encoder_type
-                    .as_deref()
-                    .unwrap_or("videotoolbox_hevc")
-                {
+                encoder: match macos_e2e_encoder_type(config) {
                     "videotoolbox_hevc" | "hevc" => EncoderType::VideoToolboxHevc,
                     "videotoolbox_h264" | "videotoolbox" | "h264" => EncoderType::VideoToolboxH264,
                     "openh264" | "software_h264" | "h264_software" | "software-h264"
@@ -3205,6 +3201,13 @@ fn scenario_supported_on_current_platform(scenario_id: &str) -> bool {
     }
 }
 
+fn macos_e2e_encoder_type(config: &TestConfigData) -> &str {
+    config
+        .encoder_type
+        .as_deref()
+        .unwrap_or("videotoolbox_hevc")
+}
+
 fn capture_supported_on_current_platform(capture_type: &str) -> bool {
     matches!(capture_type, "synthetic")
         || matches!(capture_type, "dxgi" | "winrt") && cfg!(windows)
@@ -3380,8 +3383,17 @@ fn validate_scenario_for_current_platform(
 
     if !matches!(scenario_id, "custom" | "matrix") {
         if scenario_id == "e2e.macos_local" {
+            let encoder_type = macos_e2e_encoder_type(config);
+            if !encoder_supported_on_current_platform(encoder_type) {
+                anyhow::bail!(
+                    "Encoder type {} is not supported for {} on {}",
+                    encoder_type,
+                    scenario_id,
+                    os_type
+                );
+            }
             let decoder_type = config.decoder_type.as_deref().unwrap_or("videotoolbox");
-            if !decoder_supported_for_config(decoder_type, config.encoder_type.as_deref()) {
+            if !decoder_supported_for_config(decoder_type, Some(encoder_type)) {
                 anyhow::bail!(
                     "Decoder type {} is not supported for {} on {}",
                     decoder_type,
@@ -4517,6 +4529,21 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn macos_e2e_default_encoder_matches_dispatch_default() {
+        assert_eq!(
+            macos_e2e_encoder_type(&TestConfigData::default()),
+            "videotoolbox_hevc"
+        );
+        assert_eq!(
+            macos_e2e_encoder_type(&TestConfigData {
+                encoder_type: Some("videotoolbox_h264".to_string()),
+                ..Default::default()
+            }),
+            "videotoolbox_h264"
+        );
     }
 
     #[test]
