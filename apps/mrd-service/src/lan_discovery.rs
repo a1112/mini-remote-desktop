@@ -3510,8 +3510,6 @@ fn missing_profile_receiver_media_capabilities(
                     "nvdec_hevc",
                     "nvdec_hevc_d3d11_shared",
                     "decode.videotoolbox_hevc",
-                    "decode.videotoolbox",
-                    "videotoolbox",
                     "decode.linux_hevc",
                     "linux_hevc",
                     "decode.ffmpeg_hevc",
@@ -12297,6 +12295,30 @@ mod tests {
         .expect_err("VideoToolbox HEVC encoder capability is not a decoder capability");
 
         assert!(error.to_string().contains("hevc decoder"));
+    }
+
+    #[test]
+    fn selected_hevc_profile_rejects_generic_videotoolbox_decoder_alias() {
+        let error = ensure_peer_can_receive_selected_media(
+            "mac-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            },
+            &[
+                "decode.videotoolbox".to_string(),
+                "videotoolbox".to_string(),
+            ],
+        )
+        .expect_err("HEVC stream should require the HEVC-specific VideoToolbox decoder cap");
+
+        let message = error.to_string();
+        assert!(message.contains("hevc decoder"));
+        assert!(message.contains("decode.videotoolbox_hevc"));
     }
 
     #[test]
