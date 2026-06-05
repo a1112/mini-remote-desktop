@@ -52,6 +52,7 @@ use tokio::time::{interval, timeout, Instant};
 mod dynamic_window_fps;
 mod lan_control_input;
 mod media_access_unit;
+mod media_capture_config;
 mod media_envelope;
 mod media_keyframe_request;
 mod media_ordering;
@@ -73,6 +74,12 @@ use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
 use media_access_unit::{describe_lan_access_unit, h264_access_unit_is_keyframe};
+#[cfg(test)]
+use media_capture_config::window_capture_source_error;
+use media_capture_config::{
+    dynamic_window_fps_config_key, format_capture_source_failure, lan_capture_config_key,
+    lan_capture_config_matches, DynamicWindowFpsConfigKey, LanCaptureConfigKey,
+};
 #[cfg(test)]
 use media_envelope::LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT;
 use media_envelope::{
@@ -2984,81 +2991,6 @@ async fn spawn_quic_media_sender(
     registry.lock().await.register(session_id, abort_handle);
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct LanCaptureConfigKey {
-    source_id: String,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DynamicWindowFpsConfigKey {
-    source_id: String,
-    width: u32,
-    height: u32,
-    fps: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CaptureSourceFailure {
-    code: &'static str,
-    message: String,
-}
-
-fn window_capture_source_error(source_id: &str, detail: impl AsRef<str>) -> CaptureSourceFailure {
-    CaptureSourceFailure {
-        code: "WINDOW_CAPTURE_SOURCE_NOT_FOUND",
-        message: format!(
-            "Window capture source '{}' is unavailable: {}",
-            source_id,
-            detail.as_ref()
-        ),
-    }
-}
-
-fn format_capture_source_failure(source_id: &str, message: String) -> String {
-    if is_windows_window_source_id(source_id) {
-        let failure = window_capture_source_error(source_id, &message);
-        format!("{}: {}", failure.code, failure.message)
-    } else {
-        message
-    }
-}
-
-fn lan_capture_config_key(source_id: &str, profile: &MediaProfile) -> LanCaptureConfigKey {
-    LanCaptureConfigKey {
-        source_id: source_id.to_string(),
-        width: profile.width,
-        height: profile.height,
-    }
-}
-
-fn dynamic_window_fps_config_key(
-    source_id: &str,
-    profile: &MediaProfile,
-) -> DynamicWindowFpsConfigKey {
-    DynamicWindowFpsConfigKey {
-        source_id: source_id.to_string(),
-        width: profile.width,
-        height: profile.height,
-        fps: profile.fps,
-    }
-}
-
-fn lan_capture_config_matches(
-    active: Option<&LanCaptureConfigKey>,
-    source_id: &str,
-    profile: &MediaProfile,
-) -> bool {
-    active
-        .map(|config| {
-            config.source_id == source_id
-                && config.width == profile.width
-                && config.height == profile.height
-        })
-        .unwrap_or(false)
-}
-
 async fn send_quic_media_loop(
     app_state: Arc<AppState>,
     endpoint: QuinnDatagramEndpoint,
@@ -3213,6 +3145,7 @@ async fn send_quic_media_loop(
                             format_capture_source_failure(
                                 &source_id,
                                 format!("failed to initialize LAN capture sender: {error:#}"),
+                                is_windows_window_source_id,
                             ),
                             selected_source_is_window,
                         )
@@ -3240,6 +3173,7 @@ async fn send_quic_media_loop(
                         format_capture_source_failure(
                             &source_id,
                             format!("failed to create LAN capture source: {error:#}"),
+                            is_windows_window_source_id,
                         ),
                         selected_source_is_window,
                     )
@@ -3293,7 +3227,11 @@ async fn send_quic_media_loop(
                     &session_id,
                     &error_source_id,
                     &mut consecutive_frame_errors,
-                    format_capture_source_failure(&error_source_id, format!("{error:#}")),
+                    format_capture_source_failure(
+                        &error_source_id,
+                        format!("{error:#}"),
+                        is_windows_window_source_id,
+                    ),
                     is_windows_window_source_id(&error_source_id),
                 )
                 .await?;
