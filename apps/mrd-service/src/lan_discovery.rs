@@ -115,9 +115,11 @@ use media_probe::{
 #[cfg(test)]
 use media_profile::format_media_profile;
 use media_profile::{
-    ensure_peer_can_receive_selected_media, ensure_peer_supports_requested_media,
-    lan_color_mode_for_profile, lan_profile_requests_hevc_main10,
-    missing_profile_receiver_media_capabilities,
+    apply_lan_media_profile_defaults, clamp_media_profile_to_lan_capability, default_media_profile,
+    default_media_profile_negotiation, ensure_peer_can_receive_selected_media,
+    ensure_peer_supports_requested_media, lan_color_mode_for_profile,
+    lan_profile_requests_hevc_main10, missing_profile_receiver_media_capabilities,
+    normalize_lan_codec_name, normalize_lan_media_profile, validate_media_profile,
 };
 #[cfg(all(test, target_os = "macos"))]
 use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates_from_preference;
@@ -801,20 +803,6 @@ impl LanAccessUnitCodec {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
         }
-    }
-}
-
-fn normalize_lan_codec_name(codec: &str) -> Option<&'static str> {
-    let codec = codec.trim();
-    if codec.eq_ignore_ascii_case("hevc")
-        || codec.eq_ignore_ascii_case("h265")
-        || codec.eq_ignore_ascii_case("h.265")
-    {
-        Some("hevc")
-    } else if codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("h.264") {
-        Some("h264")
-    } else {
-        None
     }
 }
 
@@ -7477,89 +7465,10 @@ async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionI
         .unwrap_or_else(default_media_profile)
 }
 
-fn default_media_profile() -> MediaProfile {
-    let mut profile = MediaProfile {
-        width: LAN_MEDIA_TARGET_WIDTH,
-        height: LAN_MEDIA_TARGET_HEIGHT,
-        fps: LAN_MEDIA_TARGET_FPS,
-        bitrate_mbps: LAN_MEDIA_TARGET_BITRATE_MBPS,
-        codec: "hevc".to_string(),
-        ..MediaProfile::default()
-    };
-    apply_lan_media_profile_defaults(&mut profile);
-    profile
-}
-
-fn default_media_profile_negotiation() -> MediaProfileNegotiation {
-    let profile = default_media_profile();
-    MediaProfileNegotiation {
-        requested: profile.clone(),
-        selected: profile,
-        status: "accepted".to_string(),
-        reason: None,
-        selected_source_id: None,
-        selected_width: None,
-        selected_height: None,
-        downgrade_reason: None,
-    }
-}
-
 fn negotiate_media_profile(
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
-    let requested = requested_profile.unwrap_or_else(default_media_profile);
-    validate_media_profile(&requested)?;
-
-    let mut selected = requested.clone();
-    selected.width = selected.width.min(LAN_MEDIA_TARGET_WIDTH);
-    selected.height = selected.height.min(LAN_MEDIA_TARGET_HEIGHT);
-    selected.fps = selected.fps.min(LAN_MEDIA_MAX_FPS);
-    selected.bitrate_mbps = selected.bitrate_mbps.min(LAN_MEDIA_TARGET_BITRATE_MBPS);
-    normalize_lan_media_profile(&mut selected);
-
-    let changed = selected != requested;
-    Ok(MediaProfileNegotiation {
-        requested,
-        selected: selected.clone(),
-        status: if changed { "downgraded" } else { "accepted" }.to_string(),
-        reason: if changed {
-            Some("clamped to LAN QUIC media capability".to_string())
-        } else {
-            None
-        },
-        selected_source_id: None,
-        selected_width: Some(selected.width),
-        selected_height: Some(selected.height),
-        downgrade_reason: if changed {
-            Some("clamped to LAN QUIC media capability".to_string())
-        } else {
-            None
-        },
-    })
-}
-
-fn validate_media_profile(profile: &MediaProfile) -> Result<()> {
-    if profile.width == 0 || profile.height == 0 || profile.fps == 0 || profile.bitrate_mbps == 0 {
-        anyhow::bail!("media profile width, height, fps and bitrate must be greater than zero");
-    }
-    Ok(())
-}
-
-fn normalize_lan_media_profile(profile: &mut MediaProfile) {
-    match normalize_lan_codec_name(&profile.codec) {
-        Some(codec) => {
-            profile.codec = codec.to_string();
-            apply_lan_media_profile_defaults(profile);
-        }
-        None => {
-            profile.codec = "h264".to_string();
-            profile.codec_profile = None;
-            profile.bit_depth = None;
-            profile.chroma_subsampling = None;
-            profile.pixel_format = None;
-            profile.hdr_enabled = None;
-        }
-    }
+    clamp_media_profile_to_lan_capability(requested_profile)
 }
 
 fn lan_runtime_media_profile(
@@ -7578,27 +7487,6 @@ fn lan_runtime_media_profile(
         apply_lan_media_profile_defaults(&mut profile);
     }
     profile
-}
-
-fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
-    if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
-        profile.codec = "hevc".to_string();
-        if profile.codec_profile.is_none() {
-            profile.codec_profile = Some("main".to_string());
-        }
-        if profile.bit_depth.is_none() {
-            profile.bit_depth = Some(8);
-        }
-        if profile.chroma_subsampling.is_none() {
-            profile.chroma_subsampling = Some("4:2:0".to_string());
-        }
-        if profile.pixel_format.is_none() {
-            profile.pixel_format = Some("nv12".to_string());
-        }
-        if profile.hdr_enabled.is_none() {
-            profile.hdr_enabled = Some(false);
-        }
-    }
 }
 
 fn now_us() -> u64 {
