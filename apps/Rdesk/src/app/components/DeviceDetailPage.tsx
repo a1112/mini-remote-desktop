@@ -844,7 +844,7 @@ function FilePane({
 
 function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   const { isDark } = useTheme();
-  const isOnline = device.status === "online";
+  const unavailableReason = remoteStartUnavailableReason(device);
 
   const [leftDeviceId, setLeftDeviceId] = useState(device.id);
   const [rightDeviceId, setRightDeviceId] = useState<string | null>(null);
@@ -872,12 +872,12 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     setShowAddMenu(false);
   };
 
-  if (!isOnline) {
+  if (unavailableReason) {
     return (
       <div className={`flex items-center justify-center h-full ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
         <div className="text-center">
           <WifiOff className={`w-12 h-12 mx-auto mb-3 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
-          <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 16 }}>设备离线，无法传输文件</div>
+          <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 16 }}>{unavailableReason}，无法传输文件</div>
         </div>
       </div>
     );

@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { Monitor } from "lucide-react";
 import { MemoryRouter, Route, Routes } from "react-router";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DeviceDetailPage } from "./DeviceDetailPage";
 import type { Device } from "./deviceData";
@@ -31,14 +31,17 @@ const device = (overrides: Partial<Device> = {}): Device => ({
   ...overrides,
 });
 
-const devices = [device()];
+const deviceDataMock = vi.hoisted(() => ({
+  devices: [] as Device[],
+}));
 
 vi.mock("./deviceData", () => ({
   useDevices: () => ({
-    devices,
+    devices: deviceDataMock.devices,
     loading: false,
   }),
-  useDeviceById: (id: string | undefined) => devices.find((item) => item.id === id),
+  useDeviceById: (id: string | undefined) =>
+    deviceDataMock.devices.find((item) => item.id === id),
 }));
 
 vi.mock("./ThemeContext", () => ({
@@ -66,6 +69,10 @@ vi.mock("../services/ipcSessionService", () => ({
   stopSession: vi.fn(),
 }));
 
+beforeEach(() => {
+  deviceDataMock.devices = [device()];
+});
+
 describe("DeviceDetailPage info tab", () => {
   it("renders real device metadata from the sidebar info route", () => {
     render(
@@ -82,5 +89,20 @@ describe("DeviceDetailPage info tab", () => {
     expect(screen.getAllByText("P2P 局域网 / 服务器").length).toBeGreaterThan(0);
     expect(screen.getByText("P2P 可用")).toBeInTheDocument();
     expect(screen.getByText("服务器可用")).toBeInTheDocument();
+  });
+
+  it("blocks file transfer for disabled devices even when the device record is online", () => {
+    deviceDataMock.devices = [device({ disabled: true, status: "online" })];
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    expect(screen.getByText("设备已禁用，无法传输文件")).toBeInTheDocument();
+    expect(screen.queryByText("选择设备以开始传输")).not.toBeInTheDocument();
   });
 });
