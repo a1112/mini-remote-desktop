@@ -401,6 +401,11 @@ fn forward_windows_surface_input(
 }
 
 #[cfg(windows)]
+fn release_windows_surface_input(hwnd: windows::Win32::Foundation::HWND) {
+    forward_windows_surface_input(hwnd, mrd_ipc::ControlInputEvent::ReleaseAll);
+}
+
+#[cfg(windows)]
 struct NativeRenderSurface {
     parent_hwnd: isize,
     hwnd: windows::Win32::Foundation::HWND,
@@ -578,6 +583,7 @@ impl Drop for NativeRenderSurface {
     fn drop(&mut self) {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+            release_windows_surface_input(self.hwnd);
             let ptr =
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) as *mut WindowsSurfaceInputContext;
             if !ptr.is_null() {
@@ -1419,6 +1425,14 @@ mod remote_display_surface_input_tests {
             input.event,
             mrd_ipc::ControlInputEvent::MouseMove { x: 42, y: 24 }
         );
+
+        drop(surface);
+
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping native surface should release active control input");
+        assert_eq!(release.session_id, "native-forward-session");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
     }
 
     #[tokio::test]
