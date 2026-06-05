@@ -50,6 +50,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
 mod discovery_config;
+mod discovery_identity;
 mod dynamic_window_fps;
 mod lan_control_input;
 mod media_access_unit;
@@ -67,6 +68,10 @@ mod media_timing;
 mod media_transport;
 mod service_identity;
 pub use discovery_config::LanDiscoveryConfig;
+use discovery_identity::{
+    default_app_id, is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID,
+    DISCOVERY_MAGIC,
+};
 use dynamic_window_fps::{
     is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
     window_dynamic_fps_input_for_capture_error, window_dynamic_fps_input_for_captured_frame,
@@ -197,8 +202,6 @@ const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKI
 #[cfg(windows)]
 const D3D11_RENDER_WAITABLE_OBJECT_ENV: &str = "MRD_D3D11_RENDER_WAITABLE_OBJECT";
 const PROTOCOL_VERSION: u32 = 1;
-const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
-const DISCOVERY_APP_ID: &str = "rdesk";
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
 const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
@@ -287,7 +290,6 @@ static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(windows, target_os = "macos"))]
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
-static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_QUEUE_CAPACITY: usize = 2;
@@ -7622,13 +7624,6 @@ fn normalize_transport_kind(value: &str) -> String {
     }
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7647,19 +7642,6 @@ async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
         .active_window_capture_count(&sessions)
         .try_into()
         .unwrap_or(u32::MAX)
-}
-
-fn new_instance_id() -> String {
-    let sequence = LAN_DISCOVERY_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("mrd-{}-{}-{}", std::process::id(), now_ms(), sequence)
-}
-
-fn default_app_id() -> String {
-    DISCOVERY_APP_ID.to_string()
-}
-
-fn is_valid_discovery_packet(magic: &str, app_id: &str) -> bool {
-    magic == DISCOVERY_MAGIC && app_id.eq_ignore_ascii_case(DISCOVERY_APP_ID)
 }
 
 #[cfg(test)]
