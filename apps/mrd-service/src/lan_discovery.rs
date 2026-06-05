@@ -1,4 +1,4 @@
-use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
+use crate::app_state::{AppState, DecodedVideoFrameStats};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 use anyhow::{Context, Result};
@@ -53,6 +53,7 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 
 mod lan_control_input;
 mod media_ordering;
+mod media_probe;
 mod media_profile;
 mod media_render_policy;
 mod media_sender_telemetry;
@@ -62,6 +63,11 @@ use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
 use media_ordering::LanMediaFrameOrderer;
+#[cfg(test)]
+use media_probe::{build_media_probe_frame, media_payload_bytes};
+use media_probe::{
+    decode_media_probe_frame, decoded_video_probe_format, fnv1a64, fnv1a64_media_metadata,
+};
 #[cfg(test)]
 use media_profile::format_media_profile;
 use media_profile::{
@@ -250,12 +256,6 @@ const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
-const LAN_MEDIA_PROBE_MAGIC: &[u8; 8] = b"MRDMPF01";
-const LAN_MEDIA_PROBE_HEADER_BYTES: usize = 56;
-const LAN_MEDIA_PROBE_H264_FORMAT: &str = "compressed_h264_test_pattern";
-const LAN_MEDIA_PROBE_HEVC_FORMAT: &str = "compressed_hevc_test_pattern";
-const LAN_MEDIA_PROBE_H264_FORMAT_CODE: u32 = 2;
-const LAN_MEDIA_PROBE_HEVC_FORMAT_CODE: u32 = 3;
 const LAN_MEDIA_ENVELOPE_MAGIC: &[u8; 8] = b"MRDMV2F1";
 const LAN_MEDIA_ENVELOPE_HEADER_BYTES: usize = 48;
 const LAN_MEDIA_PAYLOAD_ACCESS_UNIT: u8 = 1;
@@ -7907,76 +7907,6 @@ fn clamp_yuv_to_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-#[cfg(test)]
-fn build_media_probe_frame(sequence: u64, timestamp_us: u64, profile: &MediaProfile) -> Vec<u8> {
-    let media_payload = build_probe_compressed_pattern(sequence, profile);
-    let payload_hash = fnv1a64(&media_payload);
-    let format_code = media_probe_format_code_for_profile(profile);
-    let mut frame = Vec::with_capacity(LAN_MEDIA_PROBE_HEADER_BYTES + media_payload.len());
-    frame.extend_from_slice(LAN_MEDIA_PROBE_MAGIC);
-    frame.extend_from_slice(&sequence.to_le_bytes());
-    frame.extend_from_slice(&timestamp_us.to_le_bytes());
-    frame.extend_from_slice(&profile.width.to_le_bytes());
-    frame.extend_from_slice(&profile.height.to_le_bytes());
-    frame.extend_from_slice(&format_code.to_le_bytes());
-    frame.extend_from_slice(&(media_payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&payload_hash.to_le_bytes());
-    frame.extend_from_slice(&profile.fps.to_le_bytes());
-    frame.extend_from_slice(&profile.bitrate_mbps.to_le_bytes());
-    frame.extend_from_slice(&media_payload);
-    frame
-}
-
-fn decode_media_probe_frame(frame: &[u8]) -> Result<MediaProbeFrameStats> {
-    if frame.len() < LAN_MEDIA_PROBE_HEADER_BYTES {
-        anyhow::bail!("media probe frame is too small");
-    }
-    if &frame[..LAN_MEDIA_PROBE_MAGIC.len()] != LAN_MEDIA_PROBE_MAGIC {
-        anyhow::bail!("media probe frame has invalid magic");
-    }
-
-    let sequence = u64::from_le_bytes(frame[8..16].try_into().unwrap());
-    let timestamp_us = u64::from_le_bytes(frame[16..24].try_into().unwrap());
-    let width = u32::from_le_bytes(frame[24..28].try_into().unwrap());
-    let height = u32::from_le_bytes(frame[28..32].try_into().unwrap());
-    let format_code = u32::from_le_bytes(frame[32..36].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(frame[36..40].try_into().unwrap()) as usize;
-    let expected_hash = u64::from_le_bytes(frame[40..48].try_into().unwrap());
-    let target_fps = u32::from_le_bytes(frame[48..52].try_into().unwrap());
-    let target_bitrate_mbps = u32::from_le_bytes(frame[52..56].try_into().unwrap());
-
-    let Some(expected_len) = LAN_MEDIA_PROBE_HEADER_BYTES.checked_add(payload_len) else {
-        anyhow::bail!("media probe frame payload length overflow");
-    };
-    if frame.len() != expected_len {
-        anyhow::bail!(
-            "media probe frame payload length mismatch: expected {}, got {}",
-            expected_len,
-            frame.len()
-        );
-    }
-    let format = media_probe_format(format_code)?;
-
-    let media_payload = &frame[LAN_MEDIA_PROBE_HEADER_BYTES..];
-    let actual_hash = fnv1a64(media_payload);
-    if actual_hash != expected_hash {
-        anyhow::bail!("media probe payload hash mismatch");
-    }
-
-    Ok(MediaProbeFrameStats {
-        bytes_received: frame.len() as u64,
-        sequence,
-        timestamp_us,
-        width,
-        height,
-        target_fps,
-        target_bitrate_mbps,
-        payload_bytes: payload_len as u32,
-        format: format.to_string(),
-        payload_hash: format!("fnv1a64:{actual_hash:016x}"),
-    })
-}
-
 fn encode_lan_media_envelope(envelope: LanMediaEnvelope) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(envelope.payload.len())
         .context("LAN media v2 envelope payload exceeds u32 length")?;
@@ -8078,18 +8008,6 @@ fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
         bytes.extend_from_slice(color_pipeline.as_bytes());
     }
     fnv1a64(&bytes) as u32
-}
-
-#[cfg(test)]
-fn build_probe_compressed_pattern(sequence: u64, profile: &MediaProfile) -> Vec<u8> {
-    let mut payload = vec![0_u8; media_payload_bytes(profile)];
-    for (offset, byte) in payload.iter_mut().enumerate() {
-        let lane = (offset as u64).wrapping_mul(31);
-        *byte = lane
-            .wrapping_add(sequence.wrapping_mul(17))
-            .wrapping_add((offset as u64 >> 8) * 13) as u8;
-    }
-    payload
 }
 
 async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionId) -> MediaProfile {
@@ -8373,79 +8291,6 @@ fn schedule_next_media_frame(
     let delay_until = (*next_frame_at > now).then_some(*next_frame_at);
     *next_frame_at += frame_interval;
     delay_until
-}
-
-#[cfg(test)]
-fn media_payload_bytes(profile: &MediaProfile) -> usize {
-    ((profile.bitrate_mbps as usize * 1_000_000 / 8) / profile.fps.max(1) as usize).max(1)
-}
-
-#[cfg(test)]
-fn media_probe_format_code_for_profile(profile: &MediaProfile) -> u32 {
-    if LanAccessUnitCodec::from_profile(profile) == LanAccessUnitCodec::Hevc {
-        LAN_MEDIA_PROBE_HEVC_FORMAT_CODE
-    } else {
-        LAN_MEDIA_PROBE_H264_FORMAT_CODE
-    }
-}
-
-fn media_probe_format(format_code: u32) -> Result<&'static str> {
-    match format_code {
-        LAN_MEDIA_PROBE_H264_FORMAT_CODE => Ok(LAN_MEDIA_PROBE_H264_FORMAT),
-        LAN_MEDIA_PROBE_HEVC_FORMAT_CODE => Ok(LAN_MEDIA_PROBE_HEVC_FORMAT),
-        _ => anyhow::bail!("unsupported media probe format code: {format_code}"),
-    }
-}
-
-fn decoded_video_probe_format(codec: &str) -> String {
-    if normalize_lan_codec_name(codec) == Some("hevc") {
-        "hevc_desktop_frame".to_string()
-    } else if codec.trim().eq_ignore_ascii_case("av1") {
-        "av1_desktop_frame".to_string()
-    } else {
-        "h264_desktop_frame".to_string()
-    }
-}
-
-const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_extend(FNV1A64_OFFSET_BASIS, bytes)
-}
-
-fn fnv1a64_extend(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV1A64_PRIME);
-    }
-    hash
-}
-
-fn fnv1a64_media_metadata(
-    profile: &MediaProfile,
-    sequence: u64,
-    timestamp_us: u64,
-    encoded_payload_len: usize,
-) -> u64 {
-    let mut hash = FNV1A64_OFFSET_BASIS;
-    hash = fnv1a64_extend(hash, &profile.width.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.height.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.fps.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.bitrate_mbps.to_le_bytes());
-    hash = fnv1a64_extend(hash, profile.codec.as_bytes());
-    hash = fnv1a64_extend(hash, &[0]);
-    if let Some(color_mode) = profile.color_mode.as_deref() {
-        hash = fnv1a64_extend(hash, color_mode.as_bytes());
-    }
-    hash = fnv1a64_extend(hash, &[0]);
-    if let Some(color_pipeline) = profile.color_pipeline.as_deref() {
-        hash = fnv1a64_extend(hash, color_pipeline.as_bytes());
-    }
-    hash = fnv1a64_extend(hash, &sequence.to_le_bytes());
-    hash = fnv1a64_extend(hash, &timestamp_us.to_le_bytes());
-    hash = fnv1a64_extend(hash, &(encoded_payload_len as u64).to_le_bytes());
-    hash
 }
 
 fn normalize_transport_kind(value: &str) -> String {
