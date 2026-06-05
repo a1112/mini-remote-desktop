@@ -66,6 +66,7 @@ mod media_render_policy;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
+mod peer_format;
 mod service_identity;
 pub use discovery_config::LanDiscoveryConfig;
 use discovery_identity::{
@@ -177,6 +178,7 @@ use media_transport::{
 use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
+use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
 use service_identity::service_build_id;
 #[cfg(test)]
 use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
@@ -2825,22 +2827,6 @@ async fn local_device_id(app_state: &Arc<AppState>) -> Result<String> {
         .get_local_device()
         .map(|(id, _)| id.0.clone())
         .context("local device is not registered")
-}
-
-fn format_peer_transports(peer_transports: &[String]) -> String {
-    if peer_transports.is_empty() {
-        "none".to_string()
-    } else {
-        peer_transports.join(", ")
-    }
-}
-
-fn format_peer_capabilities(peer_media_capabilities: &[String]) -> String {
-    if peer_media_capabilities.is_empty() {
-        "none".to_string()
-    } else {
-        peer_media_capabilities.join(", ")
-    }
 }
 
 fn fit_capture_sources_ack_packet(
@@ -7612,15 +7598,6 @@ fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
         if profile.hdr_enabled.is_none() {
             profile.hdr_enabled = Some(false);
         }
-    }
-}
-
-fn normalize_transport_kind(value: &str) -> String {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() || normalized == "quic_quinn" {
-        "quic".to_string()
-    } else {
-        normalized
     }
 }
 
