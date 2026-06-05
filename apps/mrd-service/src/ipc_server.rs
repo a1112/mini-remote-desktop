@@ -17,11 +17,12 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::CapabilityStatus;
 use mrd_ipc::{transport, IpcRequest, IpcResponse};
 use mrd_proto::{DeviceId, SessionId};
-use std::{io::ErrorKind, sync::Arc};
+use std::sync::Arc;
 
 #[cfg(windows)]
 const WINDOWS_IPC_ACCEPT_BACKLOG: usize = 32;
 
+mod connection;
 mod dispatch;
 
 /// IPC server - handles requests from Rdesk shell
@@ -61,28 +62,6 @@ impl IpcServer {
             ui_launcher,
             autostart: crate::shell::default_autostart("mrd-service"),
         }
-    }
-
-    /// Handle a single connection
-    pub async fn handle_connection(&self, mut stream: transport::IpcStream) -> anyhow::Result<()> {
-        loop {
-            match stream.recv_request().await {
-                Ok(request) => {
-                    let response = self.handle_request(request).await;
-                    if let Err(e) = stream.send_response(&response).await {
-                        eprintln!("Failed to send IPC response: {}", e);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if !is_connection_closed_error(&e) {
-                        eprintln!("IPC request error: {}", e);
-                    }
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Handle an IPC request and return a response
@@ -215,19 +194,6 @@ impl IpcServer {
     }
 }
 
-fn is_connection_closed_error(error: &anyhow::Error) -> bool {
-    match error.downcast_ref::<std::io::Error>() {
-        Some(io_error) => matches!(
-            io_error.kind(),
-            ErrorKind::UnexpectedEof
-                | ErrorKind::BrokenPipe
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-        ),
-        None => false,
-    }
-}
-
 fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
     match response {
         IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
@@ -243,9 +209,12 @@ mod tests {
 
     #[test]
     fn closed_ipc_connection_is_not_treated_as_request_error() {
-        let error = anyhow::Error::new(std::io::Error::new(ErrorKind::UnexpectedEof, "early eof"));
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "early eof",
+        ));
 
-        assert!(is_connection_closed_error(&error));
+        assert!(connection::is_connection_closed_error(&error));
     }
 
     #[tokio::test]
