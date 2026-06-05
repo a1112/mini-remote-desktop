@@ -1,4 +1,60 @@
-use super::LanAccessUnitCodec;
+use anyhow::Result;
+use mrd_ipc::MediaProfile;
+use mrd_transport_quic_quinn::QuicMediaCodec;
+
+use super::{normalize_lan_codec_name, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LanAccessUnitCodec {
+    H264,
+    Hevc,
+}
+
+impl LanAccessUnitCodec {
+    pub(super) fn from_profile(profile: &MediaProfile) -> Self {
+        if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
+            Self::Hevc
+        } else {
+            Self::H264
+        }
+    }
+
+    pub(super) fn from_envelope_codec(codec: u8) -> Result<Self> {
+        match codec {
+            LAN_MEDIA_CODEC_H264 => Ok(Self::H264),
+            LAN_MEDIA_CODEC_HEVC => Ok(Self::Hevc),
+            _ => anyhow::bail!("unsupported LAN media access unit codec: {codec}"),
+        }
+    }
+
+    pub(super) fn quic_codec(self) -> QuicMediaCodec {
+        match self {
+            Self::H264 => QuicMediaCodec::H264,
+            Self::Hevc => QuicMediaCodec::Hevc,
+        }
+    }
+
+    pub(super) fn envelope_codec(self) -> u8 {
+        match self {
+            Self::H264 => LAN_MEDIA_CODEC_H264,
+            Self::Hevc => LAN_MEDIA_CODEC_HEVC,
+        }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
+        }
+    }
+
+    pub(super) fn display_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+}
 
 pub(super) fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
     metadata_is_keyframe

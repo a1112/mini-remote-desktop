@@ -1,4 +1,4 @@
-use super::LanAccessUnitCodec;
+use super::media_access_unit::LanAccessUnitCodec;
 
 pub(super) fn preferred_lan_receiver_decoder_candidates(
     codec: LanAccessUnitCodec,

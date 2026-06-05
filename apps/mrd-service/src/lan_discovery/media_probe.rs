@@ -1,6 +1,6 @@
-use super::normalize_lan_codec_name;
 #[cfg(test)]
-use super::LanAccessUnitCodec;
+use super::media_access_unit::LanAccessUnitCodec;
+use super::normalize_lan_codec_name;
 use crate::app_state::MediaProbeFrameStats;
 use anyhow::Result;
 use mrd_ipc::MediaProfile;

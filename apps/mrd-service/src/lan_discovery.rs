@@ -90,7 +90,9 @@ pub use lan_control_input::request_lan_control_input;
 use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
-use media_access_unit::{describe_lan_access_unit, h264_access_unit_is_keyframe};
+use media_access_unit::{
+    describe_lan_access_unit, h264_access_unit_is_keyframe, LanAccessUnitCodec,
+};
 #[cfg(test)]
 use media_capture_config::window_capture_source_error;
 use media_capture_config::{
@@ -684,12 +686,6 @@ struct LanRemoteAcceptResult {
     media_profile: Option<MediaProfileNegotiation>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LanAccessUnitCodec {
-    H264,
-    Hevc,
-}
-
 type LanEncoderConfigKey = (
     usize,
     usize,
@@ -702,52 +698,6 @@ type LanEncoderConfigKey = (
     Option<u8>,
     Option<String>,
 );
-
-impl LanAccessUnitCodec {
-    fn from_profile(profile: &MediaProfile) -> Self {
-        if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
-            Self::Hevc
-        } else {
-            Self::H264
-        }
-    }
-
-    fn from_envelope_codec(codec: u8) -> Result<Self> {
-        match codec {
-            LAN_MEDIA_CODEC_H264 => Ok(Self::H264),
-            LAN_MEDIA_CODEC_HEVC => Ok(Self::Hevc),
-            _ => anyhow::bail!("unsupported LAN media access unit codec: {codec}"),
-        }
-    }
-
-    fn quic_codec(self) -> QuicMediaCodec {
-        match self {
-            Self::H264 => QuicMediaCodec::H264,
-            Self::Hevc => QuicMediaCodec::Hevc,
-        }
-    }
-
-    fn envelope_codec(self) -> u8 {
-        match self {
-            Self::H264 => LAN_MEDIA_CODEC_H264,
-            Self::Hevc => LAN_MEDIA_CODEC_HEVC,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::H264 => "h264",
-            Self::Hevc => "hevc",
-        }
-    }
-
-    fn display_name(self) -> &'static str {
-        match self {
-            Self::H264 => "H.264",
-            Self::Hevc => "HEVC",
-        }
-    }
-}
 
 struct LanSenderEncoder {
     codec: LanAccessUnitCodec,
@@ -11883,6 +11833,17 @@ mod tests {
         assert_eq!(decoded.timestamp_us, 123_456);
         assert_eq!(decoded.profile, profile);
         assert_eq!(decoded.payload, vec![0, 0, 0, 1, 0x67]);
+    }
+
+    #[test]
+    fn access_unit_codec_lives_with_media_access_unit_mapping() {
+        let codec =
+            super::media_access_unit::LanAccessUnitCodec::from_envelope_codec(LAN_MEDIA_CODEC_HEVC)
+                .expect("hevc codec");
+
+        assert_eq!(codec.name(), "hevc");
+        assert_eq!(codec.display_name(), "HEVC");
+        assert_eq!(codec.envelope_codec(), LAN_MEDIA_CODEC_HEVC);
     }
 
     #[test]

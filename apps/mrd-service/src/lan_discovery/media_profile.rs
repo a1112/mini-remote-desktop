@@ -3,8 +3,9 @@ use mrd_ipc::{MediaProfile, MediaProfileNegotiation};
 use mrd_pipeline_core::ColorMode;
 use mrd_proto::DeviceId;
 
+use super::media_access_unit::LanAccessUnitCodec;
 use super::{
-    format_peer_capabilities, format_peer_transports, normalize_transport_kind, LanAccessUnitCodec,
+    format_peer_capabilities, format_peer_transports, normalize_transport_kind,
     LAN_MEDIA_COLOR_MODE_CAPABILITY, LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
     LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY, LAN_MEDIA_MAX_FPS,
     LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_TARGET_BITRATE_MBPS, LAN_MEDIA_TARGET_FPS,
