@@ -7,7 +7,7 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{session, transport as transport_handlers},
+    handlers::{device, session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionLifecycleState;
@@ -92,10 +92,8 @@ impl IpcServer {
                 device_id,
                 device_name,
             } => {
-                tracing::info!("Registering device: {} ({})", device_id.0, device_name);
-                let mut devices = self.app_state.devices.lock().await;
-                devices.register(device_id.clone(), device_name);
-                drop(devices);
+                let response =
+                    device::register_device(&self.app_state, device_id.clone(), device_name).await;
                 self.record_audit_event(
                     "device.register",
                     "success",
@@ -107,25 +105,10 @@ impl IpcServer {
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::DeviceRegistered { device_id }
+                response
             }
 
-            IpcRequest::ListDevices => {
-                let devices = self.app_state.devices.lock().await;
-                // Return the registered device, if any
-                let device_list = if let Some((id, name)) = devices.get_local_device() {
-                    vec![mrd_ipc::DeviceInfo {
-                        device_id: id.clone(),
-                        device_name: name.clone(),
-                        is_online: true, // Local device is always online
-                    }]
-                } else {
-                    vec![]
-                };
-                IpcResponse::DeviceList {
-                    devices: device_list,
-                }
-            }
+            IpcRequest::ListDevices => device::list_devices(&self.app_state).await,
 
             IpcRequest::LanDiscoverySnapshot => IpcResponse::LanDiscoverySnapshot {
                 snapshot: self.app_state.lan_discovery.snapshot().await,
@@ -143,21 +126,7 @@ impl IpcServer {
                 device_id,
                 mac_address,
                 broadcast_addr,
-            } => {
-                match crate::wake_on_lan::send_wake_on_lan(&mac_address, broadcast_addr.as_deref())
-                {
-                    Ok(result) => IpcResponse::WakeOnLanSent {
-                        device_id,
-                        mac_address: result.mac_address,
-                        broadcast_addr: result.broadcast_addr,
-                        packet_bytes: result.packet_bytes,
-                    },
-                    Err(error) => IpcResponse::Error {
-                        code: "E_WAKE_ON_LAN".to_string(),
-                        message: error.to_string(),
-                    },
-                }
-            }
+            } => device::wake_on_lan(device_id, mac_address, broadcast_addr),
 
             IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
 
