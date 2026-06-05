@@ -1,6 +1,7 @@
 // Handler modules for mrd-service
 
 pub mod capability;
+pub mod control;
 pub mod device;
 pub mod identity;
 pub mod session;
@@ -10,7 +11,10 @@ pub mod transport;
 #[cfg(test)]
 mod tests {
     use crate::app_state::AppState;
-    use mrd_ipc::{AuditLogQuery, CapabilityStatus, IpcResponse, ScenarioEvaluationStatus};
+    use mrd_ipc::{
+        AuditLogQuery, CapabilityStatus, ControlChannelReliability, IpcResponse,
+        ScenarioEvaluationStatus, TransportPolicyConfig,
+    };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
 
@@ -213,6 +217,57 @@ mod tests {
                 assert!(evaluation.reasons[0].message.contains(&peer_device_id.0));
             }
             _ => panic!("expected scenario profile evaluation response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_handler_returns_transport_policy_and_channel_snapshot() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("control-session".to_string());
+
+        let policy_response = super::control::set_transport_policy(
+            session_id.clone(),
+            TransportPolicyConfig {
+                mode: "wan".to_string(),
+                preferred_transport: Some("quic".to_string()),
+                allow_lan_quic: false,
+                allow_webrtc: true,
+                allow_relay: true,
+            },
+        );
+
+        match policy_response {
+            IpcResponse::TransportPolicyUpdated { snapshot } => {
+                assert_eq!(snapshot.session_id, Some(session_id.clone()));
+                assert_eq!(snapshot.selected_transport, "webrtc");
+                assert_eq!(snapshot.candidate_transports, vec!["webrtc"]);
+                assert!(snapshot.relay_required);
+                assert_eq!(
+                    snapshot.fallback_reason.as_deref(),
+                    Some("quic was requested but is not allowed by the active transport policy.")
+                );
+            }
+            _ => panic!("expected transport policy response"),
+        }
+
+        let snapshot_response =
+            super::control::control_channel_snapshot(&app_state, session_id.clone()).await;
+
+        match snapshot_response {
+            IpcResponse::ControlChannelSnapshot { snapshot } => {
+                assert_eq!(snapshot.session_id, session_id);
+                assert_eq!(snapshot.reliable.name, "ctrl_rel");
+                assert_eq!(
+                    snapshot.reliable.reliability,
+                    ControlChannelReliability::ReliableOrdered
+                );
+                assert_eq!(snapshot.realtime.name, "ctrl_rt");
+                assert_eq!(
+                    snapshot.realtime.reliability,
+                    ControlChannelReliability::UnreliableRealtime
+                );
+            }
+            _ => panic!("expected control channel snapshot response"),
         }
     }
 }
