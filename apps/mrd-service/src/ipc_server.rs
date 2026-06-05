@@ -7,7 +7,7 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{device, identity, session, telemetry, transport as transport_handlers},
+    handlers::{capability, device, identity, session, telemetry, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionLifecycleState;
@@ -419,9 +419,7 @@ impl IpcServer {
             IpcRequest::AuditLog { query } => telemetry::audit_log(&self.app_state, query).await,
 
             IpcRequest::CapabilitySnapshot => {
-                let snapshot = self.app_state.cached_capability_snapshot().await;
-                self.app_state.refresh_capability_snapshot_in_background();
-                IpcResponse::CapabilitySnapshot { snapshot }
+                capability::capability_snapshot(&self.app_state).await
             }
 
             IpcRequest::EvaluateScenarioProfile {
@@ -429,40 +427,17 @@ impl IpcServer {
                 peer_device_id,
                 requested_profile,
             } => {
-                if let Some(peer_device_id) = peer_device_id {
-                    let snapshot = self.app_state.lan_discovery.snapshot().await;
-                    if !snapshot
-                        .peers
-                        .iter()
-                        .any(|peer| peer.device_id == peer_device_id)
-                    {
-                        return IpcResponse::ScenarioProfileEvaluated {
-                            evaluation: peer_not_found_evaluation(scenario_id, peer_device_id),
-                        };
-                    }
-                }
-                let snapshot = self.app_state.cached_capability_snapshot().await;
-                self.app_state.refresh_capability_snapshot_in_background();
-                IpcResponse::ScenarioProfileEvaluated {
-                    evaluation: crate::capabilities::evaluate_scenario_profile_against_snapshot(
-                        &snapshot,
-                        &scenario_id,
-                        requested_profile,
-                    ),
-                }
+                capability::evaluate_scenario_profile(
+                    &self.app_state,
+                    scenario_id,
+                    peer_device_id,
+                    requested_profile,
+                )
+                .await
             }
 
             IpcRequest::GetPeerCapabilitySnapshot { peer_device_id } => {
-                let snapshot = self.app_state.lan_discovery.snapshot().await;
-                let capability_snapshot = snapshot
-                    .peers
-                    .iter()
-                    .find(|peer| peer.device_id == peer_device_id)
-                    .map(crate::capabilities::peer_capability_snapshot);
-                IpcResponse::PeerCapabilitySnapshot {
-                    peer_device_id,
-                    snapshot: capability_snapshot,
-                }
+                capability::peer_capability_snapshot(&self.app_state, peer_device_id).await
             }
 
             IpcRequest::SetTransportPolicy { session_id, policy } => {
@@ -1020,27 +995,6 @@ fn capability_status_runs(status: &CapabilityStatus) -> bool {
             | CapabilityStatus::Supported
             | CapabilityStatus::Degraded
     )
-}
-
-fn peer_not_found_evaluation(
-    scenario_id: String,
-    peer_device_id: DeviceId,
-) -> mrd_ipc::ScenarioEvaluation {
-    mrd_ipc::ScenarioEvaluation {
-        scenario_id,
-        status: mrd_ipc::ScenarioEvaluationStatus::Skipped,
-        selected_profile: None,
-        transport_kind: None,
-        reasons: vec![mrd_ipc::ScenarioEvaluationReason {
-            code: "peer_not_found".to_string(),
-            severity: "warning".to_string(),
-            message: format!("LAN peer {} is not currently discovered.", peer_device_id.0),
-            capability_id: None,
-        }],
-        required_capabilities: Vec::new(),
-        missing_capabilities: Vec::new(),
-        fallback_profile: None,
-    }
 }
 
 fn transport_policy_snapshot(

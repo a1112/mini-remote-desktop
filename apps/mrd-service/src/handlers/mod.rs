@@ -1,5 +1,6 @@
 // Handler modules for mrd-service
 
+pub mod capability;
 pub mod device;
 pub mod identity;
 pub mod session;
@@ -9,7 +10,7 @@ pub mod transport;
 #[cfg(test)]
 mod tests {
     use crate::app_state::AppState;
-    use mrd_ipc::{AuditLogQuery, IpcResponse};
+    use mrd_ipc::{AuditLogQuery, CapabilityStatus, IpcResponse, ScenarioEvaluationStatus};
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
 
@@ -169,6 +170,49 @@ mod tests {
                 assert!(bundle.artifacts.is_empty());
             }
             _ => panic!("expected telemetry bundle response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_handler_returns_cached_snapshot_and_peer_not_found_evaluation() {
+        let app_state = Arc::new(AppState::new());
+        let mut cached = crate::capabilities::local_capability_snapshot_static();
+        cached.service_version = "handler-test".to_string();
+        app_state
+            .replace_capability_snapshot_for_test(cached.clone())
+            .await;
+
+        let snapshot_response = super::capability::capability_snapshot(&app_state).await;
+
+        match snapshot_response {
+            IpcResponse::CapabilitySnapshot { snapshot } => {
+                assert_eq!(snapshot.service_version, "handler-test");
+                assert!(snapshot
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.status != CapabilityStatus::Unknown));
+            }
+            _ => panic!("expected capability snapshot response"),
+        }
+
+        let peer_device_id = DeviceId("missing-peer".to_string());
+        let evaluation_response = super::capability::evaluate_scenario_profile(
+            &app_state,
+            "lan.2k144".to_string(),
+            Some(peer_device_id.clone()),
+            None,
+        )
+        .await;
+
+        match evaluation_response {
+            IpcResponse::ScenarioProfileEvaluated { evaluation } => {
+                assert_eq!(evaluation.scenario_id, "lan.2k144");
+                assert_eq!(evaluation.status, ScenarioEvaluationStatus::Skipped);
+                assert_eq!(evaluation.reasons.len(), 1);
+                assert_eq!(evaluation.reasons[0].code, "peer_not_found");
+                assert!(evaluation.reasons[0].message.contains(&peer_device_id.0));
+            }
+            _ => panic!("expected scenario profile evaluation response"),
         }
     }
 }
