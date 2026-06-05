@@ -259,7 +259,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
   };
 
-  const handleOpenDeviceTab = (deviceId: string, tab: "remote" | "files" | "apps" | "info") => {
+  const handleOpenDeviceTab = (deviceId: string, tab: "remote" | "files" | "apps" | "info" | "terminal") => {
     navigate(`/devices/${deviceId}?tab=${tab}`);
     setContextMenu(null);
     setSubmenuOpen(null);
@@ -365,7 +365,11 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           label: "文件传输",
           action: () => handleOpenDeviceTab(activeContextMenu.deviceId, "files"),
         },
-        { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
+        {
+          icon: Terminal,
+          label: "远程终端",
+          action: () => handleOpenDeviceTab(activeContextMenu.deviceId, "terminal"),
+        },
         { type: "divider" as const }
       );
     }

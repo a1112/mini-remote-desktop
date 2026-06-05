@@ -87,7 +87,15 @@ type TabType = "remote" | "files" | "apps" | "info";
 
 export function deviceDetailTabFromSearch(search: string): TabType {
   const tab = new URLSearchParams(search).get("tab");
+  if (tab === "terminal") return "apps";
   return tab === "files" || tab === "apps" || tab === "info" || tab === "remote" ? tab : "remote";
+}
+
+export function remoteApplicationSourceMatchesTerminalFocus(
+  source: Pick<CaptureSource, "app_name" | "title">
+): boolean {
+  const haystack = `${source.app_name ?? ""} ${source.title ?? ""}`.toLowerCase();
+  return /\b(cmd|command prompt|powershell|pwsh|terminal|wt\.exe)\b/.test(haystack);
 }
 
 const remoteFiles = [
@@ -986,6 +994,7 @@ function CtxItem({ icon, label, onClick, isDark, danger }: { icon: React.ReactNo
 function AppsTab({ device }: { device: Device }) {
   const { isDark } = useTheme();
   const navigate = useNavigate();
+  const location = useLocation();
   const [catalog, setCatalog] = useState<RemoteApplicationCatalogResult | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [openingSourceId, setOpeningSourceId] = useState<string | null>(null);
@@ -1138,6 +1147,13 @@ function AppsTab({ device }: { device: Device }) {
         : null;
   const remoteWindows = catalog?.windows ?? [];
   const displaySources = catalog?.displays ?? [];
+  const terminalFocus = new URLSearchParams(location.search).get("tab") === "terminal";
+  const orderedRemoteWindows = terminalFocus
+    ? [...remoteWindows].sort((left, right) =>
+        Number(remoteApplicationSourceMatchesTerminalFocus(right)) -
+        Number(remoteApplicationSourceMatchesTerminalFocus(left))
+      )
+    : remoteWindows;
 
   if (!canUseRemoteApplications) {
     return (
@@ -1180,7 +1196,7 @@ function AppsTab({ device }: { device: Device }) {
               <AppWindow className="h-5 w-5 text-cyan-500" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>远程应用</div>
+              <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>{terminalFocus ? "远程终端" : "远程应用"}</div>
               <div className={`mt-0.5 truncate ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
                 {device.name} · {device.ip} · LAN QUIC 窗口流
               </div>
@@ -1249,7 +1265,7 @@ function AppsTab({ device }: { device: Device }) {
 
         {remoteWindows.length > 0 && (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {remoteWindows.map((source) => {
+            {orderedRemoteWindows.map((source) => {
               const SourceIcon = remoteCaptureSourceIcon(source);
               const opening = openingSourceId === source.id;
               return (

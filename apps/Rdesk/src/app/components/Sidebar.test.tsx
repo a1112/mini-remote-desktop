@@ -170,7 +170,7 @@ describe("Sidebar device actions", () => {
     openDeviceMenu();
 
     expect(screen.getByRole("button", { name: "文件传输" })).not.toBeDisabled();
-    expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "远程终端" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "禁用设备" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
@@ -224,6 +224,19 @@ describe("Sidebar device actions", () => {
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
     await user.click(screen.getByRole("button", { name: "设备信息" }));
     expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=info");
+  });
+
+  it("opens remote terminal through the remote application terminal focus route", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "远程终端" }));
+
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/agent-device?tab=terminal"
+    );
   });
 
   it("toggles favorite state through local device action preferences", async () => {
