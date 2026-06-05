@@ -247,8 +247,6 @@ const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
 const LAN_RENDER_QUEUE_POLICY_ENV: &str = "MRD_LAN_RENDER_QUEUE_POLICY";
 const LAN_MEDIA_PAYLOAD_HASH_ENV: &str = "MRD_LAN_MEDIA_PAYLOAD_HASH";
-#[cfg(target_os = "macos")]
-const MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV: &str = "MRD_MACOS_RENDER_PROXY_COMPRESSED_MEDIA";
 #[cfg(windows)]
 const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKING";
 #[cfg(windows)]
@@ -3800,27 +3798,12 @@ fn macos_capture_pump_repeat_frame_interval(profile: &MediaProfile) -> Duration 
 
 #[cfg(target_os = "macos")]
 fn macos_render_proxy_compressed_media_enabled() -> bool {
-    macos_render_proxy_compressed_media_override().unwrap_or(true)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_render_proxy_compressed_media_override() -> Option<bool> {
-    env_bool_override(
-        std::env::var(MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV)
-            .ok()
-            .as_deref(),
-    )
+    media_receiver::compressed_proxy_enabled()
 }
 
 #[cfg(target_os = "macos")]
 fn macos_render_proxy_compressed_media_enabled_for_profile(profile: &MediaProfile) -> bool {
-    media_receiver::compressed_proxy_enabled_for_values(
-        profile.codec.as_str(),
-        profile.width,
-        profile.height,
-        profile.fps,
-        macos_render_proxy_compressed_media_override(),
-    )
+    media_receiver::compressed_proxy_enabled_for_profile(profile)
 }
 
 #[cfg(any(windows, target_os = "macos"))]
