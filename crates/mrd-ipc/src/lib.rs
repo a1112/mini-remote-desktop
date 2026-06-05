@@ -326,6 +326,12 @@ mod wire {
         /// Whether HDR metadata is enabled for the active profile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub active_hdr_enabled: Option<bool>,
+        /// Active color transform mode, for example `full`, `grayscale`, or `monochrome`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_color_mode: Option<String>,
+        /// Active color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_color_pipeline: Option<String>,
         /// Active negotiated width in pixels.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub active_width: Option<u32>,

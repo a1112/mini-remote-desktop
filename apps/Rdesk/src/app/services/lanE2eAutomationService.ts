@@ -853,7 +853,9 @@ export async function runLanE2EAutomation(
         captureSource,
         validationMode
       );
-      const profileMismatch = describeProfileProbeFailure(profileProbeResult);
+      const profileMismatch =
+        describeProfileProbeFailure(profileProbeResult) ??
+        describeMediaPipelineProfileMismatch(mediaPipelineSnapshot, requestedProfile);
       const sampleReadinessDurationMs = sampleFpsBaseline
         ? sampleFpsElapsedMs ?? 0
         : sampleDurationMs;
@@ -1666,6 +1668,65 @@ function describeProfileProbeFailure(result: ProfileProbeResult | undefined): st
   }
 
   return result.error ?? `Runtime media profile probe failed: ${result.status}`;
+}
+
+function describeMediaPipelineProfileMismatch(
+  snapshot: MediaPipelineSnapshot | undefined,
+  requestedProfile: MediaProfile | undefined
+): string | null {
+  if (!snapshot || !requestedProfile) return null;
+
+  const mismatches = [
+    compareOptionalProfileString(
+      "color_mode",
+      requestedProfile.color_mode,
+      snapshot.active_color_mode
+    ),
+    compareOptionalProfileString(
+      "color_pipeline",
+      requestedProfile.color_pipeline,
+      snapshot.active_color_pipeline
+    ),
+    compareOptionalProfileBoolean(
+      "hdr_enabled",
+      requestedProfile.hdr_enabled,
+      snapshot.active_hdr_enabled
+    ),
+  ].filter((entry): entry is string => Boolean(entry));
+
+  if (mismatches.length === 0) return null;
+  return `Runtime media pipeline profile mismatch: ${mismatches.join(", ")}`;
+}
+
+function compareOptionalProfileString(
+  label: string,
+  expected: string | null | undefined,
+  actual: string | null | undefined
+): string | null {
+  if (!expected) return null;
+  const normalizedExpected = expected.trim().toLowerCase();
+  const normalizedActual = actual?.trim().toLowerCase();
+  if (!normalizedActual && isDefaultProfileMetadataValue(label, normalizedExpected)) return null;
+  if (normalizedExpected === normalizedActual) return null;
+  return `${label} ${normalizedExpected}/${normalizedActual ?? "missing"}`;
+}
+
+function compareOptionalProfileBoolean(
+  label: string,
+  expected: boolean | null | undefined,
+  actual: boolean | null | undefined
+): string | null {
+  if (expected == null) return null;
+  if (actual == null && expected === false) return null;
+  if (expected === actual) return null;
+  return `${label} ${expected}/${actual ?? "missing"}`;
+}
+
+function isDefaultProfileMetadataValue(label: string, value: string): boolean {
+  return (
+    (label === "color_mode" && value === "full") ||
+    (label === "color_pipeline" && value === "sdr8")
+  );
 }
 
 function isExpectedProfileDowngrade(

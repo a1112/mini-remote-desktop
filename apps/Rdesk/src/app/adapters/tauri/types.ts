@@ -906,6 +906,8 @@ export interface MediaPipelineSnapshot {
   active_chroma_subsampling?: string | null;
   active_pixel_format?: string | null;
   active_hdr_enabled?: boolean | null;
+  active_color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | string | null;
+  active_color_pipeline?: "sdr8" | "hdr_main10" | string | null;
   active_width?: number | null;
   active_height?: number | null;
   active_fps?: number | null;

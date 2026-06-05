@@ -27,6 +27,8 @@ struct MediaPipelineState {
     active_chroma_subsampling: Option<String>,
     active_pixel_format: Option<String>,
     active_hdr_enabled: Option<bool>,
+    active_color_mode: Option<String>,
+    active_color_pipeline: Option<String>,
     active_width: Option<u32>,
     active_height: Option<u32>,
     active_fps: Option<u32>,
@@ -117,6 +119,8 @@ impl MediaPipelineRegistry {
         state.active_chroma_subsampling = profile.chroma_subsampling.clone();
         state.active_pixel_format = profile.pixel_format.clone();
         state.active_hdr_enabled = profile.hdr_enabled;
+        state.active_color_mode = profile.color_mode.clone();
+        state.active_color_pipeline = profile.color_pipeline.clone();
         state.active_width = Some(profile.width);
         state.active_height = Some(profile.height);
         state.active_fps = Some(profile.fps);
@@ -309,6 +313,8 @@ impl MediaPipelineRegistry {
                 .and_then(|state| state.active_chroma_subsampling.clone()),
             active_pixel_format: state.and_then(|state| state.active_pixel_format.clone()),
             active_hdr_enabled: state.and_then(|state| state.active_hdr_enabled),
+            active_color_mode: state.and_then(|state| state.active_color_mode.clone()),
+            active_color_pipeline: state.and_then(|state| state.active_color_pipeline.clone()),
             active_width: state.and_then(|state| state.active_width),
             active_height: state.and_then(|state| state.active_height),
             active_fps: state.and_then(|state| state.active_fps),

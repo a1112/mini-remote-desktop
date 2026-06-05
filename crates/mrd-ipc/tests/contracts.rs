@@ -749,6 +749,8 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             active_chroma_subsampling: Some("4:2:0".to_string()),
             active_pixel_format: Some("d3d11_shared_nv12".to_string()),
             active_hdr_enabled: Some(false),
+            active_color_mode: Some("monochrome".to_string()),
+            active_color_pipeline: Some("sdr8".to_string()),
             active_width: Some(2560),
             active_height: Some(1440),
             active_fps: Some(144),

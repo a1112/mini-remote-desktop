@@ -1325,7 +1325,7 @@ describe("runLanE2EAutomation", () => {
       current_fps: 180,
       bitrate_mbps: 120,
       media_probe_valid: true,
-      media_probe_format: "compressed_h264_test_pattern",
+      media_probe_format: "compressed_hevc_test_pattern",
       media_probe_width: 2560,
       media_probe_height: 1440,
       media_probe_target_fps: 180,
@@ -1507,6 +1507,63 @@ describe("runLanE2EAutomation", () => {
     expect(result.errorMessage).toContain(
       "2560x1600 @ 165 FPS / 80 Mbps / h264"
     );
+  });
+
+  it("fails when the runtime pipeline color profile does not match the requested profile", async () => {
+    const requestedProfile = {
+      ...DEFAULT_REQUESTED_PROFILE,
+      codec_profile: "main10",
+      bit_depth: 10,
+      pixel_format: "p010",
+      hdr_enabled: true,
+      color_mode: "monochrome" as const,
+      color_pipeline: "hdr_main10" as const,
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
+            active_decoder: "nvdec",
+            active_renderer: "d3d11",
+            active_codec: "hevc",
+            active_codec_profile: "main10",
+            active_bit_depth: 10,
+            active_chroma_subsampling: "4:2:0",
+            active_pixel_format: "p010",
+            active_hdr_enabled: true,
+            active_color_mode: "full",
+            active_color_pipeline: "sdr8",
+            active_width: 2560,
+            active_height: 1600,
+            active_fps: 165,
+            active_bitrate_mbps: 80,
+            queue_depth: 1,
+            dropped_frames: 0,
+            stage_metrics: [],
+            adaptation: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.errorMessage).toContain("Runtime media pipeline profile mismatch");
+    expect(result.errorMessage).toContain("color_mode monochrome/full");
+    expect(result.errorMessage).toContain("color_pipeline hdr_main10/sdr8");
   });
 
   it("keeps sampling transient profile mismatches until the profile stabilizes", async () => {
@@ -2373,7 +2430,30 @@ describe("runLanE2EAutomation", () => {
           ],
         })
       );
-    const commands = createCommands({ ipcRefreshLanDiscovery });
+    const commands = createCommands({
+      ipcRefreshLanDiscovery,
+      ipcProbeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          frames_received: 4,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 165,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_width: 2560,
+          media_probe_height: 1600,
+          media_probe_target_fps: 165,
+          media_probe_target_bitrate_mbps: 80,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      ),
+    });
 
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",
@@ -2436,7 +2516,30 @@ describe("runLanE2EAutomation", () => {
         ],
       })
     );
-    const commands = createCommands({ ipcRefreshLanDiscovery });
+    const commands = createCommands({
+      ipcRefreshLanDiscovery,
+      ipcProbeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          frames_received: 4,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 165,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_width: 2560,
+          media_probe_height: 1600,
+          media_probe_target_fps: 165,
+          media_probe_target_bitrate_mbps: 80,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      ),
+    });
 
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",

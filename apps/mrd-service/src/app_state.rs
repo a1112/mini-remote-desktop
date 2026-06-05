@@ -933,6 +933,8 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("monochrome".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
             ..MediaProfile::default()
         };
 
@@ -946,6 +948,8 @@ mod tests {
         assert_eq!(snapshot.active_chroma_subsampling.as_deref(), Some("4:2:0"));
         assert_eq!(snapshot.active_pixel_format.as_deref(), Some("nv12"));
         assert_eq!(snapshot.active_hdr_enabled, Some(false));
+        assert_eq!(snapshot.active_color_mode.as_deref(), Some("monochrome"));
+        assert_eq!(snapshot.active_color_pipeline.as_deref(), Some("sdr8"));
         assert_eq!(snapshot.active_width, Some(2560));
         assert_eq!(snapshot.active_height, Some(1440));
         assert_eq!(snapshot.active_fps, Some(144));
