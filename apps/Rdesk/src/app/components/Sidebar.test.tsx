@@ -113,11 +113,11 @@ function LocationProbe() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
-function renderSidebar() {
+function renderSidebar({ collapsed = false }: { collapsed?: boolean } = {}) {
   render(
     <MemoryRouter>
       <Sidebar
-        collapsed={false}
+        collapsed={collapsed}
         onOpenConnections={vi.fn()}
         onOpenSettings={vi.fn()}
       />
@@ -229,6 +229,41 @@ describe("Sidebar device actions", () => {
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
     await user.click(screen.getByRole("button", { name: "设备信息" }));
     expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=info");
+  });
+
+  it("keeps route ids separate from stable device ids for merged device actions", async () => {
+    deviceDataMock.devices = [
+      device({
+        id: "server-row-123",
+        deviceId: "stable-device-abc",
+        macAddress: "AA:BB:CC:DD:EE:FF",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "文件传输" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/server-row-123?tab=files"
+    );
+
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "收藏设备" }));
+    expect(actionServiceMock.setDeviceFavorite).toHaveBeenCalledWith(
+      "stable-device-abc",
+      true
+    );
+  });
+
+  it("opens the device action menu from collapsed sidebar device items", () => {
+    renderSidebar({ collapsed: true });
+
+    fireEvent.contextMenu(screen.getByTitle("Agent PC (在线)"));
+
+    expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "禁用设备" })).not.toBeDisabled();
   });
 
   it("opens remote terminal through the remote application terminal focus route", async () => {

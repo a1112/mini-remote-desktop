@@ -866,6 +866,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
               <button
                 key={device.id}
                 onClick={() => navigate(`/devices/${device.id}`)}
+                onContextMenu={(e) => handleContextMenu(e, device.id)}
                 className={`w-full flex items-center justify-center p-2 rounded-md transition-all relative ${
                   isActive ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "hover:bg-gray-800" : "hover:bg-gray-50")
                 }`}
