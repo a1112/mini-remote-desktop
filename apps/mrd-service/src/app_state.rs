@@ -42,8 +42,10 @@ use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
 mod capture_source_registry;
+mod display_mode_registry;
 mod media_profile_registry;
 pub use capture_source_registry::CaptureSourceRegistry;
+pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
@@ -83,90 +85,6 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Runtime display mode changes keyed by session.
-#[derive(Debug, Default)]
-pub struct DisplayModeRegistry {
-    modes: HashMap<SessionId, DisplayModeState>,
-}
-
-#[derive(Debug, Clone)]
-struct DisplayModeState {
-    original: Option<mrd_ipc::DisplayMode>,
-    active: Option<mrd_ipc::DisplayMode>,
-    restore_required: bool,
-}
-
-impl DisplayModeRegistry {
-    pub fn record_change(
-        &mut self,
-        session_id: SessionId,
-        requested: mrd_ipc::DisplayMode,
-        previous: Option<mrd_ipc::DisplayMode>,
-        active: mrd_ipc::DisplayMode,
-        restore_required: bool,
-    ) -> mrd_ipc::DisplayModeChange {
-        let original = previous.clone().or_else(|| {
-            self.modes
-                .get(&session_id)
-                .and_then(|state| state.original.clone())
-        });
-        self.modes.insert(
-            session_id.clone(),
-            DisplayModeState {
-                original: original.clone(),
-                active: Some(active.clone()),
-                restore_required,
-            },
-        );
-        mrd_ipc::DisplayModeChange {
-            session_id,
-            requested: Some(requested),
-            previous,
-            active: Some(active),
-            status: "changed".to_string(),
-            reason: None,
-            restore_required,
-        }
-    }
-
-    pub fn record_restore(
-        &mut self,
-        session_id: SessionId,
-        previous: mrd_ipc::DisplayMode,
-        active: mrd_ipc::DisplayMode,
-    ) -> mrd_ipc::DisplayModeChange {
-        self.modes.remove(&session_id);
-        mrd_ipc::DisplayModeChange {
-            session_id,
-            requested: None,
-            previous: Some(previous),
-            active: Some(active),
-            status: "restored".to_string(),
-            reason: None,
-            restore_required: false,
-        }
-    }
-
-    pub fn restore_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .get(session_id)
-            .filter(|state| state.restore_required)
-            .and_then(|state| state.original.clone())
-    }
-
-    pub fn active_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .get(session_id)
-            .and_then(|state| state.active.clone())
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .remove(session_id)
-            .and_then(|state| state.original)
-    }
 }
 
 /// Peer media capabilities observed for each active session.
