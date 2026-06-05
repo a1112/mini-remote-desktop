@@ -1,10 +1,13 @@
 use mrd_ipc::MediaProfile;
+#[cfg(any(windows, target_os = "macos"))]
+use std::time::Duration;
 
 use super::{
     env_bool_override, fnv1a64, fnv1a64_media_metadata, LAN_MEDIA_PAYLOAD_HASH_ENV,
     LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES, LAN_RENDER_PACING_DEFAULT_MIN_FPS,
     LAN_RENDER_PACING_ENV, LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT,
-    LAN_RENDER_QUEUE_CAPACITY_ENV, LAN_RENDER_QUEUE_POLICY_ENV,
+    LAN_RENDER_PACING_PRECISE_SLEEP_GUARD, LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS,
+    LAN_RENDER_PACING_PRESENT_LEAD, LAN_RENDER_QUEUE_CAPACITY_ENV, LAN_RENDER_QUEUE_POLICY_ENV,
 };
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -250,4 +253,73 @@ pub(crate) fn lan_render_pacing_target_fps_from_values(
 
 pub(crate) fn lan_render_pacing_from_env_value(value: Option<&str>) -> Option<bool> {
     env_bool_override(value)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn should_interrupt_render_pacing_sleep(
+    pending_depth: usize,
+    _max_pending_frames: usize,
+) -> bool {
+    pending_depth > 0
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn render_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
+    lan_render_pacing_enabled_for_profile(profile)
+        && lan_render_pacing_target_fps(profile) >= LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn render_pacing_precise_sleep_guard(target_fps: u32) -> Duration {
+    if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
+        return Duration::ZERO;
+    }
+
+    LAN_RENDER_PACING_PRECISE_SLEEP_GUARD.min(render_pacing_frame_interval(target_fps) / 2)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn lan_render_pacing_render_start_delay(delay: Duration, target_fps: u32) -> Duration {
+    if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
+        return delay;
+    }
+
+    delay.saturating_sub(
+        LAN_RENDER_PACING_PRESENT_LEAD.min(render_pacing_frame_interval(target_fps) / 4),
+    )
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn render_pacing_frame_interval(fps: u32) -> Duration {
+    Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_pacing_sleep_is_interruptible_when_work_is_pending() {
+        assert!(!should_interrupt_render_pacing_sleep(0, 3));
+        assert!(should_interrupt_render_pacing_sleep(1, 3));
+        assert!(should_interrupt_render_pacing_sleep(2, 3));
+        assert!(should_interrupt_render_pacing_sleep(1, 1));
+    }
+
+    #[test]
+    fn render_pacing_guard_and_start_delay_track_high_refresh() {
+        let high_refresh_guard = render_pacing_precise_sleep_guard(120);
+
+        assert!(high_refresh_guard > Duration::ZERO);
+        assert!(high_refresh_guard < render_pacing_frame_interval(120));
+        assert_eq!(render_pacing_precise_sleep_guard(60), Duration::ZERO);
+        assert_eq!(
+            lan_render_pacing_render_start_delay(Duration::from_micros(7_000), 144),
+            Duration::from_micros(6_750)
+        );
+        assert_eq!(
+            lan_render_pacing_render_start_delay(Duration::from_micros(7_000), 60),
+            Duration::from_micros(7_000)
+        );
+    }
 }

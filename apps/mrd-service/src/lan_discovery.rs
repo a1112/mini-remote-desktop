@@ -129,16 +129,18 @@ use media_render_policy::{
 };
 #[cfg(any(windows, target_os = "macos"))]
 use media_render_policy::{
-    lan_render_cap_target_fps_for_profile, lan_render_pacing_enabled_for_profile,
+    lan_render_cap_target_fps_for_profile, lan_render_pacing_render_start_delay,
     lan_render_pacing_target_fps, lan_render_policy_allows_service_pacing,
     lan_render_queue_capacity_for_policy, lan_render_queue_capacity_for_profile,
     lan_render_queue_policy_for_profile, native_render_waitable_swapchain_pacing_enabled,
-    LanRenderQueuePolicy,
+    render_pacing_precise_sleep_guard, render_profile_requests_high_resolution_timer,
+    should_interrupt_render_pacing_sleep, LanRenderQueuePolicy,
 };
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use media_render_policy::{
-    lan_render_pacing_target_fps_from_values, lan_render_queue_capacity_from_env_value,
-    lan_render_queue_policy_for_profile_with_override, lan_render_queue_policy_from_env_value,
+    lan_render_pacing_enabled_for_profile, lan_render_pacing_target_fps_from_values,
+    lan_render_queue_capacity_from_env_value, lan_render_queue_policy_for_profile_with_override,
+    lan_render_queue_policy_from_env_value, render_pacing_frame_interval,
 };
 use media_sender_telemetry::{
     decode_lan_sender_stats_datagram, send_lan_sender_stats_datagram, LanMediaTestImpairment,
@@ -5889,42 +5891,6 @@ fn take_next_lan_render_frame_for_policy(
         LanRenderQueuePolicy::Latest => render_queues.take_latest_or_finish(session_id),
         LanRenderQueuePolicy::PacedFifo => (render_queues.take_next_or_finish(session_id), 0),
     }
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn should_interrupt_render_pacing_sleep(pending_depth: usize, _max_pending_frames: usize) -> bool {
-    pending_depth > 0
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn render_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
-    lan_render_pacing_enabled_for_profile(profile)
-        && lan_render_pacing_target_fps(profile) >= LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn render_pacing_precise_sleep_guard(target_fps: u32) -> Duration {
-    if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
-        return Duration::ZERO;
-    }
-
-    LAN_RENDER_PACING_PRECISE_SLEEP_GUARD.min(render_pacing_frame_interval(target_fps) / 2)
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn lan_render_pacing_render_start_delay(delay: Duration, target_fps: u32) -> Duration {
-    if target_fps < LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS {
-        return delay;
-    }
-
-    delay.saturating_sub(
-        LAN_RENDER_PACING_PRESENT_LEAD.min(render_pacing_frame_interval(target_fps) / 4),
-    )
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn render_pacing_frame_interval(fps: u32) -> Duration {
-    Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
 }
 
 #[cfg(any(windows, target_os = "macos"))]
