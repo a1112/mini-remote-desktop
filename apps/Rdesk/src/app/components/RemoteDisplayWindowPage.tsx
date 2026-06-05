@@ -5576,6 +5576,11 @@ export function RemoteDisplayWindowPage() {
   };
 
   const handleClose = async () => {
+    if (controlInputEnabled) {
+      lastRemoteControlPointRef.current = null;
+      const releaseResult = await ipcSendControlInput(sessionId, { kind: "release_all" });
+      if (!releaseResult.ok) setLastError(releaseResult.error.message);
+    }
     if (isTauriRuntime() && context?.label) {
       const result = await closeRemoteDisplayWindow(context.label);
       if (!result.ok) setLastError(result.error.message);
