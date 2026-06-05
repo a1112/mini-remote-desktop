@@ -132,6 +132,24 @@ pub(crate) fn normalize_lan_media_profile(profile: &mut MediaProfile) {
     }
 }
 
+pub(super) fn lan_runtime_media_profile(
+    selected_profile: &MediaProfile,
+    codec: LanAccessUnitCodec,
+) -> MediaProfile {
+    let mut profile = selected_profile.clone();
+    profile.codec = codec.name().to_string();
+    if codec == LanAccessUnitCodec::H264 {
+        profile.codec_profile = Some("high".to_string());
+        profile.bit_depth = Some(8);
+        profile.chroma_subsampling = Some("4:2:0".to_string());
+        profile.pixel_format = Some("nv12".to_string());
+        profile.hdr_enabled = Some(false);
+    } else {
+        apply_lan_media_profile_defaults(&mut profile);
+    }
+    profile
+}
+
 pub(crate) fn ensure_peer_supports_requested_media(
     target_device_id: &DeviceId,
     transport_kind: &str,
@@ -429,5 +447,40 @@ mod tests {
         assert_eq!(profile.chroma_subsampling.as_deref(), Some("4:2:0"));
         assert_eq!(profile.pixel_format.as_deref(), Some("nv12"));
         assert_eq!(profile.hdr_enabled, Some(false));
+    }
+
+    #[test]
+    fn runtime_h264_profile_uses_h264_encoder_defaults() {
+        let mut selected = default_media_profile();
+        selected.codec_profile = Some("main10".to_string());
+        selected.bit_depth = Some(10);
+        selected.pixel_format = Some("p010".to_string());
+        selected.hdr_enabled = Some(true);
+
+        let runtime = lan_runtime_media_profile(&selected, LanAccessUnitCodec::H264);
+
+        assert_eq!(runtime.codec, "h264");
+        assert_eq!(runtime.codec_profile.as_deref(), Some("high"));
+        assert_eq!(runtime.bit_depth, Some(8));
+        assert_eq!(runtime.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(runtime.pixel_format.as_deref(), Some("nv12"));
+        assert_eq!(runtime.hdr_enabled, Some(false));
+    }
+
+    #[test]
+    fn runtime_hevc_profile_preserves_selected_main10_fields() {
+        let mut selected = default_media_profile();
+        selected.codec_profile = Some("main10".to_string());
+        selected.bit_depth = Some(10);
+        selected.pixel_format = Some("p010".to_string());
+        selected.hdr_enabled = Some(true);
+
+        let runtime = lan_runtime_media_profile(&selected, LanAccessUnitCodec::Hevc);
+
+        assert_eq!(runtime.codec, "hevc");
+        assert_eq!(runtime.codec_profile.as_deref(), Some("main10"));
+        assert_eq!(runtime.bit_depth, Some(10));
+        assert_eq!(runtime.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(runtime.hdr_enabled, Some(true));
     }
 }

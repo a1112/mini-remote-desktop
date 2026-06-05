@@ -118,8 +118,9 @@ use media_profile::{
     apply_lan_media_profile_defaults, clamp_media_profile_to_lan_capability, default_media_profile,
     default_media_profile_negotiation, ensure_peer_can_receive_selected_media,
     ensure_peer_supports_requested_media, lan_color_mode_for_profile,
-    lan_profile_requests_hevc_main10, missing_profile_receiver_media_capabilities,
-    normalize_lan_codec_name, normalize_lan_media_profile, validate_media_profile,
+    lan_profile_requests_hevc_main10, lan_runtime_media_profile,
+    missing_profile_receiver_media_capabilities, normalize_lan_codec_name,
+    normalize_lan_media_profile, validate_media_profile,
 };
 #[cfg(all(test, target_os = "macos"))]
 use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates_from_preference;
@@ -7469,24 +7470,6 @@ fn negotiate_media_profile(
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
     clamp_media_profile_to_lan_capability(requested_profile)
-}
-
-fn lan_runtime_media_profile(
-    selected_profile: &MediaProfile,
-    codec: LanAccessUnitCodec,
-) -> MediaProfile {
-    let mut profile = selected_profile.clone();
-    profile.codec = codec.name().to_string();
-    if codec == LanAccessUnitCodec::H264 {
-        profile.codec_profile = Some("high".to_string());
-        profile.bit_depth = Some(8);
-        profile.chroma_subsampling = Some("4:2:0".to_string());
-        profile.pixel_format = Some("nv12".to_string());
-        profile.hdr_enabled = Some(false);
-    } else {
-        apply_lan_media_profile_defaults(&mut profile);
-    }
-    profile
 }
 
 fn now_us() -> u64 {
