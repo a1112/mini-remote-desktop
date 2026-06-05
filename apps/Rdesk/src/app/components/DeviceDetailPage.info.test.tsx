@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { Monitor } from "lucide-react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +36,12 @@ const deviceDataMock = vi.hoisted(() => ({
   devices: [] as Device[],
 }));
 
+const remoteDisplayLauncherMock = vi.hoisted(() => ({
+  launchRemoteApplicationForDevice: vi.fn(),
+  launchRemoteDisplayForDevice: vi.fn(),
+  prepareRemoteApplicationCatalogForDevice: vi.fn(),
+}));
+
 vi.mock("./deviceData", () => ({
   useDevices: () => ({
     devices: deviceDataMock.devices,
@@ -58,9 +65,10 @@ vi.mock("./DetailBarContext", () => ({
 }));
 
 vi.mock("../services/remoteDisplayLauncher", () => ({
-  launchRemoteApplicationForDevice: vi.fn(),
-  launchRemoteDisplayForDevice: vi.fn(),
-  prepareRemoteApplicationCatalogForDevice: vi.fn(),
+  launchRemoteApplicationForDevice: remoteDisplayLauncherMock.launchRemoteApplicationForDevice,
+  launchRemoteDisplayForDevice: remoteDisplayLauncherMock.launchRemoteDisplayForDevice,
+  prepareRemoteApplicationCatalogForDevice:
+    remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice,
 }));
 
 vi.mock("../services/ipcSessionService", () => ({
@@ -71,6 +79,9 @@ vi.mock("../services/ipcSessionService", () => ({
 
 beforeEach(() => {
   deviceDataMock.devices = [device()];
+  remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockReset();
+  remoteDisplayLauncherMock.launchRemoteApplicationForDevice.mockReset();
+  remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
 });
 
 describe("DeviceDetailPage info tab", () => {
@@ -104,5 +115,35 @@ describe("DeviceDetailPage info tab", () => {
 
     expect(screen.getByText("设备已禁用，无法传输文件")).toBeInTheDocument();
     expect(screen.queryByText("选择设备以开始传输")).not.toBeInTheDocument();
+  });
+
+  it("shows remote launch failures inline without a blocking browser alert", async () => {
+    remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockRejectedValue(
+      new Error("service route unavailable")
+    );
+    const alertSpy = vi.fn();
+    Object.defineProperty(window, "alert", {
+      configurable: true,
+      writable: true,
+      value: alertSpy,
+    });
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await user.click(screen.getByRole("button", { name: "发起远程连接" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("service route unavailable");
+    });
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    delete (window as unknown as Record<string, unknown>).alert;
   });
 });

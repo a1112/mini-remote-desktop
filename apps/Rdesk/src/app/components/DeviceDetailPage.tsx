@@ -429,7 +429,6 @@ function RemoteTab({ device }: { device: Device }) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Open remote display failed";
       setConnectionError(message);
-      alert(message);
     } finally {
       setLaunching(false);
     }
@@ -502,6 +501,16 @@ function RemoteTab({ device }: { device: Device }) {
           >
             {remoteUnavailableReason ?? "发起远程连接"}
           </button>
+          {connectionError ? (
+            <div
+              role="alert"
+              className={`mt-4 flex items-start gap-2 rounded-lg border px-3 py-2 text-left ${isDark ? "border-red-500/25 bg-red-500/10 text-red-200" : "border-red-200 bg-red-50 text-red-700"}`}
+              style={{ fontSize: 12 }}
+            >
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{connectionError}</span>
+            </div>
+          ) : null}
         </div>
       </div>
     );
