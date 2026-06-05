@@ -6,7 +6,7 @@ use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DisplayMode,
-    DisplayModeChange, LanDiscoverySnapshot, LanPeerInfo, MediaProfile, MediaProfileNegotiation,
+    DisplayModeChange, LanDiscoverySnapshot, MediaProfile, MediaProfileNegotiation,
 };
 #[cfg(test)]
 use mrd_ipc::{MediaSenderTransportSnapshot, MediaStageMetrics};
@@ -68,6 +68,7 @@ mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
 mod peer_format;
+mod peer_registry;
 mod protocol;
 mod runtime_flags;
 mod service_identity;
@@ -187,6 +188,7 @@ use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
+use peer_registry::LanPeerRecord;
 use protocol::{
     DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
     LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
@@ -316,7 +318,7 @@ pub struct LanDiscoveryState {
     instance_id: String,
     running: AtomicBool,
     last_probe_ms: AtomicU64,
-    peers: Mutex<HashMap<String, StoredLanPeer>>,
+    peers: Mutex<HashMap<String, LanPeerRecord>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
     probe_requested: Notify,
     peer_changed: Notify,
@@ -371,7 +373,7 @@ impl LanDiscoveryState {
             return;
         }
 
-        let peer = StoredLanPeer {
+        let peer = LanPeerRecord {
             device_id: announcement.device_id,
             device_name: announcement.device_name,
             device_type: announcement.device_type,
@@ -406,24 +408,7 @@ impl LanDiscoveryState {
             .lock()
             .await
             .values()
-            .map(|peer| {
-                let p2p_control_addr = SocketAddr::new(peer.ip, peer.discovery_port).to_string();
-                LanPeerInfo {
-                    device_id: DeviceId(peer.device_id.clone()),
-                    device_name: peer.device_name.clone(),
-                    device_type: peer.device_type.clone(),
-                    ip: peer.ip.to_string(),
-                    discovery_port: peer.discovery_port,
-                    p2p_control_addr,
-                    transports: peer.transports.clone(),
-                    protocol_version: peer.protocol_version,
-                    service_build_id: peer.service_build_id.clone(),
-                    media_protocol_version: peer.media_protocol_version,
-                    media_capabilities: peer.media_capabilities.clone(),
-                    age_ms: now.saturating_sub(peer.last_seen_ms),
-                    p2p_available: true,
-                }
-            })
+            .map(|peer| peer.to_peer_info(now))
             .collect();
 
         let last_probe = self.last_probe_ms.load(Ordering::Relaxed);
@@ -447,7 +432,7 @@ impl LanDiscoveryState {
             .lock()
             .await
             .get(&device_id.0)
-            .map(|peer| SocketAddr::new(peer.ip, peer.discovery_port))
+            .map(LanPeerRecord::control_addr)
     }
 
     pub async fn peer_transports(&self, device_id: &DeviceId) -> Option<Vec<String>> {
@@ -461,18 +446,11 @@ impl LanDiscoveryState {
 
     pub async fn peer_media_capabilities(&self, device_id: &DeviceId) -> Option<Vec<String>> {
         self.prune_stale_peers().await;
-        self.peers.lock().await.get(&device_id.0).map(|peer| {
-            let mut capabilities = peer.media_capabilities.clone();
-            for transport in &peer.transports {
-                if !capabilities
-                    .iter()
-                    .any(|capability| capability == transport)
-                {
-                    capabilities.push(transport.clone());
-                }
-            }
-            capabilities
-        })
+        self.peers
+            .lock()
+            .await
+            .get(&device_id.0)
+            .map(LanPeerRecord::media_capabilities_with_transports)
     }
 }
 
@@ -480,21 +458,6 @@ impl Default for LanDiscoveryState {
     fn default() -> Self {
         Self::new(LanDiscoveryConfig::default())
     }
-}
-
-#[derive(Debug, Clone)]
-struct StoredLanPeer {
-    device_id: String,
-    device_name: String,
-    device_type: String,
-    ip: IpAddr,
-    discovery_port: u16,
-    transports: Vec<String>,
-    protocol_version: u32,
-    service_build_id: Option<String>,
-    media_protocol_version: Option<u32>,
-    media_capabilities: Vec<String>,
-    last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8403,6 +8366,38 @@ mod tests {
             .expect("peer addr");
 
         assert_eq!(addr.to_string(), "192.168.1.50:21117");
+    }
+
+    #[test]
+    fn peer_registry_record_projects_addr_snapshot_and_capabilities() {
+        let record = super::peer_registry::LanPeerRecord {
+            device_id: "remote-device".to_string(),
+            device_name: "Remote Device".to_string(),
+            device_type: "rdesk".to_string(),
+            ip: "192.168.1.50".parse().unwrap(),
+            discovery_port: 21116,
+            transports: vec!["quic".to_string(), "media.hevc".to_string()],
+            protocol_version: 1,
+            service_build_id: Some("build-a".to_string()),
+            media_protocol_version: Some(3),
+            media_capabilities: vec!["media.hevc".to_string()],
+            last_seen_ms: 1_000,
+        };
+
+        assert_eq!(
+            record.control_addr(),
+            "192.168.1.50:21116".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            record.media_capabilities_with_transports(),
+            vec!["media.hevc".to_string(), "quic".to_string()]
+        );
+
+        let info = record.to_peer_info(1_250);
+        assert_eq!(info.device_id.0, "remote-device");
+        assert_eq!(info.p2p_control_addr, "192.168.1.50:21116");
+        assert_eq!(info.age_ms, 250);
+        assert!(info.p2p_available);
     }
 
     #[tokio::test]
