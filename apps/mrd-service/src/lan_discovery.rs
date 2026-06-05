@@ -23,7 +23,7 @@ use mrd_render::{RenderFrame, RendererSnapshot};
 use mrd_transport_quic_quinn::QuicAuReassemblerConfig;
 use mrd_transport_quic_quinn::{
     fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuFrame,
-    QuicAuReassembler, QuicAuReassemblerStats, QuicMediaCodec, QuicMediaFragment, QuicMediaFrame,
+    QuicAuReassembler, QuicAuReassemblerStats, QuicMediaCodec, QuicMediaFrame,
     QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnServerBootstrap,
     QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN, QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
@@ -52,6 +52,7 @@ use tokio::time::{interval, timeout, Instant};
 mod dynamic_window_fps;
 mod lan_control_input;
 mod media_envelope;
+mod media_keyframe_request;
 mod media_ordering;
 mod media_probe;
 mod media_profile;
@@ -76,6 +77,9 @@ use media_envelope::{
     decode_lan_media_envelope, encode_lan_media_envelope, lan_media_codec_name,
     lan_media_profile_id, LanMediaEnvelope, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC,
     LAN_MEDIA_PAYLOAD_ACCESS_UNIT, LAN_MEDIA_PAYLOAD_PROBE_FRAME,
+};
+use media_keyframe_request::{
+    decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
 };
 use media_ordering::LanMediaFrameOrderer;
 #[cfg(test)]
@@ -204,7 +208,6 @@ const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
 const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 const LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT: &str = "quic_stream_media_v3";
 const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
-const LAN_MEDIA_CONTROL_REQUEST_KEYFRAME: &[u8] = b"request_keyframe";
 const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
@@ -4253,41 +4256,6 @@ fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> b
         || h264_avcc_nal_types(payload)
             .into_iter()
             .any(|nal_type| nal_type == 5)
-}
-
-fn encode_lan_keyframe_request_datagram(
-    profile: &MediaProfile,
-    sequence: u32,
-    max_datagram_size: usize,
-) -> Result<bytes::Bytes> {
-    let fragments = fragment_media_payload_v3(
-        QuicMediaPayloadType::Control,
-        QuicMediaCodec::None,
-        lan_media_profile_id(profile),
-        sequence,
-        now_us(),
-        false,
-        LAN_MEDIA_CONTROL_REQUEST_KEYFRAME,
-        max_datagram_size.max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + 1),
-    )
-    .context("failed to encode LAN keyframe request control datagram")?;
-    fragments
-        .into_iter()
-        .next()
-        .context("LAN keyframe request control datagram encoder produced no fragments")
-}
-
-fn decode_lan_keyframe_request_datagram(datagram: &[u8]) -> Result<bool> {
-    if !is_quic_media_v3_datagram(datagram) {
-        return Ok(false);
-    }
-    let fragment = QuicMediaFragment::decode(datagram)
-        .context("failed to decode LAN media control datagram")?;
-    Ok(fragment.payload_type == QuicMediaPayloadType::Control
-        && fragment.codec == QuicMediaCodec::None
-        && fragment.fragment_index == 0
-        && fragment.fragment_count == 1
-        && fragment.payload.as_ref() == LAN_MEDIA_CONTROL_REQUEST_KEYFRAME)
 }
 
 async fn maybe_send_lan_keyframe_request(
