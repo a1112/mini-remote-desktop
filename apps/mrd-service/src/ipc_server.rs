@@ -7,7 +7,7 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{device, session, transport as transport_handlers},
+    handlers::{device, identity, session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionLifecycleState;
@@ -494,11 +494,12 @@ impl IpcServer {
                 device_id,
                 certificate_fingerprint,
             } => {
-                self.app_state.device_identities.lock().await.upsert(
+                let response = identity::pair_device(
+                    &self.app_state,
                     device_id.clone(),
                     certificate_fingerprint,
-                    "pending",
-                );
+                )
+                .await;
                 self.record_audit_event(
                     "device.pair",
                     "success",
@@ -510,17 +511,11 @@ impl IpcServer {
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                response
             }
 
             IpcRequest::ApprovePairing { device_id } => {
-                self.app_state.device_identities.lock().await.upsert(
-                    device_id.clone(),
-                    None,
-                    "paired",
-                );
+                let response = identity::approve_pairing(&self.app_state, device_id.clone()).await;
                 self.record_audit_event(
                     "device.approve_pairing",
                     "success",
@@ -532,17 +527,11 @@ impl IpcServer {
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                response
             }
 
             IpcRequest::RevokeDevice { device_id } => {
-                self.app_state
-                    .device_identities
-                    .lock()
-                    .await
-                    .revoke(&device_id);
+                let response = identity::revoke_device(&self.app_state, device_id.clone()).await;
                 self.record_audit_event(
                     "device.revoke",
                     "success",
@@ -554,14 +543,12 @@ impl IpcServer {
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                response
             }
 
-            IpcRequest::GetDeviceIdentitySnapshot => IpcResponse::DeviceIdentitySnapshot {
-                snapshot: self.identity_snapshot().await,
-            },
+            IpcRequest::GetDeviceIdentitySnapshot => {
+                identity::get_device_identity_snapshot(&self.app_state).await
+            }
 
             IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
                 bundle: mrd_ipc::TelemetryBundle {
@@ -785,23 +772,6 @@ impl IpcServer {
             .await
             .get_local_device()
             .map(|(device_id, _)| device_id.clone())
-    }
-
-    async fn identity_snapshot(&self) -> mrd_ipc::DeviceIdentitySnapshot {
-        let devices = self.app_state.devices.lock().await;
-        let (local_device_id, display_name) = devices
-            .get_local_device()
-            .map(|(device_id, name)| (Some(device_id.clone()), Some(name.clone())))
-            .unwrap_or((None, None));
-        drop(devices);
-        let paired_devices = self.app_state.device_identities.lock().await.list();
-        mrd_ipc::DeviceIdentitySnapshot {
-            local_device_id,
-            display_name,
-            certificate_fingerprint: None,
-            consent_required: true,
-            paired_devices,
-        }
     }
 
     async fn session_audit_context(
