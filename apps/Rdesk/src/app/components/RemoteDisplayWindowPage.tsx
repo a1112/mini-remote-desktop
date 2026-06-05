@@ -3313,6 +3313,14 @@ export function RemoteDisplayWindowPage() {
     };
   }, [controlInputEnabled, sessionId]);
 
+  useEffect(() => {
+    if (!controlInputEnabled) return;
+    window.addEventListener("blur", releaseRemoteControlInput);
+    return () => {
+      window.removeEventListener("blur", releaseRemoteControlInput);
+    };
+  }, [controlInputEnabled, releaseRemoteControlInput]);
+
   const title = useMemo(() => {
     if (context?.label) return context.label;
     return `display-${sessionId}`;
