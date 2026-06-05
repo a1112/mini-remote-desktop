@@ -15,8 +15,8 @@ use mrd_ipc::render_proxy::{
 };
 use mrd_ipc::{
     AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, MediaAdaptationSnapshot,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, MediaTestImpairmentSnapshot, PairedDeviceIdentity,
+    MediaPipelineSnapshot, MediaProfile, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot, PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -42,7 +42,9 @@ use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
 mod capture_source_registry;
+mod media_profile_registry;
 pub use capture_source_registry::CaptureSourceRegistry;
+pub use media_profile_registry::MediaProfileRegistry;
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
@@ -81,26 +83,6 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Runtime media profile negotiation state keyed by session.
-#[derive(Debug, Default)]
-pub struct MediaProfileRegistry {
-    profiles: HashMap<SessionId, MediaProfileNegotiation>,
-}
-
-impl MediaProfileRegistry {
-    pub fn set(&mut self, session_id: SessionId, negotiation: MediaProfileNegotiation) {
-        self.profiles.insert(session_id, negotiation);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
-        self.profiles.get(session_id).cloned()
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
-        self.profiles.remove(session_id)
-    }
 }
 
 /// Runtime display mode changes keyed by session.
@@ -2990,7 +2972,7 @@ mod tests {
             codec: "h264".to_string(),
             ..mrd_ipc::MediaProfile::default()
         };
-        let negotiation = MediaProfileNegotiation {
+        let negotiation = mrd_ipc::MediaProfileNegotiation {
             requested: profile.clone(),
             selected: profile,
             status: "accepted".to_string(),
