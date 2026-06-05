@@ -156,6 +156,10 @@ impl IpcServer {
                         last_error: snap.last_error.clone(),
                         sender_active: snap.sender_active,
                         receiver_active: snap.receiver_active,
+                        peer_device_id: snap
+                            .target_device_id
+                            .clone()
+                            .or_else(|| snap.source_device_id.clone()),
                     })
                     .collect();
                 IpcResponse::SessionList {
@@ -1326,6 +1330,10 @@ mod tests {
                 assert_eq!(sessions.len(), 1);
                 assert_eq!(sessions[0].session_id, session_id);
                 assert_eq!(sessions[0].role, "controller");
+                assert_eq!(
+                    sessions[0].peer_device_id,
+                    Some(DeviceId("agent".to_string()))
+                );
             }
             _ => panic!("Expected SessionList response"),
         }

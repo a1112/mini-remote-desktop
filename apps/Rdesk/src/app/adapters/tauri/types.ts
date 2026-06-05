@@ -708,6 +708,7 @@ export interface SessionInfo {
   last_error?: string | null;
   sender_active: boolean;
   receiver_active: boolean;
+  peer_device_id?: string | null;
 }
 
 export interface RuntimeSnapshot {

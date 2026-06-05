@@ -1422,6 +1422,9 @@ mod wire {
         pub sender_active: bool,
         /// Whether the media receiver is currently marked active.
         pub receiver_active: bool,
+        /// Peer device associated with this session, from the controller or agent perspective.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub peer_device_id: Option<DeviceId>,
     }
 
     /// Session runtime snapshot DTO (stable IPC contract)

@@ -33,6 +33,11 @@ const actionServiceMock = vi.hoisted(() => ({
   markDeviceRemoved: vi.fn(),
 }));
 
+const sessionServiceMock = vi.hoisted(() => ({
+  listSessions: vi.fn(),
+  stopSession: vi.fn(),
+}));
+
 vi.mock("./ThemeContext", () => ({
   useTheme: () => ({
     isDark: false,
@@ -65,6 +70,11 @@ vi.mock("../services/deviceActionService", () => ({
     setDeviceFavorite: actionServiceMock.setDeviceFavorite,
     markDeviceRemoved: actionServiceMock.markDeviceRemoved,
   },
+}));
+
+vi.mock("../services/ipcSessionService", () => ({
+  listSessions: sessionServiceMock.listSessions,
+  stopSession: sessionServiceMock.stopSession,
 }));
 
 const device = (overrides: Partial<Device>): Device => ({
@@ -127,6 +137,8 @@ describe("Sidebar device actions", () => {
       favorite: false,
       removed: true,
     });
+    sessionServiceMock.listSessions.mockResolvedValue([]);
+    sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
     deviceDataMock.currentDeviceId = "local-device";
     authMock.value = {
@@ -205,6 +217,39 @@ describe("Sidebar device actions", () => {
     expect(deviceDataMock.refresh).toHaveBeenCalled();
     await waitFor(() => {
       expect(screen.getByText("已移除：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("disconnects the active peer session for the selected device", async () => {
+    sessionServiceMock.listSessions.mockResolvedValue([
+      {
+        session_id: "session-1",
+        role: "controller",
+        state: "streaming",
+        transport_kind: "quic",
+        peer_device_id: "agent-device",
+        last_error: null,
+        sender_active: false,
+        receiver_active: true,
+      },
+    ]);
+    const user = userEvent.setup();
+
+    renderSidebar();
+
+    await waitFor(() => {
+      expect(sessionServiceMock.listSessions).toHaveBeenCalled();
+    });
+    openDeviceMenu();
+    const disconnect = screen.getByRole("button", { name: "断开连接" });
+    expect(disconnect).not.toBeDisabled();
+
+    await user.click(disconnect);
+
+    expect(sessionServiceMock.stopSession).toHaveBeenCalledWith("session-1");
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已断开连接：Agent PC")).toBeInTheDocument();
     });
   });
 

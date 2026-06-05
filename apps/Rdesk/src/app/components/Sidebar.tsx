@@ -1,8 +1,13 @@
 import { useDevices } from "./deviceData";
 import { AppVersionBadge } from "./AppVersionBadge";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { deviceService } from "../services/deviceService";
 import { deviceActionService } from "../services/deviceActionService";
+import {
+  listSessions,
+  stopSession,
+  type SessionInfo,
+} from "../services/ipcSessionService";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -75,6 +80,18 @@ type DeviceMenuItem = {
 };
 
 const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
+const terminalSessionStates = new Set(["failed", "closed"]);
+
+function activePeerSessionForDevice(
+  sessions: SessionInfo[],
+  deviceId: string
+): SessionInfo | null {
+  return sessions.find(
+    (session) =>
+      session.peer_device_id === deviceId &&
+      !terminalSessionStates.has(session.state)
+  ) ?? null;
+}
 
 export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
@@ -82,12 +99,21 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const [refreshing, setRefreshing] = useState(false);
   const [submenuOpen, setSubmenuOpen] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<DeviceActionStatus | null>(null);
+  const [sessionSummaries, setSessionSummaries] = useState<SessionInfo[]>([]);
   const actionStatusTimerRef = useRef<number | null>(null);
   const { isLoggedIn, user } = useAuth();
 
+  const refreshSessionSummaries = useCallback(async () => {
+    try {
+      setSessionSummaries(await listSessions());
+    } catch {
+      setSessionSummaries([]);
+    }
+  }, []);
+
   const handleRefresh = async () => {
     setRefreshing(true);
-    await refresh();
+    await Promise.all([refresh(), refreshSessionSummaries()]);
     setTimeout(() => setRefreshing(false), 500);
   };
   const [contextMenu, setContextMenu] = useState<{ deviceId: string; x: number; y: number } | null>(null);
@@ -119,6 +145,10 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
       window.clearTimeout(actionStatusTimerRef.current);
     }
   }, []);
+
+  useEffect(() => {
+    void refreshSessionSummaries();
+  }, [refreshSessionSummaries]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -159,6 +189,9 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
   const contextMenuDevice = contextMenu ? devices.find((d) => d.id === contextMenu.deviceId) : null;
   const isContextOnline = contextMenuDevice?.status === "online";
+  const contextActiveSession = contextMenuDevice
+    ? activePeerSessionForDevice(sessionSummaries, contextMenuDevice.deviceId)
+    : null;
 
   // 重命名设备
   const handleStartRename = (deviceId: string, currentName: string) => {
@@ -261,6 +294,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
   };
 
+  const handleDisconnectDevice = async (sessionId: string, deviceName: string) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      await stopSession(sessionId);
+      await Promise.all([refresh(), refreshSessionSummaries()]);
+      showActionStatus({ kind: "success", message: `已断开连接：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `断开连接失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -344,7 +390,21 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           disabled: !isLoggedIn || !user,
           title: !isLoggedIn || !user ? "请先登录后再退出绑定" : undefined,
         },
-        { icon: Power, label: "断开连接", disabled: true, title: unsupportedDeviceActionTitle, danger: true }
+        {
+          icon: Power,
+          label: "断开连接",
+          action: () => {
+            if (contextMenuDevice && contextActiveSession) {
+              return handleDisconnectDevice(
+                contextActiveSession.session_id,
+                contextMenuDevice.name
+              );
+            }
+          },
+          disabled: !contextActiveSession,
+          title: contextActiveSession ? undefined : "没有可断开的活跃会话",
+          danger: true,
+        }
       );
     }
 
