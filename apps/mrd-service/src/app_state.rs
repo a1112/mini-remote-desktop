@@ -39,6 +39,7 @@ mod peer_media_capability_registry;
 mod platform_surface_renderer;
 mod probe_registry;
 mod session_registry;
+mod shell_state;
 pub use audit_log_registry::AuditLogRegistry;
 pub use capability_snapshot_registry::CapabilitySnapshotRegistry;
 pub use capture_source_registry::CaptureSourceRegistry;
@@ -64,28 +65,9 @@ pub(crate) use platform_surface_renderer::{
 };
 pub use probe_registry::{DecodedVideoFrameStats, MediaProbeFrameStats, ProbeRegistry};
 pub use session_registry::SessionRegistry;
+pub use shell_state::{ShellState, TrayPortRef};
 
 const AUDIT_EVENT_LIMIT: usize = 1_000;
-
-/// Shell state - tracks UI presence and service lifecycle
-#[derive(Debug, Default)]
-pub struct ShellState {
-    /// UI process PID if attached
-    pub ui_pid: Option<u32>,
-    /// UI executable path for relaunch
-    pub ui_executable_path: Option<String>,
-    /// Tray availability (platform-dependent)
-    pub tray_available: bool,
-    /// Autostart enabled state (None if not supported)
-    pub autostart_enabled: Option<bool>,
-    /// Active session count (for tray display)
-    pub active_session_count: usize,
-    /// Last error message
-    pub last_error: Option<String>,
-}
-
-/// Tray port - abstracts platform-specific tray implementation
-pub type TrayPortRef = Arc<std::sync::Mutex<dyn crate::shell::TrayPort + Send + Sync>>;
 
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
