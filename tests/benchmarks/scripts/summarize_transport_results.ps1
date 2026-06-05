@@ -166,7 +166,10 @@ $headers = @(
   'render_queue_replacements','render_stale_frame_drops',
   'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate',
   'swap_chain_max_frame_latency','swap_chain_allow_tearing',
-  'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority',
+  'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority','render_pixel_format',
+  'color_mode','color_pipeline',
+  'nvdec_shared_copy_attempts','nvdec_shared_copy_successes','nvdec_shared_copy_failures',
+  'nvdec_shared_copy_last_stage','nvdec_shared_copy_last_api','nvdec_shared_copy_last_error',
   'failure_reason','run_skipped','run_passed'
 )
 $row = [pscustomobject]@{}
@@ -230,6 +233,15 @@ $report = @(
   "| swap_chain_present_mode | $($summary.swap_chain_present_mode) |",
   "| display_refresh_hz | $($summary.display_refresh_hz) |",
   "| render_thread_priority | $($summary.render_thread_priority) |",
+  "| render_pixel_format | $($summary.render_pixel_format) |",
+  "| color_mode | $($summary.color_mode) |",
+  "| color_pipeline | $($summary.color_pipeline) |",
+  "| nvdec_shared_copy_attempts | $($summary.nvdec_shared_copy_attempts) |",
+  "| nvdec_shared_copy_successes | $($summary.nvdec_shared_copy_successes) |",
+  "| nvdec_shared_copy_failures | $($summary.nvdec_shared_copy_failures) |",
+  "| nvdec_shared_copy_last_stage | $($summary.nvdec_shared_copy_last_stage) |",
+  "| nvdec_shared_copy_last_api | $($summary.nvdec_shared_copy_last_api) |",
+  "| nvdec_shared_copy_last_error | $($summary.nvdec_shared_copy_last_error) |",
   "| keyframes | $($summary.keyframes) |",
   "| dropped_frames | $($summary.dropped_frames) |",
   "| quic_receiver_completed_frames | $($summary.quic_receiver_completed_frames) |",

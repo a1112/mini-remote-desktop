@@ -13,8 +13,8 @@ use anyhow::Result;
 use base64::Engine;
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FramePixelFormat,
-    VideoEncoder,
+    CapturedFrame, ColorMode, ColorPipeline, DecodedFrame, DecodedFrameData, EncodedAccessUnit,
+    FramePixelFormat, VideoEncoder,
 };
 use mrd_render::{RenderFrame, RendererFactory};
 use mrd_test_telemetry as telemetry;
@@ -100,6 +100,8 @@ pub struct TestConfigData {
     )]
     pub renderer_target_hwnd: Option<isize>,
     pub zero_copy: Option<bool>,
+    pub color_mode: Option<ColorMode>,
+    pub color_pipeline: Option<ColorPipeline>,
     pub transport_kind: Option<String>,
     pub resolution: Option<[usize; 2]>,
     pub fps: Option<u32>,
@@ -3251,6 +3253,7 @@ fn validate_scenario_for_current_platform(
             os_type
         );
     }
+    validate_color_config_for_encoder_type(encoder_type, config)?;
 
     let decoder_type = config.decoder_type.as_deref().unwrap_or("software");
     if !decoder_supported_on_current_platform(decoder_type) {
@@ -3303,6 +3306,67 @@ fn validate_scenario_for_current_platform(
     }
 
     Ok(())
+}
+
+fn validate_color_config_for_encoder_type(
+    encoder_type: &str,
+    config: &TestConfigData,
+) -> Result<()> {
+    let color_mode = config.color_mode.unwrap_or_default();
+    if color_mode != ColorMode::Full && !encoder_type_supports_non_full_color_mode(encoder_type) {
+        anyhow::bail!(
+            "color_mode={} requires Windows D3D11 NVENC H.264/HEVC GPU color transform; encoder {} is not supported",
+            color_mode.as_str(),
+            encoder_type_label(encoder_type)
+        );
+    }
+
+    let color_pipeline = config.color_pipeline.unwrap_or_default();
+    if color_pipeline == ColorPipeline::HdrMain10
+        && !encoder_type_supports_hdr_main10_pipeline(encoder_type)
+    {
+        anyhow::bail!(
+            "color_pipeline={} requires NVENC HEVC Main10; encoder {} is not supported",
+            color_pipeline.as_str(),
+            encoder_type_label(encoder_type)
+        );
+    }
+
+    Ok(())
+}
+
+fn encoder_type_supports_non_full_color_mode(encoder_type: &str) -> bool {
+    cfg!(windows)
+        && matches!(
+            encoder_type,
+            "nvenc_h264"
+                | "nvenc_hevc"
+                | "nvenc_hevc_main10"
+                | "hevc"
+                | "hevc_main10"
+                | "hevc-main10"
+        )
+}
+
+fn encoder_type_supports_hdr_main10_pipeline(encoder_type: &str) -> bool {
+    matches!(
+        encoder_type,
+        "nvenc_hevc_main10" | "hevc_main10" | "hevc-main10"
+    )
+}
+
+fn encoder_type_label(encoder_type: &str) -> &'static str {
+    match encoder_type {
+        "none" => "none",
+        "nvenc_h264" => "NVENC H.264",
+        "nvenc_hevc" | "hevc" => "NVENC HEVC",
+        "nvenc_hevc_main10" | "hevc_main10" | "hevc-main10" => "NVENC HEVC Main10",
+        "nvenc_av1" => "NVENC AV1",
+        "openh264" | "software_h264" | "h264_software" | "software-h264" | "h264-software"
+        | "sw_h264" => "OpenH264",
+        "videotoolbox_h264" | "videotoolbox" => "VideoToolbox H.264",
+        _ => "unknown encoder",
+    }
 }
 
 fn videotoolbox_decoder_enabled() -> bool {
@@ -4004,6 +4068,8 @@ fn harness_config_from_data(config: &TestConfigData) -> HarnessConfig {
         },
         renderer_target_hwnd: config.renderer_target_hwnd,
         zero_copy: config.zero_copy,
+        color_mode: config.color_mode,
+        color_pipeline: config.color_pipeline,
         pace_to_fps: None,
         input_source: config.input_source.clone(),
         source_id: config.source_id.clone(),
@@ -5050,6 +5116,22 @@ mod tests {
     }
 
     #[test]
+    fn harness_config_passes_color_mode_and_pipeline() {
+        let config = TestConfigData {
+            color_mode: Some(ColorMode::Monochrome),
+            color_pipeline: Some(ColorPipeline::HdrMain10),
+            ..Default::default()
+        };
+        let harness_config = harness_config_from_data(&config);
+
+        assert_eq!(harness_config.color_mode, Some(ColorMode::Monochrome));
+        assert_eq!(
+            harness_config.color_pipeline,
+            Some(ColorPipeline::HdrMain10)
+        );
+    }
+
+    #[test]
     fn harness_config_passes_visual_preview_flag() {
         let config = TestConfigData {
             visual_preview: Some(false),
@@ -5240,6 +5322,46 @@ mod tests {
 
         validate_scenario_for_current_platform("matrix", &config)
             .expect("NVENC AV1 should accept D3D11 shared input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_validation_rejects_nvenc_av1_non_full_color_mode() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("nvenc_av1".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            color_mode: Some(ColorMode::Grayscale),
+            ..Default::default()
+        };
+
+        let error = validate_scenario_for_current_platform("matrix", &config)
+            .expect_err("NVENC AV1 should not accept non-full GPU color modes yet");
+
+        assert!(error.to_string().contains("NVENC AV1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn color_validation_rejects_hdr_main10_without_hevc_main10() {
+        let config = TestConfigData {
+            capture_type: Some("dxgi".to_string()),
+            encoder_type: Some("nvenc_h264".to_string()),
+            decoder_type: Some("nvdec".to_string()),
+            renderer_type: Some("d3d11".to_string()),
+            render_display: Some(true),
+            zero_copy: Some(true),
+            color_pipeline: Some(ColorPipeline::HdrMain10),
+            ..Default::default()
+        };
+
+        let error = validate_scenario_for_current_platform("matrix", &config)
+            .expect_err("HDR Main10 should require NVENC HEVC Main10");
+
+        assert!(error.to_string().contains("HEVC Main10"));
     }
 
     #[cfg(windows)]

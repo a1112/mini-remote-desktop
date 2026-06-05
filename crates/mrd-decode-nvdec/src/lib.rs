@@ -210,6 +210,14 @@ pub struct NvdecDiagnostics {
     pub last_support_chroma_format: Option<i32>,
     pub last_support_decision: Option<String>,
     pub last_support_reason: Option<String>,
+    pub shared_copy_attempts: usize,
+    pub shared_copy_successes: usize,
+    pub shared_copy_failures: usize,
+    pub last_shared_copy_stage: Option<String>,
+    pub last_shared_copy_api: Option<String>,
+    pub last_shared_copy_code: Option<i32>,
+    pub last_shared_copy_error_name: Option<String>,
+    pub last_shared_copy_error_description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +229,74 @@ pub struct NvdecCapabilityProbe {
     pub runtime_reason: String,
     pub wired_supported: bool,
     pub wired_reason: String,
+}
+
+impl NvdecDiagnostics {
+    fn record_shared_copy_attempt(&mut self) {
+        self.shared_copy_attempts = self.shared_copy_attempts.saturating_add(1);
+    }
+
+    fn record_shared_copy_success(&mut self) {
+        self.shared_copy_successes = self.shared_copy_successes.saturating_add(1);
+    }
+
+    fn record_shared_copy_failure(
+        &mut self,
+        stage: &'static str,
+        api: &'static str,
+        code: Option<i32>,
+        error_name: Option<String>,
+        description: Option<String>,
+    ) {
+        self.shared_copy_failures = self.shared_copy_failures.saturating_add(1);
+        self.last_shared_copy_stage = Some(stage.to_string());
+        self.last_shared_copy_api = Some(api.to_string());
+        self.last_shared_copy_code = code;
+        self.last_shared_copy_error_name = error_name;
+        self.last_shared_copy_error_description = description;
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::NvdecDiagnostics;
+
+    #[test]
+    fn shared_copy_diagnostics_record_attempt_success_and_failure() {
+        let mut diagnostics = NvdecDiagnostics::default();
+
+        diagnostics.record_shared_copy_attempt();
+        diagnostics.record_shared_copy_failure(
+            "register",
+            "cuGraphicsD3D11RegisterResource",
+            Some(999),
+            Some("CUDA_ERROR_UNKNOWN".to_string()),
+            Some("unknown interop failure".to_string()),
+        );
+        diagnostics.record_shared_copy_attempt();
+        diagnostics.record_shared_copy_success();
+
+        assert_eq!(diagnostics.shared_copy_attempts, 2);
+        assert_eq!(diagnostics.shared_copy_successes, 1);
+        assert_eq!(diagnostics.shared_copy_failures, 1);
+        assert_eq!(
+            diagnostics.last_shared_copy_stage.as_deref(),
+            Some("register")
+        );
+        assert_eq!(
+            diagnostics.last_shared_copy_api.as_deref(),
+            Some("cuGraphicsD3D11RegisterResource")
+        );
+        assert_eq!(diagnostics.last_shared_copy_code, Some(999));
+        assert_eq!(
+            diagnostics.last_shared_copy_error_name.as_deref(),
+            Some("CUDA_ERROR_UNKNOWN")
+        );
+        assert_eq!(
+            diagnostics.last_shared_copy_error_description.as_deref(),
+            Some("unknown interop failure")
+        );
+    }
 }
 
 pub struct NvdecDecoder {
@@ -1882,6 +1958,39 @@ mod imp {
             ));
         }
 
+        fn record_shared_copy_failure_code(
+            &mut self,
+            stage: &'static str,
+            api: &'static str,
+            code: CUresult,
+            context: Option<String>,
+        ) {
+            let (name, description) =
+                describe_cuda_error(self.cu_get_error_name, self.cu_get_error_string, code);
+            self.diagnostics.record_shared_copy_failure(
+                stage,
+                api,
+                Some(code),
+                name,
+                description.or(context),
+            );
+        }
+
+        fn record_shared_copy_failure_text(
+            &mut self,
+            stage: &'static str,
+            api: &'static str,
+            description: &'static str,
+        ) {
+            self.diagnostics.record_shared_copy_failure(
+                stage,
+                api,
+                None,
+                None,
+                Some(description.to_string()),
+            );
+        }
+
         /// Attempt GPU zero-copy from CUDA decoded frame to D3D11 shared texture
         /// Returns true if successful, false if fallback to CPU path is needed
         #[allow(clippy::too_many_arguments)]
@@ -1899,27 +2008,69 @@ mod imp {
             // Check if all required CUDA-D3D11 interop functions are available
             let register_fn = match self.cu_graphics_d3d11_register_resource {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuGraphicsD3D11RegisterResource",
+                        "CUDA-D3D11 interop register function unavailable",
+                    );
+                    return false;
+                }
             };
             let unregister_fn = match self.cu_graphics_unregister_resource {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuGraphicsUnregisterResource",
+                        "CUDA graphics unregister function unavailable",
+                    );
+                    return false;
+                }
             };
             let map_fn = match self.cu_graphics_map_resources {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuGraphicsMapResources",
+                        "CUDA graphics map function unavailable",
+                    );
+                    return false;
+                }
             };
             let unmap_fn = match self.cu_graphics_unmap_resources {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuGraphicsUnmapResources",
+                        "CUDA graphics unmap function unavailable",
+                    );
+                    return false;
+                }
             };
             let get_array_fn = match self.cu_graphics_sub_resource_get_mapped_array {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuGraphicsSubResourceGetMappedArray",
+                        "CUDA graphics mapped array function unavailable",
+                    );
+                    return false;
+                }
             };
             let copy_fn = match self.cu_memcpy_2d {
                 Some(f) => f,
-                None => return false,
+                None => {
+                    self.record_shared_copy_failure_text(
+                        "capability",
+                        "cuMemcpy2D_v2",
+                        "CUDA 2D copy function unavailable",
+                    );
+                    return false;
+                }
             };
 
             // Register D3D11 textures with CUDA if not already registered
@@ -1933,6 +2084,12 @@ mod imp {
                     )
                 };
                 if result != CUDA_SUCCESS {
+                    self.record_shared_copy_failure_code(
+                        "register",
+                        "cuGraphicsD3D11RegisterResource:Y",
+                        result,
+                        None,
+                    );
                     return false;
                 }
                 self.cuda_resource_y = Some(resource_y);
@@ -1952,6 +2109,12 @@ mod imp {
                     if let Some(res) = self.cuda_resource_y.take() {
                         let _ = unsafe { unregister_fn(res) };
                     }
+                    self.record_shared_copy_failure_code(
+                        "register",
+                        "cuGraphicsD3D11RegisterResource:UV",
+                        result,
+                        None,
+                    );
                     return false;
                 }
                 self.cuda_resource_uv = Some(resource_uv);
@@ -1965,6 +2128,12 @@ mod imp {
             // Map resources for CUDA access
             let map_result = unsafe { map_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
             if map_result != CUDA_SUCCESS {
+                self.record_shared_copy_failure_code(
+                    "map",
+                    "cuGraphicsMapResources",
+                    map_result,
+                    None,
+                );
                 return false;
             }
 
@@ -1973,6 +2142,12 @@ mod imp {
                 unsafe { get_array_fn(&mut y_array, self.cuda_resource_y.unwrap(), 0, 0) };
             if y_array_result != CUDA_SUCCESS {
                 unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                self.record_shared_copy_failure_code(
+                    "array",
+                    "cuGraphicsSubResourceGetMappedArray:Y",
+                    y_array_result,
+                    None,
+                );
                 return false;
             }
 
@@ -1981,6 +2156,12 @@ mod imp {
                 unsafe { get_array_fn(&mut uv_array, self.cuda_resource_uv.unwrap(), 0, 0) };
             if uv_array_result != CUDA_SUCCESS {
                 unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                self.record_shared_copy_failure_code(
+                    "array",
+                    "cuGraphicsSubResourceGetMappedArray:UV",
+                    uv_array_result,
+                    None,
+                );
                 return false;
             }
 
@@ -2005,6 +2186,7 @@ mod imp {
             let copy_result = unsafe { copy_fn(&copy_y) };
             if copy_result != CUDA_SUCCESS {
                 unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                self.record_shared_copy_failure_code("copy", "cuMemcpy2D_v2:Y", copy_result, None);
                 return false;
             }
 
@@ -2029,14 +2211,28 @@ mod imp {
             let copy_result_uv = unsafe { copy_fn(&copy_uv) };
             if copy_result_uv != CUDA_SUCCESS {
                 unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+                self.record_shared_copy_failure_code(
+                    "copy",
+                    "cuMemcpy2D_v2:UV",
+                    copy_result_uv,
+                    None,
+                );
                 return false;
             }
 
             // Unmap resources
-            unsafe {
-                unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut());
-            };
+            let unmap_result = unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
+            if unmap_result != CUDA_SUCCESS {
+                self.record_shared_copy_failure_code(
+                    "unmap",
+                    "cuGraphicsUnmapResources",
+                    unmap_result,
+                    None,
+                );
+                return false;
+            }
 
+            self.diagnostics.record_shared_copy_success();
             true
         }
     }
@@ -2339,6 +2535,7 @@ mod imp {
 
         // Try GPU zero-copy if shared texture mode is enabled
         let gpu_copy_success = if state.use_shared_texture {
+            state.diagnostics.record_shared_copy_attempt();
             if let (Some(d3d11_y), Some(d3d11_uv)) =
                 (state.d3d11_y_texture_ptr, state.d3d11_uv_texture_ptr)
             {
@@ -2354,6 +2551,11 @@ mod imp {
                     surface_kind,
                 )
             } else {
+                state.record_shared_copy_failure_text(
+                    "resource",
+                    "d3d11-shared-texture",
+                    "D3D11 shared output textures were not initialized",
+                );
                 false
             }
         } else {

@@ -59,6 +59,16 @@ if (@($scenario.PSObject.Properties.Name) -contains "pace_to_fps") {
 } else {
   Remove-Item Env:MRD_BENCH_PACE_TO_FPS -ErrorAction SilentlyContinue
 }
+if (@($scenario.PSObject.Properties.Name) -contains "color_mode") {
+  $env:MRD_BENCH_COLOR_MODE = [string]$scenario.color_mode
+} else {
+  Remove-Item Env:MRD_BENCH_COLOR_MODE -ErrorAction SilentlyContinue
+}
+if (@($scenario.PSObject.Properties.Name) -contains "color_pipeline") {
+  $env:MRD_BENCH_COLOR_PIPELINE = [string]$scenario.color_pipeline
+} else {
+  Remove-Item Env:MRD_BENCH_COLOR_PIPELINE -ErrorAction SilentlyContinue
+}
 $sourceEnvironment = Get-TransportMatrixSourceEnvironment -Scenario $scenario
 foreach ($key in @("MRD_BENCH_SOURCE_ID", "MRD_BENCH_DISPLAY_ID")) {
   if ($sourceEnvironment.ContainsKey($key)) {

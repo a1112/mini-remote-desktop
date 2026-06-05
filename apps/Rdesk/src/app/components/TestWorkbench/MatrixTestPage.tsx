@@ -74,6 +74,10 @@ function isVvcEncoder(encoder?: TestConfig["encoder_type"]): boolean {
   return encoder === "software_vvc";
 }
 
+function isNonFullColorMode(colorMode?: TestConfig["color_mode"] | null): boolean {
+  return Boolean(colorMode && colorMode !== "full");
+}
+
 const MATRIX_DIMENSIONS: MatrixDimension[] = [
   {
     id: "capture",
@@ -164,6 +168,24 @@ const MATRIX_DIMENSIONS: MatrixDimension[] = [
     options: [
       { id: "cpu", name: "CPU", enabled: true },
       { id: "d3d11_shared", name: "D3D11 shared texture", enabled: false },
+    ],
+  },
+  {
+    id: "color_mode",
+    name: "色彩模式",
+    options: [
+      { id: "full", name: "Full color", enabled: true },
+      { id: "grayscale", name: "Grayscale", enabled: false },
+      { id: "monochrome", name: "Monochrome", enabled: false },
+      { id: "low_chroma", name: "Low chroma", enabled: false },
+    ],
+  },
+  {
+    id: "color_pipeline",
+    name: "色彩管线",
+    options: [
+      { id: "sdr8", name: "SDR 8-bit", enabled: true },
+      { id: "hdr_main10", name: "HDR Main10", enabled: false },
     ],
   },
   {
@@ -479,6 +501,12 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
       case "memory":
         config.zero_copy = option.id === "d3d11_shared";
         break;
+      case "color_mode":
+        config.color_mode = option.id as TestConfig["color_mode"];
+        break;
+      case "color_pipeline":
+        config.color_pipeline = option.id as TestConfig["color_pipeline"];
+        break;
       case "resolution": {
         const [w, h] = option.id.split("x").map(Number);
         if (w && h) {
@@ -507,6 +535,8 @@ function buildConfig(options: SelectedMatrixOption[]): TestConfig {
   config.transport_kind ??= "loopback";
   config.render_display ??= false;
   config.zero_copy ??= false;
+  config.color_mode ??= "full";
+  config.color_pipeline ??= "sdr8";
   config.bitrate ??= 5000000;
   config.duration_ms ??= 5000;
   config.warmup_ms = 1000;
@@ -610,6 +640,33 @@ function slowestPipelineStage(summary: TestRunSummary): readonly [string, number
 }
 
 function unsupportedMatrixReason(config: TestConfig): string | null {
+  if (
+    isNonFullColorMode(config.color_mode) &&
+    !config.zero_copy
+  ) {
+    return "GPU color modes require D3D11 shared texture memory";
+  }
+  if (
+    isNonFullColorMode(config.color_mode) &&
+    config.capture_type !== "dxgi" &&
+    config.capture_type !== "winrt"
+  ) {
+    return "GPU color modes require DXGI or WinRT shared capture";
+  }
+  if (
+    isNonFullColorMode(config.color_mode) &&
+    config.encoder_type !== "nvenc_h264" &&
+    config.encoder_type !== "nvenc_hevc" &&
+    config.encoder_type !== "nvenc_hevc_main10"
+  ) {
+    return "GPU color modes require NVENC H.264/HEVC encoders";
+  }
+  if (
+    config.color_pipeline === "hdr_main10" &&
+    config.encoder_type !== "nvenc_hevc_main10"
+  ) {
+    return "HDR Main10 color pipeline requires NVENC HEVC Main10";
+  }
   if (
     config.zero_copy &&
     config.capture_type !== "dxgi" &&
@@ -924,6 +981,8 @@ function matrixConfigKey(config: TestConfig): string {
     renderer_type: config.renderer_type,
     render_display: config.render_display,
     zero_copy: config.zero_copy,
+    color_mode: config.color_mode,
+    color_pipeline: config.color_pipeline,
     adaptive_media: config.adaptive_media,
     dynamic_resolution_enabled: config.dynamic_resolution_enabled,
     resolution: config.resolution,
@@ -943,6 +1002,8 @@ function crossDeviceMatrixKey(config: TestConfig): string {
     resolution: config.resolution,
     fps: config.fps,
     bitrate: config.bitrate,
+    color_mode: config.color_mode,
+    color_pipeline: config.color_pipeline,
     duration_ms: config.duration_ms,
   });
 }
@@ -959,7 +1020,11 @@ function createCrossDeviceMatrixTests(matrixTests: MatrixTest[]): MatrixTest[] {
       ...test,
       id: `cross_device_${tests.length}`,
       status: "pending",
-      skipReason: test.skipReason ?? crossDeviceUnsupportedTransportReason(test.config) ?? undefined,
+      skipReason:
+        test.skipReason ??
+        crossDeviceUnsupportedColorReason(test.config) ??
+        crossDeviceUnsupportedTransportReason(test.config) ??
+        undefined,
       failureReason: undefined,
       result: undefined,
       duration: undefined,
@@ -974,6 +1039,12 @@ function crossDeviceTransportFromConfig(config: TestConfig): "quic" | "webrtc" |
     return config.transport_kind;
   }
   return null;
+}
+
+function crossDeviceUnsupportedColorReason(config: TestConfig): string | null {
+  return isNonFullColorMode(config.color_mode)
+    ? "Cross-device matrix does not wire GPU color modes yet"
+    : null;
 }
 
 function crossDeviceUnsupportedTransportReason(config: TestConfig): string | null {
@@ -1343,9 +1414,57 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
         optionId === "d3d11_shared" &&
         isOptionEnabled(next, "memory", "d3d11_shared")
       ) {
+        next = setOptionEnabled(next, "memory", "cpu", false);
         next = setOptionEnabled(next, "renderer", "d3d11", true);
         next = setOptionEnabled(next, "renderer", "opengl", false);
         next = setOptionEnabled(next, "renderer", "renderer_none", false);
+      }
+
+      if (
+        dimensionId === "memory" &&
+        optionId === "cpu" &&
+        isOptionEnabled(next, "memory", "cpu")
+      ) {
+        next = setOptionEnabled(next, "memory", "d3d11_shared", false);
+      }
+
+      if (
+        dimensionId === "color_mode" &&
+        optionId !== "full" &&
+        isOptionEnabled(next, "color_mode", optionId)
+      ) {
+        next = setOptionEnabled(next, "color_mode", "full", false);
+        next = setOptionEnabled(next, "memory", "cpu", false);
+        next = setOptionEnabled(next, "memory", "d3d11_shared", true);
+        next = setOptionEnabled(next, "renderer", "d3d11", true);
+        next = setOptionEnabled(next, "renderer", "opengl", false);
+        next = setOptionEnabled(next, "renderer", "renderer_none", false);
+      }
+
+      if (
+        dimensionId === "color_mode" &&
+        optionId === "full" &&
+        isOptionEnabled(next, "color_mode", "full")
+      ) {
+        next = setOptionEnabled(next, "color_mode", "grayscale", false);
+        next = setOptionEnabled(next, "color_mode", "monochrome", false);
+        next = setOptionEnabled(next, "color_mode", "low_chroma", false);
+      }
+
+      if (
+        dimensionId === "color_pipeline" &&
+        optionId === "hdr_main10" &&
+        isOptionEnabled(next, "color_pipeline", "hdr_main10")
+      ) {
+        next = setOptionEnabled(next, "color_pipeline", "sdr8", false);
+      }
+
+      if (
+        dimensionId === "color_pipeline" &&
+        optionId === "sdr8" &&
+        isOptionEnabled(next, "color_pipeline", "sdr8")
+      ) {
+        next = setOptionEnabled(next, "color_pipeline", "hdr_main10", false);
       }
 
       if (
@@ -2230,7 +2349,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
       {/* Test Results Grid */}
       {tests.length > 0 && (
         <div className="bg-card rounded-lg border overflow-x-auto">
-          <table className="w-full min-w-[1840px]">
+          <table className="w-full min-w-[2040px]">
             <thead className="bg-muted">
               <tr>
                 <th className="px-4 py-2 text-left text-sm font-medium">状态</th>
@@ -2245,6 +2364,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                 <th className="px-4 py-2 text-left text-sm font-medium">自适应</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Pipeline FPS</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Memory</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">色彩</th>
+                <th className="px-4 py-2 text-left text-sm font-medium">管线</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Encode P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Transport P95</th>
                 <th className="px-4 py-2 text-left text-sm font-medium">Decode P95</th>
@@ -2329,6 +2450,8 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
                   <td className="px-4 py-2 text-sm">
                     {test.config.zero_copy ? "d3d11_shared" : "cpu"}
                   </td>
+                  <td className="px-4 py-2 text-sm">{test.config.color_mode ?? "full"}</td>
+                  <td className="px-4 py-2 text-sm">{test.config.color_pipeline ?? "sdr8"}</td>
                   <td className="px-4 py-2 text-sm">
                     {formatMs(test.result?.encode_latency_p95)}
                   </td>
@@ -2348,7 +2471,7 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
               ))}
               {hiddenResultRows > 0 && (
                 <tr>
-                  <td colSpan={16} className="px-4 py-3 text-center text-sm text-muted-foreground">
+                  <td colSpan={19} className="px-4 py-3 text-center text-sm text-muted-foreground">
                     仅显示前 {MAX_MATRIX_RENDER_ROWS} 条结果，剩余 {hiddenResultRows} 条仍会按顺序执行。
                   </td>
                 </tr>

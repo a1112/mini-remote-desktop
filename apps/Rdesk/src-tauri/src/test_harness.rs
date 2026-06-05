@@ -32,11 +32,12 @@ use mrd_encode_openh264::OpenH264Encoder;
 use mrd_encode_vvenc::VvencSoftwareEncoder;
 use mrd_observability::PipelineComparisonResult;
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, EncodedAccessUnit, FrameCapture,
-    FramePixelFormat, PipelineError, VideoCodec, VideoDecoder, VideoEncoder,
+    CapturedFrame, ColorMode, ColorPipeline, DecodedFrame, DecodedFrameData, EncodedAccessUnit,
+    FrameCapture, FramePixelFormat, PipelineError, VideoCodec, VideoDecoder, VideoEncoder,
 };
 use mrd_render::{
-    RenderFrame, RenderFrameData, RenderTarget, RendererFactory, RendererInstance, RendererSnapshot,
+    RenderFrame, RenderFrameData, RenderPixelFormat, RenderTarget, RendererFactory,
+    RendererInstance, RendererSnapshot,
 };
 #[cfg(target_os = "macos")]
 use mrd_render_macos::MacosRendererFactory;
@@ -198,6 +199,8 @@ pub struct TestConfig {
     pub renderer_target_hwnd: Option<isize>,
     pub transport: Option<TransportKind>,
     pub zero_copy: Option<bool>,
+    pub color_mode: Option<ColorMode>,
+    pub color_pipeline: Option<ColorPipeline>,
     pub pace_to_fps: Option<bool>,
     pub input_source: Option<String>,
     pub source_id: Option<String>,
@@ -216,6 +219,8 @@ impl Default for TestConfig {
             renderer_target_hwnd: None,
             transport: None,
             zero_copy: None,
+            color_mode: None,
+            color_pipeline: None,
             pace_to_fps: None,
             input_source: None,
             source_id: None,
@@ -421,6 +426,15 @@ pub struct HarnessMetrics {
     pub swap_chain_present_mode: Option<String>,
     pub display_refresh_hz: Option<u32>,
     pub render_thread_priority: Option<String>,
+    pub render_pixel_format: Option<String>,
+    pub color_mode: Option<String>,
+    pub color_pipeline: Option<String>,
+    pub nvdec_shared_copy_attempts: u64,
+    pub nvdec_shared_copy_successes: u64,
+    pub nvdec_shared_copy_failures: u64,
+    pub nvdec_shared_copy_last_stage: Option<String>,
+    pub nvdec_shared_copy_last_api: Option<String>,
+    pub nvdec_shared_copy_last_error: Option<String>,
     pub render_present_gap_avg_ms: f64,
     pub render_present_gap_p50_ms: f64,
     pub render_present_gap_p95_ms: f64,
@@ -534,6 +548,15 @@ impl Default for HarnessMetrics {
             swap_chain_present_mode: None,
             display_refresh_hz: None,
             render_thread_priority: None,
+            render_pixel_format: None,
+            color_mode: Some(ColorMode::Full.as_str().to_string()),
+            color_pipeline: Some(ColorPipeline::Sdr8.as_str().to_string()),
+            nvdec_shared_copy_attempts: 0,
+            nvdec_shared_copy_successes: 0,
+            nvdec_shared_copy_failures: 0,
+            nvdec_shared_copy_last_stage: None,
+            nvdec_shared_copy_last_api: None,
+            nvdec_shared_copy_last_error: None,
             render_present_gap_avg_ms: 0.0,
             render_present_gap_p50_ms: 0.0,
             render_present_gap_p95_ms: 0.0,
@@ -802,6 +825,19 @@ impl PipelineDecoder {
             Self::VideoToolbox(decoder) => decoder.drain_decoded_frames(),
         }
     }
+
+    fn nvdec_shared_copy_stats(&self) -> Option<NvdecSharedCopyStats> {
+        match self {
+            Self::Nvdec(decoder) => Some(NvdecSharedCopyStats::from_diagnostics(
+                decoder.diagnostics(),
+            )),
+            Self::Software(_)
+            | Self::LinuxH264(_)
+            | Self::LinuxHevc(_)
+            | Self::LinuxHevcMain10(_)
+            | Self::VideoToolbox(_) => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -824,6 +860,33 @@ struct RenderPacingCounters {
     swap_chain_present_mode: Option<String>,
     display_refresh_hz: Option<u32>,
     render_thread_priority: Option<String>,
+    render_pixel_format: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NvdecSharedCopyStats {
+    attempts: u64,
+    successes: u64,
+    failures: u64,
+    last_stage: Option<String>,
+    last_api: Option<String>,
+    last_error: Option<String>,
+}
+
+impl NvdecSharedCopyStats {
+    fn from_diagnostics(diagnostics: mrd_decode_nvdec::NvdecDiagnostics) -> Self {
+        let last_error = diagnostics
+            .last_shared_copy_error_name
+            .or(diagnostics.last_shared_copy_error_description);
+        Self {
+            attempts: diagnostics.shared_copy_attempts as u64,
+            successes: diagnostics.shared_copy_successes as u64,
+            failures: diagnostics.shared_copy_failures as u64,
+            last_stage: diagnostics.last_shared_copy_stage,
+            last_api: diagnostics.last_shared_copy_api,
+            last_error,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1899,6 +1962,12 @@ impl TestHarness {
             let mut m = metrics.lock().unwrap();
             *m = HarnessMetrics::default();
             m.is_running = true;
+            m.color_mode = Some(resolved_color_mode(&config).as_str().to_string());
+            m.color_pipeline = Some(
+                resolved_color_pipeline(&chain, &config)
+                    .as_str()
+                    .to_string(),
+            );
         }
 
         running.store(true, Ordering::Relaxed);
@@ -1982,18 +2051,16 @@ impl TestHarness {
     }
 
     fn initialize_components(chain: &TestChain, config: &TestConfig) -> Result<PipelineState> {
-        let use_shared_texture_decode = config.zero_copy.unwrap_or(false);
-        if use_shared_texture_decode && !chain_allows_zero_copy_capture(chain) {
-            return Err(anyhow::anyhow!(
-                "software H.264 encoding requires CPU-backed capture; disable zero_copy for OpenH264/software_h264"
-            ));
-        }
+        let use_shared_texture_decode =
+            config.zero_copy.unwrap_or(false) && chain_allows_zero_copy_decode_render(chain);
+        let use_shared_texture_capture =
+            use_shared_texture_decode && chain_allows_zero_copy_capture(chain);
         let capture_type = match chain {
             TestChain::Custom { capture, .. } => capture,
             _ => &CaptureType::Dxgi,
         };
         let (capture, capture_width, capture_height): (Box<dyn FrameCapture>, usize, usize) =
-            if use_shared_texture_decode {
+            if use_shared_texture_capture {
                 if !matches!(capture_type, CaptureType::Dxgi | CaptureType::Winrt) {
                     return Err(anyhow::anyhow!(
                         "D3D11 shared texture capture requires DXGI or WinRT capture"
@@ -2141,6 +2208,9 @@ impl TestHarness {
         let fps = config.fps.unwrap_or(60).max(1);
         let low_latency_bitrate = config.bitrate.unwrap_or(12_000_000).max(1);
         let speed_bitrate = config.bitrate.unwrap_or(5_000_000).max(1);
+        let color_mode = resolved_color_mode(config);
+        let color_pipeline = resolved_color_pipeline(&chain, config);
+        validate_chain_color_config(&chain, color_mode, color_pipeline)?;
         let encoded_codec = match chain {
             TestChain::Custom {
                 encoder: EncoderType::NvencAv1,
@@ -2183,6 +2253,7 @@ impl TestHarness {
                     height,
                     fps,
                     low_latency_bitrate,
+                    color_mode,
                 )
                 .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 let decoder =
@@ -2197,6 +2268,7 @@ impl TestHarness {
             TestChain::NvencOnly => {
                 let encoder =
                     NvencH264Encoder::new_max_speed_with_bitrate(width, height, fps, speed_bitrate)
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -2251,6 +2323,7 @@ impl TestHarness {
                             fps,
                             speed_bitrate,
                         )
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC encoder init failed: {:?}", e))?;
                         (Some(Box::new(enc) as Box<dyn VideoEncoder>), None, false)
                     }
@@ -2260,6 +2333,7 @@ impl TestHarness {
                             height,
                             fps,
                             low_latency_bitrate,
+                            color_mode,
                         )
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         let dec = create_h264_nvdec_decoder(
@@ -2280,6 +2354,7 @@ impl TestHarness {
                             fps,
                             speed_bitrate,
                         )
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         let dec = mrd_decode::create_decoder("h264_software").map_err(|e| {
                             anyhow::anyhow!("software decoder init failed: {:?}", e)
@@ -2297,6 +2372,7 @@ impl TestHarness {
                             fps,
                             speed_bitrate,
                         )
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         let dec = mrd_decode::create_decoder("ffmpeg_h264").map_err(|e| {
                             anyhow::anyhow!("FFmpeg H.264 decoder init failed: {:?}", e)
@@ -2324,6 +2400,7 @@ impl TestHarness {
                             fps,
                             speed_bitrate,
                         )
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
@@ -2343,6 +2420,7 @@ impl TestHarness {
                             fps,
                             speed_bitrate,
                         )
+                        .map(|encoder| encoder.with_color_mode(color_mode))
                         .map_err(|e| anyhow::anyhow!("NVENC 编码器初始化失败: {:?}", e))?;
                         (
                             Some(Box::new(enc) as Box<dyn VideoEncoder>),
@@ -2357,8 +2435,14 @@ impl TestHarness {
                     {
                         match decoder {
                             DecoderType::None => {
-                                let enc =
-                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                let enc = create_hevc_encoder(
+                                    width,
+                                    height,
+                                    fps,
+                                    speed_bitrate,
+                                    main10,
+                                    color_mode,
+                                )?;
                                 (Some(enc), None, false)
                             }
                             DecoderType::Nvdec => {
@@ -2376,6 +2460,7 @@ impl TestHarness {
                                         fps,
                                         low_latency_bitrate,
                                         main10,
+                                        color_mode,
                                     )?;
                                     let dec = create_hevc_nvdec_decoder(
                                         use_shared_texture_decode,
@@ -2389,8 +2474,14 @@ impl TestHarness {
                                 }
                             }
                             DecoderType::Software => {
-                                let enc =
-                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                let enc = create_hevc_encoder(
+                                    width,
+                                    height,
+                                    fps,
+                                    speed_bitrate,
+                                    main10,
+                                    color_mode,
+                                )?;
                                 let decoder_id = if main10 {
                                     "software_hevc_main10"
                                 } else {
@@ -2402,8 +2493,14 @@ impl TestHarness {
                                 (Some(enc), Some(PipelineDecoder::Software(dec)), true)
                             }
                             DecoderType::FfmpegHevc => {
-                                let enc =
-                                    create_hevc_encoder(width, height, fps, speed_bitrate, main10)?;
+                                let enc = create_hevc_encoder(
+                                    width,
+                                    height,
+                                    fps,
+                                    speed_bitrate,
+                                    main10,
+                                    color_mode,
+                                )?;
                                 let dec =
                                     mrd_decode::create_decoder("ffmpeg_hevc").map_err(|e| {
                                         anyhow::anyhow!("FFmpeg HEVC decoder init failed: {:?}", e)
@@ -2437,6 +2534,7 @@ impl TestHarness {
                                     fps,
                                     low_latency_bitrate,
                                     main10,
+                                    color_mode,
                                 )?;
                                 let dec = create_linux_hevc_decoder(false)?;
                                 (Some(enc), Some(dec), true)
@@ -2448,6 +2546,7 @@ impl TestHarness {
                                     fps,
                                     low_latency_bitrate,
                                     main10,
+                                    color_mode,
                                 )?;
                                 let dec = create_linux_hevc_decoder(true)?;
                                 (Some(enc), Some(dec), true)
@@ -2784,6 +2883,7 @@ impl TestHarness {
         let mut render_present_gaps = Vec::with_capacity(1000);
         let mut total_latencies = Vec::with_capacity(1000);
         let mut render_pacing = RenderPacingCounters::default();
+        let mut nvdec_shared_copy_stats = NvdecSharedCopyStats::default();
         let mut last_render_snapshot = None::<RendererSnapshot>;
         let mut last_render_present_at = None::<Instant>;
         let mut frame_count = 0_usize;
@@ -2993,6 +3093,12 @@ impl TestHarness {
                 None
             };
 
+            if let Some(decoder) = state.decoder.as_ref() {
+                if let Some(stats) = decoder.nvdec_shared_copy_stats() {
+                    nvdec_shared_copy_stats = stats;
+                }
+            }
+
             let should_prepare_render_input = render_scheduler.is_some() || preview_due;
             let render_input = if should_prepare_render_input {
                 decoded_frames
@@ -3131,6 +3237,7 @@ impl TestHarness {
                     &render_draw_present_latencies,
                     &render_present_gaps,
                     render_pacing.clone(),
+                    nvdec_shared_copy_stats.clone(),
                     &total_latencies,
                 );
                 if decoded_frames_total > 0 {
@@ -3181,6 +3288,7 @@ impl TestHarness {
             &render_draw_present_latencies,
             &render_present_gaps,
             render_pacing.clone(),
+            nvdec_shared_copy_stats,
             &total_latencies,
         );
 
@@ -3211,6 +3319,7 @@ impl TestHarness {
         render_draw_present_latencies: &[Duration],
         render_present_gaps: &[Duration],
         render_pacing: RenderPacingCounters,
+        nvdec_shared_copy_stats: NvdecSharedCopyStats,
         total_latencies: &[Duration],
     ) {
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -3321,6 +3430,13 @@ impl TestHarness {
         m.swap_chain_present_mode = render_pacing.swap_chain_present_mode;
         m.display_refresh_hz = render_pacing.display_refresh_hz;
         m.render_thread_priority = render_pacing.render_thread_priority;
+        m.render_pixel_format = render_pacing.render_pixel_format;
+        m.nvdec_shared_copy_attempts = nvdec_shared_copy_stats.attempts;
+        m.nvdec_shared_copy_successes = nvdec_shared_copy_stats.successes;
+        m.nvdec_shared_copy_failures = nvdec_shared_copy_stats.failures;
+        m.nvdec_shared_copy_last_stage = nvdec_shared_copy_stats.last_stage;
+        m.nvdec_shared_copy_last_api = nvdec_shared_copy_stats.last_api;
+        m.nvdec_shared_copy_last_error = nvdec_shared_copy_stats.last_error;
         m.render_present_gap_avg_ms = avg_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p50_ms = p50_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p95_ms = p95_present_gap.as_secs_f64() * 1000.0;
@@ -3347,6 +3463,9 @@ impl TestHarness {
         render_pacing.swap_chain_present_mode = current_snapshot.swap_chain_present_mode.clone();
         render_pacing.display_refresh_hz = current_snapshot.display_refresh_hz;
         render_pacing.render_thread_priority = current_snapshot.render_thread_priority.clone();
+        render_pacing.render_pixel_format = current_snapshot
+            .last_pixel_format
+            .map(render_pixel_format_label);
 
         let previous_presented = previous_snapshot
             .map(|snapshot| snapshot.presented_frame_count)
@@ -3744,25 +3863,39 @@ fn create_hevc_encoder(
     fps: u32,
     bitrate: u32,
     main10: bool,
+    color_mode: ColorMode,
 ) -> Result<Box<dyn VideoEncoder>> {
     #[cfg(any(windows, target_os = "linux"))]
     {
-        let encoder = if main10 {
-            NvencHevcEncoder::new_main10_with_bitrate(width, height, fps, bitrate)
-        } else if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
-            NvencHevcEncoder::new_max_speed_with_bitrate(width, height, fps, bitrate)
-        } else {
-            NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
-        }
-        .map_err(|e| anyhow::anyhow!("NVENC HEVC encoder init failed: {:?}", e))?;
+        let encoder = create_hevc_nvenc_encoder(width, height, fps, bitrate, main10, color_mode)
+            .map_err(|e| anyhow::anyhow!("NVENC HEVC encoder init failed: {:?}", e))?;
         Ok(Box::new(encoder) as Box<dyn VideoEncoder>)
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        let _ = (width, height, fps, bitrate, main10);
+        let _ = (width, height, fps, bitrate, main10, color_mode);
         anyhow::bail!("NVENC HEVC encoder is only available on Windows")
     }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn create_hevc_nvenc_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+    main10: bool,
+    color_mode: ColorMode,
+) -> Result<NvencHevcEncoder, PipelineError> {
+    let encoder = if main10 {
+        NvencHevcEncoder::new_main10_with_bitrate(width, height, fps, bitrate)
+    } else if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
+        NvencHevcEncoder::new_max_speed_with_bitrate(width, height, fps, bitrate)
+    } else {
+        NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
+    }?;
+    Ok(encoder.with_color_mode(color_mode))
 }
 
 fn create_h264_encoder_for_hardware_decode(
@@ -3770,12 +3903,14 @@ fn create_h264_encoder_for_hardware_decode(
     height: usize,
     fps: u32,
     bitrate: u32,
+    color_mode: ColorMode,
 ) -> Result<NvencH264Encoder, PipelineError> {
-    if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
+    let encoder = if prefer_max_speed_nvenc_for_hardware_decode(width, height, fps) {
         NvencH264Encoder::new_max_speed_with_bitrate(width, height, fps, bitrate)
     } else {
         NvencH264Encoder::new_with_bitrate(width, height, fps, bitrate)
-    }
+    }?;
+    Ok(encoder.with_color_mode(color_mode))
 }
 
 fn create_vvenc_encoder(
@@ -3966,10 +4101,14 @@ fn comparison_transport_label(
     }
 }
 
-fn encoder_allows_zero_copy(encoder: &EncoderType) -> bool {
+fn encoder_allows_zero_copy_capture(encoder: &EncoderType) -> bool {
     matches!(
         encoder,
-        EncoderType::None | EncoderType::NvencH264 | EncoderType::NvencHevc | EncoderType::NvencAv1
+        EncoderType::None
+            | EncoderType::NvencH264
+            | EncoderType::NvencHevc
+            | EncoderType::NvencHevcMain10
+            | EncoderType::NvencAv1
     )
 }
 
@@ -3979,8 +4118,202 @@ fn chain_allows_zero_copy_capture(chain: &TestChain) -> bool {
         TestChain::OpenH264 => false,
         #[cfg(target_os = "linux")]
         TestChain::LinuxOpenh264 => false,
-        TestChain::Custom { encoder, .. } => encoder_allows_zero_copy(encoder),
+        TestChain::Custom { encoder, .. } => encoder_allows_zero_copy_capture(encoder),
     }
+}
+
+fn chain_allows_zero_copy_decode_render(chain: &TestChain) -> bool {
+    match chain {
+        TestChain::CaptureOnly | TestChain::NvencNvdec | TestChain::NvencOnly => true,
+        TestChain::OpenH264 => true,
+        #[cfg(target_os = "linux")]
+        TestChain::LinuxOpenh264 => true,
+        TestChain::Custom { encoder, .. } => encoder_allows_zero_copy_decode_render(encoder),
+    }
+}
+
+fn encoder_allows_zero_copy_decode_render(encoder: &EncoderType) -> bool {
+    matches!(
+        encoder,
+        EncoderType::None
+            | EncoderType::NvencH264
+            | EncoderType::NvencHevc
+            | EncoderType::NvencHevcMain10
+            | EncoderType::NvencAv1
+            | EncoderType::OpenH264
+    )
+}
+
+fn render_pixel_format_label(pixel_format: RenderPixelFormat) -> String {
+    match pixel_format {
+        RenderPixelFormat::Rgb24 => "Rgb24",
+        RenderPixelFormat::Bgra32 => "Bgra32",
+        #[cfg(windows)]
+        RenderPixelFormat::D3D11SharedBgra => "D3D11SharedBgra",
+        #[cfg(windows)]
+        RenderPixelFormat::D3D11SharedNv12 => "D3D11SharedNv12",
+        #[cfg(windows)]
+        RenderPixelFormat::D3D11SharedP010 => "D3D11SharedP010",
+    }
+    .to_string()
+}
+
+fn resolved_color_mode(config: &TestConfig) -> ColorMode {
+    config.color_mode.unwrap_or_default()
+}
+
+fn validate_chain_color_config(
+    chain: &TestChain,
+    color_mode: ColorMode,
+    color_pipeline: ColorPipeline,
+) -> Result<()> {
+    match chain {
+        TestChain::CaptureOnly => validate_named_encoder_color_config(
+            "direct capture-render",
+            false,
+            false,
+            color_mode,
+            color_pipeline,
+        ),
+        TestChain::NvencNvdec | TestChain::NvencOnly => validate_named_encoder_color_config(
+            "NVENC H.264",
+            cfg!(windows),
+            false,
+            color_mode,
+            color_pipeline,
+        ),
+        TestChain::OpenH264 => validate_named_encoder_color_config(
+            "OpenH264",
+            false,
+            false,
+            color_mode,
+            color_pipeline,
+        ),
+        #[cfg(target_os = "linux")]
+        TestChain::LinuxOpenh264 => validate_named_encoder_color_config(
+            "OpenH264",
+            false,
+            false,
+            color_mode,
+            color_pipeline,
+        ),
+        TestChain::Custom { encoder, .. } => {
+            validate_encoder_color_mode(Some(encoder), color_mode)?;
+            validate_encoder_color_pipeline(Some(encoder), color_pipeline)
+        }
+    }
+}
+
+fn validate_encoder_color_mode(encoder: Option<&EncoderType>, color_mode: ColorMode) -> Result<()> {
+    validate_named_encoder_color_mode(
+        encoder_color_label(encoder),
+        encoder_supports_non_full_color_mode(encoder),
+        color_mode,
+    )
+}
+
+fn validate_encoder_color_pipeline(
+    encoder: Option<&EncoderType>,
+    color_pipeline: ColorPipeline,
+) -> Result<()> {
+    validate_named_encoder_color_pipeline(
+        encoder_color_label(encoder),
+        encoder_supports_hdr_main10_color_pipeline(encoder),
+        color_pipeline,
+    )
+}
+
+fn validate_named_encoder_color_config(
+    encoder_label: &'static str,
+    supports_non_full_color_mode: bool,
+    supports_hdr_main10_pipeline: bool,
+    color_mode: ColorMode,
+    color_pipeline: ColorPipeline,
+) -> Result<()> {
+    validate_named_encoder_color_mode(encoder_label, supports_non_full_color_mode, color_mode)?;
+    validate_named_encoder_color_pipeline(
+        encoder_label,
+        supports_hdr_main10_pipeline,
+        color_pipeline,
+    )
+}
+
+fn validate_named_encoder_color_mode(
+    encoder_label: &'static str,
+    supports_non_full_color_mode: bool,
+    color_mode: ColorMode,
+) -> Result<()> {
+    if color_mode == ColorMode::Full || supports_non_full_color_mode {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "color_mode={} requires Windows D3D11 NVENC H.264/HEVC GPU color transform; encoder {} is not supported",
+        color_mode.as_str(),
+        encoder_label
+    );
+}
+
+fn validate_named_encoder_color_pipeline(
+    encoder_label: &'static str,
+    supports_hdr_main10_pipeline: bool,
+    color_pipeline: ColorPipeline,
+) -> Result<()> {
+    if color_pipeline == ColorPipeline::Sdr8 || supports_hdr_main10_pipeline {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "color_pipeline={} requires NVENC HEVC Main10; encoder {} is not supported",
+        color_pipeline.as_str(),
+        encoder_label
+    );
+}
+
+fn encoder_supports_non_full_color_mode(encoder: Option<&EncoderType>) -> bool {
+    cfg!(windows)
+        && matches!(
+            encoder,
+            Some(EncoderType::NvencH264 | EncoderType::NvencHevc | EncoderType::NvencHevcMain10)
+        )
+}
+
+fn encoder_supports_hdr_main10_color_pipeline(encoder: Option<&EncoderType>) -> bool {
+    matches!(encoder, Some(EncoderType::NvencHevcMain10))
+}
+
+fn encoder_color_label(encoder: Option<&EncoderType>) -> &'static str {
+    match encoder {
+        Some(EncoderType::None) => "none",
+        Some(EncoderType::NvencH264) => "NVENC H.264",
+        Some(EncoderType::NvencHevc) => "NVENC HEVC",
+        Some(EncoderType::NvencHevcMain10) => "NVENC HEVC Main10",
+        Some(EncoderType::NvencAv1) => "NVENC AV1",
+        Some(EncoderType::OpenH264) => "OpenH264",
+        Some(EncoderType::SoftwareVvc) => "software VVC",
+        Some(EncoderType::VideoToolboxH264) => "VideoToolbox H.264",
+        None => "direct capture-render",
+    }
+}
+
+fn resolved_color_pipeline(chain: &TestChain, config: &TestConfig) -> ColorPipeline {
+    config.color_pipeline.unwrap_or_else(|| {
+        if chain_uses_hevc_main10(chain) {
+            ColorPipeline::HdrMain10
+        } else {
+            ColorPipeline::Sdr8
+        }
+    })
+}
+
+fn chain_uses_hevc_main10(chain: &TestChain) -> bool {
+    matches!(
+        chain,
+        TestChain::Custom {
+            encoder: EncoderType::NvencHevcMain10,
+            ..
+        }
+    )
 }
 
 fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> DecodedFrame {
@@ -4992,6 +5325,15 @@ fn prepare_frame_for_encode<'a>(
         return frame;
     }
 
+    #[cfg(windows)]
+    if frame.d3d11_shared_bgra().is_some() {
+        return frame;
+    }
+
+    if frame.data.is_empty() {
+        return frame;
+    }
+
     adapt_frame_dimensions_into(frame, target_width, target_height, scratch);
     scratch
         .as_ref()
@@ -5360,6 +5702,18 @@ mod tests {
         current.swap_chain_present_mode = Some("waitable".to_string());
         current.display_refresh_hz = Some(144);
         current.render_thread_priority = Some("above_normal".to_string());
+        let expected_pixel_format = {
+            #[cfg(windows)]
+            {
+                current.last_pixel_format = Some(RenderPixelFormat::D3D11SharedP010);
+                "D3D11SharedP010"
+            }
+            #[cfg(not(windows))]
+            {
+                current.last_pixel_format = Some(RenderPixelFormat::Bgra32);
+                "Bgra32"
+            }
+        };
         let mut counters = RenderPacingCounters::default();
         let mut present_gaps = Vec::new();
         let mut last_present_at = None;
@@ -5384,6 +5738,10 @@ mod tests {
         assert_eq!(
             counters.render_thread_priority.as_deref(),
             Some("above_normal")
+        );
+        assert_eq!(
+            counters.render_pixel_format.as_deref(),
+            Some(expected_pixel_format)
         );
     }
 
@@ -5610,6 +5968,18 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn prepare_frame_for_encode_preserves_d3d11_shared_frame_when_dimensions_differ() {
+        let frame = CapturedFrame::from_d3d11_shared_bgra(1280, 720, 123, 77, 1280 * 4);
+        let mut scratch = None;
+
+        let prepared = prepare_frame_for_encode(&frame, 640, 360, &mut scratch);
+
+        assert!(prepared.d3d11_shared_bgra().is_some());
+        assert!(scratch.is_none());
+    }
+
     #[test]
     fn cpu_nv12_to_bgra32_preserves_bgra_channel_order() {
         let bgra = cpu_nv12_to_bgra32(&[81, 90, 240], 1, 1, 1);
@@ -5619,13 +5989,81 @@ mod tests {
 
     #[test]
     fn nvenc_av1_allows_zero_copy_policy() {
-        assert!(encoder_allows_zero_copy(&EncoderType::NvencAv1));
+        assert!(encoder_allows_zero_copy_capture(&EncoderType::NvencAv1));
+        assert!(encoder_allows_zero_copy_decode_render(
+            &EncoderType::NvencAv1
+        ));
+    }
+
+    #[test]
+    fn nvenc_av1_rejects_non_full_color_mode_policy() {
+        let error = validate_encoder_color_mode(Some(&EncoderType::NvencAv1), ColorMode::Grayscale)
+            .expect_err("NVENC AV1 does not implement GPU color transforms yet");
+
+        assert!(error.to_string().contains("NVENC AV1"));
+    }
+
+    #[test]
+    fn hdr_main10_pipeline_requires_hevc_main10_policy() {
+        let error = validate_encoder_color_pipeline(
+            Some(&EncoderType::NvencH264),
+            ColorPipeline::HdrMain10,
+        )
+        .expect_err("HDR Main10 should require NVENC HEVC Main10");
+
+        assert!(error.to_string().contains("HEVC Main10"));
     }
 
     #[test]
     fn nvenc_hevc_allows_zero_copy_policy() {
-        assert!(encoder_allows_zero_copy(&EncoderType::NvencHevc));
-        assert!(!encoder_allows_zero_copy(&EncoderType::NvencHevcMain10));
+        assert!(encoder_allows_zero_copy_capture(&EncoderType::NvencHevc));
+        assert!(encoder_allows_zero_copy_decode_render(
+            &EncoderType::NvencHevc
+        ));
+        assert!(encoder_allows_zero_copy_capture(
+            &EncoderType::NvencHevcMain10
+        ));
+        assert!(encoder_allows_zero_copy_decode_render(
+            &EncoderType::NvencHevcMain10
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_h264_encoder_for_hardware_decode_applies_color_mode() {
+        let Ok(encoder) =
+            create_h264_encoder_for_hardware_decode(16, 16, 30, 5_000_000, ColorMode::LowChroma)
+        else {
+            return;
+        };
+
+        assert_eq!(encoder.color_mode(), ColorMode::LowChroma);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_hevc_nvenc_encoder_applies_color_mode() {
+        let Ok(encoder) =
+            create_hevc_nvenc_encoder(16, 16, 30, 5_000_000, false, ColorMode::Monochrome)
+        else {
+            return;
+        };
+
+        assert_eq!(encoder.color_mode(), ColorMode::Monochrome);
+    }
+
+    #[test]
+    fn resolved_color_pipeline_defaults_main10_to_hdr_main10() {
+        let chain = TestChain::Custom {
+            capture: CaptureType::Dxgi,
+            encoder: EncoderType::NvencHevcMain10,
+            decoder: DecoderType::Nvdec,
+        };
+
+        assert_eq!(
+            resolved_color_pipeline(&chain, &TestConfig::default()),
+            ColorPipeline::HdrMain10
+        );
     }
 
     #[test]
@@ -5646,7 +6084,10 @@ mod tests {
             parse_harness_encoder_type(Some("software-h264")),
             EncoderType::OpenH264
         );
-        assert!(!encoder_allows_zero_copy(&EncoderType::OpenH264));
+        assert!(!encoder_allows_zero_copy_capture(&EncoderType::OpenH264));
+        assert!(encoder_allows_zero_copy_decode_render(
+            &EncoderType::OpenH264
+        ));
         assert_eq!(
             comparison_labels(&TestChain::OpenH264),
             ("capture-encode", "h264-software")
@@ -5671,7 +6112,10 @@ mod tests {
             parse_harness_encoder_type(Some("vvenc")),
             EncoderType::SoftwareVvc
         );
-        assert!(!encoder_allows_zero_copy(&EncoderType::SoftwareVvc));
+        assert!(!encoder_allows_zero_copy_capture(&EncoderType::SoftwareVvc));
+        assert!(!encoder_allows_zero_copy_decode_render(
+            &EncoderType::SoftwareVvc
+        ));
         assert_eq!(
             comparison_labels(&TestChain::Custom {
                 capture: CaptureType::Synthetic,
@@ -5828,9 +6272,26 @@ mod tests {
             "swap_chain_present_mode",
             "display_refresh_hz",
             "render_thread_priority",
+            "render_pixel_format",
+            "color_mode",
+            "color_pipeline",
         ] {
             assert!(object.contains_key(key), "{key} must be serialized");
         }
+    }
+
+    #[test]
+    fn test_config_deserializes_color_mode_and_pipeline() {
+        use mrd_pipeline_core::{ColorMode, ColorPipeline};
+
+        let config: TestConfig = serde_json::from_value(serde_json::json!({
+            "color_mode": "grayscale",
+            "color_pipeline": "sdr8"
+        }))
+        .expect("deserialize color config");
+
+        assert_eq!(config.color_mode, Some(ColorMode::Grayscale));
+        assert_eq!(config.color_pipeline, Some(ColorPipeline::Sdr8));
     }
 
     #[test]
@@ -6004,7 +6465,7 @@ mod tests {
         let mut harness = TestHarness::new().expect("create harness");
         harness.set_chain(TestChain::Custom {
             capture: CaptureType::Synthetic,
-            encoder: EncoderType::OpenH264,
+            encoder: EncoderType::NvencH264,
             decoder: DecoderType::None,
         });
         harness.set_config(TestConfig {
@@ -6028,7 +6489,7 @@ mod tests {
             .error_message
             .as_deref()
             .unwrap_or_default()
-            .contains("software H.264 encoding requires CPU-backed capture"));
+            .contains("D3D11 shared texture capture requires DXGI or WinRT capture"));
         harness.stop().expect("stop failed harness");
     }
 
@@ -6063,6 +6524,7 @@ mod tests {
             &[],
             &[],
             RenderPacingCounters::default(),
+            NvdecSharedCopyStats::default(),
             &total_latencies,
         );
 
@@ -6100,6 +6562,7 @@ mod tests {
             &[],
             &[],
             RenderPacingCounters::default(),
+            NvdecSharedCopyStats::default(),
             &[],
         );
 
@@ -6136,6 +6599,7 @@ mod tests {
             &[],
             &[],
             RenderPacingCounters::default(),
+            NvdecSharedCopyStats::default(),
             &[],
         );
 
@@ -6201,6 +6665,7 @@ mod tests {
             &[],
             &render_present_gaps,
             render_pacing,
+            NvdecSharedCopyStats::default(),
             &[],
         );
 
@@ -6269,6 +6734,7 @@ mod tests {
             &render_draw_present_latencies,
             &[],
             RenderPacingCounters::default(),
+            NvdecSharedCopyStats::default(),
             &[],
         );
 
@@ -6586,6 +7052,8 @@ mod tests {
                 Ok("0") | Ok("false") | Ok("cpu") => Some(false),
                 _ => None,
             },
+            color_mode: None,
+            color_pipeline: None,
             pace_to_fps: match std::env::var("MRD_HARNESS_PACE_TO_FPS").as_deref() {
                 Ok("1") | Ok("true") | Ok("yes") => Some(true),
                 Ok("0") | Ok("false") | Ok("no") => Some(false),

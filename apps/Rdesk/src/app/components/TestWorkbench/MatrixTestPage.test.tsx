@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
 import {
   MatrixTestPage,
@@ -7,6 +7,18 @@ import {
   formatMatrixMediaProfile,
   mediaProfileFromConfig,
 } from "./MatrixTestPage";
+
+beforeAll(() => {
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    writable: true,
+    value: class {
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    },
+  });
+});
 
 function selectSingleSupportedCombination() {
   setLabeledCheckbox("NVENC HEVC Main", false);
@@ -529,6 +541,97 @@ describe("MatrixTestPage failure handling", () => {
         })
       );
     });
+  });
+
+  it("includes color mode and pipeline in D3D11 shared matrix runs", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["nvenc_h264", "nvenc_hevc_main10"],
+            available_decoders: ["nvdec"],
+            available_renderers: ["none", "d3d11"],
+            available_memory_modes: ["cpu", "d3d11_shared"],
+          })
+        );
+      }
+      if (command === "test_start_run") return Promise.resolve("run-color");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("Monochrome");
+    setLabeledCheckbox("NVENC H.264", false);
+    setLabeledCheckbox("NVENC HEVC Main10", true);
+    setLabeledCheckbox("Full color", false);
+    setLabeledCheckbox("Monochrome", true);
+    setLabeledCheckbox("SDR 8-bit", false);
+    setLabeledCheckbox("HDR Main10", true);
+    setLabeledCheckbox("CPU", false);
+    setLabeledCheckbox("D3D11 shared texture", true);
+    setLabeledCheckbox("Loopback", false);
+    setLabeledCheckbox("QUIC Datagram", true);
+    setLabeledCheckbox("720p", false);
+    setLabeledCheckbox("30 FPS", false);
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          config: expect.objectContaining({
+            encoder_type: "nvenc_hevc_main10",
+            decoder_type: "nvdec",
+            renderer_type: "d3d11",
+            render_display: true,
+            zero_copy: true,
+            color_mode: "monochrome",
+            color_pipeline: "hdr_main10",
+          }),
+        })
+      );
+    });
+  });
+
+  it("skips non-full color modes when D3D11 shared memory is not selected", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(
+          windowsCapabilities({
+            available_encoders: ["nvenc_h264"],
+            available_decoders: ["nvdec"],
+            available_renderers: ["none", "d3d11"],
+            available_memory_modes: ["cpu", "d3d11_shared"],
+          })
+        );
+      }
+      if (command === "test_start_run") return Promise.resolve("run-color-cpu");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(<MatrixTestPage runDelayMs={0} />);
+
+    await screen.findByLabelText("Grayscale");
+    setLabeledCheckbox("Full color", false);
+    setLabeledCheckbox("Grayscale", true);
+    setLabeledCheckbox("D3D11 shared texture", false);
+    fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
+
+    await waitFor(() => {
+      const rowText = resultRow().textContent ?? "";
+      expect(rowText).toContain("GPU color modes require D3D11 shared texture memory");
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "test_start_run",
+      expect.objectContaining({
+        config: expect.objectContaining({ color_mode: "grayscale" }),
+      })
+    );
   });
 
   it("loads macOS-specific matrix dimensions from environment capabilities", async () => {
