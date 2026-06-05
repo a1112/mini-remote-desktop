@@ -294,6 +294,8 @@ function remoteDisplayProfileArgs(profile?: MediaProfile | null) {
     profileChromaSubsampling: profile.chroma_subsampling ?? null,
     profilePixelFormat: profile.pixel_format ?? null,
     profileHdrEnabled: profile.hdr_enabled ?? null,
+    profileColorMode: profile.color_mode ?? null,
+    profileColorPipeline: profile.color_pipeline ?? null,
   };
 }
 

@@ -73,6 +73,7 @@ import {
   type CaptureSource,
   type CaptureSourceSelection,
   type MediaAdaptationSnapshot,
+  type MediaProfile,
   type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
@@ -1455,6 +1456,31 @@ function profileBitDepthFromSearch(searchParams: URLSearchParams): number | null
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function profileColorModeFromSearch(searchParams: URLSearchParams): MediaProfile["color_mode"] | null {
+  const value = searchParams.get("colorMode") ?? searchParams.get("profileColorMode");
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "full" ||
+    normalized === "grayscale" ||
+    normalized === "monochrome" ||
+    normalized === "low_chroma"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function profileColorPipelineFromSearch(
+  searchParams: URLSearchParams
+): MediaProfile["color_pipeline"] | null {
+  const value = searchParams.get("colorPipeline") ?? searchParams.get("profileColorPipeline");
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "sdr8" || normalized === "hdr_main10") {
+    return normalized;
+  }
+  return null;
+}
+
 function encoderForRequestedProfileCodec(
   codec: "h264" | "hevc",
   hostOs: HostOs,
@@ -2276,6 +2302,11 @@ export function RemoteDisplayWindowPage() {
     [searchParams]
   );
   const requestedBitDepth = useMemo(() => profileBitDepthFromSearch(searchParams), [searchParams]);
+  const requestedColorMode = useMemo(() => profileColorModeFromSearch(searchParams), [searchParams]);
+  const requestedColorPipeline = useMemo(
+    () => profileColorPipelineFromSearch(searchParams),
+    [searchParams]
+  );
   const requestedEncoder = requestedCodec
     ? encoderForRequestedProfileCodec(
         requestedCodec,
@@ -2290,14 +2321,20 @@ export function RemoteDisplayWindowPage() {
       requestedResolution !== null ||
       requestedFps !== null ||
       requestedBitrate !== null ||
-      requestedCodec !== null
+      requestedCodec !== null ||
+      requestedColorMode !== null ||
+      requestedColorPipeline !== null
         ? `${sessionId}:${requestedResolution ?? ""}:${requestedFps ?? ""}:${
             requestedBitrate ?? ""
           }:${requestedCodec ?? ""}:${requestedCodecProfile ?? ""}:${
             requestedBitDepth ?? ""
-          }:${requestedEncoder ?? ""}`
+          }:${requestedEncoder ?? ""}:${requestedColorMode ?? ""}:${
+            requestedColorPipeline ?? ""
+          }`
         : null,
     [
+      requestedColorMode,
+      requestedColorPipeline,
       requestedBitDepth,
       requestedBitrate,
       requestedCodec,
@@ -3443,11 +3480,11 @@ export function RemoteDisplayWindowPage() {
               !capabilities.available_encoders.includes("nvenc_h264"))
           ? "WebCodecs 2K144 需要 Windows DXGI + NVENC H.264"
           : null;
-  const buildRemoteMediaProfile = useCallback(() => {
+  const buildRemoteMediaProfile = useCallback((): MediaProfile => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
     const main10 = encoder === "nvenc_hevc_main10";
-    return {
+    const profile: MediaProfile = {
       width,
       height,
       fps: Number(fps),
@@ -3459,7 +3496,14 @@ export function RemoteDisplayWindowPage() {
       pixel_format: main10 ? "p010" : "nv12",
       hdr_enabled: false,
     };
-  }, [bitrate, encoder, fps, resolution]);
+    if (requestedColorMode) {
+      profile.color_mode = requestedColorMode;
+    }
+    if (requestedColorPipeline) {
+      profile.color_pipeline = requestedColorPipeline;
+    }
+    return profile;
+  }, [bitrate, encoder, fps, requestedColorMode, requestedColorPipeline, resolution]);
   const buildRemoteAdaptiveMediaConfig = useCallback(
     (enabled: boolean): AdaptiveMediaConfig => {
       const ceilingProfile = buildRemoteMediaProfile();

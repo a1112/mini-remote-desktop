@@ -269,6 +269,8 @@ fn open_remote_display_window(
     profile_chroma_subsampling: Option<String>,
     profile_pixel_format: Option<String>,
     profile_hdr_enabled: Option<bool>,
+    profile_color_mode: Option<String>,
+    profile_color_pipeline: Option<String>,
 ) -> Result<RenderWindowContext, String> {
     let spec = {
         let mut registry = state.render_window_registry.lock().unwrap();
@@ -283,6 +285,8 @@ fn open_remote_display_window(
             profile_chroma_subsampling,
             profile_pixel_format,
             profile_hdr_enabled,
+            profile_color_mode,
+            profile_color_pipeline,
         );
         let session_id = SessionId(session_id);
         if query_params.is_empty() {
@@ -344,6 +348,8 @@ fn remote_display_profile_query_params(
     profile_chroma_subsampling: Option<String>,
     profile_pixel_format: Option<String>,
     profile_hdr_enabled: Option<bool>,
+    profile_color_mode: Option<String>,
+    profile_color_pipeline: Option<String>,
 ) -> Vec<(String, String)> {
     let mut params = Vec::new();
     push_remote_display_query_param(&mut params, "profileWidth", profile_width);
@@ -360,6 +366,8 @@ fn remote_display_profile_query_params(
     );
     push_remote_display_query_param(&mut params, "profilePixelFormat", profile_pixel_format);
     push_remote_display_query_param(&mut params, "profileHdrEnabled", profile_hdr_enabled);
+    push_remote_display_query_param(&mut params, "profileColorMode", profile_color_mode);
+    push_remote_display_query_param(&mut params, "profileColorPipeline", profile_color_pipeline);
     params
 }
 
@@ -370,6 +378,32 @@ fn push_remote_display_query_param<T: ToString>(
 ) {
     if let Some(value) = value {
         params.push((key.to_string(), value.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod remote_display_profile_query_tests {
+    use super::*;
+
+    #[test]
+    fn remote_display_profile_query_params_include_color_metadata() {
+        let params = remote_display_profile_query_params(
+            Some(2560),
+            Some(1440),
+            Some(144),
+            Some(40),
+            Some("hevc".to_string()),
+            Some("main10".to_string()),
+            Some(10),
+            Some("4:2:0".to_string()),
+            Some("p010".to_string()),
+            Some(true),
+            Some("monochrome".to_string()),
+            Some("hdr_main10".to_string()),
+        );
+
+        assert!(params.contains(&("profileColorMode".to_string(), "monochrome".to_string())));
+        assert!(params.contains(&("profileColorPipeline".to_string(), "hdr_main10".to_string())));
     }
 }
 

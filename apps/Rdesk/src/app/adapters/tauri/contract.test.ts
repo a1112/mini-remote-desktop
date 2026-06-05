@@ -133,6 +133,8 @@ describe('Tauri Adapter Contract', () => {
           chroma_subsampling: '4:2:0',
           pixel_format: 'nv12',
           hdr_enabled: false,
+          color_mode: 'grayscale',
+          color_pipeline: 'sdr8',
         },
       });
 
@@ -151,6 +153,8 @@ describe('Tauri Adapter Contract', () => {
         profileChromaSubsampling: '4:2:0',
         profilePixelFormat: 'nv12',
         profileHdrEnabled: false,
+        profileColorMode: 'grayscale',
+        profileColorPipeline: 'sdr8',
       });
     });
 
