@@ -390,6 +390,23 @@ describe("Sidebar device actions", () => {
     });
   });
 
+  it("blocks remote power actions for disabled devices even if the record is still online", () => {
+    deviceDataMock.devices = [
+      device({
+        disabled: true,
+        status: "online",
+      }),
+    ];
+
+    renderSidebar();
+    openDeviceMenu();
+
+    expect(screen.getByRole("button", { name: "解除禁用" })).not.toBeDisabled();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+  });
+
   it("disconnects the active peer session for the selected device", async () => {
     sessionServiceMock.listSessions.mockResolvedValue([
       {

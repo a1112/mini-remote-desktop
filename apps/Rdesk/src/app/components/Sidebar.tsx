@@ -189,6 +189,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
   const contextMenuDevice = contextMenu ? devices.find((d) => d.id === contextMenu.deviceId) : null;
   const isContextOnline = contextMenuDevice?.status === "online";
+  const isContextDisabled = Boolean(contextMenuDevice?.disabled);
+  const isContextRemoteActionAvailable =
+    Boolean(contextMenuDevice) &&
+    isContextOnline &&
+    !isContextDisabled &&
+    !contextMenuDevice?.isLocal;
   const contextActiveSession = contextMenuDevice
     ? activePeerSessionForDevice(sessionSummaries, contextMenuDevice.deviceId)
     : null;
@@ -377,7 +383,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
 
     // 在线设备特有菜单
-    if (isContextOnline) {
+    if (isContextOnline && !isContextDisabled) {
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
         {
@@ -451,7 +457,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     items.push({ type: "divider" as const });
 
     // 在线设备特有菜单
-    if (isContextOnline) {
+    if (isContextOnline && !isContextDisabled) {
       items.push(
         {
           icon: LogOut,
@@ -475,8 +481,16 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
               );
             }
           },
-          disabled: !contextActiveSession,
-          title: contextActiveSession ? undefined : "没有可断开的活跃会话",
+          disabled: !contextActiveSession || !isContextRemoteActionAvailable,
+          title: !isContextRemoteActionAvailable
+            ? isContextDisabled
+              ? "设备已禁用"
+              : contextMenuDevice?.isLocal
+                ? "不能断开本机设备"
+                : "设备离线"
+            : contextActiveSession
+              ? undefined
+              : "没有可断开的活跃会话",
           danger: true,
         }
       );
@@ -511,9 +525,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     const canWakeOnLan =
       Boolean(contextMenuDevice?.macAddress) &&
       contextMenuDevice?.status === "offline" &&
+      !contextMenuDevice?.disabled &&
       !contextMenuDevice?.isLocal;
     const wakeDisabledReason = contextMenuDevice?.isLocal
       ? "不能唤醒本机设备"
+      : contextMenuDevice?.disabled
+        ? "设备已禁用"
       : contextMenuDevice?.status === "online"
         ? "设备当前在线"
         : contextMenuDevice?.macAddress
@@ -524,12 +541,14 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
       {
         icon: RotateCw,
         label: "重启",
-        disabled: !isContextOnline || contextMenuDevice?.isLocal,
-        title: !isContextOnline
-          ? "设备离线"
-          : contextMenuDevice?.isLocal
-            ? "不能远端重启本机设备"
-            : undefined,
+        disabled: !isContextRemoteActionAvailable,
+        title: isContextDisabled
+          ? "设备已禁用"
+          : !isContextOnline
+            ? "设备离线"
+            : contextMenuDevice?.isLocal
+              ? "不能远端重启本机设备"
+              : undefined,
         action: () => {
           if (contextMenuDevice) {
             return handleRemotePowerAction(
@@ -543,12 +562,14 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
       {
         icon: Power,
         label: "关机",
-        disabled: !isContextOnline || contextMenuDevice?.isLocal,
-        title: !isContextOnline
-          ? "设备离线"
-          : contextMenuDevice?.isLocal
-            ? "不能远端关机本机设备"
-            : undefined,
+        disabled: !isContextRemoteActionAvailable,
+        title: isContextDisabled
+          ? "设备已禁用"
+          : !isContextOnline
+            ? "设备离线"
+            : contextMenuDevice?.isLocal
+              ? "不能远端关机本机设备"
+              : undefined,
         action: () => {
           if (contextMenuDevice) {
             return handleRemotePowerAction(
