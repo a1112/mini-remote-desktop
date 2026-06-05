@@ -8,7 +8,6 @@
 // and media control.
 
 use crate::control_input::ControlInputRegistry;
-use mrd_application::ports::SessionSnapshot;
 #[cfg(target_os = "macos")]
 use mrd_ipc::render_proxy::{
     decode_ack, encode_frame_header, RenderProxyFrameHeader, RenderProxyPixelFormat,
@@ -46,44 +45,18 @@ mod capture_source_registry;
 mod display_mode_registry;
 mod media_profile_registry;
 mod peer_media_capability_registry;
+mod session_registry;
 pub use capability_snapshot_registry::CapabilitySnapshotRegistry;
 pub use capture_source_registry::CaptureSourceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
 pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
+pub use session_registry::SessionRegistry;
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-
-/// Session registry tracking all active sessions
-#[derive(Debug, Default)]
-pub struct SessionRegistry {
-    sessions: HashMap<SessionId, SessionSnapshot>,
-}
-
-impl SessionRegistry {
-    pub fn insert(&mut self, session_id: SessionId, snapshot: SessionSnapshot) {
-        self.sessions.insert(session_id, snapshot);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<&SessionSnapshot> {
-        self.sessions.get(session_id)
-    }
-
-    pub fn get_mut(&mut self, session_id: &SessionId) -> Option<&mut SessionSnapshot> {
-        self.sessions.get_mut(session_id)
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<SessionSnapshot> {
-        self.sessions.remove(session_id)
-    }
-
-    pub fn list_all(&self) -> Vec<SessionSnapshot> {
-        self.sessions.values().cloned().collect()
-    }
-}
 
 /// Probe telemetry accumulated from LAN data-plane probe frames.
 #[derive(Debug, Default)]
@@ -1978,7 +1951,7 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mrd_application::ports::SessionLifecycleState;
+    use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 
     #[test]
     fn session_registry_tracks_sessions() {
