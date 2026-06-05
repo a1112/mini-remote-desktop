@@ -17,10 +17,14 @@ use mrd_ipc::{
     MediaProfile, MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(any(test, target_os = "macos"))]
+use mrd_render::RenderFrame;
+#[cfg(target_os = "macos")]
+use mrd_render::RenderTarget;
 #[cfg(windows)]
 use mrd_render::RendererFactory;
 #[cfg(any(windows, target_os = "macos"))]
-use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererSnapshot};
+use mrd_render::{BoxedRenderer, RendererSnapshot};
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
 #[cfg(target_os = "macos")]
@@ -31,8 +35,6 @@ use std::io::{self, IoSlice, Read, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
-#[cfg(any(windows, target_os = "macos"))]
-use std::sync::Mutex as StdMutex;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -46,6 +48,8 @@ mod display_mode_registry;
 mod media_profile_registry;
 #[cfg(any(windows, target_os = "macos"))]
 mod media_render_queue_registry;
+#[cfg(any(windows, target_os = "macos"))]
+mod media_surface_renderer_registry;
 mod media_task_registry;
 mod peer_media_capability_registry;
 mod session_registry;
@@ -60,6 +64,8 @@ pub use media_profile_registry::MediaProfileRegistry;
 pub use media_render_queue_registry::{
     MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry,
 };
+#[cfg(any(windows, target_os = "macos"))]
+pub use media_surface_renderer_registry::MediaSurfaceRendererRegistry;
 pub use media_task_registry::MediaTaskRegistry;
 pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
 pub use session_registry::SessionRegistry;
@@ -408,148 +414,6 @@ impl MediaPipelineRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) {
         self.pipelines.remove(session_id);
-    }
-}
-
-/// Native renderer instances owned by mrd-service for receiver sessions.
-#[cfg(any(windows, target_os = "macos"))]
-pub(crate) type SharedSurfaceRenderer = Arc<StdMutex<BoxedRenderer>>;
-
-/// Native renderer instances owned by mrd-service for receiver sessions.
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Default)]
-pub struct MediaSurfaceRendererRegistry {
-    renderers: HashMap<(SessionId, String), SharedSurfaceRenderer>,
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-impl MediaSurfaceRendererRegistry {
-    pub fn attach_surface(
-        &mut self,
-        session_id: &SessionId,
-        surface: &AttachedRenderSurface,
-    ) -> Result<(), String> {
-        tracing::info!(
-            session_id = %session_id.0,
-            surface_id = %surface.surface_id,
-            backend = %surface.backend,
-            window_handle = ?surface.window_handle,
-            "render-surface renderer attach requested"
-        );
-        if !surface_backend_matches_platform(&surface.backend) {
-            tracing::info!(
-                session_id = %session_id.0,
-                surface_id = %surface.surface_id,
-                backend = %surface.backend,
-                "render-surface renderer attach skipped: backend does not match this platform"
-            );
-            return Ok(());
-        }
-        let key = (session_id.clone(), surface.surface_id.clone());
-        if self.renderers.contains_key(&key) {
-            tracing::info!(
-                session_id = %session_id.0,
-                surface_id = %surface.surface_id,
-                renderer_count = self.session_surface_count(session_id),
-                "render-surface renderer attach reused existing renderer"
-            );
-            return Ok(());
-        }
-        let window_handle = surface.window_handle.ok_or_else(|| {
-            format!(
-                "render surface {} is missing native handle",
-                surface.surface_id
-            )
-        })?;
-        let mut renderer = create_platform_surface_renderer(surface)?;
-        renderer
-            .attach_target(RenderTarget::WindowHandle(window_handle as isize))
-            .map_err(|error| {
-                format!("attach {} renderer target failed: {error}", surface.backend)
-            })?;
-        self.renderers
-            .insert(key, Arc::new(StdMutex::new(renderer)));
-        tracing::info!(
-            session_id = %session_id.0,
-            surface_id = %surface.surface_id,
-            renderer_count = self.session_surface_count(session_id),
-            "render-surface renderer attach completed"
-        );
-        Ok(())
-    }
-
-    pub fn detach_surface(&mut self, session_id: &SessionId, surface_id: &str) {
-        let removed = self
-            .renderers
-            .remove(&(session_id.clone(), surface_id.to_string()))
-            .is_some();
-        tracing::info!(
-            session_id = %session_id.0,
-            surface_id = %surface_id,
-            removed,
-            renderer_count = self.session_surface_count(session_id),
-            "render-surface renderer detach"
-        );
-    }
-
-    pub fn detach_session(&mut self, session_id: &SessionId) {
-        let before = self.renderers.len();
-        self.renderers
-            .retain(|(renderer_session_id, _), _| renderer_session_id != session_id);
-        let removed = before.saturating_sub(self.renderers.len());
-        tracing::info!(
-            session_id = %session_id.0,
-            removed,
-            renderer_count = self.session_surface_count(session_id),
-            "render-surface renderer detach session"
-        );
-    }
-
-    pub fn renderers_for_session(&self, session_id: &SessionId) -> Vec<SharedSurfaceRenderer> {
-        self.renderers
-            .iter()
-            .filter(|((renderer_session_id, _), _)| renderer_session_id == session_id)
-            .map(|(_, renderer)| renderer.clone())
-            .collect()
-    }
-
-    pub fn render_frame(
-        &self,
-        session_id: &SessionId,
-        frame: &RenderFrame,
-    ) -> Result<usize, String> {
-        let mut rendered = 0;
-        for renderer in self.renderers_for_session(session_id) {
-            renderer
-                .lock()
-                .map_err(|_| "native surface renderer lock was poisoned".to_string())?
-                .upload_frame(frame.clone())
-                .map_err(|error| {
-                    format!("upload frame to native surface renderer failed: {error}")
-                })?;
-            rendered += 1;
-        }
-        Ok(rendered)
-    }
-
-    pub fn session_surface_count(&self, session_id: &SessionId) -> usize {
-        self.renderers
-            .keys()
-            .filter(|(renderer_session_id, _)| renderer_session_id == session_id)
-            .count()
-    }
-
-    #[cfg(test)]
-    pub fn insert_renderer_for_test(
-        &mut self,
-        session_id: &SessionId,
-        surface_id: impl Into<String>,
-        renderer: BoxedRenderer,
-    ) {
-        self.renderers.insert(
-            (session_id.clone(), surface_id.into()),
-            Arc::new(StdMutex::new(renderer)),
-        );
     }
 }
 
