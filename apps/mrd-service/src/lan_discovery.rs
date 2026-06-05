@@ -104,8 +104,8 @@ use media_capture_config::{
 use media_envelope::LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT;
 use media_envelope::{
     decode_lan_media_envelope, encode_lan_media_envelope, lan_media_codec_name,
-    lan_media_profile_id, LanMediaEnvelope, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC,
-    LAN_MEDIA_PAYLOAD_ACCESS_UNIT, LAN_MEDIA_PAYLOAD_PROBE_FRAME,
+    lan_media_profile_id, LanMediaEnvelope, LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264,
+    LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT, LAN_MEDIA_PAYLOAD_PROBE_FRAME,
 };
 use media_error_policy::{
     should_log_media_receiver_decode_error, should_log_media_sender_frame_error,
@@ -269,13 +269,18 @@ const LAN_ENCODE_NVENC_HEVC_CAPABILITY: &str = "encode.nvenc_hevc";
 #[cfg(windows)]
 const LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY: &str = "encode.nvenc_hevc_main10";
 #[cfg(windows)]
+const LAN_ENCODE_NVENC_AV1_CAPABILITY: &str = "encode.nvenc_av1";
+#[cfg(windows)]
 const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
 #[cfg(windows)]
 const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
 #[cfg(windows)]
 const LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY: &str = "decode.nvdec_hevc_main10";
+#[cfg(windows)]
+const LAN_DECODE_NVDEC_AV1_CAPABILITY: &str = "decode.nvdec_av1";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
 const LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY: &str = "media.hevc_main10_420_10bit";
+const LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY: &str = "media.av1_main_420_8bit";
 const LAN_MEDIA_COLOR_MODE_CAPABILITY: &str = "media.color_mode_v1";
 #[cfg(windows)]
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
@@ -2266,11 +2271,14 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
             LAN_ENCODE_NVENC_H264_CAPABILITY.to_string(),
             LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string(),
             LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY.to_string(),
+            LAN_ENCODE_NVENC_AV1_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY.to_string(),
+            LAN_DECODE_NVDEC_AV1_CAPABILITY.to_string(),
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY.to_string(),
+            LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string(),
             LAN_MEDIA_COLOR_MODE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
@@ -3194,7 +3202,7 @@ async fn send_quic_media_loop(
                 LanAccessUnitCodec::H264 => {
                     h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes)
                 }
-                LanAccessUnitCodec::Hevc => access_unit.is_keyframe,
+                LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => access_unit.is_keyframe,
             };
             sender_stats.record_encoded_access_unit(access_unit.bytes.len(), is_keyframe);
             let fragment_started = Instant::now();
@@ -3611,6 +3619,14 @@ fn create_lan_encoder(
                 encoder,
             })
         }
+        LanAccessUnitCodec::Av1 => {
+            let (backend, encoder) = create_lan_av1_encoder(width, height, fps, bitrate, profile)?;
+            Ok(LanSenderEncoder {
+                codec: LanAccessUnitCodec::Av1,
+                backend,
+                encoder,
+            })
+        }
     }
 }
 
@@ -3775,6 +3791,44 @@ fn create_lan_h264_encoder(
             .map(|error| format!("; last error: {error}"))
             .unwrap_or_default()
     )
+}
+
+#[cfg(windows)]
+fn create_lan_av1_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+    profile: &MediaProfile,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    let color_mode = lan_color_mode_for_profile(profile)?;
+    if color_mode != ColorMode::Full {
+        anyhow::bail!(
+            "NVENC AV1 LAN encoding does not support color_mode={}",
+            color_mode.as_str()
+        );
+    }
+    mrd_encode_nvenc_av1::NvencAv1Encoder::new_high_refresh_rate_with_bitrate(
+        width, height, fps, bitrate,
+    )
+    .map(|encoder| {
+        (
+            "nvenc_av1_high_refresh",
+            Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+        )
+    })
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn create_lan_av1_encoder(
+    _width: usize,
+    _height: usize,
+    _fps: u32,
+    _bitrate: u32,
+    _profile: &MediaProfile,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    anyhow::bail!("NVENC AV1 LAN encoding is unavailable on this platform")
 }
 
 #[cfg(windows)]
@@ -4430,6 +4484,7 @@ async fn receive_quic_media_loop(
                                     &envelope.profile,
                                 )
                             }
+                            LanAccessUnitCodec::Av1 => false,
                         } {
                             let proxy_forward_started = Instant::now();
                             let proxy_result = match frame_codec {
@@ -4455,6 +4510,7 @@ async fn receive_quic_media_loop(
                                     )
                                     .await
                                 }
+                                LanAccessUnitCodec::Av1 => Ok(false),
                             };
                             match proxy_result {
                                 Ok(true) => {
@@ -4935,12 +4991,13 @@ async fn quic_media_v3_frame_to_legacy_frame(
         QuicMediaCodec::None => 0,
         QuicMediaCodec::H264 => LAN_MEDIA_CODEC_H264,
         QuicMediaCodec::Hevc => LAN_MEDIA_CODEC_HEVC,
-        unsupported => {
-            anyhow::bail!("unsupported LAN media v3 codec: {unsupported:?}");
-        }
+        QuicMediaCodec::Av1 => LAN_MEDIA_CODEC_AV1,
     };
     if frame.payload_type == QuicMediaPayloadType::AccessUnit
-        && !matches!(codec, LAN_MEDIA_CODEC_H264 | LAN_MEDIA_CODEC_HEVC)
+        && !matches!(
+            codec,
+            LAN_MEDIA_CODEC_H264 | LAN_MEDIA_CODEC_HEVC | LAN_MEDIA_CODEC_AV1
+        )
     {
         anyhow::bail!("LAN media v3 access unit has unsupported codec: {codec}");
     }
@@ -9865,6 +9922,33 @@ mod tests {
     }
 
     #[test]
+    fn media_profile_negotiation_preserves_av1_profiles() {
+        let negotiation = negotiate_media_profile(Some(MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 20,
+            codec: "av1".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            ..MediaProfile::default()
+        }))
+        .unwrap();
+
+        assert_eq!(negotiation.status, "accepted");
+        assert_eq!(negotiation.selected.codec, "av1");
+        assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
+        assert_eq!(negotiation.selected.bit_depth, Some(8));
+        assert_eq!(
+            LanAccessUnitCodec::from_profile(&negotiation.selected),
+            LanAccessUnitCodec::Av1
+        );
+    }
+
+    #[test]
     fn media_profile_negotiation_allows_high_refresh_canary_profiles() {
         let negotiation = negotiate_media_profile(Some(MediaProfile {
             width: 1920,
@@ -9905,6 +9989,48 @@ mod tests {
         assert!(message.contains("hevc encoder"));
         assert!(message.contains(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY));
         assert!(message.contains("mac-target"));
+    }
+
+    #[test]
+    fn requested_av1_profile_requires_peer_av1_media_capabilities() {
+        let error = ensure_peer_supports_requested_media(
+            &DeviceId("windows-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "av1".to_string(),
+                ..MediaProfile::default()
+            }),
+            &["encode.nvenc_hevc".to_string()],
+        )
+        .expect_err("AV1 request should require AV1 encoder capability");
+
+        let message = error.to_string();
+        assert!(message.contains("av1 encoder"));
+        assert!(message.contains("windows-target"));
+    }
+
+    #[test]
+    fn requested_av1_profile_accepts_peer_av1_media_capabilities() {
+        ensure_peer_supports_requested_media(
+            &DeviceId("windows-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "AV1".to_string(),
+                ..MediaProfile::default()
+            }),
+            &["encode.nvenc_av1".to_string()],
+        )
+        .expect("AV1-capable peer should pass AV1 request preflight");
     }
 
     #[test]
@@ -10005,6 +10131,27 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("hevc decoder"));
         assert!(message.contains("mac-controller"));
+    }
+
+    #[test]
+    fn selected_av1_profile_requires_receiver_av1_decoder_capabilities() {
+        let error = ensure_peer_can_receive_selected_media(
+            "windows-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 40,
+                codec: "av1".to_string(),
+                ..MediaProfile::default()
+            },
+            &["decode.nvdec_hevc".to_string()],
+        )
+        .expect_err("AV1 stream should require an AV1-capable receiver");
+
+        let message = error.to_string();
+        assert!(message.contains("av1 decoder"));
+        assert!(message.contains("windows-controller"));
     }
 
     #[test]

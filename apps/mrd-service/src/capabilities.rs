@@ -543,7 +543,7 @@ fn add_encode_capabilities(
         Some(hevc_main10_reason.as_str()),
     );
 
-    let (av1_status, av1_reason) = nvenc_av1_status(platform);
+    let (av1_status, av1_reason) = nvenc_av1_status(platform, probe_mode);
     push_item(
         items,
         platform,
@@ -1287,16 +1287,41 @@ fn probe_nvenc_hevc_main10_status(platform: &CapabilityPlatform) -> (CapabilityS
     }
 }
 
-fn nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
-    if matches!(
-        platform,
-        CapabilityPlatform::Windows | CapabilityPlatform::Linux
-    ) {
-        (
-            CapabilityStatus::Unimplemented,
-            "NVENC AV1 is declared as a harness capability; service-owned runtime probe and LAN sender integration are not wired yet.".to_string(),
-        )
-    } else {
+fn nvenc_av1_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return unsupported_nvenc_status("NVENC AV1");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_windows_runtime_status("NVENC AV1"),
+        CapabilityProbeMode::Runtime => probe_nvenc_av1_status(platform),
+    }
+}
+
+fn probe_nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return unsupported_nvenc_status("NVENC AV1");
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVENC AV1",
+                    mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
         unsupported_nvenc_status("NVENC AV1")
     }
 }
@@ -2364,7 +2389,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_nvenc_av1_is_not_advertised_as_runnable() {
+    fn wired_nvenc_av1_is_advertised_as_static_supported() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
         let av1 = capabilities
@@ -2372,7 +2397,12 @@ mod tests {
             .find(|item| item.id == "encode.nvenc_av1")
             .expect("NVENC AV1 capability");
 
-        assert_eq!(av1.status, CapabilityStatus::Unimplemented);
+        assert_eq!(av1.status, CapabilityStatus::Supported);
+        assert!(av1
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime probe refresh is pending"));
     }
 
     #[test]

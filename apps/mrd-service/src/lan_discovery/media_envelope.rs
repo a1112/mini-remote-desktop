@@ -11,6 +11,7 @@ pub(super) const LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT: u8 = LAN_MEDIA_PAYLOAD_ACCE
 pub(super) const LAN_MEDIA_PAYLOAD_PROBE_FRAME: u8 = 2;
 pub(super) const LAN_MEDIA_CODEC_H264: u8 = 1;
 pub(super) const LAN_MEDIA_CODEC_HEVC: u8 = 2;
+pub(super) const LAN_MEDIA_CODEC_AV1: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LanMediaEnvelope {
@@ -103,6 +104,7 @@ pub(super) fn lan_media_codec_name(codec: u8) -> &'static str {
     match codec {
         LAN_MEDIA_CODEC_H264 => "h264",
         LAN_MEDIA_CODEC_HEVC => "hevc",
+        LAN_MEDIA_CODEC_AV1 => "av1",
         _ => "unknown",
     }
 }
@@ -123,4 +125,35 @@ pub(super) fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
         bytes.extend_from_slice(color_pipeline.as_bytes());
     }
     fnv1a64(&bytes) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn av1_envelope_round_trips_codec_profile_name() {
+        let encoded = encode_lan_media_envelope(LanMediaEnvelope {
+            payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+            codec: LAN_MEDIA_CODEC_AV1,
+            sequence: 7,
+            timestamp_us: 99,
+            profile: MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 144,
+                bitrate_mbps: 24,
+                codec: "av1".to_string(),
+                ..MediaProfile::default()
+            },
+            payload: vec![1, 2, 3],
+        })
+        .expect("encode envelope");
+
+        let decoded = decode_lan_media_envelope(&encoded).expect("decode envelope");
+
+        assert_eq!(decoded.codec, LAN_MEDIA_CODEC_AV1);
+        assert_eq!(decoded.profile.codec, "av1");
+        assert_eq!(lan_media_codec_name(LAN_MEDIA_CODEC_AV1), "av1");
+    }
 }

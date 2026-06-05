@@ -2,20 +2,23 @@ use anyhow::Result;
 use mrd_ipc::MediaProfile;
 use mrd_transport_quic_quinn::QuicMediaCodec;
 
-use super::{normalize_lan_codec_name, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC};
+use super::{
+    normalize_lan_codec_name, LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LanAccessUnitCodec {
     H264,
     Hevc,
+    Av1,
 }
 
 impl LanAccessUnitCodec {
     pub(super) fn from_profile(profile: &MediaProfile) -> Self {
-        if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
-            Self::Hevc
-        } else {
-            Self::H264
+        match normalize_lan_codec_name(&profile.codec) {
+            Some("hevc") => Self::Hevc,
+            Some("av1") => Self::Av1,
+            _ => Self::H264,
         }
     }
 
@@ -23,6 +26,7 @@ impl LanAccessUnitCodec {
         match codec {
             LAN_MEDIA_CODEC_H264 => Ok(Self::H264),
             LAN_MEDIA_CODEC_HEVC => Ok(Self::Hevc),
+            LAN_MEDIA_CODEC_AV1 => Ok(Self::Av1),
             _ => anyhow::bail!("unsupported LAN media access unit codec: {codec}"),
         }
     }
@@ -31,6 +35,7 @@ impl LanAccessUnitCodec {
         match self {
             Self::H264 => QuicMediaCodec::H264,
             Self::Hevc => QuicMediaCodec::Hevc,
+            Self::Av1 => QuicMediaCodec::Av1,
         }
     }
 
@@ -38,6 +43,7 @@ impl LanAccessUnitCodec {
         match self {
             Self::H264 => LAN_MEDIA_CODEC_H264,
             Self::Hevc => LAN_MEDIA_CODEC_HEVC,
+            Self::Av1 => LAN_MEDIA_CODEC_AV1,
         }
     }
 
@@ -45,6 +51,7 @@ impl LanAccessUnitCodec {
         match self {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+            Self::Av1 => "av1",
         }
     }
 
@@ -52,6 +59,7 @@ impl LanAccessUnitCodec {
         match self {
             Self::H264 => "H.264",
             Self::Hevc => "HEVC",
+            Self::Av1 => "AV1",
         }
     }
 }
@@ -69,7 +77,7 @@ pub(super) fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: 
 pub(super) fn describe_lan_access_unit(codec: LanAccessUnitCodec, payload: &[u8]) -> String {
     match codec {
         LanAccessUnitCodec::H264 => describe_h264_access_unit(payload),
-        LanAccessUnitCodec::Hevc => describe_hevc_access_unit(payload),
+        LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => describe_hevc_access_unit(payload),
     }
 }
 
@@ -205,5 +213,24 @@ mod tests {
             description,
             "payload_bytes=8, prefix_hex=[00 00 00 01 26 01 aa bb]"
         );
+    }
+
+    #[test]
+    fn maps_av1_profiles_to_av1_transport_codec() {
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 24,
+            codec: "AV1".to_string(),
+            ..MediaProfile::default()
+        };
+
+        let codec = LanAccessUnitCodec::from_profile(&profile);
+
+        assert_eq!(codec, LanAccessUnitCodec::Av1);
+        assert_eq!(codec.quic_codec(), QuicMediaCodec::Av1);
+        assert_eq!(codec.name(), "av1");
+        assert_eq!(codec.display_name(), "AV1");
     }
 }

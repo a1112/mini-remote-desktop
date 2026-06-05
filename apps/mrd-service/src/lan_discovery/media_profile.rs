@@ -20,6 +20,8 @@ pub(crate) fn normalize_lan_codec_name(codec: &str) -> Option<&'static str> {
         || codec.eq_ignore_ascii_case("h.265")
     {
         Some("hevc")
+    } else if codec.eq_ignore_ascii_case("av1") || codec.eq_ignore_ascii_case("aom-av1") {
+        Some("av1")
     } else if codec.eq_ignore_ascii_case("h264") || codec.eq_ignore_ascii_case("h.264") {
         Some("h264")
     } else {
@@ -55,23 +57,44 @@ pub(crate) fn default_media_profile_negotiation() -> MediaProfileNegotiation {
 }
 
 pub(crate) fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
-    if normalize_lan_codec_name(&profile.codec) == Some("hevc") {
-        profile.codec = "hevc".to_string();
-        if profile.codec_profile.is_none() {
-            profile.codec_profile = Some("main".to_string());
+    match normalize_lan_codec_name(&profile.codec) {
+        Some("hevc") => {
+            profile.codec = "hevc".to_string();
+            if profile.codec_profile.is_none() {
+                profile.codec_profile = Some("main".to_string());
+            }
+            if profile.bit_depth.is_none() {
+                profile.bit_depth = Some(8);
+            }
+            if profile.chroma_subsampling.is_none() {
+                profile.chroma_subsampling = Some("4:2:0".to_string());
+            }
+            if profile.pixel_format.is_none() {
+                profile.pixel_format = Some("nv12".to_string());
+            }
+            if profile.hdr_enabled.is_none() {
+                profile.hdr_enabled = Some(false);
+            }
         }
-        if profile.bit_depth.is_none() {
-            profile.bit_depth = Some(8);
+        Some("av1") => {
+            profile.codec = "av1".to_string();
+            if profile.codec_profile.is_none() {
+                profile.codec_profile = Some("main".to_string());
+            }
+            if profile.bit_depth.is_none() {
+                profile.bit_depth = Some(8);
+            }
+            if profile.chroma_subsampling.is_none() {
+                profile.chroma_subsampling = Some("4:2:0".to_string());
+            }
+            if profile.pixel_format.is_none() {
+                profile.pixel_format = Some("nv12".to_string());
+            }
+            if profile.hdr_enabled.is_none() {
+                profile.hdr_enabled = Some(false);
+            }
         }
-        if profile.chroma_subsampling.is_none() {
-            profile.chroma_subsampling = Some("4:2:0".to_string());
-        }
-        if profile.pixel_format.is_none() {
-            profile.pixel_format = Some("nv12".to_string());
-        }
-        if profile.hdr_enabled.is_none() {
-            profile.hdr_enabled = Some(false);
-        }
+        _ => {}
     }
 }
 
@@ -243,6 +266,7 @@ fn missing_profile_media_capabilities(
                 vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
             ),
         ],
+        LanAccessUnitCodec::Av1 => vec![("av1 encoder", vec!["encode.nvenc_av1", "nvenc_av1"])],
     };
     if profile_requests_non_full_color(profile) {
         groups.push((
@@ -323,6 +347,16 @@ pub(crate) fn missing_profile_receiver_media_capabilities(
                 "decode.ffmpeg_hevc",
                 "ffmpeg_hevc",
                 "software_decode",
+            ],
+        )],
+        LanAccessUnitCodec::Av1 => vec![(
+            "av1 decoder",
+            vec![
+                "decode.nvdec_av1",
+                "nvdec_av1",
+                "decode.software_av1",
+                "software_av1",
+                "av1_software",
             ],
         )],
     };
@@ -435,7 +469,7 @@ mod tests {
         assert_eq!(normalize_lan_codec_name("hevc"), Some("hevc"));
         assert_eq!(normalize_lan_codec_name(" H.265 "), Some("hevc"));
         assert_eq!(normalize_lan_codec_name("h264"), Some("h264"));
-        assert_eq!(normalize_lan_codec_name("AV1"), None);
+        assert_eq!(normalize_lan_codec_name("AV1"), Some("av1"));
     }
 
     #[test]
