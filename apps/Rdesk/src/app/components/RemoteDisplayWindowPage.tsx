@@ -1584,6 +1584,9 @@ function virtualKeyFromKeyboardEvent(
   if (/^Key[A-Z]$/.test(event.code)) return event.code.charCodeAt(3);
   if (/^Digit[0-9]$/.test(event.code)) return event.code.charCodeAt(5);
   if (/^Numpad[0-9]$/.test(event.code)) return 0x60 + Number(event.code.slice(6));
+  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(event.code)) {
+    return 0x70 + Number(event.code.slice(1)) - 1;
+  }
 
   switch (event.key) {
     case "Backspace":
