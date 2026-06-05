@@ -68,6 +68,7 @@ mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
 mod peer_format;
+mod runtime_flags;
 mod service_identity;
 mod time_utils;
 use capture_activity::active_window_capture_count;
@@ -185,6 +186,7 @@ use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
+use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
 #[cfg(test)]
 use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
@@ -4001,15 +4003,6 @@ fn macos_capture_pump_repeat_grace_timeout(profile: &MediaProfile) -> Duration {
 #[cfg(not(target_os = "macos"))]
 fn macos_capture_pump_repeat_frame_interval(profile: &MediaProfile) -> Duration {
     media_frame_interval(profile)
-}
-
-fn env_bool_override(value: Option<&str>) -> Option<bool> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        "" => None,
-        _ => None,
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -12644,6 +12637,24 @@ mod tests {
         );
         assert_eq!(
             reliable_whole_frame_media_override_from_env_value(None),
+            None
+        );
+    }
+
+    #[test]
+    fn lan_runtime_flag_parser_accepts_common_bool_aliases() {
+        assert_eq!(super::runtime_flags::env_bool_override(None), None);
+        assert_eq!(super::runtime_flags::env_bool_override(Some("")), None);
+        assert_eq!(
+            super::runtime_flags::env_bool_override(Some("YES")),
+            Some(true)
+        );
+        assert_eq!(
+            super::runtime_flags::env_bool_override(Some("off")),
+            Some(false)
+        );
+        assert_eq!(
+            super::runtime_flags::env_bool_override(Some("invalid")),
             None
         );
     }
