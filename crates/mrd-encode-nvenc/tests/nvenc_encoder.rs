@@ -1,5 +1,5 @@
 use mrd_encode_nvenc::{NvencH264Encoder, NvencHevcEncoder};
-use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoCodec, VideoEncoder};
+use mrd_pipeline_core::{CapturedFrame, ColorMode, FramePixelFormat, VideoCodec, VideoEncoder};
 
 #[cfg(windows)]
 const SMOKE_WIDTH: usize = 16;
@@ -9,6 +9,36 @@ const SMOKE_HEIGHT: usize = 16;
 const SMOKE_WIDTH: usize = 160;
 #[cfg(not(windows))]
 const SMOKE_HEIGHT: usize = 64;
+
+#[test]
+fn nvenc_h264_color_mode_defaults_to_full() {
+    assert_eq!(NvencH264Encoder::default_color_mode(), ColorMode::Full);
+}
+
+#[test]
+fn nvenc_hevc_color_mode_defaults_to_full() {
+    assert_eq!(NvencHevcEncoder::default_color_mode(), ColorMode::Full);
+}
+
+#[cfg(windows)]
+#[test]
+fn nvenc_color_modes_preserve_shared_bgra_input_contract() {
+    for mode in [
+        ColorMode::Full,
+        ColorMode::Grayscale,
+        ColorMode::Monochrome,
+        ColorMode::LowChroma,
+    ] {
+        assert_eq!(
+            NvencH264Encoder::preferred_input_memory_kind_for_color_mode(mode),
+            mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
+        );
+        assert_eq!(
+            NvencHevcEncoder::preferred_input_memory_kind_for_color_mode(mode),
+            mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
+        );
+    }
+}
 
 #[test]
 fn nvenc_encoder_is_probeable_or_emits_h264_access_unit() {
@@ -153,10 +183,10 @@ fn nvenc_hevc_encoder_prefers_d3d11_shared_bgra_input() {
 
 #[cfg(windows)]
 #[test]
-fn nvenc_hevc_main10_encoder_prefers_cpu_input_for_p010_conversion() {
+fn nvenc_hevc_main10_encoder_prefers_d3d11_shared_bgra_input_for_nvenc_8_to_10_conversion() {
     assert_eq!(
         NvencHevcEncoder::preferred_main10_input_memory_kind(),
-        mrd_pipeline_core::FrameMemoryKind::Cpu
+        mrd_pipeline_core::FrameMemoryKind::D3D11SharedBgra
     );
 }
 

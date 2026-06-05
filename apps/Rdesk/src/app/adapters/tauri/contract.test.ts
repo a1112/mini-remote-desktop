@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMockInvoke } from '@/test/mocks/tauri';
 import * as adapter from './index';
+import type { TestConfig } from './types';
 
 describe('Tauri Adapter Contract', () => {
   beforeEach(() => {
@@ -1049,9 +1050,11 @@ describe('Tauri Adapter Contract', () => {
 
     it('test_start_run calls correct command with scenario and config', async () => {
       const mockInvoke = getMockInvoke();
-      const config = {
+      const config: TestConfig = {
         capture_type: 'dxgi' as const,
         encoder_type: 'openh264' as const,
+        color_mode: 'grayscale',
+        color_pipeline: 'sdr8',
         duration_ms: 5000,
       };
       mockInvoke.mockResolvedValue('run-1');

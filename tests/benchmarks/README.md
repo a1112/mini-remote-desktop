@@ -73,6 +73,9 @@ powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.4k120.waitable.json
 
 powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
+  -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_main10_nvdec.4k120.waitable.json
+
+powershell -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_transport_matrix.ps1 `
   -ScenarioPath tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.av1_nvdec.4k120.waitable.json
 ```
 
@@ -80,7 +83,8 @@ These 4K120 scenarios use 120Mbps, D3D11 shared render, NVDEC, waitable
 swapchain pacing, and `transport.4k120.json` thresholds. Compare
 `swap_chain_max_frame_latency`, `swap_chain_allow_tearing`,
 `swap_chain_waitable_object`, `swap_chain_present_mode`, `display_refresh_hz`,
-stage p95 values, and queue/drop counters before treating a 4K120 run as valid.
+`render_pixel_format`, stage p95 values, and queue/drop counters before treating
+a 4K120 run as valid.
 
 2K H.264 decode comparison:
 

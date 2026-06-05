@@ -106,6 +106,8 @@ export interface TestConfig {
   render_display?: boolean;
   renderer_target_hwnd?: string;
   zero_copy?: boolean;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma";
+  color_pipeline?: "sdr8" | "hdr_main10";
   transport_kind?: "loopback" | "quic" | "webrtc";
   adaptive_media?: boolean;
   dynamic_resolution_enabled?: boolean;
@@ -1112,6 +1114,8 @@ export interface TestMatrixConfig {
   resolution?: [number, number];
   fps?: number;
   bitrate?: number;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma";
+  color_pipeline?: "sdr8" | "hdr_main10";
 }
 
 export interface HarnessMetrics {
@@ -1163,6 +1167,15 @@ export interface HarnessMetrics {
   swap_chain_present_mode?: string | null;
   display_refresh_hz?: number | null;
   render_thread_priority?: string | null;
+  render_pixel_format?: string | null;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | null;
+  nvdec_shared_copy_attempts?: number;
+  nvdec_shared_copy_successes?: number;
+  nvdec_shared_copy_failures?: number;
+  nvdec_shared_copy_last_stage?: string | null;
+  nvdec_shared_copy_last_api?: string | null;
+  nvdec_shared_copy_last_error?: string | null;
   render_present_gap_p50_ms?: number;
   render_present_gap_p95_ms?: number;
   present_latency_avg_ms: number;

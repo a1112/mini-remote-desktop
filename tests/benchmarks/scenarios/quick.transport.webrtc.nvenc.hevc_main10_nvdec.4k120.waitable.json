@@ -1,0 +1,20 @@
+{
+  "scenario": "quick.transport",
+  "profile": "transport-webrtc-nvenc-hevc-main10-nvdec-4k120-waitable",
+  "transport": "webrtc",
+  "capture_backend": "dxgi",
+  "encode_backend": "nvenc_hevc_main10",
+  "decode_backend": "nvdec_hevc_main10",
+  "renderer_backend": "d3d11_shared",
+  "width": 3840,
+  "height": 2160,
+  "fps": 120,
+  "duration_secs": 20,
+  "bitrate_bps": 120000000,
+  "source_id": "windows:display-shared:1",
+  "display_id": "windows:display-shared:1",
+  "pace_to_fps": true,
+  "d3d11_waitable_object": true,
+  "render_thread_priority": "above_normal",
+  "threshold_file": "transport.4k120.json"
+}

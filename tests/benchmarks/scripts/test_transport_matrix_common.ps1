@@ -138,6 +138,10 @@ $explicitNonWaitableRenderEnv = Get-TransportMatrixRenderEnvironment -Scenario (
 if ($explicitNonWaitableRenderEnv.MRD_D3D11_RENDER_WAITABLE_OBJECT -ne "0") { throw "explicit high refresh waitable=false should be preserved" }
 if ($explicitNonWaitableRenderEnv.MRD_RENDER_THREAD_PRIORITY -ne "normal") { throw "explicit high refresh render priority should be preserved" }
 
+$transportMatrixScript = Get-Content (Join-Path $scriptDir "run_transport_matrix.ps1") -Raw
+if ($transportMatrixScript -notmatch "MRD_BENCH_COLOR_MODE") { throw "run_transport_matrix.ps1 must pass color_mode to the benchmark harness" }
+if ($transportMatrixScript -notmatch "MRD_BENCH_COLOR_PIPELINE") { throw "run_transport_matrix.ps1 must pass color_pipeline to the benchmark harness" }
+
 $scenarioSpecs = @(
   [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.quic.openh264.h264_software.2k.json"
@@ -195,11 +199,107 @@ $scenarioSpecs = @(
     threshold_file = "transport.4k120.json"
   },
   [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.4k120.waitable.grayscale.json"
+    profile = "transport-webrtc-nvenc-h264-nvdec-4k120-waitable-grayscale"
+    transport = "webrtc"
+    encode = "nvenc"
+    decode = "nvdec"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "grayscale"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.4k120.waitable.monochrome.json"
+    profile = "transport-webrtc-nvenc-h264-nvdec-4k120-waitable-monochrome"
+    transport = "webrtc"
+    encode = "nvenc"
+    decode = "nvdec"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "monochrome"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.h264_nvdec.4k120.waitable.low_chroma.json"
+    profile = "transport-webrtc-nvenc-h264-nvdec-4k120-waitable-low-chroma"
+    transport = "webrtc"
+    encode = "nvenc"
+    decode = "nvdec"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "low_chroma"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
     path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.4k120.waitable.json"
     profile = "transport-webrtc-nvenc-hevc-nvdec-4k120-waitable"
     transport = "webrtc"
     encode = "nvenc_hevc"
     decode = "nvdec_hevc"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.4k120.waitable.grayscale.json"
+    profile = "transport-webrtc-nvenc-hevc-nvdec-4k120-waitable-grayscale"
+    transport = "webrtc"
+    encode = "nvenc_hevc"
+    decode = "nvdec_hevc"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "grayscale"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.4k120.waitable.monochrome.json"
+    profile = "transport-webrtc-nvenc-hevc-nvdec-4k120-waitable-monochrome"
+    transport = "webrtc"
+    encode = "nvenc_hevc"
+    decode = "nvdec_hevc"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "monochrome"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_nvdec.4k120.waitable.low_chroma.json"
+    profile = "transport-webrtc-nvenc-hevc-nvdec-4k120-waitable-low-chroma"
+    transport = "webrtc"
+    encode = "nvenc_hevc"
+    decode = "nvdec_hevc"
+    width = 3840
+    height = 2160
+    fps = 120
+    bitrate_bps = 120000000
+    threshold_file = "transport.4k120.json"
+    color_mode = "low_chroma"
+    color_pipeline = "sdr8"
+  },
+  [pscustomobject]@{
+    path = "tests/benchmarks/scenarios/quick.transport.webrtc.nvenc.hevc_main10_nvdec.4k120.waitable.json"
+    profile = "transport-webrtc-nvenc-hevc-main10-nvdec-4k120-waitable"
+    transport = "webrtc"
+    encode = "nvenc_hevc_main10"
+    decode = "nvdec_hevc_main10"
     width = 3840
     height = 2160
     fps = 120
@@ -377,6 +477,15 @@ try {
     swap_chain_present_mode = "waitable"
     display_refresh_hz = 144
     render_thread_priority = "above_normal"
+    render_pixel_format = "D3D11SharedP010"
+    color_mode = "grayscale"
+    color_pipeline = "sdr8"
+    nvdec_shared_copy_attempts = 2800
+    nvdec_shared_copy_successes = 2799
+    nvdec_shared_copy_failures = 1
+    nvdec_shared_copy_last_stage = "success"
+    nvdec_shared_copy_last_api = "cuda-d3d11-copy"
+    nvdec_shared_copy_last_error = "shared texture copy succeeded"
     failure_reason = $null
     run_skipped = $false
     run_passed = $true
@@ -430,6 +539,15 @@ database or disk is full
   if ($csv.swap_chain_allow_tearing -ne "True") { throw "summary CSV must include swapchain tearing policy" }
   if ($csv.swap_chain_present_mode -ne "waitable") { throw "summary CSV must include swapchain present mode" }
   if ($csv.display_refresh_hz -ne "144") { throw "summary CSV must include display refresh hz" }
+  if ($csv.render_pixel_format -ne "D3D11SharedP010") { throw "summary CSV must include render pixel format" }
+  if ($csv.color_mode -ne "grayscale") { throw "summary CSV must include color mode" }
+  if ($csv.color_pipeline -ne "sdr8") { throw "summary CSV must include color pipeline" }
+  if ($csv.nvdec_shared_copy_attempts -ne "2800") { throw "summary CSV must include NVDEC shared copy attempts" }
+  if ($csv.nvdec_shared_copy_successes -ne "2799") { throw "summary CSV must include NVDEC shared copy successes" }
+  if ($csv.nvdec_shared_copy_failures -ne "1") { throw "summary CSV must include NVDEC shared copy failures" }
+  if ($csv.nvdec_shared_copy_last_stage -ne "success") { throw "summary CSV must include NVDEC shared copy last stage" }
+  if ($csv.nvdec_shared_copy_last_api -ne "cuda-d3d11-copy") { throw "summary CSV must include NVDEC shared copy last API" }
+  if ($csv.nvdec_shared_copy_last_error -ne "shared texture copy succeeded") { throw "summary CSV must include NVDEC shared copy last error" }
   $report = Get-Content (Join-Path $summaryTmp "reports/markdown-report.md") -Raw
   if ($report -notmatch "target_bitrate_kbps \\| 120000") { throw "markdown report must include target bitrate" }
   if ($report -notmatch "encoded_fps \\| 143.9") { throw "markdown report must include encoded FPS" }
@@ -438,6 +556,12 @@ database or disk is full
   if ($report -notmatch "swap_chain_max_frame_latency \\| 1") { throw "markdown report must include swapchain max frame latency" }
   if ($report -notmatch "swap_chain_allow_tearing \\| True") { throw "markdown report must include swapchain tearing policy" }
   if ($report -notmatch "swap_chain_present_mode \\| waitable") { throw "markdown report must include swapchain present mode" }
+  if ($report -notmatch "render_pixel_format \\| D3D11SharedP010") { throw "markdown report must include render pixel format" }
+  if ($report -notmatch "color_mode \\| grayscale") { throw "markdown report must include color mode" }
+  if ($report -notmatch "color_pipeline \\| sdr8") { throw "markdown report must include color pipeline" }
+  if ($report -notmatch "nvdec_shared_copy_attempts \\| 2800") { throw "markdown report must include NVDEC shared copy attempts" }
+  if ($report -notmatch "nvdec_shared_copy_failures \\| 1") { throw "markdown report must include NVDEC shared copy failures" }
+  if ($report -notmatch "nvdec_shared_copy_last_error \\| shared texture copy succeeded") { throw "markdown report must include NVDEC shared copy last error" }
 
   $thresholdPath = Join-Path $summaryTmp "strict-thresholds.json"
   [ordered]@{

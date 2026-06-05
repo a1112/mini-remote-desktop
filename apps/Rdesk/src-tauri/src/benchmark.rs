@@ -5,6 +5,7 @@ use std::{
 
 use mrd_decode_nvdec::{probe_runtime as probe_nvdec_runtime, NvdecCapabilityProbe};
 use mrd_observability::{PipelineProbeSnapshot, StageId};
+use mrd_pipeline_core::{ColorMode, ColorPipeline};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,6 +106,24 @@ pub struct BenchmarkSummary {
     pub display_refresh_hz: Option<u32>,
     #[serde(default)]
     pub render_thread_priority: Option<String>,
+    #[serde(default)]
+    pub render_pixel_format: Option<String>,
+    #[serde(default)]
+    pub color_mode: Option<String>,
+    #[serde(default)]
+    pub color_pipeline: Option<String>,
+    #[serde(default)]
+    pub nvdec_shared_copy_attempts: Option<u64>,
+    #[serde(default)]
+    pub nvdec_shared_copy_successes: Option<u64>,
+    #[serde(default)]
+    pub nvdec_shared_copy_failures: Option<u64>,
+    #[serde(default)]
+    pub nvdec_shared_copy_last_stage: Option<String>,
+    #[serde(default)]
+    pub nvdec_shared_copy_last_api: Option<String>,
+    #[serde(default)]
+    pub nvdec_shared_copy_last_error: Option<String>,
     pub nvdec_runtime_summary: String,
     pub nvdec_h264_capability: String,
     pub nvdec_hevc_capability: String,
@@ -306,6 +325,15 @@ impl BenchmarkSummary {
             swap_chain_present_mode: None,
             display_refresh_hz: None,
             render_thread_priority: None,
+            render_pixel_format: None,
+            color_mode: Some(ColorMode::Full.as_str().to_string()),
+            color_pipeline: Some(ColorPipeline::Sdr8.as_str().to_string()),
+            nvdec_shared_copy_attempts: Self::counter(probe, "nvdec_shared_copy_attempts"),
+            nvdec_shared_copy_successes: Self::counter(probe, "nvdec_shared_copy_successes"),
+            nvdec_shared_copy_failures: Self::counter(probe, "nvdec_shared_copy_failures"),
+            nvdec_shared_copy_last_stage: None,
+            nvdec_shared_copy_last_api: None,
+            nvdec_shared_copy_last_error: None,
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -453,6 +481,18 @@ impl BenchmarkSummary {
             swap_chain_present_mode: None,
             display_refresh_hz: None,
             render_thread_priority: None,
+            render_pixel_format: None,
+            color_mode: Some(ColorMode::Full.as_str().to_string()),
+            color_pipeline: Some(ColorPipeline::Sdr8.as_str().to_string()),
+            nvdec_shared_copy_attempts: Self::counter(receiver_probe, "nvdec_shared_copy_attempts"),
+            nvdec_shared_copy_successes: Self::counter(
+                receiver_probe,
+                "nvdec_shared_copy_successes",
+            ),
+            nvdec_shared_copy_failures: Self::counter(receiver_probe, "nvdec_shared_copy_failures"),
+            nvdec_shared_copy_last_stage: None,
+            nvdec_shared_copy_last_api: None,
+            nvdec_shared_copy_last_error: None,
             nvdec_runtime_summary,
             nvdec_h264_capability,
             nvdec_hevc_capability,
@@ -523,6 +563,15 @@ impl BenchmarkSummary {
             "swap_chain_present_mode",
             "display_refresh_hz",
             "render_thread_priority",
+            "render_pixel_format",
+            "color_mode",
+            "color_pipeline",
+            "nvdec_shared_copy_attempts",
+            "nvdec_shared_copy_successes",
+            "nvdec_shared_copy_failures",
+            "nvdec_shared_copy_last_stage",
+            "nvdec_shared_copy_last_api",
+            "nvdec_shared_copy_last_error",
             "nvdec_runtime_summary",
             "nvdec_h264_capability",
             "nvdec_hevc_capability",
@@ -593,6 +642,21 @@ impl BenchmarkSummary {
             self.swap_chain_present_mode.clone().unwrap_or_default(),
             option_u32(self.display_refresh_hz),
             self.render_thread_priority.clone().unwrap_or_default(),
+            self.render_pixel_format.clone().unwrap_or_default(),
+            self.color_mode.clone().unwrap_or_default(),
+            self.color_pipeline.clone().unwrap_or_default(),
+            option_u64(self.nvdec_shared_copy_attempts),
+            option_u64(self.nvdec_shared_copy_successes),
+            option_u64(self.nvdec_shared_copy_failures),
+            self.nvdec_shared_copy_last_stage
+                .clone()
+                .unwrap_or_default(),
+            self.nvdec_shared_copy_last_api.clone().unwrap_or_default(),
+            csv_escape_text(
+                self.nvdec_shared_copy_last_error
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
             self.nvdec_runtime_summary.clone(),
             self.nvdec_h264_capability.clone(),
             self.nvdec_hevc_capability.clone(),
@@ -775,6 +839,15 @@ Duration: `{duration}s`\n\n\
 | swap_chain_present_mode | {swap_chain_present_mode} |\n\
 | display_refresh_hz | {display_refresh_hz} |\n\
 | render_thread_priority | {render_thread_priority} |\n\
+| render_pixel_format | {render_pixel_format} |\n\
+| color_mode | {color_mode} |\n\
+| color_pipeline | {color_pipeline} |\n\
+| nvdec_shared_copy_attempts | {nvdec_shared_copy_attempts} |\n\
+| nvdec_shared_copy_successes | {nvdec_shared_copy_successes} |\n\
+| nvdec_shared_copy_failures | {nvdec_shared_copy_failures} |\n\
+| nvdec_shared_copy_last_stage | {nvdec_shared_copy_last_stage} |\n\
+| nvdec_shared_copy_last_api | {nvdec_shared_copy_last_api} |\n\
+| nvdec_shared_copy_last_error | {nvdec_shared_copy_last_error} |\n\
 | keyframes | {keyframes} |\n\
 | dropped_frames | {dropped_frames} |\n\
 | quic_receiver_completed_frames | {quic_completed} |\n\
@@ -835,6 +908,24 @@ Duration: `{duration}s`\n\n\
             .render_thread_priority
             .as_deref()
             .unwrap_or_default(),
+        render_pixel_format = summary.render_pixel_format.as_deref().unwrap_or_default(),
+        color_mode = summary.color_mode.as_deref().unwrap_or_default(),
+        color_pipeline = summary.color_pipeline.as_deref().unwrap_or_default(),
+        nvdec_shared_copy_attempts = option_u64(summary.nvdec_shared_copy_attempts),
+        nvdec_shared_copy_successes = option_u64(summary.nvdec_shared_copy_successes),
+        nvdec_shared_copy_failures = option_u64(summary.nvdec_shared_copy_failures),
+        nvdec_shared_copy_last_stage = summary
+            .nvdec_shared_copy_last_stage
+            .as_deref()
+            .unwrap_or_default(),
+        nvdec_shared_copy_last_api = summary
+            .nvdec_shared_copy_last_api
+            .as_deref()
+            .unwrap_or_default(),
+        nvdec_shared_copy_last_error = summary
+            .nvdec_shared_copy_last_error
+            .as_deref()
+            .unwrap_or_default(),
         keyframes = summary.keyframes,
         dropped_frames = summary.dropped_frames,
         quic_completed = option_u64(summary.quic_receiver_completed_frames),
@@ -865,6 +956,7 @@ mod tests {
     #[cfg(any(windows, target_os = "linux"))]
     use mrd_encode_nvenc_av1::NvencAv1Encoder;
     use mrd_observability::{PipelineProbeSnapshot, StageId, StageStatsSnapshot};
+    use mrd_pipeline_core::{ColorMode, ColorPipeline};
     use mrd_proto::SessionId;
 
     use crate::test_harness::{
@@ -974,6 +1066,8 @@ mod tests {
             bitrate: std::env::var("MRD_BENCH_BITRATE_BPS")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok()),
+            color_mode: benchmark_color_mode_from_env(),
+            color_pipeline: benchmark_color_pipeline_from_env(),
             source_id: env_string("MRD_BENCH_SOURCE_ID"),
             display_id: env_string("MRD_BENCH_DISPLAY_ID"),
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
@@ -1075,6 +1169,21 @@ mod tests {
             swap_chain_present_mode: metrics.swap_chain_present_mode.clone(),
             display_refresh_hz: metrics.display_refresh_hz,
             render_thread_priority: metrics.render_thread_priority.clone(),
+            render_pixel_format: metrics.render_pixel_format.clone(),
+            color_mode: metrics
+                .color_mode
+                .clone()
+                .or_else(|| Some(ColorMode::Full.as_str().to_string())),
+            color_pipeline: metrics
+                .color_pipeline
+                .clone()
+                .or_else(|| Some(ColorPipeline::Sdr8.as_str().to_string())),
+            nvdec_shared_copy_attempts: nonzero_u64_option(metrics.nvdec_shared_copy_attempts),
+            nvdec_shared_copy_successes: nonzero_u64_option(metrics.nvdec_shared_copy_successes),
+            nvdec_shared_copy_failures: nonzero_u64_option(metrics.nvdec_shared_copy_failures),
+            nvdec_shared_copy_last_stage: metrics.nvdec_shared_copy_last_stage.clone(),
+            nvdec_shared_copy_last_api: metrics.nvdec_shared_copy_last_api.clone(),
+            nvdec_shared_copy_last_error: metrics.nvdec_shared_copy_last_error.clone(),
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1293,6 +1402,18 @@ mod tests {
                 "render_stale_frame_drops".to_string(),
                 metrics.render_stale_frame_drops,
             ),
+            (
+                "nvdec_shared_copy_attempts".to_string(),
+                metrics.nvdec_shared_copy_attempts,
+            ),
+            (
+                "nvdec_shared_copy_successes".to_string(),
+                metrics.nvdec_shared_copy_successes,
+            ),
+            (
+                "nvdec_shared_copy_failures".to_string(),
+                metrics.nvdec_shared_copy_failures,
+            ),
         ]
     }
 
@@ -1504,6 +1625,25 @@ mod tests {
             swap_chain_present_mode: None,
             display_refresh_hz: None,
             render_thread_priority: None,
+            render_pixel_format: None,
+            color_mode: Some(
+                benchmark_color_mode_from_env()
+                    .unwrap_or_default()
+                    .as_str()
+                    .to_string(),
+            ),
+            color_pipeline: Some(
+                benchmark_color_pipeline_from_env()
+                    .unwrap_or_default()
+                    .as_str()
+                    .to_string(),
+            ),
+            nvdec_shared_copy_attempts: None,
+            nvdec_shared_copy_successes: None,
+            nvdec_shared_copy_failures: None,
+            nvdec_shared_copy_last_stage: None,
+            nvdec_shared_copy_last_api: None,
+            nvdec_shared_copy_last_error: None,
             nvdec_runtime_summary: String::new(),
             nvdec_h264_capability: String::new(),
             nvdec_hevc_capability: String::new(),
@@ -1535,6 +1675,14 @@ mod tests {
 
     fn nonzero_option(value: f64) -> Option<f64> {
         if value.is_finite() && value > 0.0 {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn nonzero_u64_option(value: u64) -> Option<u64> {
+        if value > 0 {
             Some(value)
         } else {
             None
@@ -1577,6 +1725,53 @@ mod tests {
                 )
             })
             .unwrap_or(default)
+    }
+
+    fn benchmark_color_mode_from_env() -> Option<ColorMode> {
+        env_string("MRD_BENCH_COLOR_MODE").and_then(|value| parse_color_mode(&value))
+    }
+
+    fn benchmark_color_pipeline_from_env() -> Option<ColorPipeline> {
+        env_string("MRD_BENCH_COLOR_PIPELINE").and_then(|value| parse_color_pipeline(&value))
+    }
+
+    fn parse_color_mode(value: &str) -> Option<ColorMode> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" | "color" | "colour" => Some(ColorMode::Full),
+            "grayscale" | "greyscale" | "gray" | "grey" => Some(ColorMode::Grayscale),
+            "monochrome" | "mono" | "black_white" | "black-white" | "bw" => {
+                Some(ColorMode::Monochrome)
+            }
+            "low_chroma" | "low-chroma" | "lowchroma" | "reduced_chroma" | "reduced-chroma" => {
+                Some(ColorMode::LowChroma)
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_color_pipeline(value: &str) -> Option<ColorPipeline> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sdr8" | "sdr_8" | "sdr-8" | "8bit" | "8-bit" => Some(ColorPipeline::Sdr8),
+            "hdr_main10" | "hdr-main10" | "main10" | "hevc_main10" | "hevc-main10" => {
+                Some(ColorPipeline::HdrMain10)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn benchmark_color_mode_env_parses_requested_mode() {
+        std::env::set_var("MRD_BENCH_COLOR_MODE", "monochrome");
+        std::env::set_var("MRD_BENCH_COLOR_PIPELINE", "hdr_main10");
+
+        assert_eq!(benchmark_color_mode_from_env(), Some(ColorMode::Monochrome));
+        assert_eq!(
+            benchmark_color_pipeline_from_env(),
+            Some(ColorPipeline::HdrMain10)
+        );
+
+        std::env::remove_var("MRD_BENCH_COLOR_MODE");
+        std::env::remove_var("MRD_BENCH_COLOR_PIPELINE");
     }
 
     #[test]
@@ -2207,6 +2402,15 @@ mod tests {
             swap_chain_present_mode: Some("waitable".into()),
             display_refresh_hz: Some(144),
             render_thread_priority: Some("above_normal".into()),
+            render_pixel_format: Some("D3D11SharedP010".into()),
+            color_mode: Some("grayscale".into()),
+            color_pipeline: Some("sdr8".into()),
+            nvdec_shared_copy_attempts: Some(100),
+            nvdec_shared_copy_successes: Some(98),
+            nvdec_shared_copy_failures: Some(2),
+            nvdec_shared_copy_last_stage: Some("copy".into()),
+            nvdec_shared_copy_last_api: Some("cuMemcpy2D_v2:UV".into()),
+            nvdec_shared_copy_last_error: Some("CUDA_ERROR_UNKNOWN".into()),
             nvdec_runtime_summary: "nvdec runtime libraries and core exports are present".into(),
             nvdec_h264_capability: "runtime=true wired=true".into(),
             nvdec_hevc_capability: "runtime=true wired=false".into(),
@@ -2236,6 +2440,15 @@ mod tests {
         assert!(header.contains(&"total_bitstream_bytes"));
         assert!(header.contains(&"swap_chain_max_frame_latency"));
         assert!(header.contains(&"swap_chain_allow_tearing"));
+        assert!(header.contains(&"render_pixel_format"));
+        assert!(header.contains(&"color_mode"));
+        assert!(header.contains(&"color_pipeline"));
+        assert!(header.contains(&"nvdec_shared_copy_attempts"));
+        assert!(header.contains(&"nvdec_shared_copy_successes"));
+        assert!(header.contains(&"nvdec_shared_copy_failures"));
+        assert!(header.contains(&"nvdec_shared_copy_last_stage"));
+        assert!(header.contains(&"nvdec_shared_copy_last_api"));
+        assert!(header.contains(&"nvdec_shared_copy_last_error"));
         assert!(header.contains(&"nvdec_hevc_main10_capability"));
         let target_bitrate_index = header
             .iter()
@@ -2282,6 +2495,31 @@ mod tests {
             .position(|column| *column == "display_refresh_hz")
             .expect("display refresh column");
         assert_eq!(row[refresh_index], "144");
+        let render_pixel_format_index = header
+            .iter()
+            .position(|column| *column == "render_pixel_format")
+            .expect("render pixel format column");
+        assert_eq!(row[render_pixel_format_index], "D3D11SharedP010");
+        let color_mode_index = header
+            .iter()
+            .position(|column| *column == "color_mode")
+            .expect("color mode column");
+        assert_eq!(row[color_mode_index], "grayscale");
+        let color_pipeline_index = header
+            .iter()
+            .position(|column| *column == "color_pipeline")
+            .expect("color pipeline column");
+        assert_eq!(row[color_pipeline_index], "sdr8");
+        let shared_copy_attempts_index = header
+            .iter()
+            .position(|column| *column == "nvdec_shared_copy_attempts")
+            .expect("shared copy attempts column");
+        assert_eq!(row[shared_copy_attempts_index], "100");
+        let shared_copy_last_error_index = header
+            .iter()
+            .position(|column| *column == "nvdec_shared_copy_last_error")
+            .expect("shared copy last error column");
+        assert_eq!(row[shared_copy_last_error_index], "CUDA_ERROR_UNKNOWN");
         let failure_reason_index = header
             .iter()
             .position(|column| *column == "failure_reason")

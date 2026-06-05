@@ -1,5 +1,5 @@
 #[cfg(not(windows))]
-use mrd_pipeline_core::{CapturedFrame, EncodedAccessUnit, PipelineError, VideoEncoder};
+use mrd_pipeline_core::{CapturedFrame, ColorMode, EncodedAccessUnit, PipelineError, VideoEncoder};
 #[cfg(not(windows))]
 use mrd_pipeline_core::{FramePixelFormat, VideoCodec};
 #[cfg(not(windows))]
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 mod imp {
     use anyhow::{anyhow, Context};
     use mrd_pipeline_core::{
-        CapturedFrame, D3D11SharedBgraFrame, EncodedAccessUnit, FrameMemoryKind, FramePixelFormat,
-        PipelineError, VideoCodec, VideoEncoder,
+        CapturedFrame, ColorMode, D3D11SharedBgraFrame, EncodedAccessUnit, FrameMemoryKind,
+        FramePixelFormat, PipelineError, VideoCodec, VideoEncoder,
     };
     use nvenc::bitstream::BitStream;
     use nvenc::encoder::{Encoder, RegisteredResource};
@@ -36,11 +36,15 @@ mod imp {
     use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
     };
     use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
-        D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        D3D11CreateDevice, ID3D11ClassLinkage, ID3D11Device, ID3D11DeviceContext,
+        ID3D11PixelShader, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
+        ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_RENDER_TARGET,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_NEVER, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+        D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_P010, DXGI_SAMPLE_DESC,
@@ -51,6 +55,57 @@ mod imp {
     const SHARED_INPUT_CACHE_LIMIT: usize = 8;
     const H264_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 30;
     const HEVC_REMOTE_DESKTOP_MAX_KEYFRAME_INTERVAL_FRAMES: usize = 60;
+    const COLOR_TRANSFORM_VERTEX_SHADER: &str = r#"
+struct VSOut {
+    float4 position : SV_POSITION;
+    float2 uv : TEXCOORD0;
+};
+
+VSOut main(uint vertex_id : SV_VertexID) {
+    float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+    };
+    float2 pos = positions[vertex_id];
+    VSOut output;
+    output.position = float4(pos, 0.0, 1.0);
+    output.uv = float2((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5);
+    return output;
+}
+"#;
+    const COLOR_TRANSFORM_GRAYSCALE_PIXEL_SHADER: &str = r#"
+Texture2D source_tex : register(t0);
+SamplerState source_sampler : register(s0);
+
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float4 color = source_tex.Sample(source_sampler, uv);
+    float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+    return float4(luma, luma, luma, color.a);
+}
+"#;
+    const COLOR_TRANSFORM_MONOCHROME_PIXEL_SHADER: &str = r#"
+Texture2D source_tex : register(t0);
+SamplerState source_sampler : register(s0);
+
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float4 color = source_tex.Sample(source_sampler, uv);
+    float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+    float mono = luma >= 0.5 ? 1.0 : 0.0;
+    return float4(mono, mono, mono, color.a);
+}
+"#;
+    const COLOR_TRANSFORM_LOW_CHROMA_PIXEL_SHADER: &str = r#"
+Texture2D source_tex : register(t0);
+SamplerState source_sampler : register(s0);
+
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float4 color = source_tex.Sample(source_sampler, uv);
+    float luma = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
+    float3 low_chroma = lerp(float3(luma, luma, luma), color.rgb, 0.25);
+    return float4(low_chroma, color.a);
+}
+"#;
 
     pub struct NvencH264Encoder {
         _device: ID3D11Device,
@@ -61,12 +116,14 @@ mod imp {
         shared_inputs: Vec<SharedInputResource>,
         shared_encode_slots: Vec<SharedEncodeSlot>,
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
+        color_transform_pipeline: Option<ColorTransformPipeline>,
         bitstream: BitStream,
         width: usize,
         height: usize,
         fps: u32,
         frame_index: usize,
         force_next_keyframe: bool,
+        color_mode: ColorMode,
     }
 
     unsafe impl Send for NvencH264Encoder {}
@@ -80,12 +137,14 @@ mod imp {
         shared_inputs: Vec<SharedInputResource>,
         shared_encode_slots: Vec<SharedEncodeSlot>,
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
+        color_transform_pipeline: Option<ColorTransformPipeline>,
         bitstream: BitStream,
         width: usize,
         height: usize,
         fps: u32,
         frame_index: usize,
         main10: bool,
+        color_mode: ColorMode,
     }
 
     unsafe impl Send for NvencHevcEncoder {}
@@ -109,10 +168,12 @@ mod imp {
         width: u32,
         height: u32,
         _texture: ID3D11Texture2D,
+        shader_resource_view: Option<ID3D11ShaderResourceView>,
     }
 
     struct SharedEncodeSlot {
         texture: ID3D11Texture2D,
+        render_target_view: Option<ID3D11RenderTargetView>,
         registered: RegisteredResource,
         bitstream: BitStream,
     }
@@ -123,7 +184,41 @@ mod imp {
         is_keyframe: bool,
     }
 
+    struct SharedInputBinding {
+        texture: ID3D11Texture2D,
+        shader_resource_view: Option<ID3D11ShaderResourceView>,
+    }
+
+    struct ColorTransformPipeline {
+        vertex_shader: ID3D11VertexShader,
+        grayscale_pixel_shader: ID3D11PixelShader,
+        monochrome_pixel_shader: ID3D11PixelShader,
+        low_chroma_pixel_shader: ID3D11PixelShader,
+        sampler: ID3D11SamplerState,
+    }
+
     impl NvencH264Encoder {
+        pub fn default_color_mode() -> ColorMode {
+            ColorMode::Full
+        }
+
+        pub fn color_mode(&self) -> ColorMode {
+            self.color_mode
+        }
+
+        pub fn with_color_mode(mut self, color_mode: ColorMode) -> Self {
+            self.color_mode = color_mode;
+            self.color_transform_pipeline = None;
+            self.shared_inputs.clear();
+            self.shared_encode_slots.clear();
+            self.pending_shared_encodes.clear();
+            self
+        }
+
+        pub fn preferred_input_memory_kind_for_color_mode(_mode: ColorMode) -> FrameMemoryKind {
+            FrameMemoryKind::D3D11SharedBgra
+        }
+
         pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
             Self::new_with_profile(width, height, fps, NV_ENC_H264_PROFILE_HIGH_GUID)
         }
@@ -255,12 +350,14 @@ mod imp {
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
+                color_transform_pipeline: None,
                 bitstream,
                 width,
                 height,
                 fps,
                 frame_index: 0,
                 force_next_keyframe: false,
+                color_mode: ColorMode::Full,
             })
         }
 
@@ -337,12 +434,14 @@ mod imp {
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
+                color_transform_pipeline: None,
                 bitstream,
                 width,
                 height,
                 fps,
                 frame_index: 0,
                 force_next_keyframe: false,
+                color_mode: ColorMode::Full,
             })
         }
 
@@ -444,12 +543,14 @@ mod imp {
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
+                color_transform_pipeline: None,
                 bitstream,
                 width,
                 height,
                 fps,
                 frame_index: 0,
                 force_next_keyframe: false,
+                color_mode: ColorMode::Full,
             })
         }
 
@@ -520,12 +621,14 @@ mod imp {
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
+                color_transform_pipeline: None,
                 bitstream,
                 width,
                 height,
                 fps,
                 frame_index: 0,
                 force_next_keyframe: false,
+                color_mode: ColorMode::Full,
             })
         }
 
@@ -549,7 +652,7 @@ mod imp {
                     self.width, self.height, shared.width, shared.height
                 )));
             }
-            let source_texture = self.ensure_shared_input(shared)?;
+            let source = self.ensure_shared_input(shared)?;
             self.ensure_shared_encode_slots()?;
 
             let mut output = Vec::new();
@@ -563,7 +666,7 @@ mod imp {
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC encode slot"))?;
-            self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
+            self.copy_or_transform_shared_bgra_to_texture(&source, &slot)?;
 
             let force_idr =
                 h264_should_force_keyframe(self.frame_index, self.fps, self.force_next_keyframe);
@@ -617,8 +720,20 @@ mod imp {
                         "nvenc shared slot bitstream buffer failed: {error:?}"
                     ))
                 })?;
+                let render_target_view = if self.color_mode == ColorMode::Full {
+                    None
+                } else {
+                    Some(
+                        create_render_target_view(&self._device, &texture).map_err(|error| {
+                            PipelineError::message(format!(
+                                "create shared NVENC slot RTV failed: {error}"
+                            ))
+                        })?,
+                    )
+                };
                 self.shared_encode_slots.push(SharedEncodeSlot {
                     texture,
+                    render_target_view,
                     registered,
                     bitstream,
                 });
@@ -645,6 +760,24 @@ mod imp {
             Ok(Some(access_unit))
         }
 
+        fn copy_or_transform_shared_bgra_to_texture(
+            &mut self,
+            source: &SharedInputBinding,
+            slot: &SharedEncodeSlot,
+        ) -> Result<(), PipelineError> {
+            if self.color_mode == ColorMode::Full {
+                return self.copy_shared_bgra_to_texture(&source.texture, &slot.texture);
+            }
+
+            let source_srv = source.shader_resource_view.as_ref().ok_or_else(|| {
+                PipelineError::message("missing shared BGRA shader resource view for color mode")
+            })?;
+            let target_rtv = slot.render_target_view.as_ref().ok_or_else(|| {
+                PipelineError::message("missing NVENC render target view for color mode")
+            })?;
+            self.transform_shared_bgra_to_texture(source_srv, target_rtv)
+        }
+
         fn copy_shared_bgra_to_texture(
             &self,
             source_texture: &ID3D11Texture2D,
@@ -669,16 +802,49 @@ mod imp {
             Ok(())
         }
 
+        fn transform_shared_bgra_to_texture(
+            &mut self,
+            source_srv: &ID3D11ShaderResourceView,
+            target_rtv: &ID3D11RenderTargetView,
+        ) -> Result<(), PipelineError> {
+            let context = self.context.clone();
+            let width = self.width as u32;
+            let height = self.height as u32;
+            let color_mode = self.color_mode;
+            let pipeline = self.ensure_color_transform_pipeline()?;
+            draw_color_transform(
+                &context, width, height, color_mode, pipeline, source_srv, target_rtv,
+            )
+        }
+
+        fn ensure_color_transform_pipeline(
+            &mut self,
+        ) -> Result<&ColorTransformPipeline, PipelineError> {
+            if self.color_transform_pipeline.is_none() {
+                self.color_transform_pipeline = Some(
+                    create_color_transform_pipeline(&self._device).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create NVENC color transform pipeline failed: {error}"
+                        ))
+                    })?,
+                );
+            }
+            Ok(self.color_transform_pipeline.as_ref().unwrap())
+        }
+
         fn ensure_shared_input(
             &mut self,
             shared: &D3D11SharedBgraFrame,
-        ) -> Result<ID3D11Texture2D, PipelineError> {
+        ) -> Result<SharedInputBinding, PipelineError> {
             if let Some(input) = self.shared_inputs.iter().find(|input| {
                 input.shared_handle == shared.shared_handle
                     && input.width == shared.width
                     && input.height == shared.height
             }) {
-                return Ok(input._texture.clone());
+                return Ok(SharedInputBinding {
+                    texture: input._texture.clone(),
+                    shader_resource_view: input.shader_resource_view.clone(),
+                });
             }
 
             if shared.shared_handle == 0 {
@@ -703,29 +869,65 @@ mod imp {
             if self.shared_inputs.len() >= SHARED_INPUT_CACHE_LIMIT {
                 self.shared_inputs.remove(0);
             }
+            let shader_resource_view = if self.color_mode == ColorMode::Full {
+                None
+            } else {
+                Some(
+                    create_shader_resource_view(&self._device, &texture).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create shared BGRA input SRV failed: {error}"
+                        ))
+                    })?,
+                )
+            };
+
             self.shared_inputs.push(SharedInputResource {
                 shared_handle: shared.shared_handle,
                 width: shared.width,
                 height: shared.height,
                 _texture: texture,
+                shader_resource_view,
             });
 
-            Ok(self
+            let input = self
                 .shared_inputs
                 .last()
-                .expect("shared input resource was just inserted")
-                ._texture
-                .clone())
+                .expect("shared input resource was just inserted");
+            Ok(SharedInputBinding {
+                texture: input._texture.clone(),
+                shader_resource_view: input.shader_resource_view.clone(),
+            })
         }
     }
 
     impl NvencHevcEncoder {
+        pub fn default_color_mode() -> ColorMode {
+            ColorMode::Full
+        }
+
+        pub fn color_mode(&self) -> ColorMode {
+            self.color_mode
+        }
+
+        pub fn with_color_mode(mut self, color_mode: ColorMode) -> Self {
+            self.color_mode = color_mode;
+            self.color_transform_pipeline = None;
+            self.shared_inputs.clear();
+            self.shared_encode_slots.clear();
+            self.pending_shared_encodes.clear();
+            self
+        }
+
+        pub fn preferred_input_memory_kind_for_color_mode(_mode: ColorMode) -> FrameMemoryKind {
+            FrameMemoryKind::D3D11SharedBgra
+        }
+
         pub fn preferred_input_memory_kind() -> FrameMemoryKind {
             FrameMemoryKind::D3D11SharedBgra
         }
 
         pub fn preferred_main10_input_memory_kind() -> FrameMemoryKind {
-            FrameMemoryKind::Cpu
+            FrameMemoryKind::D3D11SharedBgra
         }
 
         pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
@@ -879,13 +1081,9 @@ mod imp {
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.frame_interval_p = 1;
             preset.preset_cfg.gop_len = hevc_remote_desktop_keyframe_interval(fps) as u32;
-            let texture_format = if main10 {
-                DXGI_FORMAT_P010
-            } else {
-                DXGI_FORMAT_B8G8R8A8_UNORM
-            };
+            let texture_format = DXGI_FORMAT_B8G8R8A8_UNORM;
             if main10 {
-                preset.preset_cfg.set_hevc_main10_bit_depths();
+                preset.preset_cfg.set_hevc_main10_8bit_input_bit_depths();
             }
 
             let init = InitParams {
@@ -895,11 +1093,7 @@ mod imp {
                 aspect_ratio: [width as u32, height as u32],
                 frame_rate: [fps, 1],
                 tuning_info: hevc_tuning_info(ultra_low_latency),
-                buffer_format: if main10 {
-                    NVencBufferFormat::YUV420_10Bit
-                } else {
-                    NVencBufferFormat::ARGB
-                },
+                buffer_format: NVencBufferFormat::ARGB,
                 encode_config: &mut preset.preset_cfg,
                 enable_ptd: true,
                 max_encoder_resolution: [width as u32, height as u32],
@@ -917,15 +1111,7 @@ mod imp {
                 PipelineError::message(format!("create nvenc HEVC texture failed: {error}"))
             })?;
             let registered = encoder
-                .register_resource_dx11(
-                    &texture,
-                    if main10 {
-                        NVencBufferFormat::YUV420_10Bit
-                    } else {
-                        NVencBufferFormat::ARGB
-                    },
-                    0,
-                )
+                .register_resource_dx11(&texture, NVencBufferFormat::ARGB, 0)
                 .map_err(|error| {
                     PipelineError::message(format!(
                         "nvenc HEVC register resource failed: {error:?}"
@@ -944,12 +1130,14 @@ mod imp {
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
+                color_transform_pipeline: None,
                 bitstream,
                 width,
                 height,
                 fps,
                 frame_index: 0,
                 main10,
+                color_mode: ColorMode::Full,
             })
         }
 
@@ -964,13 +1152,7 @@ mod imp {
                     self.width, self.height, shared.width, shared.height
                 )));
             }
-            if self.main10 {
-                return Err(PipelineError::message(
-                    "NVENC HEVC Main10 requires CPU BGRA input until shared BGRA to P010 conversion is implemented",
-                ));
-            }
-
-            let source_texture = self.ensure_shared_input(shared)?;
+            let source = self.ensure_shared_input(shared)?;
             self.ensure_shared_encode_slots()?;
 
             let mut output = Vec::new();
@@ -984,7 +1166,7 @@ mod imp {
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
-            self.copy_shared_bgra_to_texture(&source_texture, &slot.texture)?;
+            self.copy_or_transform_shared_bgra_to_texture(&source, &slot)?;
 
             let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
             let force_idr =
@@ -1038,8 +1220,20 @@ mod imp {
                         "nvenc HEVC shared slot bitstream buffer failed: {error:?}"
                     ))
                 })?;
+                let render_target_view = if self.color_mode == ColorMode::Full {
+                    None
+                } else {
+                    Some(
+                        create_render_target_view(&self._device, &texture).map_err(|error| {
+                            PipelineError::message(format!(
+                                "create shared NVENC HEVC slot RTV failed: {error}"
+                            ))
+                        })?,
+                    )
+                };
                 self.shared_encode_slots.push(SharedEncodeSlot {
                     texture,
+                    render_target_view,
                     registered,
                     bitstream,
                 });
@@ -1056,6 +1250,9 @@ mod imp {
             };
             let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
                 .map_err(|error| PipelineError::message(error.to_string()))?;
+            if self.main10 {
+                validate_hevc_main10_bitstream(&bytes)?;
+            }
             let access_unit = EncodedAccessUnit {
                 codec: VideoCodec::Hevc,
                 timestamp_us: pending.timestamp_us,
@@ -1064,6 +1261,26 @@ mod imp {
             };
             self.shared_encode_slots.push(pending.slot);
             Ok(Some(access_unit))
+        }
+
+        fn copy_or_transform_shared_bgra_to_texture(
+            &mut self,
+            source: &SharedInputBinding,
+            slot: &SharedEncodeSlot,
+        ) -> Result<(), PipelineError> {
+            if self.color_mode == ColorMode::Full {
+                return self.copy_shared_bgra_to_texture(&source.texture, &slot.texture);
+            }
+
+            let source_srv = source.shader_resource_view.as_ref().ok_or_else(|| {
+                PipelineError::message(
+                    "missing shared BGRA shader resource view for HEVC color mode",
+                )
+            })?;
+            let target_rtv = slot.render_target_view.as_ref().ok_or_else(|| {
+                PipelineError::message("missing NVENC HEVC render target view for color mode")
+            })?;
+            self.transform_shared_bgra_to_texture(source_srv, target_rtv)
         }
 
         fn copy_shared_bgra_to_texture(
@@ -1090,16 +1307,49 @@ mod imp {
             Ok(())
         }
 
+        fn transform_shared_bgra_to_texture(
+            &mut self,
+            source_srv: &ID3D11ShaderResourceView,
+            target_rtv: &ID3D11RenderTargetView,
+        ) -> Result<(), PipelineError> {
+            let context = self.context.clone();
+            let width = self.width as u32;
+            let height = self.height as u32;
+            let color_mode = self.color_mode;
+            let pipeline = self.ensure_color_transform_pipeline()?;
+            draw_color_transform(
+                &context, width, height, color_mode, pipeline, source_srv, target_rtv,
+            )
+        }
+
+        fn ensure_color_transform_pipeline(
+            &mut self,
+        ) -> Result<&ColorTransformPipeline, PipelineError> {
+            if self.color_transform_pipeline.is_none() {
+                self.color_transform_pipeline = Some(
+                    create_color_transform_pipeline(&self._device).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create NVENC HEVC color transform pipeline failed: {error}"
+                        ))
+                    })?,
+                );
+            }
+            Ok(self.color_transform_pipeline.as_ref().unwrap())
+        }
+
         fn ensure_shared_input(
             &mut self,
             shared: &D3D11SharedBgraFrame,
-        ) -> Result<ID3D11Texture2D, PipelineError> {
+        ) -> Result<SharedInputBinding, PipelineError> {
             if let Some(input) = self.shared_inputs.iter().find(|input| {
                 input.shared_handle == shared.shared_handle
                     && input.width == shared.width
                     && input.height == shared.height
             }) {
-                return Ok(input._texture.clone());
+                return Ok(SharedInputBinding {
+                    texture: input._texture.clone(),
+                    shader_resource_view: input.shader_resource_view.clone(),
+                });
             }
 
             if shared.shared_handle == 0 {
@@ -1124,19 +1374,34 @@ mod imp {
             if self.shared_inputs.len() >= SHARED_INPUT_CACHE_LIMIT {
                 self.shared_inputs.remove(0);
             }
+            let shader_resource_view = if self.color_mode == ColorMode::Full {
+                None
+            } else {
+                Some(
+                    create_shader_resource_view(&self._device, &texture).map_err(|error| {
+                        PipelineError::message(format!(
+                            "create shared BGRA HEVC input SRV failed: {error}"
+                        ))
+                    })?,
+                )
+            };
+
             self.shared_inputs.push(SharedInputResource {
                 shared_handle: shared.shared_handle,
                 width: shared.width,
                 height: shared.height,
                 _texture: texture,
+                shader_resource_view,
             });
 
-            Ok(self
+            let input = self
                 .shared_inputs
                 .last()
-                .expect("shared HEVC input resource was just inserted")
-                ._texture
-                .clone())
+                .expect("shared HEVC input resource was just inserted");
+            Ok(SharedInputBinding {
+                texture: input._texture.clone(),
+                shader_resource_view: input.shader_resource_view.clone(),
+            })
         }
     }
 
@@ -1161,6 +1426,12 @@ mod imp {
             }
             if let Some(shared) = frame.d3d11_shared_bgra() {
                 return self.encode_shared_bgra(frame, shared);
+            }
+            if self.color_mode != ColorMode::Full {
+                return Err(PipelineError::message(format!(
+                    "NVENC H.264 color_mode={} requires D3D11 shared BGRA input",
+                    self.color_mode.as_str()
+                )));
             }
 
             let bgra = to_bgra(frame)?;
@@ -1226,15 +1497,15 @@ mod imp {
             if let Some(shared) = frame.d3d11_shared_bgra() {
                 return self.encode_shared_bgra(frame, shared);
             }
+            if self.color_mode != ColorMode::Full {
+                return Err(PipelineError::message(format!(
+                    "NVENC HEVC color_mode={} requires D3D11 shared BGRA input",
+                    self.color_mode.as_str()
+                )));
+            }
 
-            let upload;
-            let (upload_data, row_pitch) = if self.main10 {
-                upload = bgra_frame_to_p010(frame, self.width, self.height)?;
-                (upload.as_slice(), (self.width * 2) as u32)
-            } else {
-                upload = to_bgra(frame)?;
-                (upload.as_slice(), (self.width * 4) as u32)
-            };
+            let upload = to_bgra(frame)?;
+            let (upload_data, row_pitch) = (upload.as_slice(), (self.width * 4) as u32);
 
             unsafe {
                 self.context.UpdateSubresource(
@@ -1256,11 +1527,7 @@ mod imp {
                 &self.registered,
                 self.frame_index,
                 force_idr,
-                if self.main10 {
-                    NVencBufferFormat::YUV420_10Bit
-                } else {
-                    NVencBufferFormat::ARGB
-                },
+                NVencBufferFormat::ARGB,
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             if self.main10 {
@@ -1353,6 +1620,209 @@ mod imp {
             assert!(h264_should_force_keyframe(7, 120, true));
             assert!(h264_should_force_keyframe(30, 120, false));
         }
+    }
+
+    fn compile_shader(source: &str, target: &'static core::ffi::CStr) -> anyhow::Result<Vec<u8>> {
+        use windows::core::PCSTR;
+        use windows::Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DBlob, ID3DInclude};
+
+        let mut code = None::<ID3DBlob>;
+        let mut errors = None::<ID3DBlob>;
+        let result = unsafe {
+            D3DCompile(
+                source.as_ptr() as *const core::ffi::c_void,
+                source.len(),
+                PCSTR::null(),
+                None,
+                None::<&ID3DInclude>,
+                PCSTR(c"main".as_ptr().cast()),
+                PCSTR(target.as_ptr().cast()),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+
+        if let Err(error) = result {
+            let details = errors
+                .as_ref()
+                .map(|blob| unsafe {
+                    let bytes = core::slice::from_raw_parts(
+                        blob.GetBufferPointer() as *const u8,
+                        blob.GetBufferSize(),
+                    );
+                    String::from_utf8_lossy(bytes).trim().to_string()
+                })
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| error.to_string());
+            return Err(anyhow!(
+                "compile NVENC color transform shader failed: {details}"
+            ));
+        }
+
+        let code = code.ok_or_else(|| anyhow!("missing NVENC color transform shader bytecode"))?;
+        let bytes = unsafe {
+            core::slice::from_raw_parts(code.GetBufferPointer() as *const u8, code.GetBufferSize())
+        };
+        Ok(bytes.to_vec())
+    }
+
+    fn create_color_transform_pipeline(
+        device: &ID3D11Device,
+    ) -> anyhow::Result<ColorTransformPipeline> {
+        let vertex_code = compile_shader(COLOR_TRANSFORM_VERTEX_SHADER, c"vs_5_0")?;
+        let grayscale_pixel_code =
+            compile_shader(COLOR_TRANSFORM_GRAYSCALE_PIXEL_SHADER, c"ps_5_0")?;
+        let monochrome_pixel_code =
+            compile_shader(COLOR_TRANSFORM_MONOCHROME_PIXEL_SHADER, c"ps_5_0")?;
+        let low_chroma_pixel_code =
+            compile_shader(COLOR_TRANSFORM_LOW_CHROMA_PIXEL_SHADER, c"ps_5_0")?;
+
+        let mut vertex_shader = None::<ID3D11VertexShader>;
+        let mut grayscale_pixel_shader = None::<ID3D11PixelShader>;
+        let mut monochrome_pixel_shader = None::<ID3D11PixelShader>;
+        let mut low_chroma_pixel_shader = None::<ID3D11PixelShader>;
+        unsafe {
+            device
+                .CreateVertexShader(
+                    &vertex_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut vertex_shader),
+                )
+                .context("create NVENC color transform vertex shader failed")?;
+            device
+                .CreatePixelShader(
+                    &grayscale_pixel_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut grayscale_pixel_shader),
+                )
+                .context("create NVENC grayscale pixel shader failed")?;
+            device
+                .CreatePixelShader(
+                    &monochrome_pixel_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut monochrome_pixel_shader),
+                )
+                .context("create NVENC monochrome pixel shader failed")?;
+            device
+                .CreatePixelShader(
+                    &low_chroma_pixel_code,
+                    None::<&ID3D11ClassLinkage>,
+                    Some(&mut low_chroma_pixel_shader),
+                )
+                .context("create NVENC low-chroma pixel shader failed")?;
+        }
+
+        let sampler_desc = D3D11_SAMPLER_DESC {
+            Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+            AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D11_COMPARISON_NEVER,
+            BorderColor: [0.0, 0.0, 0.0, 0.0],
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+        };
+        let mut sampler = None::<ID3D11SamplerState>;
+        unsafe {
+            device
+                .CreateSamplerState(&sampler_desc, Some(&mut sampler))
+                .context("create NVENC color transform sampler failed")?;
+        }
+
+        Ok(ColorTransformPipeline {
+            vertex_shader: vertex_shader.ok_or_else(|| anyhow!("missing vertex shader"))?,
+            grayscale_pixel_shader: grayscale_pixel_shader
+                .ok_or_else(|| anyhow!("missing grayscale pixel shader"))?,
+            monochrome_pixel_shader: monochrome_pixel_shader
+                .ok_or_else(|| anyhow!("missing monochrome pixel shader"))?,
+            low_chroma_pixel_shader: low_chroma_pixel_shader
+                .ok_or_else(|| anyhow!("missing low-chroma pixel shader"))?,
+            sampler: sampler.ok_or_else(|| anyhow!("missing sampler"))?,
+        })
+    }
+
+    fn create_shader_resource_view(
+        device: &ID3D11Device,
+        texture: &ID3D11Texture2D,
+    ) -> anyhow::Result<ID3D11ShaderResourceView> {
+        let resource: ID3D11Resource = texture.cast().context("cast texture to SRV resource")?;
+        let mut view = None::<ID3D11ShaderResourceView>;
+        unsafe {
+            device
+                .CreateShaderResourceView(&resource, None, Some(&mut view))
+                .context("CreateShaderResourceView failed")?;
+        }
+        view.ok_or_else(|| anyhow!("CreateShaderResourceView returned none"))
+    }
+
+    fn create_render_target_view(
+        device: &ID3D11Device,
+        texture: &ID3D11Texture2D,
+    ) -> anyhow::Result<ID3D11RenderTargetView> {
+        let resource: ID3D11Resource = texture.cast().context("cast texture to RTV resource")?;
+        let mut view = None::<ID3D11RenderTargetView>;
+        unsafe {
+            device
+                .CreateRenderTargetView(&resource, None, Some(&mut view))
+                .context("CreateRenderTargetView failed")?;
+        }
+        view.ok_or_else(|| anyhow!("CreateRenderTargetView returned none"))
+    }
+
+    fn draw_color_transform(
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        color_mode: ColorMode,
+        pipeline: &ColorTransformPipeline,
+        source_srv: &ID3D11ShaderResourceView,
+        target_rtv: &ID3D11RenderTargetView,
+    ) -> Result<(), PipelineError> {
+        let pixel_shader = match color_mode {
+            ColorMode::Full => {
+                return Err(PipelineError::message(
+                    "color transform draw called for full color mode",
+                ))
+            }
+            ColorMode::Grayscale => pipeline.grayscale_pixel_shader.clone(),
+            ColorMode::Monochrome => pipeline.monochrome_pixel_shader.clone(),
+            ColorMode::LowChroma => pipeline.low_chroma_pixel_shader.clone(),
+        };
+        let vertex_shader = pipeline.vertex_shader.clone();
+        let sampler = pipeline.sampler.clone();
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        let srvs = [Some(source_srv.clone())];
+        let empty_srvs: [Option<ID3D11ShaderResourceView>; 1] = [None];
+        let samplers = [Some(sampler)];
+        let empty_samplers: [Option<ID3D11SamplerState>; 1] = [None];
+
+        unsafe {
+            context.OMSetRenderTargets(Some(&[Some(target_rtv.clone())]), None);
+            context.RSSetViewports(Some(&[viewport]));
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            context.VSSetShader(&vertex_shader, None);
+            context.PSSetShader(&pixel_shader, None);
+            context.PSSetSamplers(0, Some(&samplers));
+            context.PSSetShaderResources(0, Some(&srvs));
+            context.Draw(3, 0);
+            context.PSSetShaderResources(0, Some(&empty_srvs));
+            context.PSSetSamplers(0, Some(&empty_samplers));
+            context.OMSetRenderTargets(Some(&[None]), None);
+            context.Flush();
+        }
+
+        Ok(())
     }
 
     fn create_d3d11_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
@@ -1755,76 +2225,6 @@ mod imp {
         }
     }
 
-    fn bgra_frame_to_p010(
-        frame: &CapturedFrame,
-        width: usize,
-        height: usize,
-    ) -> Result<Vec<u8>, PipelineError> {
-        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
-            return Err(PipelineError::message(
-                "P010 HEVC Main10 input requires even frame dimensions",
-            ));
-        }
-
-        let bgra = to_bgra(frame)?;
-        let y_samples = width
-            .checked_mul(height)
-            .ok_or_else(|| PipelineError::message("P010 luma size overflow"))?;
-        let total_bytes = y_samples
-            .checked_mul(3)
-            .ok_or_else(|| PipelineError::message("P010 frame size overflow"))?;
-        let mut p010 = vec![0_u8; total_bytes];
-        let uv_offset = y_samples * 2;
-
-        for y in 0..height {
-            for x in 0..width {
-                let [yy, _, _] = bgra_pixel_to_yuv8(&bgra, width, x, y);
-                write_p010_sample(&mut p010, (y * width + x) * 2, yy);
-            }
-        }
-
-        for y in (0..height).step_by(2) {
-            for x in (0..width).step_by(2) {
-                let mut u_acc = 0_u32;
-                let mut v_acc = 0_u32;
-                for dy in 0..2 {
-                    for dx in 0..2 {
-                        let [_, u, v] = bgra_pixel_to_yuv8(&bgra, width, x + dx, y + dy);
-                        u_acc += u as u32;
-                        v_acc += v as u32;
-                    }
-                }
-                let u = (u_acc / 4) as u8;
-                let v = (v_acc / 4) as u8;
-                let chroma_index = (y / 2) * width + x;
-                write_p010_sample(&mut p010, uv_offset + chroma_index * 2, u);
-                write_p010_sample(&mut p010, uv_offset + (chroma_index + 1) * 2, v);
-            }
-        }
-
-        Ok(p010)
-    }
-
-    fn bgra_pixel_to_yuv8(bgra: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
-        let offset = (y * width + x) * 4;
-        let b = bgra[offset] as i32;
-        let g = bgra[offset + 1] as i32;
-        let r = bgra[offset + 2] as i32;
-        let yy = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-        let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-        let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-        [
-            yy.clamp(16, 235) as u8,
-            u.clamp(16, 240) as u8,
-            v.clamp(16, 240) as u8,
-        ]
-    }
-
-    fn write_p010_sample(buffer: &mut [u8], byte_offset: usize, value8: u8) {
-        let sample = (value8 as u16) << 8;
-        buffer[byte_offset..byte_offset + 2].copy_from_slice(&sample.to_le_bytes());
-    }
-
     fn nv12_len(width: usize, height: usize) -> Option<usize> {
         if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             return None;
@@ -1873,6 +2273,7 @@ pub use imp::{NvencH264Encoder, NvencHevcEncoder};
 pub struct NvencHevcEncoder {
     encoder: GstreamerNvencEncoder,
     main10: bool,
+    color_mode: ColorMode,
 }
 
 #[cfg(not(windows))]
@@ -2050,6 +2451,7 @@ impl GstreamerNvencEncoder {
 #[cfg(not(windows))]
 pub struct NvencH264Encoder {
     encoder: GstreamerNvencEncoder,
+    color_mode: ColorMode,
 }
 
 #[cfg(not(windows))]
@@ -2358,6 +2760,25 @@ fn annex_b_contains_keyframe(codec: VideoCodec, bytes: &[u8]) -> bool {
 
 #[cfg(not(windows))]
 impl NvencH264Encoder {
+    pub fn default_color_mode() -> ColorMode {
+        ColorMode::Full
+    }
+
+    pub fn color_mode(&self) -> ColorMode {
+        self.color_mode
+    }
+
+    pub fn with_color_mode(mut self, color_mode: ColorMode) -> Self {
+        self.color_mode = color_mode;
+        self
+    }
+
+    pub fn preferred_input_memory_kind_for_color_mode(
+        _mode: ColorMode,
+    ) -> mrd_pipeline_core::FrameMemoryKind {
+        mrd_pipeline_core::FrameMemoryKind::Cpu
+    }
+
     pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
         Self::new_with_bitrate(width, height, fps, 8_000_000)
     }
@@ -2396,6 +2817,7 @@ impl NvencH264Encoder {
                 fps,
                 bitrate,
             )?,
+            color_mode: ColorMode::Full,
         })
     }
 
@@ -2429,6 +2851,25 @@ impl NvencH264Encoder {
 
 #[cfg(not(windows))]
 impl NvencHevcEncoder {
+    pub fn default_color_mode() -> ColorMode {
+        ColorMode::Full
+    }
+
+    pub fn color_mode(&self) -> ColorMode {
+        self.color_mode
+    }
+
+    pub fn with_color_mode(mut self, color_mode: ColorMode) -> Self {
+        self.color_mode = color_mode;
+        self
+    }
+
+    pub fn preferred_input_memory_kind_for_color_mode(
+        _mode: ColorMode,
+    ) -> mrd_pipeline_core::FrameMemoryKind {
+        mrd_pipeline_core::FrameMemoryKind::Cpu
+    }
+
     pub fn preferred_input_memory_kind() -> mrd_pipeline_core::FrameMemoryKind {
         mrd_pipeline_core::FrameMemoryKind::Cpu
     }
@@ -2467,6 +2908,7 @@ impl NvencHevcEncoder {
                 bitrate,
             )?,
             main10: false,
+            color_mode: ColorMode::Full,
         })
     }
 
@@ -2509,6 +2951,12 @@ impl NvencHevcEncoder {
 #[cfg(not(windows))]
 impl VideoEncoder for NvencH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        if self.color_mode != ColorMode::Full {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC H.264 color_mode={} requires a GPU color transform path",
+                self.color_mode.as_str()
+            )));
+        }
         self.encoder.encode(frame)
     }
 }
@@ -2516,6 +2964,12 @@ impl VideoEncoder for NvencH264Encoder {
 #[cfg(not(windows))]
 impl VideoEncoder for NvencHevcEncoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        if self.color_mode != ColorMode::Full {
+            return Err(PipelineError::message(format!(
+                "Linux NVENC HEVC color_mode={} requires a GPU color transform path",
+                self.color_mode.as_str()
+            )));
+        }
         self.encoder.encode(frame)
     }
 }

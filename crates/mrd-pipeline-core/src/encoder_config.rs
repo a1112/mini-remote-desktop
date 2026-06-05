@@ -9,6 +9,52 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// GPU-side color transform applied before encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorMode {
+    /// Preserve source color.
+    #[default]
+    Full,
+    /// Convert source color to luma grayscale on the GPU.
+    Grayscale,
+    /// Convert source color to thresholded black/white on the GPU.
+    Monochrome,
+    /// Reduce chroma while preserving some source color.
+    LowChroma,
+}
+
+impl ColorMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Grayscale => "grayscale",
+            Self::Monochrome => "monochrome",
+            Self::LowChroma => "low_chroma",
+        }
+    }
+}
+
+/// Bit-depth and transfer pipeline used to carry encoded frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorPipeline {
+    /// 8-bit SDR media path.
+    #[default]
+    Sdr8,
+    /// 10-bit HEVC Main10 media path.
+    HdrMain10,
+}
+
+impl ColorPipeline {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sdr8 => "sdr8",
+            Self::HdrMain10 => "hdr_main10",
+        }
+    }
+}
+
 /// Video codec type with feature support
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EnhancedCodec {
@@ -485,6 +531,50 @@ impl Default for EnhancedEncoderConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_mode_defaults_to_full() {
+        assert_eq!(ColorMode::default(), ColorMode::Full);
+    }
+
+    #[test]
+    fn color_mode_uses_stable_snake_case_json_values() {
+        let cases = [
+            (ColorMode::Full, r#""full""#),
+            (ColorMode::Grayscale, r#""grayscale""#),
+            (ColorMode::Monochrome, r#""monochrome""#),
+            (ColorMode::LowChroma, r#""low_chroma""#),
+        ];
+
+        for (mode, expected_json) in cases {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), expected_json);
+            assert_eq!(
+                serde_json::from_str::<ColorMode>(expected_json).unwrap(),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn color_pipeline_defaults_to_sdr8() {
+        assert_eq!(ColorPipeline::default(), ColorPipeline::Sdr8);
+    }
+
+    #[test]
+    fn color_pipeline_uses_stable_snake_case_json_values() {
+        let cases = [
+            (ColorPipeline::Sdr8, r#""sdr8""#),
+            (ColorPipeline::HdrMain10, r#""hdr_main10""#),
+        ];
+
+        for (pipeline, expected_json) in cases {
+            assert_eq!(serde_json::to_string(&pipeline).unwrap(), expected_json);
+            assert_eq!(
+                serde_json::from_str::<ColorPipeline>(expected_json).unwrap(),
+                pipeline
+            );
+        }
+    }
 
     #[test]
     fn quality_preset_has_correct_factors() {

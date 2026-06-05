@@ -371,6 +371,7 @@ pub struct NVencConfigHEVC {
     max_cu_size: NVencHEVCCuSize,
     bitflags: u32,
     idr_period: u32,
+    intra_refresh_period: u32,
     intra_refresh_cnt: u32,
     max_num_ref_frames_in_dpb: u32,
     ltr_num_frames: u32,
@@ -383,6 +384,8 @@ pub struct NVencConfigHEVC {
     hevc_vui_paramters: NVencConfigHEVCVUIParamaters,
     ltr_trust_mode: u32,
     use_b_frames_as_ref: NVencBFrameRefMode,
+    num_ref_l0: NVencNumRefFrames,
+    num_ref_l1: NVencNumRefFrames,
     tf_level: NVencTemporalFilterLevel,
     disable_deblocking_filter_idc: u32,
     output_bit_depth: NVencBitDepth,
@@ -492,6 +495,14 @@ pub struct NVencConfig {
 
 impl NVencConfig {
     pub fn set_hevc_main10_bit_depths(&mut self) {
+        self.set_hevc_main10_bit_depths_with_input(NVencBitDepth::Depth10);
+    }
+
+    pub fn set_hevc_main10_8bit_input_bit_depths(&mut self) {
+        self.set_hevc_main10_bit_depths_with_input(NVencBitDepth::Depth8);
+    }
+
+    fn set_hevc_main10_bit_depths_with_input(&mut self, input_bit_depth: NVencBitDepth) {
         unsafe {
             let hevc = &mut *(&mut self.encode_codec_config.hevc
                 as *mut ManuallyDrop<NVencConfigHEVC>
@@ -502,7 +513,7 @@ impl NVencConfig {
             hevc.bitflags =
                 (hevc.bitflags & !HEVC_CHROMA_FORMAT_IDC_MASK) | HEVC_CHROMA_FORMAT_IDC_420;
             hevc.output_bit_depth = NVencBitDepth::Depth10;
-            hevc.input_bit_depth = NVencBitDepth::Depth10;
+            hevc.input_bit_depth = input_bit_depth;
         }
     }
 }
@@ -588,8 +599,13 @@ pub struct NVencPresetConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::NVencConfigAV1;
-    use std::mem::{offset_of, size_of};
+    use crate::sys::enums::NVencBitDepth;
+
+    use super::{NVencConfig, NVencConfigAV1, NVencConfigHEVC};
+    use std::{
+        mem::{ManuallyDrop, MaybeUninit, offset_of, size_of},
+        ptr,
+    };
 
     #[test]
     fn av1_config_matches_sdk_13_layout() {
@@ -599,6 +615,62 @@ mod tests {
         assert_eq!(offset_of!(NVencConfigAV1, rsvd1), 132);
         assert_eq!(offset_of!(NVencConfigAV1, rsvd3), 1056);
         assert_eq!(size_of::<NVencConfigAV1>(), 1552);
+    }
+
+    #[test]
+    fn hevc_main10_bit_depths_are_written_at_sdk_13_offsets() {
+        let mut config = unsafe { MaybeUninit::<NVencConfig>::zeroed().assume_init() };
+
+        config.set_hevc_main10_bit_depths();
+
+        let hevc = unsafe {
+            &*(&config.encode_codec_config.hevc as *const ManuallyDrop<NVencConfigHEVC>
+                as *const NVencConfigHEVC)
+        };
+
+        assert_eq!(offset_of!(NVencConfigHEVC, intra_refresh_period), 24);
+        assert_eq!(offset_of!(NVencConfigHEVC, num_ref_l0), 184);
+        assert_eq!(offset_of!(NVencConfigHEVC, num_ref_l1), 188);
+        assert_eq!(
+            offset_of!(NVencConfigHEVC, output_bit_depth),
+            200,
+            "NV_ENC_CONFIG_HEVC::outputBitDepth offset changed; keep this wrapper aligned with tools/Video_Codec_Interface_13.0.37/Interface/nvEncodeAPI.h"
+        );
+        assert_eq!(
+            offset_of!(NVencConfigHEVC, input_bit_depth),
+            204,
+            "NV_ENC_CONFIG_HEVC::inputBitDepth offset changed; keep this wrapper aligned with tools/Video_Codec_Interface_13.0.37/Interface/nvEncodeAPI.h"
+        );
+        assert_eq!(offset_of!(NVencConfigHEVC, rsvd1), 216);
+        assert_eq!(size_of::<NVencConfigHEVC>(), 1560);
+        assert_eq!(
+            unsafe { ptr::read_unaligned((&raw const hevc.output_bit_depth).cast::<u32>()) },
+            NVencBitDepth::Depth10 as u32
+        );
+        assert_eq!(
+            unsafe { ptr::read_unaligned((&raw const hevc.input_bit_depth).cast::<u32>()) },
+            NVencBitDepth::Depth10 as u32
+        );
+    }
+
+    #[test]
+    fn hevc_main10_can_request_8bit_input_to_10bit_output_conversion() {
+        let mut config = unsafe { MaybeUninit::<NVencConfig>::zeroed().assume_init() };
+
+        config.set_hevc_main10_8bit_input_bit_depths();
+
+        let hevc = unsafe {
+            &*(&config.encode_codec_config.hevc as *const ManuallyDrop<NVencConfigHEVC>
+                as *const NVencConfigHEVC)
+        };
+        assert_eq!(
+            unsafe { ptr::read_unaligned((&raw const hevc.output_bit_depth).cast::<u32>()) },
+            NVencBitDepth::Depth10 as u32
+        );
+        assert_eq!(
+            unsafe { ptr::read_unaligned((&raw const hevc.input_bit_depth).cast::<u32>()) },
+            NVencBitDepth::Depth8 as u32
+        );
     }
 }
 

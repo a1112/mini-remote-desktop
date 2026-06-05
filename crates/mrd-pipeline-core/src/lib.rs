@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod encoder_config;
+pub use encoder_config::{ColorMode, ColorPipeline};
 
 #[cfg(target_os = "macos")]
 use std::{ffi::c_void, ptr::NonNull};
