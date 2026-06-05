@@ -1681,6 +1681,24 @@ fn add_service_capabilities(
             Some(reason.as_str()),
         );
     }
+    if matches!(platform, CapabilityPlatform::Windows) {
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Service,
+            "media.hevc_main10_420_10bit",
+            "HEVC Main10 10-bit 4:2:0",
+            "LAN HEVC Main10 profile metadata; NVENC Main10 encode and Main10 decode probes still gate runtime use.",
+        );
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Service,
+            "media.color_mode_v1",
+            "GPU color mode transform",
+            "LAN color mode profile metadata and GPU-side transform contract for full, grayscale, monochrome, and low-chroma modes.",
+        );
+    }
     let (ffmpeg_status, ffmpeg_reason) = ffmpeg_tool_status(probe_mode);
     push_item(
         items,
@@ -1808,6 +1826,23 @@ fn default_profiles() -> Vec<CapabilityProfile> {
                 "encode.nvenc_hevc",
                 "decode.nvdec_hevc",
                 "media.hevc_main_420_8bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
+            "lan.2k144.main10",
+            2560,
+            1440,
+            144,
+            80,
+            "hevc",
+            vec![
+                "encode.nvenc_hevc_main10",
+                "decode.nvdec_hevc_main10",
+                "media.hevc_main10_420_10bit",
                 "render.d3d11",
                 "memory.d3d11_shared",
                 "transport.quic_datagram",
@@ -2184,6 +2219,53 @@ mod tests {
             .expect("macOS HEVC Main 8-bit 4:2:0 media capability");
 
         assert_eq!(media.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn windows_color_and_main10_media_profile_capabilities_are_advertised() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+
+        let color = capabilities
+            .iter()
+            .find(|item| item.id == "media.color_mode_v1")
+            .expect("LAN color mode media capability");
+        let main10 = capabilities
+            .iter()
+            .find(|item| item.id == "media.hevc_main10_420_10bit")
+            .expect("HEVC Main10 10-bit 4:2:0 media capability");
+
+        assert_eq!(color.status, CapabilityStatus::Supported);
+        assert_eq!(main10.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn snapshot_exposes_lan_2k144_main10_profile() {
+        let snapshot = local_capability_snapshot_static();
+
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "lan.2k144.main10")
+            .expect("lan.2k144.main10 profile");
+
+        assert_eq!(profile.width, 2560);
+        assert_eq!(profile.height, 1440);
+        assert_eq!(profile.fps, 144);
+        assert_eq!(profile.bitrate_mbps, 80);
+        assert_eq!(profile.codec, "hevc");
+        assert_eq!(
+            profile.required_capabilities,
+            vec![
+                "encode.nvenc_hevc_main10".to_string(),
+                "decode.nvdec_hevc_main10".to_string(),
+                "media.hevc_main10_420_10bit".to_string(),
+                "render.d3d11".to_string(),
+                "memory.d3d11_shared".to_string(),
+                "transport.quic_datagram".to_string(),
+                "transport.media_profile_control_v1".to_string(),
+            ]
+        );
     }
 
     #[test]

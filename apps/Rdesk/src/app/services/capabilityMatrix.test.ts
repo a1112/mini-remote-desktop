@@ -767,6 +767,45 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
 
+  it("exposes LAN color and Main10 media capabilities in the baseline matrix", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    expect(snapshot.capabilities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "media.color_mode_v1",
+          status: "supported",
+        }),
+        expect.objectContaining({
+          id: "media.hevc_main10_420_10bit",
+          status: "supported",
+        }),
+      ])
+    );
+  });
+
+  it("exposes a LAN 2K144 Main10 profile with required media capabilities", () => {
+    const profile = getCapabilityProfile("lan.2k144.main10");
+
+    expect(profile).toMatchObject({
+      id: "lan.2k144.main10",
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 80,
+      codec: "hevc",
+    });
+    expect(profile?.required_capabilities).toEqual([
+      "encode.nvenc_hevc_main10",
+      "decode.nvdec_hevc_main10",
+      "media.hevc_main10_420_10bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ]);
+  });
+
   it("exposes a native macOS 2K144 profile", () => {
     const profile = getCapabilityProfile("lan.macos.2k144");
 

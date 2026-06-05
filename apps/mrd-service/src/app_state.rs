@@ -23,9 +23,7 @@ use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
 use mrd_render::RendererFactory;
 #[cfg(any(windows, target_os = "macos"))]
-use mrd_render::{
-    BoxedRenderer, RenderFrame, RenderTarget, RendererSnapshot,
-};
+use mrd_render::{BoxedRenderer, RenderFrame, RenderTarget, RendererSnapshot};
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
 #[cfg(target_os = "macos")]

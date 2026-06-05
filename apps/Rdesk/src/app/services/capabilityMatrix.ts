@@ -178,6 +178,8 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "memory.d3d11_shared": "available",
   "service.ffmpeg": "available",
   "media.hevc_main_420_8bit": "supported",
+  "media.hevc_main10_420_10bit": "supported",
+  "media.color_mode_v1": "supported",
 };
 
 const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
@@ -271,6 +273,22 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     label: "HEVC Main 8-bit 4:2:0",
     status: "supported",
     reason: "LAN high-performance HEVC profile metadata; encoder and decoder capabilities still gate runtime use",
+  },
+  {
+    id: "media.hevc_main10_420_10bit",
+    domain: "service",
+    label: "HEVC Main10 10-bit 4:2:0",
+    status: "supported",
+    reason:
+      "LAN HEVC Main10 profile metadata; NVENC Main10 encode and Main10 decode capabilities still gate runtime use",
+  },
+  {
+    id: "media.color_mode_v1",
+    domain: "service",
+    label: "GPU color mode transform",
+    status: "supported",
+    reason:
+      "LAN color mode profile metadata and GPU-side transform contract for full, grayscale, monochrome, and low-chroma modes",
   },
 ];
 
@@ -367,6 +385,25 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
       "encode.nvenc_hevc",
       "decode.nvdec_hevc",
       "media.hevc_main_420_8bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ],
+  },
+  {
+    id: "lan.2k144.main10",
+    width: 2560,
+    height: 1440,
+    fps: 144,
+    bitrate_mbps: 80,
+    codec: "hevc",
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: [
+      "encode.nvenc_hevc_main10",
+      "decode.nvdec_hevc_main10",
+      "media.hevc_main10_420_10bit",
       "render.d3d11",
       "memory.d3d11_shared",
       "transport.quic_datagram",

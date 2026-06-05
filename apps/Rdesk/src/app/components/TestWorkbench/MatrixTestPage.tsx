@@ -1120,7 +1120,6 @@ function createCrossDeviceMatrixTests(matrixTests: MatrixTest[]): MatrixTest[] {
       status: "pending",
       skipReason:
         test.skipReason ??
-        crossDeviceUnsupportedColorReason(test.config) ??
         crossDeviceUnsupportedTransportReason(test.config) ??
         undefined,
       failureReason: undefined,
@@ -1137,12 +1136,6 @@ function crossDeviceTransportFromConfig(config: TestConfig): "quic" | "webrtc" |
     return config.transport_kind;
   }
   return null;
-}
-
-function crossDeviceUnsupportedColorReason(config: TestConfig): string | null {
-  return isNonFullColorMode(config.color_mode)
-    ? "Cross-device matrix does not wire GPU color modes yet"
-    : null;
 }
 
 function crossDeviceUnsupportedTransportReason(config: TestConfig): string | null {
@@ -1186,6 +1179,20 @@ export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
 
 function crossDeviceMinimumExpectedFps(profile: MediaProfile): number {
   return Math.max(1, Math.floor(Math.max(1, profile.fps) * 0.8));
+}
+
+function mediaProfileRequestsNonFullColor(profile?: MediaProfile): boolean {
+  return Boolean(profile?.color_mode && profile.color_mode.toLowerCase() !== "full");
+}
+
+function mediaProfileRequestsHevcMain10(profile?: MediaProfile): boolean {
+  if (profile?.codec?.toLowerCase() !== "hevc") return false;
+  return (
+    profile.codec_profile?.toLowerCase() === "main10" ||
+    profile.bit_depth === 10 ||
+    profile.pixel_format?.toLowerCase() === "p010" ||
+    profile.color_pipeline?.toLowerCase() === "hdr_main10"
+  );
 }
 
 export function formatMatrixMediaProfile(profile: MediaProfile): string {
@@ -1253,49 +1260,70 @@ export function crossDevicePeerSkipReason(
   }
 
   const codec = profile?.codec?.toLowerCase() ?? "h264";
-  const requiredMediaCapabilityProfiles =
+  const requiresMain10 = mediaProfileRequestsHevcMain10(profile);
+  const requiresColorMode = mediaProfileRequestsNonFullColor(profile);
+  const colorModeCapability: string[][] = requiresColorMode ? [["media.color_mode_v1"]] : [];
+  const requiredMediaCapabilityProfiles: Array<{ label: string; capabilities: string[][] }> =
     codec === "hevc"
       ? [
           {
-            label: "Windows HEVC",
+            label: requiresMain10 ? "Windows HEVC Main10" : "Windows HEVC",
             capabilities: [
               ["dxgi_capture", "capture.dxgi"],
-              ["nvenc_hevc", "encode.nvenc_hevc"],
-              ["nvdec_hevc", "decode.nvdec_hevc"],
+              requiresMain10
+                ? ["encode.nvenc_hevc_main10", "nvenc_hevc_main10"]
+                : ["nvenc_hevc", "encode.nvenc_hevc"],
+              requiresMain10
+                ? ["decode.nvdec_hevc_main10", "nvdec_hevc_main10"]
+                : ["nvdec_hevc", "decode.nvdec_hevc"],
               ["d3d11_native_render", "render.d3d11"],
-              ["media.hevc_main_420_8bit"],
+              [
+                requiresMain10
+                  ? "media.hevc_main10_420_10bit"
+                  : "media.hevc_main_420_8bit",
+              ],
+              ...colorModeCapability,
             ],
           },
-          {
-            label: "macOS VideoToolbox HEVC",
-            capabilities: [
-              ["macos_capture", "capture.macos"],
-              ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
-              ["decode.videotoolbox_hevc"],
-              ["media.hevc_main_420_8bit"],
-              ["macos_native_render", "render.macos"],
-            ],
-          },
+          ...(!requiresMain10 && !requiresColorMode
+            ? [
+                {
+                  label: "macOS VideoToolbox HEVC",
+                  capabilities: [
+                    ["macos_capture", "capture.macos"],
+                    ["videotoolbox_hevc", "encode.videotoolbox_hevc"],
+                    ["decode.videotoolbox_hevc"],
+                    ["media.hevc_main_420_8bit"],
+                    ["macos_native_render", "render.macos"],
+                  ],
+                },
+              ]
+            : []),
         ]
       : [
           {
-            label: "Windows H.264",
+            label: requiresColorMode ? "Windows H.264 color mode" : "Windows H.264",
             capabilities: [
               ["dxgi_capture", "capture.dxgi"],
               ["nvenc_h264", "encode.nvenc_h264"],
               ["nvdec", "decode.nvdec"],
               ["d3d11_native_render", "render.d3d11"],
+              ...colorModeCapability,
             ],
           },
-          {
-            label: "macOS VideoToolbox H.264",
-            capabilities: [
-              ["macos_capture", "capture.macos"],
-              ["videotoolbox_h264", "encode.videotoolbox_h264"],
-              ["decode.videotoolbox_h264"],
-              ["macos_native_render", "render.macos"],
-            ],
-          },
+          ...(!requiresColorMode
+            ? [
+                {
+                  label: "macOS VideoToolbox H.264",
+                  capabilities: [
+                    ["macos_capture", "capture.macos"],
+                    ["videotoolbox_h264", "encode.videotoolbox_h264"],
+                    ["decode.videotoolbox_h264"],
+                    ["macos_native_render", "render.macos"],
+                  ],
+                },
+              ]
+            : []),
         ];
   const missingByProfile = requiredMediaCapabilityProfiles.map((capabilityProfile) => ({
     label: capabilityProfile.label,

@@ -12,7 +12,8 @@ use mrd_ipc::{
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use mrd_pipeline_core::FrameCapture;
 use mrd_pipeline_core::{
-    CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder, VideoEncoder,
+    CapturedFrame, ColorMode, DecodedFrame, DecodedFrameData, FramePixelFormat, VideoDecoder,
+    VideoEncoder,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(any(windows, target_os = "macos"))]
@@ -139,10 +140,16 @@ const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
 #[cfg(windows)]
 const LAN_ENCODE_NVENC_HEVC_CAPABILITY: &str = "encode.nvenc_hevc";
 #[cfg(windows)]
+const LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY: &str = "encode.nvenc_hevc_main10";
+#[cfg(windows)]
 const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
 #[cfg(windows)]
 const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
+#[cfg(windows)]
+const LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY: &str = "decode.nvdec_hevc_main10";
 const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
+const LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY: &str = "media.hevc_main10_420_10bit";
+const LAN_MEDIA_COLOR_MODE_CAPABILITY: &str = "media.color_mode_v1";
 #[cfg(windows)]
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 #[cfg(windows)]
@@ -729,6 +736,19 @@ enum LanAccessUnitCodec {
     H264,
     Hevc,
 }
+
+type LanEncoderConfigKey = (
+    usize,
+    usize,
+    u32,
+    u32,
+    LanAccessUnitCodec,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<u8>,
+    Option<String>,
+);
 
 impl LanAccessUnitCodec {
     fn from_profile(profile: &MediaProfile) -> Self {
@@ -3051,9 +3071,13 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
             LAN_CAPTURE_DXGI_CAPABILITY.to_string(),
             LAN_ENCODE_NVENC_H264_CAPABILITY.to_string(),
             LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string(),
+            LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_CAPABILITY.to_string(),
             LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string(),
+            LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY.to_string(),
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
+            LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY.to_string(),
+            LAN_MEDIA_COLOR_MODE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
             crate::display_mode::capability_name().to_string(),
@@ -3435,41 +3459,52 @@ fn missing_profile_media_capabilities(
     profile: &MediaProfile,
     peer_media_capabilities: &[String],
 ) -> Vec<String> {
-    match LanAccessUnitCodec::from_profile(profile) {
-        LanAccessUnitCodec::H264 => missing_capability_groups(
-            peer_media_capabilities,
-            &[(
-                "h264 encoder",
-                &[
-                    "encode.nvenc_h264",
-                    "nvenc_h264",
-                    "encode.videotoolbox_h264",
-                    "videotoolbox_h264",
-                    "encode.openh264",
-                    "openh264_fallback",
-                    "openh264",
-                ],
-            )],
-        ),
-        LanAccessUnitCodec::Hevc => missing_capability_groups(
-            peer_media_capabilities,
-            &[
-                (
-                    "hevc encoder",
-                    &[
-                        "encode.nvenc_hevc",
-                        "nvenc_hevc",
-                        "encode.videotoolbox_hevc",
-                        "videotoolbox_hevc",
-                    ],
-                ),
-                (
-                    LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
-                    &[LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
-                ),
+    let mut groups = match LanAccessUnitCodec::from_profile(profile) {
+        LanAccessUnitCodec::H264 => vec![(
+            "h264 encoder",
+            vec![
+                "encode.nvenc_h264",
+                "nvenc_h264",
+                "encode.videotoolbox_h264",
+                "videotoolbox_h264",
+                "encode.openh264",
+                "openh264_fallback",
+                "openh264",
             ],
-        ),
+        )],
+        LanAccessUnitCodec::Hevc if lan_profile_requests_hevc_main10(profile) => vec![
+            (
+                "hevc main10 encoder",
+                vec!["encode.nvenc_hevc_main10", "nvenc_hevc_main10"],
+            ),
+            (
+                LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
+                vec![LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY],
+            ),
+        ],
+        LanAccessUnitCodec::Hevc => vec![
+            (
+                "hevc encoder",
+                vec![
+                    "encode.nvenc_hevc",
+                    "nvenc_hevc",
+                    "encode.videotoolbox_hevc",
+                    "videotoolbox_hevc",
+                ],
+            ),
+            (
+                LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+                vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
+            ),
+        ],
+    };
+    if profile_requests_non_full_color(profile) {
+        groups.push((
+            LAN_MEDIA_COLOR_MODE_CAPABILITY,
+            vec![LAN_MEDIA_COLOR_MODE_CAPABILITY],
+        ));
     }
+    missing_capability_groups(peer_media_capabilities, &groups)
 }
 
 fn ensure_peer_can_receive_selected_media(
@@ -3495,50 +3530,62 @@ fn missing_profile_receiver_media_capabilities(
     profile: &MediaProfile,
     peer_media_capabilities: &[String],
 ) -> Vec<String> {
-    match LanAccessUnitCodec::from_profile(profile) {
-        LanAccessUnitCodec::H264 => missing_capability_groups(
-            peer_media_capabilities,
-            &[(
-                "h264 decoder",
-                &[
-                    "decode.nvdec",
-                    "nvdec",
-                    "decode.videotoolbox_h264",
-                    "decode.videotoolbox",
-                    "videotoolbox",
-                    "decode.linux_h264",
-                    "linux_h264",
-                    "decode.ffmpeg_h264",
-                    "ffmpeg_h264",
-                    "decode.software",
-                    "h264_software",
-                    "software_decode",
+    let groups = match LanAccessUnitCodec::from_profile(profile) {
+        LanAccessUnitCodec::H264 => vec![(
+            "h264 decoder",
+            vec![
+                "decode.nvdec",
+                "nvdec",
+                "decode.videotoolbox_h264",
+                "decode.videotoolbox",
+                "videotoolbox",
+                "decode.linux_h264",
+                "linux_h264",
+                "decode.ffmpeg_h264",
+                "ffmpeg_h264",
+                "decode.software",
+                "h264_software",
+                "software_decode",
+            ],
+        )],
+        LanAccessUnitCodec::Hevc if lan_profile_requests_hevc_main10(profile) => vec![
+            (
+                "hevc main10 decoder",
+                vec![
+                    "decode.nvdec_hevc_main10",
+                    "nvdec_hevc_main10",
+                    "nvdec_hevc_main10_d3d11_shared",
+                    "decode.ffmpeg_hevc_main10",
+                    "ffmpeg_hevc_main10",
+                    "software_hevc_main10",
                 ],
-            )],
-        ),
-        LanAccessUnitCodec::Hevc => missing_capability_groups(
-            peer_media_capabilities,
-            &[(
-                "hevc decoder",
-                &[
-                    "decode.nvdec_hevc",
-                    "nvdec_hevc",
-                    "nvdec_hevc_d3d11_shared",
-                    "decode.videotoolbox_hevc",
-                    "decode.linux_hevc",
-                    "linux_hevc",
-                    "decode.ffmpeg_hevc",
-                    "ffmpeg_hevc",
-                    "software_decode",
-                ],
-            )],
-        ),
-    }
+            ),
+            (
+                LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
+                vec![LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY],
+            ),
+        ],
+        LanAccessUnitCodec::Hevc => vec![(
+            "hevc decoder",
+            vec![
+                "decode.nvdec_hevc",
+                "nvdec_hevc",
+                "nvdec_hevc_d3d11_shared",
+                "decode.videotoolbox_hevc",
+                "decode.linux_hevc",
+                "linux_hevc",
+                "decode.ffmpeg_hevc",
+                "ffmpeg_hevc",
+                "software_decode",
+            ],
+        )],
+    };
+    missing_capability_groups(peer_media_capabilities, &groups)
 }
 
 fn missing_capability_groups(
     peer_media_capabilities: &[String],
-    groups: &[(&'static str, &'static [&'static str])],
+    groups: &[(&'static str, Vec<&'static str>)],
 ) -> Vec<String> {
     groups
         .iter()
@@ -3557,6 +3604,57 @@ fn missing_capability_groups(
             }
         })
         .collect()
+}
+
+fn profile_requests_non_full_color(profile: &MediaProfile) -> bool {
+    match profile.color_mode.as_deref() {
+        None => false,
+        Some(mode) => !mode.eq_ignore_ascii_case(ColorMode::Full.as_str()),
+    }
+}
+
+fn lan_color_mode_for_profile(profile: &MediaProfile) -> Result<ColorMode> {
+    match profile.color_mode.as_deref() {
+        None => Ok(ColorMode::Full),
+        Some(mode) if mode.eq_ignore_ascii_case(ColorMode::Full.as_str()) => Ok(ColorMode::Full),
+        Some(mode) if mode.eq_ignore_ascii_case(ColorMode::Grayscale.as_str()) => {
+            Ok(ColorMode::Grayscale)
+        }
+        Some(mode) if mode.eq_ignore_ascii_case(ColorMode::Monochrome.as_str()) => {
+            Ok(ColorMode::Monochrome)
+        }
+        Some(mode) if mode.eq_ignore_ascii_case(ColorMode::LowChroma.as_str()) => {
+            Ok(ColorMode::LowChroma)
+        }
+        Some(mode) => anyhow::bail!("unsupported LAN color_mode: {mode}"),
+    }
+}
+
+fn lan_profile_requests_hevc_main10(profile: &MediaProfile) -> bool {
+    if LanAccessUnitCodec::from_profile(profile) != LanAccessUnitCodec::Hevc {
+        return false;
+    }
+    profile
+        .codec_profile
+        .as_deref()
+        .map(|profile| {
+            let profile = profile.to_ascii_lowercase();
+            profile == "main10" || profile == "main_10"
+        })
+        .unwrap_or(false)
+        || profile.bit_depth.map(|depth| depth >= 10).unwrap_or(false)
+        || profile
+            .pixel_format
+            .as_deref()
+            .map(|format| {
+                format.eq_ignore_ascii_case("p010") || format.eq_ignore_ascii_case("p016")
+            })
+            .unwrap_or(false)
+        || profile
+            .color_pipeline
+            .as_deref()
+            .map(|pipeline| pipeline.eq_ignore_ascii_case("hdr_main10"))
+            .unwrap_or(false)
 }
 
 fn format_media_profile(profile: &MediaProfile) -> String {
@@ -3886,7 +3984,7 @@ async fn send_quic_media_loop(
     let mut active_capture_config: Option<LanCaptureConfigKey> = None;
     let mut capture: Option<LanSenderFrameCapture> = None;
     let mut encoder: Option<LanSenderEncoder> = None;
-    let mut encoder_config: Option<(usize, usize, u32, u32, LanAccessUnitCodec)> = None;
+    let mut encoder_config: Option<LanEncoderConfigKey> = None;
     let mut pending_keyframe_request = false;
     let mut consecutive_frame_errors = 0_u32;
     let mut next_frame_at = Instant::now();
@@ -4145,8 +4243,13 @@ async fn send_quic_media_loop(
             profile.fps,
             profile.bitrate_mbps,
             requested_codec,
+            profile.color_mode.clone(),
+            profile.color_pipeline.clone(),
+            profile.codec_profile.clone(),
+            profile.bit_depth,
+            profile.pixel_format.clone(),
         );
-        if encoder_config != Some(expected_encoder_config) {
+        if encoder_config.as_ref() != Some(&expected_encoder_config) {
             let peer_media_capabilities = app_state
                 .peer_media_capabilities
                 .lock()
@@ -4162,6 +4265,7 @@ async fn send_quic_media_loop(
                 frame.height,
                 profile.fps,
                 profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
+                &profile,
                 allow_h264_fallback,
             )
             .context("failed to create LAN media encoder")
@@ -4633,34 +4737,40 @@ fn create_lan_encoder(
     height: usize,
     fps: u32,
     bitrate: u32,
+    profile: &MediaProfile,
     allow_h264_fallback: bool,
 ) -> Result<LanSenderEncoder> {
     match requested_codec {
-        LanAccessUnitCodec::Hevc => match create_lan_hevc_encoder(width, height, fps, bitrate) {
-            Ok((backend, encoder)) => Ok(LanSenderEncoder {
-                codec: LanAccessUnitCodec::Hevc,
-                backend,
-                encoder,
-            }),
-            Err(hevc_error) => {
-                if !allow_h264_fallback {
-                    anyhow::bail!(
-                        "HEVC unavailable ({hevc_error}); H.264 fallback blocked because the peer does not advertise H.264 receiver capability"
-                    );
-                }
-                let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate)
-                    .with_context(|| {
-                        format!("HEVC unavailable ({hevc_error}); H.264 fallback also failed")
-                    })?;
-                Ok(LanSenderEncoder {
-                    codec: LanAccessUnitCodec::H264,
+        LanAccessUnitCodec::Hevc => {
+            match create_lan_hevc_encoder(width, height, fps, bitrate, profile) {
+                Ok((backend, encoder)) => Ok(LanSenderEncoder {
+                    codec: LanAccessUnitCodec::Hevc,
                     backend,
                     encoder,
-                })
+                }),
+                Err(hevc_error) => {
+                    if !allow_h264_fallback {
+                        anyhow::bail!(
+                        "HEVC unavailable ({hevc_error}); H.264 fallback blocked because the peer does not advertise H.264 receiver capability"
+                    );
+                    }
+                    let (backend, encoder) =
+                        create_lan_h264_encoder(width, height, fps, bitrate, profile)
+                            .with_context(|| {
+                                format!(
+                                    "HEVC unavailable ({hevc_error}); H.264 fallback also failed"
+                                )
+                            })?;
+                    Ok(LanSenderEncoder {
+                        codec: LanAccessUnitCodec::H264,
+                        backend,
+                        encoder,
+                    })
+                }
             }
-        },
+        }
         LanAccessUnitCodec::H264 => {
-            let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate)?;
+            let (backend, encoder) = create_lan_h264_encoder(width, height, fps, bitrate, profile)?;
             Ok(LanSenderEncoder {
                 codec: LanAccessUnitCodec::H264,
                 backend,
@@ -4690,20 +4800,35 @@ fn create_lan_hevc_encoder(
     height: usize,
     fps: u32,
     bitrate: u32,
+    profile: &MediaProfile,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    let color_mode = lan_color_mode_for_profile(profile)?;
+    if lan_profile_requests_hevc_main10(profile) {
+        return mrd_encode_nvenc::NvencHevcEncoder::new_main10_with_bitrate(
+            width, height, fps, bitrate,
+        )
+        .map(|encoder| {
+            (
+                "nvenc_hevc_main10",
+                Box::new(encoder.with_color_mode(color_mode)) as Box<dyn VideoEncoder + Send>,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
     match mrd_encode_nvenc::NvencHevcEncoder::new_max_speed_with_bitrate(
         width, height, fps, bitrate,
     ) {
         Ok(encoder) => Ok((
             "nvenc_hevc_p1_ultra_low_latency",
-            Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+            Box::new(encoder.with_color_mode(color_mode)) as Box<dyn VideoEncoder + Send>,
         )),
         Err(max_speed_error) => {
             mrd_encode_nvenc::NvencHevcEncoder::new_main_with_bitrate(width, height, fps, bitrate)
                 .map(|encoder| {
                     (
                         "nvenc_hevc",
-                        Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+                        Box::new(encoder.with_color_mode(color_mode))
+                            as Box<dyn VideoEncoder + Send>,
                     )
                 })
                 .map_err(|error| {
@@ -4721,7 +4846,18 @@ fn create_lan_hevc_encoder(
     height: usize,
     fps: u32,
     bitrate: u32,
+    profile: &MediaProfile,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    if lan_profile_requests_hevc_main10(profile) {
+        anyhow::bail!("VideoToolbox HEVC Main10 LAN encoding is unavailable");
+    }
+    let color_mode = lan_color_mode_for_profile(profile)?;
+    if color_mode != ColorMode::Full {
+        anyhow::bail!(
+            "VideoToolbox HEVC LAN encoding does not support color_mode={}",
+            color_mode.as_str()
+        );
+    }
     mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new_with_bitrate(width, height, fps, bitrate)
         .map(|encoder| {
             (
@@ -4738,6 +4874,7 @@ fn create_lan_hevc_encoder(
     _height: usize,
     _fps: u32,
     _bitrate: u32,
+    _profile: &MediaProfile,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
     anyhow::bail!("NVENC HEVC is unavailable on this platform")
 }
@@ -4747,7 +4884,9 @@ fn create_lan_h264_encoder(
     height: usize,
     fps: u32,
     bitrate: u32,
+    profile: &MediaProfile,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    let color_mode = lan_color_mode_for_profile(profile)?;
     let mut last_error = None;
     for backend in preferred_lan_h264_encoder_backends() {
         let encoder: Result<Box<dyn VideoEncoder + Send>> = match *backend {
@@ -4755,19 +4894,37 @@ fn create_lan_h264_encoder(
             "nvenc_h264" => mrd_encode_nvenc::NvencH264Encoder::new_max_speed_with_bitrate(
                 width, height, fps, bitrate,
             )
-            .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
+            .map(|encoder| {
+                Box::new(encoder.with_color_mode(color_mode)) as Box<dyn VideoEncoder + Send>
+            })
             .map_err(|error| anyhow::anyhow!(error.to_string())),
             #[cfg(target_os = "macos")]
             "videotoolbox_h264" => {
-                mrd_codec_videotoolbox::VideoToolboxH264Encoder::new_with_bitrate(
-                    width, height, fps, bitrate,
-                )
-                .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))
+                if color_mode != ColorMode::Full {
+                    Err(anyhow::anyhow!(
+                        "VideoToolbox H.264 LAN encoding does not support color_mode={}",
+                        color_mode.as_str()
+                    ))
+                } else {
+                    mrd_codec_videotoolbox::VideoToolboxH264Encoder::new_with_bitrate(
+                        width, height, fps, bitrate,
+                    )
+                    .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+                }
             }
-            "openh264" => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
-                .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
-                .map_err(|error| anyhow::anyhow!(error.to_string())),
+            "openh264" => {
+                if color_mode != ColorMode::Full {
+                    Err(anyhow::anyhow!(
+                        "OpenH264 LAN encoding does not support color_mode={}",
+                        color_mode.as_str()
+                    ))
+                } else {
+                    OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
+                        .map(|encoder| Box::new(encoder) as Box<dyn VideoEncoder + Send>)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                }
+            }
             _ => Err(anyhow::anyhow!(
                 "unknown LAN H.264 encoder backend: {backend}"
             )),
@@ -10642,9 +10799,13 @@ mod tests {
             LAN_CAPTURE_DXGI_CAPABILITY,
             LAN_ENCODE_NVENC_H264_CAPABILITY,
             LAN_ENCODE_NVENC_HEVC_CAPABILITY,
+            LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
             LAN_DECODE_NVDEC_CAPABILITY,
             LAN_DECODE_NVDEC_HEVC_CAPABILITY,
+            LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+            LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
+            LAN_MEDIA_COLOR_MODE_CAPABILITY,
             LAN_RENDER_D3D11_NATIVE_CAPABILITY,
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
         ] {
@@ -12366,6 +12527,63 @@ mod tests {
     }
 
     #[test]
+    fn requested_non_full_color_profile_requires_peer_color_mode_capability() {
+        let error = ensure_peer_supports_requested_media(
+            &DeviceId("windows-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_mbps: 12,
+                codec: "h264".to_string(),
+                color_mode: Some("grayscale".to_string()),
+                color_pipeline: Some("sdr8".to_string()),
+                ..MediaProfile::default()
+            }),
+            &["encode.nvenc_h264".to_string()],
+        )
+        .expect_err("non-full color modes require an explicit peer color transform capability");
+
+        let message = error.to_string();
+        assert!(message.contains("media.color_mode_v1"));
+        assert!(message.contains("color=grayscale"));
+    }
+
+    #[test]
+    fn requested_hdr_main10_profile_requires_peer_main10_media_capabilities() {
+        let error = ensure_peer_supports_requested_media(
+            &DeviceId("windows-target".to_string()),
+            "quic",
+            &test_required_lan_media_transports(),
+            Some(&MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 80,
+                codec: "hevc".to_string(),
+                codec_profile: Some("main10".to_string()),
+                bit_depth: Some(10),
+                chroma_subsampling: Some("4:2:0".to_string()),
+                pixel_format: Some("p010".to_string()),
+                color_pipeline: Some("hdr_main10".to_string()),
+                ..MediaProfile::default()
+            }),
+            &[
+                "encode.nvenc_hevc".to_string(),
+                LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
+            ],
+        )
+        .expect_err("HDR/Main10 HEVC must not be accepted as 8-bit HEVC");
+
+        let message = error.to_string();
+        assert!(message.contains("encode.nvenc_hevc_main10"));
+        assert!(message.contains("media.hevc_main10_420_10bit"));
+        assert!(message.contains("pipeline=hdr_main10"));
+    }
+
+    #[test]
     fn selected_hevc_profile_requires_receiver_hevc_decoder_capabilities() {
         let error = ensure_peer_can_receive_selected_media(
             "mac-controller",
@@ -12403,6 +12621,32 @@ mod tests {
         .expect_err("VideoToolbox HEVC encoder capability is not a decoder capability");
 
         assert!(error.to_string().contains("hevc decoder"));
+    }
+
+    #[test]
+    fn selected_hdr_main10_profile_requires_receiver_main10_decoder_capabilities() {
+        let error = ensure_peer_can_receive_selected_media(
+            "windows-controller",
+            &MediaProfile {
+                width: 2560,
+                height: 1440,
+                fps: 144,
+                bitrate_mbps: 80,
+                codec: "hevc".to_string(),
+                codec_profile: Some("main10".to_string()),
+                bit_depth: Some(10),
+                chroma_subsampling: Some("4:2:0".to_string()),
+                pixel_format: Some("p010".to_string()),
+                color_pipeline: Some("hdr_main10".to_string()),
+                ..MediaProfile::default()
+            },
+            &["decode.nvdec_hevc".to_string()],
+        )
+        .expect_err("Main10 selected profiles require a Main10-capable receiver");
+
+        let message = error.to_string();
+        assert!(message.contains("hevc main10 decoder"));
+        assert!(message.contains("decode.nvdec_hevc_main10"));
     }
 
     #[test]
@@ -12481,6 +12725,71 @@ mod tests {
             &["decode.videotoolbox_hevc".to_string()],
         )
         .expect("macOS VideoToolbox receiver should pass HEVC selected profile preflight");
+    }
+
+    #[test]
+    fn lan_color_mode_for_profile_maps_stable_strings() {
+        let mut profile = default_media_profile();
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            mrd_pipeline_core::ColorMode::Full
+        );
+
+        profile.color_mode = Some("full".to_string());
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            mrd_pipeline_core::ColorMode::Full
+        );
+
+        profile.color_mode = Some("grayscale".to_string());
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            mrd_pipeline_core::ColorMode::Grayscale
+        );
+
+        profile.color_mode = Some("monochrome".to_string());
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            mrd_pipeline_core::ColorMode::Monochrome
+        );
+
+        profile.color_mode = Some("low_chroma".to_string());
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            mrd_pipeline_core::ColorMode::LowChroma
+        );
+
+        profile.color_mode = Some("sepia".to_string());
+        let error = lan_color_mode_for_profile(&profile).expect_err("unknown color mode rejected");
+        assert!(error.to_string().contains("unsupported LAN color_mode"));
+    }
+
+    #[test]
+    fn lan_profile_requests_hevc_main10_from_stable_profile_fields() {
+        let mut profile = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        assert!(!lan_profile_requests_hevc_main10(&profile));
+
+        profile.codec_profile = Some("main10".to_string());
+        assert!(lan_profile_requests_hevc_main10(&profile));
+
+        profile.codec_profile = None;
+        profile.bit_depth = Some(10);
+        assert!(lan_profile_requests_hevc_main10(&profile));
+
+        profile.bit_depth = None;
+        profile.pixel_format = Some("p010".to_string());
+        assert!(lan_profile_requests_hevc_main10(&profile));
+
+        profile.pixel_format = None;
+        profile.color_pipeline = Some("hdr_main10".to_string());
+        assert!(lan_profile_requests_hevc_main10(&profile));
     }
 
     #[tokio::test]
@@ -15123,7 +15432,10 @@ mod tests {
         let mut hdr = base.clone();
         hdr.color_pipeline = Some("hdr_main10".to_string());
 
-        assert_ne!(lan_media_profile_id(&base), lan_media_profile_id(&grayscale));
+        assert_ne!(
+            lan_media_profile_id(&base),
+            lan_media_profile_id(&grayscale)
+        );
         assert_ne!(lan_media_profile_id(&base), lan_media_profile_id(&hdr));
         assert_ne!(
             fnv1a64_media_metadata(&base, 7, 123_456, 4096),
