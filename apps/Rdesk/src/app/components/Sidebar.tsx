@@ -2,6 +2,7 @@ import { useDevices } from "./deviceData";
 import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
+import { deviceActionService } from "../services/deviceActionService";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -225,6 +226,41 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
   };
 
+  const handleOpenDeviceTab = (deviceId: string, tab: "remote" | "files" | "apps" | "info") => {
+    navigate(`/devices/${deviceId}?tab=${tab}`);
+    setContextMenu(null);
+    setSubmenuOpen(null);
+  };
+
+  const handleToggleFavorite = async (deviceId: string, deviceName: string, favorite: boolean) => {
+    deviceActionService.setDeviceFavorite(deviceId, favorite);
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: favorite ? `已收藏：${deviceName}` : `已取消收藏：${deviceName}`,
+    });
+  };
+
+  const handleRemoveDevice = async (deviceId: string, deviceName: string, isLocal: boolean) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    if (isLocal) {
+      showActionStatus({ kind: "error", message: "不能移除本机设备" });
+      return;
+    }
+    if (
+      typeof window.confirm === "function" &&
+      !window.confirm(`移除设备“${deviceName}”？可通过重新发现或重新登录恢复。`)
+    ) {
+      return;
+    }
+    deviceActionService.markDeviceRemoved(deviceId);
+    await refresh();
+    showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -238,7 +274,11 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     if (isContextOnline) {
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
-        { icon: FolderIcon, label: "文件传输", disabled: true, title: unsupportedDeviceActionTitle },
+        {
+          icon: FolderIcon,
+          label: "文件传输",
+          action: () => handleOpenDeviceTab(activeContextMenu.deviceId, "files"),
+        },
         { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
         { type: "divider" as const }
       );
@@ -255,7 +295,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           }
         },
       },
-      { icon: Star, label: "收藏设备", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: Star,
+        label: contextMenuDevice?.favorite ? "取消收藏" : "收藏设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleToggleFavorite(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              !contextMenuDevice.favorite
+            );
+          }
+        },
+      },
       {
         icon: Copy,
         label: "复制 ID",
@@ -298,8 +350,23 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
     // 移除设备和管理子菜单
     items.push(
-      { icon: Trash2, label: "移除设备", disabled: true, title: unsupportedDeviceActionTitle, danger: true },
-      { icon: Settings, label: "管理", submenu: "management", title: unsupportedDeviceActionTitle }
+      {
+        icon: Trash2,
+        label: "移除设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemoveDevice(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              contextMenuDevice.isLocal
+            );
+          }
+        },
+        disabled: contextMenuDevice?.isLocal,
+        title: contextMenuDevice?.isLocal ? "不能移除本机设备" : undefined,
+        danger: true,
+      },
+      { icon: Settings, label: "管理", submenu: "management" }
     );
 
     return items;
@@ -310,7 +377,15 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
     { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
     { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Info, label: "设备信息", disabled: true, title: unsupportedDeviceActionTitle },
+    {
+      icon: Info,
+      label: "设备信息",
+      action: () => {
+        if (contextMenuDevice) {
+          handleOpenDeviceTab(contextMenuDevice.id, "info");
+        }
+      },
+    },
   ];
 
   return (
@@ -691,6 +766,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                           key={subIndex}
                           disabled={subItem.disabled}
                           title={subItem.title}
+                          onClick={() => { if (subItem.action) void subItem.action(); }}
                           className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
                             subItem.disabled
                               ? isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-400 cursor-not-allowed"

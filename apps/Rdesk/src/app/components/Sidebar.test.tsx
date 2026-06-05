@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Monitor } from "lucide-react";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Sidebar } from "./Sidebar";
@@ -26,6 +26,11 @@ const authMock = vi.hoisted(() => ({
 const serviceMock = vi.hoisted(() => ({
   renameDevice: vi.fn(),
   unbindDevice: vi.fn(),
+}));
+
+const actionServiceMock = vi.hoisted(() => ({
+  setDeviceFavorite: vi.fn(),
+  markDeviceRemoved: vi.fn(),
 }));
 
 vi.mock("./ThemeContext", () => ({
@@ -55,6 +60,13 @@ vi.mock("../services/deviceService", () => ({
   },
 }));
 
+vi.mock("../services/deviceActionService", () => ({
+  deviceActionService: {
+    setDeviceFavorite: actionServiceMock.setDeviceFavorite,
+    markDeviceRemoved: actionServiceMock.markDeviceRemoved,
+  },
+}));
+
 const device = (overrides: Partial<Device>): Device => ({
   id: "agent-device",
   name: "Agent PC",
@@ -80,6 +92,11 @@ const device = (overrides: Partial<Device>): Device => ({
   ...overrides,
 });
 
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+}
+
 function renderSidebar() {
   render(
     <MemoryRouter>
@@ -88,6 +105,7 @@ function renderSidebar() {
         onOpenConnections={vi.fn()}
         onOpenSettings={vi.fn()}
       />
+      <LocationProbe />
     </MemoryRouter>
   );
 }
@@ -99,6 +117,16 @@ function openDeviceMenu() {
 describe("Sidebar device actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    actionServiceMock.setDeviceFavorite.mockReturnValue({
+      deviceId: "agent-device",
+      favorite: true,
+      removed: false,
+    });
+    actionServiceMock.markDeviceRemoved.mockReturnValue({
+      deviceId: "agent-device",
+      favorite: false,
+      removed: true,
+    });
     deviceDataMock.devices = [device({})];
     deviceDataMock.currentDeviceId = "local-device";
     authMock.value = {
@@ -110,24 +138,74 @@ describe("Sidebar device actions", () => {
     };
   });
 
-  it("disables device menu entries that do not have a real implementation", () => {
+  it("enables implemented device menu entries and keeps unsupported operations disabled", () => {
     renderSidebar();
 
     openDeviceMenu();
 
-    expect(screen.getByRole("button", { name: "文件传输" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "文件传输" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "收藏设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "禁用设备" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "移除设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "移除设备" })).not.toBeDisabled();
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
 
     expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "设备信息" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
+  });
+
+  it("navigates to existing detail routes for file transfer and device info", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "文件传输" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=files");
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "设备信息" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=info");
+  });
+
+  it("toggles favorite state through local device action preferences", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "收藏设备" }));
+
+    expect(actionServiceMock.setDeviceFavorite).toHaveBeenCalledWith("agent-device", true);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已收藏：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("marks non-local devices as removed through local device action preferences", async () => {
+    Object.defineProperty(window, "confirm", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => true),
+    });
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "移除设备" }));
+
+    expect(actionServiceMock.markDeviceRemoved).toHaveBeenCalledWith("agent-device");
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已移除：Agent PC")).toBeInTheDocument();
+    });
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

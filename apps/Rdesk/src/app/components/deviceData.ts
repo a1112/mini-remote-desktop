@@ -6,6 +6,7 @@ import {
   type LanPeerInfo,
 } from "../adapters/tauri";
 import { deviceService } from "../services/deviceService";
+import { deviceActionService } from "../services/deviceActionService";
 import { isTauriRuntime } from "../utils/runtime";
 import { useAuth } from "./AuthContext";
 
@@ -311,7 +312,7 @@ export function mergeDevices(
   lanDevices.forEach(add);
   if (localDevice) add(localDevice);
 
-  return Array.from(byDeviceId.values()).sort((a, b) => {
+  return deviceActionService.applyDevicePreferences(Array.from(byDeviceId.values())).sort((a, b) => {
     if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
     if (a.status !== b.status) return a.status === "online" ? -1 : 1;
     if (a.p2pAvailable !== b.p2pAvailable) return a.p2pAvailable ? -1 : 1;

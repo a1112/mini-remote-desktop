@@ -1,5 +1,5 @@
 import { useCallback, useState, useEffect, useRef } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useLocation, useParams, useNavigate } from "react-router";
 import { type Device, useDeviceById, useDevices } from "./deviceData";
 import {
   launchRemoteApplicationForDevice,
@@ -85,6 +85,11 @@ import { useDetailBar } from "./DetailBarContext";
 
 type TabType = "remote" | "files" | "apps";
 
+export function deviceDetailTabFromSearch(search: string): TabType {
+  const tab = new URLSearchParams(search).get("tab");
+  return tab === "files" || tab === "apps" || tab === "remote" ? tab : "remote";
+}
+
 const remoteFiles = [
   { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03" },
   { name: "Downloads", type: "folder" as const, size: "—", modified: "2026-03-04" },
@@ -124,9 +129,12 @@ const localFiles = [
 export function DeviceDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const { devices, loading } = useDevices();
   const device = useDeviceById(id, devices);
-  const [activeTab, setActiveTab] = useState<TabType>("remote");
+  const [activeTab, setActiveTab] = useState<TabType>(() =>
+    deviceDetailTabFromSearch(location.search)
+  );
   const { isDark } = useTheme();
   const detailBar = useDetailBar();
 
@@ -163,6 +171,10 @@ export function DeviceDetailPage() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
+
+  useEffect(() => {
+    setActiveTab(deviceDetailTabFromSearch(location.search));
+  }, [location.search]);
 
   // Clean up context when leaving this page
   useEffect(() => {

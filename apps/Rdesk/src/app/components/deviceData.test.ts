@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { Monitor } from "lucide-react";
 
 import { lanPeerPlatformLabel, type Device, mergeDevices } from "./deviceData";
@@ -29,6 +29,10 @@ const device = (overrides: Partial<Device>): Device => ({
 });
 
 describe("mergeDevices", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   it("infers macOS LAN peers from native media capabilities", () => {
     expect(
       lanPeerPlatformLabel({
@@ -110,6 +114,49 @@ describe("mergeDevices", () => {
       primarySource: "local",
       isLocal: true,
       serverAvailable: true,
+    });
+  });
+
+  it("applies local device action preferences to merged devices", () => {
+    localStorage.setItem(
+      "rdesk_device_action_preferences",
+      JSON.stringify({
+        "favorite-device": { favorite: true },
+        "removed-device": { removed: true },
+      })
+    );
+
+    const merged = mergeDevices(
+      [
+        device({
+          id: "server-favorite",
+          name: "Favorite Peer",
+          deviceId: "favorite-device",
+          favorite: false,
+          discoverySources: ["server"],
+          primarySource: "server",
+          sourceLabel: "服务器",
+          isLocal: false,
+          serverAvailable: true,
+        }),
+        device({
+          id: "server-removed",
+          name: "Removed Peer",
+          deviceId: "removed-device",
+          discoverySources: ["server"],
+          primarySource: "server",
+          sourceLabel: "服务器",
+          isLocal: false,
+          serverAvailable: true,
+        }),
+      ],
+      [],
+      null
+    );
+
+    expect(merged.map((item) => item.deviceId)).toEqual(["favorite-device"]);
+    expect(merged[0]).toMatchObject({
+      favorite: true,
     });
   });
 });
