@@ -3255,12 +3255,13 @@ export function RemoteDisplayWindowPage() {
       if (!controlInputEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
+      const hadActivePointer = activeRemotePointerIdsRef.current.has(event.pointerId);
       const point = controlPointFromPointerEvent(event);
-      if (!point) return;
+      if (!point && !hadActivePointer) return;
       event.preventDefault();
       activeRemotePointerIdsRef.current.delete(event.pointerId);
       event.currentTarget.releasePointerCapture?.(event.pointerId);
-      sendRemotePointerMoveIfNeeded(point);
+      if (point) sendRemotePointerMoveIfNeeded(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,

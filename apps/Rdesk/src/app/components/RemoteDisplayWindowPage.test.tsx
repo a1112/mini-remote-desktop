@@ -1497,6 +1497,129 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("releases remote pointer input when pointer up lands in a letterbox gutter", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_controls: ["keyboard_mouse"],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1000, height: 600 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 4,
+          frames_decoded: 4,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_width: 1600,
+          media_probe_height: 900,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 80,
+          latest_frame_width: 1600,
+          latest_frame_height: 900,
+          latest_frame_pixel_format: "d3d11_shared_nv12",
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_media_pipeline_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          active_width: 1600,
+          active_height: 900,
+          active_fps: 144,
+          active_bitrate_mbps: 80,
+          stage_metrics: [],
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          lane: "reliable",
+          event_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    vi.spyOn(renderArea, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 1000,
+      bottom: 600,
+      width: 1000,
+      height: 600,
+      toJSON: () => ({}),
+    } as DOMRect);
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
+
+    act(() => {
+      renderArea.focus();
+    });
+    fireEvent.pointerDown(renderArea, { pointerId: 7, button: 0, clientX: 500, clientY: 300 });
+    fireEvent.pointerUp(renderArea, { pointerId: 7, button: 0, clientX: 500, clientY: 10 });
+
+    await waitFor(() => {
+      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
+      expect(inputCalls.map(([, args]) => args)).toEqual([
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "mouse_move", x: 800, y: 450 },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "mouse_button", button: "left", pressed: true },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "mouse_button", button: "left", pressed: false },
+        },
+      ]);
+    });
+  });
+
   it("captures keyboard input and releases tracked input on blur", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
