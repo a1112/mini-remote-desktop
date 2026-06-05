@@ -224,6 +224,15 @@ pub async fn send_control_input(
                     ),
                 };
             }
+            if !route_to_peer && !snapshot.sender_active {
+                return IpcResponse::Error {
+                    code: "E_CONTROL_INPUT".to_string(),
+                    message: format!(
+                        "control input requires an active local sender for session {}",
+                        session_id.0
+                    ),
+                };
+            }
             route_to_peer
         }
         None => {
@@ -919,6 +928,59 @@ mod tests {
         let snapshot = app_state.control_input().lock().await.snapshot(session_id);
         assert_eq!(snapshot.reliable.accepted_messages, 2);
         assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn inactive_local_sender_session_rejects_control_input_without_injection() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("inactive-local-input-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Connected,
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        let response = send_control_input(
+            &app_state,
+            session_id.clone(),
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+        )
+        .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.contains("active local sender"));
+            }
+            other => panic!("expected inactive local sender control input error, got {other:?}"),
+        }
+
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+        assert_eq!(snapshot.reliable.injected_messages, 0);
     }
 
     #[tokio::test]
