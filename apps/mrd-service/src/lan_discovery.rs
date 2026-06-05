@@ -42,9 +42,9 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::sync::{MutexGuard as StdMutexGuard, TryLockError};
 #[cfg(any(windows, target_os = "macos"))]
 use std::thread;
+use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant as StdInstant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
@@ -68,6 +68,7 @@ mod media_timing;
 mod media_transport;
 mod peer_format;
 mod service_identity;
+mod time_utils;
 pub use discovery_config::LanDiscoveryConfig;
 use discovery_identity::{
     default_app_id, is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID,
@@ -185,6 +186,7 @@ use peer_format::{format_peer_capabilities, format_peer_transports, normalize_tr
 use service_identity::service_build_id;
 #[cfg(test)]
 use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
+use time_utils::{duration_as_millis, now_us};
 
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 #[cfg(target_os = "macos")]
@@ -7470,17 +7472,6 @@ fn negotiate_media_profile(
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
     clamp_media_profile_to_lan_capability(requested_profile)
-}
-
-fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
-}
-
-fn duration_as_millis(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
