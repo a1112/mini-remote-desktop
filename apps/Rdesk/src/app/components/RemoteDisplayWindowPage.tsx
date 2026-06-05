@@ -1632,6 +1632,8 @@ function virtualKeyFromKeyboardEvent(
       return 0x14;
     case "Escape":
       return 0x1b;
+    case "PrintScreen":
+      return 0x2c;
     case " ":
     case "Spacebar":
       return 0x20;
@@ -1657,6 +1659,12 @@ function virtualKeyFromKeyboardEvent(
       return 0x2e;
     case "Meta":
       return 0x5b;
+    case "ContextMenu":
+      return 0x5d;
+    case "NumLock":
+      return 0x90;
+    case "ScrollLock":
+      return 0x91;
     default:
       return null;
   }
