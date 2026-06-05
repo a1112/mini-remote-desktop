@@ -3315,11 +3315,18 @@ export function RemoteDisplayWindowPage() {
 
   useEffect(() => {
     if (!controlInputEnabled) return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        releaseRemoteControlInput();
+      }
+    };
     window.addEventListener("blur", releaseRemoteControlInput);
     window.addEventListener("pagehide", releaseRemoteControlInput);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       window.removeEventListener("blur", releaseRemoteControlInput);
       window.removeEventListener("pagehide", releaseRemoteControlInput);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [controlInputEnabled, releaseRemoteControlInput]);
 
