@@ -44,9 +44,11 @@ use tokio::{sync::Mutex, task::AbortHandle};
 mod capture_source_registry;
 mod display_mode_registry;
 mod media_profile_registry;
+mod peer_media_capability_registry;
 pub use capture_source_registry::CaptureSourceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
+pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
@@ -85,33 +87,6 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Peer media capabilities observed for each active session.
-#[derive(Debug, Default)]
-pub struct SessionPeerMediaCapabilityRegistry {
-    capabilities: HashMap<SessionId, Vec<String>>,
-}
-
-impl SessionPeerMediaCapabilityRegistry {
-    pub fn set(&mut self, session_id: SessionId, capabilities: Vec<String>) {
-        self.capabilities.insert(session_id, capabilities);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<Vec<String>> {
-        self.capabilities.get(session_id).cloned()
-    }
-
-    pub fn supports(&self, session_id: &SessionId, capability: &str) -> bool {
-        self.capabilities
-            .get(session_id)
-            .map(|capabilities| capabilities.iter().any(|value| value == capability))
-            .unwrap_or(false)
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
-        self.capabilities.remove(session_id)
-    }
 }
 
 /// Cached service-owned capability snapshot exposed to UI and session handlers.
