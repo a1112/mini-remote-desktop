@@ -55,6 +55,7 @@ mod discovery_identity;
 mod dynamic_window_fps;
 mod lan_control_input;
 mod media_access_unit;
+mod media_capabilities;
 mod media_capture_config;
 mod media_envelope;
 mod media_error_policy;
@@ -93,6 +94,28 @@ use lan_control_input::{
 };
 use media_access_unit::{
     describe_lan_access_unit, h264_access_unit_is_keyframe, LanAccessUnitCodec,
+};
+use media_capabilities::{
+    lan_media_capabilities, lan_media_capabilities_with_input_control,
+    LAN_MEDIA_COLOR_MODE_CAPABILITY, LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
+    LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+};
+#[cfg(all(test, target_os = "macos"))]
+use media_capabilities::{
+    macos_lan_media_capabilities_from_probe, probe_macos_lan_media_capabilities,
+    MacosLanMediaCapabilityProbe, LAN_CAPTURE_MACOS_CAPABILITY, LAN_DECODE_VIDEOTOOLBOX_CAPABILITY,
+    LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY, LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
+    LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY, LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
+    LAN_RENDER_MACOS_NATIVE_CAPABILITY,
+};
+#[cfg(all(test, windows))]
+use media_capabilities::{
+    LAN_CAPTURE_DXGI_CAPABILITY, LAN_DECODE_NVDEC_AV1_CAPABILITY, LAN_DECODE_NVDEC_CAPABILITY,
+    LAN_DECODE_NVDEC_HEVC_CAPABILITY, LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
+    LAN_ENCODE_NVENC_AV1_CAPABILITY, LAN_ENCODE_NVENC_H264_CAPABILITY,
+    LAN_ENCODE_NVENC_HEVC_CAPABILITY, LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
+    LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY, LAN_RENDER_D3D11_NATIVE_CAPABILITY,
+    LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
 };
 #[cfg(test)]
 use media_capture_config::window_capture_source_error;
@@ -193,12 +216,14 @@ use media_transport::{
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
 use peer_registry::{LanPeerRecord, LanPeerRegistry};
+#[cfg(test)]
+use protocol::LAN_INPUT_CONTROL_CAPABILITY;
 use protocol::{
     DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
     LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
-    LAN_INPUT_CONTROL_CAPABILITY, LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT,
-    LAN_MEDIA_PROTOCOL_VERSION, LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT,
-    LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
+    LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
+    LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
+    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
     LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, PROTOCOL_VERSION,
 };
 use runtime_flags::env_bool_override;
@@ -260,46 +285,6 @@ const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
-#[cfg(windows)]
-const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
-#[cfg(windows)]
-const LAN_ENCODE_NVENC_H264_CAPABILITY: &str = "nvenc_h264";
-#[cfg(windows)]
-const LAN_ENCODE_NVENC_HEVC_CAPABILITY: &str = "encode.nvenc_hevc";
-#[cfg(windows)]
-const LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY: &str = "encode.nvenc_hevc_main10";
-#[cfg(windows)]
-const LAN_ENCODE_NVENC_AV1_CAPABILITY: &str = "encode.nvenc_av1";
-#[cfg(windows)]
-const LAN_DECODE_NVDEC_CAPABILITY: &str = "nvdec";
-#[cfg(windows)]
-const LAN_DECODE_NVDEC_HEVC_CAPABILITY: &str = "decode.nvdec_hevc";
-#[cfg(windows)]
-const LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY: &str = "decode.nvdec_hevc_main10";
-#[cfg(windows)]
-const LAN_DECODE_NVDEC_AV1_CAPABILITY: &str = "decode.nvdec_av1";
-const LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY: &str = "media.hevc_main_420_8bit";
-const LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY: &str = "media.hevc_main10_420_10bit";
-const LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY: &str = "media.av1_main_420_8bit";
-const LAN_MEDIA_COLOR_MODE_CAPABILITY: &str = "media.color_mode_v1";
-#[cfg(windows)]
-const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
-#[cfg(windows)]
-const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
-#[cfg(target_os = "macos")]
-const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
-#[cfg(target_os = "macos")]
-const LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "videotoolbox_h264";
-#[cfg(target_os = "macos")]
-const LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "videotoolbox_hevc";
-#[cfg(target_os = "macos")]
-const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
-#[cfg(target_os = "macos")]
-const LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "decode.videotoolbox_h264";
-#[cfg(target_os = "macos")]
-const LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "decode.videotoolbox_hevc";
-#[cfg(target_os = "macos")]
-const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 #[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 #[cfg(any(windows, target_os = "macos"))]
@@ -2251,135 +2236,6 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
         timestamp_ms: now_ms(),
     })
-}
-
-fn lan_media_capabilities() -> Vec<String> {
-    lan_media_capabilities_with_input_control(cfg!(windows))
-}
-
-fn lan_media_capabilities_with_input_control(input_control_available: bool) -> Vec<String> {
-    let mut capabilities = vec![
-        LAN_QUIC_MEDIA_V2_TRANSPORT.to_string(),
-        LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
-        LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
-        LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
-    ];
-    #[cfg(windows)]
-    {
-        capabilities.extend([
-            LAN_CAPTURE_DXGI_CAPABILITY.to_string(),
-            LAN_ENCODE_NVENC_H264_CAPABILITY.to_string(),
-            LAN_ENCODE_NVENC_HEVC_CAPABILITY.to_string(),
-            LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY.to_string(),
-            LAN_ENCODE_NVENC_AV1_CAPABILITY.to_string(),
-            LAN_DECODE_NVDEC_CAPABILITY.to_string(),
-            LAN_DECODE_NVDEC_HEVC_CAPABILITY.to_string(),
-            LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY.to_string(),
-            LAN_DECODE_NVDEC_AV1_CAPABILITY.to_string(),
-            LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
-            LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY.to_string(),
-            LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string(),
-            LAN_MEDIA_COLOR_MODE_CAPABILITY.to_string(),
-            LAN_RENDER_D3D11_NATIVE_CAPABILITY.to_string(),
-            LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY.to_string(),
-            crate::display_mode::capability_name().to_string(),
-        ]);
-    }
-    #[cfg(target_os = "macos")]
-    {
-        capabilities.extend(macos_lan_media_capabilities());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        capabilities.extend([
-            "pipewire_capture".to_string(),
-            "openh264_fallback".to_string(),
-            "software_decode".to_string(),
-        ]);
-    }
-    #[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
-    {
-        capabilities.extend([
-            "openh264_fallback".to_string(),
-            "software_decode".to_string(),
-        ]);
-    }
-    if input_control_available {
-        capabilities.push(LAN_INPUT_CONTROL_CAPABILITY.to_string());
-    }
-    capabilities
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
-struct MacosLanMediaCapabilityProbe {
-    videotoolbox_h264_encoder: bool,
-    videotoolbox_hevc_encoder: bool,
-    videotoolbox_h264_decoder: bool,
-    videotoolbox_hevc_decoder: bool,
-}
-
-#[cfg(target_os = "macos")]
-fn macos_lan_media_capabilities() -> Vec<String> {
-    static MACOS_LAN_MEDIA_CAPABILITIES: OnceLock<Vec<String>> = OnceLock::new();
-    MACOS_LAN_MEDIA_CAPABILITIES
-        .get_or_init(|| {
-            macos_lan_media_capabilities_from_probe(probe_macos_lan_media_capabilities())
-        })
-        .clone()
-}
-
-#[cfg(target_os = "macos")]
-fn probe_macos_lan_media_capabilities() -> MacosLanMediaCapabilityProbe {
-    MacosLanMediaCapabilityProbe {
-        videotoolbox_h264_encoder: mrd_codec_videotoolbox::VideoToolboxH264Encoder::new(
-            640, 480, 30,
-        )
-        .is_ok(),
-        videotoolbox_hevc_encoder: mrd_codec_videotoolbox::VideoToolboxHevcEncoder::new(
-            640, 480, 30,
-        )
-        .is_ok(),
-        videotoolbox_h264_decoder: videotoolbox_decoder_enabled()
-            && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok(),
-        videotoolbox_hevc_decoder: videotoolbox_decoder_enabled()
-            && mrd_codec_videotoolbox::VideoToolboxHevcDecoder::new().is_ok(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_lan_media_capabilities_from_probe(probe: MacosLanMediaCapabilityProbe) -> Vec<String> {
-    let mut capabilities = vec![
-        LAN_CAPTURE_MACOS_CAPABILITY.to_string(),
-        LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
-        "openh264_fallback".to_string(),
-        "software_decode".to_string(),
-    ];
-    if probe.videotoolbox_h264_encoder {
-        capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());
-    }
-    if probe.videotoolbox_hevc_encoder {
-        capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
-        capabilities.push(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string());
-    }
-    if probe.videotoolbox_h264_decoder {
-        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());
-    }
-    if probe.videotoolbox_hevc_decoder {
-        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
-    }
-    if probe.videotoolbox_h264_decoder && probe.videotoolbox_hevc_decoder {
-        capabilities.push(LAN_DECODE_VIDEOTOOLBOX_CAPABILITY.to_string());
-    }
-    capabilities
-}
-
-#[cfg(target_os = "macos")]
-fn videotoolbox_decoder_enabled() -> bool {
-    !matches!(
-        std::env::var("MRD_DISABLE_VIDEOTOOLBOX_DECODER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
 }
 
 async fn send_packet(
@@ -8122,11 +7978,14 @@ mod tests {
             LAN_ENCODE_NVENC_H264_CAPABILITY,
             LAN_ENCODE_NVENC_HEVC_CAPABILITY,
             LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
+            LAN_ENCODE_NVENC_AV1_CAPABILITY,
             LAN_DECODE_NVDEC_CAPABILITY,
             LAN_DECODE_NVDEC_HEVC_CAPABILITY,
             LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
+            LAN_DECODE_NVDEC_AV1_CAPABILITY,
             LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
             LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
+            LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY,
             LAN_MEDIA_COLOR_MODE_CAPABILITY,
             LAN_RENDER_D3D11_NATIVE_CAPABILITY,
             LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
@@ -8228,14 +8087,6 @@ mod tests {
             .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
         assert!(!announcement
             .media_capabilities
-            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
-    }
-
-    #[test]
-    fn lan_media_capabilities_follow_input_control_availability() {
-        assert!(lan_media_capabilities_with_input_control(true)
-            .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
-        assert!(!lan_media_capabilities_with_input_control(false)
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
     }
 
