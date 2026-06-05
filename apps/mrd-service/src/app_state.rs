@@ -41,10 +41,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
 
+mod capability_snapshot_registry;
 mod capture_source_registry;
 mod display_mode_registry;
 mod media_profile_registry;
 mod peer_media_capability_registry;
+pub use capability_snapshot_registry::CapabilitySnapshotRegistry;
 pub use capture_source_registry::CaptureSourceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
@@ -87,48 +89,6 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Cached service-owned capability snapshot exposed to UI and session handlers.
-#[derive(Debug)]
-pub struct CapabilitySnapshotRegistry {
-    snapshot: CapabilitySnapshot,
-    refresh_in_progress: bool,
-}
-
-impl Default for CapabilitySnapshotRegistry {
-    fn default() -> Self {
-        Self {
-            snapshot: crate::capabilities::local_capability_snapshot_static(),
-            refresh_in_progress: false,
-        }
-    }
-}
-
-impl CapabilitySnapshotRegistry {
-    pub fn snapshot(&self) -> CapabilitySnapshot {
-        self.snapshot.clone()
-    }
-
-    pub fn replace(&mut self, snapshot: CapabilitySnapshot) {
-        self.snapshot = snapshot;
-        self.refresh_in_progress = false;
-    }
-
-    pub fn begin_refresh(&mut self) -> bool {
-        if self.refresh_in_progress {
-            return false;
-        }
-        self.refresh_in_progress = true;
-        true
-    }
-
-    pub fn finish_refresh(&mut self, snapshot: Option<CapabilitySnapshot>) {
-        if let Some(snapshot) = snapshot {
-            self.snapshot = snapshot;
-        }
-        self.refresh_in_progress = false;
-    }
 }
 
 /// Runtime receiver media pipeline state keyed by session.
