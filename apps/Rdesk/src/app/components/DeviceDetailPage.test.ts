@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   deviceDetailTabFromSearch,
+  remoteStartUnavailableReason,
   remoteApplicationSourceMatchesTerminalFocus,
 } from "./DeviceDetailPage";
+import type { Device } from "./deviceData";
 
 describe("deviceDetailTabFromSearch", () => {
   it("opens supported tabs from the sidebar query string", () => {
@@ -42,5 +44,40 @@ describe("remoteApplicationSourceMatchesTerminalFocus", () => {
         title: "notes.txt",
       })
     ).toBe(false);
+  });
+});
+
+describe("remoteStartUnavailableReason", () => {
+  const device = (overrides: Partial<Device> = {}): Device => ({
+    id: "remote-device",
+    name: "Remote PC",
+    deviceId: "remote-device",
+    os: "Windows",
+    icon: (() => null) as unknown as Device["icon"],
+    status: "online",
+    location: "LAN",
+    ping: 7,
+    lastSeen: "刚刚",
+    cpu: null,
+    ram: null,
+    disk: null,
+    ip: "192.168.1.2",
+    group: "LAN P2P",
+    favorite: false,
+    discoverySources: ["lan_p2p"],
+    primarySource: "lan_p2p",
+    sourceLabel: "P2P 局域网",
+    isLocal: false,
+    p2pAvailable: true,
+    serverAvailable: false,
+    ...overrides,
+  });
+
+  it("blocks remote start for disabled devices", () => {
+    expect(remoteStartUnavailableReason(device({ disabled: true }))).toBe("设备已禁用");
+  });
+
+  it("allows online enabled devices to start remote control", () => {
+    expect(remoteStartUnavailableReason(device())).toBeNull();
   });
 });

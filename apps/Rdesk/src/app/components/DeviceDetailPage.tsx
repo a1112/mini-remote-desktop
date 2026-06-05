@@ -99,6 +99,14 @@ export function remoteApplicationSourceMatchesTerminalFocus(
   return /\b(cmd|command prompt|powershell|pwsh|terminal|wt\.exe)\b/.test(haystack);
 }
 
+export function remoteStartUnavailableReason(
+  device: Pick<Device, "disabled" | "status">
+): string | null {
+  if (device.disabled) return "设备已禁用";
+  if (device.status !== "online") return "设备当前离线";
+  return null;
+}
+
 const remoteFiles = [
   { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03" },
   { name: "Downloads", type: "folder" as const, size: "—", modified: "2026-03-04" },
@@ -340,6 +348,7 @@ function RemoteTab({ device }: { device: Device }) {
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const isOnline = device.status === "online";
+  const remoteUnavailableReason = remoteStartUnavailableReason(device);
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
   const preferredTransport = device.p2pAvailable
     ? "quic"
@@ -395,6 +404,10 @@ function RemoteTab({ device }: { device: Device }) {
   };
 
   const handleStartRemote = async () => {
+    if (remoteUnavailableReason) {
+      setConnectionError(remoteUnavailableReason);
+      return;
+    }
     setLaunching(true);
     setConnectionError(null);
     try {
@@ -483,11 +496,11 @@ function RemoteTab({ device }: { device: Device }) {
           </div>
           <button
             onClick={() => void handleStartRemote()}
-            disabled={launching}
+            disabled={launching || Boolean(remoteUnavailableReason)}
             className="w-full px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
             style={{ fontSize: 14 }}
           >
-            发起远程连接
+            {remoteUnavailableReason ?? "发起远程连接"}
           </button>
         </div>
       </div>
@@ -1014,9 +1027,10 @@ function AppsTab({
   const appSessionIdRef = useRef<string | null>(null);
   const sessionHandedOffRef = useRef(false);
   const isOnline = device.status === "online";
+  const remoteUnavailableReason = remoteStartUnavailableReason(device);
   const desktopRuntime = isTauriRuntime();
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
-  const canUseRemoteApplications = desktopRuntime && isLanP2PRemote;
+  const canUseRemoteApplications = !remoteUnavailableReason && desktopRuntime && isLanP2PRemote;
 
   useEffect(() => {
     return () => {
@@ -1076,6 +1090,10 @@ function AppsTab({
   ]);
 
   const handleOpenDesktop = async () => {
+    if (remoteUnavailableReason) {
+      setAppsError(remoteUnavailableReason);
+      return;
+    }
     setOpeningDesktop(true);
     setAppsError(null);
     try {
@@ -1147,13 +1165,15 @@ function AppsTab({
     );
   }
 
-  const unavailableReason = !desktopRuntime
-    ? "远程应用需要桌面端运行"
-    : device.isLocal
-      ? "本机设备请使用本地测试工作台"
-      : !device.p2pAvailable
-        ? "当前设备未建立 LAN P2P 通道"
-        : null;
+  const unavailableReason =
+    remoteUnavailableReason ??
+    (!desktopRuntime
+      ? "远程应用需要桌面端运行"
+      : device.isLocal
+        ? "本机设备请使用本地测试工作台"
+        : !device.p2pAvailable
+          ? "当前设备未建立 LAN P2P 通道"
+          : null);
   const remoteWindows = catalog?.windows ?? [];
   const displaySources = catalog?.displays ?? [];
   const terminalFocus =
