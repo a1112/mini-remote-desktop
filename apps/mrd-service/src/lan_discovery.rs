@@ -64,6 +64,7 @@ mod media_probe;
 mod media_profile;
 mod media_receiver_decoder_candidates;
 mod media_render_policy;
+mod media_sender;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
@@ -161,6 +162,7 @@ use media_render_policy::{
     lan_render_queue_capacity_from_env_value, lan_render_queue_policy_for_profile_with_override,
     lan_render_queue_policy_from_env_value, render_pacing_frame_interval,
 };
+use media_sender::LanSenderEncoder;
 use media_sender_telemetry::{
     decode_lan_sender_stats_datagram, send_lan_sender_stats_datagram, LanMediaTestImpairment,
     LanSenderDatagramFrameReport, LanSenderStatsTracker,
@@ -698,12 +700,6 @@ type LanEncoderConfigKey = (
     Option<u8>,
     Option<String>,
 );
-
-struct LanSenderEncoder {
-    codec: LanAccessUnitCodec,
-    backend: &'static str,
-    encoder: Box<dyn VideoEncoder + Send>,
-}
 
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
@@ -11844,6 +11840,11 @@ mod tests {
         assert_eq!(codec.name(), "hevc");
         assert_eq!(codec.display_name(), "HEVC");
         assert_eq!(codec.envelope_codec(), LAN_MEDIA_CODEC_HEVC);
+    }
+
+    #[test]
+    fn sender_encoder_state_lives_with_media_sender() {
+        let _ = std::mem::size_of::<Option<super::media_sender::LanSenderEncoder>>();
     }
 
     #[test]
