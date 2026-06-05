@@ -1520,6 +1520,9 @@ function keyboardMouseControlAvailable(
 ): boolean {
   if (isLocalPipelinePreview) return false;
   if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
+  if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
+    return false;
+  }
   return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
 }
 
