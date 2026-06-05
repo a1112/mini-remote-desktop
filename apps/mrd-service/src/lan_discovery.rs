@@ -5639,11 +5639,11 @@ async fn render_lan_frame_once(
         upload_lan_render_frame(renderer.as_mut(), frame_for_renderer)
             .map_err(|error| anyhow::anyhow!("upload frame to native renderer failed: {error}"))?;
         let after = renderer.snapshot();
-        let wait_delta = renderer_snapshot_waitable_delta(&before, &after);
+        let wait_delta = media_receiver::renderer_snapshot_waitable_delta(&before, &after);
         let upload_elapsed_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
         let upload_without_wait_ms = (upload_elapsed_ms - wait_delta.wait_ms).max(0.0);
         upload_duration_ms += upload_without_wait_ms;
-        if renderer_snapshot_uses_render_proxy(&after) {
+        if media_receiver::renderer_snapshot_uses_render_proxy(&after) {
             if let Some(proxy_upload_ms) = after.last_render_draw_present_ms {
                 render_proxy_upload_ms += proxy_upload_ms;
                 render_proxy_transport_ms += (upload_without_wait_ms - proxy_upload_ms).max(0.0);
@@ -5673,7 +5673,7 @@ async fn render_lan_frame_once(
         waitable_waits = waitable_waits.saturating_add(wait_delta.waits);
         waitable_timeouts = waitable_timeouts.saturating_add(wait_delta.timeouts);
         render_queue_replacements = render_queue_replacements.saturating_add(
-            renderer_snapshot_render_queue_replacement_delta(&before, &after),
+            media_receiver::renderer_snapshot_render_queue_replacement_delta(&before, &after),
         );
         let uploaded_delta = after
             .uploaded_frame_count
@@ -5743,25 +5743,6 @@ async fn render_lan_frame_once(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-fn renderer_snapshot_uses_render_proxy(snapshot: &RendererSnapshot) -> bool {
-    snapshot
-        .swap_chain_present_mode
-        .as_deref()
-        .is_some_and(|mode| mode.starts_with("render_proxy"))
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn renderer_snapshot_render_queue_replacement_delta(
-    before: &RendererSnapshot,
-    after: &RendererSnapshot,
-) -> u64 {
-    after
-        .render_queue_replacements
-        .unwrap_or_default()
-        .saturating_sub(before.render_queue_replacements.unwrap_or_default())
-}
-
-#[cfg(any(windows, target_os = "macos"))]
 fn upload_lan_render_frame(
     renderer: &mut dyn mrd_render::RendererInstance,
     frame: MediaRenderFrame,
@@ -5782,32 +5763,6 @@ fn upload_lan_render_frame(
             timestamp_us,
             payload,
         } => renderer.upload_hevc_access_unit(width, height, timestamp_us, payload),
-    }
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Default)]
-struct RendererWaitableDelta {
-    wait_ms: f64,
-    waits: u64,
-    timeouts: u64,
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn renderer_snapshot_waitable_delta(
-    before: &RendererSnapshot,
-    after: &RendererSnapshot,
-) -> RendererWaitableDelta {
-    let before_waits = before.waitable_wait_count.unwrap_or_default();
-    let after_waits = after.waitable_wait_count.unwrap_or_default();
-    let before_total = before.waitable_wait_total_ms.unwrap_or_default();
-    let after_total = after.waitable_wait_total_ms.unwrap_or_default();
-    let before_timeouts = before.waitable_timeout_count.unwrap_or_default();
-    let after_timeouts = after.waitable_timeout_count.unwrap_or_default();
-    RendererWaitableDelta {
-        wait_ms: (after_total - before_total).max(0.0),
-        waits: after_waits.saturating_sub(before_waits),
-        timeouts: after_timeouts.saturating_sub(before_timeouts),
     }
 }
 
@@ -13775,54 +13730,6 @@ mod tests {
             }
             other => panic!("unexpected render outcome: {other:?}"),
         }
-    }
-
-    #[cfg(any(windows, target_os = "macos"))]
-    #[test]
-    fn renderer_snapshot_render_queue_replacement_delta_uses_cumulative_counter() {
-        use mrd_render::RendererSnapshot;
-
-        fn snapshot(replacements: Option<u64>) -> RendererSnapshot {
-            RendererSnapshot {
-                attached_to_target: true,
-                uploaded_frame_count: 0,
-                presented_frame_count: 0,
-                present_skipped_count: 0,
-                render_queue_replacements: replacements,
-                last_present_status: None,
-                low_latency_frame_latency_target: None,
-                swap_chain_max_frame_latency: None,
-                swap_chain_allow_tearing: None,
-                swap_chain_waitable_object: None,
-                swap_chain_present_mode: None,
-                display_refresh_hz: None,
-                render_thread_priority: None,
-                waitable_wait_count: None,
-                waitable_wait_total_ms: None,
-                waitable_timeout_count: None,
-                last_waitable_wait_ms: None,
-                last_render_prepare_wait_ms: None,
-                last_render_shared_resource_ms: None,
-                last_render_wait_for_drawable_ms: None,
-                last_render_encode_commit_ms: None,
-                last_render_draw_present_ms: None,
-                last_width: 1,
-                last_height: 1,
-                last_pixel_format: None,
-            }
-        }
-
-        assert_eq!(
-            renderer_snapshot_render_queue_replacement_delta(
-                &snapshot(Some(2)),
-                &snapshot(Some(5))
-            ),
-            3
-        );
-        assert_eq!(
-            renderer_snapshot_render_queue_replacement_delta(&snapshot(None), &snapshot(Some(1))),
-            1
-        );
     }
 
     #[tokio::test]
