@@ -245,6 +245,10 @@ export type ControlInputEvent =
       delta: number;
     }
   | {
+      kind: "mouse_horizontal_wheel";
+      delta: number;
+    }
+  | {
       kind: "key";
       key: ControlInputKey;
       pressed: boolean;

@@ -51,6 +51,11 @@ describe('control input command adapter', () => {
       'realtime',
     ],
     [
+      'mouse_horizontal_wheel',
+      { kind: 'mouse_horizontal_wheel', delta: 120 },
+      'realtime',
+    ],
+    [
       'key',
       { kind: 'key', key: { kind: 'virtual_key', code: 0x41 }, pressed: true },
       'reliable',

@@ -812,6 +812,7 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
     fireEvent.pointerUp(renderArea, { button: 0, clientX: 640, clientY: 416 });
     fireEvent.wheel(renderArea, { deltaY: 120 });
+    fireEvent.wheel(renderArea, { deltaX: 120 });
 
     await waitFor(() => {
       const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
@@ -831,6 +832,10 @@ describe("RemoteDisplayWindowPage", () => {
         {
           sessionId: "p2p-quic-123",
           event: { kind: "mouse_wheel", delta: -120 },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "mouse_horizontal_wheel", delta: -120 },
         },
       ]);
     });

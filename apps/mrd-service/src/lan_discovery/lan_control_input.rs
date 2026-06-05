@@ -117,7 +117,9 @@ fn next_control_input_event_id() -> u64 {
 
 fn control_input_request_attempts(event: &ControlInputEvent) -> usize {
     match event {
-        ControlInputEvent::MouseMove { .. } | ControlInputEvent::MouseWheel { .. } => {
+        ControlInputEvent::MouseMove { .. }
+        | ControlInputEvent::MouseWheel { .. }
+        | ControlInputEvent::MouseHorizontalWheel { .. } => {
             super::LAN_CONTROL_INPUT_REALTIME_ATTEMPTS
         }
         ControlInputEvent::MouseButton { .. }

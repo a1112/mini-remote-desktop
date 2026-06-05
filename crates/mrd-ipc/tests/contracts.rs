@@ -574,6 +574,15 @@ fn serialize_deserialize_control_input_contracts() {
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(release_request, deserialized);
 
+    let horizontal_wheel_request = IpcRequest::SendControlInput {
+        session_id: session_id.clone(),
+        event: ControlInputEvent::MouseHorizontalWheel { delta: 120 },
+    };
+    let json = serde_json::to_string(&horizontal_wheel_request).unwrap();
+    assert!(json.contains("\"kind\":\"mouse_horizontal_wheel\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(horizontal_wheel_request, deserialized);
+
     let response = IpcResponse::ControlInputAccepted {
         session_id,
         lane: ControlInputLane::Reliable,

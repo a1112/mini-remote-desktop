@@ -3305,10 +3305,19 @@ export function RemoteDisplayWindowPage() {
   const handleRemoteWheel = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
       if (!controlInputEnabled) return;
-      const delta = Math.trunc(-event.deltaY);
-      if (delta === 0) return;
+      const verticalDelta = Math.trunc(-event.deltaY);
+      const horizontalDelta = Math.trunc(-event.deltaX);
+      if (verticalDelta === 0 && horizontalDelta === 0) return;
       event.preventDefault();
-      sendControlInputEvent({ kind: "mouse_wheel", delta });
+      if (verticalDelta !== 0) {
+        sendControlInputEvent({ kind: "mouse_wheel", delta: verticalDelta });
+      }
+      if (horizontalDelta !== 0) {
+        sendControlInputEvent({
+          kind: "mouse_horizontal_wheel",
+          delta: horizontalDelta,
+        });
+      }
     },
     [controlInputEnabled, sendControlInputEvent]
   );

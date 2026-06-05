@@ -851,6 +851,11 @@ mod wire {
             /// Wheel delta.
             delta: i32,
         },
+        /// Horizontal mouse wheel delta.
+        MouseHorizontalWheel {
+            /// Horizontal wheel delta.
+            delta: i32,
+        },
         /// Keyboard key transition.
         Key {
             /// Key id.

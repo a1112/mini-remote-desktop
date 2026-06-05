@@ -129,9 +129,9 @@ impl Default for ControlInputRegistry {
 
 fn input_lane(event: &ControlInputEvent) -> ControlInputLane {
     match event {
-        ControlInputEvent::MouseMove { .. } | ControlInputEvent::MouseWheel { .. } => {
-            ControlInputLane::Realtime
-        }
+        ControlInputEvent::MouseMove { .. }
+        | ControlInputEvent::MouseWheel { .. }
+        | ControlInputEvent::MouseHorizontalWheel { .. } => ControlInputLane::Realtime,
         ControlInputEvent::MouseButton { .. } | ControlInputEvent::Key { .. } => {
             ControlInputLane::Reliable
         }
@@ -218,6 +218,9 @@ fn input_event_from_ipc(event: &ControlInputEvent) -> Result<InputEvent, InputEr
     match *event {
         ControlInputEvent::MouseMove { x, y } => Ok(InputEvent::MouseMove { x, y }),
         ControlInputEvent::MouseWheel { delta } => Ok(InputEvent::MouseWheel { delta }),
+        ControlInputEvent::MouseHorizontalWheel { delta } => {
+            Ok(InputEvent::MouseHorizontalWheel { delta })
+        }
         ControlInputEvent::MouseButton { button, pressed } => Ok(InputEvent::MouseButton {
             button: input_button_from_ipc(button),
             pressed,
@@ -256,6 +259,22 @@ mod tests {
     fn mouse_move_uses_realtime_lane() {
         assert_eq!(
             input_lane(&ControlInputEvent::MouseMove { x: 1, y: 2 }),
+            ControlInputLane::Realtime
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_uses_realtime_lane() {
+        assert_eq!(
+            input_lane(&ControlInputEvent::MouseWheel { delta: -120 }),
+            ControlInputLane::Realtime
+        );
+    }
+
+    #[test]
+    fn horizontal_wheel_uses_realtime_lane() {
+        assert_eq!(
+            input_lane(&ControlInputEvent::MouseHorizontalWheel { delta: 120 }),
             ControlInputLane::Realtime
         );
     }
