@@ -327,6 +327,26 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
   };
 
+  const handleWakeOnLan = async (
+    deviceId: string,
+    deviceName: string,
+    macAddress: string
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      await deviceActionService.wakeOnLan({
+        deviceId,
+        macAddress,
+        broadcastAddr: undefined,
+      });
+      showActionStatus({ kind: "success", message: `已发送唤醒包：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `唤醒失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -463,20 +483,48 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   };
 
   // 管理子菜单项
-  const getManagementSubmenuItems = () => [
-    { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
-    {
-      icon: Info,
-      label: "设备信息",
-      action: () => {
-        if (contextMenuDevice) {
-          handleOpenDeviceTab(contextMenuDevice.id, "info");
-        }
+  const getManagementSubmenuItems = () => {
+    const canWakeOnLan =
+      Boolean(contextMenuDevice?.macAddress) &&
+      contextMenuDevice?.status === "offline" &&
+      !contextMenuDevice?.isLocal;
+    const wakeDisabledReason = contextMenuDevice?.isLocal
+      ? "不能唤醒本机设备"
+      : contextMenuDevice?.status === "online"
+        ? "设备当前在线"
+        : contextMenuDevice?.macAddress
+          ? undefined
+          : "缺少设备 MAC 地址";
+
+    return [
+      { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
+      { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: Zap,
+        label: "Wake-on-LAN",
+        disabled: !canWakeOnLan,
+        title: wakeDisabledReason,
+        action: () => {
+          if (contextMenuDevice?.macAddress) {
+            return handleWakeOnLan(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              contextMenuDevice.macAddress
+            );
+          }
+        },
       },
-    },
-  ];
+      {
+        icon: Info,
+        label: "设备信息",
+        action: () => {
+          if (contextMenuDevice) {
+            handleOpenDeviceTab(contextMenuDevice.id, "info");
+          }
+        },
+      },
+    ];
+  };
 
   return (
     <aside

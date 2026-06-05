@@ -138,6 +138,14 @@ struct ControlInputAcceptedDto {
 }
 
 #[derive(Debug, Serialize)]
+struct WakeOnLanSentDto {
+    device_id: String,
+    mac_address: String,
+    broadcast_addr: String,
+    packet_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
 struct ClientDiagnostics {
     app_pid: u32,
     app_exe_path: Option<String>,
@@ -1877,6 +1885,43 @@ async fn ipc_refresh_lan_discovery() -> Result<mrd_ipc::LanDiscoverySnapshot, St
 
     match response {
         IpcResponse::LanDiscoverySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Send a Wake-on-LAN magic packet via mrd-service IPC.
+#[tauri::command]
+async fn ipc_wake_on_lan(
+    device_id: String,
+    mac_address: String,
+    broadcast_addr: Option<String>,
+) -> Result<WakeOnLanSentDto, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::WakeOnLan {
+            device_id: DeviceId(device_id),
+            mac_address,
+            broadcast_addr,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::WakeOnLanSent {
+            device_id,
+            mac_address,
+            broadcast_addr,
+            packet_bytes,
+        } => Ok(WakeOnLanSentDto {
+            device_id: device_id.0,
+            mac_address,
+            broadcast_addr,
+            packet_bytes,
+        }),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -3923,6 +3968,7 @@ fn main() {
             ipc_list_devices,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
+            ipc_wake_on_lan,
             ipc_list_sessions,
             ipc_start_session,
             ipc_start_lan_remote_session,

@@ -32,6 +32,7 @@ const actionServiceMock = vi.hoisted(() => ({
   setDeviceFavorite: vi.fn(),
   markDeviceRemoved: vi.fn(),
   setDeviceDisabled: vi.fn(),
+  wakeOnLan: vi.fn(),
 }));
 
 const sessionServiceMock = vi.hoisted(() => ({
@@ -71,6 +72,7 @@ vi.mock("../services/deviceActionService", () => ({
     setDeviceFavorite: actionServiceMock.setDeviceFavorite,
     markDeviceRemoved: actionServiceMock.markDeviceRemoved,
     setDeviceDisabled: actionServiceMock.setDeviceDisabled,
+    wakeOnLan: actionServiceMock.wakeOnLan,
   },
 }));
 
@@ -143,6 +145,12 @@ describe("Sidebar device actions", () => {
       deviceId: "agent-device",
       disabled: true,
     });
+    actionServiceMock.wakeOnLan.mockResolvedValue({
+      device_id: "agent-device",
+      mac_address: "AA:BB:CC:DD:EE:FF",
+      broadcast_addr: "255.255.255.255:9",
+      packet_bytes: 102,
+    });
     sessionServiceMock.listSessions.mockResolvedValue([]);
     sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
@@ -174,6 +182,33 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
+  });
+
+  it("sends Wake-on-LAN for an offline device with a known MAC address", async () => {
+    deviceDataMock.devices = [
+      device({
+        status: "offline",
+        macAddress: "AA:BB:CC:DD:EE:FF",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    const wakeButton = screen.getByRole("button", { name: "Wake-on-LAN" });
+    expect(wakeButton).not.toBeDisabled();
+
+    await user.click(wakeButton);
+
+    expect(actionServiceMock.wakeOnLan).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      macAddress: "AA:BB:CC:DD:EE:FF",
+      broadcastAddr: undefined,
+    });
+    await waitFor(() => {
+      expect(screen.getByText("已发送唤醒包：Agent PC")).toBeInTheDocument();
+    });
   });
 
   it("navigates to existing detail routes for file transfer and device info", async () => {

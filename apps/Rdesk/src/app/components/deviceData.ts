@@ -27,6 +27,7 @@ export interface Device {
   ram: number | null;
   disk: number | null;
   ip: string;
+  macAddress?: string | null;
   group: string;
   favorite: boolean;
   discoverySources: DeviceDiscoverySource[];
@@ -51,6 +52,7 @@ type DeviceApi = {
   ram: number | null;
   disk: number | null;
   ip: string;
+  mac_address?: string | null;
   group: string;
   favorite: boolean;
 };
@@ -124,6 +126,7 @@ const toServerDevice = (item: DeviceApi): Device =>
     ram: item.ram,
     disk: item.disk,
     ip: item.ip,
+    macAddress: item.mac_address ?? null,
     group: item.group,
     favorite: item.favorite,
   });
@@ -287,6 +290,13 @@ function mergeDevice(existing: Device, incoming: Device): Device {
     ram: serverSide?.ram ?? existing.ram ?? incoming.ram,
     disk: serverSide?.disk ?? existing.disk ?? incoming.disk,
     ip: p2pSide?.ip ?? serverSide?.ip ?? localSide?.ip ?? incoming.ip,
+    macAddress:
+      p2pSide?.macAddress ??
+      serverSide?.macAddress ??
+      localSide?.macAddress ??
+      existing.macAddress ??
+      incoming.macAddress ??
+      null,
     group: localSide?.group ?? p2pSide?.group ?? serverSide?.group ?? incoming.group,
     favorite: existing.favorite || incoming.favorite,
     discoverySources,

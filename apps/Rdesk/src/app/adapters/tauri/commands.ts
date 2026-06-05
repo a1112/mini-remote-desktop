@@ -15,6 +15,7 @@ import type {
   DeviceInfo,
   LanDiscoverySnapshot,
   DeviceRegistrationResponse,
+  WakeOnLanSent,
   DecodePolicy,
   DecodePolicyResponse,
   AppSettings,
@@ -574,6 +575,33 @@ export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscove
     undefined,
     { type: 'RefreshLanDiscovery' },
     responseField<LanDiscoverySnapshot>('snapshot')
+  );
+}
+
+export async function ipcWakeOnLan(params: {
+  deviceId: string;
+  macAddress: string;
+  broadcastAddr?: string | null;
+}): Promise<AdapterResult<WakeOnLanSent>> {
+  return invokeBridgeOrTauri<WakeOnLanSent>(
+    'ipc_wake_on_lan',
+    {
+      deviceId: params.deviceId,
+      macAddress: params.macAddress,
+      broadcastAddr: params.broadcastAddr ?? null,
+    },
+    {
+      type: 'WakeOnLan',
+      device_id: params.deviceId,
+      mac_address: params.macAddress,
+      broadcast_addr: params.broadcastAddr ?? null,
+    },
+    (response) => ({
+      device_id: response.device_id as string,
+      mac_address: response.mac_address as string,
+      broadcast_addr: response.broadcast_addr as string,
+      packet_bytes: response.packet_bytes as number,
+    })
   );
 }
 

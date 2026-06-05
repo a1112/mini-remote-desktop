@@ -139,6 +139,26 @@ impl IpcServer {
                     .await,
             },
 
+            IpcRequest::WakeOnLan {
+                device_id,
+                mac_address,
+                broadcast_addr,
+            } => {
+                match crate::wake_on_lan::send_wake_on_lan(&mac_address, broadcast_addr.as_deref())
+                {
+                    Ok(result) => IpcResponse::WakeOnLanSent {
+                        device_id,
+                        mac_address: result.mac_address,
+                        broadcast_addr: result.broadcast_addr,
+                        packet_bytes: result.packet_bytes,
+                    },
+                    Err(error) => IpcResponse::Error {
+                        code: "E_WAKE_ON_LAN".to_string(),
+                        message: error.to_string(),
+                    },
+                }
+            }
+
             IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
 
             IpcRequest::StartSession {
@@ -1244,6 +1264,28 @@ mod tests {
                 );
             }
             _ => panic!("Expected SessionList response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wake_on_lan_rejects_invalid_mac_before_sending() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::WakeOnLan {
+                device_id: DeviceId("agent-device".to_string()),
+                mac_address: "not-a-mac".to_string(),
+                broadcast_addr: None,
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_WAKE_ON_LAN");
+                assert!(message.contains("invalid Wake-on-LAN MAC address"));
+            }
+            _ => panic!("expected Wake-on-LAN validation error"),
         }
     }
 

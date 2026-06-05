@@ -367,6 +367,29 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'ipc_lan_discovery_snapshot', undefined);
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_refresh_lan_discovery', undefined);
     });
+
+    it('ipc_wake_on_lan calls correct command with device and MAC arguments', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        device_id: 'agent-device',
+        mac_address: 'AA:BB:CC:DD:EE:FF',
+        broadcast_addr: '192.168.1.255:9',
+        packet_bytes: 102,
+      });
+
+      const result = await adapter.ipcWakeOnLan({
+        deviceId: 'agent-device',
+        macAddress: 'AA:BB:CC:DD:EE:FF',
+        broadcastAddr: '192.168.1.255:9',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_wake_on_lan', {
+        deviceId: 'agent-device',
+        macAddress: 'AA:BB:CC:DD:EE:FF',
+        broadcastAddr: '192.168.1.255:9',
+      });
+      expect(result.ok).toBe(true);
+    });
   });
 
   /**

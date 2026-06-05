@@ -1007,6 +1007,16 @@ mod wire {
         LanDiscoverySnapshot,
         /// Send an immediate LAN discovery probe and return the current snapshot.
         RefreshLanDiscovery,
+        /// Send a Wake-on-LAN magic packet for a known device MAC address.
+        WakeOnLan {
+            /// Peer device id associated with the wake request.
+            device_id: DeviceId,
+            /// Target MAC address, for example `AA:BB:CC:DD:EE:FF`.
+            mac_address: String,
+            /// Optional UDP broadcast endpoint, defaults to `255.255.255.255:9`.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            broadcast_addr: Option<String>,
+        },
         /// List all active sessions
         ListSessions,
         /// Start a new session as controller
@@ -1207,6 +1217,17 @@ mod wire {
         LanDiscoverySnapshot {
             /// Current discovery state.
             snapshot: LanDiscoverySnapshot,
+        },
+        /// Wake-on-LAN magic packet was sent.
+        WakeOnLanSent {
+            /// Peer device id associated with the wake request.
+            device_id: DeviceId,
+            /// Normalized target MAC address.
+            mac_address: String,
+            /// UDP endpoint used for the magic packet.
+            broadcast_addr: String,
+            /// Number of bytes in the magic packet payload.
+            packet_bytes: usize,
         },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },
@@ -1602,5 +1623,35 @@ mod tests {
 
         let decoded: MediaProfile = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn wake_on_lan_request_and_response_are_stable_ipc_messages() {
+        let request = IpcRequest::WakeOnLan {
+            device_id: DeviceId("agent-device".to_string()),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_addr: Some("192.168.1.255:9".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("WakeOnLan"));
+        assert!(encoded.contains("\"mac_address\":\"AA:BB:CC:DD:EE:FF\""));
+        assert!(encoded.contains("\"broadcast_addr\":\"192.168.1.255:9\""));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = IpcResponse::WakeOnLanSent {
+            device_id: DeviceId("agent-device".to_string()),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_addr: "192.168.1.255:9".to_string(),
+            packet_bytes: 102,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("WakeOnLanSent"));
+        assert!(encoded.contains("\"packet_bytes\":102"));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 }

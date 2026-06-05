@@ -570,6 +570,13 @@ export interface LanDiscoverySnapshot {
   peers: LanPeerInfo[];
 }
 
+export interface WakeOnLanSent {
+  device_id: string;
+  mac_address: string;
+  broadcast_addr: string;
+  packet_bytes: number;
+}
+
 export type CapabilityPlatform =
   | "windows"
   | "macos"

@@ -1,3 +1,5 @@
+import { ipcWakeOnLan, type WakeOnLanSent } from "../adapters/tauri";
+
 export type DeviceActionPreference = {
   favorite?: boolean;
   disabled?: boolean;
@@ -95,10 +97,23 @@ function applyDevicePreferences<T extends DeviceActionPreferenceTarget>(devices:
     });
 }
 
+async function wakeOnLan(params: {
+  deviceId: string;
+  macAddress: string;
+  broadcastAddr?: string | null;
+}): Promise<WakeOnLanSent> {
+  const result = await ipcWakeOnLan(params);
+  if (!result.ok) {
+    throw new Error(result.error.message);
+  }
+  return result.value;
+}
+
 export const deviceActionService = {
   applyDevicePreferences,
   getDevicePreference,
   markDeviceRemoved,
   setDeviceDisabled,
   setDeviceFavorite,
+  wakeOnLan,
 };

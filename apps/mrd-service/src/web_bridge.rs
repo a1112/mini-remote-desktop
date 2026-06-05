@@ -509,6 +509,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
         request,
         IpcRequest::LanDiscoverySnapshot
             | IpcRequest::RefreshLanDiscovery
+            | IpcRequest::WakeOnLan { .. }
             | IpcRequest::ListSessions
             | IpcRequest::StartLanRemoteSession { .. }
             | IpcRequest::ListLocalCaptureSources { .. }
