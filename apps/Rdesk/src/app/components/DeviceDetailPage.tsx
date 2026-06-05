@@ -83,11 +83,11 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
 
-type TabType = "remote" | "files" | "apps";
+type TabType = "remote" | "files" | "apps" | "info";
 
 export function deviceDetailTabFromSearch(search: string): TabType {
   const tab = new URLSearchParams(search).get("tab");
-  return tab === "files" || tab === "apps" || tab === "remote" ? tab : "remote";
+  return tab === "files" || tab === "apps" || tab === "info" || tab === "remote" ? tab : "remote";
 }
 
 const remoteFiles = [
@@ -144,6 +144,7 @@ export function DeviceDetailPage() {
     { key: "remote", label: "远程桌面", icon: Monitor },
     { key: "files", label: "文件传输", icon: FolderOpen },
     { key: "apps", label: "远程应用", icon: AppWindow },
+    { key: "info", label: "设备信息", icon: Info },
   ];
 
   const handleCollapse = () => {
@@ -301,6 +302,7 @@ export function DeviceDetailPage() {
         {activeTab === "remote" && <RemoteTab device={device} />}
         {activeTab === "files" && <FilesTab device={device} devices={devices} />}
         {activeTab === "apps" && <AppsTab device={device} />}
+        {activeTab === "info" && <InfoTab device={device} />}
       </div>
 
       {/* Performance monitoring footer */}
@@ -1340,6 +1342,104 @@ function remoteCaptureSourceAccent(source: CaptureSource): string {
   if (text.includes("excel")) return "bg-green-600";
   if (text.includes("word") || text.includes("office") || text.includes("pdf")) return "bg-indigo-600";
   return "bg-cyan-600";
+}
+
+/* ======================== Device Info Tab ======================== */
+function InfoTab({ device }: { device: Device }) {
+  const { isDark } = useTheme();
+  const Icon = device.icon;
+  const statusLabel = device.status === "online" ? "在线" : "离线";
+  const discoverySourceLabel = device.discoverySources
+    .map((source) => {
+      if (source === "lan_p2p") return "P2P 局域网";
+      if (source === "server") return "服务器";
+      if (source === "local") return "本机";
+      return source;
+    })
+    .join(" / ");
+
+  const rows = [
+    ["设备 ID", device.deviceId],
+    ["系统", device.os],
+    ["地址", device.ip],
+    ["位置", device.location],
+    ["分组", device.group],
+    ["最后在线", device.lastSeen],
+    ["发现来源", device.sourceLabel],
+    ["原始来源", discoverySourceLabel || "未知"],
+  ];
+
+  const capabilityBadges = [
+    device.p2pAvailable ? "P2P 可用" : "P2P 不可用",
+    device.serverAvailable ? "服务器可用" : "服务器不可用",
+    device.isLocal ? "本机设备" : "远程设备",
+    device.favorite ? "已收藏" : "未收藏",
+  ];
+
+  return (
+    <div className={`h-full overflow-y-auto ${isDark ? "bg-[#181818]" : "bg-[#f6f7f9]"}`}>
+      <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-5">
+        <div className={`flex items-center gap-4 border-b pb-4 ${isDark ? "border-gray-700" : "border-gray-200"}`}>
+          <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-lg ${device.status === "online" ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "bg-gray-800" : "bg-gray-100")}`}>
+            <Icon className={device.status === "online" ? "text-blue-600" : "text-gray-400"} style={{ width: 24, height: 24 }} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className={`truncate font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 18 }}>{device.name}</div>
+            <div className={`mt-1 flex flex-wrap items-center gap-2 ${isDark ? "text-gray-400" : "text-gray-500"}`} style={{ fontSize: 12 }}>
+              <span>{statusLabel}</span>
+              <span>{device.os}</span>
+              <span>{device.ip}</span>
+              {device.ping !== null && <span>{device.ping}ms</span>}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+          <div className={`overflow-hidden rounded-lg border ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+            {rows.map(([label, value], index) => (
+              <div
+                key={label}
+                className={`grid grid-cols-[120px_1fr] gap-4 px-4 py-3 ${
+                  index > 0 ? isDark ? "border-t border-gray-700" : "border-t border-gray-100" : ""
+                }`}
+              >
+                <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 12 }}>{label}</div>
+                <div className={`min-w-0 break-all font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex flex-col gap-4">
+            <div className={`rounded-lg border p-4 ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+              <div className={`mb-3 font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>连接状态</div>
+              <div className="flex flex-wrap gap-2">
+                {capabilityBadges.map((badge) => (
+                  <span
+                    key={badge}
+                    className={`rounded px-2 py-1 ${isDark ? "bg-gray-800 text-gray-300" : "bg-gray-100 text-gray-700"}`}
+                    style={{ fontSize: 12 }}
+                  >
+                    {badge}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {(device.cpu !== null || device.ram !== null || device.disk !== null) && (
+              <div className={`rounded-lg border p-4 ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+                <div className={`mb-3 font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>资源</div>
+                <div className="space-y-2">
+                  {device.cpu !== null && <ResourcePill label="CPU" value={device.cpu} color="blue" />}
+                  {device.ram !== null && <ResourcePill label="RAM" value={device.ram} color="purple" />}
+                  {device.disk !== null && <ResourcePill label="DISK" value={device.disk} color="green" />}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ======================== Performance Monitoring Footer ======================== */

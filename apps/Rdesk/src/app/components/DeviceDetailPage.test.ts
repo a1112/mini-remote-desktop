@@ -6,7 +6,7 @@ describe("deviceDetailTabFromSearch", () => {
   it("opens supported tabs from the sidebar query string", () => {
     expect(deviceDetailTabFromSearch("?tab=files")).toBe("files");
     expect(deviceDetailTabFromSearch("?tab=apps")).toBe("apps");
-    expect(deviceDetailTabFromSearch("?tab=info")).toBe("remote");
+    expect(deviceDetailTabFromSearch("?tab=info")).toBe("info");
   });
 
   it("falls back to the remote tab for unsupported values", () => {
