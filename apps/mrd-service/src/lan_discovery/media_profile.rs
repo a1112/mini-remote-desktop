@@ -335,20 +335,26 @@ pub(crate) fn missing_profile_receiver_media_capabilities(
                 vec![LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY],
             ),
         ],
-        LanAccessUnitCodec::Hevc => vec![(
-            "hevc decoder",
-            vec![
-                "decode.nvdec_hevc",
-                "nvdec_hevc",
-                "nvdec_hevc_d3d11_shared",
-                "decode.videotoolbox_hevc",
-                "decode.linux_hevc",
-                "linux_hevc",
-                "decode.ffmpeg_hevc",
-                "ffmpeg_hevc",
-                "software_decode",
-            ],
-        )],
+        LanAccessUnitCodec::Hevc => vec![
+            (
+                "hevc decoder",
+                vec![
+                    "decode.nvdec_hevc",
+                    "nvdec_hevc",
+                    "nvdec_hevc_d3d11_shared",
+                    "decode.videotoolbox_hevc",
+                    "decode.linux_hevc",
+                    "linux_hevc",
+                    "decode.ffmpeg_hevc",
+                    "ffmpeg_hevc",
+                    "software_decode",
+                ],
+            ),
+            (
+                LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+                vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
+            ),
+        ],
         LanAccessUnitCodec::Av1 => vec![(
             "av1 decoder",
             vec![
@@ -517,5 +523,28 @@ mod tests {
         assert_eq!(runtime.bit_depth, Some(10));
         assert_eq!(runtime.pixel_format.as_deref(), Some("p010"));
         assert_eq!(runtime.hdr_enabled, Some(true));
+    }
+
+    #[test]
+    fn selected_hevc_receiver_requires_main_420_media_capability() {
+        let profile = MediaProfile {
+            codec: "hevc".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            ..default_media_profile()
+        };
+
+        let missing = missing_profile_receiver_media_capabilities(
+            &profile,
+            &["decode.nvdec_hevc".to_string()],
+        );
+
+        assert_eq!(
+            missing,
+            vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()]
+        );
     }
 }

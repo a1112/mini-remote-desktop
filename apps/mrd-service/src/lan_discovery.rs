@@ -10174,7 +10174,10 @@ mod tests {
                 codec: "HEVC".to_string(),
                 ..MediaProfile::default()
             },
-            &["decode.videotoolbox_hevc".to_string()],
+            &[
+                "decode.videotoolbox_hevc".to_string(),
+                LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
+            ],
         )
         .expect("macOS VideoToolbox receiver should pass HEVC selected profile preflight");
     }
