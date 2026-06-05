@@ -51,6 +51,7 @@ use tokio::time::{interval, timeout, Instant};
 
 mod dynamic_window_fps;
 mod lan_control_input;
+mod media_access_unit;
 mod media_envelope;
 mod media_keyframe_request;
 mod media_ordering;
@@ -71,6 +72,7 @@ pub use lan_control_input::request_lan_control_input;
 use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
+use media_access_unit::{describe_lan_access_unit, h264_access_unit_is_keyframe};
 #[cfg(test)]
 use media_envelope::LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT;
 use media_envelope::{
@@ -4248,16 +4250,6 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
     *LOCAL_RENDER_REFRESH_HZ.get_or_init(mrd_capture_macos::highest_current_display_refresh_hz)
 }
 
-fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: &[u8]) -> bool {
-    metadata_is_keyframe
-        || h264_annexb_nal_types(payload)
-            .into_iter()
-            .any(|nal_type| nal_type == 5)
-        || h264_avcc_nal_types(payload)
-            .into_iter()
-            .any(|nal_type| nal_type == 5)
-}
-
 async fn maybe_send_lan_keyframe_request(
     endpoint: &QuinnDatagramEndpoint,
     session_id: &SessionId,
@@ -7624,109 +7616,6 @@ fn decode_lan_desktop_frame(
         );
     }
     Ok(decoder.drain_decoded_frames())
-}
-
-fn describe_lan_access_unit(codec: LanAccessUnitCodec, payload: &[u8]) -> String {
-    match codec {
-        LanAccessUnitCodec::H264 => describe_h264_access_unit(payload),
-        LanAccessUnitCodec::Hevc => describe_hevc_access_unit(payload),
-    }
-}
-
-fn describe_hevc_access_unit(payload: &[u8]) -> String {
-    let prefix_hex = payload
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "payload_bytes={}, prefix_hex=[{}]",
-        payload.len(),
-        prefix_hex
-    )
-}
-
-fn describe_h264_access_unit(payload: &[u8]) -> String {
-    let prefix_hex = payload
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let annexb_nals = h264_annexb_nal_types(payload);
-    let avcc_nals = if annexb_nals.is_empty() {
-        h264_avcc_nal_types(payload)
-    } else {
-        Vec::new()
-    };
-
-    format!(
-        "payload_bytes={}, prefix_hex=[{}], annexb_nals=[{}], avcc_nals=[{}]",
-        payload.len(),
-        prefix_hex,
-        annexb_nals
-            .iter()
-            .map(|nal| nal.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        avcc_nals
-            .iter()
-            .map(|nal| nal.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn h264_annexb_nal_types(payload: &[u8]) -> Vec<u8> {
-    let mut types = Vec::new();
-    let mut offset = 0usize;
-    while let Some((start, start_len)) = find_h264_start_code(payload, offset) {
-        let nal_header = start + start_len;
-        if let Some(&header) = payload.get(nal_header) {
-            types.push(header & 0x1f);
-        }
-        offset = nal_header.saturating_add(1);
-    }
-    types
-}
-
-fn h264_avcc_nal_types(payload: &[u8]) -> Vec<u8> {
-    let mut types = Vec::new();
-    let mut offset = 0usize;
-    while offset + 4 <= payload.len() {
-        let nal_len = u32::from_be_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if nal_len == 0 || offset + nal_len > payload.len() {
-            return Vec::new();
-        }
-        types.push(payload[offset] & 0x1f);
-        offset += nal_len;
-    }
-    if offset == payload.len() {
-        types
-    } else {
-        Vec::new()
-    }
-}
-
-fn find_h264_start_code(payload: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut index = from;
-    while index + 3 <= payload.len() {
-        if payload[index..].starts_with(&[0, 0, 1]) {
-            return Some((index, 3));
-        }
-        if index + 4 <= payload.len() && payload[index..].starts_with(&[0, 0, 0, 1]) {
-            return Some((index, 4));
-        }
-        index += 1;
-    }
-    None
 }
 
 fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
