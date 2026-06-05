@@ -79,6 +79,13 @@ mod wire {
         AfterSessions,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteDevicePowerAction {
+        Restart,
+        Shutdown,
+    }
+
     /// Shell/service status snapshot
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ShellStatusSnapshot {
@@ -1017,6 +1024,10 @@ mod wire {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             broadcast_addr: Option<String>,
         },
+        RequestRemoteDevicePowerAction {
+            device_id: DeviceId,
+            action: RemoteDevicePowerAction,
+        },
         /// List all active sessions
         ListSessions,
         /// Start a new session as controller
@@ -1228,6 +1239,10 @@ mod wire {
             broadcast_addr: String,
             /// Number of bytes in the magic packet payload.
             packet_bytes: usize,
+        },
+        RemoteDevicePowerActionAccepted {
+            device_id: DeviceId,
+            action: RemoteDevicePowerAction,
         },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },
@@ -1650,6 +1665,33 @@ mod tests {
         let encoded = serde_json::to_string(&response).unwrap();
         assert!(encoded.contains("WakeOnLanSent"));
         assert!(encoded.contains("\"packet_bytes\":102"));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn remote_device_power_request_is_a_stable_ipc_message() {
+        let request = IpcRequest::RequestRemoteDevicePowerAction {
+            device_id: DeviceId("agent-device".to_string()),
+            action: RemoteDevicePowerAction::Restart,
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("RequestRemoteDevicePowerAction"));
+        assert!(encoded.contains("\"device_id\":\"agent-device\""));
+        assert!(encoded.contains("\"action\":\"restart\""));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = IpcResponse::RemoteDevicePowerActionAccepted {
+            device_id: DeviceId("agent-device".to_string()),
+            action: RemoteDevicePowerAction::Shutdown,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("RemoteDevicePowerActionAccepted"));
+        assert!(encoded.contains("\"action\":\"shutdown\""));
 
         let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, response);

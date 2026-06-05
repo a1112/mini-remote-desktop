@@ -390,6 +390,25 @@ describe('Tauri Adapter Contract', () => {
       });
       expect(result.ok).toBe(true);
     });
+
+    it('ipc_request_remote_device_power_action calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        device_id: 'agent-device',
+        action: 'restart',
+      });
+
+      const result = await adapter.ipcRequestRemoteDevicePowerAction({
+        deviceId: 'agent-device',
+        action: 'restart',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_request_remote_device_power_action', {
+        deviceId: 'agent-device',
+        action: 'restart',
+      });
+      expect(result.ok).toBe(true);
+    });
   });
 
   /**

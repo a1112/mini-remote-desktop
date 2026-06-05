@@ -1,4 +1,10 @@
-import { ipcWakeOnLan, type WakeOnLanSent } from "../adapters/tauri";
+import {
+  ipcRequestRemoteDevicePowerAction,
+  ipcWakeOnLan,
+  type RemoteDevicePowerAction,
+  type RemoteDevicePowerActionAccepted,
+  type WakeOnLanSent,
+} from "../adapters/tauri";
 
 export type DeviceActionPreference = {
   favorite?: boolean;
@@ -109,10 +115,22 @@ async function wakeOnLan(params: {
   return result.value;
 }
 
+async function requestRemoteDevicePowerAction(params: {
+  deviceId: string;
+  action: RemoteDevicePowerAction;
+}): Promise<RemoteDevicePowerActionAccepted> {
+  const result = await ipcRequestRemoteDevicePowerAction(params);
+  if (!result.ok) {
+    throw new Error(result.error.message);
+  }
+  return result.value;
+}
+
 export const deviceActionService = {
   applyDevicePreferences,
   getDevicePreference,
   markDeviceRemoved,
+  requestRemoteDevicePowerAction,
   setDeviceDisabled,
   setDeviceFavorite,
   wakeOnLan,

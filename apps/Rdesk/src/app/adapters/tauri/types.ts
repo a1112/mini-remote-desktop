@@ -577,6 +577,13 @@ export interface WakeOnLanSent {
   packet_bytes: number;
 }
 
+export type RemoteDevicePowerAction = "restart" | "shutdown";
+
+export interface RemoteDevicePowerActionAccepted {
+  device_id: string;
+  action: RemoteDevicePowerAction;
+}
+
 export type CapabilityPlatform =
   | "windows"
   | "macos"

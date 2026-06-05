@@ -347,6 +347,26 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
   };
 
+  const handleRemotePowerAction = async (
+    deviceId: string,
+    deviceName: string,
+    action: "restart" | "shutdown"
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    const actionLabel = action === "restart" ? "重启" : "关机";
+    try {
+      await deviceActionService.requestRemoteDevicePowerAction({
+        deviceId,
+        action,
+      });
+      showActionStatus({ kind: "success", message: `已请求远端${actionLabel}：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `远端${actionLabel}失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -501,8 +521,44 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           : "缺少设备 MAC 地址";
 
     return [
-      { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
-      { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: RotateCw,
+        label: "重启",
+        disabled: !isContextOnline || contextMenuDevice?.isLocal,
+        title: !isContextOnline
+          ? "设备离线"
+          : contextMenuDevice?.isLocal
+            ? "不能远端重启本机设备"
+            : undefined,
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemotePowerAction(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              "restart"
+            );
+          }
+        },
+      },
+      {
+        icon: Power,
+        label: "关机",
+        disabled: !isContextOnline || contextMenuDevice?.isLocal,
+        title: !isContextOnline
+          ? "设备离线"
+          : contextMenuDevice?.isLocal
+            ? "不能远端关机本机设备"
+            : undefined,
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemotePowerAction(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              "shutdown"
+            );
+          }
+        },
+      },
       {
         icon: Zap,
         label: "Wake-on-LAN",

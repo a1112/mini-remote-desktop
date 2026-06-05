@@ -15,7 +15,7 @@ mod tests {
     use crate::app_state::AppState;
     use mrd_ipc::{
         AuditLogQuery, CapabilityStatus, ControlChannelReliability, IpcResponse,
-        ScenarioEvaluationStatus, TransportPolicyConfig, UiDetachReason,
+        RemoteDevicePowerAction, ScenarioEvaluationStatus, TransportPolicyConfig, UiDetachReason,
     };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
@@ -319,6 +319,23 @@ mod tests {
                 assert_eq!(status.active_session_count, 0);
             }
             _ => panic!("expected shell status response"),
+        }
+    }
+
+    #[test]
+    fn device_handler_rejects_remote_power_without_agent_executor() {
+        let response = super::device::request_remote_device_power_action(
+            DeviceId("agent-device".to_string()),
+            RemoteDevicePowerAction::Restart,
+        );
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_REMOTE_POWER_UNSUPPORTED");
+                assert!(message.contains("agent-device"));
+                assert!(message.contains("restart"));
+            }
+            _ => panic!("expected remote power unsupported error"),
         }
     }
 

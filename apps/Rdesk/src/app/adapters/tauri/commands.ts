@@ -15,6 +15,8 @@ import type {
   DeviceInfo,
   LanDiscoverySnapshot,
   DeviceRegistrationResponse,
+  RemoteDevicePowerAction,
+  RemoteDevicePowerActionAccepted,
   WakeOnLanSent,
   DecodePolicy,
   DecodePolicyResponse,
@@ -601,6 +603,28 @@ export async function ipcWakeOnLan(params: {
       mac_address: response.mac_address as string,
       broadcast_addr: response.broadcast_addr as string,
       packet_bytes: response.packet_bytes as number,
+    })
+  );
+}
+
+export async function ipcRequestRemoteDevicePowerAction(params: {
+  deviceId: string;
+  action: RemoteDevicePowerAction;
+}): Promise<AdapterResult<RemoteDevicePowerActionAccepted>> {
+  return invokeBridgeOrTauri<RemoteDevicePowerActionAccepted>(
+    'ipc_request_remote_device_power_action',
+    {
+      deviceId: params.deviceId,
+      action: params.action,
+    },
+    {
+      type: 'RequestRemoteDevicePowerAction',
+      device_id: params.deviceId,
+      action: params.action,
+    },
+    (response) => ({
+      device_id: response.device_id as string,
+      action: response.action as RemoteDevicePowerAction,
     })
   );
 }

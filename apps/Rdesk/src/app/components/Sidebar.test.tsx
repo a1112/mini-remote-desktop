@@ -32,6 +32,7 @@ const actionServiceMock = vi.hoisted(() => ({
   setDeviceFavorite: vi.fn(),
   markDeviceRemoved: vi.fn(),
   setDeviceDisabled: vi.fn(),
+  requestRemoteDevicePowerAction: vi.fn(),
   wakeOnLan: vi.fn(),
 }));
 
@@ -72,6 +73,7 @@ vi.mock("../services/deviceActionService", () => ({
     setDeviceFavorite: actionServiceMock.setDeviceFavorite,
     markDeviceRemoved: actionServiceMock.markDeviceRemoved,
     setDeviceDisabled: actionServiceMock.setDeviceDisabled,
+    requestRemoteDevicePowerAction: actionServiceMock.requestRemoteDevicePowerAction,
     wakeOnLan: actionServiceMock.wakeOnLan,
   },
 }));
@@ -151,6 +153,9 @@ describe("Sidebar device actions", () => {
       broadcast_addr: "255.255.255.255:9",
       packet_bytes: 102,
     });
+    actionServiceMock.requestRemoteDevicePowerAction.mockRejectedValue(
+      new Error("remote power unsupported")
+    );
     sessionServiceMock.listSessions.mockResolvedValue([]);
     sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
@@ -178,8 +183,8 @@ describe("Sidebar device actions", () => {
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
 
-    expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重启" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "关机" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
   });
@@ -237,6 +242,42 @@ describe("Sidebar device actions", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(
       "/devices/agent-device?tab=terminal"
     );
+  });
+
+  it("requests remote restart through the service IPC action path", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await user.click(screen.getByRole("button", { name: "重启" }));
+
+    expect(actionServiceMock.requestRemoteDevicePowerAction).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      action: "restart",
+    });
+    await waitFor(() => {
+      expect(screen.getByText("远端重启失败：remote power unsupported")).toBeInTheDocument();
+    });
+  });
+
+  it("requests remote shutdown through the service IPC action path", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await user.click(screen.getByRole("button", { name: "关机" }));
+
+    expect(actionServiceMock.requestRemoteDevicePowerAction).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      action: "shutdown",
+    });
+    await waitFor(() => {
+      expect(screen.getByText("远端关机失败：remote power unsupported")).toBeInTheDocument();
+    });
   });
 
   it("toggles favorite state through local device action preferences", async () => {

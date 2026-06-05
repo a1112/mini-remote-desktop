@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use mrd_ipc::IpcResponse;
+use mrd_ipc::{IpcResponse, RemoteDevicePowerAction};
 use mrd_proto::DeviceId;
 use std::sync::Arc;
 
@@ -49,5 +49,22 @@ pub fn wake_on_lan(
             code: "E_WAKE_ON_LAN".to_string(),
             message: error.to_string(),
         },
+    }
+}
+
+pub fn request_remote_device_power_action(
+    device_id: DeviceId,
+    action: RemoteDevicePowerAction,
+) -> IpcResponse {
+    let action_label = match action {
+        RemoteDevicePowerAction::Restart => "restart",
+        RemoteDevicePowerAction::Shutdown => "shutdown",
+    };
+    IpcResponse::Error {
+        code: "E_REMOTE_POWER_UNSUPPORTED".to_string(),
+        message: format!(
+            "Remote device power action {action_label} for {} is not available until the peer agent executor is implemented.",
+            device_id.0
+        ),
     }
 }

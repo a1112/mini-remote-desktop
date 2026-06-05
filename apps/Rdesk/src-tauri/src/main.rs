@@ -146,6 +146,12 @@ struct WakeOnLanSentDto {
 }
 
 #[derive(Debug, Serialize)]
+struct RemoteDevicePowerActionAcceptedDto {
+    device_id: String,
+    action: mrd_ipc::RemoteDevicePowerAction,
+}
+
+#[derive(Debug, Serialize)]
 struct ClientDiagnostics {
     app_pid: u32,
     app_exe_path: Option<String>,
@@ -1922,6 +1928,36 @@ async fn ipc_wake_on_lan(
             broadcast_addr,
             packet_bytes,
         }),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Request a remote device restart/shutdown through mrd-service IPC.
+#[tauri::command]
+async fn ipc_request_remote_device_power_action(
+    device_id: String,
+    action: mrd_ipc::RemoteDevicePowerAction,
+) -> Result<RemoteDevicePowerActionAcceptedDto, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RequestRemoteDevicePowerAction {
+            device_id: DeviceId(device_id),
+            action,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::RemoteDevicePowerActionAccepted { device_id, action } => {
+            Ok(RemoteDevicePowerActionAcceptedDto {
+                device_id: device_id.0,
+                action,
+            })
+        }
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -3969,6 +4005,7 @@ fn main() {
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
             ipc_wake_on_lan,
+            ipc_request_remote_device_power_action,
             ipc_list_sessions,
             ipc_start_session,
             ipc_start_lan_remote_session,
