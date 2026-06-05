@@ -8317,6 +8317,136 @@ mod tests {
         assert_eq!(snapshot.realtime.injected_messages, 0);
     }
 
+    #[tokio::test]
+    async fn stopping_controller_session_releases_remote_lan_control_input() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        let session_id = SessionId("input-stop-release-session".to_string());
+        controller_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Streaming,
+                last_error: None,
+                sender_active: false,
+                receiver_active: true,
+            },
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_INPUT_CONTROL_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let key_down_handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+        request_lan_control_input(
+            &controller_state,
+            &session_id,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+        )
+        .await
+        .expect("key down control input ack");
+        key_down_handler.await.unwrap();
+
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let stop_release_handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+        let response =
+            crate::handlers::session::stop_session(&controller_state, session_id.clone()).await;
+        assert!(matches!(
+            response,
+            mrd_ipc::IpcResponse::SessionStopped { .. }
+        ));
+        timeout(Duration::from_millis(500), stop_release_handler)
+            .await
+            .expect("stopping controller session should send ReleaseAll to the LAN peer")
+            .unwrap();
+
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     #[ignore = "manual smoke test: moves the local cursor through LAN control input and restores it"]

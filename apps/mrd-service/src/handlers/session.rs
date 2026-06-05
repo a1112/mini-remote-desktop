@@ -413,8 +413,32 @@ pub async fn accept_session(
 pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Stopping session: {}", session_id.0);
 
-    let mut sessions = app_state.sessions.lock().await;
-    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+    let snapshot = {
+        let sessions = app_state.sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+
+    if let Some(snapshot) = snapshot {
+        let route_release_to_peer = snapshot.target_device_id.is_some()
+            && snapshot.lifecycle_state == SessionLifecycleState::Streaming
+            && snapshot.receiver_active;
+        if route_release_to_peer {
+            if let Err(error) = crate::lan_discovery::request_lan_control_input(
+                app_state,
+                &session_id,
+                ControlInputEvent::ReleaseAll,
+            )
+            .await
+            {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    %error,
+                    "failed to release remote control input while stopping controller session"
+                );
+            }
+        }
+
+        let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
@@ -426,17 +450,19 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             },
         );
         drop(sessions);
-        if let Err(error) = app_state
-            .control_input()
-            .lock()
-            .await
-            .handle_event(&ControlInputEvent::ReleaseAll)
-        {
-            tracing::warn!(
-                session_id = %session_id.0,
-                %error,
-                "failed to release active control input while stopping session"
-            );
+        if !route_release_to_peer {
+            if let Err(error) = app_state
+                .control_input()
+                .lock()
+                .await
+                .handle_event(&ControlInputEvent::ReleaseAll)
+            {
+                tracing::warn!(
+                    session_id = %session_id.0,
+                    %error,
+                    "failed to release active control input while stopping session"
+                );
+            }
         }
         app_state
             .media_tasks
