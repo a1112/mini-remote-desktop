@@ -54,6 +54,7 @@ mod lan_control_input;
 mod media_access_unit;
 mod media_capture_config;
 mod media_envelope;
+mod media_error_policy;
 mod media_keyframe_request;
 mod media_ordering;
 mod media_probe;
@@ -87,6 +88,11 @@ use media_envelope::{
     decode_lan_media_envelope, encode_lan_media_envelope, lan_media_codec_name,
     lan_media_profile_id, LanMediaEnvelope, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC,
     LAN_MEDIA_PAYLOAD_ACCESS_UNIT, LAN_MEDIA_PAYLOAD_PROBE_FRAME,
+};
+use media_error_policy::{
+    should_log_media_receiver_decode_error, should_log_media_sender_frame_error,
+    LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS,
+    LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
 };
 use media_keyframe_request::{
     decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
@@ -273,8 +279,6 @@ const LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "decode.videotoolbox_h264"
 const LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "decode.videotoolbox_hevc";
 #[cfg(target_os = "macos")]
 const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
-const LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 8;
-
 #[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 #[cfg(any(windows, target_os = "macos"))]
@@ -283,9 +287,6 @@ static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
-const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
-const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_QUEUE_CAPACITY: usize = 2;
 #[cfg(target_os = "macos")]
@@ -4043,18 +4044,6 @@ async fn handle_media_sender_frame_error(
     }
 
     Ok(())
-}
-
-fn should_log_media_sender_frame_error(consecutive_frame_errors: u32) -> bool {
-    consecutive_frame_errors == 1
-        || consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
-        || consecutive_frame_errors.is_multiple_of(LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL)
-}
-
-fn should_log_media_receiver_decode_error(consecutive_decode_errors: u32) -> bool {
-    consecutive_decode_errors == 1
-        || consecutive_decode_errors == LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS
-        || consecutive_decode_errors.is_multiple_of(LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL)
 }
 
 #[cfg(target_os = "macos")]
