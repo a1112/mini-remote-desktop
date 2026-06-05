@@ -14,10 +14,9 @@ use mrd_ipc::render_proxy::{
     decode_ack, encode_frame_header, RenderProxyFrameHeader, RenderProxyPixelFormat,
 };
 use mrd_ipc::{
-    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
-    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
-    PairedDeviceIdentity,
+    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, MediaTestImpairmentSnapshot, PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -41,6 +40,9 @@ use std::time::Duration;
 #[cfg(any(windows, target_os = "macos"))]
 use tokio::time::Instant;
 use tokio::{sync::Mutex, task::AbortHandle};
+
+mod capture_source_registry;
+pub use capture_source_registry::CaptureSourceRegistry;
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
@@ -98,38 +100,6 @@ impl MediaProfileRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<MediaProfileNegotiation> {
         self.profiles.remove(session_id)
-    }
-}
-
-/// Runtime capture source selection state keyed by session.
-#[derive(Debug, Default)]
-pub struct CaptureSourceRegistry {
-    selections: HashMap<SessionId, CaptureSourceSelection>,
-}
-
-impl CaptureSourceRegistry {
-    pub fn set(&mut self, session_id: SessionId, selection: CaptureSourceSelection) {
-        self.selections.insert(session_id, selection);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
-        self.selections.get(session_id).cloned()
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
-        self.selections.remove(session_id)
-    }
-
-    pub fn active_window_capture_count(&self, sessions: &SessionRegistry) -> usize {
-        self.selections
-            .iter()
-            .filter(|(session_id, selection)| {
-                selection.source.source_kind == "window"
-                    && sessions.get(session_id).is_some_and(|snapshot| {
-                        snapshot.sender_active && !snapshot.lifecycle_state.is_terminal()
-                    })
-            })
-            .count()
     }
 }
 
