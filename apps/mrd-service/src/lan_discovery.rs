@@ -64,6 +64,7 @@ mod media_render_policy;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
+mod service_identity;
 use dynamic_window_fps::{
     is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
     window_dynamic_fps_input_for_capture_error, window_dynamic_fps_input_for_captured_frame,
@@ -167,11 +168,13 @@ use media_transport::{
 use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
+use service_identity::service_build_id;
+#[cfg(test)]
+use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
 
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
-const SERVICE_BUILD_ID_ENV: &str = "MRD_SERVICE_BUILD_ID";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_ENV: &str = "MRD_LAN_CAPTURE_PUMP";
@@ -2422,24 +2425,6 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
         timestamp_ms: now_ms(),
     })
-}
-
-fn service_build_id() -> String {
-    service_build_id_from_lookup(|key| std::env::var(key).ok())
-}
-
-fn service_build_id_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> String {
-    if let Some(value) = lookup(SERVICE_BUILD_ID_ENV) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-
-    option_env!("VERGEN_GIT_SHA")
-        .or(option_env!("GIT_COMMIT"))
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
-        .to_string()
 }
 
 fn lan_media_capabilities() -> Vec<String> {
