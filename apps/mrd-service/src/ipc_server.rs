@@ -10,7 +10,9 @@ use crate::{
     handlers::{session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
-use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
+use mrd_application::ports::SessionLifecycleState;
+#[cfg(test)]
+use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
     transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
     ScenarioEvaluationStatus,
@@ -137,35 +139,7 @@ impl IpcServer {
                     .await,
             },
 
-            IpcRequest::ListSessions => {
-                let sessions = self.app_state.sessions.lock().await;
-                let session_list = sessions
-                    .list_all()
-                    .into_iter()
-                    .map(|snap| mrd_ipc::SessionInfo {
-                        session_id: snap.session_id.clone(),
-                        role: if snap.target_device_id.is_some() {
-                            "controller".to_string()
-                        } else if snap.source_device_id.is_some() {
-                            "agent".to_string()
-                        } else {
-                            "unknown".to_string()
-                        },
-                        state: snap.lifecycle_state.as_str().to_string(),
-                        transport_kind: snap.transport.clone(),
-                        last_error: snap.last_error.clone(),
-                        sender_active: snap.sender_active,
-                        receiver_active: snap.receiver_active,
-                        peer_device_id: snap
-                            .target_device_id
-                            .clone()
-                            .or_else(|| snap.source_device_id.clone()),
-                    })
-                    .collect();
-                IpcResponse::SessionList {
-                    sessions: session_list,
-                }
-            }
+            IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
 
             IpcRequest::StartSession {
                 session_id,
@@ -451,26 +425,7 @@ impl IpcServer {
                 session::session_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::RuntimeSnapshot => {
-                let sessions = self.app_state.sessions.lock().await;
-                let devices = self.app_state.devices.lock().await;
-
-                let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions
-                    .list_all()
-                    .into_iter()
-                    .filter_map(|snap| self.snapshot_to_ipc(&snap))
-                    .collect();
-
-                let device_id = devices.get_local_device().map(|(id, _)| id.clone());
-
-                IpcResponse::RuntimeSnapshot {
-                    snapshot: mrd_ipc::RuntimeSnapshot {
-                        sessions: session_snapshots,
-                        device_id,
-                        is_registered: devices.is_registered(),
-                    },
-                }
-            }
+            IpcRequest::RuntimeSnapshot => session::runtime_snapshot(&self.app_state).await,
 
             IpcRequest::AuditLog { query } => {
                 let audit_log = self.app_state.audit_log.lock().await;
@@ -827,53 +782,6 @@ impl IpcServer {
                 }
             }
         }
-    }
-
-    /// Convert a session snapshot to IPC format
-    fn snapshot_to_ipc(&self, snap: &SessionSnapshot) -> Option<mrd_ipc::SessionRuntimeSnapshot> {
-        // Determine role based on which device ID is set
-        let role = if snap.target_device_id.is_some() {
-            "controller"
-        } else if snap.source_device_id.is_some() {
-            "agent"
-        } else {
-            "unknown"
-        }
-        .to_string();
-
-        // Use explicit lifecycle state from domain model
-        let state = snap.lifecycle_state.as_str().to_string();
-
-        Some(mrd_ipc::SessionRuntimeSnapshot {
-            session_id: snap.session_id.clone(),
-            role,
-            state,
-            transport_kind: snap.transport.clone(),
-            local_bootstrap: if snap.local_listen_addr.is_some() || snap.local_server_name.is_some()
-            {
-                Some(mrd_ipc::SessionBootstrap {
-                    listen_addr: snap.local_listen_addr.clone(),
-                    server_name: snap.local_server_name.clone(),
-                    cert_der: snap.local_cert_der_b64.clone(),
-                })
-            } else {
-                None
-            },
-            remote_bootstrap: if snap.remote_listen_addr.is_some()
-                || snap.remote_server_name.is_some()
-            {
-                Some(mrd_ipc::SessionBootstrap {
-                    listen_addr: snap.remote_listen_addr.clone(),
-                    server_name: snap.remote_server_name.clone(),
-                    cert_der: snap.remote_cert_der_b64.clone(),
-                })
-            } else {
-                None
-            },
-            last_error: snap.last_error.clone(),
-            sender_active: snap.sender_active,
-            receiver_active: snap.receiver_active,
-        })
     }
 
     /// Get access to the app state (for testing/integration)
