@@ -35,9 +35,9 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 #[cfg(any(windows, target_os = "macos"))]
 use std::time::Duration;
+use tokio::sync::Mutex;
 #[cfg(any(windows, target_os = "macos"))]
 use tokio::time::Instant;
-use tokio::{sync::Mutex, task::AbortHandle};
 
 mod audit_log_registry;
 mod capability_snapshot_registry;
@@ -46,6 +46,7 @@ mod device_identity_registry;
 mod device_registry;
 mod display_mode_registry;
 mod media_profile_registry;
+mod media_task_registry;
 mod peer_media_capability_registry;
 mod session_registry;
 pub use audit_log_registry::AuditLogRegistry;
@@ -55,6 +56,7 @@ pub use device_identity_registry::DeviceIdentityRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
+pub use media_task_registry::MediaTaskRegistry;
 pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
 pub use session_registry::SessionRegistry;
 
@@ -1183,31 +1185,6 @@ fn percentile(samples: &VecDeque<f64>, quantile: f64) -> Option<f64> {
     let last = sorted.len().saturating_sub(1);
     let index = ((last as f64) * quantile.clamp(0.0, 1.0)).round() as usize;
     sorted.get(index).copied()
-}
-
-/// Runtime media tasks keyed by session.
-#[derive(Default)]
-pub struct MediaTaskRegistry {
-    tasks: HashMap<SessionId, Vec<AbortHandle>>,
-}
-
-impl MediaTaskRegistry {
-    pub fn register(&mut self, session_id: SessionId, abort_handle: AbortHandle) {
-        self.tasks.entry(session_id).or_default().push(abort_handle);
-    }
-
-    pub fn abort_session(&mut self, session_id: &SessionId) -> usize {
-        let handles = self.tasks.remove(session_id).unwrap_or_default();
-        let count = handles.len();
-        for handle in handles {
-            handle.abort();
-        }
-        count
-    }
-
-    pub fn active_count(&self, session_id: &SessionId) -> usize {
-        self.tasks.get(session_id).map_or(0, Vec::len)
-    }
 }
 
 #[derive(Debug, Clone, Default)]
