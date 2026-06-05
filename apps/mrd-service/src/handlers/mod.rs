@@ -59,6 +59,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn telemetry_handler_returns_service_health() {
+        let response = super::telemetry::service_health();
+
+        match response {
+            IpcResponse::ServiceHealth { status } => {
+                assert!(status.running);
+                assert!(status.healthy);
+                assert_eq!(status.pid, Some(std::process::id()));
+            }
+            _ => panic!("expected service health response"),
+        }
+    }
+
+    #[test]
+    fn telemetry_handler_rejects_probe_event_stream_until_supported() {
+        let response = super::telemetry::stream_probe_events();
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E501");
+                assert_eq!(message, "Probe streaming not implemented yet");
+            }
+            _ => panic!("expected unsupported probe streaming error"),
+        }
+    }
+
     #[tokio::test]
     async fn identity_handler_updates_pairing_state_and_snapshot() {
         let app_state = Arc::new(AppState::new());

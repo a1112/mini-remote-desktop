@@ -524,22 +524,13 @@ impl IpcServer {
                 transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
-                status: mrd_ipc::ServiceStatus {
-                    running: true,
-                    healthy: true,
-                    pid: Some(std::process::id()),
-                },
-            },
+            IpcRequest::ServiceHealth => telemetry::service_health(),
 
             IpcRequest::ProbeSnapshot { session_id } => {
                 transport_handlers::probe_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::StreamProbeEvents => IpcResponse::Error {
-                code: "E501".to_string(),
-                message: "Probe streaming not implemented yet".to_string(),
-            },
+            IpcRequest::StreamProbeEvents => telemetry::stream_probe_events(),
 
             // === Shell / Lifecycle Commands (Phase 2) ===
             IpcRequest::OpenUi { reason } => shell_handlers::open_ui(&self.ui_launcher, reason),

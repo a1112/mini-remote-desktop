@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use mrd_ipc::{AuditLogQuery, IpcResponse, TelemetryBundle};
+use mrd_ipc::{AuditLogQuery, IpcResponse, ServiceStatus, TelemetryBundle};
 use mrd_proto::SessionId;
 use std::sync::Arc;
 
@@ -26,5 +26,24 @@ pub fn telemetry_bundle(run_id: String, session_id: Option<SessionId>) -> IpcRes
             log_count: 0,
             artifacts: Vec::new(),
         },
+    }
+}
+
+/// Return the basic service liveness contract used by UI/service probes.
+pub fn service_health() -> IpcResponse {
+    IpcResponse::ServiceHealth {
+        status: ServiceStatus {
+            running: true,
+            healthy: true,
+            pid: Some(std::process::id()),
+        },
+    }
+}
+
+/// Placeholder response for the reserved probe event streaming endpoint.
+pub fn stream_probe_events() -> IpcResponse {
+    IpcResponse::Error {
+        code: "E501".to_string(),
+        message: "Probe streaming not implemented yet".to_string(),
     }
 }
