@@ -43,6 +43,7 @@ use tokio::{sync::Mutex, task::AbortHandle};
 mod capability_snapshot_registry;
 mod capture_source_registry;
 mod device_identity_registry;
+mod device_registry;
 mod display_mode_registry;
 mod media_profile_registry;
 mod peer_media_capability_registry;
@@ -50,6 +51,7 @@ mod session_registry;
 pub use capability_snapshot_registry::CapabilitySnapshotRegistry;
 pub use capture_source_registry::CaptureSourceRegistry;
 pub use device_identity_registry::DeviceIdentityRegistry;
+pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
 pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
@@ -1482,12 +1484,6 @@ pub struct ShellState {
 /// Tray port - abstracts platform-specific tray implementation
 pub type TrayPortRef = Arc<std::sync::Mutex<dyn crate::shell::TrayPort + Send + Sync>>;
 
-/// Device registry
-#[derive(Debug, Default)]
-pub struct DeviceRegistry {
-    local_device: Option<(DeviceId, String)>, // (id, name)
-}
-
 /// In-memory service audit event registry.
 #[derive(Debug)]
 pub struct AuditLogRegistry {
@@ -1572,31 +1568,6 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-impl DeviceRegistry {
-    pub fn register(&mut self, device_id: DeviceId, device_name: String) {
-        self.local_device = Some((device_id, device_name));
-    }
-
-    pub fn register_if_unregistered(
-        &mut self,
-        device_id: DeviceId,
-        device_name: String,
-    ) -> Option<(DeviceId, String)> {
-        if self.local_device.is_none() {
-            self.register(device_id, device_name);
-        }
-        self.local_device.clone()
-    }
-
-    pub fn get_local_device(&self) -> Option<&(DeviceId, String)> {
-        self.local_device.as_ref()
-    }
-
-    pub fn is_registered(&self) -> bool {
-        self.local_device.is_some()
-    }
 }
 
 pub fn default_lan_device_identity() -> (DeviceId, String) {
