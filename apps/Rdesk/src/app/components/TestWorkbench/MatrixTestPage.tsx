@@ -1175,6 +1175,12 @@ export function mediaProfileFromConfig(config: TestConfig): MediaProfile {
     profile.pixel_format = main10 ? "p010" : "nv12";
     profile.hdr_enabled = false;
   }
+  if (config.color_mode) {
+    profile.color_mode = config.color_mode;
+  }
+  if (config.color_pipeline) {
+    profile.color_pipeline = config.color_pipeline;
+  }
   return profile;
 }
 
@@ -1189,6 +1195,8 @@ export function formatMatrixMediaProfile(profile: MediaProfile): string {
     profile.bit_depth != null ? `${profile.bit_depth}-bit` : null,
     profile.chroma_subsampling,
     profile.pixel_format,
+    profile.color_mode,
+    profile.color_pipeline,
   ].filter((part): part is string => Boolean(part));
   const codecLabel = codecParts.length > 0 ? `${codecParts.join("/")} ` : "";
   return `${codecLabel}${profile.width}x${profile.height}@${profile.fps}/${profile.bitrate_mbps}Mbps`;

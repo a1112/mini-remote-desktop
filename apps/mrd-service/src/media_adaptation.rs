@@ -1339,6 +1339,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let ladder = default_ladder_for_source(
             Some(&source(2560, 1600)),
@@ -1369,6 +1370,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let capped = cap_profile_to_render_fps(&ceiling, Some(144));
         let ladder = default_ladder_for_source(
@@ -1400,6 +1402,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let capped = cap_profile_to_render_fps(&ceiling, Some(144));
         let ladder = default_ladder_for_source(
@@ -1456,6 +1459,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let ladder = default_ladder_for_source(
             Some(&source(1920, 1080)),
@@ -1489,6 +1493,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let config = AdaptiveMediaConfig {
             ladder: vec![

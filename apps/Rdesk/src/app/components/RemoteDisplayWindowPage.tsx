@@ -2590,6 +2590,19 @@ export function RemoteDisplayWindowPage() {
 
   useEffect(() => {
     if (
+      encoder === "videotoolbox_hevc" &&
+      (decoder === "videotoolbox" || decoder === "none") &&
+      capabilities?.available_decoders?.length &&
+      !decoderOptionAvailable(capabilities.available_decoders, "videotoolbox", encoder)
+    ) {
+      setDecoder(
+        decoderOptionAvailable(capabilities.available_decoders, "software", encoder)
+          ? "software"
+          : "none"
+      );
+      return;
+    }
+    if (
       decoder === "videotoolbox" &&
       capabilities?.available_decoders?.length &&
       !decoderOptionAvailable(capabilities.available_decoders, decoder, encoder)

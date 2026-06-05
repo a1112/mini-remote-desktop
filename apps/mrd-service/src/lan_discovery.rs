@@ -3560,9 +3560,25 @@ fn missing_capability_groups(
 }
 
 fn format_media_profile(profile: &MediaProfile) -> String {
+    let color_suffix = match (
+        profile.color_mode.as_deref(),
+        profile.color_pipeline.as_deref(),
+    ) {
+        (None, None) => String::new(),
+        (mode, pipeline) => format!(
+            " / color={} pipeline={}",
+            mode.unwrap_or("full"),
+            pipeline.unwrap_or("sdr8")
+        ),
+    };
     format!(
-        "{}x{} @ {} FPS / {} Mbps / {}",
-        profile.width, profile.height, profile.fps, profile.bitrate_mbps, profile.codec
+        "{}x{} @ {} FPS / {} Mbps / {}{}",
+        profile.width,
+        profile.height,
+        profile.fps,
+        profile.bitrate_mbps,
+        profile.codec,
+        color_suffix
     )
 }
 
@@ -5258,14 +5274,14 @@ fn lan_render_queue_policy_for_profile(profile: &MediaProfile) -> LanRenderQueue
 
 #[cfg(any(windows, target_os = "macos"))]
 fn lan_render_queue_policy_for_profile_with_override(
-    profile: &MediaProfile,
+    _profile: &MediaProfile,
     override_policy: Option<LanRenderQueuePolicy>,
 ) -> LanRenderQueuePolicy {
     if let Some(policy) = override_policy {
         return policy;
     }
     #[cfg(target_os = "macos")]
-    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
+    if _profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
         return LanRenderQueuePolicy::Latest;
     }
     LanRenderQueuePolicy::PacedFifo
@@ -7982,13 +7998,13 @@ struct LanCapturedSenderFrame {
 }
 
 impl LanSenderFrameCapture {
-    fn new(capture: LanFrameCapture, profile: &MediaProfile) -> Result<Self> {
+    fn new(capture: LanFrameCapture, _profile: &MediaProfile) -> Result<Self> {
         #[cfg(target_os = "macos")]
         {
             if matches!(capture, LanFrameCapture::Macos(_)) && lan_capture_pump_enabled() {
                 return Ok(Self::Pumped(MacosPumpedLanFrameCapture::new(
                     capture,
-                    macos_capture_pump_repeat_grace_timeout(profile),
+                    macos_capture_pump_repeat_grace_timeout(_profile),
                 )?));
             }
         }
@@ -9352,6 +9368,14 @@ fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
     bytes.extend_from_slice(&profile.fps.to_le_bytes());
     bytes.extend_from_slice(&profile.bitrate_mbps.to_le_bytes());
     bytes.extend_from_slice(profile.codec.as_bytes());
+    bytes.push(0);
+    if let Some(color_mode) = profile.color_mode.as_deref() {
+        bytes.extend_from_slice(color_mode.as_bytes());
+    }
+    bytes.push(0);
+    if let Some(color_pipeline) = profile.color_pipeline.as_deref() {
+        bytes.extend_from_slice(color_pipeline.as_bytes());
+    }
     fnv1a64(&bytes) as u32
 }
 
@@ -9709,6 +9733,14 @@ fn fnv1a64_media_metadata(
     hash = fnv1a64_extend(hash, &profile.fps.to_le_bytes());
     hash = fnv1a64_extend(hash, &profile.bitrate_mbps.to_le_bytes());
     hash = fnv1a64_extend(hash, profile.codec.as_bytes());
+    hash = fnv1a64_extend(hash, &[0]);
+    if let Some(color_mode) = profile.color_mode.as_deref() {
+        hash = fnv1a64_extend(hash, color_mode.as_bytes());
+    }
+    hash = fnv1a64_extend(hash, &[0]);
+    if let Some(color_pipeline) = profile.color_pipeline.as_deref() {
+        hash = fnv1a64_extend(hash, color_pipeline.as_bytes());
+    }
     hash = fnv1a64_extend(hash, &sequence.to_le_bytes());
     hash = fnv1a64_extend(hash, &timestamp_us.to_le_bytes());
     hash = fnv1a64_extend(hash, &(encoded_payload_len as u64).to_le_bytes());
@@ -12226,6 +12258,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         }))
         .unwrap();
 
@@ -12365,7 +12398,7 @@ mod tests {
                 codec: "hevc".to_string(),
                 ..MediaProfile::default()
             },
-            &[LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()],
+            &["videotoolbox_hevc".to_string()],
         )
         .expect_err("VideoToolbox HEVC encoder capability is not a decoder capability");
 
@@ -14099,6 +14132,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         let encoded = encode_lan_media_envelope(LanMediaEnvelope {
             payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
@@ -14239,6 +14273,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
         app_state.media_profiles.lock().await.set(
             session_id.clone(),
@@ -15071,6 +15106,31 @@ mod tests {
                 .expect("encode keyframe request");
 
         assert!(decode_lan_keyframe_request_datagram(&datagram).expect("decode request"));
+    }
+
+    #[test]
+    fn lan_media_profile_identity_includes_color_fields() {
+        let base = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let mut grayscale = base.clone();
+        grayscale.color_mode = Some("grayscale".to_string());
+        let mut hdr = base.clone();
+        hdr.color_pipeline = Some("hdr_main10".to_string());
+
+        assert_ne!(lan_media_profile_id(&base), lan_media_profile_id(&grayscale));
+        assert_ne!(lan_media_profile_id(&base), lan_media_profile_id(&hdr));
+        assert_ne!(
+            fnv1a64_media_metadata(&base, 7, 123_456, 4096),
+            fnv1a64_media_metadata(&grayscale, 7, 123_456, 4096)
+        );
+        assert!(format_media_profile(&grayscale).contains("color=grayscale"));
+        assert!(format_media_profile(&hdr).contains("pipeline=hdr_main10"));
     }
 
     #[test]

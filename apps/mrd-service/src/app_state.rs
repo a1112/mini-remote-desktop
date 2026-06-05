@@ -24,7 +24,7 @@ use mrd_proto::{DeviceId, SessionId};
 use mrd_render::RendererFactory;
 #[cfg(any(windows, target_os = "macos"))]
 use mrd_render::{
-    BoxedRenderer, RenderError, RenderFrame, RenderFrameData, RenderTarget, RendererSnapshot,
+    BoxedRenderer, RenderFrame, RenderTarget, RendererSnapshot,
 };
 #[cfg(windows)]
 use mrd_render_d3d11::D3d11RendererFactory;
@@ -2798,6 +2798,7 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            ..MediaProfile::default()
         };
 
         registry.set_active_media_profile(session_id.clone(), &profile);
