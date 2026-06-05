@@ -8,9 +8,13 @@
 use crate::{
     app_state::AppState,
     handlers::control,
-    handlers::{capability, device, identity, session, telemetry, transport as transport_handlers},
+    handlers::{
+        capability, device, identity, session, shell as shell_handlers, telemetry,
+        transport as transport_handlers,
+    },
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
+#[cfg(test)]
 use mrd_application::ports::SessionLifecycleState;
 #[cfg(test)]
 use mrd_application::ports::SessionSnapshot;
@@ -539,180 +543,36 @@ impl IpcServer {
             },
 
             // === Shell / Lifecycle Commands (Phase 2) ===
-            IpcRequest::OpenUi { reason } => {
-                // Phase 3: Use UI launcher to launch or focus UI
-                tracing::info!("OpenUi requested: reason={:?}", reason);
-                let launcher = self.ui_launcher.lock().unwrap();
-                let request = crate::shell::UiLaunchRequest {
-                    reason: format!("{:?}", reason),
-                };
-                match launcher.launch_or_focus(request) {
-                    Ok(crate::shell::UiLaunchResult::FocusedExisting { pid }) => {
-                        tracing::info!("Focused existing UI: pid={}", pid);
-                        IpcResponse::UiOpenResult {
-                            status: mrd_ipc::UiOpenStatus::FocusedExisting,
-                            pid: Some(pid),
-                        }
-                    }
-                    Ok(crate::shell::UiLaunchResult::SpawnedNew { pid }) => {
-                        tracing::info!("Spawned new UI: pid={}", pid);
-                        IpcResponse::UiOpenResult {
-                            status: mrd_ipc::UiOpenStatus::SpawnedNew,
-                            pid: Some(pid),
-                        }
-                    }
-                    Ok(crate::shell::UiLaunchResult::Unavailable) => {
-                        tracing::warn!("UI launch unavailable - no configured path");
-                        IpcResponse::UiOpenResult {
-                            status: mrd_ipc::UiOpenStatus::Unavailable,
-                            pid: None,
-                        }
-                    }
-                    Ok(crate::shell::UiLaunchResult::Failed { error }) => {
-                        tracing::error!("UI launch failed: {}", error);
-                        IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: error,
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("UI launch error: {}", e);
-                        IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
-                }
-            }
+            IpcRequest::OpenUi { reason } => shell_handlers::open_ui(&self.ui_launcher, reason),
 
-            IpcRequest::FocusUi => {
-                // Phase 3: Use UI launcher to focus existing UI
-                tracing::info!("FocusUi requested");
-                let launcher = self.ui_launcher.lock().unwrap();
-                let request = crate::shell::UiLaunchRequest {
-                    reason: "focus".to_string(),
-                };
-                match launcher.launch_or_focus(request) {
-                    Ok(crate::shell::UiLaunchResult::FocusedExisting { .. }) => IpcResponse::Ack,
-                    Ok(crate::shell::UiLaunchResult::SpawnedNew { .. }) => IpcResponse::Ack,
-                    Ok(crate::shell::UiLaunchResult::Unavailable) => IpcResponse::Error {
-                        code: "E404".to_string(),
-                        message: "UI not available".to_string(),
-                    },
-                    Ok(crate::shell::UiLaunchResult::Failed { error }) => IpcResponse::Error {
-                        code: "E500".to_string(),
-                        message: error,
-                    },
-                    Err(e) => IpcResponse::Error {
-                        code: "E500".to_string(),
-                        message: e.to_string(),
-                    },
-                }
-            }
+            IpcRequest::FocusUi => shell_handlers::focus_ui(&self.ui_launcher),
 
             IpcRequest::UiAttached {
                 pid,
                 executable_path,
             } => {
-                tracing::info!("UI attached: pid={} path={:?}", pid, executable_path);
-                let mut shell = self.app_state.shell.lock().await;
-                shell.ui_pid = Some(pid);
-                shell.ui_executable_path = executable_path.clone();
-                shell.last_error = None;
-
-                // Update launcher state and persist path
-                if let Some(path) = executable_path {
-                    let launcher = self.ui_launcher.lock().unwrap();
-                    let _ = launcher.set_ui_path(std::path::PathBuf::from(path));
-                }
-
-                IpcResponse::Ack
+                shell_handlers::ui_attached(
+                    &self.app_state,
+                    &self.ui_launcher,
+                    pid,
+                    executable_path,
+                )
+                .await
             }
 
             IpcRequest::UiDetached { pid, reason } => {
-                tracing::info!("UI detached: pid={} reason={:?}", pid, reason);
-                let mut shell = self.app_state.shell.lock().await;
-                // Only clear if the PID matches (or if it's the same UI)
-                if shell.ui_pid == Some(pid) {
-                    shell.ui_pid = None;
-                }
-                IpcResponse::Ack
+                shell_handlers::ui_detached(&self.app_state, pid, reason).await
             }
 
-            IpcRequest::GetShellStatus => {
-                let shell = self.app_state.shell.lock().await;
-                let sessions = self.app_state.sessions.lock().await;
-                let active_session_count = sessions
-                    .list_all()
-                    .into_iter()
-                    .filter(|session| session.lifecycle_state != SessionLifecycleState::Closed)
-                    .count();
-                IpcResponse::ShellStatus {
-                    status: mrd_ipc::ShellStatusSnapshot {
-                        service_pid: std::process::id(),
-                        ui_pid: shell.ui_pid,
-                        tray_available: shell.tray_available,
-                        autostart_enabled: shell.autostart_enabled,
-                        active_session_count,
-                        last_error: shell.last_error.clone(),
-                    },
-                }
-            }
+            IpcRequest::GetShellStatus => shell_handlers::shell_status(&self.app_state).await,
 
             IpcRequest::SetAutostart { enabled } => {
-                // Phase 5: Use autostart port
-                tracing::info!("SetAutostart: enabled={}", enabled);
-                let result = {
-                    let autostart = self.autostart.lock().unwrap();
-                    let supported = autostart.is_supported();
-                    let set_result = autostart.set_enabled(enabled);
-                    (supported, set_result)
-                };
-
-                match result {
-                    (supported, Ok(())) => {
-                        // Update shell state (now that autostart lock is released)
-                        let mut shell = self.app_state.shell.lock().await;
-                        shell.autostart_enabled = if supported { Some(enabled) } else { None };
-                        IpcResponse::Ack
-                    }
-                    (_supported, Err(e)) => {
-                        tracing::error!("SetAutostart failed: {}", e);
-                        IpcResponse::Error {
-                            code: "E500".to_string(),
-                            message: e.to_string(),
-                        }
-                    }
-                }
+                shell_handlers::set_autostart(&self.app_state, &self.autostart, enabled).await
             }
 
-            IpcRequest::GetAutostartStatus => {
-                let autostart = self.autostart.lock().unwrap();
-                let enabled = autostart.is_enabled().unwrap_or(false);
-                let supported = autostart.is_supported();
-                IpcResponse::AutostartStatus { enabled, supported }
-            }
+            IpcRequest::GetAutostartStatus => shell_handlers::autostart_status(&self.autostart),
 
-            IpcRequest::ShutdownService { mode } => {
-                tracing::info!("ShutdownService requested: mode={:?}", mode);
-                // Phase 2: Log only - actual shutdown will be implemented later
-                // For now, return Ack to acknowledge the request
-                match mode {
-                    mrd_ipc::ShutdownMode::Force => {
-                        // In Phase 3+, this would trigger immediate shutdown
-                        IpcResponse::Error {
-                            code: "E501".to_string(),
-                            message: "Force shutdown not yet implemented".to_string(),
-                        }
-                    }
-                    mrd_ipc::ShutdownMode::Graceful | mrd_ipc::ShutdownMode::AfterSessions => {
-                        IpcResponse::Error {
-                            code: "E501".to_string(),
-                            message: "Service shutdown not yet implemented".to_string(),
-                        }
-                    }
-                }
-            }
+            IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(mode),
         }
     }
 

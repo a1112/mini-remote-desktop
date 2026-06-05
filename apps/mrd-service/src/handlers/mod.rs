@@ -5,6 +5,7 @@ pub mod control;
 pub mod device;
 pub mod identity;
 pub mod session;
+pub mod shell;
 pub mod telemetry;
 pub mod transport;
 
@@ -13,7 +14,7 @@ mod tests {
     use crate::app_state::AppState;
     use mrd_ipc::{
         AuditLogQuery, CapabilityStatus, ControlChannelReliability, IpcResponse,
-        ScenarioEvaluationStatus, TransportPolicyConfig,
+        ScenarioEvaluationStatus, TransportPolicyConfig, UiDetachReason,
     };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
@@ -268,6 +269,55 @@ mod tests {
                 );
             }
             _ => panic!("expected control channel snapshot response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_handler_tracks_ui_lifecycle_and_launcher_path() {
+        let app_state = Arc::new(AppState::new());
+        let launcher: crate::shell::UiLauncherPortRef = Arc::new(std::sync::Mutex::new(
+            crate::shell::InMemoryUiLauncher::new(),
+        ));
+
+        let attach_response = super::shell::ui_attached(
+            &app_state,
+            &launcher,
+            4242,
+            Some("C:\\Program Files\\Rdesk\\Rdesk.exe".to_string()),
+        )
+        .await;
+        assert!(matches!(attach_response, IpcResponse::Ack));
+
+        let persisted_path = launcher
+            .lock()
+            .expect("launcher lock")
+            .get_ui_path()
+            .expect("launcher path");
+        assert_eq!(
+            persisted_path.as_deref(),
+            Some(std::path::Path::new("C:\\Program Files\\Rdesk\\Rdesk.exe"))
+        );
+
+        let status_response = super::shell::shell_status(&app_state).await;
+        match status_response {
+            IpcResponse::ShellStatus { status } => {
+                assert_eq!(status.ui_pid, Some(4242));
+                assert_eq!(status.active_session_count, 0);
+            }
+            _ => panic!("expected shell status response"),
+        }
+
+        let detach_response =
+            super::shell::ui_detached(&app_state, 4242, UiDetachReason::UserClose).await;
+        assert!(matches!(detach_response, IpcResponse::Ack));
+
+        let status_response = super::shell::shell_status(&app_state).await;
+        match status_response {
+            IpcResponse::ShellStatus { status } => {
+                assert_eq!(status.ui_pid, None);
+                assert_eq!(status.active_session_count, 0);
+            }
+            _ => panic!("expected shell status response"),
         }
     }
 }
