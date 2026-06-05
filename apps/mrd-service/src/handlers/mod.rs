@@ -4,6 +4,7 @@ pub mod capability;
 pub mod control;
 pub mod device;
 pub mod identity;
+pub mod lan;
 pub mod preflight;
 pub mod session;
 pub mod shell;
@@ -40,6 +41,21 @@ mod tests {
                 assert!(devices[0].is_online);
             }
             _ => panic!("expected device list response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lan_handler_returns_discovery_snapshot() {
+        let app_state = Arc::new(AppState::new());
+
+        let response = super::lan::lan_discovery_snapshot(&app_state).await;
+
+        match response {
+            IpcResponse::LanDiscoverySnapshot { snapshot } => {
+                assert!(snapshot.enabled);
+                assert!(snapshot.peers.is_empty());
+            }
+            _ => panic!("expected LAN discovery snapshot response"),
         }
     }
 

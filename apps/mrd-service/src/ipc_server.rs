@@ -9,7 +9,7 @@ use crate::{
     app_state::AppState,
     handlers::control,
     handlers::{
-        capability, device, identity, preflight, session, shell as shell_handlers, telemetry,
+        capability, device, identity, lan, preflight, session, shell as shell_handlers, telemetry,
         transport as transport_handlers,
     },
     shell::{AutostartPortRef, UiLauncherPortRef},
@@ -22,9 +22,8 @@ use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::CapabilityStatus;
 use mrd_ipc::{transport, IpcRequest, IpcResponse};
 use mrd_proto::{DeviceId, SessionId};
-use std::{io::ErrorKind, sync::Arc, time::Duration};
+use std::{io::ErrorKind, sync::Arc};
 
-const LAN_DISCOVERY_REFRESH_WAIT_MS: u64 = 450;
 #[cfg(windows)]
 const WINDOWS_IPC_ACCEPT_BACKLOG: usize = 32;
 
@@ -114,17 +113,9 @@ impl IpcServer {
 
             IpcRequest::ListDevices => device::list_devices(&self.app_state).await,
 
-            IpcRequest::LanDiscoverySnapshot => IpcResponse::LanDiscoverySnapshot {
-                snapshot: self.app_state.lan_discovery.snapshot().await,
-            },
+            IpcRequest::LanDiscoverySnapshot => lan::lan_discovery_snapshot(&self.app_state).await,
 
-            IpcRequest::RefreshLanDiscovery => IpcResponse::LanDiscoverySnapshot {
-                snapshot: self
-                    .app_state
-                    .lan_discovery
-                    .request_probe_and_wait(Duration::from_millis(LAN_DISCOVERY_REFRESH_WAIT_MS))
-                    .await,
-            },
+            IpcRequest::RefreshLanDiscovery => lan::refresh_lan_discovery(&self.app_state).await,
 
             IpcRequest::WakeOnLan {
                 device_id,
