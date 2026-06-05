@@ -68,6 +68,7 @@ mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
 mod peer_format;
+mod protocol;
 mod runtime_flags;
 mod service_identity;
 mod time_utils;
@@ -186,6 +187,14 @@ use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
+use protocol::{
+    DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
+    LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
+    LAN_INPUT_CONTROL_CAPABILITY, LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT,
+    LAN_MEDIA_PROTOCOL_VERSION, LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT,
+    LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, PROTOCOL_VERSION,
+};
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
 #[cfg(test)]
@@ -212,9 +221,6 @@ const MACOS_RENDER_PROXY_COMPRESSED_MEDIA_ENV: &str = "MRD_MACOS_RENDER_PROXY_CO
 const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKING";
 #[cfg(windows)]
 const D3D11_RENDER_WAITABLE_OBJECT_ENV: &str = "MRD_D3D11_RENDER_WAITABLE_OBJECT";
-const PROTOCOL_VERSION: u32 = 1;
-const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
-const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
 const LAN_MEDIA_TARGET_HEIGHT: u32 = 1600;
 const LAN_MEDIA_TARGET_FPS: u32 = 165;
@@ -242,23 +248,12 @@ const LAN_RENDER_SURFACE_RENDERER_LOCK_POLL_INTERVAL: Duration = Duration::from_
 const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES: usize = 3;
 const LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT: usize = 8;
-const LAN_QUIC_MEDIA_TRANSPORT: &str = "quic_datagram";
-const LAN_QUIC_MEDIA_PROFILE_TRANSPORT: &str = "quic_datagram_2k144";
-const LAN_QUIC_MEDIA_V2_TRANSPORT: &str = "quic_datagram_media_v2";
-const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
-const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
-const LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT: &str = "quic_stream_media_v3";
-const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
-const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
-const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
-const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
-const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 #[cfg(windows)]
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
 #[cfg(windows)]
@@ -280,7 +275,6 @@ const LAN_MEDIA_COLOR_MODE_CAPABILITY: &str = "media.color_mode_v1";
 const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 #[cfg(windows)]
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
-const LAN_INPUT_CONTROL_CAPABILITY: &str = "control.keyboard_mouse";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
 #[cfg(target_os = "macos")]
@@ -8056,6 +8050,25 @@ mod tests {
                 "127.0.0.1:21217".parse::<SocketAddr>().unwrap(),
                 "127.0.0.1:21218".parse::<SocketAddr>().unwrap(),
             ]
+        );
+    }
+
+    #[test]
+    fn lan_protocol_module_exposes_stable_wire_versions_and_transports() {
+        assert_eq!(super::protocol::PROTOCOL_VERSION, 1);
+        assert_eq!(super::protocol::LAN_MEDIA_PROTOCOL_VERSION, 3);
+        assert!(
+            super::protocol::DISCOVERY_PACKET_BUFFER_BYTES
+                > super::protocol::DISCOVERY_SAFE_UDP_PAYLOAD_BYTES
+        );
+        assert_eq!(super::protocol::LAN_QUIC_MEDIA_TRANSPORT, "quic_datagram");
+        assert_eq!(
+            super::protocol::LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+            "quic_stream_media_v2"
+        );
+        assert_eq!(
+            super::protocol::LAN_INPUT_CONTROL_TRANSPORT,
+            "input_control_v1"
         );
     }
 
