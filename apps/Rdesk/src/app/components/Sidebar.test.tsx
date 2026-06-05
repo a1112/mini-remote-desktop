@@ -31,6 +31,7 @@ const serviceMock = vi.hoisted(() => ({
 const actionServiceMock = vi.hoisted(() => ({
   setDeviceFavorite: vi.fn(),
   markDeviceRemoved: vi.fn(),
+  setDeviceDisabled: vi.fn(),
 }));
 
 const sessionServiceMock = vi.hoisted(() => ({
@@ -69,6 +70,7 @@ vi.mock("../services/deviceActionService", () => ({
   deviceActionService: {
     setDeviceFavorite: actionServiceMock.setDeviceFavorite,
     markDeviceRemoved: actionServiceMock.markDeviceRemoved,
+    setDeviceDisabled: actionServiceMock.setDeviceDisabled,
   },
 }));
 
@@ -137,6 +139,10 @@ describe("Sidebar device actions", () => {
       favorite: false,
       removed: true,
     });
+    actionServiceMock.setDeviceDisabled.mockReturnValue({
+      deviceId: "agent-device",
+      disabled: true,
+    });
     sessionServiceMock.listSessions.mockResolvedValue([]);
     sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
@@ -158,7 +164,7 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "文件传输" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
-    expect(screen.getByRole("button", { name: "禁用设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "禁用设备" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "移除设备" })).not.toBeDisabled();
 
@@ -217,6 +223,46 @@ describe("Sidebar device actions", () => {
     expect(deviceDataMock.refresh).toHaveBeenCalled();
     await waitFor(() => {
       expect(screen.getByText("已移除：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("disables a non-local device through local device action preferences", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "禁用设备" }));
+
+    expect(actionServiceMock.setDeviceDisabled).toHaveBeenCalledWith("agent-device", true);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已禁用：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("re-enables a locally disabled device from the same device menu", async () => {
+    actionServiceMock.setDeviceDisabled.mockReturnValue({
+      deviceId: "agent-device",
+      disabled: false,
+    });
+    deviceDataMock.devices = [
+      device({
+        disabled: true,
+        status: "offline",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "解除禁用" }));
+
+    expect(actionServiceMock.setDeviceDisabled).toHaveBeenCalledWith("agent-device", false);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已解除禁用：Agent PC")).toBeInTheDocument();
     });
   });
 

@@ -19,6 +19,7 @@ export interface Device {
   os: string;
   icon: typeof Monitor;
   status: "online" | "offline";
+  disabled?: boolean;
   location: string;
   ping: number | null;
   lastSeen: string;

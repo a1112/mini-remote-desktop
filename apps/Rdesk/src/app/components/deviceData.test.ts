@@ -122,6 +122,7 @@ describe("mergeDevices", () => {
       "rdesk_device_action_preferences",
       JSON.stringify({
         "favorite-device": { favorite: true },
+        "disabled-device": { disabled: true },
         "removed-device": { removed: true },
       })
     );
@@ -149,14 +150,31 @@ describe("mergeDevices", () => {
           isLocal: false,
           serverAvailable: true,
         }),
+        device({
+          id: "server-disabled",
+          name: "Disabled Peer",
+          deviceId: "disabled-device",
+          discoverySources: ["server"],
+          primarySource: "server",
+          sourceLabel: "服务器",
+          isLocal: false,
+          serverAvailable: true,
+        }),
       ],
       [],
       null
     );
 
-    expect(merged.map((item) => item.deviceId)).toEqual(["favorite-device"]);
-    expect(merged[0]).toMatchObject({
+    expect(merged.map((item) => item.deviceId)).toEqual([
+      "favorite-device",
+      "disabled-device",
+    ]);
+    expect(merged.find((item) => item.deviceId === "favorite-device")).toMatchObject({
       favorite: true,
+    });
+    expect(merged.find((item) => item.deviceId === "disabled-device")).toMatchObject({
+      disabled: true,
+      status: "offline",
     });
   });
 });

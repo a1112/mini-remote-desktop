@@ -1,11 +1,14 @@
 export type DeviceActionPreference = {
   favorite?: boolean;
+  disabled?: boolean;
   removed?: boolean;
 };
 
 export type DeviceActionPreferenceTarget = {
   deviceId: string;
   favorite: boolean;
+  disabled?: boolean;
+  status: "online" | "offline";
 };
 
 const DEVICE_ACTION_PREFERENCES_KEY = "rdesk_device_action_preferences";
@@ -26,7 +29,11 @@ function writePreferences(preferences: Record<string, DeviceActionPreference>) {
   if (typeof localStorage === "undefined") return;
   const compact = Object.fromEntries(
     Object.entries(preferences).filter(([, preference]) =>
-      Boolean(preference.favorite || preference.removed)
+      Boolean(
+        preference.favorite !== undefined ||
+          preference.disabled ||
+          preference.removed
+      )
     )
   );
   if (Object.keys(compact).length === 0) {
@@ -60,17 +67,31 @@ function markDeviceRemoved(deviceId: string): DeviceActionPreference {
   return getDevicePreference(deviceId);
 }
 
+function setDeviceDisabled(deviceId: string, disabled: boolean): DeviceActionPreference {
+  const preferences = readPreferences();
+  preferences[deviceId] = {
+    ...preferences[deviceId],
+    disabled: disabled ? true : undefined,
+  };
+  writePreferences(preferences);
+  return getDevicePreference(deviceId);
+}
+
 function applyDevicePreferences<T extends DeviceActionPreferenceTarget>(devices: T[]): T[] {
   const preferences = readPreferences();
   return devices
     .filter((device) => !preferences[device.deviceId]?.removed)
     .map((device) => {
       const preference = preferences[device.deviceId];
-      if (preference?.favorite === undefined) return device;
+      if (!preference) return device;
+      const disabled = preference.disabled === true;
+      if (preference.favorite === undefined && !disabled) return device;
       return {
         ...device,
-        favorite: preference.favorite,
-      };
+        favorite: preference.favorite ?? device.favorite,
+        disabled,
+        status: disabled ? "offline" : device.status,
+      } as T;
     });
 }
 
@@ -78,5 +99,6 @@ export const deviceActionService = {
   applyDevicePreferences,
   getDevicePreference,
   markDeviceRemoved,
+  setDeviceDisabled,
   setDeviceFavorite,
 };

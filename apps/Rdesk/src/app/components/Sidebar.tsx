@@ -294,6 +294,26 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
   };
 
+  const handleToggleDisabled = async (
+    deviceId: string,
+    deviceName: string,
+    disabled: boolean,
+    isLocal: boolean
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    if (isLocal) {
+      showActionStatus({ kind: "error", message: "不能禁用本机设备" });
+      return;
+    }
+    deviceActionService.setDeviceDisabled(deviceId, disabled);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: disabled ? `已禁用：${deviceName}` : `已解除禁用：${deviceName}`,
+    });
+  };
+
   const handleDisconnectDevice = async (sessionId: string, deviceName: string) => {
     setContextMenu(null);
     setSubmenuOpen(null);
@@ -369,9 +389,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     // 启用/禁用
     items.push({
       icon: Ban,
-      label: "禁用设备",
-      disabled: true,
-      title: unsupportedDeviceActionTitle,
+      label: contextMenuDevice?.disabled ? "解除禁用" : "禁用设备",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleToggleDisabled(
+            contextMenuDevice.deviceId,
+            contextMenuDevice.name,
+            !contextMenuDevice.disabled,
+            contextMenuDevice.isLocal
+          );
+        }
+      },
+      disabled: contextMenuDevice?.isLocal,
+      title: contextMenuDevice?.isLocal ? "不能禁用本机设备" : undefined,
     });
 
     items.push({ type: "divider" as const });
