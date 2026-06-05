@@ -47,9 +47,7 @@ use std::time::Instant as StdInstant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
-use tokio::time::{interval, sleep_until, timeout, Instant};
-#[cfg(windows)]
-use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+use tokio::time::{interval, timeout, Instant};
 
 mod lan_control_input;
 mod media_envelope;
@@ -58,6 +56,7 @@ mod media_probe;
 mod media_profile;
 mod media_render_policy;
 mod media_sender_telemetry;
+mod media_timing;
 mod media_transport;
 pub use lan_control_input::request_lan_control_input;
 use lan_control_input::{
@@ -109,6 +108,17 @@ use media_sender_telemetry::{
 };
 #[cfg(test)]
 use media_sender_telemetry::{encode_lan_sender_stats_datagram, LanSenderStatsPayload};
+#[cfg(target_os = "macos")]
+use media_timing::media_frame_interval_for_fps;
+use media_timing::{
+    media_frame_interval, media_frame_interval_for_dynamic_decision, schedule_next_media_frame,
+    sleep_until_media_frame, MediaTimerResolution,
+};
+#[cfg(test)]
+use media_timing::{
+    media_frame_precise_sleep_chunk, media_frame_precise_sleep_guard,
+    media_profile_requests_high_resolution_timer,
+};
 use media_transport::{
     lan_datagram_frame_send_budget, lan_media_datagram_size, lan_media_reassembler_config,
     reliable_whole_frame_media_override, select_reliable_media_send_mode_for_profile,
@@ -170,11 +180,6 @@ const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
-const LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS: u32 = 90;
-#[cfg(windows)]
-const LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS: u32 = 1;
-const LAN_MEDIA_PRECISE_SLEEP_MIN_FPS: u32 = 90;
-const LAN_MEDIA_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
 const LAN_RENDER_PACING_PRECISE_SLEEP_MIN_FPS: u32 = 90;
 const LAN_RENDER_PACING_PRECISE_SLEEP_GUARD: Duration = Duration::from_millis(2);
 const LAN_RENDER_PACING_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -8029,155 +8034,6 @@ fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
             profile.hdr_enabled = Some(false);
         }
     }
-}
-
-fn media_frame_interval(profile: &MediaProfile) -> Duration {
-    media_frame_interval_for_fps(profile.fps)
-}
-
-fn media_frame_interval_for_fps(fps: u32) -> Duration {
-    Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
-}
-
-fn media_frame_interval_for_dynamic_decision(
-    profile: &MediaProfile,
-    decision: Option<DynamicWindowFpsDecision>,
-) -> Duration {
-    let fps = decision
-        .map(|decision| decision.target_fps)
-        .unwrap_or(profile.fps)
-        .max(1);
-    Duration::from_micros((1_000_000 / u64::from(fps)).max(1))
-}
-
-fn media_profile_requests_high_resolution_timer(profile: &MediaProfile) -> bool {
-    profile.fps >= LAN_MEDIA_HIGH_RESOLUTION_TIMER_MIN_FPS
-}
-
-fn media_frame_precise_sleep_guard(profile: &MediaProfile) -> Duration {
-    if profile.fps < LAN_MEDIA_PRECISE_SLEEP_MIN_FPS {
-        return Duration::ZERO;
-    }
-
-    LAN_MEDIA_PRECISE_SLEEP_GUARD.min(media_frame_interval(profile) / 2)
-}
-
-async fn sleep_until_media_frame(delay_until: Instant, profile: &MediaProfile) {
-    let guard = media_frame_precise_sleep_guard(profile);
-    if guard.is_zero() {
-        sleep_until(delay_until).await;
-        return;
-    }
-
-    loop {
-        let now = Instant::now();
-        if now >= delay_until {
-            break;
-        }
-        let remaining = delay_until - now;
-        if let Some(sleep_for) = media_frame_precise_sleep_chunk(remaining, guard) {
-            std::thread::sleep(sleep_for);
-        } else {
-            std::hint::spin_loop();
-        }
-    }
-}
-
-fn media_frame_precise_sleep_chunk(remaining: Duration, guard: Duration) -> Option<Duration> {
-    if remaining <= guard {
-        return None;
-    }
-    Some((remaining - guard).min(LAN_RENDER_PACING_POLL_INTERVAL))
-}
-
-#[derive(Default)]
-struct MediaTimerResolution {
-    requested: bool,
-    #[cfg(windows)]
-    period: Option<WindowsMediaTimerPeriod>,
-}
-
-impl MediaTimerResolution {
-    fn update_for_profile(&mut self, profile: &MediaProfile) {
-        if media_profile_requests_high_resolution_timer(profile) {
-            self.request();
-        } else {
-            self.release();
-        }
-    }
-
-    fn request(&mut self) {
-        if self.requested {
-            return;
-        }
-        #[cfg(windows)]
-        {
-            match WindowsMediaTimerPeriod::begin(LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS) {
-                Some(period) => {
-                    self.period = Some(period);
-                    self.requested = true;
-                }
-                None => {
-                    tracing::debug!(
-                        period_ms = LAN_MEDIA_HIGH_RESOLUTION_TIMER_PERIOD_MS,
-                        "failed to request high resolution media timer"
-                    );
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            self.requested = true;
-        }
-    }
-
-    fn release(&mut self) {
-        #[cfg(windows)]
-        {
-            self.period = None;
-        }
-        self.requested = false;
-    }
-}
-
-#[cfg(windows)]
-struct WindowsMediaTimerPeriod {
-    period_ms: u32,
-}
-
-#[cfg(windows)]
-impl WindowsMediaTimerPeriod {
-    fn begin(period_ms: u32) -> Option<Self> {
-        let result = unsafe { timeBeginPeriod(period_ms) };
-        if result == 0 {
-            Some(Self { period_ms })
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for WindowsMediaTimerPeriod {
-    fn drop(&mut self) {
-        unsafe {
-            timeEndPeriod(self.period_ms);
-        }
-    }
-}
-
-fn schedule_next_media_frame(
-    now: Instant,
-    next_frame_at: &mut Instant,
-    frame_interval: Duration,
-) -> Option<Instant> {
-    if now >= *next_frame_at && now.duration_since(*next_frame_at) > frame_interval {
-        *next_frame_at = now;
-    }
-
-    let delay_until = (*next_frame_at > now).then_some(*next_frame_at);
-    *next_frame_at += frame_interval;
-    delay_until
 }
 
 fn normalize_transport_kind(value: &str) -> String {
