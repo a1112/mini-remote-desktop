@@ -308,9 +308,9 @@ fn windows_surface_input_events_from_message(
     lparam: isize,
 ) -> Vec<mrd_ipc::ControlInputEvent> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-        WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        WM_ACTIVATEAPP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
     match message {
@@ -340,6 +340,7 @@ fn windows_surface_input_events_from_message(
         WM_KILLFOCUS | WM_CANCELMODE | WM_CAPTURECHANGED => {
             vec![mrd_ipc::ControlInputEvent::ReleaseAll]
         }
+        WM_ACTIVATEAPP if wparam == 0 => vec![mrd_ipc::ControlInputEvent::ReleaseAll],
         _ => Vec::new(),
     }
 }
@@ -768,8 +769,9 @@ mod remote_display_surface_input_tests {
         BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
         TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MSG, PM_REMOVE, SW_SHOW,
-        WINDOW_EX_STYLE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
+        WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED,
+        WS_OVERLAPPEDWINDOW,
     };
 
     fn lparam(x: i16, y: i16) -> isize {
@@ -1366,6 +1368,14 @@ mod remote_display_surface_input_tests {
         assert_eq!(
             windows_surface_input_events_from_message(WM_CAPTURECHANGED, 0, 0),
             vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        );
+        assert_eq!(
+            windows_surface_input_events_from_message(WM_ACTIVATEAPP, 0, 0),
+            vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        );
+        assert!(
+            windows_surface_input_events_from_message(WM_ACTIVATEAPP, 1, 0).is_empty(),
+            "activating the app must not synthesize input"
         );
     }
 
