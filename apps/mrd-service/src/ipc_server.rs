@@ -7,7 +7,7 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{device, identity, session, transport as transport_handlers},
+    handlers::{device, identity, session, telemetry, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionLifecycleState;
@@ -416,12 +416,7 @@ impl IpcServer {
 
             IpcRequest::RuntimeSnapshot => session::runtime_snapshot(&self.app_state).await,
 
-            IpcRequest::AuditLog { query } => {
-                let audit_log = self.app_state.audit_log.lock().await;
-                IpcResponse::AuditLog {
-                    events: audit_log.query(&query),
-                }
-            }
+            IpcRequest::AuditLog { query } => telemetry::audit_log(&self.app_state, query).await,
 
             IpcRequest::CapabilitySnapshot => {
                 let snapshot = self.app_state.cached_capability_snapshot().await;
@@ -550,16 +545,9 @@ impl IpcServer {
                 identity::get_device_identity_snapshot(&self.app_state).await
             }
 
-            IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
-                bundle: mrd_ipc::TelemetryBundle {
-                    run_id,
-                    session_id,
-                    metrics: Vec::new(),
-                    event_count: 0,
-                    log_count: 0,
-                    artifacts: Vec::new(),
-                },
-            },
+            IpcRequest::GetTelemetryBundle { run_id, session_id } => {
+                telemetry::telemetry_bundle(run_id, session_id)
+            }
 
             IpcRequest::MediaPipelineSnapshot { session_id } => {
                 transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
