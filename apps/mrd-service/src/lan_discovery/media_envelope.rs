@@ -26,11 +26,16 @@ pub(super) struct LanMediaEnvelope {
 pub(super) fn encode_lan_media_envelope(envelope: LanMediaEnvelope) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(envelope.payload.len())
         .context("LAN media v2 envelope payload exceeds u32 length")?;
-    let mut frame = Vec::with_capacity(LAN_MEDIA_ENVELOPE_HEADER_BYTES + envelope.payload.len());
+    let profile_metadata = profile_metadata_bytes(&envelope.profile, envelope.codec)?;
+    let profile_metadata_len = u16::try_from(profile_metadata.len())
+        .context("LAN media v2 envelope profile metadata exceeds u16 length")?;
+    let mut frame = Vec::with_capacity(
+        LAN_MEDIA_ENVELOPE_HEADER_BYTES + profile_metadata.len() + envelope.payload.len(),
+    );
     frame.extend_from_slice(LAN_MEDIA_ENVELOPE_MAGIC);
     frame.push(envelope.payload_type);
     frame.push(envelope.codec);
-    frame.extend_from_slice(&0_u16.to_le_bytes());
+    frame.extend_from_slice(&profile_metadata_len.to_le_bytes());
     frame.extend_from_slice(&envelope.sequence.to_le_bytes());
     frame.extend_from_slice(&envelope.timestamp_us.to_le_bytes());
     frame.extend_from_slice(&envelope.profile.width.to_le_bytes());
@@ -38,6 +43,7 @@ pub(super) fn encode_lan_media_envelope(envelope: LanMediaEnvelope) -> Result<Ve
     frame.extend_from_slice(&envelope.profile.fps.to_le_bytes());
     frame.extend_from_slice(&envelope.profile.bitrate_mbps.to_le_bytes());
     frame.extend_from_slice(&payload_len.to_le_bytes());
+    frame.extend_from_slice(&profile_metadata);
     frame.extend_from_slice(&envelope.payload);
     Ok(frame)
 }
@@ -51,6 +57,7 @@ pub(super) fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope
     }
     let payload_type = frame[8];
     let codec = frame[9];
+    let profile_metadata_len = u16::from_le_bytes(frame[10..12].try_into().unwrap()) as usize;
     let sequence = u64::from_le_bytes(frame[12..20].try_into().unwrap());
     let timestamp_us = u64::from_le_bytes(frame[20..28].try_into().unwrap());
     let width = u32::from_le_bytes(frame[28..32].try_into().unwrap());
@@ -58,7 +65,11 @@ pub(super) fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope
     let fps = u32::from_le_bytes(frame[36..40].try_into().unwrap());
     let bitrate_mbps = u32::from_le_bytes(frame[40..44].try_into().unwrap());
     let payload_len = u32::from_le_bytes(frame[44..48].try_into().unwrap()) as usize;
-    let Some(expected_len) = LAN_MEDIA_ENVELOPE_HEADER_BYTES.checked_add(payload_len) else {
+    let Some(metadata_end) = LAN_MEDIA_ENVELOPE_HEADER_BYTES.checked_add(profile_metadata_len)
+    else {
+        anyhow::bail!("LAN media v2 envelope profile metadata length overflow");
+    };
+    let Some(expected_len) = metadata_end.checked_add(payload_len) else {
         anyhow::bail!("LAN media v2 envelope payload length overflow");
     };
     if frame.len() != expected_len {
@@ -71,14 +82,52 @@ pub(super) fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope
     if width == 0 || height == 0 || fps == 0 || bitrate_mbps == 0 {
         anyhow::bail!("LAN media v2 envelope contains an invalid media profile");
     }
+    let base_profile = lan_media_profile_from_envelope(width, height, fps, bitrate_mbps, codec);
+    let profile = if profile_metadata_len == 0 {
+        base_profile
+    } else {
+        decode_profile_metadata(
+            &frame[LAN_MEDIA_ENVELOPE_HEADER_BYTES..metadata_end],
+            base_profile,
+        )?
+    };
     Ok(LanMediaEnvelope {
         payload_type,
         codec,
         sequence,
         timestamp_us,
-        profile: lan_media_profile_from_envelope(width, height, fps, bitrate_mbps, codec),
-        payload: frame[LAN_MEDIA_ENVELOPE_HEADER_BYTES..].to_vec(),
+        profile,
+        payload: frame[metadata_end..].to_vec(),
     })
+}
+
+fn profile_metadata_bytes(profile: &MediaProfile, codec: u8) -> Result<Vec<u8>> {
+    let envelope_default = lan_media_profile_from_envelope(
+        profile.width,
+        profile.height,
+        profile.fps,
+        profile.bitrate_mbps,
+        codec,
+    );
+    if &envelope_default == profile {
+        Ok(Vec::new())
+    } else {
+        serde_json::to_vec(profile).context("failed to encode LAN media v2 profile metadata")
+    }
+}
+
+fn decode_profile_metadata(metadata: &[u8], base_profile: MediaProfile) -> Result<MediaProfile> {
+    let profile: MediaProfile = serde_json::from_slice(metadata)
+        .context("failed to decode LAN media v2 profile metadata")?;
+    if profile.width != base_profile.width
+        || profile.height != base_profile.height
+        || profile.fps != base_profile.fps
+        || profile.bitrate_mbps != base_profile.bitrate_mbps
+        || !profile.codec.eq_ignore_ascii_case(&base_profile.codec)
+    {
+        anyhow::bail!("LAN media v2 profile metadata does not match envelope header");
+    }
+    Ok(profile)
 }
 
 fn lan_media_profile_from_envelope(
@@ -155,5 +204,38 @@ mod tests {
         assert_eq!(decoded.codec, LAN_MEDIA_CODEC_AV1);
         assert_eq!(decoded.profile.codec, "av1");
         assert_eq!(lan_media_codec_name(LAN_MEDIA_CODEC_AV1), "av1");
+    }
+
+    #[test]
+    fn envelope_round_trips_extended_media_profile_fields() {
+        let profile = MediaProfile {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc".to_string(),
+            codec_profile: Some("main10".to_string()),
+            bit_depth: Some(10),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("p010".to_string()),
+            hdr_enabled: Some(true),
+            color_mode: Some("grayscale".to_string()),
+            color_pipeline: Some("hdr_main10".to_string()),
+        };
+
+        let encoded = encode_lan_media_envelope(LanMediaEnvelope {
+            payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+            codec: LAN_MEDIA_CODEC_HEVC,
+            sequence: 11,
+            timestamp_us: 22,
+            profile: profile.clone(),
+            payload: b"main10-hevc".to_vec(),
+        })
+        .expect("encode envelope");
+
+        let decoded = decode_lan_media_envelope(&encoded).expect("decode envelope");
+
+        assert_eq!(decoded.profile, profile);
+        assert_eq!(decoded.payload, b"main10-hevc");
     }
 }
