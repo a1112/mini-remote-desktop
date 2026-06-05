@@ -6,6 +6,8 @@ import {
   ipcCapabilitySnapshot,
   ipcListLocalCaptureSources,
   ipcRefreshLanDiscovery,
+  ipcRequestRemoteDevicePowerAction,
+  ipcWakeOnLan,
   serviceBootstrapIfNeeded,
   shellGetStatus,
 } from './commands';
@@ -165,6 +167,82 @@ describe('commands service bridge integration', () => {
         limit: 24,
       })
     );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('uses the browser service bridge for Wake-on-LAN outside Tauri', async () => {
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'WakeOnLanSent',
+          device_id: 'agent-device',
+          mac_address: 'AA:BB:CC:DD:EE:FF',
+          broadcast_addr: '255.255.255.255:9',
+          packet_bytes: 102,
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcWakeOnLan({
+      deviceId: 'agent-device',
+      macAddress: 'AA:BB:CC:DD:EE:FF',
+      broadcastAddr: null,
+    });
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        device_id: 'agent-device',
+        mac_address: 'AA:BB:CC:DD:EE:FF',
+        broadcast_addr: '255.255.255.255:9',
+        packet_bytes: 102,
+      },
+    });
+    expect(requestBody.request).toEqual({
+      type: 'WakeOnLan',
+      device_id: 'agent-device',
+      mac_address: 'AA:BB:CC:DD:EE:FF',
+      broadcast_addr: null,
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('uses the browser service bridge for remote device power actions outside Tauri', async () => {
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'RemoteDevicePowerActionAccepted',
+          device_id: 'agent-device',
+          action: 'restart',
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcRequestRemoteDevicePowerAction({
+      deviceId: 'agent-device',
+      action: 'restart',
+    });
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        device_id: 'agent-device',
+        action: 'restart',
+      },
+    });
+    expect(requestBody.request).toEqual({
+      type: 'RequestRemoteDevicePowerAction',
+      device_id: 'agent-device',
+      action: 'restart',
+    });
     expect(invoke).not.toHaveBeenCalled();
   });
 
