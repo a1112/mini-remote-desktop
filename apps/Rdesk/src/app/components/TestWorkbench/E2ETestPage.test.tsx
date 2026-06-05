@@ -462,7 +462,7 @@ describe("E2ETestPage LAN automation", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false",
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10",
         ]}
       >
         <E2ETestPage />
@@ -486,6 +486,8 @@ describe("E2ETestPage LAN automation", () => {
             chroma_subsampling: "4:2:0",
             pixel_format: "nv12",
             hdr_enabled: false,
+            color_mode: "monochrome",
+            color_pipeline: "hdr_main10",
           },
         })
       );
