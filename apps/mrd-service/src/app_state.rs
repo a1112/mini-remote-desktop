@@ -15,6 +15,7 @@ use mrd_ipc::render_proxy::{
 use mrd_ipc::{AttachedRenderSurface, CapabilitySnapshot};
 #[cfg(test)]
 use mrd_ipc::{MediaProfile, MediaStageMetrics};
+#[cfg(test)]
 use mrd_proto::DeviceId;
 #[cfg(test)]
 use mrd_proto::SessionId;
@@ -47,6 +48,7 @@ mod capture_source_registry;
 mod device_identity_registry;
 mod device_registry;
 mod display_mode_registry;
+mod lan_identity;
 mod media_pipeline_registry;
 mod media_profile_registry;
 #[cfg(any(windows, target_os = "macos"))]
@@ -63,6 +65,9 @@ pub use capture_source_registry::CaptureSourceRegistry;
 pub use device_identity_registry::DeviceIdentityRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
+pub use lan_identity::default_lan_device_identity;
+#[cfg(test)]
+pub(crate) use lan_identity::lan_device_identity_from;
 pub use media_pipeline_registry::MediaPipelineRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
 #[cfg(any(windows, target_os = "macos"))]
@@ -553,58 +558,6 @@ fn now_unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-pub fn default_lan_device_identity() -> (DeviceId, String) {
-    lan_device_identity_from(
-        std::env::var("MRD_LAN_DEVICE_ID").ok(),
-        std::env::var("MRD_LAN_DEVICE_NAME").ok(),
-        default_hostname(),
-    )
-}
-
-fn default_hostname() -> Option<String> {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-}
-
-fn lan_device_identity_from(
-    configured_id: Option<String>,
-    configured_name: Option<String>,
-    hostname: Option<String>,
-) -> (DeviceId, String) {
-    let device_name = configured_name
-        .and_then(non_empty_trimmed)
-        .or_else(|| hostname.clone().and_then(non_empty_trimmed))
-        .unwrap_or_else(|| "Rdesk LAN Device".to_string());
-    let device_id = configured_id
-        .and_then(non_empty_trimmed)
-        .unwrap_or_else(|| build_lan_device_id(hostname.as_deref().unwrap_or(&device_name)));
-    (DeviceId(device_id), device_name)
-}
-
-fn non_empty_trimmed(value: String) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn build_lan_device_id(seed: &str) -> String {
-    let mut sanitized: String = seed
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if sanitized.len() > 16 {
-        sanitized = sanitized[sanitized.len() - 16..].to_string();
-    }
-    if sanitized.is_empty() {
-        sanitized = "local".to_string();
-    }
-    format!("lan-{sanitized}")
 }
 
 /// Application state for mrd-service
