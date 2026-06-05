@@ -6,11 +6,11 @@ use mrd_proto::DeviceId;
 use super::media_access_unit::LanAccessUnitCodec;
 use super::{
     format_peer_capabilities, format_peer_transports, normalize_transport_kind,
-    LAN_MEDIA_COLOR_MODE_CAPABILITY, LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
-    LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY, LAN_MEDIA_MAX_FPS,
-    LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_TARGET_BITRATE_MBPS, LAN_MEDIA_TARGET_FPS,
-    LAN_MEDIA_TARGET_HEIGHT, LAN_MEDIA_TARGET_WIDTH, LAN_QUIC_MEDIA_PROFILE_TRANSPORT,
-    LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
+    LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY, LAN_MEDIA_COLOR_MODE_CAPABILITY,
+    LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY, LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+    LAN_MEDIA_MAX_FPS, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_TARGET_BITRATE_MBPS,
+    LAN_MEDIA_TARGET_FPS, LAN_MEDIA_TARGET_HEIGHT, LAN_MEDIA_TARGET_WIDTH,
+    LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
 };
 
 pub(crate) fn normalize_lan_codec_name(codec: &str) -> Option<&'static str> {
@@ -266,7 +266,13 @@ fn missing_profile_media_capabilities(
                 vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
             ),
         ],
-        LanAccessUnitCodec::Av1 => vec![("av1 encoder", vec!["encode.nvenc_av1", "nvenc_av1"])],
+        LanAccessUnitCodec::Av1 => vec![
+            ("av1 encoder", vec!["encode.nvenc_av1", "nvenc_av1"]),
+            (
+                LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY,
+                vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY],
+            ),
+        ],
     };
     if profile_requests_non_full_color(profile) {
         groups.push((
@@ -355,16 +361,22 @@ pub(crate) fn missing_profile_receiver_media_capabilities(
                 vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY],
             ),
         ],
-        LanAccessUnitCodec::Av1 => vec![(
-            "av1 decoder",
-            vec![
-                "decode.nvdec_av1",
-                "nvdec_av1",
-                "decode.software_av1",
-                "software_av1",
-                "av1_software",
-            ],
-        )],
+        LanAccessUnitCodec::Av1 => vec![
+            (
+                "av1 decoder",
+                vec![
+                    "decode.nvdec_av1",
+                    "nvdec_av1",
+                    "decode.software_av1",
+                    "software_av1",
+                    "av1_software",
+                ],
+            ),
+            (
+                LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY,
+                vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY],
+            ),
+        ],
     };
     missing_capability_groups(peer_media_capabilities, &groups)
 }
@@ -545,6 +557,50 @@ mod tests {
         assert_eq!(
             missing,
             vec![LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()]
+        );
+    }
+
+    #[test]
+    fn requested_av1_sender_requires_main_420_media_capability() {
+        let profile = MediaProfile {
+            codec: "av1".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            ..default_media_profile()
+        };
+
+        let missing =
+            missing_profile_media_capabilities(&profile, &["encode.nvenc_av1".to_string()]);
+
+        assert_eq!(
+            missing,
+            vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string()]
+        );
+    }
+
+    #[test]
+    fn selected_av1_receiver_requires_main_420_media_capability() {
+        let profile = MediaProfile {
+            codec: "av1".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            ..default_media_profile()
+        };
+
+        let missing = missing_profile_receiver_media_capabilities(
+            &profile,
+            &["decode.nvdec_av1".to_string()],
+        );
+
+        assert_eq!(
+            missing,
+            vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string()]
         );
     }
 }

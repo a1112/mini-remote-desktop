@@ -98,8 +98,8 @@ use media_access_unit::{
 };
 use media_capabilities::{
     lan_media_capabilities, lan_media_capabilities_with_input_control,
-    LAN_MEDIA_COLOR_MODE_CAPABILITY, LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
-    LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
+    LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY, LAN_MEDIA_COLOR_MODE_CAPABILITY,
+    LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY, LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
 };
 #[cfg(all(test, target_os = "macos"))]
 use media_capabilities::{
@@ -115,8 +115,7 @@ use media_capabilities::{
     LAN_DECODE_NVDEC_HEVC_CAPABILITY, LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
     LAN_ENCODE_NVENC_AV1_CAPABILITY, LAN_ENCODE_NVENC_H264_CAPABILITY,
     LAN_ENCODE_NVENC_HEVC_CAPABILITY, LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
-    LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY, LAN_RENDER_D3D11_NATIVE_CAPABILITY,
-    LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
+    LAN_RENDER_D3D11_NATIVE_CAPABILITY, LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
 };
 #[cfg(test)]
 use media_capture_config::window_capture_source_error;
@@ -9913,6 +9912,7 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("av1 encoder"));
+        assert!(message.contains(LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY));
         assert!(message.contains("windows-target"));
     }
 
@@ -9930,7 +9930,10 @@ mod tests {
                 codec: "AV1".to_string(),
                 ..MediaProfile::default()
             }),
-            &["encode.nvenc_av1".to_string()],
+            &[
+                "encode.nvenc_av1".to_string(),
+                LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string(),
+            ],
         )
         .expect("AV1-capable peer should pass AV1 request preflight");
     }
