@@ -9,7 +9,7 @@ describe("deviceDetailTabFromSearch", () => {
   it("opens supported tabs from the sidebar query string", () => {
     expect(deviceDetailTabFromSearch("?tab=files")).toBe("files");
     expect(deviceDetailTabFromSearch("?tab=apps")).toBe("apps");
-    expect(deviceDetailTabFromSearch("?tab=terminal")).toBe("apps");
+    expect(deviceDetailTabFromSearch("?tab=terminal")).toBe("terminal");
     expect(deviceDetailTabFromSearch("?tab=info")).toBe("info");
   });
 

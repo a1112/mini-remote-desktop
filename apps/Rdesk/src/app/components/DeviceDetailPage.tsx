@@ -83,12 +83,13 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
 
-type TabType = "remote" | "files" | "apps" | "info";
+type TabType = "remote" | "files" | "apps" | "terminal" | "info";
 
 export function deviceDetailTabFromSearch(search: string): TabType {
   const tab = new URLSearchParams(search).get("tab");
-  if (tab === "terminal") return "apps";
-  return tab === "files" || tab === "apps" || tab === "info" || tab === "remote" ? tab : "remote";
+  return tab === "files" || tab === "apps" || tab === "terminal" || tab === "info" || tab === "remote"
+    ? tab
+    : "remote";
 }
 
 export function remoteApplicationSourceMatchesTerminalFocus(
@@ -152,6 +153,7 @@ export function DeviceDetailPage() {
     { key: "remote", label: "远程桌面", icon: Monitor },
     { key: "files", label: "文件传输", icon: FolderOpen },
     { key: "apps", label: "远程应用", icon: AppWindow },
+    { key: "terminal", label: "远程终端", icon: Terminal },
     { key: "info", label: "设备信息", icon: Info },
   ];
 
@@ -310,6 +312,7 @@ export function DeviceDetailPage() {
         {activeTab === "remote" && <RemoteTab device={device} />}
         {activeTab === "files" && <FilesTab device={device} devices={devices} />}
         {activeTab === "apps" && <AppsTab device={device} />}
+        {activeTab === "terminal" && <AppsTab device={device} terminalFocus />}
         {activeTab === "info" && <InfoTab device={device} />}
       </div>
 
@@ -991,7 +994,13 @@ function CtxItem({ icon, label, onClick, isDark, danger }: { icon: React.ReactNo
 }
 
 /* ======================== Remote Apps Tab ======================== */
-function AppsTab({ device }: { device: Device }) {
+function AppsTab({
+  device,
+  terminalFocus: terminalFocusProp = false,
+}: {
+  device: Device;
+  terminalFocus?: boolean;
+}) {
   const { isDark } = useTheme();
   const navigate = useNavigate();
   const location = useLocation();
@@ -1147,7 +1156,8 @@ function AppsTab({ device }: { device: Device }) {
         : null;
   const remoteWindows = catalog?.windows ?? [];
   const displaySources = catalog?.displays ?? [];
-  const terminalFocus = new URLSearchParams(location.search).get("tab") === "terminal";
+  const terminalFocus =
+    terminalFocusProp || new URLSearchParams(location.search).get("tab") === "terminal";
   const orderedRemoteWindows = terminalFocus
     ? [...remoteWindows].sort((left, right) =>
         Number(remoteApplicationSourceMatchesTerminalFocus(right)) -
@@ -1193,7 +1203,11 @@ function AppsTab({ device }: { device: Device }) {
         <div className={`mb-5 rounded-xl border p-4 shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
           <div className="flex flex-wrap items-center gap-3">
             <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${isDark ? "bg-cyan-900/30" : "bg-cyan-50"}`}>
-              <AppWindow className="h-5 w-5 text-cyan-500" />
+              {terminalFocus ? (
+                <Terminal className="h-5 w-5 text-cyan-500" />
+              ) : (
+                <AppWindow className="h-5 w-5 text-cyan-500" />
+              )}
             </div>
             <div className="min-w-0 flex-1">
               <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>{terminalFocus ? "远程终端" : "远程应用"}</div>
