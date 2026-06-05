@@ -3316,8 +3316,10 @@ export function RemoteDisplayWindowPage() {
   useEffect(() => {
     if (!controlInputEnabled) return;
     window.addEventListener("blur", releaseRemoteControlInput);
+    window.addEventListener("pagehide", releaseRemoteControlInput);
     return () => {
       window.removeEventListener("blur", releaseRemoteControlInput);
+      window.removeEventListener("pagehide", releaseRemoteControlInput);
     };
   }, [controlInputEnabled, releaseRemoteControlInput]);
 

@@ -1569,6 +1569,96 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("releases active remote keyboard input when the page is hidden", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_controls: ["keyboard_mouse"],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          lane: "reliable",
+          event_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
+
+    act(() => {
+      renderArea.focus();
+    });
+    fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
+    window.dispatchEvent(new Event("pagehide"));
+
+    await waitFor(() => {
+      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
+      expect(inputCalls.map(([, args]) => args)).toEqual([
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "key", key: { kind: "virtual_key", code: 0x10 }, pressed: true },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "release_all" },
+        },
+      ]);
+    });
+  });
+
   it("exposes 4K and high-refresh profile options", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
