@@ -4611,9 +4611,11 @@ async fn flush_lan_receiver_stage_metrics(
 
 #[cfg(target_os = "macos")]
 fn quic_media_v3_compressed_direct_render_candidate(frame: &QuicMediaFrame) -> bool {
-    macos_render_proxy_compressed_media_enabled()
-        && frame.payload_type == QuicMediaPayloadType::AccessUnit
-        && matches!(frame.codec, QuicMediaCodec::H264 | QuicMediaCodec::Hevc)
+    media_receiver::compressed_direct_render_candidate(
+        macos_render_proxy_compressed_media_enabled(),
+        frame.payload_type,
+        frame.codec,
+    )
 }
 
 #[cfg(target_os = "macos")]
