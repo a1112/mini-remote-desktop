@@ -25,6 +25,7 @@ pub enum EventType {
     AudioControl = 11,
     FileMount = 12,
     AudioRouteControl = 13,
+    MouseHorizontalWheel = 14,
 }
 
 impl TryFrom<u8> for EventType {
@@ -45,6 +46,7 @@ impl TryFrom<u8> for EventType {
             11 => Ok(Self::AudioControl),
             12 => Ok(Self::FileMount),
             13 => Ok(Self::AudioRouteControl),
+            14 => Ok(Self::MouseHorizontalWheel),
             _ => Err(ProtoError::UnknownEventType(value)),
         }
     }
@@ -61,6 +63,9 @@ pub enum ControlEvent {
         pressed: bool,
     },
     MouseWheel {
+        delta: i32,
+    },
+    MouseHorizontalWheel {
         delta: i32,
     },
     Key {
@@ -122,6 +127,7 @@ impl ControlEvent {
             Self::MouseMove { .. } => EventType::MouseMove,
             Self::MouseButton { .. } => EventType::MouseButton,
             Self::MouseWheel { .. } => EventType::MouseWheel,
+            Self::MouseHorizontalWheel { .. } => EventType::MouseHorizontalWheel,
             Self::Key { .. } => EventType::Key,
             Self::GamepadAxis { .. } => EventType::GamepadAxis,
             Self::GamepadButton { .. } => EventType::GamepadButton,
@@ -137,9 +143,10 @@ impl ControlEvent {
 
     pub fn channel_class(&self) -> ChannelClass {
         match self {
-            Self::MouseMove { .. } | Self::MouseWheel { .. } | Self::GamepadAxis { .. } => {
-                ChannelClass::Realtime
-            }
+            Self::MouseMove { .. }
+            | Self::MouseWheel { .. }
+            | Self::MouseHorizontalWheel { .. }
+            | Self::GamepadAxis { .. } => ChannelClass::Realtime,
             Self::MouseButton { .. }
             | Self::Key { .. }
             | Self::GamepadButton { .. }
@@ -238,6 +245,7 @@ fn encode_event_payload(event: &ControlEvent) -> Vec<u8> {
         }
         ControlEvent::MouseButton { button, pressed } => vec![*button, u8::from(*pressed)],
         ControlEvent::MouseWheel { delta } => delta.to_be_bytes().to_vec(),
+        ControlEvent::MouseHorizontalWheel { delta } => delta.to_be_bytes().to_vec(),
         ControlEvent::Key { key, pressed } => {
             let mut v = Vec::with_capacity(5);
             v.extend_from_slice(&key.to_be_bytes());
@@ -362,6 +370,12 @@ fn decode_event_payload(typ: EventType, payload: &[u8]) -> Result<ControlEvent, 
         EventType::MouseWheel => {
             expect_payload_len(typ, payload, 4)?;
             Ok(ControlEvent::MouseWheel {
+                delta: i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+            })
+        }
+        EventType::MouseHorizontalWheel => {
+            expect_payload_len(typ, payload, 4)?;
+            Ok(ControlEvent::MouseHorizontalWheel {
                 delta: i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
             })
         }
@@ -592,6 +606,19 @@ mod tests {
     }
 
     #[test]
+    fn encode_decode_roundtrip_mouse_horizontal_wheel() {
+        let frame = Frame {
+            flags: 0,
+            seq: 43,
+            ts_us: 1_234_568,
+            event: ControlEvent::MouseHorizontalWheel { delta: -120 },
+        };
+        let bytes = frame.encode();
+        let decoded = Frame::decode(&bytes).expect("decode horizontal wheel");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test]
     fn seq_tracker_requires_monotonic_increase() {
         let mut tracker = SeqTracker::default();
         assert!(tracker.validate_and_update(10));
@@ -609,6 +636,10 @@ mod tests {
             ),
             (
                 ControlEvent::MouseWheel { delta: -120 },
+                ChannelClass::Realtime,
+            ),
+            (
+                ControlEvent::MouseHorizontalWheel { delta: 120 },
                 ChannelClass::Realtime,
             ),
             (
