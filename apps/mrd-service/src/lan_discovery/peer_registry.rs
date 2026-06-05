@@ -1,6 +1,48 @@
 use mrd_ipc::LanPeerInfo;
 use mrd_proto::DeviceId;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+
+#[derive(Debug, Default)]
+pub(super) struct LanPeerRegistry {
+    peers: HashMap<String, LanPeerRecord>,
+}
+
+impl LanPeerRegistry {
+    pub(super) fn upsert(&mut self, peer: LanPeerRecord) {
+        self.peers.insert(peer.device_id.clone(), peer);
+    }
+
+    pub(super) fn prune_stale(&mut self, now_ms: u64, ttl_ms: u64) {
+        self.peers
+            .retain(|_, peer| now_ms.saturating_sub(peer.last_seen_ms) <= ttl_ms);
+    }
+
+    pub(super) fn snapshot(&self, now_ms: u64) -> Vec<LanPeerInfo> {
+        self.peers
+            .values()
+            .map(|peer| peer.to_peer_info(now_ms))
+            .collect()
+    }
+
+    pub(super) fn control_addr(&self, device_id: &DeviceId) -> Option<SocketAddr> {
+        self.peers
+            .get(&device_id.0)
+            .map(LanPeerRecord::control_addr)
+    }
+
+    pub(super) fn transports(&self, device_id: &DeviceId) -> Option<Vec<String>> {
+        self.peers
+            .get(&device_id.0)
+            .map(|peer| peer.transports.clone())
+    }
+
+    pub(super) fn media_capabilities(&self, device_id: &DeviceId) -> Option<Vec<String>> {
+        self.peers
+            .get(&device_id.0)
+            .map(LanPeerRecord::media_capabilities_with_transports)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct LanPeerRecord {

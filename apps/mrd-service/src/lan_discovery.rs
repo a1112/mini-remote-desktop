@@ -188,7 +188,7 @@ use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
-use peer_registry::LanPeerRecord;
+use peer_registry::{LanPeerRecord, LanPeerRegistry};
 use protocol::{
     DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
     LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
@@ -318,7 +318,7 @@ pub struct LanDiscoveryState {
     instance_id: String,
     running: AtomicBool,
     last_probe_ms: AtomicU64,
-    peers: Mutex<HashMap<String, LanPeerRecord>>,
+    peers: Mutex<LanPeerRegistry>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
     probe_requested: Notify,
     peer_changed: Notify,
@@ -331,7 +331,7 @@ impl LanDiscoveryState {
             instance_id: new_instance_id(),
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
-            peers: Mutex::new(HashMap::new()),
+            peers: Mutex::new(LanPeerRegistry::default()),
             recent_control_inputs: Mutex::new(HashMap::new()),
             probe_requested: Notify::new(),
             peer_changed: Notify::new(),
@@ -387,29 +387,20 @@ impl LanDiscoveryState {
             last_seen_ms: now_ms(),
         };
 
-        self.peers.lock().await.insert(peer.device_id.clone(), peer);
+        self.peers.lock().await.upsert(peer);
         self.peer_changed.notify_one();
     }
 
     async fn prune_stale_peers(&self) {
         let ttl_ms = self.config.peer_ttl.as_millis() as u64;
         let now = now_ms();
-        self.peers
-            .lock()
-            .await
-            .retain(|_, peer| now.saturating_sub(peer.last_seen_ms) <= ttl_ms);
+        self.peers.lock().await.prune_stale(now, ttl_ms);
     }
 
     pub async fn snapshot(&self) -> LanDiscoverySnapshot {
         self.prune_stale_peers().await;
         let now = now_ms();
-        let peers = self
-            .peers
-            .lock()
-            .await
-            .values()
-            .map(|peer| peer.to_peer_info(now))
-            .collect();
+        let peers = self.peers.lock().await.snapshot(now);
 
         let last_probe = self.last_probe_ms.load(Ordering::Relaxed);
         LanDiscoverySnapshot {
@@ -428,29 +419,17 @@ impl LanDiscoveryState {
 
     pub async fn peer_control_addr(&self, device_id: &DeviceId) -> Option<SocketAddr> {
         self.prune_stale_peers().await;
-        self.peers
-            .lock()
-            .await
-            .get(&device_id.0)
-            .map(LanPeerRecord::control_addr)
+        self.peers.lock().await.control_addr(device_id)
     }
 
     pub async fn peer_transports(&self, device_id: &DeviceId) -> Option<Vec<String>> {
         self.prune_stale_peers().await;
-        self.peers
-            .lock()
-            .await
-            .get(&device_id.0)
-            .map(|peer| peer.transports.clone())
+        self.peers.lock().await.transports(device_id)
     }
 
     pub async fn peer_media_capabilities(&self, device_id: &DeviceId) -> Option<Vec<String>> {
         self.prune_stale_peers().await;
-        self.peers
-            .lock()
-            .await
-            .get(&device_id.0)
-            .map(LanPeerRecord::media_capabilities_with_transports)
+        self.peers.lock().await.media_capabilities(device_id)
     }
 }
 
@@ -8398,6 +8377,54 @@ mod tests {
         assert_eq!(info.p2p_control_addr, "192.168.1.50:21116");
         assert_eq!(info.age_ms, 250);
         assert!(info.p2p_available);
+    }
+
+    #[test]
+    fn peer_registry_prunes_and_queries_records() {
+        let mut registry = super::peer_registry::LanPeerRegistry::default();
+        registry.upsert(super::peer_registry::LanPeerRecord {
+            device_id: "fresh".to_string(),
+            device_name: "Fresh Device".to_string(),
+            device_type: "rdesk".to_string(),
+            ip: "192.168.1.20".parse().unwrap(),
+            discovery_port: 21116,
+            transports: vec!["quic".to_string()],
+            protocol_version: 1,
+            service_build_id: None,
+            media_protocol_version: Some(3),
+            media_capabilities: vec!["media.hevc".to_string()],
+            last_seen_ms: 1_000,
+        });
+        registry.upsert(super::peer_registry::LanPeerRecord {
+            device_id: "stale".to_string(),
+            device_name: "Stale Device".to_string(),
+            device_type: "rdesk".to_string(),
+            ip: "192.168.1.21".parse().unwrap(),
+            discovery_port: 21117,
+            transports: vec!["webrtc".to_string()],
+            protocol_version: 1,
+            service_build_id: None,
+            media_protocol_version: None,
+            media_capabilities: Vec::new(),
+            last_seen_ms: 100,
+        });
+
+        registry.prune_stale(1_500, 600);
+
+        assert_eq!(
+            registry
+                .control_addr(&DeviceId("fresh".to_string()))
+                .unwrap(),
+            "192.168.1.20:21116".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(registry.transports(&DeviceId("stale".to_string())), None);
+        assert_eq!(
+            registry
+                .media_capabilities(&DeviceId("fresh".to_string()))
+                .unwrap(),
+            vec!["media.hevc".to_string(), "quic".to_string()]
+        );
+        assert_eq!(registry.snapshot(1_500).len(), 1);
     }
 
     #[tokio::test]
