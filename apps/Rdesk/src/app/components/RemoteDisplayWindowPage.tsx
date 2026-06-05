@@ -3256,6 +3256,15 @@ export function RemoteDisplayWindowPage() {
     [controlInputEnabled, releaseRemoteControlInput]
   );
 
+  const handleRemoteContextMenu = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      event.preventDefault();
+      releaseRemoteControlInput();
+    },
+    [controlInputEnabled, releaseRemoteControlInput]
+  );
+
   const handleRemoteWheel = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
       if (!controlInputEnabled) return;
@@ -6842,6 +6851,7 @@ export function RemoteDisplayWindowPage() {
         onPointerUp={handleRemotePointerUp}
         onPointerCancel={handleRemotePointerCancel}
         onLostPointerCapture={handleRemoteLostPointerCapture}
+        onContextMenu={handleRemoteContextMenu}
         onWheel={handleRemoteWheel}
         onKeyDown={handleRemoteKeyDown}
         onKeyUp={handleRemoteKeyUp}
