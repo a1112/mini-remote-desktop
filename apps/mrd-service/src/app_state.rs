@@ -33,11 +33,9 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 #[cfg(any(windows, target_os = "macos"))]
 use std::sync::Mutex as StdMutex;
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 use tokio::sync::Mutex;
-#[cfg(any(windows, target_os = "macos"))]
-use tokio::time::Instant;
 
 mod audit_log_registry;
 mod capability_snapshot_registry;
@@ -46,6 +44,8 @@ mod device_identity_registry;
 mod device_registry;
 mod display_mode_registry;
 mod media_profile_registry;
+#[cfg(any(windows, target_os = "macos"))]
+mod media_render_queue_registry;
 mod media_task_registry;
 mod peer_media_capability_registry;
 mod session_registry;
@@ -56,6 +56,10 @@ pub use device_identity_registry::DeviceIdentityRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
 pub use media_profile_registry::MediaProfileRegistry;
+#[cfg(any(windows, target_os = "macos"))]
+pub use media_render_queue_registry::{
+    MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry,
+};
 pub use media_task_registry::MediaTaskRegistry;
 pub use peer_media_capability_registry::SessionPeerMediaCapabilityRegistry;
 pub use session_registry::SessionRegistry;
@@ -115,167 +119,6 @@ struct MediaPipelineState {
     test_impairment: Option<MediaTestImpairmentSnapshot>,
     sender_transport: MediaSenderTransportSnapshot,
     adaptation: Option<MediaAdaptationSnapshot>,
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Debug, PartialEq, Eq)]
-pub enum MediaRenderQueueEnqueue {
-    Start(MediaRenderFrame),
-    Queued { replaced: bool, depth: usize },
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaRenderFrame {
-    Decoded(RenderFrame),
-    #[cfg(target_os = "macos")]
-    H264AccessUnit {
-        width: usize,
-        height: usize,
-        timestamp_us: u64,
-        payload: bytes::Bytes,
-    },
-    #[cfg(target_os = "macos")]
-    HevcAccessUnit {
-        width: usize,
-        height: usize,
-        timestamp_us: u64,
-        payload: bytes::Bytes,
-    },
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Default)]
-struct MediaRenderQueueState {
-    running: bool,
-    pending: VecDeque<MediaRenderFrame>,
-    last_enqueue_at: Option<Instant>,
-    last_present_at: Option<Instant>,
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-#[derive(Default)]
-pub struct MediaRenderQueueRegistry {
-    queues: HashMap<SessionId, MediaRenderQueueState>,
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-impl MediaRenderQueueRegistry {
-    pub fn enqueue_latest(
-        &mut self,
-        session_id: SessionId,
-        frame: MediaRenderFrame,
-    ) -> MediaRenderQueueEnqueue {
-        self.enqueue_bounded(session_id, frame, 1)
-    }
-
-    pub fn enqueue_bounded(
-        &mut self,
-        session_id: SessionId,
-        frame: MediaRenderFrame,
-        max_pending_frames: usize,
-    ) -> MediaRenderQueueEnqueue {
-        let state = self.queues.entry(session_id).or_default();
-        if !state.running {
-            state.running = true;
-            return MediaRenderQueueEnqueue::Start(frame);
-        }
-
-        let max_pending_frames = max_pending_frames.max(1);
-        let replaced = if state.pending.len() >= max_pending_frames {
-            state.pending.pop_front();
-            true
-        } else {
-            false
-        };
-        state.pending.push_back(frame);
-        MediaRenderQueueEnqueue::Queued {
-            replaced,
-            depth: state.pending.len(),
-        }
-    }
-
-    pub fn take_next_or_finish(&mut self, session_id: &SessionId) -> Option<MediaRenderFrame> {
-        let state = self.queues.get_mut(session_id)?;
-
-        if let Some(frame) = state.pending.pop_front() {
-            return Some(frame);
-        }
-
-        state.running = false;
-        None
-    }
-
-    pub fn take_latest_or_finish(
-        &mut self,
-        session_id: &SessionId,
-    ) -> (Option<MediaRenderFrame>, usize) {
-        let Some(state) = self.queues.get_mut(session_id) else {
-            return (None, 0);
-        };
-
-        let Some(frame) = state.pending.pop_back() else {
-            state.running = false;
-            return (None, 0);
-        };
-        let dropped = state.pending.len();
-        state.pending.clear();
-        (Some(frame), dropped)
-    }
-
-    pub fn pending_depth(&self, session_id: &SessionId) -> usize {
-        self.queues
-            .get(session_id)
-            .map_or(0, |state| state.pending.len())
-    }
-
-    pub fn pacing_delay(&self, session_id: &SessionId, fps: u32, now: Instant) -> Duration {
-        let Some(last_present_at) = self
-            .queues
-            .get(session_id)
-            .and_then(|state| state.last_present_at)
-        else {
-            return Duration::ZERO;
-        };
-        let Some(frame_interval) = render_frame_interval(fps) else {
-            return Duration::ZERO;
-        };
-        let elapsed = now
-            .checked_duration_since(last_present_at)
-            .unwrap_or(Duration::ZERO);
-        frame_interval.saturating_sub(elapsed)
-    }
-
-    pub fn record_enqueued(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
-        let state = self.queues.entry(session_id.clone()).or_default();
-        let gap = state
-            .last_enqueue_at
-            .and_then(|last| at.checked_duration_since(last));
-        state.last_enqueue_at = Some(at);
-        gap
-    }
-
-    pub fn record_presented(&mut self, session_id: &SessionId, at: Instant) -> Option<Duration> {
-        let state = self.queues.entry(session_id.clone()).or_default();
-        let gap = state
-            .last_present_at
-            .and_then(|last| at.checked_duration_since(last));
-        state.last_present_at = Some(at);
-        gap
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) {
-        self.queues.remove(session_id);
-    }
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn render_frame_interval(fps: u32) -> Option<Duration> {
-    if fps == 0 {
-        return None;
-    }
-
-    Some(Duration::from_secs_f64(1.0 / f64::from(fps)))
 }
 
 impl MediaPipelineRegistry {
