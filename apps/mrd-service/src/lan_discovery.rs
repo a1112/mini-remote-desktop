@@ -49,6 +49,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
+mod capture_activity;
 mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
@@ -69,6 +70,7 @@ mod media_transport;
 mod peer_format;
 mod service_identity;
 mod time_utils;
+use capture_activity::active_window_capture_count;
 pub use discovery_config::LanDiscoveryConfig;
 use discovery_identity::{
     default_app_id, is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID,
@@ -7472,15 +7474,6 @@ fn negotiate_media_profile(
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
     clamp_media_profile_to_lan_capability(requested_profile)
-}
-
-async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
-    let sessions = app_state.sessions.lock().await;
-    let capture_sources = app_state.capture_sources.lock().await;
-    capture_sources
-        .active_window_capture_count(&sessions)
-        .try_into()
-        .unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
