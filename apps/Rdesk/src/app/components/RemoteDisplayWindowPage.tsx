@@ -1588,6 +1588,22 @@ function virtualKeyFromKeyboardEvent(
     return 0x70 + Number(event.code.slice(1)) - 1;
   }
 
+  const oemVirtualKeys: Record<string, number> = {
+    Semicolon: 0xba,
+    Equal: 0xbb,
+    Comma: 0xbc,
+    Minus: 0xbd,
+    Period: 0xbe,
+    Slash: 0xbf,
+    Backquote: 0xc0,
+    BracketLeft: 0xdb,
+    Backslash: 0xdc,
+    BracketRight: 0xdd,
+    Quote: 0xde,
+  };
+  const oemVirtualKey = oemVirtualKeys[event.code];
+  if (oemVirtualKey !== undefined) return oemVirtualKey;
+
   switch (event.key) {
     case "Backspace":
       return 0x08;
