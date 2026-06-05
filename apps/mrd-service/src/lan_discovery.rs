@@ -49,6 +49,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
+mod discovery_config;
 mod dynamic_window_fps;
 mod lan_control_input;
 mod media_access_unit;
@@ -65,6 +66,7 @@ mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
 mod service_identity;
+pub use discovery_config::LanDiscoveryConfig;
 use dynamic_window_fps::{
     is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
     window_dynamic_fps_input_for_capture_error, window_dynamic_fps_input_for_captured_frame,
@@ -174,9 +176,6 @@ use service_identity::service_build_id;
 #[cfg(test)]
 use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
 
-const DEFAULT_DISCOVERY_PORT: u16 = 21116;
-const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
-const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
 const LAN_RELIABLE_WHOLE_FRAME_ENV: &str = "MRD_LAN_RELIABLE_WHOLE_FRAME";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_ENV: &str = "MRD_LAN_CAPTURE_PUMP";
@@ -198,8 +197,6 @@ const D3D11_RENDER_PRESENT_BLOCKING_ENV: &str = "MRD_D3D11_RENDER_PRESENT_BLOCKI
 #[cfg(windows)]
 const D3D11_RENDER_WAITABLE_OBJECT_ENV: &str = "MRD_D3D11_RENDER_WAITABLE_OBJECT";
 const PROTOCOL_VERSION: u32 = 1;
-const ANNOUNCE_INTERVAL_SECS: u64 = 3;
-const PEER_TTL_SECS: u64 = 12;
 const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
 const DISCOVERY_APP_ID: &str = "rdesk";
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
@@ -305,65 +302,6 @@ const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
-
-#[derive(Debug, Clone)]
-pub struct LanDiscoveryConfig {
-    pub enabled: bool,
-    pub discovery_port: u16,
-    pub probe_endpoints: Vec<SocketAddr>,
-    pub announce_interval: Duration,
-    pub peer_ttl: Duration,
-}
-
-impl Default for LanDiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            discovery_port: DEFAULT_DISCOVERY_PORT,
-            probe_endpoints: Vec::new(),
-            announce_interval: Duration::from_secs(ANNOUNCE_INTERVAL_SECS),
-            peer_ttl: Duration::from_secs(PEER_TTL_SECS),
-        }
-    }
-}
-
-impl LanDiscoveryConfig {
-    pub fn from_env() -> Result<Self> {
-        Self::from_env_lookup(|key| std::env::var(key).ok())
-    }
-
-    fn from_env_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let mut config = Self::default();
-        if let Some(port) = lookup(LAN_DISCOVERY_PORT_ENV) {
-            let port = port.trim();
-            if !port.is_empty() {
-                config.discovery_port = port
-                    .parse::<u16>()
-                    .with_context(|| format!("invalid {LAN_DISCOVERY_PORT_ENV}: {port}"))?;
-            }
-        }
-        if let Some(endpoints) = lookup(LAN_DISCOVERY_PROBE_ENDPOINTS_ENV) {
-            config.probe_endpoints = parse_probe_endpoints(&endpoints)?;
-        }
-        Ok(config)
-    }
-}
-
-fn parse_probe_endpoints(value: &str) -> Result<Vec<SocketAddr>> {
-    let mut endpoints = Vec::new();
-    for entry in value.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        endpoints.push(
-            entry
-                .parse::<SocketAddr>()
-                .with_context(|| format!("invalid LAN discovery probe endpoint: {entry}"))?,
-        );
-    }
-    Ok(endpoints)
-}
 
 #[derive(Debug)]
 pub struct LanDiscoveryState {
