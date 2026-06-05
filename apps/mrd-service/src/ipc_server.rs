@@ -1659,7 +1659,7 @@ mod tests {
                 remote_listen_addr: None,
                 remote_server_name: None,
                 remote_cert_der_b64: None,
-                lifecycle_state: SessionLifecycleState::Connected,
+                lifecycle_state: SessionLifecycleState::Streaming,
                 last_error: None,
                 sender_active: false,
                 receiver_active: true,
@@ -1679,6 +1679,62 @@ mod tests {
                 assert!(message.contains("LAN peer not found"));
             }
             other => panic!("expected control input routing error, got {other:?}"),
+        }
+
+        let snapshot = app_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id.clone());
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+        assert_eq!(snapshot.realtime.accepted_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn control_input_request_for_controller_session_requires_streaming_receiver() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("controller-input-not-ready-session".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: None,
+                target_device_id: Some(DeviceId("target-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Connected,
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+            },
+        );
+
+        let response = server
+            .handle_request(IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::MouseMove { x: 10, y: 20 },
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.contains("streaming receiver"));
+            }
+            other => panic!("expected control input readiness error, got {other:?}"),
         }
 
         let snapshot = app_state

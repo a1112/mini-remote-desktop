@@ -210,7 +210,22 @@ pub async fn send_control_input(
                 ),
             };
         }
-        Some(snapshot) => snapshot.target_device_id.is_some(),
+        Some(snapshot) => {
+            let route_to_peer = snapshot.target_device_id.is_some();
+            if route_to_peer
+                && (snapshot.lifecycle_state != SessionLifecycleState::Streaming
+                    || !snapshot.receiver_active)
+            {
+                return IpcResponse::Error {
+                    code: "E_CONTROL_INPUT".to_string(),
+                    message: format!(
+                        "control input requires a streaming receiver for session {}",
+                        session_id.0
+                    ),
+                };
+            }
+            route_to_peer
+        }
         None => {
             return IpcResponse::Error {
                 code: "E_CONTROL_INPUT".to_string(),
