@@ -302,6 +302,54 @@ fn windows_signed_high_word(value: usize) -> i32 {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSurfaceInputSideEffect {
+    Focus,
+    CaptureMouse,
+    ReleaseMouseCapture,
+}
+
+#[cfg(windows)]
+fn windows_surface_input_side_effects_from_message(
+    message: u32,
+) -> Vec<WindowsSurfaceInputSideEffect> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CANCELMODE, WM_CAPTURECHANGED, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    };
+
+    match message {
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => vec![
+            WindowsSurfaceInputSideEffect::Focus,
+            WindowsSurfaceInputSideEffect::CaptureMouse,
+        ],
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP | WM_KILLFOCUS
+        | WM_CANCELMODE | WM_CAPTURECHANGED => {
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_surface_input_side_effect(
+    hwnd: windows::Win32::Foundation::HWND,
+    side_effect: WindowsSurfaceInputSideEffect,
+) {
+    match side_effect {
+        WindowsSurfaceInputSideEffect::Focus => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+        },
+        WindowsSurfaceInputSideEffect::CaptureMouse => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+        },
+        WindowsSurfaceInputSideEffect::ReleaseMouseCapture => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        },
+    }
+}
+
+#[cfg(windows)]
 fn windows_surface_input_events_from_message(
     message: u32,
     wparam: usize,
@@ -437,6 +485,9 @@ impl NativeRenderSurface {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
+            for side_effect in windows_surface_input_side_effects_from_message(message) {
+                apply_windows_surface_input_side_effect(hwnd, side_effect);
+            }
             let events = windows_surface_input_events_from_message(message, wparam.0, lparam.0);
             if !events.is_empty() {
                 for event in events {
@@ -1356,6 +1407,25 @@ mod remote_display_surface_input_tests {
                     pressed: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_focuses_and_captures_on_button_drag() {
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_LBUTTONDOWN),
+            vec![
+                WindowsSurfaceInputSideEffect::Focus,
+                WindowsSurfaceInputSideEffect::CaptureMouse,
+            ]
+        );
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_LBUTTONUP),
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
+        );
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_CAPTURECHANGED),
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
         );
     }
 
