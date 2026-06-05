@@ -9036,6 +9036,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_lan_control_input_requires_active_sender_on_target() {
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+        target_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("input-target-not-ready-session".to_string());
+        target_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("controller-device".to_string())),
+                target_device_id: None,
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Listening,
+                last_error: None,
+                sender_active: false,
+                receiver_active: false,
+            },
+        );
+
+        let ack = accept_or_replay_lan_control_input(
+            &target_state,
+            &session_id,
+            "controller-device",
+            12,
+            &mrd_ipc::ControlInputEvent::MouseMove { x: 10, y: 20 },
+        )
+        .await;
+
+        assert!(!ack.accepted);
+        assert!(ack
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("active sender"));
+        assert_eq!(ack.lane, None);
+        assert_eq!(ack.event_count, 0);
+
+        let snapshot = target_state
+            .control_input()
+            .lock()
+            .await
+            .snapshot(session_id);
+        assert_eq!(snapshot.realtime.accepted_messages, 0);
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+    }
+
+    #[tokio::test]
     async fn reliable_lan_control_input_retries_after_missing_ack() {
         let controller_state = Arc::new(AppState::new());
         controller_state.devices.lock().await.register(

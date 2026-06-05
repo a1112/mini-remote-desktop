@@ -189,6 +189,12 @@ async fn accept_lan_control_input(
                 snapshot.lifecycle_state
             );
         }
+        if !snapshot.sender_active {
+            anyhow::bail!(
+                "control input rejected until target session has an active sender: {}",
+                session_id.0
+            );
+        }
     }
 
     let event = crate::control_input::map_control_input_event_for_target_geometry(
