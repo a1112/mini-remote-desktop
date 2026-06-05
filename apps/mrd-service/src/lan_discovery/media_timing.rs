@@ -1,4 +1,4 @@
-use super::DynamicWindowFpsDecision;
+use super::dynamic_window_fps::DynamicWindowFpsDecision;
 use super::LAN_RENDER_PACING_POLL_INTERVAL;
 use mrd_ipc::MediaProfile;
 use std::time::Duration;

@@ -49,6 +49,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
+mod dynamic_window_fps;
 mod lan_control_input;
 mod media_envelope;
 mod media_ordering;
@@ -58,6 +59,13 @@ mod media_render_policy;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
+use dynamic_window_fps::{
+    is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
+    window_dynamic_fps_input_for_capture_error, window_dynamic_fps_input_for_captured_frame,
+    DynamicWindowFpsDecision, DynamicWindowFpsPolicy,
+};
+#[cfg(test)]
+use dynamic_window_fps::{DynamicWindowFpsInput, DynamicWindowFpsTier};
 pub use lan_control_input::request_lan_control_input;
 use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
@@ -8061,158 +8069,6 @@ fn now_us() -> u64 {
 
 fn duration_as_millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-enum DynamicWindowFpsTier {
-    Active,
-    Warm,
-    Idle,
-    Suspended,
-}
-
-impl DynamicWindowFpsTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Warm => "warm",
-            Self::Idle => "idle",
-            Self::Suspended => "suspended",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-struct DynamicWindowFpsDecision {
-    tier: DynamicWindowFpsTier,
-    target_fps: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-struct DynamicWindowFpsInput {
-    frame_changed: bool,
-    input_active: bool,
-    source_available: bool,
-    active_window_capture_count: u32,
-}
-
-#[allow(dead_code)]
-struct DynamicWindowFpsPolicy {
-    profile_fps: u32,
-    quiet_updates: u32,
-    decision: DynamicWindowFpsDecision,
-}
-
-impl DynamicWindowFpsPolicy {
-    #[allow(dead_code)]
-    fn new(profile_fps: u32) -> Self {
-        Self {
-            profile_fps,
-            quiet_updates: 0,
-            decision: DynamicWindowFpsDecision {
-                tier: DynamicWindowFpsTier::Active,
-                target_fps: profile_fps,
-            },
-        }
-    }
-
-    #[allow(dead_code)]
-    fn update(&mut self, input: DynamicWindowFpsInput) -> DynamicWindowFpsDecision {
-        if !input.source_available {
-            self.quiet_updates = 0;
-            self.decision = DynamicWindowFpsDecision {
-                tier: DynamicWindowFpsTier::Suspended,
-                target_fps: 1,
-            };
-            return self.decision;
-        }
-
-        if input.frame_changed || input.input_active {
-            self.quiet_updates = 0;
-            let target_fps = if input.active_window_capture_count >= 3 {
-                self.profile_fps.min(60)
-            } else {
-                self.profile_fps
-            };
-            self.decision = DynamicWindowFpsDecision {
-                tier: DynamicWindowFpsTier::Active,
-                target_fps,
-            };
-            return self.decision;
-        }
-
-        self.quiet_updates = self.quiet_updates.saturating_add(1);
-        self.decision = if self.quiet_updates >= 10 {
-            DynamicWindowFpsDecision {
-                tier: DynamicWindowFpsTier::Idle,
-                target_fps: self.profile_fps.min(15),
-            }
-        } else {
-            DynamicWindowFpsDecision {
-                tier: DynamicWindowFpsTier::Warm,
-                target_fps: self.profile_fps.min(60),
-            }
-        };
-        self.decision
-    }
-
-    #[allow(dead_code)]
-    fn current(&self) -> DynamicWindowFpsDecision {
-        self.decision
-    }
-}
-
-fn window_dynamic_fps_input(
-    frame_changed: bool,
-    source_available: bool,
-    active_window_capture_count: u32,
-) -> DynamicWindowFpsInput {
-    DynamicWindowFpsInput {
-        frame_changed,
-        input_active: false,
-        source_available,
-        active_window_capture_count: active_window_capture_count.max(1),
-    }
-}
-
-fn window_dynamic_fps_input_for_captured_frame(
-    active_window_capture_count: u32,
-) -> DynamicWindowFpsInput {
-    window_dynamic_fps_input(true, true, active_window_capture_count)
-}
-
-fn is_winrt_window_capture_no_frame_timeout(error: &anyhow::Error) -> bool {
-    format!("{error:#}").contains("WinRT capture produced no frame within")
-}
-
-fn window_dynamic_fps_input_for_capture_error(
-    error: &anyhow::Error,
-    active_window_capture_count: u32,
-) -> DynamicWindowFpsInput {
-    window_dynamic_fps_input(
-        false,
-        is_winrt_window_capture_no_frame_timeout(error),
-        active_window_capture_count,
-    )
-}
-
-fn update_dynamic_window_fps_decision(
-    policy: &mut Option<DynamicWindowFpsPolicy>,
-    decision: &mut Option<DynamicWindowFpsDecision>,
-    frame_changed: bool,
-    source_available: bool,
-    active_window_capture_count: u32,
-) {
-    if let Some(policy) = policy.as_mut() {
-        *decision = Some(policy.update(window_dynamic_fps_input(
-            frame_changed,
-            source_available,
-            active_window_capture_count,
-        )));
-    }
 }
 
 async fn active_window_capture_count(app_state: &Arc<AppState>) -> u32 {
