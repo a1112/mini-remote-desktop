@@ -4,6 +4,7 @@ pub mod capability;
 pub mod control;
 pub mod device;
 pub mod identity;
+pub mod preflight;
 pub mod session;
 pub mod shell;
 pub mod telemetry;
@@ -319,5 +320,23 @@ mod tests {
             }
             _ => panic!("expected shell status response"),
         }
+    }
+
+    #[tokio::test]
+    async fn preflight_handler_rejects_missing_required_lan_peer() {
+        let app_state = Arc::new(AppState::new());
+        let target_device_id = DeviceId("missing-lan-peer".to_string());
+
+        let error = super::preflight::preflight_session_start(
+            &app_state,
+            &target_device_id,
+            "quic",
+            None,
+            true,
+        )
+        .await
+        .expect_err("missing LAN peer should fail preflight");
+
+        assert!(error.contains("LAN peer missing-lan-peer was not found"));
     }
 }

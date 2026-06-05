@@ -9,7 +9,7 @@ use crate::{
     app_state::AppState,
     handlers::control,
     handlers::{
-        capability, device, identity, session, shell as shell_handlers, telemetry,
+        capability, device, identity, preflight, session, shell as shell_handlers, telemetry,
         transport as transport_handlers,
     },
     shell::{AutostartPortRef, UiLauncherPortRef},
@@ -18,10 +18,9 @@ use crate::{
 use mrd_application::ports::SessionLifecycleState;
 #[cfg(test)]
 use mrd_application::ports::SessionSnapshot;
-use mrd_ipc::{
-    transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
-    ScenarioEvaluationStatus,
-};
+#[cfg(test)]
+use mrd_ipc::CapabilityStatus;
+use mrd_ipc::{transport, IpcRequest, IpcResponse};
 use mrd_proto::{DeviceId, SessionId};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
 
@@ -140,9 +139,14 @@ impl IpcServer {
                 target_device_id,
                 transport_kind,
             } => {
-                let response = match self
-                    .preflight_session_start(&target_device_id, &transport_kind, None, false)
-                    .await
+                let response = match preflight::preflight_session_start(
+                    &self.app_state,
+                    &target_device_id,
+                    &transport_kind,
+                    None,
+                    false,
+                )
+                .await
                 {
                     Ok(()) => {
                         session::start_session(
@@ -193,14 +197,14 @@ impl IpcServer {
                         ),
                     ));
                 }
-                let response = match self
-                    .preflight_session_start(
-                        &target_device_id,
-                        &transport_kind,
-                        requested_profile.as_ref(),
-                        true,
-                    )
-                    .await
+                let response = match preflight::preflight_session_start(
+                    &self.app_state,
+                    &target_device_id,
+                    &transport_kind,
+                    requested_profile.as_ref(),
+                    true,
+                )
+                .await
                 {
                     Ok(()) => {
                         session::start_lan_remote_session(
@@ -629,47 +633,6 @@ impl IpcServer {
         );
     }
 
-    async fn preflight_session_start(
-        &self,
-        target_device_id: &DeviceId,
-        transport_kind: &str,
-        requested_profile: Option<&MediaProfile>,
-        require_lan_peer: bool,
-    ) -> Result<(), String> {
-        let snapshot = self.app_state.cached_capability_snapshot().await;
-        self.app_state.refresh_capability_snapshot_in_background();
-
-        ensure_transport_preflight(&snapshot, transport_kind)?;
-
-        if let Some(profile) = requested_profile {
-            let scenario_id = scenario_id_for_profile(profile);
-            let evaluation = crate::capabilities::evaluate_scenario_profile_against_snapshot(
-                &snapshot,
-                scenario_id,
-                Some(profile.clone()),
-            );
-            if matches!(evaluation.status, ScenarioEvaluationStatus::Blocked) {
-                return Err(format_preflight_evaluation_failure(&evaluation));
-            }
-        }
-
-        if require_lan_peer {
-            let discovery = self.app_state.lan_discovery.snapshot().await;
-            if !discovery
-                .peers
-                .iter()
-                .any(|peer| &peer.device_id == target_device_id)
-            {
-                return Err(format!(
-                    "LAN peer {} was not found during session preflight.",
-                    target_device_id.0
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
     /// Run the IPC server (accepts connections in a loop)
     pub async fn run(&self) -> anyhow::Result<()> {
         #[cfg(windows)]
@@ -760,94 +723,6 @@ fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
         IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
         _ => ("success", None),
     }
-}
-
-fn ensure_transport_preflight(
-    snapshot: &CapabilitySnapshot,
-    transport_kind: &str,
-) -> Result<(), String> {
-    let capability_id = transport_capability_id(transport_kind);
-    let Some(capability) = snapshot
-        .capabilities
-        .iter()
-        .find(|item| item.id == capability_id)
-    else {
-        return Err(format!(
-            "{capability_id} is not advertised by local service capability preflight."
-        ));
-    };
-
-    if capability_status_runs(&capability.status) {
-        return Ok(());
-    }
-
-    Err(format!(
-        "{} preflight failed: {}",
-        capability.id,
-        capability.reason.clone().unwrap_or_else(|| {
-            format!("status {:?} cannot start this session.", capability.status)
-        })
-    ))
-}
-
-fn transport_capability_id(transport_kind: &str) -> &'static str {
-    let kind = transport_kind.to_ascii_lowercase();
-    if kind.contains("webrtc") {
-        "transport.webrtc"
-    } else if kind.contains("quic_datagram") {
-        "transport.quic_datagram"
-    } else if kind.contains("quic") {
-        "transport.quic"
-    } else {
-        "transport.loopback"
-    }
-}
-
-fn scenario_id_for_profile(profile: &MediaProfile) -> &'static str {
-    if cfg!(target_os = "macos") && profile.codec.eq_ignore_ascii_case("hevc") {
-        return "lan.macos.hevc.2k144";
-    }
-    if cfg!(target_os = "macos") && profile.codec.eq_ignore_ascii_case("h264") {
-        return "lan.macos.2k144";
-    }
-    if profile.width >= 3840 || profile.height >= 2160 {
-        "quality.4k60"
-    } else if profile.height >= 1600 && profile.fps >= 165 {
-        "lan.1600p165"
-    } else if profile.width >= 2560 && profile.height >= 1440 && profile.fps >= 144 {
-        "lan.2k144"
-    } else {
-        "interactive.1080p60"
-    }
-}
-
-fn format_preflight_evaluation_failure(evaluation: &mrd_ipc::ScenarioEvaluation) -> String {
-    let mut parts = vec![format!(
-        "Scenario {} was blocked by session preflight.",
-        evaluation.scenario_id
-    )];
-    if !evaluation.missing_capabilities.is_empty() {
-        parts.push(format!(
-            "missing capabilities: {}",
-            evaluation.missing_capabilities.join(", ")
-        ));
-    }
-    for reason in &evaluation.reasons {
-        if reason.severity == "error" {
-            parts.push(reason.message.clone());
-        }
-    }
-    parts.join(" ")
-}
-
-fn capability_status_runs(status: &CapabilityStatus) -> bool {
-    matches!(
-        status,
-        CapabilityStatus::Available
-            | CapabilityStatus::Usable
-            | CapabilityStatus::Supported
-            | CapabilityStatus::Degraded
-    )
 }
 
 #[cfg(test)]
@@ -1186,7 +1061,10 @@ mod tests {
             ..mrd_ipc::MediaProfile::default()
         };
 
-        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.2k144");
+        assert_eq!(
+            crate::handlers::preflight::scenario_id_for_profile(&profile),
+            "lan.macos.2k144"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1201,7 +1079,10 @@ mod tests {
             ..mrd_ipc::MediaProfile::default()
         };
 
-        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.hevc.2k144");
+        assert_eq!(
+            crate::handlers::preflight::scenario_id_for_profile(&profile),
+            "lan.macos.hevc.2k144"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1216,7 +1097,10 @@ mod tests {
             ..mrd_ipc::MediaProfile::default()
         };
 
-        assert_eq!(scenario_id_for_profile(&profile), "lan.macos.2k144");
+        assert_eq!(
+            crate::handlers::preflight::scenario_id_for_profile(&profile),
+            "lan.macos.2k144"
+        );
     }
 
     #[tokio::test]
