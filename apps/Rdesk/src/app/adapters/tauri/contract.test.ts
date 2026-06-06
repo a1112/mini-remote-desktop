@@ -491,6 +491,37 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('ipc_update_media_profile preserves extended color and HDR fields', async () => {
+      const mockInvoke = getMockInvoke();
+      const requestedProfile = {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: 'hevc',
+        codec_profile: 'main10',
+        bit_depth: 10,
+        chroma_subsampling: '4:2:0',
+        pixel_format: 'p010',
+        hdr_enabled: true,
+        color_mode: 'low_chroma',
+        color_pipeline: 'hdr_main10',
+      } as const;
+      mockInvoke.mockResolvedValue({
+        requested: requestedProfile,
+        selected: requestedProfile,
+        status: 'accepted',
+        reason: null,
+      });
+
+      await adapter.ipcUpdateMediaProfile('session-123', requestedProfile);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_update_media_profile', {
+        sessionId: 'session-123',
+        requestedProfile,
+      });
+    });
+
     it('ipc_configure_media_adaptation calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
       const profile = {
