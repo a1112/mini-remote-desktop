@@ -54,6 +54,7 @@ mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
 mod lan_control_input;
+mod local_network_identity;
 mod media_access_unit;
 mod media_capabilities;
 mod media_capture_config;
@@ -93,6 +94,7 @@ pub use lan_control_input::request_lan_control_input;
 use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
+use local_network_identity::local_lan_announcement_mac_address;
 use media_access_unit::{
     describe_lan_access_unit, h264_access_unit_is_keyframe, LanAccessUnitCodec,
 };
@@ -2000,7 +2002,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
-        mac_address: None,
+        mac_address: local_lan_announcement_mac_address(),
         timestamp_ms: now_ms(),
     })
 }
