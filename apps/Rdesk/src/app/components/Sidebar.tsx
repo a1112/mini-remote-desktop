@@ -693,6 +693,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                 <RefreshCw style={{ width: 14, height: 14 }} />
               </button>
               <button
+                onClick={onOpenConnections}
                 className={`p-0.5 rounded transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"}`}
                 title="添加设备"
               >

@@ -113,12 +113,18 @@ function LocationProbe() {
   return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
 }
 
-function renderSidebar({ collapsed = false }: { collapsed?: boolean } = {}) {
+function renderSidebar({
+  collapsed = false,
+  onOpenConnections = vi.fn(),
+}: {
+  collapsed?: boolean;
+  onOpenConnections?: () => void;
+} = {}) {
   render(
     <MemoryRouter>
       <Sidebar
         collapsed={collapsed}
-        onOpenConnections={vi.fn()}
+        onOpenConnections={onOpenConnections}
         onOpenSettings={vi.fn()}
       />
       <LocationProbe />
@@ -187,6 +193,17 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "关机" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
+  });
+
+  it("opens the connection dialog from the add device toolbar button", async () => {
+    const onOpenConnections = vi.fn();
+    const user = userEvent.setup();
+
+    renderSidebar({ onOpenConnections });
+
+    await user.click(screen.getByTitle("添加设备"));
+
+    expect(onOpenConnections).toHaveBeenCalledTimes(1);
   });
 
   it("sends Wake-on-LAN for an offline device with a known MAC address", async () => {
