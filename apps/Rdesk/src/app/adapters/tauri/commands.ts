@@ -40,6 +40,7 @@ import type {
   DisplayModeChange,
   ControlInputAccepted,
   ControlInputEvent,
+  DirectoryList,
   AdaptiveMediaConfig,
   MediaAdaptationSnapshot,
   MediaProfile,
@@ -577,6 +578,20 @@ export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscove
     undefined,
     { type: 'RefreshLanDiscovery' },
     responseField<LanDiscoverySnapshot>('snapshot')
+  );
+}
+
+export async function ipcListDirectory(path?: string | null): Promise<AdapterResult<DirectoryList>> {
+  return invokeBridgeOrTauri<DirectoryList>(
+    'ipc_list_directory',
+    {
+      path: path ?? null,
+    },
+    {
+      type: 'ListDirectory',
+      path: path ?? null,
+    },
+    responseField<DirectoryList>('listing')
   );
 }
 

@@ -421,6 +421,38 @@ mod wire {
         pub reason: Option<String>,
     }
 
+    /// File-system entry kind for service-owned file browsing.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileEntryKind {
+        File,
+        Directory,
+        Symlink,
+        Other,
+    }
+
+    /// File-system entry returned by a service-owned directory listing.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileEntry {
+        pub name: String,
+        pub path: String,
+        pub kind: FileEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub size_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub modified_ms: Option<u64>,
+        pub readonly: bool,
+    }
+
+    /// Directory listing returned by the local service kernel.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DirectoryList {
+        pub path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_path: Option<String>,
+        pub entries: Vec<FileEntry>,
+    }
+
     /// A display output mode that can be applied to a remote capture display.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct DisplayMode {
@@ -1025,6 +1057,11 @@ mod wire {
         LanDiscoverySnapshot,
         /// Send an immediate LAN discovery probe and return the current snapshot.
         RefreshLanDiscovery,
+        /// List files/directories from the local service host.
+        ListDirectory {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            path: Option<String>,
+        },
         /// Send a Wake-on-LAN magic packet for a known device MAC address.
         WakeOnLan {
             /// Peer device id associated with the wake request.
@@ -1298,6 +1335,8 @@ mod wire {
             session_id: SessionId,
             modes: Vec<DisplayMode>,
         },
+        /// Directory listing returned by the local service host.
+        DirectoryList { listing: DirectoryList },
         /// Display mode change or restore result.
         DisplayModeChanged {
             session_id: SessionId,

@@ -509,6 +509,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
         request,
         IpcRequest::LanDiscoverySnapshot
             | IpcRequest::RefreshLanDiscovery
+            | IpcRequest::ListDirectory { .. }
             | IpcRequest::WakeOnLan { .. }
             | IpcRequest::RequestRemoteDevicePowerAction { .. }
             | IpcRequest::ListSessions
@@ -716,6 +717,13 @@ mod tests {
                 limit: Some(24),
             }
         ));
+    }
+
+    #[test]
+    fn web_bridge_allows_directory_listing() {
+        assert!(is_ipc_request_allowed(&IpcRequest::ListDirectory {
+            path: Some(".".to_string()),
+        }));
     }
 
     #[test]

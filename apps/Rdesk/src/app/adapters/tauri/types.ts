@@ -265,6 +265,23 @@ export interface ControlInputAccepted {
   event_count: number;
 }
 
+export type FileEntryKind = "file" | "directory" | "symlink" | "other";
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  kind: FileEntryKind;
+  size_bytes?: number | null;
+  modified_ms?: number | null;
+  readonly: boolean;
+}
+
+export interface DirectoryList {
+  path: string;
+  parent_path?: string | null;
+  entries: FileEntry[];
+}
+
 export interface WindowCaptureTarget {
   id?: string;
   platform?: "windows" | "macos" | string;

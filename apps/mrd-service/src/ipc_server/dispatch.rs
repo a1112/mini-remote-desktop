@@ -1,7 +1,7 @@
 use super::{audit_outcome, IpcServer};
 use crate::handlers::control;
 use crate::handlers::{
-    capability, device, identity, lan, preflight, session, shell as shell_handlers, telemetry,
+    capability, device, files, identity, lan, preflight, session, shell as shell_handlers, telemetry,
     transport as transport_handlers,
 };
 use mrd_ipc::{IpcRequest, IpcResponse};
@@ -38,6 +38,8 @@ impl IpcServer {
             IpcRequest::LanDiscoverySnapshot => lan::lan_discovery_snapshot(&self.app_state).await,
 
             IpcRequest::RefreshLanDiscovery => lan::refresh_lan_discovery(&self.app_state).await,
+
+            IpcRequest::ListDirectory { path } => files::list_directory(path),
 
             IpcRequest::WakeOnLan {
                 device_id,

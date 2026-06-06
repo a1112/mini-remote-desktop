@@ -3,6 +3,7 @@
 pub mod capability;
 pub mod control;
 pub mod device;
+pub mod files;
 pub mod identity;
 pub mod lan;
 pub mod preflight;

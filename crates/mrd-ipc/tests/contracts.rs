@@ -7,11 +7,12 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
-    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
-    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, DirectoryList, FileEntry, FileEntryKind, IpcRequest,
+    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
+    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
+    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
+    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
+    TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -591,6 +592,37 @@ fn serialize_deserialize_control_input_contracts() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("ControlInputAccepted"));
     assert!(json.contains("\"lane\":\"reliable\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_file_directory_contracts() {
+    let request = IpcRequest::ListDirectory {
+        path: Some("C:\\Users\\tester".to_string()),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListDirectory"));
+    assert!(json.contains("C:\\\\Users\\\\tester"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let listing = DirectoryList {
+        path: "C:\\Users\\tester".to_string(),
+        parent_path: Some("C:\\Users".to_string()),
+        entries: vec![FileEntry {
+            name: "Downloads".to_string(),
+            path: "C:\\Users\\tester\\Downloads".to_string(),
+            kind: FileEntryKind::Directory,
+            size_bytes: None,
+            modified_ms: Some(1_776_000_000_000),
+            readonly: false,
+        }],
+    };
+    let response = IpcResponse::DirectoryList { listing };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DirectoryList"));
+    assert!(json.contains("\"kind\":\"directory\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }
