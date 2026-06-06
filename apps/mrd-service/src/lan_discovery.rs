@@ -74,6 +74,7 @@ mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
 mod peer_format;
+mod peer_lookup;
 mod peer_registry;
 mod protocol;
 mod remote_power;
@@ -235,6 +236,12 @@ use media_transport::{
     reliable_whole_frame_media_override_from_env_value, select_reliable_media_send_mode,
 };
 use peer_format::{format_peer_capabilities, format_peer_transports, normalize_transport_kind};
+use peer_lookup::{
+    local_device_id, peer_control_addr_with_capture_source_capability,
+    peer_control_addr_with_display_mode_capability,
+    peer_control_addr_with_input_control_capability,
+    peer_control_addr_with_remote_power_capability, session_remote_peer,
+};
 use peer_registry::{LanPeerRecord, LanPeerRegistry};
 #[cfg(test)]
 use protocol::LAN_INPUT_CONTROL_CAPABILITY;
@@ -2338,141 +2345,6 @@ async fn close_lan_media_sessions(
             .remove(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
     }
-}
-
-async fn peer_control_addr_with_capture_source_capability(
-    app_state: &Arc<AppState>,
-    peer_device_id: &DeviceId,
-) -> Result<SocketAddr> {
-    let target = app_state
-        .lan_discovery
-        .peer_control_addr(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    let peer_transports = app_state
-        .lan_discovery
-        .peer_transports(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    if !peer_transports
-        .iter()
-        .any(|transport| transport.eq_ignore_ascii_case(LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT))
-    {
-        anyhow::bail!(
-            "LAN peer does not advertise required capture source control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
-            LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
-            peer_device_id.0,
-            format_peer_transports(&peer_transports)
-        );
-    }
-    Ok(target)
-}
-
-async fn peer_control_addr_with_display_mode_capability(
-    app_state: &Arc<AppState>,
-    peer_device_id: &DeviceId,
-) -> Result<SocketAddr> {
-    let target = app_state
-        .lan_discovery
-        .peer_control_addr(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    let peer_transports = app_state
-        .lan_discovery
-        .peer_transports(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    if !peer_transports
-        .iter()
-        .any(|transport| transport.eq_ignore_ascii_case(LAN_DISPLAY_MODE_CONTROL_TRANSPORT))
-    {
-        anyhow::bail!(
-            "LAN peer does not advertise required display mode control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
-            LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
-            peer_device_id.0,
-            format_peer_transports(&peer_transports)
-        );
-    }
-    Ok(target)
-}
-
-async fn peer_control_addr_with_input_control_capability(
-    app_state: &Arc<AppState>,
-    peer_device_id: &DeviceId,
-) -> Result<SocketAddr> {
-    let target = app_state
-        .lan_discovery
-        .peer_control_addr(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    let peer_transports = app_state
-        .lan_discovery
-        .peer_transports(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    if !peer_transports
-        .iter()
-        .any(|transport| transport.eq_ignore_ascii_case(LAN_INPUT_CONTROL_TRANSPORT))
-    {
-        anyhow::bail!(
-            "LAN peer does not advertise required input control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
-            LAN_INPUT_CONTROL_TRANSPORT,
-            peer_device_id.0,
-            format_peer_transports(&peer_transports)
-        );
-    }
-    Ok(target)
-}
-
-async fn peer_control_addr_with_remote_power_capability(
-    app_state: &Arc<AppState>,
-    peer_device_id: &DeviceId,
-) -> Result<SocketAddr> {
-    let target = app_state
-        .lan_discovery
-        .peer_control_addr(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    let peer_transports = app_state
-        .lan_discovery
-        .peer_transports(peer_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
-    if !peer_transports
-        .iter()
-        .any(|transport| transport.eq_ignore_ascii_case(LAN_REMOTE_POWER_CONTROL_TRANSPORT))
-    {
-        anyhow::bail!(
-            "LAN peer does not advertise required remote power control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
-            LAN_REMOTE_POWER_CONTROL_TRANSPORT,
-            peer_device_id.0,
-            format_peer_transports(&peer_transports)
-        );
-    }
-    Ok(target)
-}
-
-async fn session_remote_peer(
-    app_state: &Arc<AppState>,
-    session_id: &SessionId,
-) -> Result<DeviceId> {
-    let sessions = app_state.sessions.lock().await;
-    let snapshot = sessions
-        .get(session_id)
-        .with_context(|| format!("session not found: {}", session_id.0))?;
-    snapshot
-        .target_device_id
-        .clone()
-        .or_else(|| snapshot.source_device_id.clone())
-        .with_context(|| format!("session has no remote peer: {}", session_id.0))
-}
-
-async fn local_device_id(app_state: &Arc<AppState>) -> Result<String> {
-    let devices = app_state.devices.lock().await;
-    devices
-        .get_local_device()
-        .map(|(id, _)| id.0.clone())
-        .context("local device is not registered")
 }
 
 fn fit_capture_sources_ack_packet(
