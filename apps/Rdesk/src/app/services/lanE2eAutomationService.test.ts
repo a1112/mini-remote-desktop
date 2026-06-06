@@ -3,6 +3,7 @@ import {
   runLanE2EAutomation,
   type LanE2EAutomationCommands,
 } from "./lanE2eAutomationService";
+import type { MediaProfile } from "../adapters/tauri";
 
 function ok<T>(value: T) {
   return { ok: true as const, value };
@@ -12,7 +13,7 @@ function err(message: string) {
   return { ok: false as const, error: { message } };
 }
 
-const DEFAULT_REQUESTED_PROFILE = {
+const DEFAULT_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1600,
   fps: 165,
@@ -23,25 +24,31 @@ const DEFAULT_REQUESTED_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const H264_FALLBACK_REQUESTED_PROFILE = {
+const H264_FALLBACK_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1600,
   fps: 165,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const MACOS_H264_2K144_REQUESTED_PROFILE = {
+const MACOS_H264_2K144_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1440,
   fps: 144,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
+const MACOS_HEVC_2K144_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1440,
   fps: 144,
@@ -52,6 +59,8 @@ const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 const DEFAULT_CAPTURE_SOURCES = [

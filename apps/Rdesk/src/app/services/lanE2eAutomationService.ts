@@ -298,6 +298,8 @@ const DEFAULT_LAN_HEVC_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -305,6 +307,8 @@ const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   fps: 165,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -317,6 +321,8 @@ const DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -324,6 +330,8 @@ const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
   fps: 144,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
 const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
