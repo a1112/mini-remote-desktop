@@ -7,12 +7,13 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    DeviceIdentitySnapshot, DeviceInfo, DirectoryList, FileEntry, FileEntryKind, IpcRequest,
-    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
-    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
-    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
-    TransportPolicyConfig, TransportPolicySnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, DirectoryList, FileEntry, FileEntryKind,
+    FileTransferConflictPolicy, FileTransferEntry, FileTransferStartRequest, FileTransferStatus,
+    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
+    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
+    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -637,6 +638,92 @@ fn serialize_deserialize_file_directory_contracts() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("DirectoryList"));
     assert!(json.contains("\"kind\":\"directory\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_file_transfer_contracts() {
+    let request = IpcRequest::StartFileTransfer {
+        request: FileTransferStartRequest {
+            source_device_id: Some(DeviceId("source-device".to_string())),
+            target_device_id: Some(DeviceId("target-device".to_string())),
+            entries: vec![FileTransferEntry {
+                source_path: "C:\\Users\\tester\\source.txt".to_string(),
+                file_name: Some("source.txt".to_string()),
+                kind: FileEntryKind::File,
+            }],
+            target_path: "C:\\Users\\tester\\Downloads".to_string(),
+            conflict_policy: FileTransferConflictPolicy::Rename,
+            transport_hint: Some("local".to_string()),
+        },
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("StartFileTransfer"));
+    assert!(json.contains("\"source_device_id\":\"source-device\""));
+    assert!(json.contains("\"conflict_policy\":\"rename\""));
+    assert!(json.contains("\"transport_hint\":\"local\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let request = IpcRequest::ListFileTransfers;
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListFileTransfers"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let request = IpcRequest::CancelFileTransfer {
+        transfer_id: "file-transfer-1".to_string(),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("CancelFileTransfer"));
+    assert!(json.contains("\"transfer_id\":\"file-transfer-1\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let transfer = FileTransferTaskSnapshot {
+        transfer_id: "file-transfer-1".to_string(),
+        status: FileTransferStatus::Completed,
+        source_device_id: Some(DeviceId("source-device".to_string())),
+        target_device_id: Some(DeviceId("target-device".to_string())),
+        transport_kind: "local".to_string(),
+        total_entries: 1,
+        copied_entries: 1,
+        total_bytes: Some(5),
+        copied_bytes: 5,
+        error: None,
+        entries: vec![FileEntry {
+            name: "source.txt".to_string(),
+            path: "C:\\Users\\tester\\Downloads\\source.txt".to_string(),
+            kind: FileEntryKind::File,
+            size_bytes: Some(5),
+            modified_ms: None,
+            readonly: false,
+        }],
+    };
+    let response = IpcResponse::FileTransferStarted {
+        transfer: transfer.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferStarted"));
+    assert!(json.contains("\"status\":\"completed\""));
+    assert!(json.contains("\"copied_bytes\":5"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::FileTransferCancelled {
+        transfer: transfer.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferCancelled"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::FileTransferList {
+        transfers: vec![transfer],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferList"));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }

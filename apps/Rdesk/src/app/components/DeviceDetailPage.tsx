@@ -16,7 +16,13 @@ import {
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
-import { ipcListDirectory, type FileEntry } from "../adapters/tauri";
+import {
+  ipcListDirectory,
+  ipcStartFileTransfer,
+  type FileEntry,
+  type FileEntryKind,
+  type FileTransferEntry,
+} from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import {
   ArrowLeft,
@@ -632,6 +638,7 @@ function RemoteTab({ device }: { device: Device }) {
 type FileItem = {
   name: string;
   path?: string;
+  kind?: FileEntryKind;
   type: "folder" | "file";
   size: string;
   modified: string;
@@ -669,6 +676,7 @@ function fileEntryToItem(entry: FileEntry): FileItem {
   return {
     name: entry.name,
     path: entry.path,
+    kind: entry.kind,
     type: entry.kind === "directory" ? "folder" : "file",
     size: entry.kind === "directory" ? "--" : formatFileSize(entry.size_bytes),
     modified: formatModifiedTime(entry.modified_ms),
@@ -681,6 +689,20 @@ function pathSegmentsFromDirectory(path: string | null, fallback: string[]): str
   const segments = path.split(/[\\/]+/).filter(Boolean);
   return segments.length > 0 ? segments : [path];
 }
+
+type FileTransferDragPayload = {
+  files: string[];
+  entries: FileTransferEntry[];
+  fromSide: "left" | "right";
+  fromDeviceId: string;
+};
+
+type FileTransferDropRequest = {
+  sourceDeviceId: string;
+  targetDeviceId: string;
+  entries: FileTransferEntry[];
+  targetPath: string;
+};
 
 // Helper to get file system for a device
 function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
@@ -697,10 +719,13 @@ function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
 }
 
 function FilePane({
-  deviceId, side, otherDeviceName, isDark, onSendToOther, dragOver, devices,
+  deviceId, side, otherDeviceName, isDark, onSendToOther, onFileTransferDrop, dragOver, devices,
 }: {
   deviceId: string; side: "left" | "right"; otherDeviceName: string | null; isDark: boolean;
-  onSendToOther: (fileNames: string[]) => void; dragOver: boolean; devices: Device[];
+  onSendToOther: (fileNames: string[]) => void;
+  onFileTransferDrop: (request: FileTransferDropRequest) => void;
+  dragOver: boolean;
+  devices: Device[];
 }) {
   const dev = devices.find(d => d.id === deviceId);
   const devName = dev?.name ?? "未知设备";
@@ -742,8 +767,8 @@ function FilePane({
     void loadDirectory(null);
   }, [devName, deviceId, loadDirectory]);
 
-  const fallbackFiles = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
-  const files = (serviceFiles ?? fallbackFiles).filter(f =>
+  const fallbackFiles: FileItem[] = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
+  const files: FileItem[] = (serviceFiles ?? fallbackFiles).filter(f =>
     searchQuery ? f.name.toLowerCase().includes(searchQuery.toLowerCase()) : true
   );
 
@@ -784,15 +809,33 @@ function FilePane({
 
   const handleDragStart = (e: React.DragEvent, fileName: string) => {
     const dragFiles = selectedFiles.has(fileName) ? Array.from(selectedFiles) : [fileName];
-    e.dataTransfer.setData("fileTransfer", JSON.stringify({ files: dragFiles, fromSide: side, fromDeviceId: deviceId }));
+    const entries = dragFiles
+      .map((name) => files.find((candidate) => candidate.name === name))
+      .filter((file): file is FileItem => Boolean(file?.path))
+      .map((file) => ({
+        source_path: file.path ?? "",
+        file_name: file.name,
+        kind: file.kind ?? (file.type === "folder" ? "directory" : "file"),
+      }));
+    e.dataTransfer.setData(
+      "fileTransfer",
+      JSON.stringify({ files: dragFiles, entries, fromSide: side, fromDeviceId: deviceId })
+    );
     e.dataTransfer.effectAllowed = "copy";
   };
 
   const handlePaneDrop = (e: React.DragEvent) => {
     e.preventDefault();
     try {
-      const parsed = JSON.parse(e.dataTransfer.getData("fileTransfer"));
-      if (parsed.fromSide !== side) console.log(`Transfer ${parsed.files.join(", ")} → ${devName}`);
+      const parsed = JSON.parse(e.dataTransfer.getData("fileTransfer")) as FileTransferDragPayload;
+      if (parsed.fromSide !== side && servicePath && parsed.entries.length > 0) {
+        onFileTransferDrop({
+          sourceDeviceId: parsed.fromDeviceId,
+          targetDeviceId: deviceId,
+          entries: parsed.entries,
+          targetPath: servicePath,
+        });
+      }
     } catch {}
   };
 
@@ -973,6 +1016,8 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   const addMenuRef = useRef<HTMLDivElement>(null);
   const addBtnRef = useRef<HTMLButtonElement>(null);
   const [dragOverSide, setDragOverSide] = useState<"left" | "right" | null>(null);
+  const [transferMessage, setTransferMessage] = useState<string | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
 
   const onlineDevices = devices.filter(d => d.status === "online");
   const leftDevice = devices.find(d => d.id === leftDeviceId);
@@ -992,6 +1037,30 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     setShowAddMenu(false);
   };
 
+  const handleFileTransferDrop = useCallback(async (request: FileTransferDropRequest) => {
+    setTransferMessage(null);
+    setTransferError(null);
+    const result = await ipcStartFileTransfer({
+      source_device_id: request.sourceDeviceId,
+      target_device_id: request.targetDeviceId,
+      entries: request.entries,
+      target_path: request.targetPath,
+      conflict_policy: "rename",
+      transport_hint: "local",
+    });
+    if (!result.ok) {
+      setTransferError(result.error.message);
+      return;
+    }
+    if (result.value.status === "failed") {
+      setTransferError(result.value.error ?? "文件传输失败");
+      return;
+    }
+    setTransferMessage(
+      `已传输 ${result.value.copied_entries}/${result.value.total_entries} 个文件`
+    );
+  }, []);
+
   if (unavailableReason) {
     return (
       <div className={`flex items-center justify-center h-full ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
@@ -1005,6 +1074,23 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
 
   return (
     <div className={`flex h-full overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+      {(transferMessage || transferError) && (
+        <div
+          role="status"
+          className={`absolute right-4 top-20 z-30 rounded-md border px-3 py-2 shadow-sm ${
+            transferError
+              ? isDark
+                ? "border-red-900/50 bg-red-950 text-red-200"
+                : "border-red-100 bg-red-50 text-red-700"
+              : isDark
+                ? "border-emerald-900/50 bg-emerald-950 text-emerald-200"
+                : "border-emerald-100 bg-emerald-50 text-emerald-700"
+          }`}
+          style={{ fontSize: 12 }}
+        >
+          {transferError ?? transferMessage}
+        </div>
+      )}
       {/* Left pane */}
       <div
         className="flex-1 flex flex-col min-w-0"
@@ -1018,6 +1104,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           otherDeviceName={rightDevice?.name ?? null}
           isDark={isDark}
           onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to right pane`)}
+          onFileTransferDrop={handleFileTransferDrop}
           dragOver={dragOverSide === "left"}
           devices={devices}
         />
@@ -1093,6 +1180,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
             otherDeviceName={leftDevice?.name ?? null}
             isDark={isDark}
             onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to left pane`)}
+            onFileTransferDrop={handleFileTransferDrop}
             dragOver={dragOverSide === "right"}
             devices={devices}
           />

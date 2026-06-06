@@ -453,6 +453,73 @@ mod wire {
         pub entries: Vec<FileEntry>,
     }
 
+    /// Conflict policy for service-owned file transfer writes.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileTransferConflictPolicy {
+        Reject,
+        #[default]
+        Rename,
+        Replace,
+    }
+
+    /// One source entry in a service-owned file transfer request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferEntry {
+        pub source_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub file_name: Option<String>,
+        pub kind: FileEntryKind,
+    }
+
+    /// Request to copy files through the local service runtime.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferStartRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_device_id: Option<DeviceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<DeviceId>,
+        pub entries: Vec<FileTransferEntry>,
+        pub target_path: String,
+        #[serde(default)]
+        pub conflict_policy: FileTransferConflictPolicy,
+        /// Reserved for future LAN/QUIC routing. The MVP executes `local`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub transport_hint: Option<String>,
+    }
+
+    /// Service-owned file transfer lifecycle status.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileTransferStatus {
+        Queued,
+        Running,
+        Completed,
+        Failed,
+        Cancelled,
+    }
+
+    /// Snapshot of one service-owned file transfer task.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferTaskSnapshot {
+        pub transfer_id: String,
+        pub status: FileTransferStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_device_id: Option<DeviceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<DeviceId>,
+        pub transport_kind: String,
+        pub total_entries: usize,
+        pub copied_entries: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_bytes: Option<u64>,
+        pub copied_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub entries: Vec<FileEntry>,
+    }
+
     /// A display output mode that can be applied to a remote capture display.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct DisplayMode {
@@ -1083,6 +1150,18 @@ mod wire {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             path: Option<String>,
         },
+        /// Start a local-service-owned file transfer task.
+        StartFileTransfer {
+            /// File transfer request.
+            request: FileTransferStartRequest,
+        },
+        /// List service-owned file transfer task snapshots.
+        ListFileTransfers,
+        /// Cancel a service-owned file transfer task when it is still active.
+        CancelFileTransfer {
+            /// Transfer id returned by `StartFileTransfer`.
+            transfer_id: String,
+        },
         /// Send a Wake-on-LAN magic packet for a known device MAC address.
         WakeOnLan {
             /// Peer device id associated with the wake request.
@@ -1358,6 +1437,21 @@ mod wire {
         },
         /// Directory listing returned by the local service host.
         DirectoryList { listing: DirectoryList },
+        /// File transfer task accepted or completed by the local service host.
+        FileTransferStarted {
+            /// Current transfer snapshot.
+            transfer: FileTransferTaskSnapshot,
+        },
+        /// File transfer task snapshots known by the local service host.
+        FileTransferList {
+            /// Ordered transfer snapshots.
+            transfers: Vec<FileTransferTaskSnapshot>,
+        },
+        /// File transfer cancellation result.
+        FileTransferCancelled {
+            /// Current transfer snapshot.
+            transfer: FileTransferTaskSnapshot,
+        },
         /// Display mode change or restore result.
         DisplayModeChanged {
             session_id: SessionId,

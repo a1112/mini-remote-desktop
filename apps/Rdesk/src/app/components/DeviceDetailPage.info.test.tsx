@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Monitor } from "lucide-react";
 import { MemoryRouter, Route, Routes } from "react-router";
@@ -44,6 +44,7 @@ const remoteDisplayLauncherMock = vi.hoisted(() => ({
 
 const tauriAdapterMock = vi.hoisted(() => ({
   ipcListDirectory: vi.fn(),
+  ipcStartFileTransfer: vi.fn(),
 }));
 
 vi.mock("./deviceData", () => ({
@@ -83,6 +84,7 @@ vi.mock("../services/ipcSessionService", () => ({
 
 vi.mock("../adapters/tauri", () => ({
   ipcListDirectory: tauriAdapterMock.ipcListDirectory,
+  ipcStartFileTransfer: tauriAdapterMock.ipcStartFileTransfer,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -95,6 +97,7 @@ beforeEach(() => {
   remoteDisplayLauncherMock.launchRemoteApplicationForDevice.mockReset();
   remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
   tauriAdapterMock.ipcListDirectory.mockReset();
+  tauriAdapterMock.ipcStartFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockResolvedValue({
     ok: true,
     value: {
@@ -118,6 +121,22 @@ beforeEach(() => {
           readonly: false,
         },
       ],
+    },
+  });
+  tauriAdapterMock.ipcStartFileTransfer.mockResolvedValue({
+    ok: true,
+    value: {
+      transfer_id: "file-transfer-1",
+      status: "completed",
+      source_device_id: "agent-device",
+      target_device_id: "peer-device",
+      transport_kind: "local",
+      total_entries: 1,
+      copied_entries: 1,
+      total_bytes: 2048,
+      copied_bytes: 2048,
+      error: null,
+      entries: [],
     },
   });
 });
@@ -169,6 +188,69 @@ describe("DeviceDetailPage info tab", () => {
     });
     expect(screen.getByText("service-report.txt")).toBeInTheDocument();
     expect(tauriAdapterMock.ipcListDirectory).toHaveBeenCalledWith(null);
+  });
+
+  it("starts a service-owned file transfer when a file is dropped onto another device pane", async () => {
+    deviceDataMock.devices = [
+      device(),
+      device({
+        id: "peer-device",
+        deviceId: "peer-device",
+        name: "Peer PC",
+        ip: "192.168.1.3",
+        favorite: false,
+      }),
+    ];
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("service-report.txt")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getAllByRole("button", { name: "添加设备" })[0]!);
+    await user.click(screen.getByRole("button", { name: /Peer PC/ }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText("service-report.txt").length).toBeGreaterThan(1);
+    });
+
+    const dragStore: Record<string, string> = {};
+    const dataTransfer = {
+      effectAllowed: "",
+      dropEffect: "",
+      setData: vi.fn((key: string, value: string) => {
+        dragStore[key] = value;
+      }),
+      getData: vi.fn((key: string) => dragStore[key] ?? ""),
+    };
+
+    fireEvent.dragStart(screen.getAllByText("service-report.txt")[0]!, { dataTransfer });
+    fireEvent.drop(screen.getAllByText("Peer PC")[0]!, { dataTransfer });
+
+    await waitFor(() => {
+      expect(tauriAdapterMock.ipcStartFileTransfer).toHaveBeenCalledWith({
+        source_device_id: "agent-device",
+        target_device_id: "peer-device",
+        entries: [
+          {
+            source_path: "C:\\Users\\tester\\service-report.txt",
+            file_name: "service-report.txt",
+            kind: "file",
+          },
+        ],
+        target_path: "C:\\Users\\tester",
+        conflict_policy: "rename",
+        transport_hint: "local",
+      });
+    });
   });
 
   it("shows remote launch failures inline without a blocking browser alert", async () => {

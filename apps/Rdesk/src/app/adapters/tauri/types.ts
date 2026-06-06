@@ -282,6 +282,43 @@ export interface DirectoryList {
   entries: FileEntry[];
 }
 
+export type FileTransferConflictPolicy = "reject" | "rename" | "replace";
+export type FileTransferStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface FileTransferEntry {
+  source_path: string;
+  file_name?: string | null;
+  kind: FileEntryKind;
+}
+
+export interface FileTransferStartRequest {
+  source_device_id?: string | null;
+  target_device_id?: string | null;
+  entries: FileTransferEntry[];
+  target_path: string;
+  conflict_policy?: FileTransferConflictPolicy;
+  transport_hint?: string | null;
+}
+
+export interface FileTransferTaskSnapshot {
+  transfer_id: string;
+  status: FileTransferStatus;
+  source_device_id?: string | null;
+  target_device_id?: string | null;
+  transport_kind: string;
+  total_entries: number;
+  copied_entries: number;
+  total_bytes?: number | null;
+  copied_bytes: number;
+  error?: string | null;
+  entries: FileEntry[];
+}
+
 export interface WindowCaptureTarget {
   id?: string;
   platform?: "windows" | "macos" | string;

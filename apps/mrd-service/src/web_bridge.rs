@@ -510,6 +510,9 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
         IpcRequest::LanDiscoverySnapshot
             | IpcRequest::RefreshLanDiscovery
             | IpcRequest::ListDirectory { .. }
+            | IpcRequest::StartFileTransfer { .. }
+            | IpcRequest::ListFileTransfers
+            | IpcRequest::CancelFileTransfer { .. }
             | IpcRequest::WakeOnLan { .. }
             | IpcRequest::RequestRemoteDevicePowerAction { .. }
             | IpcRequest::ListSessions
@@ -723,6 +726,28 @@ mod tests {
     fn web_bridge_allows_directory_listing() {
         assert!(is_ipc_request_allowed(&IpcRequest::ListDirectory {
             path: Some(".".to_string()),
+        }));
+    }
+
+    #[test]
+    fn web_bridge_allows_local_file_transfer_requests() {
+        assert!(is_ipc_request_allowed(&IpcRequest::StartFileTransfer {
+            request: mrd_ipc::FileTransferStartRequest {
+                source_device_id: None,
+                target_device_id: None,
+                entries: vec![mrd_ipc::FileTransferEntry {
+                    source_path: "source.txt".to_string(),
+                    file_name: Some("source.txt".to_string()),
+                    kind: mrd_ipc::FileEntryKind::File,
+                }],
+                target_path: ".".to_string(),
+                conflict_policy: mrd_ipc::FileTransferConflictPolicy::Rename,
+                transport_hint: Some("local".to_string()),
+            },
+        }));
+        assert!(is_ipc_request_allowed(&IpcRequest::ListFileTransfers));
+        assert!(is_ipc_request_allowed(&IpcRequest::CancelFileTransfer {
+            transfer_id: "file-transfer-1".to_string(),
         }));
     }
 

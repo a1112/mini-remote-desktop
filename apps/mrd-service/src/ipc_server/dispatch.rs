@@ -41,6 +41,16 @@ impl IpcServer {
 
             IpcRequest::ListDirectory { path } => files::list_directory(path),
 
+            IpcRequest::StartFileTransfer { request } => {
+                files::start_file_transfer(&self.app_state, request).await
+            }
+
+            IpcRequest::ListFileTransfers => files::list_file_transfers(&self.app_state).await,
+
+            IpcRequest::CancelFileTransfer { transfer_id } => {
+                files::cancel_file_transfer(&self.app_state, transfer_id).await
+            }
+
             IpcRequest::WakeOnLan {
                 device_id,
                 mac_address,

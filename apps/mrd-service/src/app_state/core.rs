@@ -1,8 +1,8 @@
 use super::{
     AuditLogRegistry, CapabilitySnapshotRegistry, CaptureSourceRegistry, DeviceIdentityRegistry,
-    DeviceRegistry, DisplayModeRegistry, MediaPipelineRegistry, MediaProfileRegistry,
-    MediaTaskRegistry, ProbeRegistry, SessionPeerMediaCapabilityRegistry, SessionRegistry,
-    ShellState, TrayPortRef,
+    DeviceRegistry, DisplayModeRegistry, FileTransferRegistry, MediaPipelineRegistry,
+    MediaProfileRegistry, MediaTaskRegistry, ProbeRegistry, SessionPeerMediaCapabilityRegistry,
+    SessionRegistry, ShellState, TrayPortRef,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use super::{MediaRenderQueueRegistry, MediaSurfaceRendererRegistry};
@@ -51,6 +51,8 @@ pub struct AppState {
     pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
     /// Service-owned keyboard and mouse injection state.
     pub control_input: Arc<Mutex<ControlInputRegistry>>,
+    /// Service-owned file transfer task snapshots.
+    pub file_transfers: Arc<Mutex<FileTransferRegistry>>,
     /// Receiver pipeline state keyed by session.
     pub media_pipelines: Arc<Mutex<MediaPipelineRegistry>>,
     /// Native renderer instances keyed by receiver session/surface.
@@ -100,6 +102,7 @@ impl AppState {
             )),
             capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             control_input: Arc::new(Mutex::new(ControlInputRegistry::default())),
+            file_transfers: Arc::new(Mutex::new(FileTransferRegistry::default())),
             media_pipelines: Arc::new(Mutex::new(MediaPipelineRegistry::default())),
             #[cfg(any(windows, target_os = "macos"))]
             media_surface_renderers: Arc::new(Mutex::new(MediaSurfaceRendererRegistry::default())),
@@ -177,6 +180,11 @@ impl AppState {
     /// Get a clone of the service-owned control input registry.
     pub fn control_input(&self) -> Arc<Mutex<ControlInputRegistry>> {
         self.control_input.clone()
+    }
+
+    /// Get a clone of the file transfer registry.
+    pub fn file_transfers(&self) -> Arc<Mutex<FileTransferRegistry>> {
+        self.file_transfers.clone()
     }
 
     /// Return the currently cached local capability snapshot without running runtime probes.

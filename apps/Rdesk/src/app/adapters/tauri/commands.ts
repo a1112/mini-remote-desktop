@@ -41,6 +41,8 @@ import type {
   ControlInputAccepted,
   ControlInputEvent,
   DirectoryList,
+  FileTransferStartRequest,
+  FileTransferTaskSnapshot,
   AdaptiveMediaConfig,
   MediaAdaptationSnapshot,
   MediaProfile,
@@ -592,6 +594,43 @@ export async function ipcListDirectory(path?: string | null): Promise<AdapterRes
       path: path ?? null,
     },
     responseField<DirectoryList>('listing')
+  );
+}
+
+export async function ipcStartFileTransfer(
+  request: FileTransferStartRequest
+): Promise<AdapterResult<FileTransferTaskSnapshot>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot>(
+    'ipc_start_file_transfer',
+    { request },
+    {
+      type: 'StartFileTransfer',
+      request,
+    },
+    responseField<FileTransferTaskSnapshot>('transfer')
+  );
+}
+
+export async function ipcListFileTransfers(): Promise<AdapterResult<FileTransferTaskSnapshot[]>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot[]>(
+    'ipc_list_file_transfers',
+    undefined,
+    { type: 'ListFileTransfers' },
+    responseField<FileTransferTaskSnapshot[]>('transfers')
+  );
+}
+
+export async function ipcCancelFileTransfer(
+  transferId: string
+): Promise<AdapterResult<FileTransferTaskSnapshot>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot>(
+    'ipc_cancel_file_transfer',
+    { transferId },
+    {
+      type: 'CancelFileTransfer',
+      transfer_id: transferId,
+    },
+    responseField<FileTransferTaskSnapshot>('transfer')
   );
 }
 

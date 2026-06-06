@@ -25,6 +25,7 @@ mod core;
 mod device_identity_registry;
 mod device_registry;
 mod display_mode_registry;
+mod file_transfer_registry;
 mod lan_identity;
 mod media_pipeline_registry;
 mod media_profile_registry;
@@ -46,6 +47,7 @@ pub use core::AppState;
 pub use device_identity_registry::DeviceIdentityRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
+pub use file_transfer_registry::FileTransferRegistry;
 pub use lan_identity::default_lan_device_identity;
 #[cfg(test)]
 pub(crate) use lan_identity::lan_device_identity_from;

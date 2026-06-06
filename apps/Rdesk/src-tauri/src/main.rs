@@ -1914,6 +1914,64 @@ async fn ipc_list_directory(path: Option<String>) -> Result<mrd_ipc::DirectoryLi
     }
 }
 
+/// Start a service-owned file transfer through mrd-service IPC.
+#[tauri::command]
+async fn ipc_start_file_transfer(
+    request: mrd_ipc::FileTransferStartRequest,
+) -> Result<mrd_ipc::FileTransferTaskSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::StartFileTransfer { request })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferStarted { transfer } => Ok(transfer),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List service-owned file transfer tasks through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_file_transfers() -> Result<Vec<mrd_ipc::FileTransferTaskSnapshot>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListFileTransfers)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferList { transfers } => Ok(transfers),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Cancel a service-owned file transfer task through mrd-service IPC.
+#[tauri::command]
+async fn ipc_cancel_file_transfer(
+    transfer_id: String,
+) -> Result<mrd_ipc::FileTransferTaskSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::CancelFileTransfer { transfer_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferCancelled { transfer } => Ok(transfer),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Send a Wake-on-LAN magic packet via mrd-service IPC.
 #[tauri::command]
 async fn ipc_wake_on_lan(
@@ -4023,6 +4081,9 @@ fn main() {
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
             ipc_list_directory,
+            ipc_start_file_transfer,
+            ipc_list_file_transfers,
+            ipc_cancel_file_transfer,
             ipc_wake_on_lan,
             ipc_request_remote_device_power_action,
             ipc_list_sessions,
