@@ -4,6 +4,8 @@ import {
   browserWebrtcPreviewStart,
   browserWebrtcPreviewStop,
   ipcCapabilitySnapshot,
+  ipcStartLanRemoteSession,
+  ipcUpdateMediaProfile,
   ipcListLocalCaptureSources,
   ipcRefreshLanDiscovery,
   ipcRequestRemoteDevicePowerAction,
@@ -242,6 +244,75 @@ describe('commands service bridge integration', () => {
       type: 'RequestRemoteDevicePowerAction',
       device_id: 'agent-device',
       action: 'restart',
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('preserves extended media profile fields through LAN session bridge requests', async () => {
+    const invoke = getMockInvoke();
+    const requestedProfile = {
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 80,
+      codec: 'hevc',
+      codec_profile: 'main10',
+      bit_depth: 10,
+      chroma_subsampling: '4:2:0',
+      pixel_format: 'p010',
+      hdr_enabled: true,
+      color_mode: 'low_chroma',
+      color_pipeline: 'hdr_main10',
+    } as const;
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          response: {
+            type: 'SessionStarted',
+            session_id: 'session-123',
+          },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          response: {
+            type: 'MediaProfileUpdated',
+            negotiation: {
+              requested: requestedProfile,
+              selected: requestedProfile,
+              status: 'accepted',
+              reason: null,
+            },
+          },
+        }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const started = await ipcStartLanRemoteSession(
+      'session-123',
+      'agent-device',
+      'quic',
+      requestedProfile
+    );
+    const updated = await ipcUpdateMediaProfile('session-123', requestedProfile);
+    const startBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+    const updateBody = JSON.parse((fetchMock.mock.calls[1]?.[1] as RequestInit).body as string);
+
+    expect(started.ok && started.value).toBe('session-123');
+    expect(updated.ok && updated.value.selected.color_pipeline).toBe('hdr_main10');
+    expect(startBody.request).toEqual({
+      type: 'StartLanRemoteSession',
+      session_id: 'session-123',
+      target_device_id: 'agent-device',
+      transport_kind: 'quic',
+      requested_profile: requestedProfile,
+    });
+    expect(updateBody.request).toEqual({
+      type: 'UpdateMediaProfile',
+      session_id: 'session-123',
+      requested_profile: requestedProfile,
     });
     expect(invoke).not.toHaveBeenCalled();
   });
