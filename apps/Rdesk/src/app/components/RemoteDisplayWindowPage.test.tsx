@@ -201,6 +201,7 @@ describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    delete (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__;
     getMockInvoke().mockReset();
     runtimeMock.isTauri = true;
     mockRenderAreaRect();
@@ -839,6 +840,147 @@ describe("RemoteDisplayWindowPage", () => {
         },
       ]);
     });
+  });
+
+  it("enables remote control from service-owned keyboard mouse capability snapshots", async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        request?: { type?: string; session_id?: string };
+      };
+      const request = body.request;
+      if (request?.type === "CapabilitySnapshot") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "CapabilitySnapshot",
+              snapshot: {
+                schema_version: 1,
+                platform: "windows",
+                service_version: "0.1.0",
+                capabilities: [
+                  {
+                    id: "control.keyboard_mouse",
+                    domain: "control",
+                    label: "Keyboard and mouse control",
+                    status: "available",
+                    platform: "windows",
+                  },
+                ],
+                constraints: [],
+                profiles: [],
+                updated_at_ms: 1,
+              },
+            },
+          }),
+        };
+      }
+      if (request?.type === "SessionRuntimeSnapshot") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "SessionRuntimeSnapshot",
+              snapshot: {
+                session_id: request.session_id,
+                role: "controller",
+                state: "streaming",
+                transport_kind: "quic",
+                last_error: null,
+                sender_active: false,
+                receiver_active: true,
+              },
+            },
+          }),
+        };
+      }
+      if (request?.type === "ProbeSnapshot") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "ProbeSnapshot",
+              snapshot: {
+                session_id: request.session_id,
+                frames_received: 2,
+                frames_decoded: 2,
+                frames_dropped: 0,
+                current_fps: 60,
+                bitrate_mbps: 20,
+                media_probe_valid: true,
+                media_probe_width: 1920,
+                media_probe_height: 1080,
+                media_probe_target_fps: 60,
+                media_probe_target_bitrate_mbps: 20,
+                latest_frame_width: 1920,
+                latest_frame_height: 1080,
+                last_error: null,
+              },
+            },
+          }),
+        };
+      }
+      if (request?.type === "MediaPipelineSnapshot") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "MediaPipelineSnapshot",
+              snapshot: {
+                session_id: request.session_id,
+                active_width: 1920,
+                active_height: 1080,
+                active_fps: 60,
+                active_bitrate_mbps: 20,
+                queue_depth: 0,
+                dropped_frames: 0,
+                stage_metrics: [],
+              },
+            },
+          }),
+        };
+      }
+      if (request?.type === "SendControlInput") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "ControlInputAccepted",
+              session_id: request.session_id,
+              lane: "realtime",
+              event_count: 1,
+            },
+          }),
+        };
+      }
+      return {
+        ok: true,
+        json: async () => ({ response: { type: "Ack" } }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
+
+    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
+
+    await waitFor(() => {
+      const sentRequests = fetchMock.mock.calls
+        .map(([, init]) => JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")))
+        .map((body) => body.request)
+        .filter((request) => request?.type === "SendControlInput");
+      expect(sentRequests).toEqual([
+        {
+          type: "SendControlInput",
+          session_id: "p2p-quic-123",
+          event: { kind: "mouse_move", x: 960, y: 540 },
+        },
+      ]);
+    });
+    expect(getMockInvoke()).not.toHaveBeenCalledWith("test_get_capabilities", expect.anything());
   });
 
   it("captures extended pointer buttons on the focused remote render area", async () => {
