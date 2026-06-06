@@ -233,7 +233,13 @@ fn profile_to_media(profile: &CapabilityProfile) -> MediaProfile {
         fps: profile.fps,
         bitrate_mbps: profile.bitrate_mbps,
         codec: profile.codec.clone(),
-        ..MediaProfile::default()
+        codec_profile: profile.codec_profile.clone(),
+        bit_depth: profile.bit_depth,
+        chroma_subsampling: profile.chroma_subsampling.clone(),
+        pixel_format: profile.pixel_format.clone(),
+        hdr_enabled: profile.hdr_enabled,
+        color_mode: profile.color_mode.clone(),
+        color_pipeline: profile.color_pipeline.clone(),
     }
 }
 
@@ -2431,6 +2437,41 @@ mod tests {
                 "transport.media_profile_control_v1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn scenario_evaluation_preserves_lan_2k144_main10_media_metadata() {
+        let snapshot = CapabilitySnapshot {
+            schema_version: SCHEMA_VERSION,
+            platform: CapabilityPlatform::Windows,
+            service_version: "test".to_string(),
+            capabilities: local_capabilities(
+                CapabilityPlatform::Windows,
+                CapabilityProbeMode::Static,
+            ),
+            constraints: default_constraints(),
+            profiles: default_profiles(),
+            updated_at_ms: 1,
+        };
+
+        let evaluation =
+            evaluate_scenario_profile_against_snapshot(&snapshot, "lan.2k144.main10", None);
+        let selected = evaluation
+            .selected_profile
+            .expect("lan.2k144.main10 selected media profile");
+
+        assert_eq!(selected.width, 2560);
+        assert_eq!(selected.height, 1440);
+        assert_eq!(selected.fps, 144);
+        assert_eq!(selected.bitrate_mbps, 80);
+        assert_eq!(selected.codec, "hevc");
+        assert_eq!(selected.codec_profile.as_deref(), Some("main10"));
+        assert_eq!(selected.bit_depth, Some(10));
+        assert_eq!(selected.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(selected.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(selected.hdr_enabled, Some(true));
+        assert_eq!(selected.color_mode.as_deref(), Some("full"));
+        assert_eq!(selected.color_pipeline.as_deref(), Some("hdr_main10"));
     }
 
     #[test]
