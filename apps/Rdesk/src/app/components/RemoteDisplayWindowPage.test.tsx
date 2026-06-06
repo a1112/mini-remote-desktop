@@ -2588,21 +2588,8 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
-      }
-      if (command === "ipc_list_sessions") {
-        return Promise.resolve([
-          {
-            session_id: "p2p-quic-123",
-            role: "controller",
-            state: "streaming",
-            transport_kind: "quic",
-            last_error: null,
-            sender_active: false,
-            receiver_active: true,
-            peer_device_id: "target-device",
-          },
-        ]);
       }
       if (command === "ipc_lan_discovery_snapshot") {
         return Promise.resolve({
@@ -2662,6 +2649,7 @@ describe("RemoteDisplayWindowPage", () => {
         event: { kind: "mouse_move", x: 1280, y: 720 },
       });
     });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_list_sessions")).toBe(false);
   });
 
   it("releases active remote keyboard input when the window loses focus", async () => {

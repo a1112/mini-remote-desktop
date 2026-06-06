@@ -37,7 +37,6 @@ import {
   currentRemoteDisplayWindowContext,
   getSystemResourceSnapshot,
   ipcLanDiscoverySnapshot,
-  ipcListSessions,
   ipcMediaPipelineSnapshot,
   ipcSendControlInput,
   presentTestHarnessFrameOnNativeSurface,
@@ -58,7 +57,6 @@ import {
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
-  type SessionInfo,
   type SystemResourceSnapshot,
   type TestConfig,
   type TestMatrixConfig,
@@ -1543,11 +1541,9 @@ function keyboardMouseControlAvailable(
 }
 
 function peerKeyboardMouseControlAvailable(
-  sessionId: string,
-  sessions: readonly SessionInfo[],
+  peerDeviceId: string | null | undefined,
   lanDiscovery: LanDiscoverySnapshot | null
 ): boolean {
-  const peerDeviceId = sessions.find((session) => session.session_id === sessionId)?.peer_device_id;
   if (!peerDeviceId) return false;
   const peer = lanDiscovery?.peers.find((peer) => peer.device_id === peerDeviceId);
   return peer?.media_capabilities?.includes("control.keyboard_mouse") ?? false;
@@ -2814,15 +2810,8 @@ export function RemoteDisplayWindowPage() {
 
     let cancelled = false;
     const refreshPeerInputCapability = async () => {
-      const [sessionsResult, discoveryResult] = await Promise.all([
-        ipcListSessions(),
-        ipcLanDiscoverySnapshot(),
-      ]);
+      const discoveryResult = await ipcLanDiscoverySnapshot();
       if (cancelled) return;
-      const sessions =
-        sessionsResult.ok && Array.isArray(sessionsResult.value)
-          ? sessionsResult.value
-          : [];
       const discovery =
         discoveryResult.ok &&
         discoveryResult.value &&
@@ -2830,7 +2819,7 @@ export function RemoteDisplayWindowPage() {
           ? discoveryResult.value
           : null;
       setPeerInputControlAvailable(
-        peerKeyboardMouseControlAvailable(sessionId, sessions, discovery)
+        peerKeyboardMouseControlAvailable(sessionSnapshot.peer_device_id, discovery)
       );
     };
 
@@ -2846,6 +2835,7 @@ export function RemoteDisplayWindowPage() {
   }, [
     isLocalPipelinePreview,
     sessionId,
+    sessionSnapshot?.peer_device_id,
     sessionSnapshot?.receiver_active,
     sessionSnapshot?.role,
     sessionSnapshot?.state,

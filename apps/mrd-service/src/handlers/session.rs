@@ -671,6 +671,7 @@ fn session_runtime_snapshot(s: &SessionSnapshot) -> mrd_ipc::SessionRuntimeSnaps
         last_error: s.last_error.clone(),
         sender_active: s.sender_active,
         receiver_active: s.receiver_active,
+        peer_device_id: peer_device_id(s),
     }
 }
 
@@ -856,6 +857,10 @@ mod tests {
                 assert_eq!(snapshot.device_id, Some(device_id));
                 assert_eq!(snapshot.sessions.len(), 1);
                 assert_eq!(snapshot.sessions[0].session_id, session_id);
+                assert_eq!(
+                    snapshot.sessions[0].peer_device_id,
+                    Some(DeviceId("agent".to_string()))
+                );
             }
             other => panic!("Expected RuntimeSnapshot response, got {other:?}"),
         }

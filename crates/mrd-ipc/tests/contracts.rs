@@ -779,10 +779,12 @@ fn serialize_deserialize_session_snapshot_response() {
             last_error: None,
             sender_active: false,
             receiver_active: false,
+            peer_device_id: Some(test_device_id()),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"peer_device_id\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
     assert_eq!(response, deserialized);

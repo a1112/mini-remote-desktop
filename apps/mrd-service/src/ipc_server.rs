@@ -129,6 +129,7 @@ mod tests {
                 assert_eq!(snapshot.session_id, session_id);
                 assert_eq!(snapshot.state, "listening"); // Only local bootstrap
                 assert_eq!(snapshot.transport_kind, "quic");
+                assert_eq!(snapshot.peer_device_id, Some(DeviceId("agent".to_string())));
             }
             _ => panic!("Expected SessionSnapshot response"),
         }

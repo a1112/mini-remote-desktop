@@ -60,6 +60,7 @@ export interface SessionRuntimeSnapshot {
   last_error?: string;
   sender_active: boolean;
   receiver_active: boolean;
+  peer_device_id?: string | null;
 }
 
 export interface RuntimeSnapshot {
