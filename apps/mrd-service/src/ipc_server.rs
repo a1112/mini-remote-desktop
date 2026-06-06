@@ -258,6 +258,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_device_power_action_routes_through_lan_peer_lookup() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::RequestRemoteDevicePowerAction {
+                device_id: DeviceId("missing-agent".to_string()),
+                action: mrd_ipc::RemoteDevicePowerAction::Restart,
+            })
+            .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_REMOTE_POWER");
+                assert!(message.contains("LAN peer not found"));
+                assert!(message.contains("missing-agent"));
+            }
+            _ => panic!("expected LAN remote power routing error"),
+        }
+    }
+
+    #[tokio::test]
     async fn list_local_capture_sources_returns_local_response_or_error() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);

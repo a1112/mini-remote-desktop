@@ -231,7 +231,7 @@ use protocol::{
     LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
     LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, PROTOCOL_VERSION,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
@@ -809,6 +809,59 @@ pub async fn request_lan_capture_sources(
             }
         }
         _ => anyhow::bail!("unexpected LAN capture sources response"),
+    }
+}
+
+pub async fn request_lan_remote_device_power_action(
+    app_state: &Arc<AppState>,
+    target_device_id: &DeviceId,
+    action: mrd_ipc::RemoteDevicePowerAction,
+) -> Result<()> {
+    let target =
+        peer_control_addr_with_remote_power_capability(app_state, target_device_id).await?;
+    let source_device_id = local_device_id(app_state).await?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN remote power UDP socket")?;
+    let packet = LanDiscoveryPacket::RemoteDevicePowerAction {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        source_device_id,
+        action: action.clone(),
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN remote power request timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::RemoteDevicePowerActionAck {
+            magic,
+            app_id,
+            device_id,
+            action: ack_action,
+            accepted,
+            message,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id)
+            && device_id == target_device_id.0
+            && ack_action == action =>
+        {
+            if accepted {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "LAN peer rejected remote power action: {}",
+                    message.unwrap_or_else(|| "unknown reason".to_string())
+                );
+            }
+        }
+        _ => anyhow::bail!("unexpected LAN remote power response"),
     }
 }
 
@@ -1478,9 +1531,56 @@ async fn handle_packet(
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::ControlInputAck { .. } => {}
+        LanDiscoveryPacket::RemoteDevicePowerAction {
+            magic,
+            app_id,
+            instance_id,
+            source_device_id,
+            action,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let local_device_id = local_device_id(app_state).await?;
+            let action_result = accept_lan_remote_device_power_action(&action);
+            let (accepted, message) = match action_result {
+                Ok(()) => (true, Some("accepted".to_string())),
+                Err(error) => (false, Some(error.to_string())),
+            };
+            tracing::info!(
+                source_device_id = %source_device_id,
+                local_device_id = %local_device_id,
+                accepted,
+                "handled LAN remote device power action"
+            );
+            let ack = LanDiscoveryPacket::RemoteDevicePowerActionAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                device_id: local_device_id,
+                action,
+                accepted,
+                message,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::RemoteDevicePowerActionAck { .. } => {}
     }
 
     Ok(())
+}
+
+fn accept_lan_remote_device_power_action(action: &mrd_ipc::RemoteDevicePowerAction) -> Result<()> {
+    let action_label = match action {
+        mrd_ipc::RemoteDevicePowerAction::Restart => "restart",
+        mrd_ipc::RemoteDevicePowerAction::Shutdown => "shutdown",
+    };
+    anyhow::bail!("remote power executor is not enabled on this peer for {action_label}")
 }
 
 async fn accept_lan_remote_session(
@@ -1983,6 +2083,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
+        LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string(),
     ];
     let input_control_available = app_state.control_input().lock().await.is_available();
     if input_control_available {
@@ -2309,6 +2410,34 @@ async fn peer_control_addr_with_input_control_capability(
         anyhow::bail!(
             "LAN peer does not advertise required input control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
             LAN_INPUT_CONTROL_TRANSPORT,
+            peer_device_id.0,
+            format_peer_transports(&peer_transports)
+        );
+    }
+    Ok(target)
+}
+
+async fn peer_control_addr_with_remote_power_capability(
+    app_state: &Arc<AppState>,
+    peer_device_id: &DeviceId,
+) -> Result<SocketAddr> {
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(peer_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", peer_device_id.0))?;
+    if !peer_transports
+        .iter()
+        .any(|transport| transport.eq_ignore_ascii_case(LAN_REMOTE_POWER_CONTROL_TRANSPORT))
+    {
+        anyhow::bail!(
+            "LAN peer does not advertise required remote power control [{}]: {} supports {}. Rebuild and restart the peer mrd-service/Rdesk from the latest main branch",
+            LAN_REMOTE_POWER_CONTROL_TRANSPORT,
             peer_device_id.0,
             format_peer_transports(&peer_transports)
         );
@@ -7392,6 +7521,10 @@ mod tests {
             super::protocol::LAN_INPUT_CONTROL_TRANSPORT,
             "input_control_v1"
         );
+        assert_eq!(
+            super::protocol::LAN_REMOTE_POWER_CONTROL_TRANSPORT,
+            "remote_power_control_v1"
+        );
     }
 
     #[test]
@@ -7583,6 +7716,9 @@ mod tests {
             .transports
             .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
         assert!(announcement
+            .transports
+            .contains(&LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string()));
+        assert!(announcement
             .media_capabilities
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
     }
@@ -7608,6 +7744,9 @@ mod tests {
         assert!(!announcement
             .transports
             .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
+        assert!(announcement
+            .transports
+            .contains(&LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string()));
         assert!(!announcement
             .media_capabilities
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
@@ -7923,6 +8062,72 @@ mod tests {
         assert_eq!(snapshot.reliable.accepted_messages, 1);
         assert_eq!(snapshot.reliable.injected_messages, 1);
         assert_eq!(snapshot.realtime.injected_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn request_lan_remote_power_routes_to_discovered_peer() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller Device".to_string(),
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state.devices.lock().await.register(
+            DeviceId("target-device".to_string()),
+            "Target Device".to_string(),
+        );
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec![
+                        "quic".to_string(),
+                        LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string(),
+                    ],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: vec![],
+                    mac_address: None,
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let error = request_lan_remote_device_power_action(
+            &controller_state,
+            &DeviceId("target-device".to_string()),
+            mrd_ipc::RemoteDevicePowerAction::Restart,
+        )
+        .await
+        .expect_err("peer should reject until executor is enabled");
+
+        handler.await.unwrap();
+        assert!(error
+            .to_string()
+            .contains("remote power executor is not enabled"));
     }
 
     #[tokio::test]

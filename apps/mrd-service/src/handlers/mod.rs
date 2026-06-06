@@ -365,18 +365,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn device_handler_rejects_remote_power_without_agent_executor() {
+    #[tokio::test]
+    async fn device_handler_routes_remote_power_through_lan_peer_lookup() {
+        let app_state = Arc::new(AppState::new());
         let response = super::device::request_remote_device_power_action(
+            &app_state,
             DeviceId("agent-device".to_string()),
             RemoteDevicePowerAction::Restart,
-        );
+        )
+        .await;
 
         match response {
             IpcResponse::Error { code, message } => {
-                assert_eq!(code, "E_REMOTE_POWER_UNSUPPORTED");
+                assert_eq!(code, "E_REMOTE_POWER");
                 assert!(message.contains("agent-device"));
-                assert!(message.contains("restart"));
+                assert!(message.contains("LAN peer not found"));
             }
             _ => panic!("expected remote power unsupported error"),
         }

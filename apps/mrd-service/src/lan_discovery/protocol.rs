@@ -1,7 +1,7 @@
 use super::discovery_identity::default_app_id;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DisplayMode,
-    DisplayModeChange, MediaProfile, MediaProfileNegotiation,
+    DisplayModeChange, MediaProfile, MediaProfileNegotiation, RemoteDevicePowerAction,
 };
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,7 @@ pub(super) const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_cont
 pub(super) const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 pub(super) const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 pub(super) const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
+pub(super) const LAN_REMOTE_POWER_CONTROL_TRANSPORT: &str = "remote_power_control_v1";
 pub(super) const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 pub(super) const LAN_INPUT_CONTROL_CAPABILITY: &str = "control.keyboard_mouse";
 
@@ -221,6 +222,26 @@ pub(super) enum LanDiscoveryPacket {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lane: Option<ControlInputLane>,
         event_count: u32,
+        timestamp_ms: u64,
+    },
+    RemoteDevicePowerAction {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        source_device_id: String,
+        action: RemoteDevicePowerAction,
+        timestamp_ms: u64,
+    },
+    RemoteDevicePowerActionAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        device_id: String,
+        action: RemoteDevicePowerAction,
+        accepted: bool,
+        message: Option<String>,
         timestamp_ms: u64,
     },
 }

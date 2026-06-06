@@ -46,7 +46,7 @@ impl IpcServer {
             } => device::wake_on_lan(device_id, mac_address, broadcast_addr),
 
             IpcRequest::RequestRemoteDevicePowerAction { device_id, action } => {
-                device::request_remote_device_power_action(device_id, action)
+                device::request_remote_device_power_action(&self.app_state, device_id, action).await
             }
 
             IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
