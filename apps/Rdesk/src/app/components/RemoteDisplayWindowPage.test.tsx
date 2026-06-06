@@ -197,6 +197,38 @@ const localWindowSource = {
 
 const localMixedSources = [...localDisplaySources, localWindowSource];
 
+function lanDiscoverySnapshotWithPeerInput() {
+  return {
+    enabled: true,
+    running: true,
+    discovery_port: 49700,
+    instance_id: "local-instance",
+    peers: [
+      {
+        device_id: "target-device",
+        device_name: "Target",
+        device_type: "desktop",
+        ip: "127.0.0.1",
+        discovery_port: 49700,
+        p2p_control_addr: "127.0.0.1:49701",
+        transports: ["quic"],
+        protocol_version: 1,
+        media_protocol_version: 1,
+        media_capabilities: ["control.keyboard_mouse"],
+        age_ms: 10,
+        p2p_available: true,
+      },
+    ],
+  };
+}
+
+function defaultRemoteDisplayInvoke(command: string): Promise<unknown> {
+  if (command === "ipc_lan_discovery_snapshot") {
+    return Promise.resolve(lanDiscoverySnapshotWithPeerInput());
+  }
+  return Promise.resolve(null);
+}
+
 describe("RemoteDisplayWindowPage", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -584,6 +616,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -674,7 +707,7 @@ describe("RemoteDisplayWindowPage", () => {
           sampled_at_ms: Date.now(),
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -760,6 +793,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -799,7 +833,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -890,7 +924,19 @@ describe("RemoteDisplayWindowPage", () => {
                 last_error: null,
                 sender_active: false,
                 receiver_active: true,
+                peer_device_id: "target-device",
               },
+            },
+          }),
+        };
+      }
+      if (request?.type === "LanDiscoverySnapshot") {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              type: "LanDiscoverySnapshot",
+              snapshot: lanDiscoverySnapshotWithPeerInput(),
             },
           }),
         };
@@ -1024,6 +1070,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1060,7 +1107,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1177,7 +1224,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1234,6 +1281,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1273,7 +1321,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1341,6 +1389,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1380,7 +1429,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1452,6 +1501,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1491,7 +1541,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1564,6 +1614,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1603,7 +1654,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1676,6 +1727,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1715,7 +1767,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1794,6 +1846,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1833,7 +1886,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -1915,6 +1968,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -1954,7 +2008,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2038,6 +2092,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2059,7 +2114,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2138,6 +2193,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2159,7 +2215,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2228,6 +2284,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2249,7 +2306,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2328,6 +2385,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2349,7 +2407,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2468,6 +2526,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2489,7 +2548,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2634,7 +2693,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2650,6 +2709,110 @@ describe("RemoteDisplayWindowPage", () => {
       });
     });
     expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_list_sessions")).toBe(false);
+  });
+
+  it("keeps remote control disabled until the peer advertises keyboard mouse capability", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_controls: ["keyboard_mouse"],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+          peer_device_id: "target-device",
+        });
+      }
+      if (command === "ipc_lan_discovery_snapshot") {
+        return Promise.resolve({
+          enabled: true,
+          running: true,
+          discovery_port: 49700,
+          instance_id: "local-instance",
+          peers: [
+            {
+              device_id: "target-device",
+              device_name: "Target",
+              device_type: "desktop",
+              ip: "127.0.0.1",
+              discovery_port: 49700,
+              p2p_control_addr: "127.0.0.1:49701",
+              transports: ["quic"],
+              protocol_version: 1,
+              media_protocol_version: 1,
+              media_capabilities: ["codec.h264"],
+              age_ms: 10,
+              p2p_available: true,
+            },
+          ],
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          lane: "realtime",
+          event_count: 1,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() =>
+      expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_lan_discovery_snapshot"))
+        .toBe(true)
+    );
+
+    expect(renderArea).toHaveAttribute("tabindex", "-1");
+    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")).toBe(
+      false
+    );
   });
 
   it("releases active remote keyboard input when the window loses focus", async () => {
@@ -2693,6 +2856,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2714,7 +2878,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2783,6 +2947,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2804,7 +2969,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2873,6 +3038,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -2894,7 +3060,7 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -2961,7 +3127,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3012,7 +3178,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 0, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3066,7 +3232,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("p2p-quic-123");
@@ -3125,7 +3291,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-1");
@@ -3146,7 +3312,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3233,7 +3399,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-missing");
@@ -3248,9 +3414,9 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_get_run") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3293,7 +3459,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-web");
@@ -3314,7 +3480,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3365,7 +3531,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-web-2k144-lowlat");
@@ -3386,7 +3552,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3435,7 +3601,7 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3470,7 +3636,7 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3516,7 +3682,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-60s");
@@ -3533,7 +3699,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-60s", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3573,13 +3739,13 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-modal-stop");
       }
       if (command === "test_stop_run") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_harness_get_metrics") {
         return Promise.resolve({
@@ -3593,7 +3759,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-modal-stop", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3634,7 +3800,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-completed");
@@ -3664,7 +3830,7 @@ describe("RemoteDisplayWindowPage", () => {
           },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3687,7 +3853,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_capabilities") {
         return Promise.resolve(windowsCapabilities());
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3718,7 +3884,7 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3775,7 +3941,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-url-override");
@@ -3792,7 +3958,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-url-override", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay(
@@ -3843,7 +4009,7 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -3890,7 +4056,7 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-linux-web");
@@ -3971,7 +4137,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-linux-native");
@@ -3988,7 +4154,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-linux-native", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -4056,7 +4222,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-linux-low-latency");
@@ -4077,7 +4243,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -4139,7 +4305,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-macos-hevc-software");
@@ -4160,7 +4326,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -4219,7 +4385,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-1");
@@ -4236,7 +4402,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-1", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -4295,7 +4461,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-1");
@@ -4312,7 +4478,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-1", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -4404,7 +4570,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "ipc_start_receiver") {
         return Promise.resolve("p2p-quic-123");
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -4497,7 +4663,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -4577,7 +4743,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay(
@@ -4660,7 +4826,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay(
@@ -4740,7 +4906,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay(
@@ -4859,7 +5025,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -4950,7 +5116,7 @@ describe("RemoteDisplayWindowPage", () => {
           reason: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5002,7 +5168,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "ipc_list_local_capture_sources") {
         return Promise.resolve(localMixedSources);
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5078,7 +5244,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "ipc_list_local_capture_sources") {
         return Promise.resolve(localMixedSources);
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5137,7 +5303,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-local-source");
@@ -5154,7 +5320,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "test_get_run") {
         return Promise.resolve({ run_id: "run-local-source", status: "running", summary: null });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5220,7 +5386,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         runIndex += 1;
@@ -5238,7 +5404,7 @@ describe("RemoteDisplayWindowPage", () => {
           },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5309,7 +5475,7 @@ describe("RemoteDisplayWindowPage", () => {
         return Promise.resolve(true);
       }
       if (command === "test_harness_stop") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
       if (command === "test_start_run") {
         return Promise.resolve("run-local-window-source");
@@ -5330,7 +5496,7 @@ describe("RemoteDisplayWindowPage", () => {
           summary: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5441,7 +5607,7 @@ describe("RemoteDisplayWindowPage", () => {
           reason: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5496,6 +5662,7 @@ describe("RemoteDisplayWindowPage", () => {
           transport_kind: "quic",
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -5534,7 +5701,7 @@ describe("RemoteDisplayWindowPage", () => {
           reason: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5593,6 +5760,7 @@ describe("RemoteDisplayWindowPage", () => {
           transport_kind: "quic",
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -5631,7 +5799,7 @@ describe("RemoteDisplayWindowPage", () => {
           reason: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5694,7 +5862,7 @@ describe("RemoteDisplayWindowPage", () => {
       if (command === "ipc_list_remote_capture_sources") {
         return Promise.resolve([]);
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5766,7 +5934,7 @@ describe("RemoteDisplayWindowPage", () => {
           reason: null,
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5810,7 +5978,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5854,7 +6022,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay("local-display-test-1");
@@ -5895,7 +6063,7 @@ describe("RemoteDisplayWindowPage", () => {
           rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();
@@ -5950,6 +6118,7 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
           sender_active: false,
           receiver_active: true,
+          peer_device_id: "target-device",
         });
       }
       if (command === "ipc_probe_snapshot") {
@@ -5972,9 +6141,9 @@ describe("RemoteDisplayWindowPage", () => {
         });
       }
       if (command === "close_remote_display_window") {
-        return Promise.resolve(null);
+        return defaultRemoteDisplayInvoke(command);
       }
-      return Promise.resolve(null);
+      return defaultRemoteDisplayInvoke(command);
     });
 
     renderRemoteDisplay();

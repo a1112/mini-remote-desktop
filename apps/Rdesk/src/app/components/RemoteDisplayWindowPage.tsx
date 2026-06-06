@@ -1524,7 +1524,7 @@ function resolutionDimensions(resolution: ResolutionKey): { width: number; heigh
 }
 
 function keyboardMouseControlAvailable(
-  capabilities: EnvironmentSnapshot | null,
+  _capabilities: EnvironmentSnapshot | null,
   sessionSnapshot: SessionRuntimeSnapshot | null,
   isLocalPipelinePreview: boolean,
   peerInputControlAvailable: boolean
@@ -1534,10 +1534,7 @@ function keyboardMouseControlAvailable(
   if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
     return false;
   }
-  return (
-    peerInputControlAvailable ||
-    (capabilities?.available_controls?.includes("keyboard_mouse") ?? false)
-  );
+  return peerInputControlAvailable;
 }
 
 function peerKeyboardMouseControlAvailable(
