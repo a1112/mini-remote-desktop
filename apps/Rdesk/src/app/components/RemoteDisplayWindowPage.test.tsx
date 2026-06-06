@@ -4319,6 +4319,87 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("keeps remote AV1 profile updates from the window URL", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_update_media_profile") {
+        return Promise.resolve({
+          requested: args?.requestedProfile,
+          selected: args?.requestedProfile,
+          status: "accepted",
+          reason: null,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 40,
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          media_probe_target_fps: 144,
+          media_probe_target_bitrate_mbps: 40,
+          last_error: null,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay(
+      "p2p-quic-123",
+      "?surface=surface-1&profileWidth=2560&profileHeight=1440&profileFps=144&profileBitrateMbps=40&profileCodec=av1"
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "配置" }));
+    fireEvent.click(await screen.findByRole("button", { name: "应用远端" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_update_media_profile", {
+        sessionId: "p2p-quic-123",
+        requestedProfile: expect.objectContaining({
+          width: 2560,
+          height: 1440,
+          fps: 144,
+          bitrate_mbps: 40,
+          codec: "av1",
+          codec_profile: "main",
+          bit_depth: 8,
+          pixel_format: "nv12",
+        }),
+      });
+    });
+  });
+
   it("applies remote dynamic resolution adaptation from the settings panel", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

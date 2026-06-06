@@ -504,6 +504,10 @@ function isHevcEncoder(encoder: EncoderType) {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10" || encoder === "videotoolbox_hevc";
 }
 
+function isAv1Encoder(encoder: EncoderType) {
+  return encoder === "nvenc_av1";
+}
+
 function isNvencHevcEncoder(encoder: EncoderType) {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10";
 }
@@ -1437,10 +1441,11 @@ function bitrateFromSearch(searchParams: URLSearchParams): BitrateKey | null {
   );
 }
 
-function profileCodecFromSearch(searchParams: URLSearchParams): "h264" | "hevc" | null {
+function profileCodecFromSearch(searchParams: URLSearchParams): "h264" | "hevc" | "av1" | null {
   const value = searchParams.get("codec") ?? searchParams.get("profileCodec");
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return null;
+  if (normalized === "av1" || normalized === "av01") return "av1";
   if (normalized === "hevc" || normalized === "h265" || normalized === "h.265") return "hevc";
   return "h264";
 }
@@ -1482,7 +1487,7 @@ function profileColorPipelineFromSearch(
 }
 
 function encoderForRequestedProfileCodec(
-  codec: "h264" | "hevc",
+  codec: "h264" | "hevc" | "av1",
   hostOs: HostOs,
   availableEncoders: readonly string[] | undefined,
   codecProfile: string | null,
@@ -1492,7 +1497,9 @@ function encoderForRequestedProfileCodec(
     codec === "hevc" &&
     (codecProfile?.trim().toLowerCase() === "main10" || bitDepth === 10);
   const candidates: EncoderType[] =
-    codec === "hevc"
+    codec === "av1"
+      ? ["nvenc_av1"]
+      : codec === "hevc"
       ? main10
         ? ["nvenc_hevc_main10", "nvenc_hevc", "videotoolbox_hevc"]
         : hostOs === "macos"
@@ -3584,14 +3591,15 @@ export function RemoteDisplayWindowPage() {
   const buildRemoteMediaProfile = useCallback((): MediaProfile => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
+    const av1 = isAv1Encoder(encoder);
     const main10 = encoder === "nvenc_hevc_main10";
     const profile: MediaProfile = {
       width,
       height,
       fps: Number(fps),
       bitrate_mbps: Number(bitrate),
-      codec: hevc ? "hevc" : "h264",
-      codec_profile: hevc ? (main10 ? "main10" : "main") : "high",
+      codec: av1 ? "av1" : hevc ? "hevc" : "h264",
+      codec_profile: av1 ? "main" : hevc ? (main10 ? "main10" : "main") : "high",
       bit_depth: main10 ? 10 : 8,
       chroma_subsampling: "4:2:0",
       pixel_format: main10 ? "p010" : "nv12",
