@@ -428,24 +428,8 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
     };
 
     if let Some(snapshot) = snapshot {
-        let route_release_to_peer = snapshot.target_device_id.is_some()
-            && snapshot.lifecycle_state == SessionLifecycleState::Streaming
-            && snapshot.receiver_active;
-        if route_release_to_peer {
-            if let Err(error) = crate::lan_discovery::request_lan_control_input(
-                app_state,
-                &session_id,
-                ControlInputEvent::ReleaseAll,
-            )
-            .await
-            {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    %error,
-                    "failed to release remote control input while stopping controller session"
-                );
-            }
-        }
+        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "stopping")
+            .await;
 
         let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
@@ -459,20 +443,6 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             },
         );
         drop(sessions);
-        if !route_release_to_peer {
-            if let Err(error) = app_state
-                .control_input()
-                .lock()
-                .await
-                .handle_event(&ControlInputEvent::ReleaseAll)
-            {
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    %error,
-                    "failed to release active control input while stopping session"
-                );
-            }
-        }
         app_state
             .media_tasks
             .lock()
@@ -509,8 +479,16 @@ pub async fn fail_session(
 ) -> IpcResponse {
     tracing::warn!("Failing session: {} reason={}", session_id.0, reason);
 
-    let mut sessions = app_state.sessions.lock().await;
-    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+    let snapshot = {
+        let sessions = app_state.sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+
+    if let Some(snapshot) = snapshot {
+        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "failing")
+            .await;
+
+        let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
@@ -546,6 +524,41 @@ pub async fn fail_session(
     IpcResponse::Error {
         code: "E404".to_string(),
         message: format!("Session not found: {}", session_id.0),
+    }
+}
+
+async fn release_control_input_for_terminal_session(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    snapshot: &SessionSnapshot,
+    action: &'static str,
+) {
+    let route_release_to_peer = snapshot.target_device_id.is_some()
+        && snapshot.lifecycle_state == SessionLifecycleState::Streaming
+        && snapshot.receiver_active;
+    let result = if route_release_to_peer {
+        crate::lan_discovery::request_lan_control_input(
+            app_state,
+            session_id,
+            ControlInputEvent::ReleaseAll,
+        )
+        .await
+        .map(|_| ())
+    } else {
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&ControlInputEvent::ReleaseAll)
+            .map(|_| ())
+            .map_err(Into::into)
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            session_id = %session_id.0,
+            %error,
+            "failed to release active control input while {action} session"
+        );
     }
 }
 
@@ -924,6 +937,55 @@ mod tests {
 
         let response = stop_session(&app_state, session_id.clone()).await;
         assert!(matches!(response, IpcResponse::SessionStopped { .. }));
+
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_session_releases_active_control_input() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("control-fail-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Listening,
+                    last_error: None,
+                    sender_active: true,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            })
+            .expect("key down");
+
+        let response =
+            fail_session(&app_state, session_id.clone(), "transport lost".to_string()).await;
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
 
         let snapshot = app_state.control_input().lock().await.snapshot(session_id);
         assert_eq!(snapshot.reliable.accepted_messages, 2);
