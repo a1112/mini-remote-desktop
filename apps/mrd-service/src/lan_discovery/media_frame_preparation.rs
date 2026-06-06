@@ -1,6 +1,8 @@
 use anyhow::Result;
 use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::{CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat};
+#[cfg(any(windows, target_os = "macos"))]
+use mrd_render::RenderFrame;
 
 pub(super) fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
     #[cfg(target_os = "macos")]
@@ -311,6 +313,105 @@ pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, V
     Ok((frame.width as u32, frame.height as u32, rgb))
 }
 
+pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
+        DecodedFrameData::CpuBgra32(_) => "cpu_bgra32",
+        DecodedFrameData::CpuI420 { .. } => "cpu_i420",
+        DecodedFrameData::CpuNv12 { .. } => "cpu_nv12",
+        DecodedFrameData::CpuP010 { .. } => "cpu_p010",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => "d3d11_shared_nv12",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => "d3d11_shared_p010",
+    }
+    .to_string()
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+pub(super) fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
+    match frame.data {
+        DecodedFrameData::CpuRgb24(data) => {
+            let expected_len = frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(3))
+                .ok_or_else(|| anyhow::anyhow!("decoded RGB render frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded RGB render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_rgb24(frame.width, frame.height, data))
+        }
+        DecodedFrameData::CpuBgra32(data) => {
+            let expected_len = frame
+                .width
+                .checked_mul(frame.height)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| anyhow::anyhow!("decoded BGRA render frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded BGRA render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_bgra32(frame.width, frame.height, data))
+        }
+        DecodedFrameData::CpuNv12 { data, pitch } => {
+            if pitch < frame.width {
+                anyhow::bail!("decoded NV12 render frame pitch is smaller than width");
+            }
+            let y_bytes = pitch
+                .checked_mul(frame.height)
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 luma byte size overflow"))?;
+            let uv_bytes = pitch
+                .checked_mul(frame.height.div_ceil(2))
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 chroma byte size overflow"))?;
+            let expected_len = y_bytes
+                .checked_add(uv_bytes)
+                .ok_or_else(|| anyhow::anyhow!("decoded NV12 byte size overflow"))?;
+            if data.len() < expected_len {
+                anyhow::bail!("decoded NV12 render frame has invalid byte length");
+            }
+            Ok(RenderFrame::from_nv12(
+                frame.width,
+                frame.height,
+                data,
+                pitch,
+            ))
+        }
+        DecodedFrameData::CpuI420 { .. } => {
+            let (width, height, rgb24) = decoded_frame_to_rgb24(frame)?;
+            Ok(RenderFrame::from_rgb24(
+                width as usize,
+                height as usize,
+                rgb24,
+            ))
+        }
+        DecodedFrameData::CpuP010 { .. } => {
+            anyhow::bail!("CPU P010 decoded frames are not supported by the native renderer yet")
+        }
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => Ok(RenderFrame::from_d3d11_shared_nv12(
+            frame.width,
+            frame.height,
+            shared_handle_y,
+            shared_handle_uv,
+        )),
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 {
+            shared_handle_y,
+            shared_handle_uv,
+            ..
+        } => Ok(RenderFrame::from_d3d11_shared_p010(
+            frame.width,
+            frame.height,
+            shared_handle_y,
+            shared_handle_uv,
+        )),
+    }
+}
+
 fn clamp_yuv_to_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
@@ -378,5 +479,50 @@ mod tests {
 
         assert_eq!((width, height), (2, 1));
         assert_eq!(rgb, vec![3, 2, 1, 6, 5, 4]);
+    }
+
+    #[test]
+    fn decoded_frame_pixel_format_names_cpu_nv12_decoder_output() {
+        let frame = DecodedFrame {
+            width: 2,
+            height: 2,
+            timestamp_us: 42,
+            data: DecodedFrameData::CpuNv12 {
+                data: vec![16, 235, 16, 235, 128, 128],
+                pitch: 2,
+            },
+        };
+
+        assert_eq!(decoded_frame_pixel_format(&frame), "cpu_nv12");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn decoded_frame_to_render_frame_preserves_nv12_pitch() {
+        let frame = DecodedFrame {
+            width: 2,
+            height: 2,
+            timestamp_us: 42,
+            data: DecodedFrameData::CpuNv12 {
+                data: vec![16, 235, 16, 235, 128, 128],
+                pitch: 2,
+            },
+        };
+
+        let render_frame = decoded_frame_to_render_frame(frame).unwrap();
+
+        assert_eq!(render_frame.width, 2);
+        assert_eq!(render_frame.height, 2);
+        assert_eq!(
+            render_frame.pixel_format,
+            mrd_render::RenderPixelFormat::Nv12
+        );
+        assert_eq!(
+            render_frame.data,
+            mrd_render::RenderFrameData::Nv12 {
+                data: vec![16, 235, 16, 235, 128, 128],
+                pitch: 2
+            }
+        );
     }
 }

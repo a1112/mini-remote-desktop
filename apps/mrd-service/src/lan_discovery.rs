@@ -9,14 +9,18 @@ use mrd_ipc::{
 };
 #[cfg(test)]
 use mrd_ipc::{MediaSenderTransportSnapshot, MediaStageMetrics};
+#[cfg(test)]
+use mrd_pipeline_core::DecodedFrameData;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use mrd_pipeline_core::FrameCapture;
 #[cfg(test)]
 use mrd_pipeline_core::FramePixelFormat;
-use mrd_pipeline_core::{CapturedFrame, DecodedFrame, DecodedFrameData, VideoDecoder};
+use mrd_pipeline_core::{CapturedFrame, DecodedFrame, VideoDecoder};
 use mrd_proto::{DeviceId, SessionId};
+#[cfg(test)]
+use mrd_render::RenderFrame;
 #[cfg(any(windows, target_os = "macos"))]
-use mrd_render::{RenderFrame, RendererSnapshot};
+use mrd_render::RendererSnapshot;
 #[cfg(test)]
 use mrd_transport_quic_quinn::QuicAuReassemblerConfig;
 use mrd_transport_quic_quinn::{
@@ -144,11 +148,13 @@ use media_error_policy::{
     LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS,
     LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
 };
+#[cfg(test)]
+use media_frame_preparation::decoded_frame_to_rgb24;
 #[cfg(any(test, target_os = "macos"))]
 use media_frame_preparation::even_dimension;
 use media_frame_preparation::{
-    captured_frame_memory_path, decoded_frame_to_rgb24, h264_target_dimensions,
-    prepare_frame_for_h264, window_h264_capture_dimensions,
+    captured_frame_memory_path, decoded_frame_pixel_format, decoded_frame_to_render_frame,
+    h264_target_dimensions, prepare_frame_for_h264, window_h264_capture_dimensions,
 };
 use media_keyframe_request::{
     decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
@@ -5422,90 +5428,6 @@ fn wait_for_mutex_guard<'a, T>(
     }
 }
 
-#[cfg(any(windows, target_os = "macos"))]
-fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<RenderFrame> {
-    match frame.data {
-        DecodedFrameData::CpuRgb24(data) => {
-            let expected_len = frame
-                .width
-                .checked_mul(frame.height)
-                .and_then(|pixels| pixels.checked_mul(3))
-                .ok_or_else(|| anyhow::anyhow!("decoded RGB render frame byte size overflow"))?;
-            if data.len() != expected_len {
-                anyhow::bail!("decoded RGB render frame has invalid byte length");
-            }
-            Ok(RenderFrame::from_rgb24(frame.width, frame.height, data))
-        }
-        DecodedFrameData::CpuBgra32(data) => {
-            let expected_len = frame
-                .width
-                .checked_mul(frame.height)
-                .and_then(|pixels| pixels.checked_mul(4))
-                .ok_or_else(|| anyhow::anyhow!("decoded BGRA render frame byte size overflow"))?;
-            if data.len() != expected_len {
-                anyhow::bail!("decoded BGRA render frame has invalid byte length");
-            }
-            Ok(RenderFrame::from_bgra32(frame.width, frame.height, data))
-        }
-        DecodedFrameData::CpuNv12 { data, pitch } => {
-            if pitch < frame.width {
-                anyhow::bail!("decoded NV12 render frame pitch is smaller than width");
-            }
-            let y_bytes = pitch
-                .checked_mul(frame.height)
-                .ok_or_else(|| anyhow::anyhow!("decoded NV12 luma byte size overflow"))?;
-            let uv_bytes = pitch
-                .checked_mul(frame.height.div_ceil(2))
-                .ok_or_else(|| anyhow::anyhow!("decoded NV12 chroma byte size overflow"))?;
-            let expected_len = y_bytes
-                .checked_add(uv_bytes)
-                .ok_or_else(|| anyhow::anyhow!("decoded NV12 byte size overflow"))?;
-            if data.len() < expected_len {
-                anyhow::bail!("decoded NV12 render frame has invalid byte length");
-            }
-            Ok(RenderFrame::from_nv12(
-                frame.width,
-                frame.height,
-                data,
-                pitch,
-            ))
-        }
-        DecodedFrameData::CpuI420 { .. } => {
-            let (width, height, rgb24) = decoded_frame_to_rgb24(frame)?;
-            Ok(RenderFrame::from_rgb24(
-                width as usize,
-                height as usize,
-                rgb24,
-            ))
-        }
-        DecodedFrameData::CpuP010 { .. } => {
-            anyhow::bail!("CPU P010 decoded frames are not supported by the native renderer yet")
-        }
-        #[cfg(windows)]
-        DecodedFrameData::D3D11SharedNv12 {
-            shared_handle_y,
-            shared_handle_uv,
-            ..
-        } => Ok(RenderFrame::from_d3d11_shared_nv12(
-            frame.width,
-            frame.height,
-            shared_handle_y,
-            shared_handle_uv,
-        )),
-        #[cfg(windows)]
-        DecodedFrameData::D3D11SharedP010 {
-            shared_handle_y,
-            shared_handle_uv,
-            ..
-        } => Ok(RenderFrame::from_d3d11_shared_p010(
-            frame.width,
-            frame.height,
-            shared_handle_y,
-            shared_handle_uv,
-        )),
-    }
-}
-
 struct LanReceiverDecoder {
     codec: LanAccessUnitCodec,
     backend: &'static str,
@@ -6372,21 +6294,6 @@ fn decode_lan_desktop_frame(
         );
     }
     Ok(decoder.drain_decoded_frames())
-}
-
-fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
-    match &frame.data {
-        DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
-        DecodedFrameData::CpuBgra32(_) => "cpu_bgra32",
-        DecodedFrameData::CpuI420 { .. } => "cpu_i420",
-        DecodedFrameData::CpuNv12 { .. } => "cpu_nv12",
-        DecodedFrameData::CpuP010 { .. } => "cpu_p010",
-        #[cfg(windows)]
-        DecodedFrameData::D3D11SharedNv12 { .. } => "d3d11_shared_nv12",
-        #[cfg(windows)]
-        DecodedFrameData::D3D11SharedP010 { .. } => "d3d11_shared_p010",
-    }
-    .to_string()
 }
 
 async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionId) -> MediaProfile {
