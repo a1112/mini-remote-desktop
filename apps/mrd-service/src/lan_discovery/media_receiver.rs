@@ -1,5 +1,8 @@
+use super::media_access_unit::{describe_lan_access_unit, LanAccessUnitCodec};
+use anyhow::Result;
 #[cfg(any(test, target_os = "macos"))]
 use mrd_ipc::MediaProfile;
+use mrd_pipeline_core::{DecodedFrame, VideoDecoder};
 #[cfg(any(test, windows, target_os = "macos"))]
 use mrd_render::RendererSnapshot;
 #[cfg(any(test, target_os = "macos"))]
@@ -87,6 +90,28 @@ pub(super) fn renderer_snapshot_waitable_delta(
     }
 }
 
+pub(super) fn decode_h264_desktop_frame(
+    decoder: &mut dyn VideoDecoder,
+    payload: &[u8],
+) -> Result<Vec<DecodedFrame>> {
+    decode_lan_desktop_frame(LanAccessUnitCodec::H264, decoder, payload)
+}
+
+pub(super) fn decode_lan_desktop_frame(
+    codec: LanAccessUnitCodec,
+    decoder: &mut dyn VideoDecoder,
+    payload: &[u8],
+) -> Result<Vec<DecodedFrame>> {
+    if let Err(error) = decoder.push_access_unit(payload) {
+        anyhow::bail!(
+            "failed to decode LAN {} access unit: {error}; {}",
+            codec.display_name(),
+            describe_lan_access_unit(codec, payload)
+        );
+    }
+    Ok(decoder.drain_decoded_frames())
+}
+
 #[cfg(any(test, target_os = "macos"))]
 pub(super) fn compressed_direct_render_candidate(
     proxy_enabled: bool,
@@ -123,6 +148,7 @@ fn high_throughput_media_profile(width: u32, height: u32, fps: u32) -> bool {
 mod tests {
     use super::{QuicMediaCodec, QuicMediaPayloadType};
     use mrd_ipc::MediaProfile;
+    use mrd_pipeline_core::{DecodedFrame, PipelineError, VideoDecoder};
     use mrd_render::RendererSnapshot;
 
     #[test]
@@ -153,6 +179,35 @@ mod tests {
             144,
             Some(false)
         ));
+    }
+
+    #[test]
+    fn decode_error_message_uses_selected_access_unit_codec() {
+        struct RejectingDecoder;
+
+        impl VideoDecoder for RejectingDecoder {
+            fn push_access_unit(&mut self, _access_unit: &[u8]) -> Result<(), PipelineError> {
+                Err(PipelineError::message("synthetic failure"))
+            }
+
+            fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+                Vec::new()
+            }
+        }
+
+        let mut decoder = RejectingDecoder;
+        let error = super::decode_lan_desktop_frame(
+            super::super::media_access_unit::LanAccessUnitCodec::Hevc,
+            &mut decoder,
+            &[0, 0, 1, 0x26],
+        )
+        .expect_err("decode should fail")
+        .to_string();
+
+        assert!(error.contains("HEVC access unit"));
+        assert!(!error.contains("H.264"));
+        assert!(!error.contains("invalid magic"));
+        assert!(!error.contains("probe fallback"));
     }
 
     #[test]

@@ -97,9 +97,7 @@ use lan_control_input::{
     accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
 };
 use local_network_identity::local_lan_announcement_mac_address;
-use media_access_unit::{
-    describe_lan_access_unit, h264_access_unit_is_keyframe, LanAccessUnitCodec,
-};
+use media_access_unit::{h264_access_unit_is_keyframe, LanAccessUnitCodec};
 use media_capabilities::{
     lan_media_capabilities, lan_media_capabilities_with_input_control,
     LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY, LAN_MEDIA_COLOR_MODE_CAPABILITY,
@@ -173,6 +171,7 @@ use media_profile::{
     ensure_peer_supports_requested_media, lan_runtime_media_profile, normalize_lan_codec_name,
     normalize_lan_media_profile, validate_media_profile,
 };
+use media_receiver::{decode_h264_desktop_frame, decode_lan_desktop_frame};
 #[cfg(all(test, target_os = "macos"))]
 use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates_from_preference;
 #[cfg(test)]
@@ -6274,28 +6273,6 @@ fn capture_source_kind_from_id(source_id: &str) -> Option<String> {
         .map(|kind| kind.replace('-', "_"))
 }
 
-fn decode_h264_desktop_frame(
-    decoder: &mut dyn VideoDecoder,
-    payload: &[u8],
-) -> Result<Vec<DecodedFrame>> {
-    decode_lan_desktop_frame(LanAccessUnitCodec::H264, decoder, payload)
-}
-
-fn decode_lan_desktop_frame(
-    codec: LanAccessUnitCodec,
-    decoder: &mut dyn VideoDecoder,
-    payload: &[u8],
-) -> Result<Vec<DecodedFrame>> {
-    if let Err(error) = decoder.push_access_unit(payload) {
-        anyhow::bail!(
-            "failed to decode LAN {} access unit: {error}; {}",
-            codec.display_name(),
-            describe_lan_access_unit(codec, payload)
-        );
-    }
-    Ok(decoder.drain_decoded_frames())
-}
-
 async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionId) -> MediaProfile {
     app_state
         .media_profiles
@@ -10967,37 +10944,6 @@ mod tests {
         assert_eq!(decoded.profile.chroma_subsampling.as_deref(), Some("4:2:0"));
         assert_eq!(decoded.payload, b"fake-hevc");
         assert_eq!(decoded.profile, profile);
-    }
-
-    #[test]
-    fn hevc_decode_error_message_does_not_use_h264_or_probe_fallback() {
-        struct RejectingDecoder;
-
-        impl VideoDecoder for RejectingDecoder {
-            fn push_access_unit(
-                &mut self,
-                _access_unit: &[u8],
-            ) -> std::result::Result<(), mrd_pipeline_core::PipelineError> {
-                Err(mrd_pipeline_core::PipelineError::message(
-                    "synthetic failure",
-                ))
-            }
-
-            fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
-                Vec::new()
-            }
-        }
-
-        let mut decoder = RejectingDecoder;
-        let error =
-            decode_lan_desktop_frame(LanAccessUnitCodec::Hevc, &mut decoder, &[0, 0, 1, 0x26])
-                .expect_err("decode should fail")
-                .to_string();
-
-        assert!(error.contains("HEVC access unit"));
-        assert!(!error.contains("H.264"));
-        assert!(!error.contains("invalid magic"));
-        assert!(!error.contains("probe fallback"));
     }
 
     #[test]
