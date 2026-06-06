@@ -2006,6 +2006,7 @@ fn profile(
     codec: &str,
     required_capabilities: Vec<&str>,
 ) -> CapabilityProfile {
+    let metadata = default_profile_media_metadata(id, codec);
     CapabilityProfile {
         id: id.to_string(),
         width,
@@ -2013,6 +2014,13 @@ fn profile(
         fps,
         bitrate_mbps,
         codec: codec.to_string(),
+        codec_profile: metadata.codec_profile,
+        bit_depth: metadata.bit_depth,
+        chroma_subsampling: metadata.chroma_subsampling,
+        pixel_format: metadata.pixel_format,
+        hdr_enabled: metadata.hdr_enabled,
+        color_mode: metadata.color_mode,
+        color_pipeline: metadata.color_pipeline,
         latency_budget_ms: None,
         min_stable_fps_ratio: Some(0.8),
         max_drop_ratio: Some(0.02),
@@ -2020,6 +2028,62 @@ fn profile(
             .into_iter()
             .map(ToString::to_string)
             .collect(),
+    }
+}
+
+struct CapabilityProfileMediaMetadata {
+    codec_profile: Option<String>,
+    bit_depth: Option<u8>,
+    chroma_subsampling: Option<String>,
+    pixel_format: Option<String>,
+    hdr_enabled: Option<bool>,
+    color_mode: Option<String>,
+    color_pipeline: Option<String>,
+}
+
+fn default_profile_media_metadata(id: &str, codec: &str) -> CapabilityProfileMediaMetadata {
+    let normalized_codec = codec.trim().to_ascii_lowercase().replace('.', "");
+    let requests_main10 = id.to_ascii_lowercase().contains("main10");
+    if (normalized_codec == "hevc" || normalized_codec == "h265") && requests_main10 {
+        return CapabilityProfileMediaMetadata {
+            codec_profile: Some("main10".to_string()),
+            bit_depth: Some(10),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("p010".to_string()),
+            hdr_enabled: Some(true),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("hdr_main10".to_string()),
+        };
+    }
+
+    match normalized_codec.as_str() {
+        "hevc" | "h265" => CapabilityProfileMediaMetadata {
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
+        },
+        "h264" | "av1" => CapabilityProfileMediaMetadata {
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
+        },
+        _ => CapabilityProfileMediaMetadata {
+            codec_profile: None,
+            bit_depth: None,
+            chroma_subsampling: None,
+            pixel_format: None,
+            hdr_enabled: None,
+            color_mode: None,
+            color_pipeline: None,
+        },
     }
 }
 
@@ -2348,6 +2412,13 @@ mod tests {
         assert_eq!(profile.fps, 144);
         assert_eq!(profile.bitrate_mbps, 80);
         assert_eq!(profile.codec, "hevc");
+        assert_eq!(profile.codec_profile.as_deref(), Some("main10"));
+        assert_eq!(profile.bit_depth, Some(10));
+        assert_eq!(profile.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(profile.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(profile.hdr_enabled, Some(true));
+        assert_eq!(profile.color_mode.as_deref(), Some("full"));
+        assert_eq!(profile.color_pipeline.as_deref(), Some("hdr_main10"));
         assert_eq!(
             profile.required_capabilities,
             vec![

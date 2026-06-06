@@ -1825,6 +1825,15 @@ function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {
     fps: profile.fps,
     bitrate_mbps: profile.bitrate_mbps,
     codec: normalizeMediaCodec(profile.codec),
+    ...(profile.codec_profile ? { codec_profile: profile.codec_profile } : {}),
+    ...(profile.bit_depth ? { bit_depth: profile.bit_depth } : {}),
+    ...(profile.chroma_subsampling ? { chroma_subsampling: profile.chroma_subsampling } : {}),
+    ...(profile.pixel_format ? { pixel_format: profile.pixel_format } : {}),
+    ...(profile.hdr_enabled !== undefined && profile.hdr_enabled !== null
+      ? { hdr_enabled: profile.hdr_enabled }
+      : {}),
+    ...(profile.color_mode ? { color_mode: profile.color_mode } : {}),
+    ...(profile.color_pipeline ? { color_pipeline: profile.color_pipeline } : {}),
     required_capabilities: [],
   };
 }

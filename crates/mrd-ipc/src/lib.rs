@@ -654,6 +654,27 @@ mod wire {
         pub bitrate_mbps: u32,
         /// Requested codec, for example `h264`.
         pub codec: String,
+        /// Codec profile name, for example `main` or `main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub codec_profile: Option<String>,
+        /// Video bit depth. HEVC Main uses 8, HEVC Main10 uses 10.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bit_depth: Option<u8>,
+        /// Chroma subsampling label such as `4:2:0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub chroma_subsampling: Option<String>,
+        /// Runtime pixel format associated with this profile, for example `nv12`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pixel_format: Option<String>,
+        /// Whether HDR is expected for this media profile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hdr_enabled: Option<bool>,
+        /// Optional color transform requested before encode, for example `full` or `grayscale`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_mode: Option<String>,
+        /// Optional media color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_pipeline: Option<String>,
         /// Optional latency budget in milliseconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub latency_budget_ms: Option<u32>,
