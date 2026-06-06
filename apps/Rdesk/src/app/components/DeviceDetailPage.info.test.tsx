@@ -74,7 +74,11 @@ vi.mock("../services/remoteDisplayLauncher", () => ({
 vi.mock("../services/ipcSessionService", () => ({
   getProbeSnapshot: vi.fn(),
   getSessionSnapshot: vi.fn(),
-  stopSession: vi.fn(),
+  stopSession: vi.fn(() => Promise.resolve()),
+}));
+
+vi.mock("../utils/runtime", () => ({
+  isTauriRuntime: () => true,
 }));
 
 beforeEach(() => {
@@ -145,5 +149,52 @@ describe("DeviceDetailPage info tab", () => {
     expect(alertSpy).not.toHaveBeenCalled();
 
     delete (window as unknown as Record<string, unknown>).alert;
+  });
+
+  it("does not offer non-terminal windows from the remote terminal route", async () => {
+    remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockResolvedValue({
+      sessionId: "terminal-catalog-session",
+      sources: [
+        {
+          id: "notepad-window",
+          platform: "windows",
+          source_kind: "window",
+          title: "notes.txt - Notepad",
+          class_name: "Notepad",
+          width: 1280,
+          height: 720,
+          process_id: 42,
+          app_name: "Notepad",
+        },
+      ],
+      windows: [
+        {
+          id: "notepad-window",
+          platform: "windows",
+          source_kind: "window",
+          title: "notes.txt - Notepad",
+          class_name: "Notepad",
+          width: 1280,
+          height: 720,
+          process_id: 42,
+          app_name: "Notepad",
+        },
+      ],
+      displays: [],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=terminal"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("未发现远程终端窗口")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("Notepad")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "打开应用" })).not.toBeInTheDocument();
   });
 });

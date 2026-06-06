@@ -1187,12 +1187,15 @@ function AppsTab({
   const displaySources = catalog?.displays ?? [];
   const terminalFocus =
     terminalFocusProp || new URLSearchParams(location.search).get("tab") === "terminal";
+  const visibleRemoteWindows = terminalFocus
+    ? remoteWindows.filter(remoteApplicationSourceMatchesTerminalFocus)
+    : remoteWindows;
   const orderedRemoteWindows = terminalFocus
-    ? [...remoteWindows].sort((left, right) =>
+    ? [...visibleRemoteWindows].sort((left, right) =>
         Number(remoteApplicationSourceMatchesTerminalFocus(right)) -
         Number(remoteApplicationSourceMatchesTerminalFocus(left))
       )
-    : remoteWindows;
+    : visibleRemoteWindows;
 
   if (!canUseRemoteApplications) {
     return (
@@ -1245,7 +1248,7 @@ function AppsTab({
               </div>
             </div>
             <div className={`rounded-lg border px-3 py-1.5 ${isDark ? "border-gray-700 bg-[#181818] text-gray-400" : "border-gray-200 bg-gray-50 text-gray-600"}`} style={{ fontSize: 12 }}>
-              {catalog ? `${remoteWindows.length} 个窗口 / ${displaySources.length} 个屏幕` : "等待枚举"}
+              {catalog ? `${visibleRemoteWindows.length} 个窗口 / ${displaySources.length} 个屏幕` : "等待枚举"}
             </div>
             <button
               onClick={() => void loadRemoteApplications()}
@@ -1287,12 +1290,20 @@ function AppsTab({
           </div>
         )}
 
-        {!sourcesLoading && catalog && remoteWindows.length === 0 && (
+        {!sourcesLoading && catalog && visibleRemoteWindows.length === 0 && (
           <div className={`rounded-xl border p-6 text-center ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
-            <AppWindow className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
-            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 15 }}>未发现可独立捕获的窗口</div>
+            {terminalFocus ? (
+              <Terminal className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
+            ) : (
+              <AppWindow className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
+            )}
+            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 15 }}>
+              {terminalFocus ? "未发现远程终端窗口" : "未发现可独立捕获的窗口"}
+            </div>
             <div className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
-              已发现 {catalog.sources.length} 个采集源，可先打开远程桌面或在远端启动目标应用后刷新。
+              {terminalFocus
+                ? `已发现 ${remoteWindows.length} 个窗口，但没有匹配 PowerShell、cmd 或 Windows Terminal。`
+                : `已发现 ${catalog.sources.length} 个采集源，可先打开远程桌面或在远端启动目标应用后刷新。`}
             </div>
             <button
               onClick={() => void handleOpenDesktop()}
