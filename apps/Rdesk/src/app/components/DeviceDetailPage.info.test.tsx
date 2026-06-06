@@ -43,7 +43,9 @@ const remoteDisplayLauncherMock = vi.hoisted(() => ({
 }));
 
 const tauriAdapterMock = vi.hoisted(() => ({
+  ipcCancelFileTransfer: vi.fn(),
   ipcListDirectory: vi.fn(),
+  ipcListFileTransfers: vi.fn(),
   ipcStartFileTransfer: vi.fn(),
 }));
 
@@ -83,7 +85,9 @@ vi.mock("../services/ipcSessionService", () => ({
 }));
 
 vi.mock("../adapters/tauri", () => ({
+  ipcCancelFileTransfer: tauriAdapterMock.ipcCancelFileTransfer,
   ipcListDirectory: tauriAdapterMock.ipcListDirectory,
+  ipcListFileTransfers: tauriAdapterMock.ipcListFileTransfers,
   ipcStartFileTransfer: tauriAdapterMock.ipcStartFileTransfer,
 }));
 
@@ -96,7 +100,9 @@ beforeEach(() => {
   remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockReset();
   remoteDisplayLauncherMock.launchRemoteApplicationForDevice.mockReset();
   remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
+  tauriAdapterMock.ipcCancelFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockReset();
+  tauriAdapterMock.ipcListFileTransfers.mockReset();
   tauriAdapterMock.ipcStartFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockResolvedValue({
     ok: true,
@@ -134,6 +140,26 @@ beforeEach(() => {
       total_entries: 1,
       copied_entries: 1,
       total_bytes: 2048,
+      copied_bytes: 2048,
+      error: null,
+      entries: [],
+    },
+  });
+  tauriAdapterMock.ipcListFileTransfers.mockResolvedValue({
+    ok: true,
+    value: [],
+  });
+  tauriAdapterMock.ipcCancelFileTransfer.mockResolvedValue({
+    ok: true,
+    value: {
+      transfer_id: "file-transfer-running",
+      status: "cancelled",
+      source_device_id: "agent-device",
+      target_device_id: "peer-device",
+      transport_kind: "local",
+      total_entries: 2,
+      copied_entries: 1,
+      total_bytes: 4096,
       copied_bytes: 2048,
       error: null,
       entries: [],
@@ -250,6 +276,86 @@ describe("DeviceDetailPage info tab", () => {
         conflict_policy: "rename",
         transport_hint: "local",
       });
+    });
+  });
+
+  it("shows service-owned file transfer task snapshots in the file transfer tab", async () => {
+    tauriAdapterMock.ipcListFileTransfers.mockResolvedValue({
+      ok: true,
+      value: [
+        {
+          transfer_id: "file-transfer-1",
+          status: "completed",
+          source_device_id: "agent-device",
+          target_device_id: "peer-device",
+          transport_kind: "local",
+          total_entries: 3,
+          copied_entries: 3,
+          total_bytes: 3072,
+          copied_bytes: 3072,
+          error: null,
+          entries: [],
+        },
+      ],
+    });
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(tauriAdapterMock.ipcListFileTransfers).toHaveBeenCalled();
+    });
+    expect(screen.getByText("传输任务")).toBeInTheDocument();
+    expect(screen.getByText("file-transfer-1")).toBeInTheDocument();
+    expect(screen.getByText("完成 3/3")).toBeInTheDocument();
+    expect(screen.getByText("3 KB / 3 KB")).toBeInTheDocument();
+  });
+
+  it("cancels a running service-owned file transfer task from the file transfer tab", async () => {
+    tauriAdapterMock.ipcListFileTransfers.mockResolvedValue({
+      ok: true,
+      value: [
+        {
+          transfer_id: "file-transfer-running",
+          status: "running",
+          source_device_id: "agent-device",
+          target_device_id: "peer-device",
+          transport_kind: "local",
+          total_entries: 2,
+          copied_entries: 1,
+          total_bytes: 4096,
+          copied_bytes: 2048,
+          error: null,
+          entries: [],
+        },
+      ],
+    });
+    const user = userEvent.setup();
+
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("运行中 1/2")).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole("button", { name: "取消 file-transfer-running" }));
+
+    expect(tauriAdapterMock.ipcCancelFileTransfer).toHaveBeenCalledWith(
+      "file-transfer-running"
+    );
+    await waitFor(() => {
+      expect(screen.getByText("已取消 1/2")).toBeInTheDocument();
     });
   });
 

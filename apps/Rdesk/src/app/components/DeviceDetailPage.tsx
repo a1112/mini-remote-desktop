@@ -17,11 +17,15 @@ import {
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
 import {
+  ipcCancelFileTransfer,
   ipcListDirectory,
+  ipcListFileTransfers,
   ipcStartFileTransfer,
   type FileEntry,
   type FileEntryKind,
   type FileTransferEntry,
+  type FileTransferStatus,
+  type FileTransferTaskSnapshot,
 } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import {
@@ -704,6 +708,48 @@ type FileTransferDropRequest = {
   targetPath: string;
 };
 
+function fileTransferStatusLabel(status: FileTransferStatus): string {
+  switch (status) {
+    case "queued":
+      return "排队";
+    case "running":
+      return "运行中";
+    case "completed":
+      return "完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status;
+  }
+}
+
+function fileTransferProgressLabel(transfer: FileTransferTaskSnapshot): string {
+  return `${fileTransferStatusLabel(transfer.status)} ${transfer.copied_entries}/${transfer.total_entries}`;
+}
+
+function fileTransferByteLabel(transfer: FileTransferTaskSnapshot): string {
+  return `${formatFileSize(transfer.copied_bytes)} / ${formatFileSize(transfer.total_bytes)}`;
+}
+
+function isCancellableFileTransfer(status: FileTransferStatus): boolean {
+  return status === "queued" || status === "running";
+}
+
+function upsertFileTransferTask(
+  transfers: FileTransferTaskSnapshot[],
+  nextTransfer: FileTransferTaskSnapshot
+): FileTransferTaskSnapshot[] {
+  const index = transfers.findIndex(
+    (transfer) => transfer.transfer_id === nextTransfer.transfer_id
+  );
+  if (index === -1) return [nextTransfer, ...transfers];
+  const nextTransfers = [...transfers];
+  nextTransfers[index] = nextTransfer;
+  return nextTransfers;
+}
+
 // Helper to get file system for a device
 function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
   const dev = devices.find(d => d.id === deviceId);
@@ -1018,10 +1064,23 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   const [dragOverSide, setDragOverSide] = useState<"left" | "right" | null>(null);
   const [transferMessage, setTransferMessage] = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
+  const [fileTransfers, setFileTransfers] = useState<FileTransferTaskSnapshot[]>([]);
+  const [transferListError, setTransferListError] = useState<string | null>(null);
+  const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
 
   const onlineDevices = devices.filter(d => d.status === "online");
   const leftDevice = devices.find(d => d.id === leftDeviceId);
   const rightDevice = rightDeviceId ? devices.find(d => d.id === rightDeviceId) : null;
+
+  const refreshFileTransfers = useCallback(async () => {
+    const result = await ipcListFileTransfers();
+    if (!result.ok) {
+      setTransferListError(result.error.message);
+      return;
+    }
+    setTransferListError(null);
+    setFileTransfers(result.value);
+  }, []);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -1030,6 +1089,10 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, []);
+
+  useEffect(() => {
+    void refreshFileTransfers();
+  }, [refreshFileTransfers]);
 
   const handleAddDevice = (dId: string) => {
     if (addMenuSide === "right") setRightDeviceId(dId);
@@ -1056,9 +1119,22 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
       setTransferError(result.value.error ?? "文件传输失败");
       return;
     }
+    setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
     setTransferMessage(
       `已传输 ${result.value.copied_entries}/${result.value.total_entries} 个文件`
     );
+  }, []);
+
+  const handleCancelFileTransfer = useCallback(async (transferId: string) => {
+    setCancellingTransferId(transferId);
+    setTransferError(null);
+    const result = await ipcCancelFileTransfer(transferId);
+    setCancellingTransferId(null);
+    if (!result.ok) {
+      setTransferError(result.error.message);
+      return;
+    }
+    setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
   }, []);
 
   if (unavailableReason) {
@@ -1073,7 +1149,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   }
 
   return (
-    <div className={`flex h-full overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+    <div className={`relative flex h-full overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
       {(transferMessage || transferError) && (
         <div
           role="status"
@@ -1089,6 +1165,88 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           style={{ fontSize: 12 }}
         >
           {transferError ?? transferMessage}
+        </div>
+      )}
+      {(fileTransfers.length > 0 || transferListError) && (
+        <div
+          role="region"
+          aria-label="传输任务"
+          className={`absolute bottom-3 right-4 z-30 w-[380px] max-w-[calc(100%-2rem)] rounded-lg border shadow-lg ${
+            isDark
+              ? "border-gray-700 bg-[#202020] text-gray-200"
+              : "border-gray-200 bg-white text-gray-800"
+          }`}
+        >
+          <div className={`flex items-center justify-between border-b px-3 py-2 ${isDark ? "border-gray-700" : "border-gray-100"}`}>
+            <div className="flex items-center gap-2">
+              <ArrowRightLeft className="h-3.5 w-3.5 text-blue-500" />
+              <span className="font-medium" style={{ fontSize: 12 }}>传输任务</span>
+            </div>
+            <button
+              onClick={() => void refreshFileTransfers()}
+              className={`rounded-md p-1 transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`}
+              title="刷新传输任务"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          {transferListError ? (
+            <div className={`px-3 py-2 ${isDark ? "text-red-300" : "text-red-700"}`} style={{ fontSize: 11 }}>
+              读取传输任务失败：{transferListError}
+            </div>
+          ) : (
+            <div className="max-h-48 overflow-y-auto py-1">
+              {fileTransfers.map((transfer) => (
+                <div
+                  key={transfer.transfer_id}
+                  className={`flex items-start gap-2 px-3 py-2 ${isDark ? "hover:bg-[#292929]" : "hover:bg-gray-50"}`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate font-mono" style={{ fontSize: 11 }}>{transfer.transfer_id}</span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 ${
+                          transfer.status === "failed"
+                            ? isDark ? "bg-red-950 text-red-300" : "bg-red-50 text-red-700"
+                            : transfer.status === "completed"
+                              ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
+                              : isDark ? "bg-blue-950 text-blue-300" : "bg-blue-50 text-blue-700"
+                        }`}
+                        style={{ fontSize: 10 }}
+                      >
+                        {fileTransferProgressLabel(transfer)}
+                      </span>
+                    </div>
+                    <div className={`mt-1 flex items-center gap-2 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>
+                      <span>{fileTransferByteLabel(transfer)}</span>
+                      <span>·</span>
+                      <span>{transfer.transport_kind}</span>
+                    </div>
+                    {transfer.error ? (
+                      <div className={isDark ? "mt-1 text-red-300" : "mt-1 text-red-700"} style={{ fontSize: 10 }}>
+                        {transfer.error}
+                      </div>
+                    ) : null}
+                  </div>
+                  {isCancellableFileTransfer(transfer.status) ? (
+                    <button
+                      onClick={() => void handleCancelFileTransfer(transfer.transfer_id)}
+                      disabled={cancellingTransferId === transfer.transfer_id}
+                      aria-label={`取消 ${transfer.transfer_id}`}
+                      className={`shrink-0 rounded-md border px-2 py-1 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                        isDark
+                          ? "border-gray-700 text-gray-300 hover:border-red-500 hover:text-red-300"
+                          : "border-gray-200 text-gray-600 hover:border-red-300 hover:text-red-600"
+                      }`}
+                      style={{ fontSize: 11 }}
+                    >
+                      {cancellingTransferId === transfer.transfer_id ? "取消中" : "取消"}
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {/* Left pane */}
