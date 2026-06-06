@@ -147,7 +147,7 @@ use media_error_policy::{
 #[cfg(any(test, target_os = "macos"))]
 use media_frame_preparation::even_dimension;
 use media_frame_preparation::{
-    captured_frame_memory_path, h264_target_dimensions, i420_to_rgb24, nv12_to_rgb24,
+    captured_frame_memory_path, decoded_frame_to_rgb24, h264_target_dimensions,
     prepare_frame_for_h264, window_h264_capture_dimensions,
 };
 use media_keyframe_request::{
@@ -6387,48 +6387,6 @@ fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
         DecodedFrameData::D3D11SharedP010 { .. } => "d3d11_shared_p010",
     }
     .to_string()
-}
-
-fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
-    let expected_pixels = frame
-        .width
-        .checked_mul(frame.height)
-        .ok_or_else(|| anyhow::anyhow!("decoded frame dimensions overflow"))?;
-    let rgb = match frame.data {
-        DecodedFrameData::CpuRgb24(data) => {
-            let expected_len = expected_pixels
-                .checked_mul(3)
-                .ok_or_else(|| anyhow::anyhow!("decoded RGB frame byte size overflow"))?;
-            if data.len() != expected_len {
-                anyhow::bail!("decoded RGB frame has invalid byte length");
-            }
-            data
-        }
-        DecodedFrameData::CpuBgra32(data) => {
-            let expected_len = expected_pixels
-                .checked_mul(4)
-                .ok_or_else(|| anyhow::anyhow!("decoded BGRA frame byte size overflow"))?;
-            if data.len() != expected_len {
-                anyhow::bail!("decoded BGRA frame has invalid byte length");
-            }
-            let mut rgb = Vec::with_capacity(expected_pixels * 3);
-            for pixel in data.chunks_exact(4) {
-                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
-            }
-            rgb
-        }
-        DecodedFrameData::CpuNv12 { data, pitch } => {
-            nv12_to_rgb24(&data, pitch, frame.width, frame.height)?
-        }
-        DecodedFrameData::CpuI420 {
-            data,
-            y_pitch,
-            uv_pitch,
-        } => i420_to_rgb24(&data, y_pitch, uv_pitch, frame.width, frame.height)?,
-        _ => anyhow::bail!("decoded frame is not CPU RGB/BGRA/NV12/I420 backed"),
-    };
-
-    Ok((frame.width as u32, frame.height as u32, rgb))
 }
 
 async fn selected_media_profile(app_state: &Arc<AppState>, session_id: &SessionId) -> MediaProfile {

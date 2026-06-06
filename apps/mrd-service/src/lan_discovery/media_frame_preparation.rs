@@ -1,6 +1,6 @@
 use anyhow::Result;
 use mrd_ipc::MediaProfile;
-use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
+use mrd_pipeline_core::{CapturedFrame, DecodedFrame, DecodedFrameData, FramePixelFormat};
 
 pub(super) fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
     #[cfg(target_os = "macos")]
@@ -269,6 +269,48 @@ pub(super) fn i420_to_rgb24(
     Ok(rgb)
 }
 
+pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, Vec<u8>)> {
+    let expected_pixels = frame
+        .width
+        .checked_mul(frame.height)
+        .ok_or_else(|| anyhow::anyhow!("decoded frame dimensions overflow"))?;
+    let rgb = match frame.data {
+        DecodedFrameData::CpuRgb24(data) => {
+            let expected_len = expected_pixels
+                .checked_mul(3)
+                .ok_or_else(|| anyhow::anyhow!("decoded RGB frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded RGB frame has invalid byte length");
+            }
+            data
+        }
+        DecodedFrameData::CpuBgra32(data) => {
+            let expected_len = expected_pixels
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("decoded BGRA frame byte size overflow"))?;
+            if data.len() != expected_len {
+                anyhow::bail!("decoded BGRA frame has invalid byte length");
+            }
+            let mut rgb = Vec::with_capacity(expected_pixels * 3);
+            for pixel in data.chunks_exact(4) {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+            rgb
+        }
+        DecodedFrameData::CpuNv12 { data, pitch } => {
+            nv12_to_rgb24(&data, pitch, frame.width, frame.height)?
+        }
+        DecodedFrameData::CpuI420 {
+            data,
+            y_pitch,
+            uv_pitch,
+        } => i420_to_rgb24(&data, y_pitch, uv_pitch, frame.width, frame.height)?,
+        _ => anyhow::bail!("decoded frame is not CPU RGB/BGRA/NV12/I420 backed"),
+    };
+
+    Ok((frame.width as u32, frame.height as u32, rgb))
+}
+
 fn clamp_yuv_to_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
@@ -321,5 +363,20 @@ mod tests {
 
         assert_eq!(rgb.len(), width * height * 3);
         assert_eq!(&rgb[0..3], &[179, 0, 0]);
+    }
+
+    #[test]
+    fn decoded_frame_to_rgb24_converts_bgra_decoder_output() {
+        let frame = DecodedFrame {
+            width: 2,
+            height: 1,
+            timestamp_us: 42,
+            data: DecodedFrameData::CpuBgra32(vec![1, 2, 3, 255, 4, 5, 6, 255]),
+        };
+
+        let (width, height, rgb) = decoded_frame_to_rgb24(frame).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgb, vec![3, 2, 1, 6, 5, 4]);
     }
 }
