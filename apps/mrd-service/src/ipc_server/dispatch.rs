@@ -1,4 +1,4 @@
-use super::{audit_outcome, IpcServer};
+use super::{audit::audit_outcome, IpcServer};
 use crate::handlers::control;
 use crate::handlers::{
     capability, device, files, identity, lan, preflight, session, shell as shell_handlers,
