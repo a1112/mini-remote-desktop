@@ -1,4 +1,9 @@
+use anyhow::Result;
 use mrd_ipc::MediaProfile;
+use std::sync::OnceLock;
+
+#[cfg(windows)]
+use super::media_frame_preparation::{even_dimension, h264_target_dimensions};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct LanCaptureConfigKey {
@@ -83,6 +88,85 @@ pub(super) fn lan_capture_config_matches(
                 && config.height == profile.height
         })
         .unwrap_or(false)
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WindowsLanCaptureBackend {
+    DxgiShared,
+    WinrtWindowShared,
+    Winrt,
+}
+
+#[cfg(windows)]
+pub(super) fn windows_lan_capture_backend(
+    source_id: &str,
+    nvenc_h264_available: bool,
+) -> WindowsLanCaptureBackend {
+    let normalized = source_id.trim().to_ascii_lowercase();
+    if normalized.starts_with("windows:display-shared:") {
+        WindowsLanCaptureBackend::DxgiShared
+    } else if normalized.starts_with("windows:window:")
+        && windows_lan_window_capture_uses_shared_texture(nvenc_h264_available)
+    {
+        WindowsLanCaptureBackend::WinrtWindowShared
+    } else {
+        WindowsLanCaptureBackend::Winrt
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn windows_lan_capture_backend_for_profile(
+    source_id: &str,
+    source_width: usize,
+    source_height: usize,
+    profile: &MediaProfile,
+    nvenc_h264_available: bool,
+) -> WindowsLanCaptureBackend {
+    let backend = windows_lan_capture_backend(source_id, nvenc_h264_available);
+    if matches!(backend, WindowsLanCaptureBackend::WinrtWindowShared)
+        && windows_lan_profile_requires_scaling_path(source_width, source_height, profile)
+    {
+        WindowsLanCaptureBackend::Winrt
+    } else {
+        backend
+    }
+}
+
+#[cfg(windows)]
+fn windows_lan_profile_requires_scaling_path(
+    source_width: usize,
+    source_height: usize,
+    profile: &MediaProfile,
+) -> bool {
+    let (target_width, target_height) =
+        h264_target_dimensions(source_width, source_height, profile);
+    let native_width = even_dimension(source_width).max(2);
+    let native_height = even_dimension(source_height).max(2);
+    target_width < native_width || target_height < native_height
+}
+
+#[cfg(windows)]
+pub(super) fn windows_lan_window_capture_uses_shared_texture(nvenc_h264_available: bool) -> bool {
+    nvenc_h264_available
+}
+
+#[cfg(windows)]
+pub(super) fn windows_lan_nvenc_h264_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| mrd_encode_nvenc::NvencH264Encoder::probe_h264_available().is_ok())
+}
+
+#[cfg(windows)]
+pub(super) fn parse_windows_window_source_id(source_id: &str) -> Result<isize> {
+    crate::capture_source::parse_windows_window_hwnd_source_id(source_id)
+}
+
+pub(super) fn is_windows_window_source_id(source_id: &str) -> bool {
+    source_id
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("windows:window:")
 }
 
 #[cfg(test)]
@@ -172,5 +256,26 @@ mod tests {
         );
 
         assert_eq!(message, "display source failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_backend_for_profile_uses_cpu_scaling_path_for_reduced_window() {
+        assert_eq!(
+            windows_lan_capture_backend_for_profile(
+                "windows:window:0x1234",
+                1280,
+                720,
+                &MediaProfile {
+                    width: 960,
+                    height: 540,
+                    fps: 144,
+                    bitrate_mbps: 80,
+                    ..MediaProfile::default()
+                },
+                true,
+            ),
+            WindowsLanCaptureBackend::Winrt
+        );
     }
 }

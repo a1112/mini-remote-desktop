@@ -119,9 +119,18 @@ use media_capabilities::{
 };
 #[cfg(test)]
 use media_capture_config::window_capture_source_error;
+#[cfg(all(test, windows))]
+use media_capture_config::windows_lan_window_capture_uses_shared_texture;
 use media_capture_config::{
-    dynamic_window_fps_config_key, format_capture_source_failure, lan_capture_config_key,
-    lan_capture_config_matches, DynamicWindowFpsConfigKey, LanCaptureConfigKey,
+    dynamic_window_fps_config_key, format_capture_source_failure, is_windows_window_source_id,
+    lan_capture_config_key, lan_capture_config_matches, DynamicWindowFpsConfigKey,
+    LanCaptureConfigKey,
+};
+#[cfg(windows)]
+use media_capture_config::{
+    parse_windows_window_source_id, windows_lan_capture_backend,
+    windows_lan_capture_backend_for_profile, windows_lan_nvenc_h264_available,
+    WindowsLanCaptureBackend,
 };
 #[cfg(test)]
 use media_envelope::LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT;
@@ -135,8 +144,10 @@ use media_error_policy::{
     LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS,
     LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS,
 };
+#[cfg(any(test, target_os = "macos"))]
+use media_frame_preparation::even_dimension;
 use media_frame_preparation::{
-    captured_frame_memory_path, even_dimension, h264_target_dimensions, prepare_frame_for_h264,
+    captured_frame_memory_path, h264_target_dimensions, prepare_frame_for_h264,
     window_h264_capture_dimensions,
 };
 use media_keyframe_request::{
@@ -6330,85 +6341,6 @@ fn create_windows_lan_winrt_capture(source_id: &str) -> Result<LanFrameCapture> 
     Ok(LanFrameCapture::Winrt(
         crate::capture_source::create_frame_capture(source_id)?,
     ))
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowsLanCaptureBackend {
-    DxgiShared,
-    WinrtWindowShared,
-    Winrt,
-}
-
-#[cfg(windows)]
-fn windows_lan_capture_backend(
-    source_id: &str,
-    nvenc_h264_available: bool,
-) -> WindowsLanCaptureBackend {
-    let normalized = source_id.trim().to_ascii_lowercase();
-    if normalized.starts_with("windows:display-shared:") {
-        WindowsLanCaptureBackend::DxgiShared
-    } else if normalized.starts_with("windows:window:")
-        && windows_lan_window_capture_uses_shared_texture(nvenc_h264_available)
-    {
-        WindowsLanCaptureBackend::WinrtWindowShared
-    } else {
-        WindowsLanCaptureBackend::Winrt
-    }
-}
-
-#[cfg(windows)]
-fn windows_lan_capture_backend_for_profile(
-    source_id: &str,
-    source_width: usize,
-    source_height: usize,
-    profile: &MediaProfile,
-    nvenc_h264_available: bool,
-) -> WindowsLanCaptureBackend {
-    let backend = windows_lan_capture_backend(source_id, nvenc_h264_available);
-    if matches!(backend, WindowsLanCaptureBackend::WinrtWindowShared)
-        && windows_lan_profile_requires_scaling_path(source_width, source_height, profile)
-    {
-        WindowsLanCaptureBackend::Winrt
-    } else {
-        backend
-    }
-}
-
-#[cfg(windows)]
-fn windows_lan_profile_requires_scaling_path(
-    source_width: usize,
-    source_height: usize,
-    profile: &MediaProfile,
-) -> bool {
-    let (target_width, target_height) =
-        h264_target_dimensions(source_width, source_height, profile);
-    let native_width = even_dimension(source_width).max(2);
-    let native_height = even_dimension(source_height).max(2);
-    target_width < native_width || target_height < native_height
-}
-
-#[cfg(windows)]
-fn windows_lan_window_capture_uses_shared_texture(nvenc_h264_available: bool) -> bool {
-    nvenc_h264_available
-}
-
-#[cfg(windows)]
-fn windows_lan_nvenc_h264_available() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| mrd_encode_nvenc::NvencH264Encoder::probe_h264_available().is_ok())
-}
-
-#[cfg(windows)]
-fn parse_windows_window_source_id(source_id: &str) -> Result<isize> {
-    crate::capture_source::parse_windows_window_hwnd_source_id(source_id)
-}
-
-fn is_windows_window_source_id(source_id: &str) -> bool {
-    source_id
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("windows:window:")
 }
 
 fn capture_source_kind_from_id(source_id: &str) -> Option<String> {
