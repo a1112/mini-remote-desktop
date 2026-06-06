@@ -796,9 +796,15 @@ function parseRequestedProfile(searchParams: URLSearchParams): LanE2EAutomationO
   return profile;
 }
 
-function parseProfileCodec(value: string | null): "h264" | "hevc" {
+function parseProfileCodec(value: string | null): "h264" | "hevc" | "av1" {
   const normalized = value?.trim().toLowerCase();
-  return normalized === "hevc" || normalized === "h265" || normalized === "h.265" ? "hevc" : "h264";
+  if (normalized === "hevc" || normalized === "h265" || normalized === "h.265") {
+    return "hevc";
+  }
+  if (normalized === "av1" || normalized === "aom-av1") {
+    return "av1";
+  }
+  return "h264";
 }
 
 function parseProfileColorMode(
