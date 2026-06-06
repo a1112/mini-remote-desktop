@@ -435,6 +435,10 @@ export function useDevices(options?: UseDevicesOptions) {
   return { devices, loading, error, lastUpdated, refresh, currentDeviceId };
 }
 
+export function findDeviceByRouteId(devices: Device[], id: string | undefined) {
+  return devices.find((device) => device.id === id || device.deviceId === id);
+}
+
 export function useDeviceById(id: string | undefined, devices: Device[]) {
-  return useMemo(() => devices.find((d) => d.id === id), [id, devices]);
+  return useMemo(() => findDeviceByRouteId(devices, id), [id, devices]);
 }

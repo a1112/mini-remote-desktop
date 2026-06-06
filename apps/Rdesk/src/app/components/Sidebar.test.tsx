@@ -272,6 +272,13 @@ describe("Sidebar device actions", () => {
       "stable-device-abc",
       true
     );
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "设备信息" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/stable-device-abc?tab=info"
+    );
   });
 
   it("opens the device action menu from collapsed sidebar device items", () => {

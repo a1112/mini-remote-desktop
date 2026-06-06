@@ -600,7 +600,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
         label: "设备信息",
         action: () => {
           if (contextMenuDevice) {
-            handleOpenDeviceTab(contextMenuDevice.id, "info");
+            handleOpenDeviceTab(contextMenuDevice.deviceId, "info");
           }
         },
       },

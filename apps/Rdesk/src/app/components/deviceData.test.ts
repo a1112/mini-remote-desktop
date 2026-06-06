@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { Monitor } from "lucide-react";
 
-import { lanPeerPlatformLabel, lanPeerToDevice, type Device, mergeDevices } from "./deviceData";
+import {
+  findDeviceByRouteId,
+  lanPeerPlatformLabel,
+  lanPeerToDevice,
+  type Device,
+  mergeDevices,
+} from "./deviceData";
 
 const device = (overrides: Partial<Device>): Device => ({
   id: "base-id",
@@ -201,5 +207,15 @@ describe("mergeDevices", () => {
       disabled: true,
       status: "offline",
     });
+  });
+
+  it("finds merged device detail records by stable device id as well as row id", () => {
+    const merged = device({
+      id: "server-row-123",
+      deviceId: "stable-device-abc",
+    });
+
+    expect(findDeviceByRouteId([merged], "server-row-123")).toBe(merged);
+    expect(findDeviceByRouteId([merged], "stable-device-abc")).toBe(merged);
   });
 });
