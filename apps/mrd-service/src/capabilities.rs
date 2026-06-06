@@ -9,6 +9,7 @@ use std::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
+const REMOTE_POWER_ACTIONS_ENABLED_ENV: &str = "MRD_ENABLE_REMOTE_POWER_ACTIONS";
 
 #[derive(Clone, Copy)]
 enum CapabilityProbeMode {
@@ -1634,6 +1635,44 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             Some("Input injection is currently implemented only for Windows SendInput."),
         );
     }
+    let (remote_power_status, remote_power_reason) =
+        remote_power_control_status_from_env_lookup(|key| std::env::var(key).ok());
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Control,
+        "control.remote_power",
+        "Remote restart and shutdown",
+        remote_power_status,
+        Some(remote_power_reason.as_str()),
+    );
+}
+
+fn remote_power_control_status_from_env_lookup<E>(env_lookup: E) -> (CapabilityStatus, String)
+where
+    E: Fn(&str) -> Option<String>,
+{
+    let enabled = matches!(
+        env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV)
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+    if enabled {
+        (
+            CapabilityStatus::Available,
+            "Remote restart/shutdown executor is enabled for LAN peer control.".to_string(),
+        )
+    } else {
+        (
+            CapabilityStatus::Unsupported,
+            format!(
+                "Remote restart/shutdown executor is disabled. Set {REMOTE_POWER_ACTIONS_ENABLED_ENV}=1 on this peer to allow LAN remote power actions."
+            ),
+        )
+    }
 }
 
 fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -2202,6 +2241,36 @@ mod tests {
             .capabilities
             .iter()
             .any(|item| item.id == "decode.ffmpeg_vvc"));
+    }
+
+    #[test]
+    fn remote_power_control_capability_tracks_executor_opt_in() {
+        let disabled = remote_power_control_status_from_env_lookup(|_| None);
+        assert_eq!(disabled.0, CapabilityStatus::Unsupported);
+        assert!(disabled.1.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS"));
+
+        let enabled = remote_power_control_status_from_env_lookup(|key| match key {
+            "MRD_ENABLE_REMOTE_POWER_ACTIONS" => Some("yes".to_string()),
+            _ => None,
+        });
+        assert_eq!(enabled.0, CapabilityStatus::Available);
+    }
+
+    #[test]
+    fn local_snapshot_advertises_remote_power_control_capability() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+        let remote_power = capabilities
+            .iter()
+            .find(|item| item.id == "control.remote_power")
+            .expect("remote power control capability");
+
+        assert_eq!(remote_power.domain, CapabilityDomain::Control);
+        assert_eq!(remote_power.status, CapabilityStatus::Unsupported);
+        assert!(remote_power
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS")));
     }
 
     #[test]
