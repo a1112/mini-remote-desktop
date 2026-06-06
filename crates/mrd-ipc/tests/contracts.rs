@@ -7,13 +7,14 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    DeviceIdentitySnapshot, DeviceInfo, DirectoryList, FileEntry, FileEntryKind,
-    FileTransferConflictPolicy, FileTransferEntry, FileTransferStartRequest, FileTransferStatus,
-    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
-    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
-    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, DevicePreference, DevicePreferenceUpdate, DirectoryList,
+    FileEntry, FileEntryKind, FileTransferConflictPolicy, FileTransferEntry,
+    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcRequest,
+    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
+    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
+    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
+    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
+    TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -759,6 +760,51 @@ fn serialize_deserialize_device_list_response() {
     let json = serde_json::to_string(&response).unwrap();
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_device_preference_contracts() {
+    let update_request = IpcRequest::UpdateDevicePreference {
+        device_id: test_device_id(),
+        update: DevicePreferenceUpdate {
+            favorite: Some(true),
+            disabled: Some(false),
+            removed: Some(false),
+        },
+    };
+    let json = serde_json::to_string(&update_request).unwrap();
+    assert!(json.contains("UpdateDevicePreference"));
+    assert!(json.contains("\"favorite\":true"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(update_request, deserialized);
+
+    let list_request = IpcRequest::GetDevicePreferences;
+    let json = serde_json::to_string(&list_request).unwrap();
+    assert!(json.contains("GetDevicePreferences"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(list_request, deserialized);
+
+    let preference = DevicePreference {
+        device_id: test_device_id(),
+        favorite: true,
+        disabled: false,
+        removed: false,
+    };
+    let response = IpcResponse::DevicePreferenceUpdated {
+        preference: preference.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DevicePreferenceUpdated"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::DevicePreferences {
+        preferences: vec![preference],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DevicePreferences"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }
 

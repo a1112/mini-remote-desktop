@@ -363,6 +363,7 @@ export function useDevices(options?: UseDevicesOptions) {
       [lanDevices, localDevice] = await Promise.all([
         fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
         fetchLocalDevice(),
+        deviceActionService.refreshDevicePreferences(),
       ]);
       setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
 

@@ -35,6 +35,14 @@ impl IpcServer {
 
             IpcRequest::ListDevices => device::list_devices(&self.app_state).await,
 
+            IpcRequest::GetDevicePreferences => {
+                device::list_device_preferences(&self.app_state).await
+            }
+
+            IpcRequest::UpdateDevicePreference { device_id, update } => {
+                device::update_device_preference(&self.app_state, device_id, update).await
+            }
+
             IpcRequest::LanDiscoverySnapshot => lan::lan_discovery_snapshot(&self.app_state).await,
 
             IpcRequest::RefreshLanDiscovery => lan::refresh_lan_discovery(&self.app_state).await,

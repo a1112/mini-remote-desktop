@@ -1,8 +1,8 @@
 use super::{
     AuditLogRegistry, CapabilitySnapshotRegistry, CaptureSourceRegistry, DeviceIdentityRegistry,
-    DeviceRegistry, DisplayModeRegistry, FileTransferRegistry, MediaPipelineRegistry,
-    MediaProfileRegistry, MediaTaskRegistry, ProbeRegistry, SessionPeerMediaCapabilityRegistry,
-    SessionRegistry, ShellState, TrayPortRef,
+    DevicePreferenceRegistry, DeviceRegistry, DisplayModeRegistry, FileTransferRegistry,
+    MediaPipelineRegistry, MediaProfileRegistry, MediaTaskRegistry, ProbeRegistry,
+    SessionPeerMediaCapabilityRegistry, SessionRegistry, ShellState, TrayPortRef,
 };
 #[cfg(any(windows, target_os = "macos"))]
 use super::{MediaRenderQueueRegistry, MediaSurfaceRendererRegistry};
@@ -31,6 +31,8 @@ pub struct AppState {
     pub audit_log: Arc<Mutex<AuditLogRegistry>>,
     /// Service-owned device pairing and identity state.
     pub device_identities: Arc<Mutex<DeviceIdentityRegistry>>,
+    /// Service-owned device preference flags.
+    pub device_preferences: Arc<Mutex<DevicePreferenceRegistry>>,
     /// Shell state - UI presence and service lifecycle
     pub shell: Arc<Mutex<ShellState>>,
     /// Tray port (Phase 4)
@@ -88,6 +90,7 @@ impl AppState {
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             audit_log: Arc::new(Mutex::new(AuditLogRegistry::default())),
             device_identities: Arc::new(Mutex::new(DeviceIdentityRegistry::default())),
+            device_preferences: Arc::new(Mutex::new(DevicePreferenceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
             lan_discovery: Arc::new(crate::lan_discovery::LanDiscoveryState::new(
@@ -130,6 +133,11 @@ impl AppState {
     /// Get a clone of the device identity registry.
     pub fn device_identities(&self) -> Arc<Mutex<DeviceIdentityRegistry>> {
         self.device_identities.clone()
+    }
+
+    /// Get a clone of the service-owned device preference registry.
+    pub fn device_preferences(&self) -> Arc<Mutex<DevicePreferenceRegistry>> {
+        self.device_preferences.clone()
     }
 
     /// Get a clone of the shell Arc for injection into handlers

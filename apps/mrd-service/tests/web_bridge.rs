@@ -31,6 +31,17 @@ fn bridge_allows_only_browser_safe_ipc_requests() {
     assert!(is_ipc_request_allowed(&IpcRequest::RefreshLanDiscovery));
     assert!(is_ipc_request_allowed(&IpcRequest::ServiceHealth));
     assert!(is_ipc_request_allowed(&IpcRequest::GetShellStatus));
+    assert!(is_ipc_request_allowed(&IpcRequest::GetDevicePreferences));
+    assert!(is_ipc_request_allowed(
+        &IpcRequest::UpdateDevicePreference {
+            device_id: mrd_proto::DeviceId("agent-device".to_string()),
+            update: mrd_ipc::DevicePreferenceUpdate {
+                favorite: Some(true),
+                disabled: None,
+                removed: None,
+            },
+        }
+    ));
     assert!(is_ipc_request_allowed(
         &IpcRequest::RequestRemoteDevicePowerAction {
             device_id: mrd_proto::DeviceId("agent-device".to_string()),

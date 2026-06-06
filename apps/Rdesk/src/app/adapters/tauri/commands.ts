@@ -13,6 +13,8 @@ import type {
   AdapterResult,
   ClientDiagnostics,
   DeviceInfo,
+  DevicePreference,
+  DevicePreferenceUpdate,
   LanDiscoverySnapshot,
   DeviceRegistrationResponse,
   RemoteDevicePowerAction,
@@ -557,6 +559,34 @@ export async function ipcRegisterDevice(
  */
 export async function ipcListDevices(): Promise<AdapterResult<DeviceInfo[]>> {
   return invokeAdapter<DeviceInfo[]>('ipc_list_devices');
+}
+
+export async function ipcGetDevicePreferences(): Promise<AdapterResult<DevicePreference[]>> {
+  return invokeBridgeOrTauri<DevicePreference[]>(
+    'ipc_get_device_preferences',
+    undefined,
+    { type: 'GetDevicePreferences' },
+    responseField<DevicePreference[]>('preferences')
+  );
+}
+
+export async function ipcUpdateDevicePreference(
+  deviceId: string,
+  update: DevicePreferenceUpdate
+): Promise<AdapterResult<DevicePreference>> {
+  return invokeBridgeOrTauri<DevicePreference>(
+    'ipc_update_device_preference',
+    {
+      deviceId,
+      update,
+    },
+    {
+      type: 'UpdateDevicePreference',
+      device_id: deviceId,
+      update,
+    },
+    responseField<DevicePreference>('preference')
+  );
 }
 
 /**

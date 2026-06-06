@@ -274,6 +274,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_preferences_update_and_list_roundtrip_through_service() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+        let device_id = DeviceId("pref-device".to_string());
+
+        let response = server
+            .handle_request(IpcRequest::UpdateDevicePreference {
+                device_id: device_id.clone(),
+                update: mrd_ipc::DevicePreferenceUpdate {
+                    favorite: Some(true),
+                    disabled: Some(true),
+                    removed: None,
+                },
+            })
+            .await;
+
+        match response {
+            IpcResponse::DevicePreferenceUpdated { preference } => {
+                assert_eq!(preference.device_id, device_id);
+                assert!(preference.favorite);
+                assert!(preference.disabled);
+                assert!(!preference.removed);
+            }
+            other => panic!("expected DevicePreferenceUpdated, got {other:?}"),
+        }
+
+        let response = server
+            .handle_request(IpcRequest::GetDevicePreferences)
+            .await;
+
+        match response {
+            IpcResponse::DevicePreferences { preferences } => {
+                assert_eq!(preferences.len(), 1);
+                assert_eq!(
+                    preferences[0].device_id,
+                    DeviceId("pref-device".to_string())
+                );
+                assert!(preferences[0].favorite);
+                assert!(preferences[0].disabled);
+                assert!(!preferences[0].removed);
+            }
+            other => panic!("expected DevicePreferences, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn capability_snapshot_reports_structured_capabilities() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);

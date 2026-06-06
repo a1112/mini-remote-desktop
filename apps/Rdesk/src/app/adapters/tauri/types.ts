@@ -606,6 +606,19 @@ export interface DeviceInfo {
   is_online: boolean;
 }
 
+export interface DevicePreference {
+  device_id: string;
+  favorite: boolean;
+  disabled: boolean;
+  removed: boolean;
+}
+
+export interface DevicePreferenceUpdate {
+  favorite?: boolean;
+  disabled?: boolean;
+  removed?: boolean;
+}
+
 export interface LanPeerInfo {
   device_id: string;
   device_name: string;

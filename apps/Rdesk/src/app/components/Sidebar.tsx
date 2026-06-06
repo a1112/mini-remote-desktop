@@ -321,7 +321,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   };
 
   const handleToggleFavorite = async (deviceId: string, deviceName: string, favorite: boolean) => {
-    deviceActionService.setDeviceFavorite(deviceId, favorite);
+    await deviceActionService.setDeviceFavorite(deviceId, favorite);
     setContextMenu(null);
     setSubmenuOpen(null);
     await refresh();
@@ -344,7 +344,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     ) {
       return;
     }
-    deviceActionService.markDeviceRemoved(deviceId);
+    await deviceActionService.markDeviceRemoved(deviceId);
     await refresh();
     showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
   };
@@ -361,7 +361,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
       showActionStatus({ kind: "error", message: "不能禁用本机设备" });
       return;
     }
-    deviceActionService.setDeviceDisabled(deviceId, disabled);
+    await deviceActionService.setDeviceDisabled(deviceId, disabled);
     await refresh();
     showActionStatus({
       kind: "success",

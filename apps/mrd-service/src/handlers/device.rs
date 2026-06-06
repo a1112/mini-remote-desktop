@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use mrd_ipc::{IpcResponse, RemoteDevicePowerAction};
+use mrd_ipc::{DevicePreferenceUpdate, IpcResponse, RemoteDevicePowerAction};
 use mrd_proto::DeviceId;
 use std::sync::Arc;
 
@@ -30,6 +30,26 @@ pub async fn list_devices(app_state: &Arc<AppState>) -> IpcResponse {
     IpcResponse::DeviceList {
         devices: device_list,
     }
+}
+
+/// Return service-owned device preference flags.
+pub async fn list_device_preferences(app_state: &Arc<AppState>) -> IpcResponse {
+    let preferences = app_state.device_preferences.lock().await.list();
+    IpcResponse::DevicePreferences { preferences }
+}
+
+/// Apply a partial service-owned preference update for one device.
+pub async fn update_device_preference(
+    app_state: &Arc<AppState>,
+    device_id: DeviceId,
+    update: DevicePreferenceUpdate,
+) -> IpcResponse {
+    let preference = app_state
+        .device_preferences
+        .lock()
+        .await
+        .update(device_id, update);
+    IpcResponse::DevicePreferenceUpdated { preference }
 }
 
 /// Send a Wake-on-LAN magic packet for a known peer MAC address.

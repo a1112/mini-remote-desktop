@@ -1152,6 +1152,15 @@ mod wire {
         },
         /// List available devices
         ListDevices,
+        /// List service-owned device preferences.
+        GetDevicePreferences,
+        /// Update service-owned preference flags for one device.
+        UpdateDevicePreference {
+            /// Target device id.
+            device_id: DeviceId,
+            /// Partial preference update.
+            update: DevicePreferenceUpdate,
+        },
         /// Get the current LAN peer discovery snapshot.
         LanDiscoverySnapshot,
         /// Send an immediate LAN discovery probe and return the current snapshot.
@@ -1383,6 +1392,16 @@ mod wire {
         DeviceRegistered { device_id: DeviceId },
         /// List of available devices
         DeviceList { devices: Vec<DeviceInfo> },
+        /// Service-owned preference flags for known devices.
+        DevicePreferences {
+            /// Current preference records.
+            preferences: Vec<DevicePreference>,
+        },
+        /// Updated service-owned preference for one device.
+        DevicePreferenceUpdated {
+            /// Preference after applying the update.
+            preference: DevicePreference,
+        },
         /// LAN peer discovery snapshot.
         LanDiscoverySnapshot {
             /// Current discovery state.
@@ -1569,6 +1588,33 @@ mod wire {
         pub device_id: DeviceId,
         pub device_name: String,
         pub is_online: bool,
+    }
+
+    /// Service-owned preference flags for one device.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DevicePreference {
+        /// Device id the preference applies to.
+        pub device_id: DeviceId,
+        /// Whether the device should be surfaced as a favorite.
+        pub favorite: bool,
+        /// Whether user actions should be blocked for this device.
+        pub disabled: bool,
+        /// Whether the device should be hidden from normal device lists.
+        pub removed: bool,
+    }
+
+    /// Partial service-owned device preference update.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    pub struct DevicePreferenceUpdate {
+        /// New favorite flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub favorite: Option<bool>,
+        /// New disabled flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub disabled: Option<bool>,
+        /// New removed flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub removed: Option<bool>,
     }
 
     /// Discovered LAN peer information.

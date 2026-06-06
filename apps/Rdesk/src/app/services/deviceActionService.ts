@@ -1,6 +1,9 @@
 import {
+  ipcGetDevicePreferences,
   ipcRequestRemoteDevicePowerAction,
+  ipcUpdateDevicePreference,
   ipcWakeOnLan,
+  type DevicePreference,
   type RemoteDevicePowerAction,
   type RemoteDevicePowerActionAccepted,
   type WakeOnLanSent,
@@ -55,34 +58,82 @@ function getDevicePreference(deviceId: string): DeviceActionPreference {
   return readPreferences()[deviceId] ?? {};
 }
 
-function setDeviceFavorite(deviceId: string, favorite: boolean): DeviceActionPreference {
+function devicePreferenceToActionPreference(
+  preference: DevicePreference
+): DeviceActionPreference {
+  return {
+    favorite: preference.favorite,
+    disabled: preference.disabled ? true : undefined,
+    removed: preference.removed ? true : undefined,
+  };
+}
+
+function cacheServicePreference(preference: DevicePreference): DeviceActionPreference {
+  const preferences = readPreferences();
+  preferences[preference.device_id] = devicePreferenceToActionPreference(preference);
+  writePreferences(preferences);
+  return getDevicePreference(preference.device_id);
+}
+
+function replaceCachedServicePreferences(preferences: DevicePreference[]) {
+  writePreferences(
+    Object.fromEntries(
+      preferences.map((preference) => [
+        preference.device_id,
+        devicePreferenceToActionPreference(preference),
+      ])
+    )
+  );
+}
+
+function setLocalDevicePreference(
+  deviceId: string,
+  update: DeviceActionPreference
+): DeviceActionPreference {
   const preferences = readPreferences();
   preferences[deviceId] = {
     ...preferences[deviceId],
-    favorite,
+    ...update,
   };
   writePreferences(preferences);
   return getDevicePreference(deviceId);
 }
 
-function markDeviceRemoved(deviceId: string): DeviceActionPreference {
-  const preferences = readPreferences();
-  preferences[deviceId] = {
-    ...preferences[deviceId],
-    removed: true,
-  };
-  writePreferences(preferences);
-  return getDevicePreference(deviceId);
+async function updateDevicePreference(
+  deviceId: string,
+  update: DeviceActionPreference
+): Promise<DeviceActionPreference> {
+  const result = await ipcUpdateDevicePreference(deviceId, update);
+  if (result.ok) {
+    return cacheServicePreference(result.value);
+  }
+  return setLocalDevicePreference(deviceId, update);
 }
 
-function setDeviceDisabled(deviceId: string, disabled: boolean): DeviceActionPreference {
-  const preferences = readPreferences();
-  preferences[deviceId] = {
-    ...preferences[deviceId],
-    disabled: disabled ? true : undefined,
-  };
-  writePreferences(preferences);
-  return getDevicePreference(deviceId);
+async function refreshDevicePreferences(): Promise<Record<string, DeviceActionPreference>> {
+  const result = await ipcGetDevicePreferences();
+  if (result.ok) {
+    replaceCachedServicePreferences(result.value);
+  }
+  return readPreferences();
+}
+
+async function setDeviceFavorite(
+  deviceId: string,
+  favorite: boolean
+): Promise<DeviceActionPreference> {
+  return updateDevicePreference(deviceId, { favorite });
+}
+
+async function markDeviceRemoved(deviceId: string): Promise<DeviceActionPreference> {
+  return updateDevicePreference(deviceId, { removed: true });
+}
+
+async function setDeviceDisabled(
+  deviceId: string,
+  disabled: boolean
+): Promise<DeviceActionPreference> {
+  return updateDevicePreference(deviceId, { disabled });
 }
 
 function applyDevicePreferences<T extends DeviceActionPreferenceTarget>(devices: T[]): T[] {
@@ -130,6 +181,7 @@ export const deviceActionService = {
   applyDevicePreferences,
   getDevicePreference,
   markDeviceRemoved,
+  refreshDevicePreferences,
   requestRemoteDevicePowerAction,
   setDeviceDisabled,
   setDeviceFavorite,

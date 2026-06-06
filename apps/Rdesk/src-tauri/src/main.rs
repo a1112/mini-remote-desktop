@@ -1860,6 +1860,49 @@ async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
     }
 }
 
+/// List service-owned device preferences via IPC.
+#[tauri::command]
+async fn ipc_get_device_preferences() -> Result<Vec<mrd_ipc::DevicePreference>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::GetDevicePreferences)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DevicePreferences { preferences } => Ok(preferences),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Update service-owned device preferences via IPC.
+#[tauri::command]
+async fn ipc_update_device_preference(
+    device_id: String,
+    update: mrd_ipc::DevicePreferenceUpdate,
+) -> Result<mrd_ipc::DevicePreference, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::UpdateDevicePreference {
+            device_id: DeviceId(device_id),
+            update,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DevicePreferenceUpdated { preference } => Ok(preference),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Get LAN peer discovery snapshot via IPC.
 #[tauri::command]
 async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
@@ -4078,6 +4121,8 @@ fn main() {
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
+            ipc_get_device_preferences,
+            ipc_update_device_preference,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
             ipc_list_directory,
