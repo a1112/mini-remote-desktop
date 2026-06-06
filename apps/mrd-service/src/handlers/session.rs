@@ -448,20 +448,7 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             .lock()
             .await
             .abort_session(&session_id);
-        app_state.media_profiles.lock().await.remove(&session_id);
-        app_state.capture_sources.lock().await.remove(&session_id);
-        app_state
-            .peer_media_capabilities
-            .lock()
-            .await
-            .remove(&session_id);
-        #[cfg(windows)]
-        app_state
-            .media_surface_renderers
-            .lock()
-            .await
-            .detach_session(&session_id);
-        app_state.media_pipelines.lock().await.remove(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
         return IpcResponse::SessionStopped { session_id };
     }
 
@@ -507,13 +494,7 @@ pub async fn fail_session(
             .lock()
             .await
             .abort_session(&session_id);
-        #[cfg(windows)]
-        app_state
-            .media_surface_renderers
-            .lock()
-            .await
-            .detach_session(&session_id);
-        app_state.media_pipelines.lock().await.remove(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
 
         let mut shell = app_state.shell.lock().await;
         shell.last_error = Some(reason);
@@ -525,6 +506,23 @@ pub async fn fail_session(
         code: "E404".to_string(),
         message: format!("Session not found: {}", session_id.0),
     }
+}
+
+async fn clear_session_media_state(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.media_profiles.lock().await.remove(session_id);
+    app_state.capture_sources.lock().await.remove(session_id);
+    app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .remove(session_id);
+    #[cfg(windows)]
+    app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .detach_session(session_id);
+    app_state.media_pipelines.lock().await.remove(session_id);
 }
 
 async fn release_control_input_for_terminal_session(
@@ -990,6 +988,108 @@ mod tests {
         let snapshot = app_state.control_input().lock().await.snapshot(session_id);
         assert_eq!(snapshot.reliable.accepted_messages, 2);
         assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_session_clears_media_negotiation_state() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("media-fail-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Streaming,
+                    last_error: None,
+                    sender_active: true,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        let profile = MediaProfile {
+            codec: "av1".to_string(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            ..MediaProfile::default()
+        };
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            mrd_ipc::MediaProfileNegotiation {
+                requested: profile.clone(),
+                selected: profile,
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: Some("display:0".to_string()),
+                selected_width: Some(2560),
+                selected_height: Some(1440),
+                downgrade_reason: None,
+            },
+        );
+        app_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            mrd_ipc::CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: mrd_ipc::CaptureSource {
+                    id: "display:0".to_string(),
+                    platform: "windows".to_string(),
+                    source_kind: "display".to_string(),
+                    title: "Primary".to_string(),
+                    class_name: String::new(),
+                    width: 2560,
+                    height: 1440,
+                    process_id: 0,
+                    app_name: None,
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        );
+        app_state.peer_media_capabilities.lock().await.set(
+            session_id.clone(),
+            vec![
+                "media.codec.av1".to_string(),
+                "media.color_mode_v1".to_string(),
+            ],
+        );
+
+        let response =
+            fail_session(&app_state, session_id.clone(), "transport lost".to_string()).await;
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
+
+        assert!(app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none());
+        assert!(app_state
+            .capture_sources
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none());
+        assert!(!app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .supports(&session_id, "media.codec.av1"));
     }
 
     #[tokio::test]
