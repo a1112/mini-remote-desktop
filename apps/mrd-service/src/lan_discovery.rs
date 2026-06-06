@@ -51,6 +51,7 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
 mod capture_activity;
+mod capture_sources;
 mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
@@ -243,17 +244,17 @@ use peer_lookup::{
     peer_control_addr_with_remote_power_capability, session_remote_peer,
 };
 use peer_registry::{LanPeerRecord, LanPeerRegistry};
-#[cfg(test)]
-use protocol::LAN_INPUT_CONTROL_CAPABILITY;
 use protocol::{
     LanAnnouncement, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap,
-    DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
-    LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
-    LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
+    DISCOVERY_PACKET_BUFFER_BYTES, LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
+    LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
+    LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
     LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
     LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use protocol::{DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY};
 use remote_power::accept_lan_remote_device_power_action;
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
@@ -1328,7 +1329,7 @@ async fn handle_packet(
                 accepted,
                 "handled LAN capture sources request"
             );
-            let ack = fit_capture_sources_ack_packet(
+            let ack = capture_sources::fit_capture_sources_ack_packet(
                 app_state.lan_discovery.instance_id.clone(),
                 session_id,
                 accepted,
@@ -2345,57 +2346,6 @@ async fn close_lan_media_sessions(
             .remove(&session_id);
         app_state.media_pipelines.lock().await.remove(&session_id);
     }
-}
-
-fn fit_capture_sources_ack_packet(
-    instance_id: String,
-    session_id: String,
-    accepted: bool,
-    message: Option<String>,
-    sources: Vec<CaptureSource>,
-) -> LanDiscoveryPacket {
-    let sources = sources
-        .into_iter()
-        .map(strip_capture_source_preview)
-        .collect();
-    let mut packet = LanDiscoveryPacket::CaptureSourcesAck {
-        magic: DISCOVERY_MAGIC.to_string(),
-        app_id: DISCOVERY_APP_ID.to_string(),
-        instance_id,
-        session_id,
-        accepted,
-        message,
-        sources,
-        timestamp_ms: now_ms(),
-    };
-
-    while serialized_packet_len(&packet) > DISCOVERY_SAFE_UDP_PAYLOAD_BYTES {
-        let LanDiscoveryPacket::CaptureSourcesAck { sources, .. } = &mut packet else {
-            break;
-        };
-
-        if sources.len() > 1 {
-            sources.pop();
-            continue;
-        }
-
-        break;
-    }
-
-    packet
-}
-
-fn strip_capture_source_preview(mut source: CaptureSource) -> CaptureSource {
-    source.preview_data_url = None;
-    source.preview_width = None;
-    source.preview_height = None;
-    source
-}
-
-fn serialized_packet_len(packet: &LanDiscoveryPacket) -> usize {
-    serde_json::to_vec(packet)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
 }
 
 async fn spawn_quic_media_sender(
@@ -10648,7 +10598,7 @@ mod tests {
             })
             .collect();
 
-        let packet = fit_capture_sources_ack_packet(
+        let packet = capture_sources::fit_capture_sources_ack_packet(
             "target-instance".to_string(),
             "capture-source-session".to_string(),
             true,
@@ -10656,7 +10606,9 @@ mod tests {
             sources,
         );
 
-        assert!(serialized_packet_len(&packet) <= DISCOVERY_SAFE_UDP_PAYLOAD_BYTES);
+        assert!(
+            capture_sources::serialized_packet_len(&packet) <= DISCOVERY_SAFE_UDP_PAYLOAD_BYTES
+        );
         let LanDiscoveryPacket::CaptureSourcesAck { sources, .. } = packet else {
             panic!("expected capture sources ack");
         };
