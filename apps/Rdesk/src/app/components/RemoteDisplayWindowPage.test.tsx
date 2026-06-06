@@ -2547,6 +2547,123 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("enables remote control from the peer input capability when local injection is unavailable", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_controls: [],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_list_sessions") {
+        return Promise.resolve([
+          {
+            session_id: "p2p-quic-123",
+            role: "controller",
+            state: "streaming",
+            transport_kind: "quic",
+            last_error: null,
+            sender_active: false,
+            receiver_active: true,
+            peer_device_id: "target-device",
+          },
+        ]);
+      }
+      if (command === "ipc_lan_discovery_snapshot") {
+        return Promise.resolve({
+          enabled: true,
+          running: true,
+          discovery_port: 49700,
+          instance_id: "local-instance",
+          peers: [
+            {
+              device_id: "target-device",
+              device_name: "Target",
+              device_type: "desktop",
+              ip: "127.0.0.1",
+              discovery_port: 49700,
+              p2p_control_addr: "127.0.0.1:49701",
+              transports: ["quic"],
+              protocol_version: 1,
+              media_protocol_version: 1,
+              media_capabilities: ["control.keyboard_mouse"],
+              age_ms: 10,
+              p2p_available: true,
+            },
+          ],
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          lane: "realtime",
+          event_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
+
+    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_send_control_input", {
+        sessionId: "p2p-quic-123",
+        event: { kind: "mouse_move", x: 1280, y: 720 },
+      });
+    });
+  });
+
   it("releases active remote keyboard input when the window loses focus", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {

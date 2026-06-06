@@ -36,6 +36,8 @@ import {
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
   getSystemResourceSnapshot,
+  ipcLanDiscoverySnapshot,
+  ipcListSessions,
   ipcMediaPipelineSnapshot,
   ipcSendControlInput,
   presentTestHarnessFrameOnNativeSurface,
@@ -52,9 +54,11 @@ import {
   type EncoderType,
   type EnvironmentSnapshot,
   type HarnessMetrics,
+  type LanDiscoverySnapshot,
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
+  type SessionInfo,
   type SystemResourceSnapshot,
   type TestConfig,
   type TestMatrixConfig,
@@ -109,6 +113,7 @@ type LocalTestSelection = Partial<LocalWebViewProfile> & {
 const METRICS_POLL_MS = 500;
 const REMOTE_NATIVE_DIAGNOSTICS_POLL_MS = 500;
 const REMOTE_WEB_DIAGNOSTICS_POLL_MS = 1_000;
+const PEER_CONTROL_CAPABILITY_POLL_MS = 2_000;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
 const DIAGNOSTICS_SAMPLE_LIMIT = 60;
@@ -1523,14 +1528,29 @@ function resolutionDimensions(resolution: ResolutionKey): { width: number; heigh
 function keyboardMouseControlAvailable(
   capabilities: EnvironmentSnapshot | null,
   sessionSnapshot: SessionRuntimeSnapshot | null,
-  isLocalPipelinePreview: boolean
+  isLocalPipelinePreview: boolean,
+  peerInputControlAvailable: boolean
 ): boolean {
   if (isLocalPipelinePreview) return false;
   if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
   if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
     return false;
   }
-  return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
+  return (
+    peerInputControlAvailable ||
+    (capabilities?.available_controls?.includes("keyboard_mouse") ?? false)
+  );
+}
+
+function peerKeyboardMouseControlAvailable(
+  sessionId: string,
+  sessions: readonly SessionInfo[],
+  lanDiscovery: LanDiscoverySnapshot | null
+): boolean {
+  const peerDeviceId = sessions.find((session) => session.session_id === sessionId)?.peer_device_id;
+  if (!peerDeviceId) return false;
+  const peer = lanDiscovery?.peers.find((peer) => peer.device_id === peerDeviceId);
+  return peer?.media_capabilities?.includes("control.keyboard_mouse") ?? false;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -2307,6 +2327,7 @@ export function RemoteDisplayWindowPage() {
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
+  const [peerInputControlAvailable, setPeerInputControlAvailable] = useState(false);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [mediaPipelineSnapshot, setMediaPipelineSnapshot] =
     useState<MediaPipelineSnapshot | null>(null);
@@ -2779,10 +2800,62 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.media_probe_width,
     resolution,
   ]);
+
+  useEffect(() => {
+    if (
+      isLocalPipelinePreview ||
+      sessionSnapshot?.role !== "controller" ||
+      sessionSnapshot?.state !== "streaming" ||
+      sessionSnapshot.receiver_active !== true
+    ) {
+      setPeerInputControlAvailable(false);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshPeerInputCapability = async () => {
+      const [sessionsResult, discoveryResult] = await Promise.all([
+        ipcListSessions(),
+        ipcLanDiscoverySnapshot(),
+      ]);
+      if (cancelled) return;
+      const sessions =
+        sessionsResult.ok && Array.isArray(sessionsResult.value)
+          ? sessionsResult.value
+          : [];
+      const discovery =
+        discoveryResult.ok &&
+        discoveryResult.value &&
+        Array.isArray(discoveryResult.value.peers)
+          ? discoveryResult.value
+          : null;
+      setPeerInputControlAvailable(
+        peerKeyboardMouseControlAvailable(sessionId, sessions, discovery)
+      );
+    };
+
+    void refreshPeerInputCapability();
+    const interval = window.setInterval(
+      () => void refreshPeerInputCapability(),
+      PEER_CONTROL_CAPABILITY_POLL_MS
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    isLocalPipelinePreview,
+    sessionId,
+    sessionSnapshot?.receiver_active,
+    sessionSnapshot?.role,
+    sessionSnapshot?.state,
+  ]);
+
   const controlInputEnabled = keyboardMouseControlAvailable(
     capabilities,
     sessionSnapshot,
-    isLocalPipelinePreview
+    isLocalPipelinePreview,
+    peerInputControlAvailable
   );
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
