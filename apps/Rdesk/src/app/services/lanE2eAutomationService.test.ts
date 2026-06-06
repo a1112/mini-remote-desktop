@@ -1562,6 +1562,9 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("media_profile_mismatch");
     expect(result.errorMessage).toContain("Runtime media pipeline profile mismatch");
+    expect(result.errorMessage).toContain(
+      "requested 2560x1600 @ 165 FPS / 80 Mbps / hevc main10 / 10-bit / p010 / HDR / color=monochrome / pipeline=hdr_main10"
+    );
     expect(result.errorMessage).toContain("color_mode monochrome/full");
     expect(result.errorMessage).toContain("color_pipeline hdr_main10/sdr8");
   });

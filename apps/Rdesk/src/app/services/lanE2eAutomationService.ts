@@ -1695,7 +1695,9 @@ function describeMediaPipelineProfileMismatch(
   ].filter((entry): entry is string => Boolean(entry));
 
   if (mismatches.length === 0) return null;
-  return `Runtime media pipeline profile mismatch: ${mismatches.join(", ")}`;
+  return `Runtime media pipeline profile mismatch: requested ${formatMediaProfile(
+    requestedProfile
+  )}; ${mismatches.join(", ")}`;
 }
 
 function compareOptionalProfileString(
@@ -1792,7 +1794,21 @@ function isActualProfileDowngraded(
 }
 
 function formatMediaProfile(profile: MediaProfile): string {
-  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+  const codec = [normalizeMediaCodec(profile.codec), profile.codec_profile]
+    .filter(Boolean)
+    .join(" ");
+  const parts = [
+    `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`,
+    codec,
+  ];
+
+  if (profile.bit_depth) parts.push(`${profile.bit_depth}-bit`);
+  if (profile.pixel_format) parts.push(profile.pixel_format);
+  if (profile.hdr_enabled === true) parts.push("HDR");
+  if (profile.color_mode) parts.push(`color=${profile.color_mode}`);
+  if (profile.color_pipeline) parts.push(`pipeline=${profile.color_pipeline}`);
+
+  return parts.filter(Boolean).join(" / ");
 }
 
 function formatProbeProfile(probe: ProbeSnapshot): string {
