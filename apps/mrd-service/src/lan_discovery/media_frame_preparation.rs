@@ -2,8 +2,6 @@ use anyhow::Result;
 use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
 
-use super::nv12_to_rgb24;
-
 pub(super) fn captured_frame_memory_path(frame: &CapturedFrame) -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -178,6 +176,103 @@ fn nv12_cpu_frame_len(width: usize, height: usize) -> Option<usize> {
     })
 }
 
+pub(super) fn nv12_to_rgb24(
+    data: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
+    if pitch < width {
+        anyhow::bail!("NV12 pitch is smaller than frame width");
+    }
+    let y_bytes = pitch
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("NV12 luma byte size overflow"))?;
+    let uv_height = height.div_ceil(2);
+    let uv_bytes = pitch
+        .checked_mul(uv_height)
+        .ok_or_else(|| anyhow::anyhow!("NV12 chroma byte size overflow"))?;
+    let expected_len = y_bytes
+        .checked_add(uv_bytes)
+        .ok_or_else(|| anyhow::anyhow!("NV12 byte size overflow"))?;
+    if data.len() < expected_len {
+        anyhow::bail!("NV12 frame has invalid byte length");
+    }
+
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        let y_row = y * pitch;
+        let uv_row = y_bytes + (y / 2) * pitch;
+        for x in 0..width {
+            let luma = data[y_row + x] as i32;
+            let uv_x = (x / 2) * 2;
+            let u = data[uv_row + uv_x] as i32;
+            let v = data[uv_row + uv_x + 1] as i32;
+            let c = (luma - 16).max(0);
+            let d = u - 128;
+            let e = v - 128;
+            rgb.push(clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8));
+        }
+    }
+    Ok(rgb)
+}
+
+pub(super) fn i420_to_rgb24(
+    data: &[u8],
+    y_pitch: usize,
+    uv_pitch: usize,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
+    if y_pitch < width {
+        anyhow::bail!("I420 Y pitch is smaller than frame width");
+    }
+    let chroma_width = width.div_ceil(2);
+    if uv_pitch < chroma_width {
+        anyhow::bail!("I420 UV pitch is smaller than chroma width");
+    }
+    let chroma_height = height.div_ceil(2);
+    let y_bytes = y_pitch
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("I420 luma byte size overflow"))?;
+    let uv_bytes = uv_pitch
+        .checked_mul(chroma_height)
+        .ok_or_else(|| anyhow::anyhow!("I420 chroma byte size overflow"))?;
+    let expected_len = y_bytes
+        .checked_add(uv_bytes)
+        .and_then(|bytes| bytes.checked_add(uv_bytes))
+        .ok_or_else(|| anyhow::anyhow!("I420 byte size overflow"))?;
+    if data.len() < expected_len {
+        anyhow::bail!("I420 frame has invalid byte length");
+    }
+
+    let u_base = y_bytes;
+    let v_base = y_bytes + uv_bytes;
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for y in 0..height {
+        let y_row = y * y_pitch;
+        let uv_row = (y / 2) * uv_pitch;
+        for x in 0..width {
+            let luma = data[y_row + x] as i32;
+            let u = data[u_base + uv_row + x / 2] as i32;
+            let v = data[v_base + uv_row + x / 2] as i32;
+            let c = (luma - 16).max(0);
+            let d = u - 128;
+            let e = v - 128;
+            rgb.push(clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8));
+            rgb.push(clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8));
+        }
+    }
+    Ok(rgb)
+}
+
+fn clamp_yuv_to_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
 fn read_captured_rgb(
     frame: &CapturedFrame,
     x: usize,
@@ -203,5 +298,28 @@ fn read_captured_rgb(
             frame.data[index + 2],
         ),
         FramePixelFormat::Nv12 => unreachable!("NV12 is handled before packed RGB scaling"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn i420_to_rgb24_converts_decoder_planes_to_rgb_pixels() {
+        let width = 2;
+        let height = 2;
+        let y_pitch = 2;
+        let uv_pitch = 1;
+        let data = vec![
+            16, 235, 81, 145, // Y plane
+            90,  // U plane
+            240, // V plane
+        ];
+
+        let rgb = i420_to_rgb24(&data, y_pitch, uv_pitch, width, height).unwrap();
+
+        assert_eq!(rgb.len(), width * height * 3);
+        assert_eq!(&rgb[0..3], &[179, 0, 0]);
     }
 }
