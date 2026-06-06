@@ -1543,7 +1543,14 @@ function mapClientPointToRemoteFrame(
   rect: DOMRect,
   frameSize: { width: number; height: number }
 ): { x: number; y: number } | null {
-  if (rect.width <= 0 || rect.height <= 0 || frameSize.width <= 0 || frameSize.height <= 0) {
+  if (
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY) ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    frameSize.width <= 0 ||
+    frameSize.height <= 0
+  ) {
     return null;
   }
 
@@ -3208,17 +3215,23 @@ export function RemoteDisplayWindowPage() {
     [sendControlInputEvent]
   );
 
-  const controlPointFromPointerEvent = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const rect = event.currentTarget.getBoundingClientRect();
+  const controlPointFromClientPoint = useCallback(
+    (target: HTMLDivElement, clientX: number, clientY: number) => {
+      const rect = target.getBoundingClientRect();
       return mapClientPointToRemoteFrame(
-        event.clientX,
-        event.clientY,
+        clientX,
+        clientY,
         rect,
         remoteInputFrameSize
       );
     },
     [remoteInputFrameSize]
+  );
+
+  const controlPointFromPointerEvent = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) =>
+      controlPointFromClientPoint(event.currentTarget, event.clientX, event.clientY),
+    [controlPointFromClientPoint]
   );
 
   const handleRemotePointerMove = useCallback(
@@ -3316,7 +3329,9 @@ export function RemoteDisplayWindowPage() {
       const verticalDelta = Math.trunc(-event.deltaY);
       const horizontalDelta = Math.trunc(-event.deltaX);
       if (verticalDelta === 0 && horizontalDelta === 0) return;
+      const point = controlPointFromClientPoint(event.currentTarget, event.clientX, event.clientY);
       event.preventDefault();
+      if (point) sendRemotePointerMoveIfNeeded(point);
       if (verticalDelta !== 0) {
         sendControlInputEvent({ kind: "mouse_wheel", delta: verticalDelta });
       }
@@ -3327,7 +3342,12 @@ export function RemoteDisplayWindowPage() {
         });
       }
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [
+      controlInputEnabled,
+      controlPointFromClientPoint,
+      sendControlInputEvent,
+      sendRemotePointerMoveIfNeeded,
+    ]
   );
 
   const handleRemoteKeyDown = useCallback(
