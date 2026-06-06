@@ -360,6 +360,51 @@ mod tests {
     }
 
     #[test]
+    fn windows_mapping_extended_mouse_buttons_preserves_button_and_pressed_state() {
+        let cases = [
+            (
+                InputEvent::MouseButton {
+                    button: InputButton::Other(1),
+                    pressed: true,
+                },
+                WindowsInputCommand::MouseButton {
+                    button: WindowsMouseButton::X1,
+                    pressed: true,
+                },
+            ),
+            (
+                InputEvent::MouseButton {
+                    button: InputButton::Other(2),
+                    pressed: false,
+                },
+                WindowsInputCommand::MouseButton {
+                    button: WindowsMouseButton::X2,
+                    pressed: false,
+                },
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                map_windows_input(&event).expect("map extended button"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn windows_mapping_rejects_unsupported_extended_mouse_buttons() {
+        assert_eq!(
+            map_windows_input(&InputEvent::MouseButton {
+                button: InputButton::Other(3),
+                pressed: true,
+            })
+            .expect_err("unsupported extended button should be invalid"),
+            InputError::InvalidEvent("unsupported mouse button 3".to_string())
+        );
+    }
+
+    #[test]
     fn windows_mapping_wheel_delta_is_preserved() {
         assert_eq!(
             map_windows_input(&InputEvent::MouseWheel { delta: -240 }).expect("map wheel"),
