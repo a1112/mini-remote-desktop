@@ -2110,6 +2110,8 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent.keyUp(renderArea, { key: "*", code: "NumpadMultiply" });
     fireEvent.keyDown(renderArea, { key: "+", code: "NumpadAdd" });
     fireEvent.keyUp(renderArea, { key: "+", code: "NumpadAdd" });
+    fireEvent.keyDown(renderArea, { key: "=", code: "NumpadEqual" });
+    fireEvent.keyUp(renderArea, { key: "=", code: "NumpadEqual" });
     fireEvent.keyDown(renderArea, { key: "-", code: "NumpadSubtract" });
     fireEvent.keyUp(renderArea, { key: "-", code: "NumpadSubtract" });
     fireEvent.keyDown(renderArea, { key: ".", code: "NumpadDecimal" });
@@ -2135,6 +2137,14 @@ describe("RemoteDisplayWindowPage", () => {
         {
           sessionId: "p2p-quic-123",
           event: { kind: "key", key: { kind: "virtual_key", code: 0x6b }, pressed: false },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "key", key: { kind: "virtual_key", code: 0xbb }, pressed: true },
+        },
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "key", key: { kind: "virtual_key", code: 0xbb }, pressed: false },
         },
         {
           sessionId: "p2p-quic-123",

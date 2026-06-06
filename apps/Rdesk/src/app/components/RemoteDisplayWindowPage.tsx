@@ -1594,6 +1594,7 @@ function virtualKeyFromKeyboardEvent(
   const numpadVirtualKeys: Record<string, number> = {
     NumpadMultiply: 0x6a,
     NumpadAdd: 0x6b,
+    NumpadEqual: 0xbb,
     NumpadSubtract: 0x6d,
     NumpadDecimal: 0x6e,
     NumpadDivide: 0x6f,
