@@ -75,6 +75,7 @@ mod media_transport;
 mod peer_format;
 mod peer_registry;
 mod protocol;
+mod remote_power;
 mod runtime_flags;
 mod service_identity;
 mod time_utils;
@@ -233,6 +234,7 @@ use protocol::{
     LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
     LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
+use remote_power::accept_lan_remote_device_power_action;
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
 #[cfg(test)]
@@ -290,7 +292,6 @@ const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
-const REMOTE_POWER_ACTIONS_ENABLED_ENV: &str = "MRD_ENABLE_REMOTE_POWER_ACTIONS";
 #[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 #[cfg(any(windows, target_os = "macos"))]
@@ -311,12 +312,6 @@ const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemotePowerCommand {
-    program: String,
-    args: Vec<String>,
-}
 
 #[derive(Debug)]
 pub struct LanDiscoveryState {
@@ -1579,90 +1574,6 @@ async fn handle_packet(
         LanDiscoveryPacket::RemoteDevicePowerActionAck { .. } => {}
     }
 
-    Ok(())
-}
-
-fn accept_lan_remote_device_power_action(action: &mrd_ipc::RemoteDevicePowerAction) -> Result<()> {
-    accept_lan_remote_device_power_action_with_runner(
-        action,
-        |key| std::env::var(key).ok(),
-        run_remote_power_command,
-    )
-}
-
-fn accept_lan_remote_device_power_action_with_runner<E, R>(
-    action: &mrd_ipc::RemoteDevicePowerAction,
-    env_lookup: E,
-    mut runner: R,
-) -> Result<()>
-where
-    E: Fn(&str) -> Option<String>,
-    R: FnMut(&RemotePowerCommand) -> Result<()>,
-{
-    if !remote_power_actions_enabled(env_lookup) {
-        let action_label = remote_power_action_label(action);
-        anyhow::bail!("remote power executor is not enabled on this peer for {action_label}");
-    }
-    let command = platform_remote_power_command(action);
-    runner(&command)
-}
-
-fn remote_power_actions_enabled<E>(env_lookup: E) -> bool
-where
-    E: Fn(&str) -> Option<String>,
-{
-    matches!(
-        env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV)
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
-}
-
-fn remote_power_action_label(action: &mrd_ipc::RemoteDevicePowerAction) -> &'static str {
-    match action {
-        mrd_ipc::RemoteDevicePowerAction::Restart => "restart",
-        mrd_ipc::RemoteDevicePowerAction::Shutdown => "shutdown",
-    }
-}
-
-#[cfg(windows)]
-fn platform_remote_power_command(action: &mrd_ipc::RemoteDevicePowerAction) -> RemotePowerCommand {
-    let mode = match action {
-        mrd_ipc::RemoteDevicePowerAction::Restart => "/r",
-        mrd_ipc::RemoteDevicePowerAction::Shutdown => "/s",
-    };
-    RemotePowerCommand {
-        program: "shutdown.exe".to_string(),
-        args: vec![mode.to_string(), "/t".to_string(), "0".to_string()],
-    }
-}
-
-#[cfg(not(windows))]
-fn platform_remote_power_command(action: &mrd_ipc::RemoteDevicePowerAction) -> RemotePowerCommand {
-    let mode = match action {
-        mrd_ipc::RemoteDevicePowerAction::Restart => "-r",
-        mrd_ipc::RemoteDevicePowerAction::Shutdown => "-h",
-    };
-    RemotePowerCommand {
-        program: "shutdown".to_string(),
-        args: vec![mode.to_string(), "now".to_string()],
-    }
-}
-
-fn run_remote_power_command(command: &RemotePowerCommand) -> Result<()> {
-    std::process::Command::new(&command.program)
-        .args(&command.args)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn remote power command {} {}",
-                command.program,
-                command.args.join(" ")
-            )
-        })?;
     Ok(())
 }
 
@@ -8211,50 +8122,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("remote power executor is not enabled"));
-    }
-
-    #[test]
-    fn remote_power_executor_rejects_by_default() {
-        let mut invoked = false;
-        let error = accept_lan_remote_device_power_action_with_runner(
-            &mrd_ipc::RemoteDevicePowerAction::Restart,
-            |_| None,
-            |_| {
-                invoked = true;
-                Ok(())
-            },
-        )
-        .expect_err("remote power must be opt-in");
-
-        assert!(!invoked);
-        assert!(error.to_string().contains("not enabled"));
-    }
-
-    #[test]
-    fn remote_power_executor_invokes_platform_command_when_enabled() {
-        let mut commands = Vec::new();
-        accept_lan_remote_device_power_action_with_runner(
-            &mrd_ipc::RemoteDevicePowerAction::Shutdown,
-            |key| {
-                if key == REMOTE_POWER_ACTIONS_ENABLED_ENV {
-                    Some("1".to_string())
-                } else {
-                    None
-                }
-            },
-            |command| {
-                commands.push(command.clone());
-                Ok(())
-            },
-        )
-        .expect("enabled remote power executor");
-
-        assert_eq!(
-            commands,
-            vec![platform_remote_power_command(
-                &mrd_ipc::RemoteDevicePowerAction::Shutdown
-            )]
-        );
     }
 
     #[tokio::test]
