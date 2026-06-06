@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DisplayMode,
-    DisplayModeChange, LanDiscoverySnapshot, MediaProfile, MediaProfileNegotiation,
+    CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
+    MediaProfile, MediaProfileNegotiation,
 };
 #[cfg(test)]
 use mrd_ipc::{MediaSenderTransportSnapshot, MediaStageMetrics};
@@ -28,7 +28,6 @@ use mrd_transport_quic_quinn::{
     QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnServerBootstrap,
     QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN, QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::collections::VecDeque;
@@ -81,8 +80,7 @@ mod time_utils;
 use capture_activity::active_window_capture_count;
 pub use discovery_config::LanDiscoveryConfig;
 use discovery_identity::{
-    default_app_id, is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID,
-    DISCOVERY_MAGIC,
+    is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID, DISCOVERY_MAGIC,
 };
 use dynamic_window_fps::{
     is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
@@ -225,6 +223,7 @@ use peer_registry::{LanPeerRecord, LanPeerRegistry};
 #[cfg(test)]
 use protocol::LAN_INPUT_CONTROL_CAPABILITY;
 use protocol::{
+    LanAnnouncement, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap,
     DISCOVERY_PACKET_BUFFER_BYTES, DISCOVERY_SAFE_UDP_PAYLOAD_BYTES,
     LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT, LAN_DISPLAY_MODE_CONTROL_TRANSPORT,
     LAN_INPUT_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
@@ -435,244 +434,6 @@ impl Default for LanDiscoveryState {
     fn default() -> Self {
         Self::new(LanDiscoveryConfig::default())
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum LanDiscoveryPacket {
-    Probe {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        device_id: Option<String>,
-        timestamp_ms: u64,
-    },
-    Announce(LanAnnouncement),
-    RemoteSessionRequest {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        source_device_name: String,
-        transport_kind: String,
-        #[serde(default)]
-        source_discovery_port: Option<u16>,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        source_media_capabilities: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        requested_media_profile: Option<MediaProfile>,
-        timestamp_ms: u64,
-    },
-    RemoteSessionAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        media: Option<LanMediaBootstrap>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        media_profile: Option<MediaProfileNegotiation>,
-        timestamp_ms: u64,
-    },
-    MediaProfileUpdate {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        requested_media_profile: MediaProfile,
-        timestamp_ms: u64,
-    },
-    MediaProfileUpdateAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        media_profile: Option<MediaProfileNegotiation>,
-        timestamp_ms: u64,
-    },
-    CaptureSourcesRequest {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        include_previews: bool,
-        limit: Option<u32>,
-        timestamp_ms: u64,
-    },
-    CaptureSourcesAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        sources: Vec<CaptureSource>,
-        timestamp_ms: u64,
-    },
-    CaptureSourceSelect {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        source_id: String,
-        timestamp_ms: u64,
-    },
-    CaptureSourceSelectAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        selection: Option<CaptureSourceSelection>,
-        timestamp_ms: u64,
-    },
-    DisplayModesRequest {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        source_id: Option<String>,
-        timestamp_ms: u64,
-    },
-    DisplayModesAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        modes: Vec<DisplayMode>,
-        timestamp_ms: u64,
-    },
-    DisplayModeSet {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        mode: DisplayMode,
-        restore_after_session: bool,
-        timestamp_ms: u64,
-    },
-    DisplayModeSetAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        change: Option<DisplayModeChange>,
-        timestamp_ms: u64,
-    },
-    DisplayModeRestore {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        timestamp_ms: u64,
-    },
-    DisplayModeRestoreAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        change: Option<DisplayModeChange>,
-        timestamp_ms: u64,
-    },
-    ControlInput {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        source_device_id: String,
-        #[serde(default)]
-        event_id: u64,
-        event: ControlInputEvent,
-        timestamp_ms: u64,
-    },
-    ControlInputAck {
-        magic: String,
-        #[serde(default = "default_app_id")]
-        app_id: String,
-        instance_id: String,
-        session_id: String,
-        #[serde(default)]
-        event_id: u64,
-        accepted: bool,
-        message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        lane: Option<ControlInputLane>,
-        event_count: u32,
-        timestamp_ms: u64,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LanAnnouncement {
-    magic: String,
-    #[serde(default = "default_app_id")]
-    app_id: String,
-    instance_id: String,
-    device_id: String,
-    device_name: String,
-    device_type: String,
-    protocol_version: u32,
-    discovery_port: u16,
-    transports: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    service_build_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    media_protocol_version: Option<u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    media_capabilities: Vec<String>,
-    timestamp_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LanMediaBootstrap {
-    transport_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quic: Option<LanQuicBootstrap>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LanQuicBootstrap {
-    listen_addr: String,
-    server_name: String,
-    cert_der: Vec<u8>,
 }
 
 struct LanRemoteAcceptResult {
@@ -7019,6 +6780,31 @@ mod tests {
             self.events.lock().expect("record input event").push(*event);
             Ok(())
         }
+    }
+
+    #[test]
+    fn lan_discovery_control_input_ack_serializes_stable_tagged_protocol() {
+        let packet = LanDiscoveryPacket::ControlInputAck {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            instance_id: "instance-1".to_string(),
+            session_id: "session-1".to_string(),
+            event_id: 42,
+            accepted: true,
+            message: None,
+            lane: Some(mrd_ipc::ControlInputLane::Reliable),
+            event_count: 1,
+            timestamp_ms: 1234,
+        };
+
+        let value = serde_json::to_value(packet).expect("serialize control input ack");
+
+        assert_eq!(value["type"], "control_input_ack");
+        assert_eq!(value["session_id"], "session-1");
+        assert_eq!(value["event_id"], 42);
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["lane"], "reliable");
+        assert_eq!(value["event_count"], 1);
     }
 
     #[cfg(windows)]

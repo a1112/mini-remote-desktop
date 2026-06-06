@@ -1,3 +1,4 @@
+use super::protocol::LanDiscoveryPacket;
 use crate::app_state::AppState;
 use anyhow::{Context, Result};
 use mrd_ipc::{CaptureSource, ControlInputEvent, ControlInputLane, DisplayMode};
@@ -38,7 +39,7 @@ pub async fn request_lan_control_input(
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .context("failed to bind LAN control input UDP socket")?;
-    let packet = super::LanDiscoveryPacket::ControlInput {
+    let packet = LanDiscoveryPacket::ControlInput {
         magic: super::DISCOVERY_MAGIC.to_string(),
         app_id: super::DISCOVERY_APP_ID.to_string(),
         instance_id: app_state.lan_discovery.instance_id.clone(),
@@ -70,9 +71,9 @@ pub async fn request_lan_control_input(
             }
         };
 
-        let ack: super::LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+        let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
         match ack {
-            super::LanDiscoveryPacket::ControlInputAck {
+            LanDiscoveryPacket::ControlInputAck {
                 magic,
                 app_id,
                 session_id: ack_session_id,
