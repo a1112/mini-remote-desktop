@@ -42,6 +42,10 @@ const remoteDisplayLauncherMock = vi.hoisted(() => ({
   prepareRemoteApplicationCatalogForDevice: vi.fn(),
 }));
 
+const tauriAdapterMock = vi.hoisted(() => ({
+  ipcListDirectory: vi.fn(),
+}));
+
 vi.mock("./deviceData", () => ({
   useDevices: () => ({
     devices: deviceDataMock.devices,
@@ -77,6 +81,10 @@ vi.mock("../services/ipcSessionService", () => ({
   stopSession: vi.fn(() => Promise.resolve()),
 }));
 
+vi.mock("../adapters/tauri", () => ({
+  ipcListDirectory: tauriAdapterMock.ipcListDirectory,
+}));
+
 vi.mock("../utils/runtime", () => ({
   isTauriRuntime: () => true,
 }));
@@ -86,6 +94,32 @@ beforeEach(() => {
   remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockReset();
   remoteDisplayLauncherMock.launchRemoteApplicationForDevice.mockReset();
   remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
+  tauriAdapterMock.ipcListDirectory.mockReset();
+  tauriAdapterMock.ipcListDirectory.mockResolvedValue({
+    ok: true,
+    value: {
+      path: "C:\\Users\\tester",
+      parent_path: "C:\\Users",
+      entries: [
+        {
+          name: "ServiceDownloads",
+          path: "C:\\Users\\tester\\Downloads",
+          kind: "directory",
+          size_bytes: null,
+          modified_ms: 1776000000000,
+          readonly: false,
+        },
+        {
+          name: "service-report.txt",
+          path: "C:\\Users\\tester\\service-report.txt",
+          kind: "file",
+          size_bytes: 2048,
+          modified_ms: 1776000000000,
+          readonly: false,
+        },
+      ],
+    },
+  });
 });
 
 describe("DeviceDetailPage info tab", () => {
@@ -119,6 +153,22 @@ describe("DeviceDetailPage info tab", () => {
 
     expect(screen.getByText("设备已禁用，无法传输文件")).toBeInTheDocument();
     expect(screen.queryByText("选择设备以开始传输")).not.toBeInTheDocument();
+  });
+
+  it("renders service directory entries in the file transfer tab", async () => {
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("ServiceDownloads")).toBeInTheDocument();
+    });
+    expect(screen.getByText("service-report.txt")).toBeInTheDocument();
+    expect(tauriAdapterMock.ipcListDirectory).toHaveBeenCalledWith(null);
   });
 
   it("shows remote launch failures inline without a blocking browser alert", async () => {

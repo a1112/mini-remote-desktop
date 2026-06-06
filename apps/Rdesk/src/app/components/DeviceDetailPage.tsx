@@ -16,6 +16,7 @@ import {
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
+import { ipcListDirectory, type FileEntry } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import {
   ArrowLeft,
@@ -628,7 +629,58 @@ function RemoteTab({ device }: { device: Device }) {
 }
 
 /* ======================== File Transfer Tab ======================== */
-type FileItem = { name: string; type: "folder" | "file"; size: string; modified: string; fileKind: string };
+type FileItem = {
+  name: string;
+  path?: string;
+  type: "folder" | "file";
+  size: string;
+  modified: string;
+  fileKind: string;
+};
+
+function formatFileSize(sizeBytes: number | null | undefined): string {
+  if (sizeBytes === null || sizeBytes === undefined) return "--";
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${Math.round(sizeBytes / 1024)} KB`;
+  if (sizeBytes < 1024 * 1024 * 1024) return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(sizeBytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function formatModifiedTime(modifiedMs: number | null | undefined): string {
+  if (!modifiedMs) return "--";
+  const date = new Date(modifiedMs);
+  if (Number.isNaN(date.getTime())) return "--";
+  return date.toISOString().slice(0, 10);
+}
+
+function fileKindLabel(entry: FileEntry): string {
+  if (entry.kind === "directory") return "文件夹";
+  if (entry.kind === "symlink") return "符号链接";
+  if (entry.kind === "other") return "其他";
+  const ext = entry.name.split(".").pop()?.toLowerCase();
+  if (ext === "pdf") return "PDF 文档";
+  if (ext === "json") return "JSON 文件";
+  if (ext === "png" || ext === "jpg" || ext === "jpeg") return "图片";
+  if (ext === "txt" || ext === "md") return "文本文件";
+  return "文件";
+}
+
+function fileEntryToItem(entry: FileEntry): FileItem {
+  return {
+    name: entry.name,
+    path: entry.path,
+    type: entry.kind === "directory" ? "folder" : "file",
+    size: entry.kind === "directory" ? "--" : formatFileSize(entry.size_bytes),
+    modified: formatModifiedTime(entry.modified_ms),
+    fileKind: fileKindLabel(entry),
+  };
+}
+
+function pathSegmentsFromDirectory(path: string | null, fallback: string[]): string[] {
+  if (!path) return fallback;
+  const segments = path.split(/[\\/]+/).filter(Boolean);
+  return segments.length > 0 ? segments : [path];
+}
 
 // Helper to get file system for a device
 function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
@@ -658,8 +710,40 @@ function FilePane({
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [searchQuery, setSearchQuery] = useState("");
   const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number; fileName: string; fileType: string } | null>(null);
+  const [serviceFiles, setServiceFiles] = useState<FileItem[] | null>(null);
+  const [servicePath, setServicePath] = useState<string | null>(null);
+  const [serviceParentPath, setServiceParentPath] = useState<string | null>(null);
+  const [serviceLoading, setServiceLoading] = useState(false);
+  const [serviceError, setServiceError] = useState<string | null>(null);
 
-  const files = (deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices)).filter(f =>
+  const loadDirectory = useCallback(async (path: string | null) => {
+    setServiceLoading(true);
+    setServiceError(null);
+    const result = await ipcListDirectory(path);
+    if (!result.ok) {
+      setServiceError(result.error.message);
+      setServiceLoading(false);
+      return;
+    }
+    setServicePath(result.value.path);
+    setServiceParentPath(result.value.parent_path ?? null);
+    setServiceFiles(result.value.entries.map(fileEntryToItem));
+    setCurrentPath(pathSegmentsFromDirectory(result.value.path, [devName]));
+    setSelectedFiles(new Set());
+    setServiceLoading(false);
+  }, [devName]);
+
+  useEffect(() => {
+    setServiceFiles(null);
+    setServicePath(null);
+    setServiceParentPath(null);
+    setCurrentPath([devName]);
+    setSelectedFiles(new Set());
+    void loadDirectory(null);
+  }, [devName, deviceId, loadDirectory]);
+
+  const fallbackFiles = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
+  const files = (serviceFiles ?? fallbackFiles).filter(f =>
     searchQuery ? f.name.toLowerCase().includes(searchQuery.toLowerCase()) : true
   );
 
@@ -677,9 +761,25 @@ function FilePane({
       setSelectedFiles(prev => { const n = new Set(prev); if (n.has(fileName)) n.delete(fileName); else n.add(fileName); return n; });
     } else setSelectedFiles(new Set([fileName]));
   };
-  const handleDoubleClick = (f: FileItem) => { if (f.type === "folder") { setCurrentPath(p => [...p, f.name]); setSelectedFiles(new Set()); } };
-  const navigateUp = () => { if (currentPath.length > 1) { setCurrentPath(p => p.slice(0, -1)); setSelectedFiles(new Set()); } };
-  const navigateHome = () => { setCurrentPath([devName, "Users", "Admin"]); setSelectedFiles(new Set()); };
+  const handleDoubleClick = (f: FileItem) => {
+    if (f.type === "folder") {
+      if (f.path) void loadDirectory(f.path);
+      else {
+        setCurrentPath(p => [...p, f.name]);
+        setSelectedFiles(new Set());
+      }
+    }
+  };
+  const navigateUp = () => {
+    if (serviceParentPath) {
+      void loadDirectory(serviceParentPath);
+      return;
+    }
+    if (currentPath.length > 1) { setCurrentPath(p => p.slice(0, -1)); setSelectedFiles(new Set()); }
+  };
+  const navigateHome = () => {
+    void loadDirectory(null);
+  };
   const navigateTo = (i: number) => { setCurrentPath(p => p.slice(0, i + 1)); setSelectedFiles(new Set()); };
 
   const handleDragStart = (e: React.DragEvent, fileName: string) => {
@@ -729,7 +829,7 @@ function FilePane({
         <button onClick={navigateHome} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="主目录">
           <Home style={{ width: 13, height: 13 }} />
         </button>
-        <button className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="刷新">
+        <button onClick={() => void loadDirectory(servicePath)} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="刷新">
           <RefreshCw style={{ width: 12, height: 12 }} />
         </button>
         <div className={`flex-1 flex items-center gap-0.5 px-2 py-0.5 rounded-md min-w-0 ${isDark ? "bg-[#2a2a2a] border border-gray-700" : "bg-gray-50 border border-gray-200"}`}>
@@ -766,6 +866,17 @@ function FilePane({
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedFiles(new Set()); }}
         onContextMenu={(e) => { if (e.target === e.currentTarget) { e.preventDefault(); setContextMenuState({ x: e.clientX, y: e.clientY, fileName: "", fileType: "background" }); } }}
       >
+        {serviceError && (
+          <div role="alert" className={`px-3 py-2 border-b ${isDark ? "border-red-900/40 bg-red-950/20 text-red-300" : "border-red-100 bg-red-50 text-red-700"}`} style={{ fontSize: 11 }}>
+            目录读取失败：{serviceError}
+          </div>
+        )}
+        {serviceLoading && (
+          <div className={`flex items-center gap-2 px-3 py-2 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
+            <Loader2 className="w-3 h-3 animate-spin" />
+            正在读取目录...
+          </div>
+        )}
         {viewMode === "list" ? (
           <div>
             {files.map((f) => {
