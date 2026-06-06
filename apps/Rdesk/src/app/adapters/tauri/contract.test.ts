@@ -363,6 +363,27 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'ipc_lan_discovery_snapshot', undefined);
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_refresh_lan_discovery', undefined);
     });
+
+    it('ipc_file_transfer_snapshot calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        provider: {
+          provider_id: 'mrd.file_transfer.reserved',
+          display_name: 'Reserved file transfer provider',
+          status: 'reserved',
+          detail: 'Reserved for MRD/R-File provider binding.',
+          capabilities: ['file.transfer.snapshot', 'file.transfer.external_provider'],
+          supported_actions: ['list'],
+        },
+        tasks: [],
+        updated_at_ms: null,
+      });
+
+      const result = await adapter.ipcFileTransferSnapshot();
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_file_transfer_snapshot', undefined);
+      expect(result.ok && result.value.provider.status).toBe('reserved');
+    });
   });
 
   /**

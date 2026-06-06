@@ -12,8 +12,8 @@ use crate::{
 };
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{
-    transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
-    ScenarioEvaluationStatus,
+    transport, CapabilitySnapshot, CapabilityStatus, FileTransferProviderSnapshot,
+    FileTransferSnapshot, IpcRequest, IpcResponse, MediaProfile, ScenarioEvaluationStatus,
 };
 use mrd_proto::{DeviceId, SessionId};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
@@ -135,6 +135,10 @@ impl IpcServer {
                     .lan_discovery
                     .request_probe_and_wait(Duration::from_millis(LAN_DISCOVERY_REFRESH_WAIT_MS))
                     .await,
+            },
+
+            IpcRequest::FileTransferSnapshot => IpcResponse::FileTransferSnapshot {
+                snapshot: reserved_file_transfer_snapshot(),
             },
 
             IpcRequest::ListSessions => {
@@ -1055,6 +1059,27 @@ impl IpcServer {
     }
 }
 
+fn reserved_file_transfer_snapshot() -> FileTransferSnapshot {
+    FileTransferSnapshot {
+        provider: FileTransferProviderSnapshot {
+            provider_id: "mrd.file_transfer.reserved".to_string(),
+            display_name: "Reserved file transfer provider".to_string(),
+            status: "reserved".to_string(),
+            detail: Some(
+                "Reserved for MRD-native or R-File provider binding; no transfer engine is bound."
+                    .to_string(),
+            ),
+            capabilities: vec![
+                "file.transfer.snapshot".to_string(),
+                "file.transfer.external_provider".to_string(),
+            ],
+            supported_actions: vec!["list".to_string()],
+        },
+        tasks: Vec::new(),
+        updated_at_ms: None,
+    }
+}
+
 fn is_connection_closed_error(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<std::io::Error>() {
         Some(io_error) => matches!(
@@ -1376,6 +1401,31 @@ mod tests {
                 assert_eq!(snapshot.device_id, Some(device_id));
             }
             _ => panic!("Expected RuntimeSnapshot response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_transfer_snapshot_returns_reserved_provider_boundary() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::FileTransferSnapshot)
+            .await;
+
+        match response {
+            IpcResponse::FileTransferSnapshot { snapshot } => {
+                assert_eq!(snapshot.provider.provider_id, "mrd.file_transfer.reserved");
+                assert_eq!(snapshot.provider.status, "reserved");
+                assert!(snapshot
+                    .provider
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "file.transfer.external_provider"));
+                assert_eq!(snapshot.provider.supported_actions, vec!["list"]);
+                assert!(snapshot.tasks.is_empty());
+            }
+            other => panic!("Expected FileTransferSnapshot response, got {other:?}"),
         }
     }
 

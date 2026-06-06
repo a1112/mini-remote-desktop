@@ -1846,6 +1846,24 @@ async fn ipc_refresh_lan_discovery() -> Result<mrd_ipc::LanDiscoverySnapshot, St
     }
 }
 
+/// Get service-owned file transfer provider and task snapshot via IPC.
+#[tauri::command]
+async fn ipc_file_transfer_snapshot() -> Result<mrd_ipc::FileTransferSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::FileTransferSnapshot)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Start session via IPC (migrated version)
 #[tauri::command]
 async fn ipc_start_session(
@@ -3879,6 +3897,7 @@ fn main() {
             ipc_list_devices,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
+            ipc_file_transfer_snapshot,
             ipc_list_sessions,
             ipc_start_session,
             ipc_start_lan_remote_session,

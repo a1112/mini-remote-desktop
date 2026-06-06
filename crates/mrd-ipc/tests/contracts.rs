@@ -7,7 +7,8 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, FileTransferProviderSnapshot, FileTransferSnapshot,
+    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
     MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
     MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
     ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
@@ -615,6 +616,53 @@ fn serialize_deserialize_device_list_response() {
 }
 
 #[test]
+fn serialize_deserialize_file_transfer_provider_reservation() {
+    let request = IpcRequest::FileTransferSnapshot;
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("FileTransferSnapshot"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let snapshot = FileTransferSnapshot {
+        provider: FileTransferProviderSnapshot {
+            provider_id: "mrd.file_transfer.reserved".to_string(),
+            display_name: "Reserved file transfer provider".to_string(),
+            status: "reserved".to_string(),
+            detail: Some("Reserved for MRD/R-File provider binding.".to_string()),
+            capabilities: vec![
+                "file.transfer.snapshot".to_string(),
+                "file.transfer.external_provider".to_string(),
+            ],
+            supported_actions: vec!["list".to_string()],
+        },
+        tasks: vec![FileTransferTaskSnapshot {
+            transfer_id: "transfer-1".to_string(),
+            direction: "send".to_string(),
+            status: "queued".to_string(),
+            source_device_id: DeviceId("local".to_string()),
+            target_device_id: DeviceId("remote".to_string()),
+            source_paths: vec!["C:\\Users\\Admin\\demo.txt".to_string()],
+            target_path: "D:\\Inbox".to_string(),
+            total_bytes: 1024,
+            transferred_bytes: 0,
+            current_path: None,
+            error_message: None,
+        }],
+        updated_at_ms: Some(1_700_000_000_000),
+    };
+    let response = IpcResponse::FileTransferSnapshot {
+        snapshot: snapshot.clone(),
+    };
+
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("mrd.file_transfer.reserved"));
+    assert!(json.contains("file.transfer.external_provider"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, response);
+}
+
+#[test]
 fn serialize_deserialize_session_snapshot_response() {
     let response = IpcResponse::SessionSnapshot {
         snapshot: SessionRuntimeSnapshot {
@@ -922,6 +970,7 @@ fn serialize_deserialize_all_request_types() {
             device_name: "Device".to_string(),
         },
         IpcRequest::ListDevices,
+        IpcRequest::FileTransferSnapshot,
         IpcRequest::StartSession {
             session_id: test_session_id(),
             target_device_id: test_device_id(),

@@ -570,6 +570,35 @@ export interface LanDiscoverySnapshot {
   peers: LanPeerInfo[];
 }
 
+export interface FileTransferProviderSnapshot {
+  provider_id: string;
+  display_name: string;
+  status: "reserved" | "available" | "unavailable" | string;
+  detail?: string | null;
+  capabilities: string[];
+  supported_actions: string[];
+}
+
+export interface FileTransferTaskSnapshot {
+  transfer_id: string;
+  direction: "send" | "receive" | string;
+  status: "queued" | "preparing" | "running" | "paused" | "completed" | "failed" | "cancelled" | string;
+  source_device_id: string;
+  target_device_id: string;
+  source_paths: string[];
+  target_path: string;
+  total_bytes: number;
+  transferred_bytes: number;
+  current_path?: string | null;
+  error_message?: string | null;
+}
+
+export interface FileTransferSnapshot {
+  provider: FileTransferProviderSnapshot;
+  tasks: FileTransferTaskSnapshot[];
+  updated_at_ms?: number | null;
+}
+
 export type CapabilityPlatform =
   | "windows"
   | "macos"

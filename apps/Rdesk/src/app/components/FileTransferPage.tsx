@@ -9,8 +9,6 @@ import {
   FileCode,
   File,
   Monitor,
-  Laptop,
-  Server,
   CheckCircle2,
   Pause,
   Play,
@@ -19,11 +17,15 @@ import {
   ArrowUpFromLine,
   ArrowDownToLine,
   Trash2,
-  Clock,
   Search,
   RotateCcw,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import {
+  ipcFileTransferSnapshot,
+  type FileTransferSnapshot,
+  type FileTransferTaskSnapshot,
+} from "../adapters/tauri";
 
 type TransferStatus = "active" | "paused" | "done" | "error";
 type TransferDirection = "send" | "receive";
@@ -47,161 +49,63 @@ interface TransferItem {
   savePath?: string;
 }
 
-const transferData: TransferItem[] = [
-  {
-    id: "1",
-    name: "project-backup.zip",
-    size: "2.1 GB",
-    totalBytes: 2254857830,
-    transferredBytes: 1510754746,
-    progress: 67,
-    status: "active",
-    direction: "send",
-    localDevice: "本机",
-    remoteDevice: "办公室电脑",
-    remoteDeviceIcon: Monitor,
-    speed: "12.4 MB/s",
-    eta: "约 58 秒",
-    time: "14:32",
-    fileIcon: FileArchive,
-    savePath: "C:\\Users\\Admin\\Downloads",
-  },
-  {
-    id: "2",
-    name: "design-assets-v3.fig",
-    size: "340 MB",
-    totalBytes: 356515840,
-    transferredBytes: 142606336,
-    progress: 40,
-    status: "active",
-    direction: "receive",
-    localDevice: "本机",
-    remoteDevice: "设计工作站",
-    remoteDeviceIcon: Laptop,
-    speed: "8.7 MB/s",
-    eta: "约 23 秒",
-    time: "14:28",
-    fileIcon: FileImage,
-    savePath: "~/Downloads",
-  },
-  {
-    id: "3",
-    name: "database-dump.sql",
-    size: "890 MB",
-    totalBytes: 933232640,
-    transferredBytes: 317299098,
-    progress: 34,
-    status: "paused",
-    direction: "send",
-    localDevice: "本机",
-    remoteDevice: "Linux 服务器",
-    remoteDeviceIcon: Server,
-    time: "13:15",
-    fileIcon: FileCode,
-    savePath: "/home/admin/backups",
-  },
-  {
-    id: "4",
-    name: "weekly-report.docx",
-    size: "4.2 MB",
-    totalBytes: 4404019,
-    transferredBytes: 1761608,
-    progress: 40,
-    status: "error",
-    direction: "receive",
-    localDevice: "本机",
-    remoteDevice: "办公室电脑",
-    remoteDeviceIcon: Monitor,
-    time: "13:02",
-    fileIcon: FileText,
-    savePath: "~/Documents",
-  },
-  {
-    id: "5",
-    name: "presentation-final.pptx",
-    size: "18 MB",
-    totalBytes: 18874368,
-    transferredBytes: 18874368,
-    progress: 100,
-    status: "done",
-    direction: "send",
-    localDevice: "本机",
-    remoteDevice: "设计工作站",
-    remoteDeviceIcon: Laptop,
-    time: "12:45",
-    fileIcon: FileText,
-    savePath: "~/Documents/Work",
-  },
-  {
-    id: "6",
-    name: "demo-video.mp4",
-    size: "1.4 GB",
-    totalBytes: 1503238553,
-    transferredBytes: 1503238553,
-    progress: 100,
-    status: "done",
-    direction: "receive",
-    localDevice: "本机",
-    remoteDevice: "Linux 服务器",
-    remoteDeviceIcon: Server,
-    time: "11:30",
-    fileIcon: FileVideo,
-    savePath: "~/Videos",
-  },
-  {
-    id: "7",
-    name: "config-backup.tar.gz",
-    size: "56 MB",
-    totalBytes: 58720256,
-    transferredBytes: 58720256,
-    progress: 100,
-    status: "done",
-    direction: "send",
-    localDevice: "本机",
-    remoteDevice: "Linux 服务器",
-    remoteDeviceIcon: Server,
-    time: "10:22",
-    fileIcon: FileArchive,
-    savePath: "/etc/backup",
-  },
-  {
-    id: "8",
-    name: "screenshot-2026-03-04.png",
-    size: "3.8 MB",
-    totalBytes: 3984588,
-    transferredBytes: 3984588,
-    progress: 100,
-    status: "done",
-    direction: "receive",
-    localDevice: "本机",
-    remoteDevice: "办公室电脑",
-    remoteDeviceIcon: Monitor,
-    time: "09:55",
-    fileIcon: FileImage,
-    savePath: "~/Pictures",
-  },
-  {
-    id: "9",
-    name: "logs-archive.zip",
-    size: "234 MB",
-    totalBytes: 245366784,
-    transferredBytes: 245366784,
-    progress: 100,
-    status: "done",
-    direction: "send",
-    localDevice: "本机",
-    remoteDevice: "设计工作站",
-    remoteDeviceIcon: Laptop,
-    time: "昨天 18:30",
-    fileIcon: FileArchive,
-    savePath: "~/Downloads",
-  },
-];
-
 function formatBytes(bytes: number): string {
   if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(1) + " GB";
   if (bytes >= 1048576) return (bytes / 1048576).toFixed(0) + " MB";
   return (bytes / 1024).toFixed(0) + " KB";
+}
+
+function pathBaseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function iconForPath(path: string): typeof File {
+  const lower = path.toLowerCase();
+  if (/\.(zip|7z|rar|tar|gz|bz2|xz)$/.test(lower)) return FileArchive;
+  if (/\.(png|jpg|jpeg|gif|webp|bmp|svg|fig)$/.test(lower)) return FileImage;
+  if (/\.(mp4|mov|mkv|webm|avi)$/.test(lower)) return FileVideo;
+  if (/\.(js|ts|tsx|rs|py|go|java|json|sql|toml|yaml|yml)$/.test(lower)) return FileCode;
+  if (/\.(doc|docx|ppt|pptx|pdf|txt|md)$/.test(lower)) return FileText;
+  return File;
+}
+
+function statusFromTask(status: string): TransferStatus {
+  if (status === "completed") return "done";
+  if (status === "failed" || status === "cancelled") return "error";
+  if (status === "paused") return "paused";
+  return "active";
+}
+
+function transferItemFromTask(
+  task: FileTransferTaskSnapshot,
+  updatedAtMs?: number | null
+): TransferItem {
+  const direction: TransferDirection = task.direction === "receive" ? "receive" : "send";
+  const status = statusFromTask(task.status);
+  const firstPath = task.current_path ?? task.source_paths[0] ?? task.transfer_id;
+  const progress =
+    task.total_bytes > 0
+      ? Math.min(100, Math.round((task.transferred_bytes / task.total_bytes) * 100))
+      : status === "done"
+        ? 100
+        : 0;
+
+  return {
+    id: task.transfer_id,
+    name: pathBaseName(firstPath),
+    size: formatBytes(task.total_bytes),
+    totalBytes: task.total_bytes,
+    transferredBytes: task.transferred_bytes,
+    progress,
+    status,
+    direction,
+    localDevice: "本机",
+    remoteDevice: direction === "send" ? task.target_device_id : task.source_device_id,
+    remoteDeviceIcon: Monitor,
+    time: updatedAtMs ? new Date(updatedAtMs).toLocaleTimeString() : "刚刚",
+    fileIcon: iconForPath(firstPath),
+    savePath: task.target_path,
+  };
 }
 
 interface TransferModalProps {
@@ -213,6 +117,8 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
   const { isDark } = useTheme();
   const [filter, setFilter] = useState<"all" | "send" | "receive">("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [transferSnapshot, setTransferSnapshot] = useState<FileTransferSnapshot | null>(null);
+  const [snapshotError, setSnapshotError] = useState<string | null>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -224,7 +130,43 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
     return () => document.removeEventListener("keydown", handler);
   }, [open, onClose]);
 
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setSnapshotError(null);
+
+    void ipcFileTransferSnapshot().then((result) => {
+      if (cancelled) return;
+      if (result.ok) {
+        setTransferSnapshot(result.value);
+        return;
+      }
+      setTransferSnapshot(null);
+      setSnapshotError(result.error.message);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   if (!open) return null;
+
+  const transferData = transferSnapshot?.tasks.map((task) =>
+    transferItemFromTask(task, transferSnapshot.updated_at_ms)
+  ) ?? [];
+  const providerReserved = transferSnapshot?.provider.status === "reserved";
+  const emptyTitle = snapshotError
+    ? "传输服务不可用"
+    : providerReserved
+      ? "Provider 已预留"
+      : "暂无传输记录";
+  const emptyProvider = providerReserved ? transferSnapshot?.provider.display_name : null;
+  const emptyDetail =
+    snapshotError ??
+    (providerReserved
+      ? transferSnapshot?.provider.detail ?? "等待绑定文件传输 provider"
+      : "在设备详情中发起文件传输后，任务将显示在此处");
 
   const activeTransfers = transferData.filter(
     (t) => t.status === "active" || t.status === "paused" || t.status === "error"
@@ -771,10 +713,15 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
                 <Upload style={{ width: 22, height: 22 }} className={textTertiary} />
               </div>
               <p className={textSecondary} style={{ fontSize: 13 }}>
-                暂无传输记录
+                {emptyTitle}
               </p>
+              {emptyProvider && (
+                <p className={isDark ? "text-gray-300" : "text-gray-600"} style={{ fontSize: 12 }}>
+                  {emptyProvider}
+                </p>
+              )}
               <p className={textTertiary} style={{ fontSize: 11 }}>
-                在设备详情中发起文件传输后，任务将显示在此处
+                {emptyDetail}
               </p>
             </div>
           )}

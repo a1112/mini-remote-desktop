@@ -14,6 +14,7 @@ import type {
   ClientDiagnostics,
   DeviceInfo,
   LanDiscoverySnapshot,
+  FileTransferSnapshot,
   DeviceRegistrationResponse,
   DecodePolicy,
   DecodePolicyResponse,
@@ -572,6 +573,18 @@ export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscove
     undefined,
     { type: 'RefreshLanDiscovery' },
     responseField<LanDiscoverySnapshot>('snapshot')
+  );
+}
+
+/**
+ * Get service-owned file transfer provider and task snapshot via IPC.
+ */
+export async function ipcFileTransferSnapshot(): Promise<AdapterResult<FileTransferSnapshot>> {
+  return invokeBridgeOrTauri<FileTransferSnapshot>(
+    'ipc_file_transfer_snapshot',
+    undefined,
+    { type: 'FileTransferSnapshot' },
+    responseField<FileTransferSnapshot>('snapshot')
   );
 }
 

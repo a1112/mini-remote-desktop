@@ -982,6 +982,49 @@ mod wire {
         pub details: Vec<(String, String)>,
     }
 
+    /// Service-owned file transfer provider state.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferProviderSnapshot {
+        pub provider_id: String,
+        pub display_name: String,
+        pub status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub supported_actions: Vec<String>,
+    }
+
+    /// One file transfer task exposed by the service-owned provider.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferTaskSnapshot {
+        pub transfer_id: String,
+        pub direction: String,
+        pub status: String,
+        pub source_device_id: DeviceId,
+        pub target_device_id: DeviceId,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub source_paths: Vec<String>,
+        pub target_path: String,
+        pub total_bytes: u64,
+        pub transferred_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub current_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_message: Option<String>,
+    }
+
+    /// File transfer provider and task snapshot exposed to Rdesk.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferSnapshot {
+        pub provider: FileTransferProviderSnapshot,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tasks: Vec<FileTransferTaskSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub updated_at_ms: Option<u64>,
+    }
+
     // === Core IPC Types ===
 
     /// IPC request from Rdesk to mrd-service
@@ -999,6 +1042,8 @@ mod wire {
         LanDiscoverySnapshot,
         /// Send an immediate LAN discovery probe and return the current snapshot.
         RefreshLanDiscovery,
+        /// Get file transfer provider and task state.
+        FileTransferSnapshot,
         /// List all active sessions
         ListSessions,
         /// Start a new session as controller
@@ -1199,6 +1244,11 @@ mod wire {
         LanDiscoverySnapshot {
             /// Current discovery state.
             snapshot: LanDiscoverySnapshot,
+        },
+        /// File transfer provider and task state.
+        FileTransferSnapshot {
+            /// Current provider/task snapshot.
+            snapshot: FileTransferSnapshot,
         },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },

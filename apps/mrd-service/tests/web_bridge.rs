@@ -29,6 +29,7 @@ fn lan_bound_web_bridge_requires_token() {
 fn bridge_allows_only_browser_safe_ipc_requests() {
     assert!(is_ipc_request_allowed(&IpcRequest::CapabilitySnapshot));
     assert!(is_ipc_request_allowed(&IpcRequest::RefreshLanDiscovery));
+    assert!(is_ipc_request_allowed(&IpcRequest::FileTransferSnapshot));
     assert!(is_ipc_request_allowed(&IpcRequest::ServiceHealth));
     assert!(is_ipc_request_allowed(&IpcRequest::GetShellStatus));
 
