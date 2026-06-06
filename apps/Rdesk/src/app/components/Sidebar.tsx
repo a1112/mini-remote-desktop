@@ -8,6 +8,7 @@ import {
   stopSession,
   type SessionInfo,
 } from "../services/ipcSessionService";
+import { ipcCapabilitySnapshot } from "../adapters/tauri";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -81,6 +82,16 @@ type DeviceMenuItem = {
 
 const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
 const terminalSessionStates = new Set(["failed", "closed"]);
+const runnableCapabilityStatuses = new Set(["available", "usable", "supported", "degraded"]);
+
+type CapabilitySnapshotLike = {
+  capabilities?: Array<{
+    id?: string;
+    status?: string;
+    reason?: string | null;
+    detail?: string | null;
+  }>;
+};
 
 function activePeerSessionForDevice(
   sessions: SessionInfo[],
@@ -93,6 +104,22 @@ function activePeerSessionForDevice(
   ) ?? null;
 }
 
+function remotePowerUnavailableReasonFromSnapshot(
+  snapshot: CapabilitySnapshotLike
+): string | null {
+  const capability = snapshot.capabilities?.find(
+    (item) => item.id === "control.remote_power"
+  );
+  if (!capability) return null;
+  const status = capability.status?.trim().toLowerCase();
+  if (status && runnableCapabilityStatuses.has(status)) return null;
+  return (
+    capability.reason?.trim() ||
+    capability.detail?.trim() ||
+    "远程重启/关机能力未启用"
+  );
+}
+
 export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
   const [devicesExpanded, setDevicesExpanded] = useState(true);
@@ -100,6 +127,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const [submenuOpen, setSubmenuOpen] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<DeviceActionStatus | null>(null);
   const [sessionSummaries, setSessionSummaries] = useState<SessionInfo[]>([]);
+  const [remotePowerUnavailableReason, setRemotePowerUnavailableReason] = useState<string | null>(null);
   const actionStatusTimerRef = useRef<number | null>(null);
   const { isLoggedIn, user } = useAuth();
 
@@ -149,6 +177,27 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   useEffect(() => {
     void refreshSessionSummaries();
   }, [refreshSessionSummaries]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void ipcCapabilitySnapshot()
+      .then((result) => {
+        if (cancelled) return;
+        if (!result.ok) {
+          setRemotePowerUnavailableReason(null);
+          return;
+        }
+        setRemotePowerUnavailableReason(
+          remotePowerUnavailableReasonFromSnapshot(result.value)
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setRemotePowerUnavailableReason(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -536,19 +585,22 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
         : contextMenuDevice?.macAddress
           ? undefined
           : "缺少设备 MAC 地址";
+    const remotePowerDisabledReason = isContextDisabled
+      ? "设备已禁用"
+      : !isContextOnline
+        ? "设备离线"
+        : contextMenuDevice?.isLocal
+          ? "不能远端控制本机电源"
+          : remotePowerUnavailableReason ?? undefined;
+    const remotePowerDisabled =
+      !isContextRemoteActionAvailable || Boolean(remotePowerUnavailableReason);
 
     return [
       {
         icon: RotateCw,
         label: "重启",
-        disabled: !isContextRemoteActionAvailable,
-        title: isContextDisabled
-          ? "设备已禁用"
-          : !isContextOnline
-            ? "设备离线"
-            : contextMenuDevice?.isLocal
-              ? "不能远端重启本机设备"
-              : undefined,
+        disabled: remotePowerDisabled,
+        title: remotePowerDisabledReason,
         action: () => {
           if (contextMenuDevice) {
             return handleRemotePowerAction(
@@ -562,14 +614,8 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
       {
         icon: Power,
         label: "关机",
-        disabled: !isContextRemoteActionAvailable,
-        title: isContextDisabled
-          ? "设备已禁用"
-          : !isContextOnline
-            ? "设备离线"
-            : contextMenuDevice?.isLocal
-              ? "不能远端关机本机设备"
-              : undefined,
+        disabled: remotePowerDisabled,
+        title: remotePowerDisabledReason,
         action: () => {
           if (contextMenuDevice) {
             return handleRemotePowerAction(

@@ -41,6 +41,10 @@ const sessionServiceMock = vi.hoisted(() => ({
   stopSession: vi.fn(),
 }));
 
+const capabilityMock = vi.hoisted(() => ({
+  ipcCapabilitySnapshot: vi.fn(),
+}));
+
 vi.mock("./ThemeContext", () => ({
   useTheme: () => ({
     isDark: false,
@@ -81,6 +85,10 @@ vi.mock("../services/deviceActionService", () => ({
 vi.mock("../services/ipcSessionService", () => ({
   listSessions: sessionServiceMock.listSessions,
   stopSession: sessionServiceMock.stopSession,
+}));
+
+vi.mock("../adapters/tauri", () => ({
+  ipcCapabilitySnapshot: capabilityMock.ipcCapabilitySnapshot,
 }));
 
 const device = (overrides: Partial<Device>): Device => ({
@@ -162,6 +170,7 @@ describe("Sidebar device actions", () => {
     actionServiceMock.requestRemoteDevicePowerAction.mockRejectedValue(
       new Error("remote power unsupported")
     );
+    capabilityMock.ipcCapabilitySnapshot.mockResolvedValue({ ok: false });
     sessionServiceMock.listSessions.mockResolvedValue([]);
     sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
@@ -429,6 +438,49 @@ describe("Sidebar device actions", () => {
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
     expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+  });
+
+  it("blocks remote power actions when service capability marks them unsupported", async () => {
+    capabilityMock.ipcCapabilitySnapshot.mockResolvedValue({
+      ok: true,
+      value: {
+        schema_version: 1,
+        platform: "windows",
+        service_version: "test",
+        capabilities: [
+          {
+            id: "control.remote_power",
+            label: "Remote restart and shutdown",
+            domain: "control",
+            status: "unsupported",
+            platform: "windows",
+            reason: "Set MRD_ENABLE_REMOTE_POWER_ACTIONS=1 on this peer",
+            detail: null,
+            requires: [],
+            conflicts_with: [],
+            depends_on: [],
+            fallback_ids: [],
+            last_probe_time_ms: null,
+          },
+        ],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      },
+    });
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+    });
+    expect(screen.getByRole("button", { name: "重启" })).toHaveAttribute(
+      "title",
+      "Set MRD_ENABLE_REMOTE_POWER_ACTIONS=1 on this peer"
+    );
   });
 
   it("disconnects the active peer session for the selected device", async () => {
