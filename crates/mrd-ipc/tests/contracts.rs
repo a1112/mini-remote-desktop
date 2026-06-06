@@ -656,6 +656,7 @@ fn serialize_deserialize_file_transfer_contracts() {
             target_path: "C:\\Users\\tester\\Downloads".to_string(),
             conflict_policy: FileTransferConflictPolicy::Rename,
             transport_hint: Some("local".to_string()),
+            provider_hint: Some("mrd-local".to_string()),
         },
     };
     let json = serde_json::to_string(&request).unwrap();
@@ -663,6 +664,7 @@ fn serialize_deserialize_file_transfer_contracts() {
     assert!(json.contains("\"source_device_id\":\"source-device\""));
     assert!(json.contains("\"conflict_policy\":\"rename\""));
     assert!(json.contains("\"transport_hint\":\"local\""));
+    assert!(json.contains("\"provider_hint\":\"mrd-local\""));
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(request, deserialized);
 
@@ -687,6 +689,8 @@ fn serialize_deserialize_file_transfer_contracts() {
         source_device_id: Some(DeviceId("source-device".to_string())),
         target_device_id: Some(DeviceId("target-device".to_string())),
         transport_kind: "local".to_string(),
+        provider_kind: "mrd-local".to_string(),
+        provider_capabilities: vec!["service.file_transfer.local".to_string()],
         total_entries: 1,
         copied_entries: 1,
         total_bytes: Some(5),
@@ -707,6 +711,8 @@ fn serialize_deserialize_file_transfer_contracts() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("FileTransferStarted"));
     assert!(json.contains("\"status\":\"completed\""));
+    assert!(json.contains("\"provider_kind\":\"mrd-local\""));
+    assert!(json.contains("\"service.file_transfer.local\""));
     assert!(json.contains("\"copied_bytes\":5"));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);

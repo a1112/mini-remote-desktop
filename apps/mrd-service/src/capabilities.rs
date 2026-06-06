@@ -1728,6 +1728,24 @@ fn add_service_capabilities(
         "Autostart",
         "Autostart support is provided by platform shell adapters.",
     );
+    push_available(
+        items,
+        platform,
+        CapabilityDomain::Service,
+        "service.file_transfer.local",
+        "Local file transfer",
+    );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Service,
+        "service.file_transfer.external_bridge",
+        "External file transfer bridge",
+        CapabilityStatus::Unimplemented,
+        Some(
+            "Reserved for R-File provider integration; MRD currently keeps service-owned local copy/list/cancel as the active path.",
+        ),
+    );
     if matches!(
         platform,
         CapabilityPlatform::Windows | CapabilityPlatform::Linux | CapabilityPlatform::Macos
@@ -2311,6 +2329,30 @@ mod tests {
             .capabilities
             .iter()
             .any(|item| item.id == "decode.ffmpeg_vvc"));
+    }
+
+    #[test]
+    fn static_snapshot_reserves_file_transfer_provider_capabilities() {
+        let snapshot = local_capability_snapshot_static();
+
+        let local = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "service.file_transfer.local")
+            .expect("local file transfer capability");
+        assert_eq!(local.status, CapabilityStatus::Available);
+
+        let external_bridge = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "service.file_transfer.external_bridge")
+            .expect("external file transfer bridge reservation");
+        assert_eq!(external_bridge.status, CapabilityStatus::Unimplemented);
+        assert!(external_bridge
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("R-File"));
     }
 
     #[test]

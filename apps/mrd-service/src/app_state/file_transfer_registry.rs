@@ -56,6 +56,8 @@ mod tests {
             source_device_id: None,
             target_device_id: None,
             transport_kind: "local".to_string(),
+            provider_kind: "mrd-local".to_string(),
+            provider_capabilities: vec!["service.file_transfer.local".to_string()],
             total_entries: 0,
             copied_entries: 0,
             total_bytes: None,

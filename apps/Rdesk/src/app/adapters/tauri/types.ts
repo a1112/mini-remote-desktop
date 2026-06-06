@@ -303,6 +303,7 @@ export interface FileTransferStartRequest {
   target_path: string;
   conflict_policy?: FileTransferConflictPolicy;
   transport_hint?: string | null;
+  provider_hint?: string | null;
 }
 
 export interface FileTransferTaskSnapshot {
@@ -311,6 +312,8 @@ export interface FileTransferTaskSnapshot {
   source_device_id?: string | null;
   target_device_id?: string | null;
   transport_kind: string;
+  provider_kind?: string | null;
+  provider_capabilities?: string[];
   total_entries: number;
   copied_entries: number;
   total_bytes?: number | null;

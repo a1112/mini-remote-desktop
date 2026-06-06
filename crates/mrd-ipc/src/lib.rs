@@ -463,6 +463,10 @@ mod wire {
         Replace,
     }
 
+    fn default_file_transfer_provider_kind() -> String {
+        "mrd-local".to_string()
+    }
+
     /// One source entry in a service-owned file transfer request.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct FileTransferEntry {
@@ -486,6 +490,9 @@ mod wire {
         /// Reserved for future LAN/QUIC routing. The MVP executes `local`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub transport_hint: Option<String>,
+        /// Reserved provider preference for future external file engines, such as R-File.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider_hint: Option<String>,
     }
 
     /// Service-owned file transfer lifecycle status.
@@ -509,6 +516,10 @@ mod wire {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub target_device_id: Option<DeviceId>,
         pub transport_kind: String,
+        #[serde(default = "default_file_transfer_provider_kind")]
+        pub provider_kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub provider_capabilities: Vec<String>,
         pub total_entries: usize,
         pub copied_entries: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]

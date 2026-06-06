@@ -743,6 +743,7 @@ mod tests {
                 target_path: ".".to_string(),
                 conflict_policy: mrd_ipc::FileTransferConflictPolicy::Rename,
                 transport_hint: Some("local".to_string()),
+                provider_hint: None,
             },
         }));
         assert!(is_ipc_request_allowed(&IpcRequest::ListFileTransfers));

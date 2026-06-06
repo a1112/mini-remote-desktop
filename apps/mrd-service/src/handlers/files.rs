@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
+const LOCAL_FILE_TRANSFER_PROVIDER: &str = "mrd-local";
+const LOCAL_FILE_TRANSFER_CAPABILITY: &str = "service.file_transfer.local";
+
 pub fn list_directory(path: Option<String>) -> IpcResponse {
     match read_directory(path) {
         Ok(listing) => IpcResponse::DirectoryList { listing },
@@ -47,6 +50,8 @@ pub async fn start_file_transfer(
         source_device_id: request.source_device_id.clone(),
         target_device_id: request.target_device_id.clone(),
         transport_kind,
+        provider_kind: LOCAL_FILE_TRANSFER_PROVIDER.to_string(),
+        provider_capabilities: vec![LOCAL_FILE_TRANSFER_CAPABILITY.to_string()],
         total_entries: request.entries.len(),
         copied_entries: 0,
         total_bytes,
@@ -545,6 +550,7 @@ mod tests {
                 target_path: target_dir.display().to_string(),
                 conflict_policy: FileTransferConflictPolicy::Rename,
                 transport_hint: Some("local".to_string()),
+                provider_hint: None,
             },
         )
         .await;
@@ -554,6 +560,11 @@ mod tests {
         };
         assert_eq!(transfer.status, FileTransferStatus::Completed);
         assert_eq!(transfer.transport_kind, "local");
+        assert_eq!(transfer.provider_kind, "mrd-local");
+        assert_eq!(
+            transfer.provider_capabilities,
+            vec!["service.file_transfer.local".to_string()]
+        );
         assert_eq!(transfer.total_entries, 1);
         assert_eq!(transfer.copied_entries, 1);
         assert_eq!(transfer.total_bytes, Some(5));
@@ -603,6 +614,7 @@ mod tests {
                 target_path: target_dir.display().to_string(),
                 conflict_policy: FileTransferConflictPolicy::Rename,
                 transport_hint: None,
+                provider_hint: None,
             },
         )
         .await;

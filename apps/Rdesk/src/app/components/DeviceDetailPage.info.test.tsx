@@ -289,6 +289,8 @@ describe("DeviceDetailPage info tab", () => {
           source_device_id: "agent-device",
           target_device_id: "peer-device",
           transport_kind: "local",
+          provider_kind: "mrd-local",
+          provider_capabilities: ["service.file_transfer.local"],
           total_entries: 3,
           copied_entries: 3,
           total_bytes: 3072,
@@ -314,6 +316,7 @@ describe("DeviceDetailPage info tab", () => {
     expect(screen.getByText("file-transfer-1")).toBeInTheDocument();
     expect(screen.getByText("完成 3/3")).toBeInTheDocument();
     expect(screen.getByText("3 KB / 3 KB")).toBeInTheDocument();
+    expect(screen.getByText("mrd-local")).toBeInTheDocument();
   });
 
   it("cancels a running service-owned file transfer task from the file transfer tab", async () => {

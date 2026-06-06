@@ -1221,6 +1221,8 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
                       <span>{fileTransferByteLabel(transfer)}</span>
                       <span>·</span>
                       <span>{transfer.transport_kind}</span>
+                      <span>·</span>
+                      <span>{transfer.provider_kind ?? "mrd-local"}</span>
                     </div>
                     {transfer.error ? (
                       <div className={isDark ? "mt-1 text-red-300" : "mt-1 text-red-700"} style={{ fontSize: 10 }}>
