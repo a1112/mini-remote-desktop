@@ -755,10 +755,16 @@ mod tests {
     #[test]
     fn lan_color_mode_for_profile_maps_stable_strings() {
         let mut profile = default_media_profile();
-        assert_eq!(lan_color_mode_for_profile(&profile).unwrap(), ColorMode::Full);
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            ColorMode::Full
+        );
 
         profile.color_mode = Some("full".to_string());
-        assert_eq!(lan_color_mode_for_profile(&profile).unwrap(), ColorMode::Full);
+        assert_eq!(
+            lan_color_mode_for_profile(&profile).unwrap(),
+            ColorMode::Full
+        );
 
         profile.color_mode = Some("grayscale".to_string());
         assert_eq!(

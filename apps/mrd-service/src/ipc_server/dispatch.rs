@@ -1,8 +1,8 @@
 use super::{audit_outcome, IpcServer};
 use crate::handlers::control;
 use crate::handlers::{
-    capability, device, files, identity, lan, preflight, session, shell as shell_handlers, telemetry,
-    transport as transport_handlers,
+    capability, device, files, identity, lan, preflight, session, shell as shell_handlers,
+    telemetry, transport as transport_handlers,
 };
 use mrd_ipc::{IpcRequest, IpcResponse};
 

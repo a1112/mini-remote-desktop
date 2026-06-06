@@ -25,8 +25,8 @@ fn read_directory(path: Option<String>) -> Result<DirectoryList, String> {
     }
 
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&directory)
-        .map_err(|error| format!("read directory failed: {error}"))?
+    for entry in
+        std::fs::read_dir(&directory).map_err(|error| format!("read directory failed: {error}"))?
     {
         let entry = entry.map_err(|error| format!("read directory entry failed: {error}"))?;
         let metadata = entry
@@ -43,7 +43,9 @@ fn read_directory(path: Option<String>) -> Result<DirectoryList, String> {
 
     Ok(DirectoryList {
         path: directory.display().to_string(),
-        parent_path: directory.parent().map(|parent| parent.display().to_string()),
+        parent_path: directory
+            .parent()
+            .map(|parent| parent.display().to_string()),
         entries,
     })
 }
@@ -107,10 +109,8 @@ mod tests {
 
     #[test]
     fn list_directory_returns_sorted_entries_from_service_host() {
-        let root = std::env::temp_dir().join(format!(
-            "mrd-service-list-directory-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("mrd-service-list-directory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("folder")).expect("create folder");
         std::fs::write(root.join("file.txt"), b"hello").expect("write file");
@@ -120,7 +120,10 @@ mod tests {
             panic!("expected directory list response");
         };
 
-        assert_eq!(listing.path, root.canonicalize().unwrap().display().to_string());
+        assert_eq!(
+            listing.path,
+            root.canonicalize().unwrap().display().to_string()
+        );
         assert_eq!(listing.entries[0].name, "folder");
         assert_eq!(listing.entries[0].kind, FileEntryKind::Directory);
         assert_eq!(listing.entries[1].name, "file.txt");
