@@ -56,6 +56,7 @@ pub(super) struct LanPeerRecord {
     pub(super) service_build_id: Option<String>,
     pub(super) media_protocol_version: Option<u32>,
     pub(super) media_capabilities: Vec<String>,
+    pub(super) mac_address: Option<String>,
     pub(super) last_seen_ms: u64,
 }
 
@@ -77,6 +78,7 @@ impl LanPeerRecord {
             service_build_id: self.service_build_id.clone(),
             media_protocol_version: self.media_protocol_version,
             media_capabilities: self.media_capabilities.clone(),
+            mac_address: self.mac_address.clone(),
             age_ms: now_ms.saturating_sub(self.last_seen_ms),
             p2p_available: true,
         }

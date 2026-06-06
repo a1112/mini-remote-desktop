@@ -381,6 +381,7 @@ impl LanDiscoveryState {
             service_build_id: announcement.service_build_id,
             media_protocol_version: announcement.media_protocol_version,
             media_capabilities: announcement.media_capabilities,
+            mac_address: announcement.mac_address,
             last_seen_ms: now_ms(),
         };
 
@@ -1999,6 +2000,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
+        mac_address: None,
         timestamp_ms: now_ms(),
     })
 }
@@ -7443,6 +7445,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -7479,6 +7482,7 @@ mod tests {
                     service_build_id: Some("build-a".to_string()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: lan_media_capabilities(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -7704,6 +7708,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -7731,6 +7736,7 @@ mod tests {
             service_build_id: Some("build-a".to_string()),
             media_protocol_version: Some(3),
             media_capabilities: vec!["media.hevc".to_string()],
+            mac_address: Some("AA:BB:CC:DD:EE:FF".to_string()),
             last_seen_ms: 1_000,
         };
 
@@ -7746,6 +7752,7 @@ mod tests {
         let info = record.to_peer_info(1_250);
         assert_eq!(info.device_id.0, "remote-device");
         assert_eq!(info.p2p_control_addr, "192.168.1.50:21116");
+        assert_eq!(info.mac_address.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
         assert_eq!(info.age_ms, 250);
         assert!(info.p2p_available);
     }
@@ -7764,6 +7771,7 @@ mod tests {
             service_build_id: None,
             media_protocol_version: Some(3),
             media_capabilities: vec!["media.hevc".to_string()],
+            mac_address: None,
             last_seen_ms: 1_000,
         });
         registry.upsert(super::peer_registry::LanPeerRecord {
@@ -7777,6 +7785,7 @@ mod tests {
             service_build_id: None,
             media_protocol_version: None,
             media_capabilities: Vec::new(),
+            mac_address: None,
             last_seen_ms: 100,
         });
 
@@ -7882,6 +7891,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -7987,6 +7997,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -8131,6 +8142,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -8257,6 +8269,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -8406,6 +8419,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -8712,6 +8726,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -8860,6 +8875,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -9081,6 +9097,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: lan_media_capabilities(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -9194,6 +9211,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 peer_addr,
@@ -9239,6 +9257,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 peer_addr,
@@ -9277,6 +9296,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "127.0.0.1:21116".parse().unwrap(),
@@ -9311,6 +9331,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),

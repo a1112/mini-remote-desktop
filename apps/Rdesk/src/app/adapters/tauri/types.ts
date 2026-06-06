@@ -561,6 +561,7 @@ export interface LanPeerInfo {
   service_build_id?: string | null;
   media_protocol_version?: number | null;
   media_capabilities?: string[];
+  mac_address?: string | null;
   age_ms: number;
   p2p_available: boolean;
 }

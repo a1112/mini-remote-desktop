@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { Monitor } from "lucide-react";
 
-import { lanPeerPlatformLabel, type Device, mergeDevices } from "./deviceData";
+import { lanPeerPlatformLabel, lanPeerToDevice, type Device, mergeDevices } from "./deviceData";
 
 const device = (overrides: Partial<Device>): Device => ({
   id: "base-id",
@@ -83,6 +83,31 @@ describe("mergeDevices", () => {
       primarySource: "lan_p2p",
       p2pAvailable: true,
       serverAvailable: true,
+    });
+  });
+
+  it("preserves LAN peer MAC addresses for Wake-on-LAN device actions", () => {
+    const lanDevice = lanPeerToDevice({
+      device_id: "peer-device",
+      device_name: "Peer Device",
+      device_type: "rdesk",
+      ip: "192.168.1.20",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.20:21116",
+      transports: ["quic_datagram"],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [],
+      mac_address: "AA:BB:CC:DD:EE:FF",
+      age_ms: 1500,
+      p2p_available: false,
+    });
+
+    expect(lanDevice).toMatchObject({
+      deviceId: "peer-device",
+      status: "offline",
+      macAddress: "AA:BB:CC:DD:EE:FF",
     });
   });
 

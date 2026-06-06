@@ -1434,6 +1434,9 @@ mod wire {
         /// Structured media capabilities advertised by the peer.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub media_capabilities: Vec<String>,
+        /// Optional MAC address advertised by the peer for Wake-on-LAN flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mac_address: Option<String>,
         /// Milliseconds since this peer was last observed.
         pub age_ms: u64,
         /// Whether this peer was discovered through the local P2P LAN path.

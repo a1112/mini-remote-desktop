@@ -243,6 +243,8 @@ pub(super) struct LanAnnouncement {
     pub(super) media_protocol_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) media_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) mac_address: Option<String>,
     pub(super) timestamp_ms: u64,
 }
 

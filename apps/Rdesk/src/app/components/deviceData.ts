@@ -200,7 +200,7 @@ function mergeLanPeers(peerSets: LanPeerInfo[][]): LanPeerInfo[] {
   return Array.from(byDeviceId.values());
 }
 
-const lanPeerToDevice = (peer: LanPeerInfo): Device =>
+export const lanPeerToDevice = (peer: LanPeerInfo): Device =>
   baseDevice("lan_p2p", {
     id: peer.device_id,
     name: peer.device_name,
@@ -215,6 +215,7 @@ const lanPeerToDevice = (peer: LanPeerInfo): Device =>
     ram: null,
     disk: null,
     ip: peer.ip,
+    macAddress: peer.mac_address ?? null,
     group: "LAN P2P",
     favorite: false,
   });

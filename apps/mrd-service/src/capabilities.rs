@@ -2439,6 +2439,7 @@ mod tests {
                 "encode.software_vvc".to_string(),
                 "decode.software_h266".to_string(),
             ],
+            mac_address: None,
             age_ms: 0,
             p2p_available: true,
         };
