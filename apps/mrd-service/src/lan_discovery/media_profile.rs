@@ -60,20 +60,34 @@ pub(crate) fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
     match normalize_lan_codec_name(&profile.codec) {
         Some("hevc") => {
             profile.codec = "hevc".to_string();
+            let requests_main10 = lan_profile_requests_hevc_main10(profile);
+            let requests_hdr_main10 = profile
+                .color_pipeline
+                .as_deref()
+                .map(|pipeline| pipeline.eq_ignore_ascii_case("hdr_main10"))
+                .unwrap_or(false);
             if profile.codec_profile.is_none() {
-                profile.codec_profile = Some("main".to_string());
+                profile.codec_profile = Some(if requests_main10 {
+                    "main10".to_string()
+                } else {
+                    "main".to_string()
+                });
             }
             if profile.bit_depth.is_none() {
-                profile.bit_depth = Some(8);
+                profile.bit_depth = Some(if requests_main10 { 10 } else { 8 });
             }
             if profile.chroma_subsampling.is_none() {
                 profile.chroma_subsampling = Some("4:2:0".to_string());
             }
             if profile.pixel_format.is_none() {
-                profile.pixel_format = Some("nv12".to_string());
+                profile.pixel_format = Some(if requests_main10 {
+                    "p010".to_string()
+                } else {
+                    "nv12".to_string()
+                });
             }
             if profile.hdr_enabled.is_none() {
-                profile.hdr_enabled = Some(false);
+                profile.hdr_enabled = Some(requests_hdr_main10);
             }
         }
         Some("av1") => {
@@ -500,6 +514,37 @@ mod tests {
         assert_eq!(profile.chroma_subsampling.as_deref(), Some("4:2:0"));
         assert_eq!(profile.pixel_format.as_deref(), Some("nv12"));
         assert_eq!(profile.hdr_enabled, Some(false));
+    }
+
+    #[test]
+    fn hdr_main10_pipeline_defaults_to_10bit_hevc_profile() {
+        let negotiation = clamp_media_profile_to_lan_capability(Some(MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 144,
+            bitrate_mbps: 40,
+            codec: "hevc".to_string(),
+            color_pipeline: Some("hdr_main10".to_string()),
+            ..MediaProfile::default()
+        }))
+        .unwrap();
+
+        assert_eq!(negotiation.selected.codec, "hevc");
+        assert_eq!(
+            negotiation.selected.codec_profile.as_deref(),
+            Some("main10")
+        );
+        assert_eq!(negotiation.selected.bit_depth, Some(10));
+        assert_eq!(
+            negotiation.selected.chroma_subsampling.as_deref(),
+            Some("4:2:0")
+        );
+        assert_eq!(negotiation.selected.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(negotiation.selected.hdr_enabled, Some(true));
+        assert_eq!(
+            negotiation.selected.color_pipeline.as_deref(),
+            Some("hdr_main10")
+        );
     }
 
     #[test]
