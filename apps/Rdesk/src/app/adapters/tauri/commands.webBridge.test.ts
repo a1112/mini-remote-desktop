@@ -4,6 +4,7 @@ import {
   browserWebrtcPreviewStart,
   browserWebrtcPreviewStop,
   ipcCapabilitySnapshot,
+  ipcPeerCapabilitySnapshot,
   ipcStartLanRemoteSession,
   ipcUpdateMediaProfile,
   ipcListLocalCaptureSources,
@@ -46,6 +47,39 @@ describe('commands service bridge integration', () => {
       'http://127.0.0.1:9532/ipc',
       expect.any(Object)
     );
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('uses the browser service bridge for peer capability snapshots outside Tauri', async () => {
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'PeerCapabilitySnapshot',
+          peer_device_id: 'agent-device',
+          snapshot: {
+            schema_version: 1,
+            platform: 'windows',
+            service_version: 'peer',
+            capabilities: [],
+            constraints: [],
+            profiles: [],
+            updated_at_ms: 0,
+          },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcPeerCapabilitySnapshot('agent-device');
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok && result.value?.service_version).toBe('peer');
+    expect(requestBody.request).toEqual({
+      type: 'GetPeerCapabilitySnapshot',
+      peer_device_id: 'agent-device',
+    });
     expect(invoke).not.toHaveBeenCalled();
   });
 

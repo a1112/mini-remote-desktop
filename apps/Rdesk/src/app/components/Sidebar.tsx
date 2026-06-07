@@ -8,7 +8,7 @@ import {
   stopSession,
   type SessionInfo,
 } from "../services/ipcSessionService";
-import { ipcCapabilitySnapshot } from "../adapters/tauri";
+import { ipcCapabilitySnapshot, ipcPeerCapabilitySnapshot } from "../adapters/tauri";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -128,6 +128,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const [actionStatus, setActionStatus] = useState<DeviceActionStatus | null>(null);
   const [sessionSummaries, setSessionSummaries] = useState<SessionInfo[]>([]);
   const [remotePowerUnavailableReason, setRemotePowerUnavailableReason] = useState<string | null>(null);
+  const [peerRemotePowerUnavailableReason, setPeerRemotePowerUnavailableReason] = useState<string | null>(null);
   const actionStatusTimerRef = useRef<number | null>(null);
   const { isLoggedIn, user } = useAuth();
 
@@ -247,6 +248,35 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const contextActiveSession = contextMenuDevice
     ? activePeerSessionForDevice(sessionSummaries, contextMenuDevice.deviceId)
     : null;
+
+  useEffect(() => {
+    let cancelled = false;
+    setPeerRemotePowerUnavailableReason(null);
+    if (!contextMenuDevice || contextMenuDevice.isLocal) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void ipcPeerCapabilitySnapshot(contextMenuDevice.deviceId)
+      .then((result) => {
+        if (cancelled) return;
+        if (!result.ok || !result.value) {
+          setPeerRemotePowerUnavailableReason(null);
+          return;
+        }
+        setPeerRemotePowerUnavailableReason(
+          remotePowerUnavailableReasonFromSnapshot(result.value)
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setPeerRemotePowerUnavailableReason(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contextMenuDevice?.deviceId, contextMenuDevice?.isLocal]);
 
   // 重命名设备
   const handleStartRename = (deviceId: string, currentName: string) => {
@@ -591,9 +621,10 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
         ? "设备离线"
         : contextMenuDevice?.isLocal
           ? "不能远端控制本机电源"
-          : remotePowerUnavailableReason ?? undefined;
+          : peerRemotePowerUnavailableReason ?? remotePowerUnavailableReason ?? undefined;
     const remotePowerDisabled =
-      !isContextRemoteActionAvailable || Boolean(remotePowerUnavailableReason);
+      !isContextRemoteActionAvailable ||
+      Boolean(peerRemotePowerUnavailableReason ?? remotePowerUnavailableReason);
 
     return [
       {

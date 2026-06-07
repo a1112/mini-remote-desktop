@@ -1078,6 +1078,25 @@ export async function ipcCapabilitySnapshot(): Promise<AdapterResult<CapabilityS
 }
 
 /**
+ * Get a discovered peer capability snapshot from mrd-service.
+ */
+export async function ipcPeerCapabilitySnapshot(
+  peerDeviceId: string
+): Promise<AdapterResult<CapabilitySnapshot | null>> {
+  return invokeBridgeOrTauri<CapabilitySnapshot | null>(
+    'ipc_peer_capability_snapshot',
+    {
+      peerDeviceId,
+    },
+    {
+      type: 'GetPeerCapabilitySnapshot',
+      peer_device_id: peerDeviceId,
+    },
+    responseField<CapabilitySnapshot | null>('snapshot')
+  );
+}
+
+/**
  * Get probe snapshot.
  */
 export async function ipcProbeSnapshot(

@@ -409,6 +409,26 @@ describe('Tauri Adapter Contract', () => {
       });
       expect(result.ok).toBe(true);
     });
+
+    it('ipc_peer_capability_snapshot calls correct command with peer device id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        schema_version: 1,
+        platform: 'windows',
+        service_version: 'peer',
+        capabilities: [],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      });
+
+      const result = await adapter.ipcPeerCapabilitySnapshot('agent-device');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_peer_capability_snapshot', {
+        peerDeviceId: 'agent-device',
+      });
+      expect(result.ok).toBe(true);
+    });
   });
 
   /**
