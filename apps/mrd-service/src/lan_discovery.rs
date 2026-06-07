@@ -148,6 +148,14 @@ const LAN_RENDER_D3D11_NATIVE_CAPABILITY: &str = "d3d11_native_render";
 #[cfg(windows)]
 const LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY: &str = "render.d3d11_shared_nv12";
 const LAN_INPUT_CONTROL_CAPABILITY: &str = "control.keyboard_mouse";
+const LAN_MEDIA_COLOR_CAPABILITIES: [&str; 6] = [
+    "media.color_mode.full",
+    "media.color_mode.grayscale",
+    "media.color_mode.monochrome",
+    "media.color_mode.low_chroma",
+    "media.color_pipeline.sdr8",
+    "media.color_pipeline.hdr_main10",
+];
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_MACOS_CAPABILITY: &str = "macos_capture";
 #[cfg(target_os = "macos")]
@@ -3090,6 +3098,7 @@ fn lan_media_capabilities_with_input_control(input_control_available: bool) -> V
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
     ];
+    capabilities.extend(LAN_MEDIA_COLOR_CAPABILITIES.into_iter().map(str::to_string));
     #[cfg(windows)]
     {
         capabilities.extend([
@@ -5315,6 +5324,7 @@ fn lan_render_queue_policy_for_profile_with_override(
     if let Some(policy) = override_policy {
         return policy;
     }
+    let _ = profile;
     #[cfg(target_os = "macos")]
     if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
         return LanRenderQueuePolicy::Latest;
@@ -8034,6 +8044,7 @@ struct LanCapturedSenderFrame {
 
 impl LanSenderFrameCapture {
     fn new(capture: LanFrameCapture, profile: &MediaProfile) -> Result<Self> {
+        let _ = profile;
         #[cfg(target_os = "macos")]
         {
             if matches!(capture, LanFrameCapture::Macos(_)) && lan_capture_pump_enabled() {
@@ -10827,6 +10838,25 @@ mod tests {
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
         assert!(!lan_media_capabilities_with_input_control(false)
             .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
+    }
+
+    #[test]
+    fn lan_media_capabilities_advertise_color_profile_support() {
+        let capabilities = lan_media_capabilities_with_input_control(false);
+
+        for capability in [
+            "media.color_mode.full",
+            "media.color_mode.grayscale",
+            "media.color_mode.monochrome",
+            "media.color_mode.low_chroma",
+            "media.color_pipeline.sdr8",
+            "media.color_pipeline.hdr_main10",
+        ] {
+            assert!(
+                capabilities.contains(&capability.to_string()),
+                "missing LAN color capability {capability}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
