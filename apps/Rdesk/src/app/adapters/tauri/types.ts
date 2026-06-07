@@ -751,6 +751,8 @@ export interface SessionInfo {
     | "closed";
   transport_kind: "quic" | "webrtc" | string;
   last_error?: string | null;
+  source_device_id?: string | null;
+  target_device_id?: string | null;
   sender_active: boolean;
   receiver_active: boolean;
 }

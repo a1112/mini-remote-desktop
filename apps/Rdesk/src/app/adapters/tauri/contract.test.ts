@@ -777,11 +777,24 @@ describe('Tauri Adapter Contract', () => {
 
     it('ipc_list_sessions calls correct command', async () => {
       const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue([]);
+      mockInvoke.mockResolvedValue([
+        {
+          session_id: 'session-123',
+          role: 'controller',
+          state: 'streaming',
+          transport_kind: 'quic',
+          last_error: null,
+          source_device_id: null,
+          target_device_id: 'agent-device',
+          sender_active: true,
+          receiver_active: true,
+        },
+      ]);
 
-      await adapter.ipcListSessions();
+      const result = await adapter.ipcListSessions();
 
       expect(mockInvoke).toHaveBeenCalledWith('ipc_list_sessions', undefined);
+      expect(result.ok && result.value[0]?.target_device_id).toBe('agent-device');
     });
 
     it('ipc_runtime_snapshot calls correct command', async () => {

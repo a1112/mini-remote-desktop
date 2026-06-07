@@ -158,6 +158,8 @@ impl IpcServer {
                         state: snap.lifecycle_state.as_str().to_string(),
                         transport_kind: snap.transport.clone(),
                         last_error: snap.last_error.clone(),
+                        source_device_id: snap.source_device_id.clone(),
+                        target_device_id: snap.target_device_id.clone(),
                         sender_active: snap.sender_active,
                         receiver_active: snap.receiver_active,
                     })

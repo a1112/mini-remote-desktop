@@ -39,6 +39,8 @@ export interface SessionInfo {
   state: SessionState;
   transport_kind: TransportKind | string;
   last_error?: string | null;
+  source_device_id?: string | null;
+  target_device_id?: string | null;
   sender_active: boolean;
   receiver_active: boolean;
 }
@@ -355,6 +357,24 @@ export const getSessionSnapshot = async (
 export const listSessions = async (): Promise<SessionInfo[]> => {
   const result = await tauriAdapter.ipcListSessions();
   return unwrapAdapterResult(result);
+};
+
+const terminalSessionStates = new Set<SessionState>(["failed", "closed"]);
+
+export const disconnectDeviceSessions = async (deviceId: string): Promise<number> => {
+  const sessions = await listSessions();
+  const matchingSessions = sessions.filter(
+    (session) =>
+      !terminalSessionStates.has(session.state) &&
+      (session.source_device_id === deviceId || session.target_device_id === deviceId)
+  );
+
+  let stopped = 0;
+  for (const session of matchingSessions) {
+    await stopSession(session.session_id);
+    stopped += 1;
+  }
+  return stopped;
 };
 
 /**

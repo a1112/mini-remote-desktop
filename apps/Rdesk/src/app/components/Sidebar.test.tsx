@@ -29,6 +29,7 @@ const authMock = vi.hoisted(() => ({
 const serviceMock = vi.hoisted(() => ({
   renameDevice: vi.fn(),
   unbindDevice: vi.fn(),
+  disconnectDeviceSessions: vi.fn(),
 }));
 const layoutActionMock = vi.hoisted(() => ({
   openTransfers: vi.fn(),
@@ -62,6 +63,10 @@ vi.mock("../services/deviceService", () => ({
     renameDevice: serviceMock.renameDevice,
     unbindDevice: serviceMock.unbindDevice,
   },
+}));
+
+vi.mock("../services/ipcSessionService", () => ({
+  disconnectDeviceSessions: serviceMock.disconnectDeviceSessions,
 }));
 
 const device = (overrides: Partial<Device>): Device => ({
@@ -130,7 +135,7 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "收藏设备" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "禁用设备" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "断开连接" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "移除设备" })).toBeEnabled();
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
@@ -171,6 +176,22 @@ describe("Sidebar device actions", () => {
     await user.click(screen.getByRole("button", { name: "移除设备" }));
 
     expect(deviceDataMock.removeDeviceLocally).toHaveBeenCalledWith("agent-device");
+  });
+
+  it("disconnects active sessions for the selected device", async () => {
+    serviceMock.disconnectDeviceSessions.mockResolvedValue(2);
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "断开连接" }));
+
+    expect(serviceMock.disconnectDeviceSessions).toHaveBeenCalledWith("agent-device");
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已断开 2 个会话：Agent PC")).toBeInTheDocument();
+    });
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

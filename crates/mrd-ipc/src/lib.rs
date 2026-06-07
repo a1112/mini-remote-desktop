@@ -1468,6 +1468,10 @@ mod wire {
         pub state: String, // "created", "listening", "connecting", "connected", "streaming", "failed", "closed"
         pub transport_kind: String,
         pub last_error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_device_id: Option<DeviceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<DeviceId>,
         /// Whether the media sender is currently marked active.
         pub sender_active: bool,
         /// Whether the media receiver is currently marked active.

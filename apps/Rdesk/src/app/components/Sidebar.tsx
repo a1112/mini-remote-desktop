@@ -7,6 +7,7 @@ import {
 import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
+import { disconnectDeviceSessions } from "../services/ipcSessionService";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -259,6 +260,25 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
   };
 
+  const handleDisconnectDevice = async (deviceId: string, deviceName: string) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      const stopped = await disconnectDeviceSessions(deviceId);
+      await refresh();
+      showActionStatus({
+        kind: "success",
+        message:
+          stopped > 0
+            ? `已断开 ${stopped} 个会话：${deviceName}`
+            : `没有活动会话：${deviceName}`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `断开连接失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -347,7 +367,16 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
           disabled: !isLoggedIn || !user,
           title: !isLoggedIn || !user ? "请先登录后再退出绑定" : undefined,
         },
-        { icon: Power, label: "断开连接", disabled: true, title: unsupportedDeviceActionTitle, danger: true }
+        {
+          icon: Power,
+          label: "断开连接",
+          action: () => {
+            if (contextMenuDevice) {
+              return handleDisconnectDevice(contextMenuDevice.deviceId, contextMenuDevice.name);
+            }
+          },
+          danger: true,
+        }
       );
     }
 
