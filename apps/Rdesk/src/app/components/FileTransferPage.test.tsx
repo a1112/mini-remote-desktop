@@ -47,7 +47,12 @@ describe("TransferModal", () => {
         display_name: "R-File provider boundary",
         status: "available",
         detail: "Detected R-File provider root.",
-        capabilities: ["file.transfer.rfile.transfer_tasks"],
+        capabilities: [
+          "file.transfer.rfile.transfer_tasks",
+          "file.transfer.rfile.http.download_stream_1mb_buffer",
+          "file.transfer.rfile.quic.transfer_16gb_limit",
+          "file.transfer.rfile.endpoint.http://127.0.0.1:18080",
+        ],
         supported_actions: ["list", "pause", "resume", "cancel"],
       },
       tasks: [
@@ -106,6 +111,9 @@ describe("TransferModal", () => {
       transferId: "transfer-active",
       action: "cancel",
     });
+    expect(screen.getByText("file.transfer.rfile.http.download_stream_1mb_buffer")).toBeInTheDocument();
+    expect(screen.getByText("file.transfer.rfile.quic.transfer_16gb_limit")).toBeInTheDocument();
+    expect(screen.getByText("file.transfer.rfile.endpoint.http://127.0.0.1:18080")).toBeInTheDocument();
   });
 
   it("routes cancel all through one service request per visible active transfer", async () => {

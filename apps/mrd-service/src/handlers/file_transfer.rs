@@ -4,6 +4,11 @@ use mrd_ipc::{
 };
 use std::path::{Path, PathBuf};
 
+const RFILE_DEFAULT_HTTP_HOST: &str = "127.0.0.1";
+const RFILE_DEFAULT_HTTP_PORT: u16 = 18080;
+const RFILE_DEFAULT_QUIC_HOST: &str = "127.0.0.1";
+const RFILE_DEFAULT_QUIC_PORT: u16 = 18081;
+
 pub fn snapshot() -> FileTransferSnapshot {
     match detect_rfile_root() {
         Some(root) => snapshot_for_rfile_root(&root),
@@ -88,7 +93,10 @@ fn snapshot_for_rfile_root(root: &Path) -> FileTransferSnapshot {
         capabilities.extend([
             "file.transfer.rfile.watch_service".to_string(),
             "file.transfer.rfile.http_fs".to_string(),
+            "file.transfer.rfile.http.download_stream_1mb_buffer".to_string(),
+            "file.transfer.rfile.http.upload_stream_16gb_limit".to_string(),
             "file.transfer.rfile.quic_stream".to_string(),
+            "file.transfer.rfile.quic.transfer_16gb_limit".to_string(),
             "file.transfer.rfile.transfer_tasks".to_string(),
         ]);
     }
@@ -109,6 +117,7 @@ fn snapshot_for_rfile_root(root: &Path) -> FileTransferSnapshot {
         ]);
     }
 
+    capabilities.extend(rfile_runtime_endpoint_capabilities());
     capabilities.sort();
     capabilities.dedup();
 
@@ -145,6 +154,39 @@ fn detect_rfile_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let sibling = cwd.parent()?.join("R-File");
     sibling.is_dir().then_some(sibling)
+}
+
+fn rfile_runtime_endpoint_capabilities() -> Vec<String> {
+    let http_host =
+        env_string("RFILE_SERVICE_HOST").unwrap_or_else(|| RFILE_DEFAULT_HTTP_HOST.to_string());
+    let http_port = env_u16("RFILE_SERVICE_PORT").unwrap_or(RFILE_DEFAULT_HTTP_PORT);
+    let quic_host = normalize_endpoint_host(
+        &env_string("RFILE_QUIC_HOST").unwrap_or_else(|| RFILE_DEFAULT_QUIC_HOST.to_string()),
+    );
+    let quic_port = env_u16("RFILE_QUIC_PORT").unwrap_or(RFILE_DEFAULT_QUIC_PORT);
+
+    vec![
+        format!("file.transfer.rfile.endpoint.http://{http_host}:{http_port}"),
+        format!("file.transfer.rfile.quic_endpoint.{quic_host}:{quic_port}"),
+    ]
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_u16(name: &str) -> Option<u16> {
+    env_string(name).and_then(|value| value.parse::<u16>().ok())
+}
+
+fn normalize_endpoint_host(host: &str) -> String {
+    match host.trim() {
+        "0.0.0.0" | "::" | "" => "127.0.0.1".to_string(),
+        value => value.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -186,5 +228,25 @@ mod tests {
             .provider
             .supported_actions
             .contains(&"bind_external_provider".to_string()));
+        assert!(snapshot
+            .provider
+            .capabilities
+            .contains(&"file.transfer.rfile.http.download_stream_1mb_buffer".to_string()));
+        assert!(snapshot
+            .provider
+            .capabilities
+            .contains(&"file.transfer.rfile.http.upload_stream_16gb_limit".to_string()));
+        assert!(snapshot
+            .provider
+            .capabilities
+            .contains(&"file.transfer.rfile.quic.transfer_16gb_limit".to_string()));
+        assert!(snapshot
+            .provider
+            .capabilities
+            .contains(&"file.transfer.rfile.endpoint.http://127.0.0.1:18080".to_string()));
+        assert!(snapshot
+            .provider
+            .capabilities
+            .contains(&"file.transfer.rfile.quic_endpoint.127.0.0.1:18081".to_string()));
     }
 }
