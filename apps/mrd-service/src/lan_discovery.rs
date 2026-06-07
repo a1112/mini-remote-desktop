@@ -1,6 +1,7 @@
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
+mod control_input;
 mod device_action;
 mod identity;
 mod protocol;
@@ -132,10 +133,6 @@ const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
 const LAN_DEVICE_ACTION_TRANSPORT: &str = device_action::LAN_DEVICE_ACTION_TRANSPORT;
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
-const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
-const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
-const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
-const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
 const LAN_MEDIA_PROTOCOL_VERSION: u32 = 3;
 #[cfg(windows)]
 const LAN_CAPTURE_DXGI_CAPABILITY: &str = "dxgi_capture";
@@ -184,7 +181,6 @@ static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(windows, target_os = "macos"))]
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -286,7 +282,7 @@ pub struct LanDiscoveryState {
     running: AtomicBool,
     last_probe_ms: AtomicU64,
     peers: Mutex<HashMap<String, StoredLanPeer>>,
-    recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
+    recent_control_inputs: Mutex<HashMap<control_input::DedupeKey, control_input::AckState>>,
     probe_requested: Notify,
     peer_changed: Notify,
 }
@@ -475,22 +471,6 @@ struct StoredLanPeer {
     media_capabilities: Vec<String>,
     wake_mac_address: Option<String>,
     last_seen_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LanControlInputDedupeKey {
-    source_device_id: String,
-    session_id: String,
-    event_id: u64,
-}
-
-#[derive(Debug, Clone)]
-struct LanControlInputAckState {
-    accepted: bool,
-    message: Option<String>,
-    lane: Option<ControlInputLane>,
-    event_count: u32,
-    timestamp_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1575,7 +1555,7 @@ pub async fn request_lan_control_input(
     let target =
         peer_control_addr_with_input_control_capability(app_state, &peer_device_id).await?;
     let source_device_id = local_device_id(app_state).await?;
-    let event_id = next_control_input_event_id();
+    let event_id = control_input::next_event_id();
 
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
@@ -1592,7 +1572,7 @@ pub async fn request_lan_control_input(
     };
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let attempts = control_input_request_attempts(&event);
+    let attempts = control_input::request_attempts(&event);
     for attempt in 0..attempts {
         send_packet(&socket, &packet, target).await?;
 
@@ -1719,24 +1699,6 @@ pub async fn request_lan_device_action(
             })
         }
         _ => anyhow::bail!("unexpected LAN device action response"),
-    }
-}
-
-fn next_control_input_event_id() -> u64 {
-    LAN_CONTROL_INPUT_EVENT_COUNTER
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
-        .max(1)
-}
-
-fn control_input_request_attempts(event: &ControlInputEvent) -> usize {
-    match event {
-        ControlInputEvent::MouseMove { .. } | ControlInputEvent::MouseWheel { .. } => {
-            LAN_CONTROL_INPUT_REALTIME_ATTEMPTS
-        }
-        ControlInputEvent::MouseButton { .. }
-        | ControlInputEvent::Key { .. }
-        | ControlInputEvent::ReleaseAll => LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS,
     }
 }
 
@@ -2742,30 +2704,30 @@ async fn accept_or_replay_lan_control_input(
     source_device_id: &str,
     event_id: u64,
     event: &ControlInputEvent,
-) -> LanControlInputAckState {
+) -> control_input::AckState {
     let now = now_ms();
-    let key = (event_id != 0).then(|| LanControlInputDedupeKey {
+    let key = (event_id != 0).then(|| control_input::DedupeKey {
         source_device_id: source_device_id.to_string(),
         session_id: session_id.0.clone(),
         event_id,
     });
     if let Some(key) = key.as_ref() {
         let mut cache = app_state.lan_discovery.recent_control_inputs.lock().await;
-        prune_recent_control_inputs(&mut cache, now);
+        control_input::prune_recent(&mut cache, now);
         if let Some(cached) = cache.get(key).cloned() {
             return cached;
         }
     }
 
     let ack_state = match accept_lan_control_input(app_state, session_id, event).await {
-        Ok(result) => LanControlInputAckState {
+        Ok(result) => control_input::AckState {
             accepted: true,
             message: Some("injected".to_string()),
             lane: Some(result.lane),
             event_count: result.event_count,
             timestamp_ms: now,
         },
-        Err(error) => LanControlInputAckState {
+        Err(error) => control_input::AckState {
             accepted: false,
             message: Some(error.to_string()),
             lane: None,
@@ -2777,31 +2739,10 @@ async fn accept_or_replay_lan_control_input(
     if let Some(key) = key {
         let mut cache = app_state.lan_discovery.recent_control_inputs.lock().await;
         cache.insert(key, ack_state.clone());
-        prune_recent_control_inputs(&mut cache, now);
+        control_input::prune_recent(&mut cache, now);
     }
 
     ack_state
-}
-
-fn prune_recent_control_inputs(
-    cache: &mut HashMap<LanControlInputDedupeKey, LanControlInputAckState>,
-    now: u64,
-) {
-    let cutoff = now.saturating_sub(LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS);
-    cache.retain(|_, ack| ack.timestamp_ms >= cutoff);
-    if cache.len() <= LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT {
-        return;
-    }
-
-    let remove_count = cache.len() - LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT;
-    let mut oldest = cache
-        .iter()
-        .map(|(key, ack)| (key.clone(), ack.timestamp_ms))
-        .collect::<Vec<_>>();
-    oldest.sort_by_key(|(_, timestamp_ms)| *timestamp_ms);
-    for (key, _) in oldest.into_iter().take(remove_count) {
-        cache.remove(&key);
-    }
 }
 
 async fn accept_lan_media_profile_update(
@@ -12592,6 +12533,36 @@ mod tests {
             protocol::DISCOVERY_MAGIC,
             "rsharemouse"
         ));
+    }
+
+    #[test]
+    fn control_input_attempt_policy_keeps_realtime_single_shot_and_reliable_retried() {
+        assert_eq!(
+            control_input::request_attempts(&ControlInputEvent::MouseMove { x: 1, y: 2 }),
+            1
+        );
+        assert_eq!(
+            control_input::request_attempts(&ControlInputEvent::MouseWheel { delta: 120 }),
+            1
+        );
+        assert_eq!(
+            control_input::request_attempts(&ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: true,
+            }),
+            3
+        );
+        assert_eq!(
+            control_input::request_attempts(&ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            }),
+            3
+        );
+        assert_eq!(
+            control_input::request_attempts(&ControlInputEvent::ReleaseAll),
+            3
+        );
     }
 
     #[test]
