@@ -1,7 +1,12 @@
 use super::SessionRegistry;
-use mrd_ipc::{CaptureSourceSelection, DisplayMode, DisplayModeChange, MediaProfileNegotiation};
-use mrd_proto::SessionId;
-use std::collections::HashMap;
+use mrd_ipc::{
+    AuditEvent, AuditLogQuery, CaptureSourceSelection, DisplayMode, DisplayModeChange,
+    MediaProfileNegotiation, PairedDeviceIdentity,
+};
+use mrd_proto::{DeviceId, SessionId};
+use std::collections::{HashMap, VecDeque};
+
+const AUDIT_EVENT_LIMIT: usize = 1_000;
 
 /// Runtime media profile negotiation state keyed by session.
 #[derive(Debug, Default)]
@@ -164,4 +169,172 @@ impl SessionPeerMediaCapabilityRegistry {
     pub fn remove(&mut self, session_id: &SessionId) -> Option<Vec<String>> {
         self.capabilities.remove(session_id)
     }
+}
+
+/// Device registry.
+#[derive(Debug, Default)]
+pub struct DeviceRegistry {
+    local_device: Option<(DeviceId, String)>,
+}
+
+impl DeviceRegistry {
+    pub fn register(&mut self, device_id: DeviceId, device_name: String) {
+        self.local_device = Some((device_id, device_name));
+    }
+
+    pub fn register_if_unregistered(
+        &mut self,
+        device_id: DeviceId,
+        device_name: String,
+    ) -> Option<(DeviceId, String)> {
+        if self.local_device.is_none() {
+            self.register(device_id, device_name);
+        }
+        self.local_device.clone()
+    }
+
+    pub fn get_local_device(&self) -> Option<&(DeviceId, String)> {
+        self.local_device.as_ref()
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.local_device.is_some()
+    }
+}
+
+/// In-memory paired device identity registry.
+#[derive(Debug, Default)]
+pub struct DeviceIdentityRegistry {
+    paired_devices: HashMap<DeviceId, PairedDeviceIdentity>,
+}
+
+impl DeviceIdentityRegistry {
+    pub fn upsert(
+        &mut self,
+        device_id: DeviceId,
+        certificate_fingerprint: Option<String>,
+        trust_status: impl Into<String>,
+    ) {
+        let display_name = device_id.0.clone();
+        let existing = self.paired_devices.remove(&device_id);
+        let certificate_fingerprint = certificate_fingerprint.or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|identity| identity.certificate_fingerprint.clone())
+        });
+        self.paired_devices.insert(
+            device_id.clone(),
+            PairedDeviceIdentity {
+                display_name: existing
+                    .as_ref()
+                    .map(|identity| identity.display_name.clone())
+                    .unwrap_or(display_name),
+                device_id,
+                certificate_fingerprint,
+                trust_status: trust_status.into(),
+                last_seen_ms: Some(now_unix_ms()),
+            },
+        );
+    }
+
+    pub fn revoke(&mut self, device_id: &DeviceId) {
+        if let Some(identity) = self.paired_devices.get_mut(device_id) {
+            identity.trust_status = "revoked".to_string();
+            identity.last_seen_ms = Some(now_unix_ms());
+        } else {
+            self.upsert(device_id.clone(), None, "revoked");
+        }
+    }
+
+    pub fn list(&self) -> Vec<PairedDeviceIdentity> {
+        let mut identities = self.paired_devices.values().cloned().collect::<Vec<_>>();
+        identities.sort_by(|a, b| a.device_id.0.cmp(&b.device_id.0));
+        identities
+    }
+}
+
+/// In-memory service audit event registry.
+#[derive(Debug)]
+pub struct AuditLogRegistry {
+    next_id: u64,
+    events: VecDeque<AuditEvent>,
+    max_events: usize,
+}
+
+impl Default for AuditLogRegistry {
+    fn default() -> Self {
+        Self {
+            next_id: 1,
+            events: VecDeque::new(),
+            max_events: AUDIT_EVENT_LIMIT,
+        }
+    }
+}
+
+impl AuditLogRegistry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        action: impl Into<String>,
+        outcome: impl Into<String>,
+        session_id: Option<SessionId>,
+        actor_device_id: Option<DeviceId>,
+        peer_device_id: Option<DeviceId>,
+        transport_kind: Option<String>,
+        reason: Option<String>,
+        details: Vec<(String, String)>,
+    ) -> AuditEvent {
+        let event = AuditEvent {
+            id: self.next_id,
+            timestamp_ms: now_unix_ms(),
+            action: action.into(),
+            outcome: outcome.into(),
+            session_id,
+            actor_device_id,
+            peer_device_id,
+            transport_kind,
+            reason,
+            details,
+        };
+        self.next_id = self.next_id.saturating_add(1);
+        self.events.push_back(event.clone());
+        while self.events.len() > self.max_events {
+            self.events.pop_front();
+        }
+        event
+    }
+
+    pub fn query(&self, query: &AuditLogQuery) -> Vec<AuditEvent> {
+        let mut events = self
+            .events
+            .iter()
+            .filter(|event| {
+                query
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|session_id| event.session_id.as_ref() == Some(session_id))
+            })
+            .filter(|event| {
+                query
+                    .action
+                    .as_ref()
+                    .is_none_or(|action| event.action == *action)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(limit) = query.limit {
+            let limit = limit as usize;
+            if events.len() > limit {
+                events = events.split_off(events.len() - limit);
+            }
+        }
+        events
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
