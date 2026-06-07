@@ -78,6 +78,7 @@ mod protocol;
 mod remote_power;
 mod runtime_flags;
 mod service_identity;
+mod session_runtime;
 mod time_utils;
 use capture_activity::active_window_capture_count;
 pub use discovery_config::LanDiscoveryConfig;
@@ -173,12 +174,14 @@ use media_probe::{
     decode_media_probe_frame, decoded_video_probe_format, fnv1a64, fnv1a64_media_metadata,
 };
 #[cfg(test)]
+use media_profile::default_media_profile;
+#[cfg(test)]
 use media_profile::format_media_profile;
 use media_profile::{
-    apply_lan_media_profile_defaults, clamp_media_profile_to_lan_capability, default_media_profile,
-    default_media_profile_negotiation, ensure_peer_can_receive_selected_media,
-    ensure_peer_supports_requested_media, lan_runtime_media_profile, normalize_lan_codec_name,
-    normalize_lan_media_profile, validate_media_profile,
+    apply_lan_media_profile_defaults, default_media_profile_negotiation,
+    ensure_peer_can_receive_selected_media, ensure_peer_supports_requested_media,
+    lan_runtime_media_profile, normalize_lan_codec_name, normalize_lan_media_profile,
+    validate_media_profile,
 };
 use media_receiver::decode_lan_desktop_frame;
 #[cfg(all(test, target_os = "macos"))]
@@ -281,6 +284,9 @@ use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
 #[cfg(test)]
 use service_identity::{service_build_id_from_lookup, SERVICE_BUILD_ID_ENV};
+use session_runtime::{
+    mark_session_failed, negotiate_media_profile, selected_media_profile, session_allows_media,
+};
 #[cfg(target_os = "macos")]
 use time_utils::duration_as_millis;
 use time_utils::now_us;
@@ -4389,55 +4395,6 @@ async fn record_lan_decoded_frames(
             now_ms(),
         );
     }
-}
-
-async fn session_allows_media(app_state: &Arc<AppState>, session_id: &SessionId) -> bool {
-    let sessions = app_state.sessions.lock().await;
-    let Some(snapshot) = sessions.get(session_id) else {
-        return false;
-    };
-    !snapshot.lifecycle_state.is_terminal()
-}
-
-async fn mark_session_failed(app_state: &Arc<AppState>, session_id: &SessionId, reason: String) {
-    let mut sessions = app_state.sessions.lock().await;
-    let Some(snapshot) = sessions.get(session_id).cloned() else {
-        return;
-    };
-    if snapshot.lifecycle_state == SessionLifecycleState::Closed {
-        return;
-    }
-    sessions.insert(
-        session_id.clone(),
-        SessionSnapshot {
-            lifecycle_state: SessionLifecycleState::Failed {
-                message: reason.clone(),
-            },
-            last_error: Some(reason),
-            sender_active: false,
-            receiver_active: false,
-            ..snapshot
-        },
-    );
-}
-
-pub(super) async fn selected_media_profile(
-    app_state: &Arc<AppState>,
-    session_id: &SessionId,
-) -> MediaProfile {
-    app_state
-        .media_profiles
-        .lock()
-        .await
-        .get(session_id)
-        .map(|negotiation| negotiation.selected)
-        .unwrap_or_else(default_media_profile)
-}
-
-fn negotiate_media_profile(
-    requested_profile: Option<MediaProfile>,
-) -> Result<MediaProfileNegotiation> {
-    clamp_media_profile_to_lan_capability(requested_profile)
 }
 
 #[cfg(test)]
