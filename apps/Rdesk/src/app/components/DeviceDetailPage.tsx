@@ -639,7 +639,7 @@ function RemoteTab({ device }: { device: Device }) {
 }
 
 /* ======================== File Transfer Tab ======================== */
-type FileItem = {
+export type FileItem = {
   name: string;
   path?: string;
   kind?: FileEntryKind;
@@ -701,12 +701,56 @@ type FileTransferDragPayload = {
   fromDeviceId: string;
 };
 
-type FileTransferDropRequest = {
+export type FileTransferDropRequest = {
   sourceDeviceId: string;
   targetDeviceId: string;
   entries: FileTransferEntry[];
   targetPath: string;
 };
+
+export function fileTransferEntriesFromSelection(
+  files: FileItem[],
+  selectedNames: string[],
+  contextFileName: string
+): FileTransferEntry[] {
+  const transferNames = selectedNames.includes(contextFileName)
+    ? selectedNames
+    : [contextFileName];
+  return transferNames
+    .map((name) => files.find((candidate) => candidate.name === name))
+    .filter((file): file is FileItem => Boolean(file?.path))
+    .map((file) => ({
+      source_path: file.path ?? "",
+      file_name: file.name,
+      kind: file.kind ?? (file.type === "folder" ? "directory" : "file"),
+    }));
+}
+
+export function fileTransferDropRequestForSendToOther({
+  sourceDeviceId,
+  targetDeviceId,
+  targetPath,
+  files,
+  selectedNames,
+  contextFileName,
+}: {
+  sourceDeviceId: string;
+  targetDeviceId: string | null | undefined;
+  targetPath: string | null | undefined;
+  files: FileItem[];
+  selectedNames: string[];
+  contextFileName: string;
+}): FileTransferDropRequest | null {
+  if (!targetDeviceId || !targetPath) return null;
+  const entries = fileTransferEntriesFromSelection(files, selectedNames, contextFileName);
+  if (entries.length === 0) return null;
+  return {
+    sourceDeviceId,
+    targetDeviceId,
+    targetPath,
+    entries,
+  };
+}
 
 function fileTransferStatusLabel(status: FileTransferStatus): string {
   switch (status) {
@@ -765,10 +809,21 @@ function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
 }
 
 function FilePane({
-  deviceId, side, otherDeviceName, isDark, onSendToOther, onFileTransferDrop, dragOver, devices,
+  deviceId,
+  side,
+  otherDeviceName,
+  targetDeviceId,
+  targetPath,
+  isDark,
+  onPathChange,
+  onFileTransferDrop,
+  dragOver,
+  devices,
 }: {
   deviceId: string; side: "left" | "right"; otherDeviceName: string | null; isDark: boolean;
-  onSendToOther: (fileNames: string[]) => void;
+  targetDeviceId: string | null;
+  targetPath: string | null;
+  onPathChange: (path: string | null) => void;
   onFileTransferDrop: (request: FileTransferDropRequest) => void;
   dragOver: boolean;
   devices: Device[];
@@ -797,21 +852,23 @@ function FilePane({
       return;
     }
     setServicePath(result.value.path);
+    onPathChange(result.value.path);
     setServiceParentPath(result.value.parent_path ?? null);
     setServiceFiles(result.value.entries.map(fileEntryToItem));
     setCurrentPath(pathSegmentsFromDirectory(result.value.path, [devName]));
     setSelectedFiles(new Set());
     setServiceLoading(false);
-  }, [devName]);
+  }, [devName, onPathChange]);
 
   useEffect(() => {
     setServiceFiles(null);
     setServicePath(null);
+    onPathChange(null);
     setServiceParentPath(null);
     setCurrentPath([devName]);
     setSelectedFiles(new Set());
     void loadDirectory(null);
-  }, [devName, deviceId, loadDirectory]);
+  }, [devName, deviceId, loadDirectory, onPathChange]);
 
   const fallbackFiles: FileItem[] = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
   const files: FileItem[] = (serviceFiles ?? fallbackFiles).filter(f =>
@@ -855,14 +912,7 @@ function FilePane({
 
   const handleDragStart = (e: React.DragEvent, fileName: string) => {
     const dragFiles = selectedFiles.has(fileName) ? Array.from(selectedFiles) : [fileName];
-    const entries = dragFiles
-      .map((name) => files.find((candidate) => candidate.name === name))
-      .filter((file): file is FileItem => Boolean(file?.path))
-      .map((file) => ({
-        source_path: file.path ?? "",
-        file_name: file.name,
-        kind: file.kind ?? (file.type === "folder" ? "directory" : "file"),
-      }));
+    const entries = fileTransferEntriesFromSelection(files, dragFiles, fileName);
     e.dataTransfer.setData(
       "fileTransfer",
       JSON.stringify({ files: dragFiles, entries, fromSide: side, fromDeviceId: deviceId })
@@ -883,6 +933,20 @@ function FilePane({
         });
       }
     } catch {}
+  };
+
+  const handleSendContextFileToOther = () => {
+    if (!contextMenuState) return;
+    const request = fileTransferDropRequestForSendToOther({
+      sourceDeviceId: deviceId,
+      targetDeviceId,
+      targetPath,
+      files,
+      selectedNames: Array.from(selectedFiles),
+      contextFileName: contextMenuState.fileName,
+    });
+    if (request) onFileTransferDrop(request);
+    setContextMenuState(null);
   };
 
   const DevIcon = dev?.icon ?? Monitor;
@@ -1026,7 +1090,7 @@ function FilePane({
               <CtxItem icon={<Download style={{ width: 13, height: 13 }} />} label="下载到本地" onClick={() => setContextMenuState(null)} isDark={isDark} />
               {otherDeviceName && (
                 <CtxItem icon={<Send style={{ width: 13, height: 13 }} />} label={`发送到 ${otherDeviceName}`}
-                  onClick={() => { onSendToOther([contextMenuState.fileName]); setContextMenuState(null); }} isDark={isDark} />
+                  onClick={handleSendContextFileToOther} isDark={isDark} />
               )}
               <div className={`h-px mx-2 my-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
               <CtxItem icon={<Scissors style={{ width: 13, height: 13 }} />} label="剪切" onClick={() => setContextMenuState(null)} isDark={isDark} />
@@ -1057,6 +1121,8 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
 
   const [leftDeviceId, setLeftDeviceId] = useState(device.id);
   const [rightDeviceId, setRightDeviceId] = useState<string | null>(null);
+  const [leftPanePath, setLeftPanePath] = useState<string | null>(null);
+  const [rightPanePath, setRightPanePath] = useState<string | null>(null);
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [addMenuSide, setAddMenuSide] = useState<"left" | "right">("right");
   const addMenuRef = useRef<HTMLDivElement>(null);
@@ -1262,8 +1328,10 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           deviceId={leftDeviceId}
           side="left"
           otherDeviceName={rightDevice?.name ?? null}
+          targetDeviceId={rightDeviceId}
+          targetPath={rightPanePath}
           isDark={isDark}
-          onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to right pane`)}
+          onPathChange={setLeftPanePath}
           onFileTransferDrop={handleFileTransferDrop}
           dragOver={dragOverSide === "left"}
           devices={devices}
@@ -1338,8 +1406,10 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
             deviceId={rightDeviceId}
             side="right"
             otherDeviceName={leftDevice?.name ?? null}
+            targetDeviceId={leftDeviceId}
+            targetPath={leftPanePath}
             isDark={isDark}
-            onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to left pane`)}
+            onPathChange={setRightPanePath}
             onFileTransferDrop={handleFileTransferDrop}
             dragOver={dragOverSide === "right"}
             devices={devices}

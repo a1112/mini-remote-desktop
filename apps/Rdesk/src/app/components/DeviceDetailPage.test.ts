@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   deviceDetailTabFromSearch,
+  fileTransferDropRequestForSendToOther,
+  fileTransferEntriesFromSelection,
   remoteStartUnavailableReason,
   remoteApplicationSourceMatchesTerminalFocus,
 } from "./DeviceDetailPage";
@@ -79,5 +81,112 @@ describe("remoteStartUnavailableReason", () => {
 
   it("allows online enabled devices to start remote control", () => {
     expect(remoteStartUnavailableReason(device())).toBeNull();
+  });
+});
+
+describe("file transfer send-to-other helpers", () => {
+  const files = [
+    {
+      name: "notes.txt",
+      path: "G:\\Project\\notes.txt",
+      kind: "file" as const,
+      type: "file" as const,
+      size: "4 KB",
+      modified: "2026-03-04",
+      fileKind: "文本文件",
+    },
+    {
+      name: "Screens",
+      path: "G:\\Project\\Screens",
+      kind: "directory" as const,
+      type: "folder" as const,
+      size: "--",
+      modified: "2026-03-04",
+      fileKind: "文件夹",
+    },
+    {
+      name: "fallback-only.txt",
+      type: "file" as const,
+      size: "1 KB",
+      modified: "2026-03-04",
+      fileKind: "文本文件",
+    },
+  ];
+
+  it("builds path-backed entries from the selected context file set", () => {
+    expect(
+      fileTransferEntriesFromSelection(files, ["notes.txt", "Screens"], "notes.txt")
+    ).toEqual([
+      {
+        source_path: "G:\\Project\\notes.txt",
+        file_name: "notes.txt",
+        kind: "file",
+      },
+      {
+        source_path: "G:\\Project\\Screens",
+        file_name: "Screens",
+        kind: "directory",
+      },
+    ]);
+  });
+
+  it("falls back to the context file when it is not part of the selection", () => {
+    expect(
+      fileTransferEntriesFromSelection(files, ["notes.txt"], "Screens")
+    ).toEqual([
+      {
+        source_path: "G:\\Project\\Screens",
+        file_name: "Screens",
+        kind: "directory",
+      },
+    ]);
+  });
+
+  it("creates a drop request for the other pane current service path", () => {
+    expect(
+      fileTransferDropRequestForSendToOther({
+        sourceDeviceId: "left-device",
+        targetDeviceId: "right-device",
+        targetPath: "G:\\Target",
+        files,
+        selectedNames: ["notes.txt"],
+        contextFileName: "notes.txt",
+      })
+    ).toEqual({
+      sourceDeviceId: "left-device",
+      targetDeviceId: "right-device",
+      targetPath: "G:\\Target",
+      entries: [
+        {
+          source_path: "G:\\Project\\notes.txt",
+          file_name: "notes.txt",
+          kind: "file",
+        },
+      ],
+    });
+  });
+
+  it("does not create a request without a target path or path-backed entries", () => {
+    expect(
+      fileTransferDropRequestForSendToOther({
+        sourceDeviceId: "left-device",
+        targetDeviceId: "right-device",
+        targetPath: null,
+        files,
+        selectedNames: ["notes.txt"],
+        contextFileName: "notes.txt",
+      })
+    ).toBeNull();
+
+    expect(
+      fileTransferDropRequestForSendToOther({
+        sourceDeviceId: "left-device",
+        targetDeviceId: "right-device",
+        targetPath: "G:\\Target",
+        files,
+        selectedNames: ["fallback-only.txt"],
+        contextFileName: "fallback-only.txt",
+      })
+    ).toBeNull();
   });
 });
