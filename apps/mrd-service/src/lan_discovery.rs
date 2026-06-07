@@ -3,6 +3,7 @@ use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 mod device_action;
 mod identity;
+mod protocol;
 mod wake_on_lan;
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
@@ -81,8 +82,8 @@ const D3D11_RENDER_WAITABLE_OBJECT_ENV: &str = "MRD_D3D11_RENDER_WAITABLE_OBJECT
 const PROTOCOL_VERSION: u32 = 1;
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
-const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
-const DISCOVERY_APP_ID: &str = "rdesk";
+const DISCOVERY_MAGIC: &str = protocol::DISCOVERY_MAGIC;
+const DISCOVERY_APP_ID: &str = protocol::DISCOVERY_APP_ID;
 const DISCOVERY_PACKET_BUFFER_BYTES: usize = 65_535;
 const DISCOVERY_SAFE_UDP_PAYLOAD_BYTES: usize = 60_000;
 const LAN_MEDIA_TARGET_WIDTH: u32 = 2560;
@@ -1407,7 +1408,9 @@ pub async fn request_lan_remote_session(
             media,
             media_profile,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 let negotiation = media_profile.unwrap_or_else(default_media_profile_negotiation);
                 app_state
@@ -1540,7 +1543,9 @@ pub async fn request_lan_media_profile_update(
             message,
             media_profile,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 let negotiation =
                     media_profile.context("LAN peer accepted profile update without result")?;
@@ -1615,7 +1620,7 @@ pub async fn request_lan_control_input(
                 lane,
                 event_count,
                 ..
-            } if is_valid_discovery_packet(&magic, &app_id)
+            } if protocol::is_valid_discovery_packet(&magic, &app_id)
                 && ack_session_id == session_id.0
                 && ack_event_id == event_id =>
             {
@@ -1700,7 +1705,7 @@ pub async fn request_lan_device_action(
             supported,
             message,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id)
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
             && ack_request_id == request_id
             && ack_target_device_id == target_device_id.0
             && ack_action == action =>
@@ -1775,7 +1780,9 @@ pub async fn request_lan_capture_sources(
             message,
             sources,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 Ok(sources)
             } else {
@@ -1827,7 +1834,9 @@ pub async fn request_lan_capture_source_select(
             message,
             selection,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 let selection =
                     selection.context("LAN peer accepted capture source without selection")?;
@@ -1887,7 +1896,9 @@ pub async fn request_lan_display_modes(
             message,
             modes,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 Ok(modes)
             } else {
@@ -1940,7 +1951,9 @@ pub async fn request_lan_display_mode_set(
             message,
             change,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 let change = change.context("LAN peer accepted display mode set without change")?;
                 record_remote_display_mode_change(app_state, session_id, &change).await;
@@ -1991,7 +2004,9 @@ pub async fn request_lan_display_mode_restore(
             message,
             change,
             ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
+        } if protocol::is_valid_discovery_packet(&magic, &app_id)
+            && ack_session_id == session_id.0 =>
+        {
             if accepted {
                 let change =
                     change.context("LAN peer accepted display mode restore without change")?;
@@ -2097,7 +2112,7 @@ async fn handle_packet(
             instance_id,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2107,7 +2122,7 @@ async fn handle_packet(
             }
         }
         LanDiscoveryPacket::Announce(announcement) => {
-            if is_valid_discovery_packet(&announcement.magic, &announcement.app_id) {
+            if protocol::is_valid_discovery_packet(&announcement.magic, &announcement.app_id) {
                 app_state
                     .lan_discovery
                     .upsert_peer(announcement, addr)
@@ -2125,7 +2140,7 @@ async fn handle_packet(
             requested_media_profile,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2164,7 +2179,7 @@ async fn handle_packet(
             requested_media_profile,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2207,7 +2222,7 @@ async fn handle_packet(
             limit,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2249,7 +2264,7 @@ async fn handle_packet(
             source_id,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2290,7 +2305,7 @@ async fn handle_packet(
             source_id,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2332,7 +2347,7 @@ async fn handle_packet(
             restore_after_session,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2377,7 +2392,7 @@ async fn handle_packet(
             source_device_id,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2419,7 +2434,7 @@ async fn handle_packet(
             event,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -2465,7 +2480,7 @@ async fn handle_packet(
             action,
             ..
         } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
+            if !protocol::is_valid_discovery_packet(&magic, &app_id)
                 || instance_id == app_state.lan_discovery.instance_id()
             {
                 return Ok(());
@@ -10132,11 +10147,7 @@ fn new_instance_id() -> String {
 }
 
 fn default_app_id() -> String {
-    DISCOVERY_APP_ID.to_string()
-}
-
-fn is_valid_discovery_packet(magic: &str, app_id: &str) -> bool {
-    magic == DISCOVERY_MAGIC && app_id.eq_ignore_ascii_case(DISCOVERY_APP_ID)
+    protocol::default_app_id()
 }
 
 #[cfg(test)]
@@ -12573,8 +12584,14 @@ mod tests {
 
     #[test]
     fn discovery_packet_requires_rdesk_namespace() {
-        assert!(is_valid_discovery_packet(DISCOVERY_MAGIC, DISCOVERY_APP_ID));
-        assert!(!is_valid_discovery_packet(DISCOVERY_MAGIC, "rsharemouse"));
+        assert!(protocol::is_valid_discovery_packet(
+            protocol::DISCOVERY_MAGIC,
+            protocol::DISCOVERY_APP_ID
+        ));
+        assert!(!protocol::is_valid_discovery_packet(
+            protocol::DISCOVERY_MAGIC,
+            "rsharemouse"
+        ));
     }
 
     #[test]
