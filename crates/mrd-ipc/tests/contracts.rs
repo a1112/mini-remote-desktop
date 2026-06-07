@@ -633,8 +633,16 @@ fn serialize_deserialize_file_transfer_provider_reservation() {
             capabilities: vec![
                 "file.transfer.snapshot".to_string(),
                 "file.transfer.external_provider".to_string(),
+                "file.transfer.rfile.quic_stream".to_string(),
+                "file.transfer.rfile.http_client_stats".to_string(),
+                "file.transfer.rfile.remote_mount".to_string(),
+                "file.transfer.perf_baseline".to_string(),
             ],
-            supported_actions: vec!["list".to_string()],
+            supported_actions: vec![
+                "list".to_string(),
+                "compare_provider".to_string(),
+                "bind_external_provider".to_string(),
+            ],
         },
         tasks: vec![FileTransferTaskSnapshot {
             transfer_id: "transfer-1".to_string(),
@@ -658,6 +666,8 @@ fn serialize_deserialize_file_transfer_provider_reservation() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("mrd.file_transfer.reserved"));
     assert!(json.contains("file.transfer.external_provider"));
+    assert!(json.contains("file.transfer.rfile.quic_stream"));
+    assert!(json.contains("compare_provider"));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, response);
 }

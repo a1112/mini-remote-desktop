@@ -1066,14 +1066,22 @@ fn reserved_file_transfer_snapshot() -> FileTransferSnapshot {
             display_name: "Reserved file transfer provider".to_string(),
             status: "reserved".to_string(),
             detail: Some(
-                "Reserved for MRD-native or R-File provider binding; no transfer engine is bound."
+                "Reserved for MRD-native or R-File provider binding; R-File QUIC/HTTP/mount capabilities are mapped for future binding."
                     .to_string(),
             ),
             capabilities: vec![
                 "file.transfer.snapshot".to_string(),
                 "file.transfer.external_provider".to_string(),
+                "file.transfer.rfile.quic_stream".to_string(),
+                "file.transfer.rfile.http_client_stats".to_string(),
+                "file.transfer.rfile.remote_mount".to_string(),
+                "file.transfer.perf_baseline".to_string(),
             ],
-            supported_actions: vec!["list".to_string()],
+            supported_actions: vec![
+                "list".to_string(),
+                "compare_provider".to_string(),
+                "bind_external_provider".to_string(),
+            ],
         },
         tasks: Vec::new(),
         updated_at_ms: None,
@@ -1422,7 +1430,16 @@ mod tests {
                     .capabilities
                     .iter()
                     .any(|capability| capability == "file.transfer.external_provider"));
-                assert_eq!(snapshot.provider.supported_actions, vec!["list"]);
+                assert!(snapshot
+                    .provider
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "file.transfer.rfile.quic_stream"));
+                assert!(snapshot
+                    .provider
+                    .supported_actions
+                    .iter()
+                    .any(|action| action == "compare_provider"));
                 assert!(snapshot.tasks.is_empty());
             }
             other => panic!("Expected FileTransferSnapshot response, got {other:?}"),

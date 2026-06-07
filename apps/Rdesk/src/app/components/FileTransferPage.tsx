@@ -167,6 +167,8 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
     (providerReserved
       ? transferSnapshot?.provider.detail ?? "等待绑定文件传输 provider"
       : "在设备详情中发起文件传输后，任务将显示在此处");
+  const providerCapabilities = transferSnapshot?.provider.capabilities ?? [];
+  const providerActions = transferSnapshot?.provider.supported_actions ?? [];
 
   const activeTransfers = transferData.filter(
     (t) => t.status === "active" || t.status === "paused" || t.status === "error"
@@ -723,6 +725,36 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
               <p className={textTertiary} style={{ fontSize: 11 }}>
                 {emptyDetail}
               </p>
+              {(providerCapabilities.length > 0 || providerActions.length > 0) && (
+                <div className="mt-3 flex max-w-[520px] flex-wrap items-center justify-center gap-1.5">
+                  {providerCapabilities.map((capability) => (
+                    <span
+                      key={capability}
+                      className={`rounded-md border px-2 py-0.5 ${
+                        isDark
+                          ? "border-gray-700 bg-gray-800 text-gray-400"
+                          : "border-gray-200 bg-white text-gray-500"
+                      }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {capability}
+                    </span>
+                  ))}
+                  {providerActions.map((action) => (
+                    <span
+                      key={action}
+                      className={`rounded-md border px-2 py-0.5 ${
+                        isDark
+                          ? "border-blue-900/60 bg-blue-950/30 text-blue-300"
+                          : "border-blue-100 bg-blue-50 text-blue-600"
+                      }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {action}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>

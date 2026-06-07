@@ -12,8 +12,15 @@ describe("TransferModal", () => {
         display_name: "Reserved file transfer provider",
         status: "reserved",
         detail: "Reserved for MRD/R-File provider binding.",
-        capabilities: ["file.transfer.snapshot", "file.transfer.external_provider"],
-        supported_actions: ["list"],
+        capabilities: [
+          "file.transfer.snapshot",
+          "file.transfer.external_provider",
+          "file.transfer.rfile.quic_stream",
+          "file.transfer.rfile.http_client_stats",
+          "file.transfer.rfile.remote_mount",
+          "file.transfer.perf_baseline",
+        ],
+        supported_actions: ["list", "compare_provider", "bind_external_provider"],
       },
       tasks: [],
       updated_at_ms: null,
@@ -26,6 +33,8 @@ describe("TransferModal", () => {
     });
     expect(screen.getByText("Provider 已预留")).toBeInTheDocument();
     expect(screen.getByText("Reserved file transfer provider")).toBeInTheDocument();
+    expect(screen.getByText("file.transfer.rfile.quic_stream")).toBeInTheDocument();
+    expect(screen.getByText("compare_provider")).toBeInTheDocument();
     expect(screen.queryByText("project-backup.zip")).not.toBeInTheDocument();
   });
 });
