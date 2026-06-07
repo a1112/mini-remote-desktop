@@ -290,6 +290,11 @@ pub(crate) fn lan_render_pacing_render_start_delay(delay: Duration, target_fps: 
 }
 
 #[cfg(any(windows, target_os = "macos"))]
+pub(crate) fn lan_render_pacing_should_wait(delay: Duration) -> bool {
+    delay >= Duration::from_micros(500)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn render_pacing_frame_interval(fps: u32) -> Duration {
     Duration::from_micros((1_000_000 / u64::from(fps.max(1))).max(1))
 }
@@ -321,5 +326,13 @@ mod tests {
             lan_render_pacing_render_start_delay(Duration::from_micros(7_000), 60),
             Duration::from_micros(7_000)
         );
+    }
+
+    #[test]
+    fn render_pacing_waits_only_for_meaningful_delay() {
+        assert!(!lan_render_pacing_should_wait(Duration::ZERO));
+        assert!(!lan_render_pacing_should_wait(Duration::from_micros(499)));
+        assert!(lan_render_pacing_should_wait(Duration::from_micros(500)));
+        assert!(lan_render_pacing_should_wait(Duration::from_millis(1)));
     }
 }

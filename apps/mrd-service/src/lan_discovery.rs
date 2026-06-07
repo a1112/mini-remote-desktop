@@ -193,11 +193,12 @@ use media_render_policy::{
 #[cfg(any(windows, target_os = "macos"))]
 use media_render_policy::{
     lan_render_cap_target_fps_for_profile, lan_render_pacing_render_start_delay,
-    lan_render_pacing_target_fps, lan_render_policy_allows_service_pacing,
-    lan_render_queue_capacity_for_policy, lan_render_queue_capacity_for_profile,
-    lan_render_queue_policy_for_profile, native_render_waitable_swapchain_pacing_enabled,
-    render_pacing_precise_sleep_guard, render_profile_requests_high_resolution_timer,
-    should_interrupt_render_pacing_sleep, LanRenderQueuePolicy,
+    lan_render_pacing_should_wait, lan_render_pacing_target_fps,
+    lan_render_policy_allows_service_pacing, lan_render_queue_capacity_for_policy,
+    lan_render_queue_capacity_for_profile, lan_render_queue_policy_for_profile,
+    native_render_waitable_swapchain_pacing_enabled, render_pacing_precise_sleep_guard,
+    render_profile_requests_high_resolution_timer, should_interrupt_render_pacing_sleep,
+    LanRenderQueuePolicy,
 };
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use media_render_policy::{
@@ -4944,7 +4945,7 @@ async fn pace_lan_render_frame(
         Instant::now(),
     );
     let delay = lan_render_pacing_render_start_delay(delay, target_fps);
-    if delay < Duration::from_micros(500) {
+    if !lan_render_pacing_should_wait(delay) {
         return;
     }
 
