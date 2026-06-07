@@ -7,7 +7,7 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{session, transport as transport_handlers},
+    handlers::{device, session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
@@ -90,10 +90,8 @@ impl IpcServer {
                 device_id,
                 device_name,
             } => {
-                tracing::info!("Registering device: {} ({})", device_id.0, device_name);
-                let mut devices = self.app_state.devices.lock().await;
-                devices.register(device_id.clone(), device_name);
-                drop(devices);
+                let response =
+                    device::register_device(&self.app_state, device_id.clone(), device_name).await;
                 self.record_audit_event(
                     "device.register",
                     "success",
@@ -105,25 +103,10 @@ impl IpcServer {
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::DeviceRegistered { device_id }
+                response
             }
 
-            IpcRequest::ListDevices => {
-                let devices = self.app_state.devices.lock().await;
-                // Return the registered device, if any
-                let device_list = if let Some((id, name)) = devices.get_local_device() {
-                    vec![mrd_ipc::DeviceInfo {
-                        device_id: id.clone(),
-                        device_name: name.clone(),
-                        is_online: true, // Local device is always online
-                    }]
-                } else {
-                    vec![]
-                };
-                IpcResponse::DeviceList {
-                    devices: device_list,
-                }
-            }
+            IpcRequest::ListDevices => device::list_devices(&self.app_state).await,
 
             IpcRequest::LanDiscoverySnapshot => IpcResponse::LanDiscoverySnapshot {
                 snapshot: self.app_state.lan_discovery.snapshot().await,
@@ -197,7 +180,7 @@ impl IpcServer {
                     "session.start",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(target_device_id),
                     Some(transport_kind),
                     reason,
@@ -256,7 +239,7 @@ impl IpcServer {
                     "session.start_lan",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(target_device_id),
                     Some(transport_kind),
                     reason,
@@ -372,7 +355,7 @@ impl IpcServer {
                     "session.accept",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(source_device_id),
                     None,
                     reason,
@@ -399,7 +382,7 @@ impl IpcServer {
                     "session.stop",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     peer_device_id,
                     transport_kind,
                     reason,
@@ -420,7 +403,7 @@ impl IpcServer {
                     "session.fail",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     peer_device_id,
                     transport_kind,
                     response_reason.or(Some(reason)),
@@ -439,7 +422,7 @@ impl IpcServer {
                     "session.recover",
                     outcome,
                     Some(session_id),
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     peer_device_id,
                     transport_kind,
                     reason,
@@ -552,73 +535,60 @@ impl IpcServer {
                 device_id,
                 certificate_fingerprint,
             } => {
-                self.app_state.device_identities.lock().await.upsert(
+                let snapshot = device::pair_device(
+                    &self.app_state,
                     device_id.clone(),
                     certificate_fingerprint,
-                    "pending",
-                );
+                )
+                .await;
                 self.record_audit_event(
                     "device.pair",
                     "success",
                     None,
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(device_id),
                     None,
                     None,
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                IpcResponse::PairingUpdated { snapshot }
             }
 
             IpcRequest::ApprovePairing { device_id } => {
-                self.app_state.device_identities.lock().await.upsert(
-                    device_id.clone(),
-                    None,
-                    "paired",
-                );
+                let snapshot = device::approve_pairing(&self.app_state, device_id.clone()).await;
                 self.record_audit_event(
                     "device.approve_pairing",
                     "success",
                     None,
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(device_id),
                     None,
                     None,
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                IpcResponse::PairingUpdated { snapshot }
             }
 
             IpcRequest::RevokeDevice { device_id } => {
-                self.app_state
-                    .device_identities
-                    .lock()
-                    .await
-                    .revoke(&device_id);
+                let snapshot = device::revoke_device(&self.app_state, &device_id).await;
                 self.record_audit_event(
                     "device.revoke",
                     "success",
                     None,
-                    self.local_device_id().await,
+                    device::local_device_id(&self.app_state).await,
                     Some(device_id),
                     None,
                     None,
                     Vec::new(),
                 )
                 .await;
-                IpcResponse::PairingUpdated {
-                    snapshot: self.identity_snapshot().await,
-                }
+                IpcResponse::PairingUpdated { snapshot }
             }
 
             IpcRequest::GetDeviceIdentitySnapshot => IpcResponse::DeviceIdentitySnapshot {
-                snapshot: self.identity_snapshot().await,
+                snapshot: device::identity_snapshot(&self.app_state).await,
             },
 
             IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
@@ -881,32 +851,6 @@ impl IpcServer {
     /// Get access to the app state (for testing/integration)
     pub fn app_state(&self) -> &Arc<AppState> {
         &self.app_state
-    }
-
-    async fn local_device_id(&self) -> Option<DeviceId> {
-        self.app_state
-            .devices
-            .lock()
-            .await
-            .get_local_device()
-            .map(|(device_id, _)| device_id.clone())
-    }
-
-    async fn identity_snapshot(&self) -> mrd_ipc::DeviceIdentitySnapshot {
-        let devices = self.app_state.devices.lock().await;
-        let (local_device_id, display_name) = devices
-            .get_local_device()
-            .map(|(device_id, name)| (Some(device_id.clone()), Some(name.clone())))
-            .unwrap_or((None, None));
-        drop(devices);
-        let paired_devices = self.app_state.device_identities.lock().await.list();
-        mrd_ipc::DeviceIdentitySnapshot {
-            local_device_id,
-            display_name,
-            certificate_fingerprint: None,
-            consent_required: true,
-            paired_devices,
-        }
     }
 
     async fn session_audit_context(
