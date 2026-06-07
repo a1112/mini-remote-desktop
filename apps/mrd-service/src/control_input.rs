@@ -117,8 +117,9 @@ impl ControlInputRegistry {
         match result {
             Ok(event_count) => {
                 self.record_successful_realtime_event(session_id, event);
-                counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
-                    .injected_messages += u64::from(event_count);
+                let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
+                counter.injected_messages += u64::from(event_count);
+                counter.last_error = None;
                 Ok(ControlInputResult { lane, event_count })
             }
             Err(error) => {
@@ -322,6 +323,34 @@ fn input_key_from_ipc(key: ControlInputKey) -> InputKey {
 mod tests {
     use super::*;
 
+    struct FailsOnceInputInjector {
+        error_message: String,
+        should_fail: bool,
+    }
+
+    impl FailsOnceInputInjector {
+        fn new(error_message: impl Into<String>) -> Self {
+            Self {
+                error_message: error_message.into(),
+                should_fail: true,
+            }
+        }
+    }
+
+    impl InputInjector for FailsOnceInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, _event: &InputEvent) -> Result<(), InputError> {
+            if self.should_fail {
+                self.should_fail = false;
+                return Err(InputError::Platform(self.error_message.clone()));
+            }
+            Ok(())
+        }
+    }
+
     #[test]
     fn mouse_move_uses_realtime_lane() {
         assert_eq!(
@@ -403,6 +432,41 @@ mod tests {
             }),
             ControlInputLane::Reliable
         );
+    }
+
+    #[test]
+    fn successful_input_clears_lane_last_error_after_recovery() {
+        let mut registry =
+            ControlInputRegistry::with_injector(FailsOnceInputInjector::new("temporary failure"));
+        let session_id = SessionId("recovering-control-session".to_string());
+        let key_down = ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        };
+
+        let failed = registry
+            .handle_session_event(&session_id, &key_down)
+            .expect_err("first injection should fail");
+        assert_eq!(
+            failed,
+            InputError::Platform("temporary failure".to_string())
+        );
+        let failed_snapshot = registry.snapshot(session_id.clone());
+        assert_eq!(failed_snapshot.reliable.failed_messages, 1);
+        assert_eq!(
+            failed_snapshot.reliable.last_error.as_deref(),
+            Some("platform input injection failed: temporary failure")
+        );
+
+        let recovered = registry
+            .handle_session_event(&session_id, &key_down)
+            .expect("second injection should recover");
+        let recovered_snapshot = registry.snapshot(session_id);
+
+        assert_eq!(recovered.event_count, 1);
+        assert_eq!(recovered_snapshot.reliable.failed_messages, 1);
+        assert_eq!(recovered_snapshot.reliable.injected_messages, 1);
+        assert_eq!(recovered_snapshot.reliable.last_error, None);
     }
 
     #[test]
