@@ -107,4 +107,78 @@ describe("TransferModal", () => {
       action: "cancel",
     });
   });
+
+  it("routes cancel all through one service request per visible active transfer", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockResolvedValueOnce({
+      provider: {
+        provider_id: "mrd.file_transfer.rfile",
+        display_name: "R-File provider boundary",
+        status: "available",
+        detail: "Detected R-File provider root.",
+        capabilities: ["file.transfer.rfile.transfer_tasks"],
+        supported_actions: ["list", "pause", "resume", "cancel"],
+      },
+      tasks: [
+        {
+          transfer_id: "transfer-active",
+          direction: "send",
+          status: "running",
+          source_device_id: "local",
+          target_device_id: "remote",
+          source_paths: ["C:\\Users\\Admin\\active.bin"],
+          target_path: "D:\\Inbox",
+          total_bytes: 1024,
+          transferred_bytes: 128,
+        },
+        {
+          transfer_id: "transfer-paused",
+          direction: "receive",
+          status: "paused",
+          source_device_id: "remote",
+          target_device_id: "local",
+          source_paths: ["D:\\paused.bin"],
+          target_path: "C:\\Inbox",
+          total_bytes: 2048,
+          transferred_bytes: 256,
+        },
+        {
+          transfer_id: "transfer-complete",
+          direction: "receive",
+          status: "completed",
+          source_device_id: "remote",
+          target_device_id: "local",
+          source_paths: ["D:\\done.bin"],
+          target_path: "C:\\Inbox",
+          total_bytes: 4096,
+          transferred_bytes: 4096,
+        },
+      ],
+      updated_at_ms: null,
+    });
+    mockInvoke.mockResolvedValue({
+      accepted: false,
+      supported: false,
+      message: "File transfer provider has no active runtime task binding yet.",
+    });
+    const user = userEvent.setup();
+
+    render(<TransferModal open onClose={vi.fn()} />);
+
+    await screen.findByText("active.bin");
+    await user.click(screen.getByText("全部取消"));
+
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-active",
+      action: "cancel",
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-paused",
+      action: "cancel",
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-complete",
+      action: "cancel",
+    });
+  });
 });

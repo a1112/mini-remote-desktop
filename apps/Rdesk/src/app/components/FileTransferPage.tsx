@@ -260,6 +260,17 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
     setActionStatus(result.error.message);
   };
 
+  const handleCancelVisibleActiveTransfers = async () => {
+    if (filteredActive.length === 0) return;
+
+    const results = await Promise.all(
+      filteredActive.map((transfer) => ipcRequestFileTransferAction(transfer.id, "cancel"))
+    );
+    const requested = results.length;
+    const accepted = results.filter((result) => result.ok && result.value.accepted).length;
+    setActionStatus(`已请求取消 ${requested} 个传输任务，service 接受 ${accepted} 个。`);
+  };
+
   const renderActiveItem = (t: TransferItem) => {
     const Icon = t.fileIcon;
     const isSend = t.direction === "send";
@@ -694,6 +705,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
                     isDark ? "text-red-400 hover:bg-red-900/20" : "text-red-500 hover:bg-red-50"
                   }`}
                   style={{ fontSize: 11 }}
+                  onClick={() => void handleCancelVisibleActiveTransfers()}
                 >
                   <X style={{ width: 11, height: 11 }} />
                   全部取消
