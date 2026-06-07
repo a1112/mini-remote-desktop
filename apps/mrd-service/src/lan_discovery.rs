@@ -2,6 +2,7 @@ use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 mod device_action;
+mod identity;
 mod wake_on_lan;
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
@@ -52,7 +53,6 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
-const SERVICE_BUILD_ID_ENV: &str = "MRD_SERVICE_BUILD_ID";
 const LAN_TEST_IMPAIRMENT_LOSS_PCT_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT";
 const LAN_TEST_IMPAIRMENT_BASE_DELAY_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS";
 const LAN_TEST_IMPAIRMENT_JITTER_MS_ENV: &str = "MRD_LAN_TEST_IMPAIRMENT_JITTER_MS";
@@ -3193,21 +3193,7 @@ fn wake_mac_address_from_env() -> Option<String> {
 }
 
 fn service_build_id() -> String {
-    service_build_id_from_lookup(|key| std::env::var(key).ok())
-}
-
-fn service_build_id_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> String {
-    if let Some(value) = lookup(SERVICE_BUILD_ID_ENV) {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-
-    option_env!("VERGEN_GIT_SHA")
-        .or(option_env!("GIT_COMMIT"))
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
-        .to_string()
+    identity::service_build_id_from_lookup(|key| std::env::var(key).ok())
 }
 
 fn lan_media_capabilities() -> Vec<String> {
@@ -11050,8 +11036,8 @@ mod tests {
 
     #[test]
     fn service_build_id_prefers_runtime_override() {
-        let build_id = service_build_id_from_lookup(|key| {
-            if key == SERVICE_BUILD_ID_ENV {
+        let build_id = identity::service_build_id_from_lookup(|key| {
+            if key == identity::SERVICE_BUILD_ID_ENV {
                 Some("peer-runtime-build".to_string())
             } else {
                 None
