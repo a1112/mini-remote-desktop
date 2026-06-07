@@ -7,13 +7,13 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{device, runtime, session, transport as transport_handlers},
+    handlers::{device, file_transfer, runtime, session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
 use mrd_application::ports::SessionLifecycleState;
 use mrd_ipc::{
-    transport, CapabilitySnapshot, CapabilityStatus, FileTransferProviderSnapshot,
-    FileTransferSnapshot, IpcRequest, IpcResponse, MediaProfile, ScenarioEvaluationStatus,
+    transport, CapabilitySnapshot, CapabilityStatus, IpcRequest, IpcResponse, MediaProfile,
+    ScenarioEvaluationStatus,
 };
 use mrd_proto::{DeviceId, SessionId};
 use std::{io::ErrorKind, sync::Arc, time::Duration};
@@ -121,7 +121,7 @@ impl IpcServer {
             },
 
             IpcRequest::FileTransferSnapshot => IpcResponse::FileTransferSnapshot {
-                snapshot: reserved_file_transfer_snapshot(),
+                snapshot: file_transfer::snapshot(),
             },
 
             IpcRequest::ListSessions => {
@@ -906,35 +906,6 @@ impl IpcServer {
     }
 }
 
-fn reserved_file_transfer_snapshot() -> FileTransferSnapshot {
-    FileTransferSnapshot {
-        provider: FileTransferProviderSnapshot {
-            provider_id: "mrd.file_transfer.reserved".to_string(),
-            display_name: "Reserved file transfer provider".to_string(),
-            status: "reserved".to_string(),
-            detail: Some(
-                "Reserved for MRD-native or R-File provider binding; R-File QUIC/HTTP/mount capabilities are mapped for future binding."
-                    .to_string(),
-            ),
-            capabilities: vec![
-                "file.transfer.snapshot".to_string(),
-                "file.transfer.external_provider".to_string(),
-                "file.transfer.rfile.quic_stream".to_string(),
-                "file.transfer.rfile.http_client_stats".to_string(),
-                "file.transfer.rfile.remote_mount".to_string(),
-                "file.transfer.perf_baseline".to_string(),
-            ],
-            supported_actions: vec![
-                "list".to_string(),
-                "compare_provider".to_string(),
-                "bind_external_provider".to_string(),
-            ],
-        },
-        tasks: Vec::new(),
-        updated_at_ms: None,
-    }
-}
-
 fn is_connection_closed_error(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<std::io::Error>() {
         Some(io_error) => matches!(
@@ -1241,6 +1212,13 @@ mod tests {
 
     #[tokio::test]
     async fn file_transfer_snapshot_returns_reserved_provider_boundary() {
+        let _env_lock = env_lock().lock().unwrap();
+        let previous = std::env::var_os("MRD_RFILE_ROOT");
+        std::env::set_var(
+            "MRD_RFILE_ROOT",
+            std::env::temp_dir().join("mrd-rfile-provider-missing"),
+        );
+
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);
 
@@ -1271,6 +1249,68 @@ mod tests {
             }
             other => panic!("Expected FileTransferSnapshot response, got {other:?}"),
         }
+
+        match previous {
+            Some(value) => std::env::set_var("MRD_RFILE_ROOT", value),
+            None => std::env::remove_var("MRD_RFILE_ROOT"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_transfer_snapshot_detects_rfile_provider_boundary() {
+        let _env_lock = env_lock().lock().unwrap();
+        let rfile_root =
+            std::env::temp_dir().join(format!("mrd-rfile-provider-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rfile_root);
+        std::fs::create_dir_all(rfile_root.join("services/rfile-watch")).unwrap();
+        std::fs::create_dir_all(rfile_root.join("crates/rfile-remote-client")).unwrap();
+        std::fs::create_dir_all(rfile_root.join("crates/rfile-mount-core")).unwrap();
+        std::fs::write(rfile_root.join("services/rfile-watch/Cargo.toml"), "").unwrap();
+        std::fs::write(rfile_root.join("crates/rfile-remote-client/Cargo.toml"), "").unwrap();
+        std::fs::write(rfile_root.join("crates/rfile-mount-core/Cargo.toml"), "").unwrap();
+
+        let previous = std::env::var_os("MRD_RFILE_ROOT");
+        std::env::set_var("MRD_RFILE_ROOT", &rfile_root);
+
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+        let response = server
+            .handle_request(IpcRequest::FileTransferSnapshot)
+            .await;
+
+        match previous {
+            Some(value) => std::env::set_var("MRD_RFILE_ROOT", value),
+            None => std::env::remove_var("MRD_RFILE_ROOT"),
+        }
+        let _ = std::fs::remove_dir_all(&rfile_root);
+
+        match response {
+            IpcResponse::FileTransferSnapshot { snapshot } => {
+                assert_eq!(snapshot.provider.status, "available");
+                assert!(snapshot
+                    .provider
+                    .capabilities
+                    .contains(&"file.transfer.rfile.watch_service".to_string()));
+                assert!(snapshot
+                    .provider
+                    .capabilities
+                    .contains(&"file.transfer.rfile.remote_client".to_string()));
+                assert!(snapshot
+                    .provider
+                    .capabilities
+                    .contains(&"file.transfer.rfile.mount_core".to_string()));
+                assert!(snapshot
+                    .provider
+                    .supported_actions
+                    .contains(&"bind_external_provider".to_string()));
+            }
+            other => panic!("Expected FileTransferSnapshot response, got {other:?}"),
+        }
+    }
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
     #[tokio::test]
