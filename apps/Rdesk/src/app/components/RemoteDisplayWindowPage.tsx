@@ -2278,6 +2278,8 @@ export function RemoteDisplayWindowPage() {
   const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
   const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
   const lastRemoteControlPointRef = useRef<{ x: number; y: number } | null>(null);
+  const pendingRemoteControlPointRef = useRef<{ x: number; y: number } | null>(null);
+  const remoteControlMoveFrameRef = useRef<number | null>(null);
   const capabilitiesRef = useRef<EnvironmentSnapshot | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
@@ -3203,7 +3205,7 @@ export function RemoteDisplayWindowPage() {
     [controlInputEnabled, sessionId]
   );
 
-  const sendRemotePointerMoveIfNeeded = useCallback(
+  const sendRemotePointerMoveNow = useCallback(
     (point: { x: number; y: number }) => {
       const lastPoint = lastRemoteControlPointRef.current;
       if (lastPoint?.x === point.x && lastPoint.y === point.y) return;
@@ -3211,6 +3213,37 @@ export function RemoteDisplayWindowPage() {
       sendControlInputEvent({ kind: "mouse_move", ...point });
     },
     [sendControlInputEvent]
+  );
+
+  const cancelPendingRemotePointerMove = useCallback(() => {
+    if (remoteControlMoveFrameRef.current !== null) {
+      window.cancelAnimationFrame(remoteControlMoveFrameRef.current);
+      remoteControlMoveFrameRef.current = null;
+    }
+    pendingRemoteControlPointRef.current = null;
+  }, []);
+
+  const flushPendingRemotePointerMove = useCallback(() => {
+    const point = pendingRemoteControlPointRef.current;
+    pendingRemoteControlPointRef.current = null;
+    remoteControlMoveFrameRef.current = null;
+    if (point) sendRemotePointerMoveNow(point);
+  }, [sendRemotePointerMoveNow]);
+
+  const scheduleRemotePointerMove = useCallback(
+    (point: { x: number; y: number }) => {
+      const pendingPoint = pendingRemoteControlPointRef.current;
+      const lastPoint = lastRemoteControlPointRef.current;
+      if (pendingPoint?.x === point.x && pendingPoint.y === point.y) return;
+      if (!pendingPoint && lastPoint?.x === point.x && lastPoint.y === point.y) return;
+
+      pendingRemoteControlPointRef.current = point;
+      if (remoteControlMoveFrameRef.current !== null) return;
+      remoteControlMoveFrameRef.current = window.requestAnimationFrame(
+        flushPendingRemotePointerMove
+      );
+    },
+    [flushPendingRemotePointerMove]
   );
 
   const controlPointFromPointerEvent = useCallback(
@@ -3232,9 +3265,9 @@ export function RemoteDisplayWindowPage() {
       const point = controlPointFromPointerEvent(event);
       if (!point) return;
       event.preventDefault();
-      sendRemotePointerMoveIfNeeded(point);
+      scheduleRemotePointerMove(point);
     },
-    [controlInputEnabled, controlPointFromPointerEvent, sendRemotePointerMoveIfNeeded]
+    [controlInputEnabled, controlPointFromPointerEvent, scheduleRemotePointerMove]
   );
 
   const handleRemotePointerDown = useCallback(
@@ -3247,7 +3280,8 @@ export function RemoteDisplayWindowPage() {
       event.preventDefault();
       event.currentTarget.focus();
       event.currentTarget.setPointerCapture?.(event.pointerId);
-      sendRemotePointerMoveIfNeeded(point);
+      cancelPendingRemotePointerMove();
+      sendRemotePointerMoveNow(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,
@@ -3257,8 +3291,9 @@ export function RemoteDisplayWindowPage() {
     [
       controlInputEnabled,
       controlPointFromPointerEvent,
+      cancelPendingRemotePointerMove,
       sendControlInputEvent,
-      sendRemotePointerMoveIfNeeded,
+      sendRemotePointerMoveNow,
     ]
   );
 
@@ -3271,7 +3306,8 @@ export function RemoteDisplayWindowPage() {
       if (!point) return;
       event.preventDefault();
       event.currentTarget.releasePointerCapture?.(event.pointerId);
-      sendRemotePointerMoveIfNeeded(point);
+      cancelPendingRemotePointerMove();
+      sendRemotePointerMoveNow(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,
@@ -3281,8 +3317,9 @@ export function RemoteDisplayWindowPage() {
     [
       controlInputEnabled,
       controlPointFromPointerEvent,
+      cancelPendingRemotePointerMove,
       sendControlInputEvent,
-      sendRemotePointerMoveIfNeeded,
+      sendRemotePointerMoveNow,
     ]
   );
 
@@ -3330,18 +3367,20 @@ export function RemoteDisplayWindowPage() {
   const handleRemoteBlur = useCallback(
     (_event: ReactFocusEvent<HTMLDivElement>) => {
       lastRemoteControlPointRef.current = null;
+      cancelPendingRemotePointerMove();
       sendControlInputEvent({ kind: "release_all" });
     },
-    [sendControlInputEvent]
+    [cancelPendingRemotePointerMove, sendControlInputEvent]
   );
 
   useEffect(() => {
     if (!controlInputEnabled) return;
     return () => {
       lastRemoteControlPointRef.current = null;
+      cancelPendingRemotePointerMove();
       void ipcSendControlInput(sessionId, { kind: "release_all" });
     };
-  }, [controlInputEnabled, sessionId]);
+  }, [cancelPendingRemotePointerMove, controlInputEnabled, sessionId]);
 
   const title = useMemo(() => {
     if (context?.label) return context.label;

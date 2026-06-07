@@ -836,6 +836,122 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("coalesces high frequency pointer moves to the latest animation frame", async () => {
+    const frameCallbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frameCallbacks.push(callback);
+      return frameCallbacks.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_controls: ["keyboard_mouse"],
+        });
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_media_pipeline_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          active_width: 2560,
+          active_height: 1440,
+          active_fps: 144,
+          active_bitrate_mbps: 80,
+          stage_metrics: [],
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: args?.sessionId,
+          lane: "realtime",
+          event_count: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
+    frameCallbacks.length = 0;
+
+    act(() => {
+      renderArea.focus();
+    });
+    fireEvent.pointerMove(renderArea, { clientX: 320, clientY: 236 });
+    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
+    fireEvent.pointerMove(renderArea, { clientX: 960, clientY: 596 });
+
+    expect(frameCallbacks).toHaveLength(1);
+    expect(
+      mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input")
+    ).toHaveLength(0);
+
+    const flushFrame = frameCallbacks[0];
+    if (!flushFrame) throw new Error("expected scheduled animation frame");
+    act(() => {
+      flushFrame(16);
+    });
+
+    await waitFor(() => {
+      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
+      expect(inputCalls.map(([, args]) => args)).toEqual([
+        {
+          sessionId: "p2p-quic-123",
+          event: { kind: "mouse_move", x: 1920, y: 1080 },
+        },
+      ]);
+    });
+  });
+
   it("moves the remote cursor before sending a direct pointer button press", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
