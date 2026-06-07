@@ -1,12 +1,82 @@
-use super::SessionRegistry;
+use mrd_application::ports::SessionSnapshot;
 use mrd_ipc::{
-    AuditEvent, AuditLogQuery, CaptureSourceSelection, DisplayMode, DisplayModeChange,
-    MediaProfileNegotiation, PairedDeviceIdentity,
+    AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection, DisplayMode,
+    DisplayModeChange, MediaProfileNegotiation, PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 use std::collections::{HashMap, VecDeque};
 
 const AUDIT_EVENT_LIMIT: usize = 1_000;
+
+/// Session registry tracking all active sessions.
+#[derive(Debug, Default)]
+pub struct SessionRegistry {
+    sessions: HashMap<SessionId, SessionSnapshot>,
+}
+
+impl SessionRegistry {
+    pub fn insert(&mut self, session_id: SessionId, snapshot: SessionSnapshot) {
+        self.sessions.insert(session_id, snapshot);
+    }
+
+    pub fn get(&self, session_id: &SessionId) -> Option<&SessionSnapshot> {
+        self.sessions.get(session_id)
+    }
+
+    pub fn get_mut(&mut self, session_id: &SessionId) -> Option<&mut SessionSnapshot> {
+        self.sessions.get_mut(session_id)
+    }
+
+    pub fn remove(&mut self, session_id: &SessionId) -> Option<SessionSnapshot> {
+        self.sessions.remove(session_id)
+    }
+
+    pub fn list_all(&self) -> Vec<SessionSnapshot> {
+        self.sessions.values().cloned().collect()
+    }
+}
+
+/// Cached service-owned capability snapshot exposed to UI and session handlers.
+#[derive(Debug)]
+pub struct CapabilitySnapshotRegistry {
+    snapshot: CapabilitySnapshot,
+    refresh_in_progress: bool,
+}
+
+impl Default for CapabilitySnapshotRegistry {
+    fn default() -> Self {
+        Self {
+            snapshot: crate::capabilities::local_capability_snapshot_static(),
+            refresh_in_progress: false,
+        }
+    }
+}
+
+impl CapabilitySnapshotRegistry {
+    pub fn snapshot(&self) -> CapabilitySnapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn replace(&mut self, snapshot: CapabilitySnapshot) {
+        self.snapshot = snapshot;
+        self.refresh_in_progress = false;
+    }
+
+    pub fn begin_refresh(&mut self) -> bool {
+        if self.refresh_in_progress {
+            return false;
+        }
+        self.refresh_in_progress = true;
+        true
+    }
+
+    pub fn finish_refresh(&mut self, snapshot: Option<CapabilitySnapshot>) {
+        if let Some(snapshot) = snapshot {
+            self.snapshot = snapshot;
+        }
+        self.refresh_in_progress = false;
+    }
+}
 
 /// Runtime media profile negotiation state keyed by session.
 #[derive(Debug, Default)]

@@ -8,7 +8,6 @@
 // and media control.
 
 use crate::control_input::ControlInputRegistry;
-use mrd_application::ports::SessionSnapshot;
 #[cfg(target_os = "macos")]
 use mrd_ipc::render_proxy::{
     decode_ack, encode_frame_header, RenderProxyFrameHeader, RenderProxyPixelFormat,
@@ -49,88 +48,19 @@ mod registries;
 
 pub use lan_identity::default_lan_device_identity;
 pub use registries::{
-    AuditLogRegistry, CaptureSourceRegistry, DeviceIdentityRegistry, DeviceRegistry,
-    DisplayModeRegistry, MediaProfileRegistry, SessionPeerMediaCapabilityRegistry,
+    AuditLogRegistry, CapabilitySnapshotRegistry, CaptureSourceRegistry, DeviceIdentityRegistry,
+    DeviceRegistry, DisplayModeRegistry, MediaProfileRegistry, SessionPeerMediaCapabilityRegistry,
+    SessionRegistry,
 };
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 #[cfg(target_os = "macos")]
 const MACOS_RENDER_PROXY_SOCKET_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
-/// Session registry tracking all active sessions
-#[derive(Debug, Default)]
-pub struct SessionRegistry {
-    sessions: HashMap<SessionId, SessionSnapshot>,
-}
-
-impl SessionRegistry {
-    pub fn insert(&mut self, session_id: SessionId, snapshot: SessionSnapshot) {
-        self.sessions.insert(session_id, snapshot);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<&SessionSnapshot> {
-        self.sessions.get(session_id)
-    }
-
-    pub fn get_mut(&mut self, session_id: &SessionId) -> Option<&mut SessionSnapshot> {
-        self.sessions.get_mut(session_id)
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<SessionSnapshot> {
-        self.sessions.remove(session_id)
-    }
-
-    pub fn list_all(&self) -> Vec<SessionSnapshot> {
-        self.sessions.values().cloned().collect()
-    }
-}
-
 /// Probe telemetry accumulated from LAN data-plane probe frames.
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Cached service-owned capability snapshot exposed to UI and session handlers.
-#[derive(Debug)]
-pub struct CapabilitySnapshotRegistry {
-    snapshot: CapabilitySnapshot,
-    refresh_in_progress: bool,
-}
-
-impl Default for CapabilitySnapshotRegistry {
-    fn default() -> Self {
-        Self {
-            snapshot: crate::capabilities::local_capability_snapshot_static(),
-            refresh_in_progress: false,
-        }
-    }
-}
-
-impl CapabilitySnapshotRegistry {
-    pub fn snapshot(&self) -> CapabilitySnapshot {
-        self.snapshot.clone()
-    }
-
-    pub fn replace(&mut self, snapshot: CapabilitySnapshot) {
-        self.snapshot = snapshot;
-        self.refresh_in_progress = false;
-    }
-
-    pub fn begin_refresh(&mut self) -> bool {
-        if self.refresh_in_progress {
-            return false;
-        }
-        self.refresh_in_progress = true;
-        true
-    }
-
-    pub fn finish_refresh(&mut self, snapshot: Option<CapabilitySnapshot>) {
-        if let Some(snapshot) = snapshot {
-            self.snapshot = snapshot;
-        }
-        self.refresh_in_progress = false;
-    }
 }
 
 /// Runtime receiver media pipeline state keyed by session.
@@ -1800,7 +1730,7 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mrd_application::ports::SessionLifecycleState;
+    use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
     use mrd_proto::DeviceId;
 
     #[test]
