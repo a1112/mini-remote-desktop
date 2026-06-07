@@ -545,6 +545,22 @@ export interface DeviceInfo {
   is_online: boolean;
 }
 
+export interface DeviceDetailSnapshot {
+  device_id: string;
+  device_name?: string | null;
+  is_local: boolean;
+  is_online: boolean;
+  is_lan_peer: boolean;
+  is_paired: boolean;
+  discovery_port?: number | null;
+  p2p_control_addr?: string | null;
+  transports: string[];
+  media_capabilities: string[];
+  age_ms?: number | null;
+  service_build_id?: string | null;
+  media_protocol_version?: number | null;
+}
+
 export interface PairedDeviceIdentity {
   device_id: string;
   display_name: string;

@@ -6,7 +6,7 @@ use mrd_ipc::{
     CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
-    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
+    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane, DeviceDetailSnapshot,
     DeviceIdentitySnapshot, DeviceInfo, FileTransferProviderSnapshot, FileTransferSnapshot,
     FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
     MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
@@ -617,6 +617,40 @@ fn serialize_deserialize_device_list_response() {
     let json = serde_json::to_string(&response).unwrap();
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_device_detail_snapshot_contract() {
+    let device_id = test_device_id();
+    let request = IpcRequest::GetDeviceDetail {
+        device_id: device_id.clone(),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("GetDeviceDetail"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let detail = DeviceDetailSnapshot {
+        device_id,
+        device_name: Some("Agent PC".to_string()),
+        is_local: false,
+        is_online: true,
+        is_lan_peer: true,
+        is_paired: true,
+        discovery_port: Some(45891),
+        p2p_control_addr: Some("192.168.1.44:45891".to_string()),
+        transports: vec!["quic".to_string(), "input_control_v1".to_string()],
+        media_capabilities: vec!["control.keyboard_mouse".to_string()],
+        age_ms: Some(12),
+        service_build_id: Some("test-build".to_string()),
+        media_protocol_version: Some(3),
+    };
+    let response = IpcResponse::DeviceDetail { detail };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DeviceDetail"));
+    assert!(json.contains("\"is_lan_peer\":true"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }
 

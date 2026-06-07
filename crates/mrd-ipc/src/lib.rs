@@ -1229,6 +1229,11 @@ mod wire {
         },
         /// Get local device identity and pairing snapshot.
         GetDeviceIdentitySnapshot,
+        /// Get service-owned detail for a device row.
+        GetDeviceDetail {
+            /// Target device id.
+            device_id: DeviceId,
+        },
         /// Request a service-owned device operation.
         RequestDeviceAction {
             /// Target device id.
@@ -1405,6 +1410,11 @@ mod wire {
             /// Current identity state.
             snapshot: DeviceIdentitySnapshot,
         },
+        /// Service-owned device detail snapshot.
+        DeviceDetail {
+            /// Requested device detail.
+            detail: DeviceDetailSnapshot,
+        },
         /// Device action request result.
         DeviceActionRequested {
             /// Result state for the requested action.
@@ -1448,6 +1458,32 @@ mod wire {
         pub device_id: DeviceId,
         pub device_name: String,
         pub is_online: bool,
+    }
+
+    /// Service-owned detail snapshot for a device row.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DeviceDetailSnapshot {
+        pub device_id: DeviceId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub device_name: Option<String>,
+        pub is_local: bool,
+        pub is_online: bool,
+        pub is_lan_peer: bool,
+        pub is_paired: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub discovery_port: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub p2p_control_addr: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub transports: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub media_capabilities: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub age_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_build_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub media_protocol_version: Option<u32>,
     }
 
     /// Discovered LAN peer information.

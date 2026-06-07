@@ -1849,6 +1849,27 @@ async fn ipc_device_identity_snapshot() -> Result<mrd_ipc::DeviceIdentitySnapsho
     }
 }
 
+/// Get service-owned detail for a device row via IPC.
+#[tauri::command]
+async fn ipc_device_detail(device_id: String) -> Result<mrd_ipc::DeviceDetailSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::GetDeviceDetail {
+            device_id: DeviceId(device_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DeviceDetail { detail } => Ok(detail),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Request a service-owned device operation via IPC.
 #[tauri::command]
 async fn ipc_request_device_action(
@@ -3961,6 +3982,7 @@ fn main() {
             ipc_list_devices,
             ipc_revoke_device,
             ipc_device_identity_snapshot,
+            ipc_device_detail,
             ipc_request_device_action,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,

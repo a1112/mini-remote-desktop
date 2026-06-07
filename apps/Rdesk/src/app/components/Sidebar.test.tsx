@@ -31,6 +31,7 @@ const serviceMock = vi.hoisted(() => ({
   unbindDevice: vi.fn(),
   disconnectDeviceSessions: vi.fn(),
   ipcRequestDeviceAction: vi.fn(),
+  ipcDeviceDetail: vi.fn(),
 }));
 const layoutActionMock = vi.hoisted(() => ({
   openTransfers: vi.fn(),
@@ -72,6 +73,7 @@ vi.mock("../services/ipcSessionService", () => ({
 
 vi.mock("../adapters/tauri/commands", () => ({
   ipcRequestDeviceAction: serviceMock.ipcRequestDeviceAction,
+  ipcDeviceDetail: serviceMock.ipcDeviceDetail,
 }));
 
 const device = (overrides: Partial<Device>): Device => ({
@@ -243,6 +245,33 @@ describe("Sidebar device actions", () => {
       "agent-device",
       "wake_on_lan"
     );
+  });
+
+  it("requests service-owned device detail before opening device info", async () => {
+    serviceMock.ipcDeviceDetail.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        device_name: "Agent PC",
+        is_local: false,
+        is_online: true,
+        is_lan_peer: true,
+        is_paired: false,
+        transports: ["quic"],
+        media_capabilities: ["control.keyboard_mouse"],
+      },
+    });
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "设备信息" }));
+
+    expect(serviceMock.ipcDeviceDetail).toHaveBeenCalledWith("agent-device");
+    await waitFor(() => {
+      expect(screen.getByText("设备信息：Agent PC")).toBeInTheDocument();
+    });
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

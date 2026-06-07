@@ -8,7 +8,7 @@ import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
 import { disconnectDeviceSessions } from "../services/ipcSessionService";
-import { ipcRequestDeviceAction } from "../adapters/tauri/commands";
+import { ipcDeviceDetail, ipcRequestDeviceAction } from "../adapters/tauri/commands";
 import type { DeviceActionKind } from "../adapters/tauri/types";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
@@ -305,6 +305,25 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     }
   };
 
+  const handleOpenDeviceInfo = async (
+    routeDeviceId: string,
+    serviceDeviceId: string,
+    deviceName: string
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    const result = await ipcDeviceDetail(serviceDeviceId);
+    if (!result.ok) {
+      showActionStatus({ kind: "error", message: `设备信息获取失败：${result.error.message}` });
+    } else {
+      showActionStatus({
+        kind: "success",
+        message: `设备信息：${result.value.device_name ?? deviceName}`,
+      });
+    }
+    navigate(`/devices/${routeDeviceId}`);
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -492,9 +511,11 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
       label: "设备信息",
       action: () => {
         if (!contextMenuDevice) return;
-        navigate(`/devices/${contextMenuDevice.id}`);
-        setContextMenu(null);
-        setSubmenuOpen(null);
+        return handleOpenDeviceInfo(
+          contextMenuDevice.id,
+          contextMenuDevice.deviceId,
+          contextMenuDevice.name
+        );
       },
     },
   ];

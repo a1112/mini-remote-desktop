@@ -4,7 +4,8 @@ use std::{
 };
 
 use mrd_ipc::{
-    DeviceActionKind, DeviceActionResult, DeviceIdentitySnapshot, DeviceInfo, IpcResponse,
+    DeviceActionKind, DeviceActionResult, DeviceDetailSnapshot, DeviceIdentitySnapshot, DeviceInfo,
+    IpcResponse,
 };
 use mrd_proto::DeviceId;
 
@@ -94,6 +95,67 @@ pub async fn identity_snapshot(app_state: &Arc<AppState>) -> DeviceIdentitySnaps
         certificate_fingerprint: None,
         consent_required: true,
         paired_devices,
+    }
+}
+
+pub async fn detail_snapshot(app_state: &Arc<AppState>, device_id: DeviceId) -> IpcResponse {
+    let local_device = app_state
+        .devices
+        .lock()
+        .await
+        .get_local_device()
+        .map(|(id, name)| (id.clone(), name.clone()));
+    let local_name = local_device
+        .as_ref()
+        .filter(|(id, _)| id == &device_id)
+        .map(|(_, name)| name.clone());
+    let is_local = local_name.is_some();
+
+    let lan_peer = app_state
+        .lan_discovery
+        .snapshot()
+        .await
+        .peers
+        .into_iter()
+        .find(|peer| peer.device_id == device_id);
+
+    let paired_devices = app_state.device_identities.lock().await.list();
+    let paired = paired_devices
+        .iter()
+        .find(|identity| identity.device_id == device_id);
+
+    let device_name = lan_peer
+        .as_ref()
+        .map(|peer| peer.device_name.clone())
+        .or(local_name)
+        .or_else(|| paired.map(|identity| identity.display_name.clone()));
+
+    IpcResponse::DeviceDetail {
+        detail: DeviceDetailSnapshot {
+            device_id,
+            device_name,
+            is_local,
+            is_online: is_local || lan_peer.is_some(),
+            is_lan_peer: lan_peer.is_some(),
+            is_paired: paired.is_some(),
+            discovery_port: lan_peer.as_ref().map(|peer| peer.discovery_port),
+            p2p_control_addr: lan_peer.as_ref().map(|peer| peer.p2p_control_addr.clone()),
+            transports: lan_peer
+                .as_ref()
+                .map(|peer| peer.transports.clone())
+                .unwrap_or_default(),
+            media_capabilities: lan_peer
+                .as_ref()
+                .map(|peer| peer.media_capabilities.clone())
+                .unwrap_or_default(),
+            age_ms: lan_peer.as_ref().map(|peer| peer.age_ms),
+            service_build_id: lan_peer
+                .as_ref()
+                .and_then(|peer| peer.service_build_id.clone()),
+            media_protocol_version: lan_peer
+                .as_ref()
+                .and_then(|peer| peer.media_protocol_version),
+        },
     }
 }
 

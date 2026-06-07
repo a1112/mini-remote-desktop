@@ -534,6 +534,10 @@ impl IpcServer {
                 snapshot: device::identity_snapshot(&self.app_state).await,
             },
 
+            IpcRequest::GetDeviceDetail { device_id } => {
+                device::detail_snapshot(&self.app_state, device_id).await
+            }
+
             IpcRequest::RequestDeviceAction { device_id, action } => {
                 let response =
                     device::request_device_action(&self.app_state, device_id.clone(), action).await;
@@ -1773,6 +1777,35 @@ mod tests {
             snapshot.reliable.last_error.as_deref(),
             Some("input injector unavailable: blocked by test")
         );
+    }
+
+    #[tokio::test]
+    async fn device_detail_request_returns_local_service_owned_snapshot() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("local-device".to_string()), "Local PC".to_string());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::GetDeviceDetail {
+                device_id: DeviceId("local-device".to_string()),
+            })
+            .await;
+
+        match response {
+            IpcResponse::DeviceDetail { detail } => {
+                assert_eq!(detail.device_id, DeviceId("local-device".to_string()));
+                assert_eq!(detail.device_name.as_deref(), Some("Local PC"));
+                assert!(detail.is_local);
+                assert!(detail.is_online);
+                assert!(!detail.is_lan_peer);
+                assert!(!detail.is_paired);
+            }
+            other => panic!("Expected DeviceDetail response, got {other:?}"),
+        }
     }
 
     #[tokio::test]
