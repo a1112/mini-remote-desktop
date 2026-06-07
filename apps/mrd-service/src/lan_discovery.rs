@@ -2,6 +2,7 @@ use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
 mod device_action;
+mod wake_on_lan;
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
@@ -3188,34 +3189,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
 }
 
 fn wake_mac_address_from_env() -> Option<String> {
-    wake_mac_address_from_lookup(|key| std::env::var(key).ok())
-}
-
-fn wake_mac_address_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let value = lookup("MRD_WAKE_MAC_ADDRESS")?;
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    normalize_wake_mac_address(value).ok()
-}
-
-fn normalize_wake_mac_address(value: &str) -> Result<String> {
-    let hex = value
-        .chars()
-        .filter(|ch| ch.is_ascii_hexdigit())
-        .collect::<String>();
-    if hex.len() != 12 {
-        anyhow::bail!("Wake-on-LAN MAC address must contain 12 hex digits");
-    }
-
-    let mut bytes = Vec::with_capacity(6);
-    for index in (0..hex.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex[index..index + 2], 16)
-            .context("invalid Wake-on-LAN MAC address")?;
-        bytes.push(format!("{byte:02X}"));
-    }
-    Ok(bytes.join(":"))
+    wake_on_lan::mac_address_from_lookup(|key| std::env::var(key).ok())
 }
 
 fn service_build_id() -> String {
@@ -11089,7 +11063,7 @@ mod tests {
 
     #[test]
     fn wake_mac_address_from_lookup_normalizes_hex_separators() {
-        let mac = wake_mac_address_from_lookup(|key| {
+        let mac = wake_on_lan::mac_address_from_lookup(|key| {
             (key == "MRD_WAKE_MAC_ADDRESS").then(|| "aa-bb:cc dd.ee.ff".to_string())
         });
 
