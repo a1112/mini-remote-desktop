@@ -3253,7 +3253,11 @@ export function RemoteDisplayWindowPage() {
     (event: ControlInputEvent) => {
       if (!controlInputEnabled) return;
       void ipcSendControlInput(sessionId, event).then((result) => {
-        if (!result.ok) setLastError(result.error.message);
+        if (result.ok) {
+          setLastError(null);
+        } else {
+          setLastError(result.error.message);
+        }
       });
     },
     [controlInputEnabled, sessionId]
