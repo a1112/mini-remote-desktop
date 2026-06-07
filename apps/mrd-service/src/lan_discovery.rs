@@ -5,9 +5,10 @@ use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DisplayMode,
-    DisplayModeChange, LanDiscoverySnapshot, LanPeerInfo, MediaProfile, MediaProfileNegotiation,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    CaptureSource, CaptureSourceSelection, ControlInputEvent, ControlInputLane, DeviceActionKind,
+    DeviceActionResult, DisplayMode, DisplayModeChange, LanDiscoverySnapshot, LanPeerInfo,
+    MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot,
 };
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use mrd_pipeline_core::FrameCapture;
@@ -126,6 +127,7 @@ const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
+const LAN_DEVICE_ACTION_TRANSPORT: &str = "device_action_control_v1";
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
@@ -180,6 +182,7 @@ static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAN_DEVICE_ACTION_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -687,6 +690,30 @@ enum LanDiscoveryPacket {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lane: Option<ControlInputLane>,
         event_count: u32,
+        timestamp_ms: u64,
+    },
+    DeviceActionRequest {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        request_id: u64,
+        source_device_id: String,
+        target_device_id: String,
+        action: DeviceActionKind,
+        timestamp_ms: u64,
+    },
+    DeviceActionAck {
+        magic: String,
+        #[serde(default = "default_app_id")]
+        app_id: String,
+        instance_id: String,
+        request_id: u64,
+        target_device_id: String,
+        action: DeviceActionKind,
+        accepted: bool,
+        supported: bool,
+        message: String,
         timestamp_ms: u64,
     },
 }
@@ -1613,6 +1640,89 @@ pub async fn request_lan_control_input(
     )
 }
 
+pub async fn request_lan_device_action(
+    app_state: &Arc<AppState>,
+    target_device_id: &DeviceId,
+    action: DeviceActionKind,
+) -> Result<DeviceActionResult> {
+    let target = app_state
+        .lan_discovery
+        .peer_control_addr(target_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+    let peer_transports = app_state
+        .lan_discovery
+        .peer_transports(target_device_id)
+        .await
+        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+    if !peer_transports
+        .iter()
+        .any(|transport| transport == LAN_DEVICE_ACTION_TRANSPORT)
+    {
+        anyhow::bail!(
+            "LAN peer {} does not advertise {}",
+            target_device_id.0,
+            LAN_DEVICE_ACTION_TRANSPORT
+        );
+    }
+
+    let source_device_id = local_device_id(app_state).await?;
+    let request_id = next_device_action_request_id();
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN device action UDP socket")?;
+    let packet = LanDiscoveryPacket::DeviceActionRequest {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        request_id,
+        source_device_id,
+        target_device_id: target_device_id.0.clone(),
+        action,
+        timestamp_ms: now_ms(),
+    };
+    send_packet(&socket, &packet, target).await?;
+
+    let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+    let (len, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+        .await
+        .context("LAN device action request timed out")??;
+    let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
+    match ack {
+        LanDiscoveryPacket::DeviceActionAck {
+            magic,
+            app_id,
+            request_id: ack_request_id,
+            target_device_id: ack_target_device_id,
+            action: ack_action,
+            accepted,
+            supported,
+            message,
+            ..
+        } if is_valid_discovery_packet(&magic, &app_id)
+            && ack_request_id == request_id
+            && ack_target_device_id == target_device_id.0
+            && ack_action == action =>
+        {
+            Ok(DeviceActionResult {
+                device_id: target_device_id.clone(),
+                action,
+                accepted,
+                supported,
+                message,
+            })
+        }
+        _ => anyhow::bail!("unexpected LAN device action response"),
+    }
+}
+
+fn next_device_action_request_id() -> u64 {
+    LAN_DEVICE_ACTION_REQUEST_COUNTER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+        .max(1)
+}
+
 fn next_control_input_event_id() -> u64 {
     LAN_CONTROL_INPUT_EVENT_COUNTER
         .fetch_add(1, Ordering::Relaxed)
@@ -2351,9 +2461,87 @@ async fn handle_packet(
             send_packet(socket, &ack, addr).await?;
         }
         LanDiscoveryPacket::ControlInputAck { .. } => {}
+        LanDiscoveryPacket::DeviceActionRequest {
+            magic,
+            app_id,
+            instance_id,
+            request_id,
+            source_device_id,
+            target_device_id,
+            action,
+            ..
+        } => {
+            if !is_valid_discovery_packet(&magic, &app_id)
+                || instance_id == app_state.lan_discovery.instance_id()
+            {
+                return Ok(());
+            }
+
+            let result =
+                accept_lan_device_action_request(app_state, &target_device_id, action).await;
+            tracing::info!(
+                source_device_id = %source_device_id,
+                target_device_id = %target_device_id,
+                action = ?action,
+                accepted = result.accepted,
+                supported = result.supported,
+                "handled LAN device action request"
+            );
+            let ack = LanDiscoveryPacket::DeviceActionAck {
+                magic: DISCOVERY_MAGIC.to_string(),
+                app_id: DISCOVERY_APP_ID.to_string(),
+                instance_id: app_state.lan_discovery.instance_id.clone(),
+                request_id,
+                target_device_id,
+                action,
+                accepted: result.accepted,
+                supported: result.supported,
+                message: result.message,
+                timestamp_ms: now_ms(),
+            };
+            send_packet(socket, &ack, addr).await?;
+        }
+        LanDiscoveryPacket::DeviceActionAck { .. } => {}
     }
 
     Ok(())
+}
+
+async fn accept_lan_device_action_request(
+    app_state: &Arc<AppState>,
+    target_device_id: &str,
+    action: DeviceActionKind,
+) -> DeviceActionResult {
+    let local_device_id = local_device_id(app_state).await.ok();
+    let is_local_target = local_device_id
+        .as_ref()
+        .is_some_and(|device_id| device_id == target_device_id);
+    let message = if is_local_target {
+        match action {
+            DeviceActionKind::RemoteTerminal => {
+                "Remote terminal requires explicit peer consent and a service-owned command executor."
+            }
+            DeviceActionKind::Restart => {
+                "Remote restart requires explicit peer consent and a privileged service executor."
+            }
+            DeviceActionKind::Shutdown => {
+                "Remote shutdown requires explicit peer consent and a privileged service executor."
+            }
+            DeviceActionKind::WakeOnLan => {
+                "Wake-on-LAN must be sent by the requesting device before the peer is awake."
+            }
+        }
+    } else {
+        "Device action target does not match this local service."
+    };
+
+    DeviceActionResult {
+        device_id: DeviceId(target_device_id.to_string()),
+        action,
+        accepted: false,
+        supported: false,
+        message: message.to_string(),
+    }
 }
 
 async fn accept_lan_remote_session(
@@ -3014,6 +3202,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
+        LAN_DEVICE_ACTION_TRANSPORT.to_string(),
     ];
     let input_control_available = app_state.control_input().lock().await.is_available();
     if input_control_available {
@@ -11128,6 +11317,72 @@ mod tests {
         assert_eq!(snapshot.reliable.accepted_messages, 1);
         assert_eq!(snapshot.reliable.injected_messages, 1);
         assert_eq!(snapshot.realtime.injected_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn device_action_request_round_trips_to_lan_peer_with_structured_rejection() {
+        let controller_state = Arc::new(AppState::new());
+        controller_state.devices.lock().await.register(
+            DeviceId("controller-device".to_string()),
+            "Controller".to_string(),
+        );
+
+        let target_state = Arc::new(AppState::new());
+        target_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("target-device".to_string()), "Target".to_string());
+
+        let service_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let service_addr = service_socket.local_addr().unwrap();
+        let handler_socket = service_socket.clone();
+        let handler_state = target_state.clone();
+        let handler = tokio::spawn(async move {
+            let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
+            let (len, addr) = handler_socket.recv_from(&mut buffer).await.unwrap();
+            handle_packet(&handler_socket, &handler_state, &buffer[..len], addr)
+                .await
+                .unwrap();
+        });
+
+        controller_state
+            .lan_discovery
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "target-instance".to_string(),
+                    device_id: "target-device".to_string(),
+                    device_name: "Target Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    discovery_port: service_addr.port(),
+                    transports: vec!["quic".to_string(), LAN_DEVICE_ACTION_TRANSPORT.to_string()],
+                    service_build_id: Some(service_build_id()),
+                    media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
+                    media_capabilities: Vec::new(),
+                    wake_mac_address: None,
+                    timestamp_ms: now_ms(),
+                },
+                service_addr,
+            )
+            .await;
+
+        let result = request_lan_device_action(
+            &controller_state,
+            &DeviceId("target-device".to_string()),
+            mrd_ipc::DeviceActionKind::Restart,
+        )
+        .await
+        .expect("device action ack");
+
+        assert_eq!(result.device_id, DeviceId("target-device".to_string()));
+        assert_eq!(result.action, mrd_ipc::DeviceActionKind::Restart);
+        assert!(!result.accepted);
+        assert!(!result.supported);
+        assert!(result.message.contains("consent"));
+        handler.await.unwrap();
     }
 
     #[cfg(windows)]

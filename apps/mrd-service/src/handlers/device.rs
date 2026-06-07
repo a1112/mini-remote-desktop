@@ -208,22 +208,27 @@ pub async fn request_device_action(
                 "Device is not known to the local service.".to_string(),
             ),
         },
-        DeviceActionKind::RemoteTerminal => (
-            false,
-            false,
-            "Remote terminal requires a service-owned command channel and consent flow."
-                .to_string(),
-        ),
-        DeviceActionKind::Restart => (
-            false,
-            false,
-            "Remote restart requires a service-owned privileged action channel.".to_string(),
-        ),
-        DeviceActionKind::Shutdown => (
-            false,
-            false,
-            "Remote shutdown requires a service-owned privileged action channel.".to_string(),
-        ),
+        DeviceActionKind::RemoteTerminal
+        | DeviceActionKind::Restart
+        | DeviceActionKind::Shutdown => {
+            match crate::lan_discovery::request_lan_device_action(app_state, &device_id, action)
+                .await
+            {
+                Ok(result) => {
+                    return IpcResponse::DeviceActionRequested { result };
+                }
+                Err(error) if known_device => (
+                    false,
+                    false,
+                    format!("Remote device action command channel is unavailable: {error}"),
+                ),
+                Err(_) => (
+                    false,
+                    false,
+                    "Device is not known to the local service.".to_string(),
+                ),
+            }
+        }
     };
 
     IpcResponse::DeviceActionRequested {
