@@ -14,10 +14,9 @@ use mrd_ipc::render_proxy::{
     decode_ack, encode_frame_header, RenderProxyFrameHeader, RenderProxyPixelFormat,
 };
 use mrd_ipc::{
-    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, CaptureSourceSelection,
-    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
-    PairedDeviceIdentity,
+    AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilitySnapshot, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot, PairedDeviceIdentity,
 };
 use mrd_proto::{DeviceId, SessionId};
 #[cfg(windows)]
@@ -50,7 +49,10 @@ mod lan_identity;
 mod registries;
 
 pub use lan_identity::default_lan_device_identity;
-pub use registries::{MediaProfileRegistry, SessionPeerMediaCapabilityRegistry};
+pub use registries::{
+    CaptureSourceRegistry, DisplayModeRegistry, MediaProfileRegistry,
+    SessionPeerMediaCapabilityRegistry,
+};
 
 const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 const AUDIT_EVENT_LIMIT: usize = 1_000;
@@ -89,122 +91,6 @@ impl SessionRegistry {
 #[derive(Debug, Default)]
 pub struct ProbeRegistry {
     probes: HashMap<SessionId, SessionProbeStats>,
-}
-
-/// Runtime capture source selection state keyed by session.
-#[derive(Debug, Default)]
-pub struct CaptureSourceRegistry {
-    selections: HashMap<SessionId, CaptureSourceSelection>,
-}
-
-impl CaptureSourceRegistry {
-    pub fn set(&mut self, session_id: SessionId, selection: CaptureSourceSelection) {
-        self.selections.insert(session_id, selection);
-    }
-
-    pub fn get(&self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
-        self.selections.get(session_id).cloned()
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<CaptureSourceSelection> {
-        self.selections.remove(session_id)
-    }
-
-    pub fn active_window_capture_count(&self, sessions: &SessionRegistry) -> usize {
-        self.selections
-            .iter()
-            .filter(|(session_id, selection)| {
-                selection.source.source_kind == "window"
-                    && sessions.get(session_id).is_some_and(|snapshot| {
-                        snapshot.sender_active && !snapshot.lifecycle_state.is_terminal()
-                    })
-            })
-            .count()
-    }
-}
-
-/// Runtime display mode changes keyed by session.
-#[derive(Debug, Default)]
-pub struct DisplayModeRegistry {
-    modes: HashMap<SessionId, DisplayModeState>,
-}
-
-#[derive(Debug, Clone)]
-struct DisplayModeState {
-    original: Option<mrd_ipc::DisplayMode>,
-    active: Option<mrd_ipc::DisplayMode>,
-    restore_required: bool,
-}
-
-impl DisplayModeRegistry {
-    pub fn record_change(
-        &mut self,
-        session_id: SessionId,
-        requested: mrd_ipc::DisplayMode,
-        previous: Option<mrd_ipc::DisplayMode>,
-        active: mrd_ipc::DisplayMode,
-        restore_required: bool,
-    ) -> mrd_ipc::DisplayModeChange {
-        let original = previous.clone().or_else(|| {
-            self.modes
-                .get(&session_id)
-                .and_then(|state| state.original.clone())
-        });
-        self.modes.insert(
-            session_id.clone(),
-            DisplayModeState {
-                original: original.clone(),
-                active: Some(active.clone()),
-                restore_required,
-            },
-        );
-        mrd_ipc::DisplayModeChange {
-            session_id,
-            requested: Some(requested),
-            previous,
-            active: Some(active),
-            status: "changed".to_string(),
-            reason: None,
-            restore_required,
-        }
-    }
-
-    pub fn record_restore(
-        &mut self,
-        session_id: SessionId,
-        previous: mrd_ipc::DisplayMode,
-        active: mrd_ipc::DisplayMode,
-    ) -> mrd_ipc::DisplayModeChange {
-        self.modes.remove(&session_id);
-        mrd_ipc::DisplayModeChange {
-            session_id,
-            requested: None,
-            previous: Some(previous),
-            active: Some(active),
-            status: "restored".to_string(),
-            reason: None,
-            restore_required: false,
-        }
-    }
-
-    pub fn restore_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .get(session_id)
-            .filter(|state| state.restore_required)
-            .and_then(|state| state.original.clone())
-    }
-
-    pub fn active_mode(&self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .get(session_id)
-            .and_then(|state| state.active.clone())
-    }
-
-    pub fn remove(&mut self, session_id: &SessionId) -> Option<mrd_ipc::DisplayMode> {
-        self.modes
-            .remove(session_id)
-            .and_then(|state| state.original)
-    }
 }
 
 /// Cached service-owned capability snapshot exposed to UI and session handlers.
@@ -2911,7 +2797,7 @@ mod tests {
             codec: "h264".to_string(),
             ..mrd_ipc::MediaProfile::default()
         };
-        let negotiation = MediaProfileNegotiation {
+        let negotiation = mrd_ipc::MediaProfileNegotiation {
             requested: profile.clone(),
             selected: profile,
             status: "accepted".to_string(),
