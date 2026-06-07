@@ -727,6 +727,8 @@ export interface CapabilityProfile {
   fps: number;
   bitrate_mbps: number;
   codec: "h264" | "hevc" | "av1" | string;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | null;
   latency_budget_ms?: number | null;
   min_stable_fps_ratio?: number | null;
   max_drop_ratio?: number | null;

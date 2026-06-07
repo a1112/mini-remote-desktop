@@ -1760,6 +1760,8 @@ function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {
     fps: profile.fps,
     bitrate_mbps: profile.bitrate_mbps,
     codec: normalizeMediaCodec(profile.codec),
+    color_mode: profile.color_mode ?? null,
+    color_pipeline: profile.color_pipeline ?? null,
     required_capabilities: [],
   };
 }

@@ -68,6 +68,8 @@ export interface CapabilityProfile {
   fps: number;
   bitrate_mbps: number;
   codec: string;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | null;
   latency_budget_ms?: number;
   min_stable_fps_ratio?: number;
   max_drop_ratio?: number;
@@ -313,6 +315,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 8,
     codec: "h264",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: ["transport.loopback", "encode.openh264", "decode.software"],
@@ -324,6 +328,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 20,
     codec: "hevc",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -343,6 +349,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 20,
     codec: "h264",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -361,6 +369,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 64,
     codec: "hevc",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -380,6 +390,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 80,
     codec: "h264",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -398,6 +410,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 40,
     codec: "hevc",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -417,6 +431,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 165,
     bitrate_mbps: 80,
     codec: "hevc",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -436,6 +452,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 80,
     codec: "hevc",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -455,6 +473,8 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 6,
     codec: "h264",
+    color_mode: "full",
+    color_pipeline: "sdr8",
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -893,7 +913,9 @@ function isProfileCapabilityUsable(item: CapabilityItem): boolean {
 function formatProfile(profile: CapabilityProfile): string {
   return `${profile.width}x${profile.height} @ ${
     profile.fps
-  } FPS / ${profile.bitrate_mbps} Mbps / ${normalizeProfileCodec(profile.codec)}`;
+  } FPS / ${profile.bitrate_mbps} Mbps / ${normalizeProfileCodec(profile.codec)} / color_mode=${
+    profile.color_mode ?? "full"
+  } / color_pipeline=${profile.color_pipeline ?? "sdr8"}`;
 }
 
 function formatActualProfile(profile: {

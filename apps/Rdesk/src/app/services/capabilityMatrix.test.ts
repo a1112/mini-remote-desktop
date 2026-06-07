@@ -759,6 +759,8 @@ describe("capability profiles", () => {
       fps: 144,
       bitrate_mbps: 64,
       codec: "hevc",
+      color_mode: "full",
+      color_pipeline: "sdr8",
     });
     expect(profile?.required_capabilities).toContain("encode.nvenc_hevc");
     expect(profile?.required_capabilities).toContain("decode.nvdec_hevc");

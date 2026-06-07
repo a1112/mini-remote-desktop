@@ -232,6 +232,8 @@ fn profile_to_media(profile: &CapabilityProfile) -> MediaProfile {
         fps: profile.fps,
         bitrate_mbps: profile.bitrate_mbps,
         codec: profile.codec.clone(),
+        color_mode: profile.color_mode.clone(),
+        color_pipeline: profile.color_pipeline.clone(),
         ..MediaProfile::default()
     }
 }
@@ -1914,6 +1916,8 @@ fn profile(
         fps,
         bitrate_mbps,
         codec: codec.to_string(),
+        color_mode: Some("full".to_string()),
+        color_pipeline: Some("sdr8".to_string()),
         latency_budget_ms: None,
         min_stable_fps_ratio: Some(0.8),
         max_drop_ratio: Some(0.02),
@@ -2114,6 +2118,21 @@ mod tests {
         assert!(lan_2k144
             .required_capabilities
             .contains(&"memory.d3d11_shared".to_string()));
+    }
+
+    #[test]
+    fn selected_profile_preserves_capability_color_defaults() {
+        let evaluation = evaluate_scenario_profile_against_snapshot(
+            &local_capability_snapshot_static(),
+            "lan.2k144",
+            None,
+        );
+
+        let selected = evaluation
+            .selected_profile
+            .expect("selected media profile");
+        assert_eq!(selected.color_mode.as_deref(), Some("full"));
+        assert_eq!(selected.color_pipeline.as_deref(), Some("sdr8"));
     }
 
     #[test]

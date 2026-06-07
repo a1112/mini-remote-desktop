@@ -609,6 +609,12 @@ mod wire {
         pub bitrate_mbps: u32,
         /// Requested codec, for example `h264`.
         pub codec: String,
+        /// Optional color reduction mode, for example `full` or `low_chroma`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_mode: Option<String>,
+        /// Optional color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_pipeline: Option<String>,
         /// Optional latency budget in milliseconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub latency_budget_ms: Option<u32>,

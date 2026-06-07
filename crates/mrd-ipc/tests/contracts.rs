@@ -94,6 +94,8 @@ fn test_capability_snapshot() -> CapabilitySnapshot {
                 fps: 144,
                 bitrate_mbps: 64,
                 codec: "h264".to_string(),
+                color_mode: Some("full".to_string()),
+                color_pipeline: Some("sdr8".to_string()),
                 latency_budget_ms: None,
                 min_stable_fps_ratio: Some(0.8),
                 max_drop_ratio: Some(0.02),
@@ -109,6 +111,8 @@ fn test_capability_snapshot() -> CapabilitySnapshot {
                 fps: 165,
                 bitrate_mbps: 80,
                 codec: "h264".to_string(),
+                color_mode: Some("low_chroma".to_string()),
+                color_pipeline: Some("sdr8".to_string()),
                 latency_budget_ms: None,
                 min_stable_fps_ratio: Some(0.8),
                 max_drop_ratio: Some(0.02),
@@ -189,6 +193,31 @@ fn serialize_deserialize_update_media_profile() {
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_capability_profile_color_metadata() {
+    let profile = CapabilityProfile {
+        id: "lan.color.low_chroma".to_string(),
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 48,
+        codec: "hevc".to_string(),
+        color_mode: Some("low_chroma".to_string()),
+        color_pipeline: Some("sdr8".to_string()),
+        latency_budget_ms: None,
+        min_stable_fps_ratio: Some(0.8),
+        max_drop_ratio: Some(0.02),
+        required_capabilities: vec!["media.color_mode.low_chroma".to_string()],
+    };
+
+    let json = serde_json::to_string(&profile).unwrap();
+    assert!(json.contains("\"color_mode\":\"low_chroma\""));
+    assert!(json.contains("\"color_pipeline\":\"sdr8\""));
+
+    let deserialized: CapabilityProfile = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, profile);
 }
 
 #[test]

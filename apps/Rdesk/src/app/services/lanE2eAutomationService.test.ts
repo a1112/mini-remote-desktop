@@ -1470,6 +1470,11 @@ describe("runLanE2EAutomation", () => {
   });
 
   it("fails when the QUIC media probe codec does not match the requested profile", async () => {
+    const requestedProfile: MediaProfile = {
+      ...DEFAULT_REQUESTED_PROFILE,
+      color_mode: "low_chroma",
+      color_pipeline: "sdr8",
+    };
     const commands = withCaptureSourceCommands(
       createCommands({
         ipcProbeSnapshot: vi.fn().mockResolvedValue(
@@ -1499,7 +1504,7 @@ describe("runLanE2EAutomation", () => {
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",
       transportKind: "quic",
-      requestedProfile: DEFAULT_REQUESTED_PROFILE,
+      requestedProfile,
       sampleIntervalMs: 0,
       timeoutMs: 100,
       minDecodedFrames: 1,
@@ -1513,6 +1518,8 @@ describe("runLanE2EAutomation", () => {
     expect(result.errorMessage).toContain(
       "2560x1600 @ 165 FPS / 80 Mbps / hevc"
     );
+    expect(result.errorMessage).toContain("color_mode=low_chroma");
+    expect(result.errorMessage).toContain("color_pipeline=sdr8");
     expect(result.errorMessage).toContain(
       "2560x1600 @ 165 FPS / 80 Mbps / h264"
     );
