@@ -13,6 +13,7 @@ Use MRD's IPC contract as the reservation boundary:
 - `FileTransferTaskSnapshot.provider_capabilities` records stable capability ids for UI and diagnostics.
 - The current active provider is `mrd-local` with `service.file_transfer.local`.
 - `service.file_transfer.external_bridge` is advertised as `unimplemented` and reserved for a later R-File bridge.
+- Non-local `provider_hint` values must fail with `E_FILE_TRANSFER_PROVIDER_UNAVAILABLE` until a provider router is implemented, so reserved R-File/external bridge requests cannot silently run through the MRD-local copier.
 
 ## Non-Goals
 

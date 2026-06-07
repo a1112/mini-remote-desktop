@@ -10,6 +10,7 @@ use std::time::UNIX_EPOCH;
 
 const LOCAL_FILE_TRANSFER_PROVIDER: &str = "mrd-local";
 const LOCAL_FILE_TRANSFER_CAPABILITY: &str = "service.file_transfer.local";
+const EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY: &str = "service.file_transfer.external_bridge";
 
 pub fn list_directory(path: Option<String>) -> IpcResponse {
     match read_directory(path) {
@@ -29,6 +30,14 @@ pub async fn start_file_transfer(
         return IpcResponse::Error {
             code: "E_FILE_TRANSFER_EMPTY".to_string(),
             message: "file transfer request is empty".to_string(),
+        };
+    }
+    if let Some(provider_hint) = unsupported_file_transfer_provider_hint(&request.provider_hint) {
+        return IpcResponse::Error {
+            code: "E_FILE_TRANSFER_PROVIDER_UNAVAILABLE".to_string(),
+            message: format!(
+                "file transfer provider hint `{provider_hint}` is reserved or unavailable; {EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY} is not implemented"
+            ),
         };
     }
 
@@ -110,6 +119,18 @@ pub async fn cancel_file_transfer(app_state: &Arc<AppState>, transfer_id: String
             code: "E_FILE_TRANSFER_NOT_FOUND".to_string(),
             message: format!("file transfer not found: {transfer_id}"),
         },
+    }
+}
+
+fn unsupported_file_transfer_provider_hint(provider_hint: &Option<String>) -> Option<String> {
+    let hint = provider_hint.as_deref()?.trim();
+    if hint.is_empty() {
+        return None;
+    }
+    let normalized = hint.to_ascii_lowercase();
+    match normalized.as_str() {
+        LOCAL_FILE_TRANSFER_PROVIDER | "local" | LOCAL_FILE_TRANSFER_CAPABILITY => None,
+        _ => Some(hint.to_string()),
     }
 }
 
@@ -631,6 +652,58 @@ mod tests {
             std::fs::read(target_dir.join("payload (1).txt")).unwrap(),
             b"new"
         );
+
+        std::fs::remove_dir_all(root).expect("remove temp directory");
+    }
+
+    #[tokio::test]
+    async fn start_file_transfer_rejects_reserved_external_provider_hint() {
+        let app_state = Arc::new(AppState::new());
+        let root = std::env::temp_dir().join(format!(
+            "mrd-service-file-transfer-provider-hint-{}",
+            std::process::id()
+        ));
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&source_dir).expect("create source");
+        std::fs::create_dir_all(&target_dir).expect("create target");
+        let source_file = source_dir.join("payload.txt");
+        std::fs::write(&source_file, b"new").expect("write source");
+
+        let response = start_file_transfer(
+            &app_state,
+            FileTransferStartRequest {
+                source_device_id: None,
+                target_device_id: None,
+                entries: vec![FileTransferEntry {
+                    source_path: source_file.display().to_string(),
+                    file_name: Some("payload.txt".to_string()),
+                    kind: FileEntryKind::File,
+                }],
+                target_path: target_dir.display().to_string(),
+                conflict_policy: FileTransferConflictPolicy::Rename,
+                transport_hint: None,
+                provider_hint: Some("r-file".to_string()),
+            },
+        )
+        .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_FILE_TRANSFER_PROVIDER_UNAVAILABLE");
+                assert!(message.contains("r-file"));
+                assert!(message.contains("service.file_transfer.external_bridge"));
+            }
+            other => panic!("expected provider unavailable error, got {other:?}"),
+        }
+        assert!(!target_dir.join("payload.txt").exists());
+
+        let IpcResponse::FileTransferList { transfers } = list_file_transfers(&app_state).await
+        else {
+            panic!("expected file transfer list");
+        };
+        assert!(transfers.is_empty());
 
         std::fs::remove_dir_all(root).expect("remove temp directory");
     }
