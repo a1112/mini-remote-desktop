@@ -306,12 +306,21 @@ export interface FileTransferStartRequest {
   provider_hint?: string | null;
 }
 
+export interface FileTransferProviderHandoffHint {
+  external_app: string;
+  bridge_service: string;
+  control_endpoint?: string | null;
+  data_endpoint?: string | null;
+  capabilities?: string[];
+}
+
 export interface FileTransferProviderDescriptor {
   provider_kind: string;
   display_name: string;
   status: CapabilityStatus;
   capabilities?: string[];
   reason?: string | null;
+  handoff_hint?: FileTransferProviderHandoffHint | null;
 }
 
 export interface FileTransferTaskSnapshot {

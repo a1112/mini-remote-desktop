@@ -1371,26 +1371,41 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
               </span>
             ) : (
               fileTransferProviders.map((provider) => (
-                <div key={provider.provider_kind} className={`flex min-w-0 max-w-full items-center gap-2 rounded-md border px-2 py-1 ${
+                <div key={provider.provider_kind} className={`flex min-w-0 max-w-full flex-col gap-1 rounded-md border px-2 py-1 ${
                   isDark ? "border-gray-700 bg-[#252525]" : "border-gray-200 bg-gray-50"
                 }`}>
-                  <span className="truncate" style={{ fontSize: 11 }}>
-                    {provider.display_name}
-                  </span>
-                  <span className={isDark ? "font-mono text-gray-500" : "font-mono text-gray-400"} style={{ fontSize: 10 }}>
-                    {provider.provider_kind}
-                  </span>
-                  <span
-                    title={provider.reason ?? provider.capabilities?.join(", ") ?? provider.status}
-                    className={`shrink-0 rounded px-1.5 py-0.5 ${
-                      provider.status === "available"
-                        ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
-                        : isDark ? "bg-amber-950 text-amber-300" : "bg-amber-50 text-amber-700"
-                    }`}
-                    style={{ fontSize: 10 }}
-                  >
-                    {fileTransferProviderStatusLabel(provider.status)}
-                  </span>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate" style={{ fontSize: 11 }}>
+                      {provider.display_name}
+                    </span>
+                    <span className={isDark ? "font-mono text-gray-500" : "font-mono text-gray-400"} style={{ fontSize: 10 }}>
+                      {provider.provider_kind}
+                    </span>
+                    <span
+                      title={provider.reason ?? provider.capabilities?.join(", ") ?? provider.status}
+                      className={`shrink-0 rounded px-1.5 py-0.5 ${
+                        provider.status === "available"
+                          ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
+                          : isDark ? "bg-amber-950 text-amber-300" : "bg-amber-50 text-amber-700"
+                      }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {fileTransferProviderStatusLabel(provider.status)}
+                    </span>
+                  </div>
+                  {provider.handoff_hint ? (
+                    <div className={`flex min-w-0 flex-wrap items-center gap-1 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>
+                      <span>{provider.handoff_hint.external_app}</span>
+                      <span>·</span>
+                      <span className="font-mono">{provider.handoff_hint.bridge_service}</span>
+                      {provider.handoff_hint.control_endpoint ? (
+                        <>
+                          <span>·</span>
+                          <span className="font-mono">{provider.handoff_hint.control_endpoint}</span>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               ))
             )}

@@ -161,6 +161,7 @@ beforeEach(() => {
         status: "available",
         capabilities: ["service.file_transfer.local"],
         reason: null,
+        handoff_hint: null,
       },
       {
         provider_kind: "r-file",
@@ -168,6 +169,17 @@ beforeEach(() => {
         status: "unimplemented",
         capabilities: ["service.file_transfer.external_bridge"],
         reason: "reserved provider bridge",
+        handoff_hint: {
+          external_app: "R-File",
+          bridge_service: "rfile-bridge",
+          control_endpoint: "http://127.0.0.1:18100",
+          data_endpoint: "http://127.0.0.1:18080",
+          capabilities: [
+            "rfile.bridge.session_v1",
+            "rfile.watch.http_v1",
+            "rfile.remote_mount.v1",
+          ],
+        },
       },
     ],
   });
@@ -318,6 +330,8 @@ describe("DeviceDetailPage info tab", () => {
     expect(screen.getByText("MRD local file transfer")).toBeInTheDocument();
     expect(screen.getByText("R-File external bridge")).toBeInTheDocument();
     expect(screen.getByText("预留")).toBeInTheDocument();
+    expect(screen.getByText("rfile-bridge")).toBeInTheDocument();
+    expect(screen.getByText("http://127.0.0.1:18100")).toBeInTheDocument();
   });
 
   it("shows service-owned file transfer task snapshots in the file transfer tab", async () => {

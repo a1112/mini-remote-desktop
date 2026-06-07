@@ -1,8 +1,8 @@
 use crate::app_state::AppState;
 use mrd_ipc::{
     CapabilityStatus, DirectoryList, FileEntry, FileEntryKind, FileTransferConflictPolicy,
-    FileTransferEntry, FileTransferProviderDescriptor, FileTransferStartRequest,
-    FileTransferStatus, FileTransferTaskSnapshot, IpcResponse,
+    FileTransferEntry, FileTransferProviderDescriptor, FileTransferProviderHandoffHint,
+    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcResponse,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,9 @@ const LOCAL_FILE_TRANSFER_CAPABILITY: &str = "service.file_transfer.local";
 const RFILE_FILE_TRANSFER_PROVIDER: &str = "r-file";
 const EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY: &str = "service.file_transfer.external_bridge";
 const EXTERNAL_FILE_TRANSFER_BRIDGE_REASON: &str =
-    "reserved provider bridge for future R-File integration";
+    "reserved handoff to R-File; MRD keeps local copy/list/cancel as the active path";
+const RFILE_BRIDGE_CONTROL_ENDPOINT: &str = "http://127.0.0.1:18100";
+const RFILE_WATCH_DATA_ENDPOINT: &str = "http://127.0.0.1:18080";
 
 pub fn list_directory(path: Option<String>) -> IpcResponse {
     match read_directory(path) {
@@ -40,7 +42,7 @@ pub async fn start_file_transfer(
         return IpcResponse::Error {
             code: "E_FILE_TRANSFER_PROVIDER_UNAVAILABLE".to_string(),
             message: format!(
-                "file transfer provider hint `{provider_hint}` is reserved or unavailable; {EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY} is not implemented"
+                "file transfer provider hint `{provider_hint}` is reserved for R-File handoff via rfile-bridge ({RFILE_BRIDGE_CONTROL_ENDPOINT}); {EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY} is not implemented in MRD"
             ),
         };
     }
@@ -140,6 +142,7 @@ fn file_transfer_provider_descriptors() -> Vec<FileTransferProviderDescriptor> {
             status: CapabilityStatus::Available,
             capabilities: vec![LOCAL_FILE_TRANSFER_CAPABILITY.to_string()],
             reason: None,
+            handoff_hint: None,
         },
         FileTransferProviderDescriptor {
             provider_kind: RFILE_FILE_TRANSFER_PROVIDER.to_string(),
@@ -147,6 +150,18 @@ fn file_transfer_provider_descriptors() -> Vec<FileTransferProviderDescriptor> {
             status: CapabilityStatus::Unimplemented,
             capabilities: vec![EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY.to_string()],
             reason: Some(EXTERNAL_FILE_TRANSFER_BRIDGE_REASON.to_string()),
+            handoff_hint: Some(FileTransferProviderHandoffHint {
+                external_app: "R-File".to_string(),
+                bridge_service: "rfile-bridge".to_string(),
+                control_endpoint: Some(RFILE_BRIDGE_CONTROL_ENDPOINT.to_string()),
+                data_endpoint: Some(RFILE_WATCH_DATA_ENDPOINT.to_string()),
+                capabilities: vec![
+                    "rfile.bridge.session_v1".to_string(),
+                    "rfile.watch.http_v1".to_string(),
+                    "rfile.remote_mount.v1".to_string(),
+                    "rfile.transfer_history.v1".to_string(),
+                ],
+            }),
         },
     ]
 }
@@ -765,5 +780,18 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("reserved"));
+        let handoff = providers[1]
+            .handoff_hint
+            .as_ref()
+            .expect("reserved R-File handoff hint");
+        assert_eq!(handoff.external_app, "R-File");
+        assert_eq!(handoff.bridge_service, "rfile-bridge");
+        assert_eq!(
+            handoff.control_endpoint.as_deref(),
+            Some("http://127.0.0.1:18100")
+        );
+        assert!(handoff
+            .capabilities
+            .contains(&"rfile.remote_mount.v1".to_string()));
     }
 }

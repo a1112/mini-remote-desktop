@@ -9,8 +9,8 @@ use mrd_ipc::{
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
     DeviceIdentitySnapshot, DeviceInfo, DevicePreference, DevicePreferenceUpdate, DirectoryList,
     FileEntry, FileEntryKind, FileTransferConflictPolicy, FileTransferEntry,
-    FileTransferProviderDescriptor, FileTransferStartRequest, FileTransferStatus,
-    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    FileTransferProviderDescriptor, FileTransferProviderHandoffHint, FileTransferStartRequest,
+    FileTransferStatus, FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
     MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
     MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
     ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
@@ -748,6 +748,7 @@ fn serialize_deserialize_file_transfer_contracts() {
                 status: CapabilityStatus::Available,
                 capabilities: vec!["service.file_transfer.local".to_string()],
                 reason: None,
+                handoff_hint: None,
             },
             FileTransferProviderDescriptor {
                 provider_kind: "r-file".to_string(),
@@ -755,6 +756,17 @@ fn serialize_deserialize_file_transfer_contracts() {
                 status: CapabilityStatus::Unimplemented,
                 capabilities: vec!["service.file_transfer.external_bridge".to_string()],
                 reason: Some("reserved provider bridge".to_string()),
+                handoff_hint: Some(FileTransferProviderHandoffHint {
+                    external_app: "R-File".to_string(),
+                    bridge_service: "rfile-bridge".to_string(),
+                    control_endpoint: Some("http://127.0.0.1:18100".to_string()),
+                    data_endpoint: Some("http://127.0.0.1:18080".to_string()),
+                    capabilities: vec![
+                        "rfile.bridge.session_v1".to_string(),
+                        "rfile.watch.http_v1".to_string(),
+                        "rfile.remote_mount.v1".to_string(),
+                    ],
+                }),
             },
         ],
     };
@@ -763,6 +775,8 @@ fn serialize_deserialize_file_transfer_contracts() {
     assert!(json.contains("\"provider_kind\":\"r-file\""));
     assert!(json.contains("\"status\":\"unimplemented\""));
     assert!(json.contains("\"service.file_transfer.external_bridge\""));
+    assert!(json.contains("\"bridge_service\":\"rfile-bridge\""));
+    assert!(json.contains("\"control_endpoint\":\"http://127.0.0.1:18100\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }

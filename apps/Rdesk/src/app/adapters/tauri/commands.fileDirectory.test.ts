@@ -215,6 +215,7 @@ describe('file directory command adapter', () => {
         status: 'available',
         capabilities: ['service.file_transfer.local'],
         reason: null,
+        handoff_hint: null,
       },
       {
         provider_kind: 'r-file',
@@ -222,6 +223,13 @@ describe('file directory command adapter', () => {
         status: 'unimplemented',
         capabilities: ['service.file_transfer.external_bridge'],
         reason: 'reserved provider bridge',
+        handoff_hint: {
+          external_app: 'R-File',
+          bridge_service: 'rfile-bridge',
+          control_endpoint: 'http://127.0.0.1:18100',
+          data_endpoint: 'http://127.0.0.1:18080',
+          capabilities: ['rfile.bridge.session_v1', 'rfile.watch.http_v1'],
+        },
       },
     ]);
 
@@ -229,6 +237,7 @@ describe('file directory command adapter', () => {
 
     expect(result.ok && result.value[1]?.provider_kind).toBe('r-file');
     expect(result.ok && result.value[1]?.status).toBe('unimplemented');
+    expect(result.ok && result.value[1]?.handoff_hint?.bridge_service).toBe('rfile-bridge');
     expect(invoke).toHaveBeenCalledWith('ipc_list_file_transfer_providers', undefined);
   });
 
@@ -247,6 +256,7 @@ describe('file directory command adapter', () => {
               status: 'available',
               capabilities: ['service.file_transfer.local'],
               reason: null,
+              handoff_hint: null,
             },
             {
               provider_kind: 'r-file',
@@ -254,6 +264,13 @@ describe('file directory command adapter', () => {
               status: 'unimplemented',
               capabilities: ['service.file_transfer.external_bridge'],
               reason: 'reserved provider bridge',
+              handoff_hint: {
+                external_app: 'R-File',
+                bridge_service: 'rfile-bridge',
+                control_endpoint: 'http://127.0.0.1:18100',
+                data_endpoint: 'http://127.0.0.1:18080',
+                capabilities: ['rfile.bridge.session_v1', 'rfile.watch.http_v1'],
+              },
             },
           ],
         },
@@ -265,6 +282,9 @@ describe('file directory command adapter', () => {
     const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
 
     expect(result.ok && result.value[0]?.provider_kind).toBe('mrd-local');
+    expect(result.ok && result.value[1]?.handoff_hint?.control_endpoint).toBe(
+      'http://127.0.0.1:18100'
+    );
     expect(requestBody.request).toEqual({ type: 'ListFileTransferProviders' });
     expect(invoke).not.toHaveBeenCalled();
   });

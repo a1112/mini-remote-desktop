@@ -495,6 +495,24 @@ mod wire {
         pub provider_hint: Option<String>,
     }
 
+    /// Reserved external handoff metadata for a file transfer provider.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferProviderHandoffHint {
+        /// External application expected to own the feature path.
+        pub external_app: String,
+        /// External bridge service expected to receive the handoff.
+        pub bridge_service: String,
+        /// Optional control-plane endpoint hint for local discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub control_endpoint: Option<String>,
+        /// Optional data-plane endpoint hint for local discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_endpoint: Option<String>,
+        /// External capability ids MRD reserves without executing directly.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+    }
+
     /// One file transfer provider known by the local service.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct FileTransferProviderDescriptor {
@@ -510,6 +528,9 @@ mod wire {
         /// Short explanation when the provider is not available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,
+        /// External handoff details for reserved providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub handoff_hint: Option<FileTransferProviderHandoffHint>,
     }
 
     /// Service-owned file transfer lifecycle status.
