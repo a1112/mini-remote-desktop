@@ -1,6 +1,7 @@
 use crate::app_state::{AppState, DecodedVideoFrameStats, MediaProbeFrameStats};
 #[cfg(any(windows, target_os = "macos"))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQueueRegistry};
+mod device_action;
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_encode_openh264::OpenH264Encoder;
@@ -127,7 +128,7 @@ const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(
 const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";
 const LAN_INPUT_CONTROL_TRANSPORT: &str = "input_control_v1";
-const LAN_DEVICE_ACTION_TRANSPORT: &str = "device_action_control_v1";
+const LAN_DEVICE_ACTION_TRANSPORT: &str = device_action::LAN_DEVICE_ACTION_TRANSPORT;
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
@@ -182,7 +183,6 @@ static LAN_RENDER_NO_SURFACE_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_RENDER_PRESENT_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LAN_DEVICE_ACTION_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_MEDIA_SENDER_ERROR_LOG_INTERVAL: u32 = 3;
 const LAN_MEDIA_RECEIVER_MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 8;
 const LAN_MEDIA_RECEIVER_DECODE_ERROR_LOG_INTERVAL: u32 = 3;
@@ -1667,7 +1667,7 @@ pub async fn request_lan_device_action(
     }
 
     let source_device_id = local_device_id(app_state).await?;
-    let request_id = next_device_action_request_id();
+    let request_id = device_action::next_device_action_request_id();
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .context("failed to bind LAN device action UDP socket")?;
@@ -1714,13 +1714,6 @@ pub async fn request_lan_device_action(
         }
         _ => anyhow::bail!("unexpected LAN device action response"),
     }
-}
-
-fn next_device_action_request_id() -> u64 {
-    LAN_DEVICE_ACTION_REQUEST_COUNTER
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
-        .max(1)
 }
 
 fn next_control_input_event_id() -> u64 {
@@ -2477,8 +2470,12 @@ async fn handle_packet(
                 return Ok(());
             }
 
-            let result =
-                accept_lan_device_action_request(app_state, &target_device_id, action).await;
+            let local_device_id = local_device_id(app_state).await.ok();
+            let result = device_action::accept_device_action_request(
+                local_device_id.as_deref(),
+                &target_device_id,
+                action,
+            );
             tracing::info!(
                 source_device_id = %source_device_id,
                 target_device_id = %target_device_id,
@@ -2505,60 +2502,6 @@ async fn handle_packet(
     }
 
     Ok(())
-}
-
-async fn accept_lan_device_action_request(
-    app_state: &Arc<AppState>,
-    target_device_id: &str,
-    action: DeviceActionKind,
-) -> DeviceActionResult {
-    let local_device_id = local_device_id(app_state).await.ok();
-    let is_local_target = local_device_id
-        .as_ref()
-        .is_some_and(|device_id| device_id == target_device_id);
-    let (accepted, supported, message) = if is_local_target {
-        match action {
-            DeviceActionKind::RemoteTerminal => (
-                true,
-                false,
-                "Remote terminal request reserved; waiting for explicit peer consent and a service-owned command executor.",
-            ),
-            DeviceActionKind::Restart => (
-                false,
-                false,
-                "Remote restart requires explicit peer consent and a privileged service executor.",
-            ),
-            DeviceActionKind::Shutdown => (
-                false,
-                false,
-                "Remote shutdown requires explicit peer consent and a privileged service executor.",
-            ),
-            DeviceActionKind::Disconnect => (
-                false,
-                false,
-                "Disconnect is handled by the requesting service session registry.",
-            ),
-            DeviceActionKind::WakeOnLan => (
-                false,
-                false,
-                "Wake-on-LAN must be sent by the requesting device before the peer is awake.",
-            ),
-        }
-    } else {
-        (
-            false,
-            false,
-            "Device action target does not match this local service.",
-        )
-    };
-
-    DeviceActionResult {
-        device_id: DeviceId(target_device_id.to_string()),
-        action,
-        accepted,
-        supported,
-        message: message.to_string(),
-    }
 }
 
 async fn accept_lan_remote_session(
@@ -11404,19 +11347,11 @@ mod tests {
 
     #[tokio::test]
     async fn peer_accepts_remote_terminal_as_reserved_consent_gated_action() {
-        let app_state = Arc::new(AppState::new());
-        app_state
-            .devices
-            .lock()
-            .await
-            .register(DeviceId("target-device".to_string()), "Target".to_string());
-
-        let result = accept_lan_device_action_request(
-            &app_state,
+        let result = device_action::accept_device_action_request(
+            Some("target-device"),
             "target-device",
             mrd_ipc::DeviceActionKind::RemoteTerminal,
-        )
-        .await;
+        );
 
         assert_eq!(result.device_id, DeviceId("target-device".to_string()));
         assert_eq!(result.action, mrd_ipc::DeviceActionKind::RemoteTerminal);
@@ -11428,19 +11363,15 @@ mod tests {
 
     #[tokio::test]
     async fn peer_rejects_remote_power_actions_until_privileged_executor_exists() {
-        let app_state = Arc::new(AppState::new());
-        app_state
-            .devices
-            .lock()
-            .await
-            .register(DeviceId("target-device".to_string()), "Target".to_string());
-
         for action in [
             mrd_ipc::DeviceActionKind::Restart,
             mrd_ipc::DeviceActionKind::Shutdown,
         ] {
-            let result =
-                accept_lan_device_action_request(&app_state, "target-device", action).await;
+            let result = device_action::accept_device_action_request(
+                Some("target-device"),
+                "target-device",
+                action,
+            );
 
             assert_eq!(result.action, action);
             assert!(!result.accepted);
