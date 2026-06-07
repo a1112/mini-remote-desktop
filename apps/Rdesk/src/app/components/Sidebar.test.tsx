@@ -258,6 +258,56 @@ describe("Sidebar device actions", () => {
     );
   });
 
+  it("requests service-owned restart and shutdown from the management submenu", async () => {
+    serviceMock.ipcRequestDeviceAction.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        action: "restart",
+        accepted: false,
+        supported: false,
+        message: "Power management provider is reserved.",
+      },
+    });
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "重启" }));
+
+    expect(serviceMock.ipcRequestDeviceAction).toHaveBeenCalledWith(
+      "agent-device",
+      "restart"
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/重启：Agent PC/)).toBeInTheDocument();
+    });
+
+    serviceMock.ipcRequestDeviceAction.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        action: "shutdown",
+        accepted: false,
+        supported: false,
+        message: "Power management provider is reserved.",
+      },
+    });
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "关机" }));
+
+    expect(serviceMock.ipcRequestDeviceAction).toHaveBeenLastCalledWith(
+      "agent-device",
+      "shutdown"
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/关机：Agent PC/)).toBeInTheDocument();
+    });
+  });
+
   it("requests service-owned device detail before opening device info", async () => {
     serviceMock.ipcDeviceDetail.mockResolvedValue({
       ok: true,

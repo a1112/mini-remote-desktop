@@ -7,6 +7,8 @@ import {
   prepareRemoteApplicationCatalogForDevice,
   type RemoteApplicationCatalogResult,
 } from "../services/remoteDisplayLauncher";
+import { ipcRequestDeviceAction } from "../adapters/tauri/commands";
+import type { DeviceActionKind } from "../adapters/tauri/types";
 import {
   getProbeSnapshot,
   getSessionSnapshot,
@@ -414,6 +416,22 @@ function RemoteTab({ device }: { device: Device }) {
     }
   };
 
+  const handleToolbarDeviceAction = async (action: DeviceActionKind, label: string) => {
+    setConnectionError(null);
+    try {
+      const result = await ipcRequestDeviceAction(device.deviceId, action);
+      if (!result.ok) {
+        setConnectionError(`${label}失败：${result.error.message}`);
+        return;
+      }
+      setConnectionError(`${label}：${result.value.message}`);
+    } catch (error) {
+      setConnectionError(
+        error instanceof Error ? `${label}失败：${error.message}` : `${label}失败：未知错误`
+      );
+    }
+  };
+
   const fpsLabel = probeSnapshot?.current_fps == null ? "probing" : `${probeSnapshot.current_fps.toFixed(1)} fps`;
   const bitrateLabel = probeSnapshot?.bitrate_mbps == null ? "-" : `${probeSnapshot.bitrate_mbps.toFixed(2)} Mbps`;
   const frameSizeLabel =
@@ -485,7 +503,12 @@ function RemoteTab({ device }: { device: Device }) {
         <div className="w-px h-4 bg-white/10 mx-1" />
         <ToolbarBtn icon={<Lock className="w-3.5 h-3.5" />} label="锁屏" />
         <ToolbarBtn icon={<RefreshCw className="w-3.5 h-3.5" />} label="刷新" />
-        <ToolbarBtn icon={<Power className="w-3.5 h-3.5" />} label="重启" danger />
+        <ToolbarBtn
+          icon={<Power className="w-3.5 h-3.5" />}
+          label="重启"
+          onClick={() => void handleToolbarDeviceAction("restart", "重启")}
+          danger
+        />
         <div className="flex-1" />
 
         <div className="flex items-center gap-3 mr-2">
