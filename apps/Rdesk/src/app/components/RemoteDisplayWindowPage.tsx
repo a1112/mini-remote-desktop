@@ -3323,6 +3323,17 @@ export function RemoteDisplayWindowPage() {
     ]
   );
 
+  const handleRemotePointerCancel = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      event.preventDefault();
+      lastRemoteControlPointRef.current = null;
+      cancelPendingRemotePointerMove();
+      sendControlInputEvent({ kind: "release_all" });
+    },
+    [cancelPendingRemotePointerMove, controlInputEnabled, sendControlInputEvent]
+  );
+
   const handleRemoteWheel = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
       if (!controlInputEnabled) return;
@@ -6906,6 +6917,7 @@ export function RemoteDisplayWindowPage() {
         onPointerMove={handleRemotePointerMove}
         onPointerDown={handleRemotePointerDown}
         onPointerUp={handleRemotePointerUp}
+        onPointerCancel={handleRemotePointerCancel}
         onWheel={handleRemoteWheel}
         onKeyDown={handleRemoteKeyDown}
         onKeyUp={handleRemoteKeyUp}
