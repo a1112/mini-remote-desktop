@@ -397,6 +397,11 @@ export interface NativeSurfaceRect {
   height: number;
 }
 
+export interface NativeSurfaceControlFrameSize {
+  width: number;
+  height: number;
+}
+
 export interface NativeRenderSurfaceSnapshot {
   label: string;
   backend: "web" | "d3d11" | string;

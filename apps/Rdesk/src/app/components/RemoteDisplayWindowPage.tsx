@@ -3919,6 +3919,13 @@ export function RemoteDisplayWindowPage() {
     const enabled = isNative && nativeRenderAvailable;
     const visible = enabled && (options?.visible ?? !testSettingsOpen);
     const scale = nativeRendererType === "macos" ? 1 : window.devicePixelRatio || 1;
+    const controlFrameSize =
+      remoteInputFrameSize.width > 0 && remoteInputFrameSize.height > 0
+        ? {
+            width: remoteInputFrameSize.width,
+            height: remoteInputFrameSize.height,
+          }
+        : undefined;
     const payload = {
       enabled,
       visible,
@@ -3928,6 +3935,7 @@ export function RemoteDisplayWindowPage() {
         width: Math.round(rect.width * scale),
         height: Math.round(rect.height * scale),
       },
+      ...(controlFrameSize ? { controlFrameSize } : {}),
     };
     const key = JSON.stringify(payload);
     const currentSync = nativeSurfaceSyncStateRef.current;
@@ -3960,7 +3968,13 @@ export function RemoteDisplayWindowPage() {
       inFlight,
     };
     return inFlight;
-  }, [isNative, nativeRenderAvailable, nativeRendererType, testSettingsOpen]);
+  }, [
+    isNative,
+    nativeRenderAvailable,
+    nativeRendererType,
+    remoteInputFrameSize,
+    testSettingsOpen,
+  ]);
 
   const openTestSettings = useCallback(() => {
     setTestSettingsOpen(true);

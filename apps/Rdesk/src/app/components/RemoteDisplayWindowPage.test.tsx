@@ -3346,6 +3346,87 @@ describe("RemoteDisplayWindowPage", () => {
     expect(configureCalls.some((call) => call.enabled === false)).toBe(false);
   });
 
+  it("passes the current remote frame size to native surface input configuration", async () => {
+    const mockInvoke = getMockInvoke();
+    const configureCalls: Record<string, unknown>[] = [];
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        configureCalls.push(args ?? {});
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: args?.enabled ? "d3d11" : "web",
+          attached: Boolean(args?.enabled),
+          visible: Boolean(args?.visible),
+          parent_hwnd: "0xA",
+          hwnd: args?.enabled ? "0x14" : null,
+          rect: { x: 0, y: 56, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+          peer_device_id: "target-device",
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 144,
+          bitrate_mbps: 70,
+          media_probe_valid: true,
+          media_probe_width: 2560,
+          media_probe_height: 1440,
+          latest_frame_width: 2560,
+          latest_frame_height: 1440,
+          latest_frame_data_url: null,
+          last_error: null,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command);
+    });
+
+    renderRemoteDisplay("p2p-quic-123");
+
+    await waitFor(() => {
+      expect(
+        configureCalls.some((call) => {
+          const controlFrameSize = call.controlFrameSize as
+            | { width?: number; height?: number }
+            | undefined;
+          return (
+            call.enabled === true &&
+            controlFrameSize?.width === 2560 &&
+            controlFrameSize.height === 1440
+          );
+        })
+      ).toBe(true);
+    });
+  });
+
   it("probes the D3D11 native surface before starting a local pipeline test", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {

@@ -33,7 +33,8 @@ use device_info::HardwareInfo;
 use mrd_pipeline_core::VideoCodec;
 use mrd_proto::SessionId;
 use remote_display_surface::{
-    NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
+    NativeRenderSurfaceSnapshot, NativeSurfaceControlFrameSize, NativeSurfaceRect,
+    RemoteDisplaySurfaceManager,
 };
 use render_window_registry::{
     NativeSurfaceServiceAction, PendingRenderWindow, RenderWindowContext, RenderWindowRegistry,
@@ -980,6 +981,7 @@ async fn configure_remote_display_native_surface(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: Option<bool>,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let label = window.label().to_string();
     let app_handle = window.app_handle().clone();
@@ -992,6 +994,7 @@ async fn configure_remote_display_native_surface(
         rect,
         enabled,
         visible.unwrap_or(enabled),
+        control_frame_size,
     )?;
     drop(window);
 
@@ -1196,6 +1199,7 @@ fn configure_native_surface_for_window(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: bool,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let scheduler_window = window.clone();
     let surface_window = window.clone();
@@ -1207,6 +1211,7 @@ fn configure_native_surface_for_window(
                 rect,
                 enabled,
                 visible,
+                control_frame_size,
             );
             let _ = sender.send(result);
         })
@@ -1224,12 +1229,15 @@ fn configure_native_surface_for_window(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: bool,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
-    state
-        .remote_display_surfaces
-        .lock()
-        .unwrap()
-        .configure(window, rect, enabled, visible)
+    state.remote_display_surfaces.lock().unwrap().configure(
+        window,
+        rect,
+        enabled,
+        visible,
+        control_frame_size,
+    )
 }
 
 #[cfg(windows)]

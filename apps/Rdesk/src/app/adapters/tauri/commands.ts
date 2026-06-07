@@ -69,6 +69,7 @@ import type {
   CaptureShareSourceTarget,
   RemoteDisplayWindowContext,
   NativeSurfaceRect,
+  NativeSurfaceControlFrameSize,
   NativeRenderSurfaceSnapshot,
   BrowserWebrtcPreviewAnswer,
   TestMatrixConfig,
@@ -337,6 +338,7 @@ export async function configureRemoteDisplayNativeSurface(params: {
   rect: NativeSurfaceRect;
   enabled: boolean;
   visible?: boolean;
+  controlFrameSize?: NativeSurfaceControlFrameSize;
 }): Promise<AdapterResult<NativeRenderSurfaceSnapshot>> {
   return invokeAdapter<NativeRenderSurfaceSnapshot>(
     'configure_remote_display_native_surface',
