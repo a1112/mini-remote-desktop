@@ -211,7 +211,7 @@ pub async fn request_device_action(
         },
         DeviceActionKind::Disconnect => {
             return IpcResponse::DeviceActionRequested {
-                result: disconnect_device_sessions(app_state, device_id).await,
+                result: disconnect_device_sessions(app_state, device_id, known_device).await,
             };
         }
         DeviceActionKind::RemoteTerminal
@@ -251,6 +251,7 @@ pub async fn request_device_action(
 async fn disconnect_device_sessions(
     app_state: &Arc<AppState>,
     device_id: DeviceId,
+    known_device: bool,
 ) -> DeviceActionResult {
     let session_ids = {
         let sessions = app_state.sessions.lock().await;
@@ -316,8 +317,10 @@ async fn disconnect_device_sessions(
         device_id,
         action: DeviceActionKind::Disconnect,
         accepted: !session_ids.is_empty(),
-        supported: true,
-        message: if session_ids.is_empty() {
+        supported: known_device || !session_ids.is_empty(),
+        message: if session_ids.is_empty() && !known_device {
+            "Device is not known to the local service.".to_string()
+        } else if session_ids.is_empty() {
             "No active sessions are associated with this device.".to_string()
         } else {
             format!("Disconnected {} active session(s).", session_ids.len())

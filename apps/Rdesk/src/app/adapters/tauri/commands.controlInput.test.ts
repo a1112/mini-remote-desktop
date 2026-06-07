@@ -100,6 +100,39 @@ describe('control input command adapter', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it('sends disconnect device action requests through the browser service bridge', async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'DeviceActionRequested',
+          result: {
+            device_id: 'agent-device',
+            action: 'disconnect',
+            accepted: true,
+            supported: true,
+            message: 'Disconnected 1 active session(s).',
+          },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcRequestDeviceAction('agent-device', 'disconnect');
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok && result.value.action).toBe('disconnect');
+    expect(requestBody.request).toEqual({
+      type: 'RequestDeviceAction',
+      device_id: 'agent-device',
+      action: 'disconnect',
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+
   it('requests service-owned device detail through Tauri and browser bridge', async () => {
     const invoke = getMockInvoke();
     invoke.mockResolvedValue({

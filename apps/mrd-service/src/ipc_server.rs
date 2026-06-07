@@ -1938,6 +1938,30 @@ mod tests {
         assert!(!snapshot.receiver_active);
     }
 
+    #[tokio::test]
+    async fn disconnect_device_action_rejects_unknown_device_without_sessions() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::RequestDeviceAction {
+                device_id: DeviceId("missing-device".to_string()),
+                action: mrd_ipc::DeviceActionKind::Disconnect,
+            })
+            .await;
+
+        match response {
+            IpcResponse::DeviceActionRequested { result } => {
+                assert_eq!(result.device_id, DeviceId("missing-device".to_string()));
+                assert_eq!(result.action, mrd_ipc::DeviceActionKind::Disconnect);
+                assert!(!result.accepted);
+                assert!(!result.supported);
+                assert!(result.message.contains("not known"));
+            }
+            other => panic!("expected device action response, got {other:?}"),
+        }
+    }
+
     fn set_capability_status(
         snapshot: &mut mrd_ipc::CapabilitySnapshot,
         id: &str,
