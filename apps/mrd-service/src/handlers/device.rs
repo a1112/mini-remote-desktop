@@ -3,9 +3,10 @@ use std::{
     sync::Arc,
 };
 
+use mrd_application::ports::SessionLifecycleState;
 use mrd_ipc::{
-    DeviceActionKind, DeviceActionResult, DeviceDetailSnapshot, DeviceIdentitySnapshot, DeviceInfo,
-    IpcResponse,
+    ControlInputEvent, DeviceActionKind, DeviceActionResult, DeviceDetailSnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, IpcResponse,
 };
 use mrd_proto::DeviceId;
 
@@ -208,6 +209,11 @@ pub async fn request_device_action(
                 "Device is not known to the local service.".to_string(),
             ),
         },
+        DeviceActionKind::Disconnect => {
+            return IpcResponse::DeviceActionRequested {
+                result: disconnect_device_sessions(app_state, device_id).await,
+            };
+        }
         DeviceActionKind::RemoteTerminal
         | DeviceActionKind::Restart
         | DeviceActionKind::Shutdown => {
@@ -238,6 +244,83 @@ pub async fn request_device_action(
             accepted,
             supported,
             message,
+        },
+    }
+}
+
+async fn disconnect_device_sessions(
+    app_state: &Arc<AppState>,
+    device_id: DeviceId,
+) -> DeviceActionResult {
+    let session_ids = {
+        let sessions = app_state.sessions.lock().await;
+        sessions
+            .list_all()
+            .into_iter()
+            .filter(|session| {
+                !matches!(
+                    session.lifecycle_state,
+                    SessionLifecycleState::Closed | SessionLifecycleState::Failed { .. }
+                ) && (session.source_device_id.as_ref() == Some(&device_id)
+                    || session.target_device_id.as_ref() == Some(&device_id))
+            })
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>()
+    };
+
+    for session_id in &session_ids {
+        let mut sessions = app_state.sessions.lock().await;
+        if let Some(snapshot) = sessions.get(session_id).cloned() {
+            sessions.insert(
+                session_id.clone(),
+                mrd_application::ports::SessionSnapshot {
+                    lifecycle_state: SessionLifecycleState::Closed,
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
+                    ..snapshot
+                },
+            );
+        }
+        drop(sessions);
+        if let Err(error) = app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&ControlInputEvent::ReleaseAll)
+        {
+            tracing::warn!(
+                session_id = %session_id.0,
+                %error,
+                "failed to release active control input while disconnecting device"
+            );
+        }
+        app_state.media_tasks.lock().await.abort_session(session_id);
+        app_state.media_profiles.lock().await.remove(session_id);
+        app_state.capture_sources.lock().await.remove(session_id);
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .remove(session_id);
+        #[cfg(windows)]
+        app_state
+            .media_surface_renderers
+            .lock()
+            .await
+            .detach_session(session_id);
+        app_state.media_pipelines.lock().await.remove(session_id);
+    }
+
+    DeviceActionResult {
+        device_id,
+        action: DeviceActionKind::Disconnect,
+        accepted: !session_ids.is_empty(),
+        supported: true,
+        message: if session_ids.is_empty() {
+            "No active sessions are associated with this device.".to_string()
+        } else {
+            format!("Disconnected {} active session(s).", session_ids.len())
         },
     }
 }

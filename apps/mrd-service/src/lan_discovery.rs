@@ -2527,6 +2527,9 @@ async fn accept_lan_device_action_request(
             DeviceActionKind::Shutdown => {
                 "Remote shutdown requires explicit peer consent and a privileged service executor."
             }
+            DeviceActionKind::Disconnect => {
+                "Disconnect is handled by the requesting service session registry."
+            }
             DeviceActionKind::WakeOnLan => {
                 "Wake-on-LAN must be sent by the requesting device before the peer is awake."
             }

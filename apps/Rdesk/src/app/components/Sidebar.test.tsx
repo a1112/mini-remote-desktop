@@ -185,8 +185,17 @@ describe("Sidebar device actions", () => {
     expect(deviceDataMock.removeDeviceLocally).toHaveBeenCalledWith("agent-device");
   });
 
-  it("disconnects active sessions for the selected device", async () => {
-    serviceMock.disconnectDeviceSessions.mockResolvedValue(2);
+  it("requests service-owned disconnect for the selected device", async () => {
+    serviceMock.ipcRequestDeviceAction.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        action: "disconnect",
+        accepted: true,
+        supported: true,
+        message: "Disconnected 2 active session(s).",
+      },
+    });
     const user = userEvent.setup();
 
     renderSidebar();
@@ -194,10 +203,12 @@ describe("Sidebar device actions", () => {
 
     await user.click(screen.getByRole("button", { name: "断开连接" }));
 
-    expect(serviceMock.disconnectDeviceSessions).toHaveBeenCalledWith("agent-device");
-    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    expect(serviceMock.ipcRequestDeviceAction).toHaveBeenCalledWith(
+      "agent-device",
+      "disconnect"
+    );
     await waitFor(() => {
-      expect(screen.getByText("已断开 2 个会话：Agent PC")).toBeInTheDocument();
+      expect(screen.getByText(/断开连接：Agent PC/)).toBeInTheDocument();
     });
   });
 

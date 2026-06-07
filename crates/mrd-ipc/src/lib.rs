@@ -907,6 +907,8 @@ mod wire {
         Restart,
         /// Request a remote shutdown.
         Shutdown,
+        /// Stop local service sessions associated with the device.
+        Disconnect,
         /// Send or reserve a Wake-on-LAN request.
         WakeOnLan,
     }
@@ -1742,6 +1744,15 @@ mod tests {
 
         let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
+
+        let disconnect_request = IpcRequest::RequestDeviceAction {
+            device_id: DeviceId("agent-device".to_string()),
+            action: DeviceActionKind::Disconnect,
+        };
+        let encoded = serde_json::to_string(&disconnect_request).unwrap();
+        assert!(encoded.contains("disconnect"));
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, disconnect_request);
 
         let response = IpcResponse::DeviceActionRequested {
             result: DeviceActionResult {

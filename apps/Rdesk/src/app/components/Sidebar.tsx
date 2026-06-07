@@ -7,7 +7,6 @@ import {
 import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
-import { disconnectDeviceSessions } from "../services/ipcSessionService";
 import { ipcDeviceDetail, ipcRequestDeviceAction } from "../adapters/tauri/commands";
 import type { DeviceActionKind } from "../adapters/tauri/types";
 import { useTheme } from "./ThemeContext";
@@ -262,25 +261,6 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
   };
 
-  const handleDisconnectDevice = async (deviceId: string, deviceName: string) => {
-    setContextMenu(null);
-    setSubmenuOpen(null);
-    try {
-      const stopped = await disconnectDeviceSessions(deviceId);
-      await refresh();
-      showActionStatus({
-        kind: "success",
-        message:
-          stopped > 0
-            ? `已断开 ${stopped} 个会话：${deviceName}`
-            : `没有活动会话：${deviceName}`,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "未知错误";
-      showActionStatus({ kind: "error", message: `断开连接失败：${message}` });
-    }
-  };
-
   const handleRequestDeviceAction = async (
     deviceId: string,
     deviceName: string,
@@ -431,7 +411,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
           label: "断开连接",
           action: () => {
             if (contextMenuDevice) {
-              return handleDisconnectDevice(contextMenuDevice.deviceId, contextMenuDevice.name);
+              return handleRequestDeviceAction(
+                contextMenuDevice.deviceId,
+                contextMenuDevice.name,
+                "disconnect",
+                "断开连接"
+              );
             }
           },
           danger: true,

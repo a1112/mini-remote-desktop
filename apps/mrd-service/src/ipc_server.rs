@@ -1882,6 +1882,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn disconnect_device_action_stops_matching_active_sessions() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("agent-device".to_string()),
+            "Agent Device".to_string(),
+        );
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("session-for-agent".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("local-device".to_string())),
+                target_device_id: Some(DeviceId("agent-device".to_string())),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Streaming,
+                last_error: None,
+                sender_active: true,
+                receiver_active: true,
+            },
+        );
+
+        let response = server
+            .handle_request(IpcRequest::RequestDeviceAction {
+                device_id: DeviceId("agent-device".to_string()),
+                action: mrd_ipc::DeviceActionKind::Disconnect,
+            })
+            .await;
+
+        match response {
+            IpcResponse::DeviceActionRequested { result } => {
+                assert_eq!(result.device_id, DeviceId("agent-device".to_string()));
+                assert_eq!(result.action, mrd_ipc::DeviceActionKind::Disconnect);
+                assert!(result.accepted);
+                assert!(result.supported);
+                assert!(result.message.contains("1"));
+            }
+            other => panic!("expected device action response, got {other:?}"),
+        }
+
+        let sessions = app_state.sessions.lock().await;
+        let snapshot = sessions
+            .get(&session_id)
+            .expect("session retained as closed");
+        assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Closed);
+        assert!(!snapshot.sender_active);
+        assert!(!snapshot.receiver_active);
+    }
+
     fn set_capability_status(
         snapshot: &mut mrd_ipc::CapabilitySnapshot,
         id: &str,

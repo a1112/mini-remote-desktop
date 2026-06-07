@@ -581,6 +581,7 @@ export type DeviceActionKind =
   | "remote_terminal"
   | "restart"
   | "shutdown"
+  | "disconnect"
   | "wake_on_lan";
 
 export interface DeviceActionResult {
