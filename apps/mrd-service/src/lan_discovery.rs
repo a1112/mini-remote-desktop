@@ -4,6 +4,7 @@ use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue, MediaRenderQue
 mod control_input;
 mod device_action;
 mod identity;
+mod media_payload_hash;
 mod protocol;
 mod wake_on_lan;
 use anyhow::{Context, Result};
@@ -5344,13 +5345,6 @@ enum LanRenderQueuePolicy {
     Latest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LanMediaPayloadHashMode {
-    Full,
-    Metadata,
-    Disabled,
-}
-
 #[cfg(any(windows, target_os = "macos"))]
 impl LanRenderQueuePolicy {
     fn as_str(self) -> &'static str {
@@ -5397,74 +5391,19 @@ fn lan_render_queue_policy_for_profile_with_override(
     LanRenderQueuePolicy::PacedFifo
 }
 
-fn lan_media_payload_hash_mode_from_env_value(
-    value: Option<&str>,
-) -> Option<LanMediaPayloadHashMode> {
-    match value?.trim().to_ascii_lowercase().as_str() {
-        "full" | "fnv" | "fnv1a64" => Some(LanMediaPayloadHashMode::Full),
-        "metadata" | "meta" | "cheap" => Some(LanMediaPayloadHashMode::Metadata),
-        "disabled" | "disable" | "off" | "none" | "0" | "false" => {
-            Some(LanMediaPayloadHashMode::Disabled)
-        }
-        "" => None,
-        _ => None,
-    }
-}
-
-fn lan_media_payload_hash_mode_for_profile(profile: &MediaProfile) -> LanMediaPayloadHashMode {
-    lan_media_payload_hash_mode_for_profile_with_override(
-        profile,
-        lan_media_payload_hash_mode_from_env_value(
-            std::env::var(LAN_MEDIA_PAYLOAD_HASH_ENV).ok().as_deref(),
-        ),
-    )
-}
-
-fn lan_media_payload_hash_mode_for_profile_with_override(
-    profile: &MediaProfile,
-    override_mode: Option<LanMediaPayloadHashMode>,
-) -> LanMediaPayloadHashMode {
-    if let Some(mode) = override_mode {
-        return mode;
-    }
-    if profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
-        return LanMediaPayloadHashMode::Metadata;
-    }
-    LanMediaPayloadHashMode::Full
-}
-
 fn lan_media_payload_hash_for_profile(
     profile: &MediaProfile,
     sequence: u64,
     timestamp_us: u64,
     encoded_payload: &[u8],
 ) -> String {
-    lan_media_payload_hash_for_mode(
-        lan_media_payload_hash_mode_for_profile(profile),
+    media_payload_hash::for_profile(
         profile,
         sequence,
         timestamp_us,
         encoded_payload,
+        std::env::var(LAN_MEDIA_PAYLOAD_HASH_ENV).ok().as_deref(),
     )
-}
-
-fn lan_media_payload_hash_for_mode(
-    mode: LanMediaPayloadHashMode,
-    profile: &MediaProfile,
-    sequence: u64,
-    timestamp_us: u64,
-    encoded_payload: &[u8],
-) -> String {
-    match mode {
-        LanMediaPayloadHashMode::Full => {
-            format!("fnv1a64:{:016x}", fnv1a64(encoded_payload))
-        }
-        LanMediaPayloadHashMode::Metadata => format!(
-            "fnv1a64:meta:{:016x}",
-            fnv1a64_media_metadata(profile, sequence, timestamp_us, encoded_payload.len())
-        ),
-        LanMediaPayloadHashMode::Disabled => "fnv1a64:disabled".to_string(),
-    }
 }
 
 #[cfg(windows)]
@@ -9849,49 +9788,18 @@ fn decoded_video_probe_format(codec: &str) -> String {
     }
 }
 
-const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
-
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    fnv1a64_extend(FNV1A64_OFFSET_BASIS, bytes)
+    media_payload_hash::fnv1a64(bytes)
 }
 
-fn fnv1a64_extend(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV1A64_PRIME);
-    }
-    hash
-}
-
+#[cfg(test)]
 fn fnv1a64_media_metadata(
     profile: &MediaProfile,
     sequence: u64,
     timestamp_us: u64,
     encoded_payload_len: usize,
 ) -> u64 {
-    let mut hash = FNV1A64_OFFSET_BASIS;
-    hash = fnv1a64_extend(hash, &profile.width.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.height.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.fps.to_le_bytes());
-    hash = fnv1a64_extend(hash, &profile.bitrate_mbps.to_le_bytes());
-    hash = fnv1a64_extend(hash, profile.codec.as_bytes());
-    hash = fnv1a64_extend(
-        hash,
-        profile.color_mode.as_deref().unwrap_or("full").as_bytes(),
-    );
-    hash = fnv1a64_extend(
-        hash,
-        profile
-            .color_pipeline
-            .as_deref()
-            .unwrap_or("sdr8")
-            .as_bytes(),
-    );
-    hash = fnv1a64_extend(hash, &sequence.to_le_bytes());
-    hash = fnv1a64_extend(hash, &timestamp_us.to_le_bytes());
-    hash = fnv1a64_extend(hash, &(encoded_payload_len as u64).to_le_bytes());
-    hash
+    media_payload_hash::metadata_hash(profile, sequence, timestamp_us, encoded_payload_len)
 }
 
 fn normalize_transport_kind(value: &str) -> String {
@@ -15434,30 +15342,30 @@ mod tests {
         };
 
         assert_eq!(
-            lan_media_payload_hash_mode_for_profile_with_override(&high_fps, None),
-            LanMediaPayloadHashMode::Metadata
+            media_payload_hash::mode_for_profile_with_override(&high_fps, None),
+            media_payload_hash::Mode::Metadata
         );
         assert_eq!(
-            lan_media_payload_hash_mode_for_profile_with_override(&low_fps, None),
-            LanMediaPayloadHashMode::Full
+            media_payload_hash::mode_for_profile_with_override(&low_fps, None),
+            media_payload_hash::Mode::Full
         );
         assert_eq!(
-            lan_media_payload_hash_mode_from_env_value(Some("full")),
-            Some(LanMediaPayloadHashMode::Full)
+            media_payload_hash::mode_from_env_value(Some("full")),
+            Some(media_payload_hash::Mode::Full)
         );
         assert_eq!(
-            lan_media_payload_hash_mode_from_env_value(Some("metadata")),
-            Some(LanMediaPayloadHashMode::Metadata)
+            media_payload_hash::mode_from_env_value(Some("metadata")),
+            Some(media_payload_hash::Mode::Metadata)
         );
         assert_eq!(
-            lan_media_payload_hash_mode_from_env_value(Some("off")),
-            Some(LanMediaPayloadHashMode::Disabled)
+            media_payload_hash::mode_from_env_value(Some("off")),
+            Some(media_payload_hash::Mode::Disabled)
         );
 
         let payload = [1, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(
-            lan_media_payload_hash_for_mode(
-                LanMediaPayloadHashMode::Full,
+            media_payload_hash::for_mode(
+                media_payload_hash::Mode::Full,
                 &high_fps,
                 42,
                 123_456,
@@ -15465,8 +15373,8 @@ mod tests {
             ),
             format!("fnv1a64:{:016x}", fnv1a64(&payload))
         );
-        assert!(lan_media_payload_hash_for_mode(
-            LanMediaPayloadHashMode::Metadata,
+        assert!(media_payload_hash::for_mode(
+            media_payload_hash::Mode::Metadata,
             &high_fps,
             42,
             123_456,
@@ -15474,8 +15382,8 @@ mod tests {
         )
         .starts_with("fnv1a64:meta:"));
         assert_eq!(
-            lan_media_payload_hash_for_mode(
-                LanMediaPayloadHashMode::Disabled,
+            media_payload_hash::for_mode(
+                media_payload_hash::Mode::Disabled,
                 &high_fps,
                 42,
                 123_456,
