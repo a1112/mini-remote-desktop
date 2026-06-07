@@ -13,6 +13,8 @@ import type {
   AdapterResult,
   ClientDiagnostics,
   DeviceIdentitySnapshot,
+  DeviceActionKind,
+  DeviceActionResult,
   DeviceInfo,
   LanDiscoverySnapshot,
   FileTransferSnapshot,
@@ -569,6 +571,28 @@ export async function ipcRevokeDevice(
  */
 export async function ipcDeviceIdentitySnapshot(): Promise<AdapterResult<DeviceIdentitySnapshot>> {
   return invokeAdapter<DeviceIdentitySnapshot>('ipc_device_identity_snapshot');
+}
+
+/**
+ * Request a service-owned operation for a device.
+ */
+export async function ipcRequestDeviceAction(
+  deviceId: string,
+  action: DeviceActionKind
+): Promise<AdapterResult<DeviceActionResult>> {
+  return invokeBridgeOrTauri<DeviceActionResult>(
+    'ipc_request_device_action',
+    {
+      deviceId,
+      action,
+    },
+    {
+      type: 'RequestDeviceAction',
+      device_id: deviceId,
+      action,
+    },
+    responseField<DeviceActionResult>('result')
+  );
 }
 
 /**

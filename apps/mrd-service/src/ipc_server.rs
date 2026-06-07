@@ -534,6 +534,24 @@ impl IpcServer {
                 snapshot: device::identity_snapshot(&self.app_state).await,
             },
 
+            IpcRequest::RequestDeviceAction { device_id, action } => {
+                let response =
+                    device::request_device_action(&self.app_state, device_id.clone(), action).await;
+                let (outcome, reason) = audit_outcome(&response);
+                self.record_audit_event(
+                    format!("device.action.{action:?}").to_ascii_lowercase(),
+                    outcome,
+                    None,
+                    device::local_device_id(&self.app_state).await,
+                    Some(device_id),
+                    None,
+                    reason,
+                    Vec::new(),
+                )
+                .await;
+                response
+            }
+
             IpcRequest::GetTelemetryBundle { run_id, session_id } => {
                 runtime::telemetry_bundle(run_id, session_id)
             }
@@ -1715,6 +1733,51 @@ mod tests {
             snapshot.reliable.last_error.as_deref(),
             Some("input injector unavailable: blocked by test")
         );
+    }
+
+    #[tokio::test]
+    async fn device_action_request_returns_structured_service_status() {
+        let app_state = Arc::new(AppState::new());
+        app_state.devices.lock().await.register(
+            DeviceId("local-device".to_string()),
+            "Local Device".to_string(),
+        );
+        let server = IpcServer::new(app_state);
+
+        let wake_response = server
+            .handle_request(IpcRequest::RequestDeviceAction {
+                device_id: DeviceId("local-device".to_string()),
+                action: mrd_ipc::DeviceActionKind::WakeOnLan,
+            })
+            .await;
+
+        match wake_response {
+            IpcResponse::DeviceActionRequested { result } => {
+                assert_eq!(result.device_id, DeviceId("local-device".to_string()));
+                assert_eq!(result.action, mrd_ipc::DeviceActionKind::WakeOnLan);
+                assert!(result.accepted);
+                assert!(!result.supported);
+                assert!(result.message.contains("provider is reserved"));
+            }
+            other => panic!("expected device action response, got {other:?}"),
+        }
+
+        let terminal_response = server
+            .handle_request(IpcRequest::RequestDeviceAction {
+                device_id: DeviceId("local-device".to_string()),
+                action: mrd_ipc::DeviceActionKind::RemoteTerminal,
+            })
+            .await;
+
+        match terminal_response {
+            IpcResponse::DeviceActionRequested { result } => {
+                assert_eq!(result.action, mrd_ipc::DeviceActionKind::RemoteTerminal);
+                assert!(!result.accepted);
+                assert!(!result.supported);
+                assert!(result.message.contains("command channel"));
+            }
+            other => panic!("expected device action response, got {other:?}"),
+        }
     }
 
     fn set_capability_status(

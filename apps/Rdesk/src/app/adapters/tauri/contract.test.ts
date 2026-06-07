@@ -394,6 +394,25 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_refresh_lan_discovery', undefined);
     });
 
+    it('ipc_request_device_action calls correct command', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        device_id: 'agent-device',
+        action: 'wake_on_lan',
+        accepted: true,
+        supported: false,
+        message: 'Wake-on-LAN provider is reserved.',
+      });
+
+      const result = await adapter.ipcRequestDeviceAction('agent-device', 'wake_on_lan');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_request_device_action', {
+        deviceId: 'agent-device',
+        action: 'wake_on_lan',
+      });
+      expect(result.ok && result.value.action).toBe('wake_on_lan');
+    });
+
     it('ipc_file_transfer_snapshot calls correct command', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue({

@@ -519,6 +519,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::SetRemoteDisplayMode { .. }
             | IpcRequest::RestoreRemoteDisplayMode { .. }
             | IpcRequest::SendControlInput { .. }
+            | IpcRequest::RequestDeviceAction { .. }
             | IpcRequest::StartReceiver { .. }
             | IpcRequest::SessionRuntimeSnapshot { .. }
             | IpcRequest::RuntimeSnapshot

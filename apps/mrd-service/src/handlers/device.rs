@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use mrd_ipc::{DeviceIdentitySnapshot, DeviceInfo, IpcResponse};
+use mrd_ipc::{
+    DeviceActionKind, DeviceActionResult, DeviceIdentitySnapshot, DeviceInfo, IpcResponse,
+};
 use mrd_proto::DeviceId;
 
 use crate::app_state::AppState;
@@ -89,5 +91,69 @@ pub async fn identity_snapshot(app_state: &Arc<AppState>) -> DeviceIdentitySnaps
         certificate_fingerprint: None,
         consent_required: true,
         paired_devices,
+    }
+}
+
+pub async fn request_device_action(
+    app_state: &Arc<AppState>,
+    device_id: DeviceId,
+    action: DeviceActionKind,
+) -> IpcResponse {
+    let known_device = app_state
+        .lan_discovery
+        .snapshot()
+        .await
+        .peers
+        .iter()
+        .any(|peer| peer.device_id == device_id)
+        || local_device_id(app_state)
+            .await
+            .as_ref()
+            .is_some_and(|local_id| local_id == &device_id)
+        || app_state
+            .device_identities
+            .lock()
+            .await
+            .list()
+            .iter()
+            .any(|identity| identity.device_id == device_id);
+
+    let (accepted, supported, message) = match action {
+        DeviceActionKind::WakeOnLan => (
+            known_device,
+            false,
+            if known_device {
+                "Wake-on-LAN provider is reserved; no MAC address binding is available yet."
+                    .to_string()
+            } else {
+                "Device is not known to the local service.".to_string()
+            },
+        ),
+        DeviceActionKind::RemoteTerminal => (
+            false,
+            false,
+            "Remote terminal requires a service-owned command channel and consent flow."
+                .to_string(),
+        ),
+        DeviceActionKind::Restart => (
+            false,
+            false,
+            "Remote restart requires a service-owned privileged action channel.".to_string(),
+        ),
+        DeviceActionKind::Shutdown => (
+            false,
+            false,
+            "Remote shutdown requires a service-owned privileged action channel.".to_string(),
+        ),
+    };
+
+    IpcResponse::DeviceActionRequested {
+        result: DeviceActionResult {
+            device_id,
+            action,
+            accepted,
+            supported,
+            message,
+        },
     }
 }

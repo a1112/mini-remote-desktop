@@ -8,6 +8,8 @@ import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
 import { disconnectDeviceSessions } from "../services/ipcSessionService";
+import { ipcRequestDeviceAction } from "../adapters/tauri/commands";
+import type { DeviceActionKind } from "../adapters/tauri/types";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -80,7 +82,7 @@ type DeviceMenuItem = {
   title?: string;
 };
 
-const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
+const unsupportedDeviceActionTitle = "由 mrd-service 返回当前支持状态";
 
 export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTransfers }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
@@ -279,6 +281,30 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     }
   };
 
+  const handleRequestDeviceAction = async (
+    deviceId: string,
+    deviceName: string,
+    action: DeviceActionKind,
+    label: string
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      const result = await ipcRequestDeviceAction(deviceId, action);
+      if (!result.ok) {
+        showActionStatus({ kind: "error", message: `${label}失败：${result.error.message}` });
+        return;
+      }
+      showActionStatus({
+        kind: result.value.accepted && result.value.supported ? "success" : "error",
+        message: `${label}：${deviceName} - ${result.value.message}`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `${label}失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -293,7 +319,21 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
         { icon: FolderIcon, label: "文件传输", action: () => { onOpenTransfers(); setContextMenu(null); } },
-        { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
+        {
+          icon: Terminal,
+          label: "远程终端",
+          action: () => {
+            if (contextMenuDevice) {
+              return handleRequestDeviceAction(
+                contextMenuDevice.deviceId,
+                contextMenuDevice.name,
+                "remote_terminal",
+                "远程终端"
+              );
+            }
+          },
+          title: unsupportedDeviceActionTitle,
+        },
         { type: "divider" as const }
       );
     }
@@ -401,10 +441,52 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
   };
 
   // 管理子菜单项
-  const getManagementSubmenuItems = () => [
-    { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
+  const getManagementSubmenuItems = (): DeviceMenuItem[] => [
+    {
+      icon: RotateCw,
+      label: "重启",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleRequestDeviceAction(
+            contextMenuDevice.deviceId,
+            contextMenuDevice.name,
+            "restart",
+            "重启"
+          );
+        }
+      },
+      title: unsupportedDeviceActionTitle,
+    },
+    {
+      icon: Power,
+      label: "关机",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleRequestDeviceAction(
+            contextMenuDevice.deviceId,
+            contextMenuDevice.name,
+            "shutdown",
+            "关机"
+          );
+        }
+      },
+      title: unsupportedDeviceActionTitle,
+    },
+    {
+      icon: Zap,
+      label: "Wake-on-LAN",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleRequestDeviceAction(
+            contextMenuDevice.deviceId,
+            contextMenuDevice.name,
+            "wake_on_lan",
+            "Wake-on-LAN"
+          );
+        }
+      },
+      title: unsupportedDeviceActionTitle,
+    },
     {
       icon: Info,
       label: "设备信息",

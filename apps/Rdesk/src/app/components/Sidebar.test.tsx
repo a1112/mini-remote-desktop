@@ -30,6 +30,7 @@ const serviceMock = vi.hoisted(() => ({
   renameDevice: vi.fn(),
   unbindDevice: vi.fn(),
   disconnectDeviceSessions: vi.fn(),
+  ipcRequestDeviceAction: vi.fn(),
 }));
 const layoutActionMock = vi.hoisted(() => ({
   openTransfers: vi.fn(),
@@ -67,6 +68,10 @@ vi.mock("../services/deviceService", () => ({
 
 vi.mock("../services/ipcSessionService", () => ({
   disconnectDeviceSessions: serviceMock.disconnectDeviceSessions,
+}));
+
+vi.mock("../adapters/tauri/commands", () => ({
+  ipcRequestDeviceAction: serviceMock.ipcRequestDeviceAction,
 }));
 
 const device = (overrides: Partial<Device>): Device => ({
@@ -132,7 +137,7 @@ describe("Sidebar device actions", () => {
     openDeviceMenu();
 
     expect(screen.getByRole("button", { name: "文件传输" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "远程终端" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "收藏设备" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "禁用设备" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeEnabled();
@@ -140,9 +145,9 @@ describe("Sidebar device actions", () => {
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
 
-    expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重启" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "关机" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "设备信息" })).toBeEnabled();
   });
 
@@ -192,6 +197,52 @@ describe("Sidebar device actions", () => {
     await waitFor(() => {
       expect(screen.getByText("已断开 2 个会话：Agent PC")).toBeInTheDocument();
     });
+  });
+
+  it("requests service-owned terminal and power actions for a selected device", async () => {
+    serviceMock.ipcRequestDeviceAction.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        action: "remote_terminal",
+        accepted: false,
+        supported: false,
+        message: "Remote terminal requires a service-owned command channel and consent flow.",
+      },
+    });
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "远程终端" }));
+
+    expect(serviceMock.ipcRequestDeviceAction).toHaveBeenCalledWith(
+      "agent-device",
+      "remote_terminal"
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/远程终端：Agent PC/)).toBeInTheDocument();
+    });
+
+    serviceMock.ipcRequestDeviceAction.mockResolvedValue({
+      ok: true,
+      value: {
+        device_id: "agent-device",
+        action: "wake_on_lan",
+        accepted: true,
+        supported: false,
+        message: "Wake-on-LAN provider is reserved; no MAC address binding is available yet.",
+      },
+    });
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "Wake-on-LAN" }));
+
+    expect(serviceMock.ipcRequestDeviceAction).toHaveBeenLastCalledWith(
+      "agent-device",
+      "wake_on_lan"
+    );
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

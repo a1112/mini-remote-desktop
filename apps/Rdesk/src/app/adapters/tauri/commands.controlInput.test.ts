@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getMockInvoke } from '@/test/mocks/tauri';
-import { ipcSendControlInput } from './commands';
+import { ipcRequestDeviceAction, ipcSendControlInput } from './commands';
 import { resetServiceBridgeConfigForTest } from '../serviceBridge/client';
 
 describe('control input command adapter', () => {
@@ -64,6 +64,38 @@ describe('control input command adapter', () => {
       type: 'SendControlInput',
       session_id: 'session-1',
       event,
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('sends device action requests through the browser service bridge', async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'DeviceActionRequested',
+          result: {
+            device_id: 'agent-device',
+            action: 'remote_terminal',
+            accepted: false,
+            supported: false,
+            message: 'Remote terminal requires a service-owned command channel.',
+          },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcRequestDeviceAction('agent-device', 'remote_terminal');
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok && result.value.action).toBe('remote_terminal');
+    expect(requestBody.request).toEqual({
+      type: 'RequestDeviceAction',
+      device_id: 'agent-device',
+      action: 'remote_terminal',
     });
     expect(invoke).not.toHaveBeenCalled();
   });

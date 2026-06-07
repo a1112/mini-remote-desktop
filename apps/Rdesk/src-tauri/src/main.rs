@@ -1849,6 +1849,31 @@ async fn ipc_device_identity_snapshot() -> Result<mrd_ipc::DeviceIdentitySnapsho
     }
 }
 
+/// Request a service-owned device operation via IPC.
+#[tauri::command]
+async fn ipc_request_device_action(
+    device_id: String,
+    action: mrd_ipc::DeviceActionKind,
+) -> Result<mrd_ipc::DeviceActionResult, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RequestDeviceAction {
+            device_id: DeviceId(device_id),
+            action,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DeviceActionRequested { result } => Ok(result),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Get LAN peer discovery snapshot via IPC.
 #[tauri::command]
 async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
@@ -3936,6 +3961,7 @@ fn main() {
             ipc_list_devices,
             ipc_revoke_device,
             ipc_device_identity_snapshot,
+            ipc_request_device_action,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
             ipc_file_transfer_snapshot,

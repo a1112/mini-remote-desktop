@@ -561,6 +561,20 @@ export interface DeviceIdentitySnapshot {
   paired_devices: PairedDeviceIdentity[];
 }
 
+export type DeviceActionKind =
+  | "remote_terminal"
+  | "restart"
+  | "shutdown"
+  | "wake_on_lan";
+
+export interface DeviceActionResult {
+  device_id: string;
+  action: DeviceActionKind;
+  accepted: boolean;
+  supported: boolean;
+  message: string;
+}
+
 export interface LanPeerInfo {
   device_id: string;
   device_name: string;

@@ -897,6 +897,35 @@ mod wire {
         pub paired_devices: Vec<PairedDeviceIdentity>,
     }
 
+    /// Service-owned action requested for a device row.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum DeviceActionKind {
+        /// Open or reserve a remote terminal session for the device.
+        RemoteTerminal,
+        /// Request a remote restart.
+        Restart,
+        /// Request a remote shutdown.
+        Shutdown,
+        /// Send or reserve a Wake-on-LAN request.
+        WakeOnLan,
+    }
+
+    /// Result of a service-owned device action request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DeviceActionResult {
+        /// Target device id.
+        pub device_id: DeviceId,
+        /// Requested action.
+        pub action: DeviceActionKind,
+        /// Whether the request was accepted by the local service.
+        pub accepted: bool,
+        /// Whether a real implementation is available for this action.
+        pub supported: bool,
+        /// Human-readable operation status.
+        pub message: String,
+    }
+
     /// Summary statistics for a telemetry metric series.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct TelemetryMetricSummary {
@@ -1200,6 +1229,13 @@ mod wire {
         },
         /// Get local device identity and pairing snapshot.
         GetDeviceIdentitySnapshot,
+        /// Request a service-owned device operation.
+        RequestDeviceAction {
+            /// Target device id.
+            device_id: DeviceId,
+            /// Requested action.
+            action: DeviceActionKind,
+        },
         /// Get compact telemetry bundle for a run/session.
         GetTelemetryBundle {
             /// Test or session run id.
@@ -1368,6 +1404,11 @@ mod wire {
         DeviceIdentitySnapshot {
             /// Current identity state.
             snapshot: DeviceIdentitySnapshot,
+        },
+        /// Device action request result.
+        DeviceActionRequested {
+            /// Result state for the requested action.
+            result: DeviceActionResult,
         },
         /// Compact telemetry bundle.
         TelemetryBundle {
@@ -1625,6 +1666,36 @@ mod tests {
 
         let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn device_action_requests_round_trip() {
+        let request = IpcRequest::RequestDeviceAction {
+            device_id: DeviceId("agent-device".to_string()),
+            action: DeviceActionKind::WakeOnLan,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("RequestDeviceAction"));
+        assert!(encoded.contains("wake_on_lan"));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = IpcResponse::DeviceActionRequested {
+            result: DeviceActionResult {
+                device_id: DeviceId("agent-device".to_string()),
+                action: DeviceActionKind::RemoteTerminal,
+                accepted: false,
+                supported: false,
+                message: "Remote terminal requires a service-owned command channel.".to_string(),
+            },
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("DeviceActionRequested"));
+        assert!(encoded.contains("remote_terminal"));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]
