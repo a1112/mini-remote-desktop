@@ -146,6 +146,7 @@ const mockDevices: Device[] = [
     ip: '192.168.1.100',
     group: 'Work',
     favorite: false,
+    disabled: false,
     discoverySources: ['server'],
     primarySource: 'server',
     sourceLabel: '服务器',

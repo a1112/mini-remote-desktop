@@ -27,6 +27,7 @@ export interface Device {
   ip: string;
   group: string;
   favorite: boolean;
+  disabled: boolean;
   discoverySources: DeviceDiscoverySource[];
   primarySource: DeviceDiscoverySource;
   sourceLabel: string;
@@ -71,6 +72,97 @@ const sourceLabels: Record<DeviceDiscoverySource, string> = {
 const API_BASE =
   (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
 const LAN_DEEP_REFRESH_SETTLE_MS = 250;
+const DEVICE_LOCAL_STATE_KEY = "rdesk_device_local_state_v1";
+const DEVICE_LOCAL_STATE_CHANGED_EVENT = "rdesk-device-local-state-changed";
+
+type DeviceLocalState = {
+  favorites: string[];
+  disabled: string[];
+  removed: string[];
+};
+
+const emptyDeviceLocalState = (): DeviceLocalState => ({
+  favorites: [],
+  disabled: [],
+  removed: [],
+});
+
+function readDeviceLocalState(): DeviceLocalState {
+  if (typeof window === "undefined") return emptyDeviceLocalState();
+  try {
+    const raw = window.localStorage.getItem(DEVICE_LOCAL_STATE_KEY);
+    if (!raw) return emptyDeviceLocalState();
+    const parsed = JSON.parse(raw) as Partial<DeviceLocalState>;
+    return {
+      favorites: Array.isArray(parsed.favorites) ? parsed.favorites : [],
+      disabled: Array.isArray(parsed.disabled) ? parsed.disabled : [],
+      removed: Array.isArray(parsed.removed) ? parsed.removed : [],
+    };
+  } catch {
+    return emptyDeviceLocalState();
+  }
+}
+
+function writeDeviceLocalState(next: DeviceLocalState) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(DEVICE_LOCAL_STATE_KEY, JSON.stringify(next));
+  window.dispatchEvent(new CustomEvent(DEVICE_LOCAL_STATE_CHANGED_EVENT));
+}
+
+function setMembership(values: string[], deviceId: string, enabled: boolean): string[] {
+  const next = new Set(values);
+  if (enabled) next.add(deviceId);
+  else next.delete(deviceId);
+  return Array.from(next).sort();
+}
+
+export function setDeviceFavorite(deviceId: string, favorite: boolean) {
+  const state = readDeviceLocalState();
+  writeDeviceLocalState({
+    ...state,
+    favorites: setMembership(state.favorites, deviceId, favorite),
+  });
+}
+
+export function setDeviceDisabled(deviceId: string, disabled: boolean) {
+  const state = readDeviceLocalState();
+  writeDeviceLocalState({
+    ...state,
+    disabled: setMembership(state.disabled, deviceId, disabled),
+  });
+}
+
+export function removeDeviceLocally(deviceId: string) {
+  const state = readDeviceLocalState();
+  writeDeviceLocalState({
+    ...state,
+    favorites: setMembership(state.favorites, deviceId, false),
+    disabled: setMembership(state.disabled, deviceId, false),
+    removed: setMembership(state.removed, deviceId, true),
+  });
+}
+
+function applyDeviceLocalState(devices: Device[]): Device[] {
+  const state = readDeviceLocalState();
+  const favorites = new Set(state.favorites);
+  const disabled = new Set(state.disabled);
+  const removed = new Set(state.removed);
+
+  return devices
+    .filter((device) => device.isLocal || !removed.has(device.deviceId))
+    .map((device) => {
+      const locallyDisabled = !device.isLocal && disabled.has(device.deviceId);
+      return {
+        ...device,
+        favorite: device.favorite || favorites.has(device.deviceId),
+        disabled: locallyDisabled,
+        status: locallyDisabled ? "offline" : device.status,
+        p2pAvailable: locallyDisabled ? false : device.p2pAvailable,
+        serverAvailable: locallyDisabled ? false : device.serverAvailable,
+        lastSeen: locallyDisabled ? "已禁用" : device.lastSeen,
+      };
+    });
+}
 
 const uniqueSources = (sources: DeviceDiscoverySource[]) =>
   Array.from(new Set(sources));
@@ -124,6 +216,7 @@ const toServerDevice = (item: DeviceApi): Device =>
     ip: item.ip,
     group: item.group,
     favorite: item.favorite,
+    disabled: false,
   });
 
 const formatLanLastSeen = (ageMs: number) => {
@@ -212,6 +305,7 @@ const lanPeerToDevice = (peer: LanPeerInfo): Device =>
     ip: peer.ip,
     group: "LAN P2P",
     favorite: false,
+    disabled: false,
   });
 
 const localDeviceToDevice = (info: StoredDeviceInfo): Device =>
@@ -231,6 +325,7 @@ const localDeviceToDevice = (info: StoredDeviceInfo): Device =>
     ip: "127.0.0.1",
     group: "Local",
     favorite: false,
+    disabled: false,
   });
 
 async function fetchLanDevices(triggerProbe: boolean): Promise<Device[]> {
@@ -287,6 +382,7 @@ function mergeDevice(existing: Device, incoming: Device): Device {
     ip: p2pSide?.ip ?? serverSide?.ip ?? localSide?.ip ?? incoming.ip,
     group: localSide?.group ?? p2pSide?.group ?? serverSide?.group ?? incoming.group,
     favorite: existing.favorite || incoming.favorite,
+    disabled: existing.disabled || incoming.disabled,
     discoverySources,
     primarySource: isLocal ? "local" : p2pAvailable ? "lan_p2p" : "server",
     sourceLabel: sourceLabel(discoverySources),
@@ -311,8 +407,9 @@ export function mergeDevices(
   lanDevices.forEach(add);
   if (localDevice) add(localDevice);
 
-  return Array.from(byDeviceId.values()).sort((a, b) => {
+  return applyDeviceLocalState(Array.from(byDeviceId.values())).sort((a, b) => {
     if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
+    if (a.favorite !== b.favorite) return a.favorite ? -1 : 1;
     if (a.status !== b.status) return a.status === "online" ? -1 : 1;
     if (a.p2pAvailable !== b.p2pAvailable) return a.p2pAvailable ? -1 : 1;
     return a.name.localeCompare(b.name);
@@ -404,6 +501,19 @@ export function useDevices(options?: UseDevicesOptions) {
     }, pollInterval);
     return () => clearInterval(interval);
   }, [fetchDevices, pollInterval, enabled]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    const handleLocalStateChange = () => {
+      void fetchDevices();
+    };
+    window.addEventListener(DEVICE_LOCAL_STATE_CHANGED_EVENT, handleLocalStateChange);
+    window.addEventListener("storage", handleLocalStateChange);
+    return () => {
+      window.removeEventListener(DEVICE_LOCAL_STATE_CHANGED_EVENT, handleLocalStateChange);
+      window.removeEventListener("storage", handleLocalStateChange);
+    };
+  }, [fetchDevices, enabled]);
 
   useEffect(() => {
     if (!enabled) return;

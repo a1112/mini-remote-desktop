@@ -11,6 +11,9 @@ const deviceDataMock = vi.hoisted(() => ({
   devices: [] as Device[],
   currentDeviceId: "local-device",
   refresh: vi.fn(),
+  setDeviceFavorite: vi.fn(),
+  setDeviceDisabled: vi.fn(),
+  removeDeviceLocally: vi.fn(),
 }));
 
 const authMock = vi.hoisted(() => ({
@@ -49,6 +52,9 @@ vi.mock("./deviceData", () => ({
     refresh: deviceDataMock.refresh,
     currentDeviceId: deviceDataMock.currentDeviceId,
   }),
+  setDeviceFavorite: deviceDataMock.setDeviceFavorite,
+  setDeviceDisabled: deviceDataMock.setDeviceDisabled,
+  removeDeviceLocally: deviceDataMock.removeDeviceLocally,
 }));
 
 vi.mock("../services/deviceService", () => ({
@@ -74,6 +80,7 @@ const device = (overrides: Partial<Device>): Device => ({
   ip: "192.168.1.2",
   group: "LAN P2P",
   favorite: false,
+  disabled: false,
   discoverySources: ["lan_p2p", "server"],
   primarySource: "lan_p2p",
   sourceLabel: "P2P 局域网 / 服务器",
@@ -121,10 +128,10 @@ describe("Sidebar device actions", () => {
 
     expect(screen.getByRole("button", { name: "文件传输" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "收藏设备" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "禁用设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "收藏设备" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "禁用设备" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "移除设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "移除设备" })).toBeEnabled();
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
 
@@ -143,6 +150,27 @@ describe("Sidebar device actions", () => {
     await user.click(screen.getByRole("button", { name: "文件传输" }));
 
     expect(layoutActionMock.openTransfers).toHaveBeenCalled();
+  });
+
+  it("persists favorite, disabled, and removed state through deviceData actions", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "收藏设备" }));
+
+    expect(deviceDataMock.setDeviceFavorite).toHaveBeenCalledWith("agent-device", true);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "禁用设备" }));
+
+    expect(deviceDataMock.setDeviceDisabled).toHaveBeenCalledWith("agent-device", true);
+
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "移除设备" }));
+
+    expect(deviceDataMock.removeDeviceLocally).toHaveBeenCalledWith("agent-device");
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

@@ -1,7 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { Monitor } from "lucide-react";
 
-import { lanPeerPlatformLabel, type Device, mergeDevices } from "./deviceData";
+import {
+  lanPeerPlatformLabel,
+  removeDeviceLocally,
+  setDeviceDisabled,
+  setDeviceFavorite,
+  type Device,
+  mergeDevices,
+} from "./deviceData";
 
 const device = (overrides: Partial<Device>): Device => ({
   id: "base-id",
@@ -19,6 +26,7 @@ const device = (overrides: Partial<Device>): Device => ({
   ip: "127.0.0.1",
   group: "Local",
   favorite: false,
+  disabled: false,
   discoverySources: ["local"],
   primarySource: "local",
   sourceLabel: "本机",
@@ -29,6 +37,10 @@ const device = (overrides: Partial<Device>): Device => ({
 });
 
 describe("mergeDevices", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
   it("infers macOS LAN peers from native media capabilities", () => {
     expect(
       lanPeerPlatformLabel({
@@ -111,5 +123,99 @@ describe("mergeDevices", () => {
       isLocal: true,
       serverAvailable: true,
     });
+  });
+
+  it("applies local favorite state and sorts favorites before ordinary peers", () => {
+    setDeviceFavorite("peer-favorite", true);
+
+    const merged = mergeDevices(
+      [],
+      [
+        device({
+          id: "peer-normal",
+          name: "Normal",
+          deviceId: "peer-normal",
+          isLocal: false,
+          discoverySources: ["lan_p2p"],
+          primarySource: "lan_p2p",
+          sourceLabel: "P2P 局域网",
+          p2pAvailable: true,
+        }),
+        device({
+          id: "peer-favorite",
+          name: "Favorite",
+          deviceId: "peer-favorite",
+          isLocal: false,
+          discoverySources: ["lan_p2p"],
+          primarySource: "lan_p2p",
+          sourceLabel: "P2P 局域网",
+          p2pAvailable: true,
+        }),
+      ],
+      null
+    );
+
+    expect(merged.map((item) => item.deviceId)).toEqual(["peer-favorite", "peer-normal"]);
+    expect(merged[0]?.favorite).toBe(true);
+  });
+
+  it("applies local disabled state without removing the peer from the list", () => {
+    setDeviceDisabled("peer-disabled", true);
+
+    const merged = mergeDevices(
+      [],
+      [
+        device({
+          id: "peer-disabled",
+          name: "Disabled",
+          deviceId: "peer-disabled",
+          isLocal: false,
+          discoverySources: ["lan_p2p"],
+          primarySource: "lan_p2p",
+          sourceLabel: "P2P 局域网",
+          p2pAvailable: true,
+        }),
+      ],
+      null
+    );
+
+    expect(merged[0]).toMatchObject({
+      deviceId: "peer-disabled",
+      disabled: true,
+      status: "offline",
+      p2pAvailable: false,
+      serverAvailable: false,
+      lastSeen: "已禁用",
+    });
+  });
+
+  it("hides locally removed peers but never hides the local device", () => {
+    setDeviceDisabled("peer-removed", true);
+    removeDeviceLocally("peer-removed");
+    removeDeviceLocally("local-device");
+
+    const merged = mergeDevices(
+      [],
+      [
+        device({
+          id: "peer-removed",
+          name: "Removed",
+          deviceId: "peer-removed",
+          isLocal: false,
+          discoverySources: ["lan_p2p"],
+          primarySource: "lan_p2p",
+          sourceLabel: "P2P 局域网",
+          p2pAvailable: true,
+        }),
+      ],
+      device({
+        id: "local-device",
+        name: "Local",
+        deviceId: "local-device",
+      })
+    );
+
+    expect(merged.map((item) => item.deviceId)).toEqual(["local-device"]);
+    expect(merged[0]?.isLocal).toBe(true);
   });
 });

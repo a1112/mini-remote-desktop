@@ -125,6 +125,7 @@ function webSessionToDevice(session: WebRemoteSession): Device {
     ip: session.targetIp,
     group: "WebRTC",
     favorite: false,
+    disabled: false,
     discoverySources: ["lan_p2p"],
     primarySource: "lan_p2p",
     sourceLabel: "P2P 局域网",

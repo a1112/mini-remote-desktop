@@ -1,4 +1,9 @@
-import { useDevices } from "./deviceData";
+import {
+  removeDeviceLocally,
+  setDeviceDisabled,
+  setDeviceFavorite,
+  useDevices,
+} from "./deviceData";
 import { AppVersionBadge } from "./AppVersionBadge";
 import { useState, useEffect, useRef } from "react";
 import { deviceService } from "../services/deviceService";
@@ -226,6 +231,34 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     }
   };
 
+  const handleSetFavorite = async (deviceId: string, favorite: boolean, deviceName: string) => {
+    setDeviceFavorite(deviceId, favorite);
+    setContextMenu(null);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: favorite ? `已收藏：${deviceName}` : `已取消收藏：${deviceName}`,
+    });
+  };
+
+  const handleSetDisabled = async (deviceId: string, disabled: boolean, deviceName: string) => {
+    setDeviceDisabled(deviceId, disabled);
+    setContextMenu(null);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: disabled ? `已禁用：${deviceName}` : `已启用：${deviceName}`,
+    });
+  };
+
+  const handleRemoveDevice = async (deviceId: string, deviceName: string) => {
+    removeDeviceLocally(deviceId);
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    await refresh();
+    showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -256,7 +289,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
           }
         },
       },
-      { icon: Star, label: "收藏设备", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: Star,
+        label: contextMenuDevice?.favorite ? "取消收藏" : "收藏设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleSetFavorite(
+              contextMenuDevice.deviceId,
+              !contextMenuDevice.favorite,
+              contextMenuDevice.name
+            );
+          }
+        },
+      },
       {
         icon: Copy,
         label: "复制 ID",
@@ -272,9 +317,18 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
     // 启用/禁用
     items.push({
       icon: Ban,
-      label: "禁用设备",
-      disabled: true,
-      title: unsupportedDeviceActionTitle,
+      label: contextMenuDevice?.disabled ? "启用设备" : "禁用设备",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleSetDisabled(
+            contextMenuDevice.deviceId,
+            !contextMenuDevice.disabled,
+            contextMenuDevice.name
+          );
+        }
+      },
+      disabled: contextMenuDevice?.isLocal,
+      title: contextMenuDevice?.isLocal ? "不能禁用本机设备" : undefined,
     });
 
     items.push({ type: "divider" as const });
@@ -299,7 +353,18 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
 
     // 移除设备和管理子菜单
     items.push(
-      { icon: Trash2, label: "移除设备", disabled: true, title: unsupportedDeviceActionTitle, danger: true },
+      {
+        icon: Trash2,
+        label: "移除设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemoveDevice(contextMenuDevice.deviceId, contextMenuDevice.name);
+          }
+        },
+        disabled: contextMenuDevice?.isLocal,
+        title: contextMenuDevice?.isLocal ? "不能移除本机设备" : undefined,
+        danger: true,
+      },
       { icon: Settings, label: "管理", submenu: "management", title: unsupportedDeviceActionTitle }
     );
 
