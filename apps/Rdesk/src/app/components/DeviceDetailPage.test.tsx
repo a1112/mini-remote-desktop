@@ -25,6 +25,7 @@ const sessionMock = vi.hoisted(() => ({
 
 const commandMock = vi.hoisted(() => ({
   ipcRequestDeviceAction: vi.fn(),
+  ipcSendControlInput: vi.fn(),
 }));
 
 vi.mock("./ThemeContext", () => ({
@@ -66,6 +67,7 @@ vi.mock("../services/ipcSessionService", () => ({
 
 vi.mock("../adapters/tauri/commands", () => ({
   ipcRequestDeviceAction: commandMock.ipcRequestDeviceAction,
+  ipcSendControlInput: commandMock.ipcSendControlInput,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -133,6 +135,14 @@ describe("DeviceDetailPage remote toolbar actions", () => {
         message: "Power management provider is reserved.",
       },
     });
+    commandMock.ipcSendControlInput.mockResolvedValue({
+      ok: true,
+      value: {
+        session_id: "session-1",
+        lane: "realtime",
+        event_count: 1,
+      },
+    });
   });
 
   it("routes toolbar restart through the service-owned device action API", async () => {
@@ -149,6 +159,71 @@ describe("DeviceDetailPage remote toolbar actions", () => {
         "agent-device",
         "restart"
       );
+    });
+  });
+
+  it("captures embedded remote pointer, wheel, and keyboard events through service input", async () => {
+    const user = userEvent.setup();
+
+    renderDetailPage();
+    await user.click(screen.getByRole("button", { name: "发起远程连接" }));
+    const renderArea = await screen.findByTestId("device-detail-remote-render-area");
+    vi.spyOn(renderArea, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 1920,
+      bottom: 1080,
+      width: 1920,
+      height: 1080,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    await user.pointer({
+      target: renderArea,
+      keys: "[MouseLeft>]",
+      coords: { clientX: 960, clientY: 540 },
+    });
+    await user.pointer({
+      target: renderArea,
+      keys: "[/MouseLeft]",
+      coords: { clientX: 960, clientY: 540 },
+    });
+    renderArea.dispatchEvent(
+      new WheelEvent("wheel", { deltaY: -120, bubbles: true, cancelable: true })
+    );
+    renderArea.focus();
+    await user.keyboard("[KeyA]");
+
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "mouse_move",
+      x: 960,
+      y: 540,
+    });
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "mouse_button",
+      button: "left",
+      pressed: true,
+    });
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "mouse_button",
+      button: "left",
+      pressed: false,
+    });
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "mouse_wheel",
+      delta: 120,
+    });
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "key",
+      key: { kind: "virtual_key", code: 65 },
+      pressed: true,
+    });
+    expect(commandMock.ipcSendControlInput).toHaveBeenCalledWith("session-1", {
+      kind: "key",
+      key: { kind: "virtual_key", code: 65 },
+      pressed: false,
     });
   });
 });

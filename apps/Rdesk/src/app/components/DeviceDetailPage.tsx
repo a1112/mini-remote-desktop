@@ -1,4 +1,12 @@
-import { useCallback, useState, useEffect, useRef } from "react";
+import {
+  useCallback,
+  useState,
+  useEffect,
+  useRef,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
+} from "react";
 import { useParams, useNavigate } from "react-router";
 import { type Device, useDeviceById, useDevices } from "./deviceData";
 import {
@@ -7,8 +15,12 @@ import {
   prepareRemoteApplicationCatalogForDevice,
   type RemoteApplicationCatalogResult,
 } from "../services/remoteDisplayLauncher";
-import { ipcRequestDeviceAction } from "../adapters/tauri/commands";
-import type { DeviceActionKind } from "../adapters/tauri/types";
+import { ipcRequestDeviceAction, ipcSendControlInput } from "../adapters/tauri/commands";
+import type {
+  ControlInputButton,
+  ControlInputEvent,
+  DeviceActionKind,
+} from "../adapters/tauri/types";
 import {
   getProbeSnapshot,
   getSessionSnapshot,
@@ -432,6 +444,127 @@ function RemoteTab({ device }: { device: Device }) {
     }
   };
 
+  const sendControlInputEvent = useCallback(
+    (event: ControlInputEvent) => {
+      const sessionId = activeSessionIdRef.current ?? activeSessionId;
+      if (!sessionId) return;
+      void ipcSendControlInput(sessionId, event).then((result) => {
+        if (!result.ok) setConnectionError(result.error.message);
+      });
+    },
+    [activeSessionId]
+  );
+
+  const controlPointFromPointerEvent = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      return mapClientPointToRemoteFrame(event.clientX, event.clientY, rect, {
+        width:
+          probeSnapshot?.latest_frame_width ??
+          probeSnapshot?.media_probe_width ??
+          1920,
+        height:
+          probeSnapshot?.latest_frame_height ??
+          probeSnapshot?.media_probe_height ??
+          1080,
+      });
+    },
+    [
+      probeSnapshot?.latest_frame_height,
+      probeSnapshot?.latest_frame_width,
+      probeSnapshot?.media_probe_height,
+      probeSnapshot?.media_probe_width,
+    ]
+  );
+
+  const handleRemotePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const point = controlPointFromPointerEvent(event);
+      if (!point) return;
+      event.preventDefault();
+      sendControlInputEvent({ kind: "mouse_move", ...point });
+    },
+    [controlPointFromPointerEvent, sendControlInputEvent]
+  );
+
+  const handleRemotePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const button = mapPointerButton(event.button);
+      const point = controlPointFromPointerEvent(event);
+      if (!button || !point) return;
+      event.preventDefault();
+      event.currentTarget.focus();
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      sendControlInputEvent({ kind: "mouse_move", ...point });
+      sendControlInputEvent({ kind: "mouse_button", button, pressed: true });
+    },
+    [controlPointFromPointerEvent, sendControlInputEvent]
+  );
+
+  const handleRemotePointerUp = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      const button = mapPointerButton(event.button);
+      const point = controlPointFromPointerEvent(event);
+      if (!button || !point) return;
+      event.preventDefault();
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+      sendControlInputEvent({ kind: "mouse_move", ...point });
+      sendControlInputEvent({ kind: "mouse_button", button, pressed: false });
+    },
+    [controlPointFromPointerEvent, sendControlInputEvent]
+  );
+
+  const handleRemotePointerCancel = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      sendControlInputEvent({ kind: "release_all" });
+    },
+    [sendControlInputEvent]
+  );
+
+  const handleRemoteWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      const delta = Math.trunc(-event.deltaY);
+      if (delta === 0) return;
+      event.preventDefault();
+      sendControlInputEvent({ kind: "mouse_wheel", delta });
+    },
+    [sendControlInputEvent]
+  );
+
+  const handleRemoteKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.repeat) return;
+      const code = virtualKeyFromKeyboardEvent(event);
+      if (code === null) return;
+      event.preventDefault();
+      sendControlInputEvent({
+        kind: "key",
+        key: { kind: "virtual_key", code },
+        pressed: true,
+      });
+    },
+    [sendControlInputEvent]
+  );
+
+  const handleRemoteKeyUp = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      const code = virtualKeyFromKeyboardEvent(event);
+      if (code === null) return;
+      event.preventDefault();
+      sendControlInputEvent({
+        kind: "key",
+        key: { kind: "virtual_key", code },
+        pressed: false,
+      });
+    },
+    [sendControlInputEvent]
+  );
+
+  const handleRemoteBlur = useCallback(() => {
+    sendControlInputEvent({ kind: "release_all" });
+  }, [sendControlInputEvent]);
+
   const fpsLabel = probeSnapshot?.current_fps == null ? "probing" : `${probeSnapshot.current_fps.toFixed(1)} fps`;
   const bitrateLabel = probeSnapshot?.bitrate_mbps == null ? "-" : `${probeSnapshot.bitrate_mbps.toFixed(2)} Mbps`;
   const frameSizeLabel =
@@ -536,7 +669,20 @@ function RemoteTab({ device }: { device: Device }) {
       </div>
 
       {/* Screen */}
-      <div className="flex-1 relative overflow-hidden cursor-crosshair select-none bg-[#070b14]">
+      <div
+        data-testid="device-detail-remote-render-area"
+        tabIndex={0}
+        onPointerMove={handleRemotePointerMove}
+        onPointerDown={handleRemotePointerDown}
+        onPointerUp={handleRemotePointerUp}
+        onPointerCancel={handleRemotePointerCancel}
+        onWheel={handleRemoteWheel}
+        onKeyDown={handleRemoteKeyDown}
+        onKeyUp={handleRemoteKeyUp}
+        onBlur={handleRemoteBlur}
+        className="flex-1 relative overflow-hidden cursor-crosshair select-none bg-[#070b14] outline-none"
+        style={{ touchAction: "none" }}
+      >
         <div className="absolute inset-0 bg-[#070b14]" />
         <div className="absolute inset-0 flex items-center justify-center px-6">
           <div className="w-full max-w-3xl rounded-xl border border-white/10 bg-white/[0.03] p-5 text-gray-200 shadow-2xl">
@@ -1494,6 +1640,100 @@ function ToolbarBtn({
       <span style={{ fontSize: 11 }}>{label}</span>
     </button>
   );
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function mapClientPointToRemoteFrame(
+  clientX: number,
+  clientY: number,
+  rect: DOMRect,
+  frameSize: { width: number; height: number }
+): { x: number; y: number } | null {
+  if (rect.width <= 0 || rect.height <= 0 || frameSize.width <= 0 || frameSize.height <= 0) {
+    return null;
+  }
+
+  const frameAspect = frameSize.width / frameSize.height;
+  const rectAspect = rect.width / rect.height;
+  let contentWidth = rect.width;
+  let contentHeight = rect.height;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  if (rectAspect > frameAspect) {
+    contentWidth = rect.height * frameAspect;
+    offsetX = (rect.width - contentWidth) / 2;
+  } else if (rectAspect < frameAspect) {
+    contentHeight = rect.width / frameAspect;
+    offsetY = (rect.height - contentHeight) / 2;
+  }
+
+  const localX = clientX - rect.left - offsetX;
+  const localY = clientY - rect.top - offsetY;
+  if (localX < 0 || localY < 0 || localX > contentWidth || localY > contentHeight) {
+    return null;
+  }
+
+  return {
+    x: clamp(Math.round((localX / contentWidth) * frameSize.width), 0, frameSize.width - 1),
+    y: clamp(Math.round((localY / contentHeight) * frameSize.height), 0, frameSize.height - 1),
+  };
+}
+
+function mapPointerButton(button: number): ControlInputButton | null {
+  if (button === 0) return "left";
+  if (button === 1) return "middle";
+  if (button === 2) return "right";
+  if (button === 3) return "x1";
+  if (button === 4) return "x2";
+  return null;
+}
+
+function virtualKeyFromKeyboardEvent(
+  event: Pick<KeyboardEvent, "key" | "code">
+): number | null {
+  if (/^Key[A-Z]$/.test(event.code)) return event.code.charCodeAt(3);
+  if (/^Digit[0-9]$/.test(event.code)) return event.code.charCodeAt(5);
+  if (/^Numpad[0-9]$/.test(event.code)) return 0x60 + Number(event.code.slice(6));
+
+  switch (event.key) {
+    case "Backspace":
+      return 0x08;
+    case "Tab":
+      return 0x09;
+    case "Enter":
+      return 0x0d;
+    case "Shift":
+      return 0x10;
+    case "Control":
+      return 0x11;
+    case "Alt":
+      return 0x12;
+    case "Pause":
+      return 0x13;
+    case "CapsLock":
+      return 0x14;
+    case "Escape":
+      return 0x1b;
+    case " ":
+    case "Spacebar":
+      return 0x20;
+    case "ArrowLeft":
+      return 0x25;
+    case "ArrowUp":
+      return 0x26;
+    case "ArrowRight":
+      return 0x27;
+    case "ArrowDown":
+      return 0x28;
+    case "Delete":
+      return 0x2e;
+    default:
+      return null;
+  }
 }
 
 function StatusItem({ label, value }: { label: string; value: string }) {
