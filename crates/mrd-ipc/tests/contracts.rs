@@ -6,14 +6,15 @@ use mrd_ipc::{
     CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
-    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane, DeviceDetailSnapshot,
-    DeviceIdentitySnapshot, DeviceInfo, FileTransferActionKind, FileTransferActionResult,
-    FileTransferProviderSnapshot, FileTransferSnapshot, FileTransferTaskSnapshot, IpcRequest,
-    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
-    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
-    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
-    TransportPolicyConfig, TransportPolicySnapshot,
+    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane, DeviceActionKind,
+    DeviceActionResult, DeviceDetailSnapshot, DeviceIdentitySnapshot, DeviceInfo,
+    FileTransferActionKind, FileTransferActionResult, FileTransferProviderSnapshot,
+    FileTransferSnapshot, FileTransferTaskSnapshot, IpcRequest, IpcResponse,
+    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
+    MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation,
+    ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot,
+    TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig,
+    TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -656,6 +657,34 @@ fn serialize_deserialize_device_detail_snapshot_contract() {
 }
 
 #[test]
+fn serialize_deserialize_device_action_contract() {
+    let request = IpcRequest::RequestDeviceAction {
+        device_id: test_device_id(),
+        action: DeviceActionKind::Disconnect,
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("RequestDeviceAction"));
+    assert!(json.contains("\"action\":\"disconnect\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let response = IpcResponse::DeviceActionRequested {
+        result: DeviceActionResult {
+            device_id: test_device_id(),
+            action: DeviceActionKind::Disconnect,
+            accepted: true,
+            supported: true,
+            message: "Disconnected 1 active session(s).".to_string(),
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DeviceActionRequested"));
+    assert!(json.contains("\"action\":\"disconnect\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
 fn serialize_deserialize_file_transfer_provider_reservation() {
     let request = IpcRequest::FileTransferSnapshot;
 
@@ -1136,6 +1165,10 @@ fn serialize_deserialize_all_request_types() {
             device_id: test_device_id(),
         },
         IpcRequest::GetDeviceIdentitySnapshot,
+        IpcRequest::RequestDeviceAction {
+            device_id: test_device_id(),
+            action: DeviceActionKind::Disconnect,
+        },
         IpcRequest::GetTelemetryBundle {
             run_id: "run-1".to_string(),
             session_id: Some(test_session_id()),
