@@ -7,10 +7,10 @@
 
 use crate::{
     app_state::AppState,
-    handlers::{device, session, transport as transport_handlers},
+    handlers::{device, runtime, session, transport as transport_handlers},
     shell::{AutostartPortRef, UiLauncherPortRef},
 };
-use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
+use mrd_application::ports::SessionLifecycleState;
 use mrd_ipc::{
     transport, CapabilitySnapshot, CapabilityStatus, FileTransferProviderSnapshot,
     FileTransferSnapshot, IpcRequest, IpcResponse, MediaProfile, ScenarioEvaluationStatus,
@@ -436,79 +436,28 @@ impl IpcServer {
                 session::session_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::RuntimeSnapshot => {
-                let sessions = self.app_state.sessions.lock().await;
-                let devices = self.app_state.devices.lock().await;
+            IpcRequest::RuntimeSnapshot => runtime::runtime_snapshot(&self.app_state).await,
 
-                let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions
-                    .list_all()
-                    .into_iter()
-                    .filter_map(|snap| self.snapshot_to_ipc(&snap))
-                    .collect();
+            IpcRequest::AuditLog { query } => runtime::audit_log(&self.app_state, query).await,
 
-                let device_id = devices.get_local_device().map(|(id, _)| id.clone());
-
-                IpcResponse::RuntimeSnapshot {
-                    snapshot: mrd_ipc::RuntimeSnapshot {
-                        sessions: session_snapshots,
-                        device_id,
-                        is_registered: devices.is_registered(),
-                    },
-                }
-            }
-
-            IpcRequest::AuditLog { query } => {
-                let audit_log = self.app_state.audit_log.lock().await;
-                IpcResponse::AuditLog {
-                    events: audit_log.query(&query),
-                }
-            }
-
-            IpcRequest::CapabilitySnapshot => {
-                let snapshot = self.app_state.cached_capability_snapshot().await;
-                self.app_state.refresh_capability_snapshot_in_background();
-                IpcResponse::CapabilitySnapshot { snapshot }
-            }
+            IpcRequest::CapabilitySnapshot => runtime::capability_snapshot(&self.app_state).await,
 
             IpcRequest::EvaluateScenarioProfile {
                 scenario_id,
                 peer_device_id,
                 requested_profile,
             } => {
-                if let Some(peer_device_id) = peer_device_id {
-                    let snapshot = self.app_state.lan_discovery.snapshot().await;
-                    if !snapshot
-                        .peers
-                        .iter()
-                        .any(|peer| peer.device_id == peer_device_id)
-                    {
-                        return IpcResponse::ScenarioProfileEvaluated {
-                            evaluation: peer_not_found_evaluation(scenario_id, peer_device_id),
-                        };
-                    }
-                }
-                let snapshot = self.app_state.cached_capability_snapshot().await;
-                self.app_state.refresh_capability_snapshot_in_background();
-                IpcResponse::ScenarioProfileEvaluated {
-                    evaluation: crate::capabilities::evaluate_scenario_profile_against_snapshot(
-                        &snapshot,
-                        &scenario_id,
-                        requested_profile,
-                    ),
-                }
+                runtime::evaluate_scenario_profile(
+                    &self.app_state,
+                    scenario_id,
+                    peer_device_id,
+                    requested_profile,
+                )
+                .await
             }
 
             IpcRequest::GetPeerCapabilitySnapshot { peer_device_id } => {
-                let snapshot = self.app_state.lan_discovery.snapshot().await;
-                let capability_snapshot = snapshot
-                    .peers
-                    .iter()
-                    .find(|peer| peer.device_id == peer_device_id)
-                    .map(crate::capabilities::peer_capability_snapshot);
-                IpcResponse::PeerCapabilitySnapshot {
-                    peer_device_id,
-                    snapshot: capability_snapshot,
-                }
+                runtime::peer_capability_snapshot(&self.app_state, peer_device_id).await
             }
 
             IpcRequest::SetTransportPolicy { session_id, policy } => {
@@ -518,13 +467,7 @@ impl IpcServer {
             }
 
             IpcRequest::GetControlChannelSnapshot { session_id } => {
-                let snapshot = self
-                    .app_state
-                    .control_input()
-                    .lock()
-                    .await
-                    .snapshot(session_id);
-                IpcResponse::ControlChannelSnapshot { snapshot }
+                runtime::control_channel_snapshot(&self.app_state, session_id).await
             }
 
             IpcRequest::SendControlInput { session_id, event } => {
@@ -591,28 +534,15 @@ impl IpcServer {
                 snapshot: device::identity_snapshot(&self.app_state).await,
             },
 
-            IpcRequest::GetTelemetryBundle { run_id, session_id } => IpcResponse::TelemetryBundle {
-                bundle: mrd_ipc::TelemetryBundle {
-                    run_id,
-                    session_id,
-                    metrics: Vec::new(),
-                    event_count: 0,
-                    log_count: 0,
-                    artifacts: Vec::new(),
-                },
-            },
+            IpcRequest::GetTelemetryBundle { run_id, session_id } => {
+                runtime::telemetry_bundle(run_id, session_id)
+            }
 
             IpcRequest::MediaPipelineSnapshot { session_id } => {
                 transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
-                status: mrd_ipc::ServiceStatus {
-                    running: true,
-                    healthy: true,
-                    pid: Some(std::process::id()),
-                },
-            },
+            IpcRequest::ServiceHealth => runtime::service_health(),
 
             IpcRequest::ProbeSnapshot { session_id } => {
                 transport_handlers::probe_snapshot(&self.app_state, session_id).await
@@ -799,53 +729,6 @@ impl IpcServer {
                 }
             }
         }
-    }
-
-    /// Convert a session snapshot to IPC format
-    fn snapshot_to_ipc(&self, snap: &SessionSnapshot) -> Option<mrd_ipc::SessionRuntimeSnapshot> {
-        // Determine role based on which device ID is set
-        let role = if snap.target_device_id.is_some() {
-            "controller"
-        } else if snap.source_device_id.is_some() {
-            "agent"
-        } else {
-            "unknown"
-        }
-        .to_string();
-
-        // Use explicit lifecycle state from domain model
-        let state = snap.lifecycle_state.as_str().to_string();
-
-        Some(mrd_ipc::SessionRuntimeSnapshot {
-            session_id: snap.session_id.clone(),
-            role,
-            state,
-            transport_kind: snap.transport.clone(),
-            local_bootstrap: if snap.local_listen_addr.is_some() || snap.local_server_name.is_some()
-            {
-                Some(mrd_ipc::SessionBootstrap {
-                    listen_addr: snap.local_listen_addr.clone(),
-                    server_name: snap.local_server_name.clone(),
-                    cert_der: snap.local_cert_der_b64.clone(),
-                })
-            } else {
-                None
-            },
-            remote_bootstrap: if snap.remote_listen_addr.is_some()
-                || snap.remote_server_name.is_some()
-            {
-                Some(mrd_ipc::SessionBootstrap {
-                    listen_addr: snap.remote_listen_addr.clone(),
-                    server_name: snap.remote_server_name.clone(),
-                    cert_der: snap.remote_cert_der_b64.clone(),
-                })
-            } else {
-                None
-            },
-            last_error: snap.last_error.clone(),
-            sender_active: snap.sender_active,
-            receiver_active: snap.receiver_active,
-        })
     }
 
     /// Get access to the app state (for testing/integration)
@@ -1142,27 +1025,6 @@ fn capability_status_runs(status: &CapabilityStatus) -> bool {
     )
 }
 
-fn peer_not_found_evaluation(
-    scenario_id: String,
-    peer_device_id: DeviceId,
-) -> mrd_ipc::ScenarioEvaluation {
-    mrd_ipc::ScenarioEvaluation {
-        scenario_id,
-        status: mrd_ipc::ScenarioEvaluationStatus::Skipped,
-        selected_profile: None,
-        transport_kind: None,
-        reasons: vec![mrd_ipc::ScenarioEvaluationReason {
-            code: "peer_not_found".to_string(),
-            severity: "warning".to_string(),
-            message: format!("LAN peer {} is not currently discovered.", peer_device_id.0),
-            capability_id: None,
-        }],
-        required_capabilities: Vec::new(),
-        missing_capabilities: Vec::new(),
-        fallback_profile: None,
-    }
-}
-
 fn transport_policy_snapshot(
     session_id: Option<SessionId>,
     policy: &mrd_ipc::TransportPolicyConfig,
@@ -1213,6 +1075,7 @@ fn transport_policy_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_application::ports::SessionSnapshot;
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
 
