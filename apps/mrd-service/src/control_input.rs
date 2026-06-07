@@ -71,6 +71,7 @@ impl ControlInputRegistry {
         self.injector.is_available()
     }
 
+    #[cfg(test)]
     pub fn handle_event(
         &mut self,
         event: &ControlInputEvent,
