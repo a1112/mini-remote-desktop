@@ -1181,6 +1181,113 @@ function pickAvailableDecoder(
   return preferred.find((value) => decoderOptionAvailable(available, value, encoder)) ?? fallback;
 }
 
+function normalizeLocalTestSelectionForCapabilities(
+  selection: {
+    capture: CaptureType;
+    encoder: EncoderType;
+    decoder: DecoderType;
+    fps: FpsKey;
+  },
+  capabilities: EnvironmentSnapshot | null,
+  isLocalPipelinePreview: boolean
+) {
+  if (!capabilities) return selection;
+
+  const os = normalizeOs(capabilities.os_type);
+  if (os === "macos") {
+    const nextEncoder = pickAvailable(
+      selection.encoder,
+      capabilities.available_encoders,
+      ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+      "videotoolbox_hevc"
+    );
+    const nextDecoderCandidate =
+      nextEncoder === "videotoolbox_hevc" &&
+      selection.decoder === "none" &&
+      !decoderOptionAvailable(capabilities.available_decoders, "videotoolbox", nextEncoder) &&
+      decoderOptionAvailable(capabilities.available_decoders, "software", nextEncoder)
+        ? "software"
+        : selection.decoder;
+    return {
+      capture: pickAvailable(
+        selection.capture,
+        capabilities.available_captures,
+        ["macos", "synthetic"],
+        "macos"
+      ),
+      encoder: nextEncoder,
+      decoder: pickAvailableDecoder(
+        nextDecoderCandidate,
+        capabilities.available_decoders,
+        ["videotoolbox", "software", "none"],
+        "software",
+        nextEncoder
+      ),
+      fps:
+        isLocalPipelinePreview && (selection.fps === "120" || selection.fps === "144")
+          ? ("60" as FpsKey)
+          : selection.fps,
+    };
+  }
+
+  if (os === "windows") {
+    const nextEncoder = pickAvailable(
+      selection.encoder,
+      capabilities.available_encoders,
+      ["nvenc_hevc", "nvenc_h264", "nvenc_av1", "openh264"],
+      "nvenc_hevc"
+    );
+    return {
+      capture: pickAvailable(
+        selection.capture,
+        capabilities.available_captures,
+        ["dxgi", "winrt", "synthetic"],
+        "dxgi"
+      ),
+      encoder: nextEncoder,
+      decoder: pickAvailableDecoder(
+        selection.decoder,
+        capabilities.available_decoders,
+        ["nvdec", "software", "none"],
+        "nvdec",
+        nextEncoder
+      ),
+      fps: selection.fps,
+    };
+  }
+
+  if (os === "linux") {
+    const decoderPreference: DecoderType[] = isLocalPipelinePreview
+      ? ["software", "linux_h264", "none"]
+      : ["linux_h264", "software", "none"];
+    const fallbackDecoder = decoderPreference[0] ?? "software";
+    return {
+      capture: pickAvailable(
+        selection.capture,
+        capabilities.available_captures,
+        ["linux", "synthetic"],
+        "linux"
+      ),
+      encoder: pickAvailable(
+        selection.encoder,
+        capabilities.available_encoders,
+        ["openh264"],
+        "openh264"
+      ),
+      decoder: pickAvailableDecoder(
+        selection.decoder,
+        capabilities.available_decoders,
+        decoderPreference,
+        fallbackDecoder,
+        selection.encoder
+      ),
+      fps: selection.fps,
+    };
+  }
+
+  return selection;
+}
+
 function uniqueValues<T extends string>(values: readonly T[]): T[] {
   return values.filter((value, index) => values.indexOf(value) === index);
 }
@@ -2171,6 +2278,7 @@ export function RemoteDisplayWindowPage() {
   const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
   const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
   const lastRemoteControlPointRef = useRef<{ x: number; y: number } | null>(null);
+  const capabilitiesRef = useRef<EnvironmentSnapshot | null>(null);
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -3260,11 +3368,21 @@ export function RemoteDisplayWindowPage() {
     [bitrate, capture, displayDecoderLabel, displayTransportLabel, encoder, fps, resolution]
   );
   const buildTestConfig = useCallback((rendererTargetHwnd?: string | null, selection?: LocalTestSelection) => {
-    const selectedCapture = selection?.capture ?? capture;
-    const selectedEncoder = selection?.encoder ?? encoder;
-    const selectedDecoder = selection?.decoder ?? decoder;
+    const normalizedSelection = normalizeLocalTestSelectionForCapabilities(
+      {
+        capture: selection?.capture ?? capture,
+        encoder: selection?.encoder ?? encoder,
+        decoder: selection?.decoder ?? decoder,
+        fps: selection?.fps ?? fps,
+      },
+      capabilities ?? capabilitiesRef.current,
+      isLocalPipelinePreview
+    );
+    const selectedCapture = normalizedSelection.capture;
+    const selectedEncoder = normalizedSelection.encoder;
+    const selectedDecoder = normalizedSelection.decoder;
     const selectedTransport = selection?.transport ?? transport;
-    const selectedFps = selection?.fps ?? fps;
+    const selectedFps = normalizedSelection.fps;
     const selectedBitrate = selection?.bitrate ?? bitrate;
     const selectedResolution = selection?.resolution ?? resolution;
     const selectedLocalSourceCandidate = selection?.captureSource ?? captureSourceSelection?.source;
@@ -3322,6 +3440,7 @@ export function RemoteDisplayWindowPage() {
     } satisfies TestConfig;
   }, [
     bitrate,
+    capabilities,
     capture,
     captureSourceSelection,
     decoder,
@@ -3482,11 +3601,24 @@ export function RemoteDisplayWindowPage() {
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    void testGetCapabilities().then((result) => {
-      if (result.ok) setCapabilities(result.value);
-    });
+  const refreshCapabilities = useCallback(async () => {
+    const result = await testGetCapabilities();
+    if (result.ok) {
+      capabilitiesRef.current = result.value;
+      setCapabilities(result.value);
+      return result.value;
+    }
+    return null;
   }, []);
+
+  const ensureCapabilities = useCallback(async () => {
+    if (capabilitiesRef.current) return capabilitiesRef.current;
+    return refreshCapabilities();
+  }, [refreshCapabilities]);
+
+  useEffect(() => {
+    void refreshCapabilities();
+  }, [refreshCapabilities]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -5304,6 +5436,7 @@ export function RemoteDisplayWindowPage() {
     }
 
     try {
+      await ensureCapabilities();
       await testHarnessStop();
 
       let configForRun = testConfig;
