@@ -23,9 +23,11 @@ import {
 import { useTheme } from "./ThemeContext";
 import {
   ipcFileTransferSnapshot,
+  ipcRequestFileTransferAction,
   type FileTransferSnapshot,
   type FileTransferTaskSnapshot,
 } from "../adapters/tauri";
+import type { FileTransferActionKind } from "../adapters/tauri/types";
 
 type TransferStatus = "active" | "paused" | "done" | "error";
 type TransferDirection = "send" | "receive";
@@ -119,6 +121,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [transferSnapshot, setTransferSnapshot] = useState<FileTransferSnapshot | null>(null);
   const [snapshotError, setSnapshotError] = useState<string | null>(null);
+  const [actionStatus, setActionStatus] = useState<string | null>(null);
   const backdropRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -134,6 +137,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
     if (!open) return;
     let cancelled = false;
     setSnapshotError(null);
+    setActionStatus(null);
 
     void ipcFileTransferSnapshot().then((result) => {
       if (cancelled) return;
@@ -244,6 +248,18 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
     );
   };
 
+  const handleTransferAction = async (
+    transferId: string,
+    action: FileTransferActionKind
+  ) => {
+    const result = await ipcRequestFileTransferAction(transferId, action);
+    if (result.ok) {
+      setActionStatus(result.value.message);
+      return;
+    }
+    setActionStatus(result.error.message);
+  };
+
   const renderActiveItem = (t: TransferItem) => {
     const Icon = t.fileIcon;
     const isSend = t.direction === "send";
@@ -345,6 +361,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
                       isDark ? "text-gray-400 hover:text-yellow-400 hover:bg-yellow-900/20" : "text-gray-400 hover:text-amber-600 hover:bg-amber-50"
                     }`}
                     title="暂停"
+                    onClick={() => void handleTransferAction(t.id, "pause")}
                   >
                     <Pause style={{ width: 12, height: 12 }} />
                   </button>
@@ -355,6 +372,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
                       isDark ? "text-gray-400 hover:text-blue-400 hover:bg-blue-900/20" : "text-gray-400 hover:text-blue-600 hover:bg-blue-50"
                     }`}
                     title="继续"
+                    onClick={() => void handleTransferAction(t.id, "resume")}
                   >
                     <Play style={{ width: 12, height: 12 }} />
                   </button>
@@ -374,6 +392,7 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
                     isDark ? "text-gray-400 hover:text-red-400 hover:bg-red-900/20" : "text-gray-400 hover:text-red-500 hover:bg-red-50"
                   }`}
                   title="取消传输"
+                  onClick={() => void handleTransferAction(t.id, "cancel")}
                 >
                   <X style={{ width: 12, height: 12 }} />
                 </button>
@@ -642,6 +661,19 @@ export function TransferModal({ open, onClose }: TransferModalProps) {
 
         {/* Scrollable content */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {actionStatus && (
+            <div
+              className={`rounded-lg border px-3 py-2 ${
+                isDark
+                  ? "border-gray-700 bg-gray-800/70 text-gray-300"
+                  : "border-gray-200 bg-white text-gray-600"
+              }`}
+              style={{ fontSize: 11 }}
+            >
+              {actionStatus}
+            </div>
+          )}
+
           {/* Active / In-progress section */}
           {filteredActive.length > 0 && (
             <div>

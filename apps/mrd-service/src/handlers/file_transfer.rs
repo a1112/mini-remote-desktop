@@ -1,10 +1,50 @@
-use mrd_ipc::{FileTransferProviderSnapshot, FileTransferSnapshot};
+use mrd_ipc::{
+    FileTransferActionKind, FileTransferActionResult, FileTransferProviderSnapshot,
+    FileTransferSnapshot, IpcResponse,
+};
 use std::path::{Path, PathBuf};
 
 pub fn snapshot() -> FileTransferSnapshot {
     match detect_rfile_root() {
         Some(root) => snapshot_for_rfile_root(&root),
         None => reserved_snapshot(),
+    }
+}
+
+pub fn request_action(transfer_id: String, action: FileTransferActionKind) -> IpcResponse {
+    let snapshot = snapshot();
+    let known_task = snapshot
+        .tasks
+        .iter()
+        .any(|task| task.transfer_id == transfer_id);
+    let (accepted, supported, message) = if known_task {
+        (
+            false,
+            false,
+            format!(
+                "File transfer provider {} does not expose runtime task actions yet.",
+                snapshot.provider.provider_id
+            ),
+        )
+    } else {
+        (
+            false,
+            false,
+            format!(
+                "File transfer provider {} has no active task named {}.",
+                snapshot.provider.provider_id, transfer_id
+            ),
+        )
+    };
+
+    IpcResponse::FileTransferActionRequested {
+        result: FileTransferActionResult {
+            transfer_id,
+            action,
+            accepted,
+            supported,
+            message,
+        },
     }
 }
 

@@ -645,6 +645,16 @@ export interface FileTransferSnapshot {
   updated_at_ms?: number | null;
 }
 
+export type FileTransferActionKind = "pause" | "resume" | "cancel";
+
+export interface FileTransferActionResult {
+  transfer_id: string;
+  action: FileTransferActionKind;
+  accepted: boolean;
+  supported: boolean;
+  message: string;
+}
+
 export type CapabilityPlatform =
   | "windows"
   | "macos"

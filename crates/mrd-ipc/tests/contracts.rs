@@ -7,12 +7,13 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane, DeviceDetailSnapshot,
-    DeviceIdentitySnapshot, DeviceInfo, FileTransferProviderSnapshot, FileTransferSnapshot,
-    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
-    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
-    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
+    DeviceIdentitySnapshot, DeviceInfo, FileTransferActionKind, FileTransferActionResult,
+    FileTransferProviderSnapshot, FileTransferSnapshot, FileTransferTaskSnapshot, IpcRequest,
+    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
+    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
+    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
+    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
+    TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -707,6 +708,33 @@ fn serialize_deserialize_file_transfer_provider_reservation() {
     assert!(json.contains("file.transfer.external_provider"));
     assert!(json.contains("file.transfer.rfile.quic_stream"));
     assert!(json.contains("compare_provider"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, response);
+}
+
+#[test]
+fn serialize_deserialize_file_transfer_action_contract() {
+    let request = IpcRequest::RequestFileTransferAction {
+        transfer_id: "transfer-1".to_string(),
+        action: FileTransferActionKind::Cancel,
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("RequestFileTransferAction"));
+    assert!(json.contains("\"action\":\"cancel\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, request);
+
+    let response = IpcResponse::FileTransferActionRequested {
+        result: FileTransferActionResult {
+            transfer_id: "transfer-1".to_string(),
+            action: FileTransferActionKind::Cancel,
+            accepted: false,
+            supported: false,
+            message: "No active provider task is bound yet.".to_string(),
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferActionRequested"));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, response);
 }

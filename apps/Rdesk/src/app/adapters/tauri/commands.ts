@@ -18,6 +18,8 @@ import type {
   DeviceDetailSnapshot,
   DeviceInfo,
   LanDiscoverySnapshot,
+  FileTransferActionKind,
+  FileTransferActionResult,
   FileTransferSnapshot,
   DeviceRegistrationResponse,
   DecodePolicy,
@@ -648,6 +650,28 @@ export async function ipcFileTransferSnapshot(): Promise<AdapterResult<FileTrans
     undefined,
     { type: 'FileTransferSnapshot' },
     responseField<FileTransferSnapshot>('snapshot')
+  );
+}
+
+/**
+ * Request a service-owned action for a file transfer task.
+ */
+export async function ipcRequestFileTransferAction(
+  transferId: string,
+  action: FileTransferActionKind
+): Promise<AdapterResult<FileTransferActionResult>> {
+  return invokeBridgeOrTauri<FileTransferActionResult>(
+    'ipc_request_file_transfer_action',
+    {
+      transferId,
+      action,
+    },
+    {
+      type: 'RequestFileTransferAction',
+      transfer_id: transferId,
+      action,
+    },
+    responseField<FileTransferActionResult>('result')
   );
 }
 

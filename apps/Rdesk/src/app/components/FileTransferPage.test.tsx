@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "@/test/mocks/tauri";
 import { TransferModal } from "./FileTransferPage";
@@ -36,5 +37,74 @@ describe("TransferModal", () => {
     expect(screen.getByText("file.transfer.rfile.quic_stream")).toBeInTheDocument();
     expect(screen.getByText("compare_provider")).toBeInTheDocument();
     expect(screen.queryByText("project-backup.zip")).not.toBeInTheDocument();
+  });
+
+  it("routes transfer item pause, resume, and cancel actions through mrd-service", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockResolvedValueOnce({
+      provider: {
+        provider_id: "mrd.file_transfer.rfile",
+        display_name: "R-File provider boundary",
+        status: "available",
+        detail: "Detected R-File provider root.",
+        capabilities: ["file.transfer.rfile.transfer_tasks"],
+        supported_actions: ["list", "pause", "resume", "cancel"],
+      },
+      tasks: [
+        {
+          transfer_id: "transfer-active",
+          direction: "send",
+          status: "running",
+          source_device_id: "local",
+          target_device_id: "remote",
+          source_paths: ["C:\\Users\\Admin\\active.bin"],
+          target_path: "D:\\Inbox",
+          total_bytes: 1024,
+          transferred_bytes: 128,
+        },
+        {
+          transfer_id: "transfer-paused",
+          direction: "receive",
+          status: "paused",
+          source_device_id: "remote",
+          target_device_id: "local",
+          source_paths: ["D:\\paused.bin"],
+          target_path: "C:\\Inbox",
+          total_bytes: 2048,
+          transferred_bytes: 256,
+        },
+      ],
+      updated_at_ms: null,
+    });
+    mockInvoke.mockResolvedValue({
+      accepted: false,
+      supported: false,
+      message: "File transfer provider has no active runtime task binding yet.",
+    });
+    const user = userEvent.setup();
+
+    render(<TransferModal open onClose={vi.fn()} />);
+
+    await screen.findByText("active.bin");
+    await user.click(screen.getByTitle("暂停"));
+    await user.click(screen.getByTitle("继续"));
+    const [cancelActiveTransfer] = screen.getAllByTitle("取消传输");
+    if (!cancelActiveTransfer) {
+      throw new Error("Expected an active transfer cancel button");
+    }
+    await user.click(cancelActiveTransfer);
+
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-active",
+      action: "pause",
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-paused",
+      action: "resume",
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_request_file_transfer_action", {
+      transferId: "transfer-active",
+      action: "cancel",
+    });
   });
 });

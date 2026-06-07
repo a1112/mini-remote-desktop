@@ -124,6 +124,11 @@ impl IpcServer {
                 snapshot: file_transfer::snapshot(),
             },
 
+            IpcRequest::RequestFileTransferAction {
+                transfer_id,
+                action,
+            } => file_transfer::request_action(transfer_id, action),
+
             IpcRequest::ListSessions => {
                 let sessions = self.app_state.sessions.lock().await;
                 let session_list = sessions
@@ -1309,6 +1314,30 @@ mod tests {
                     .contains(&"bind_external_provider".to_string()));
             }
             other => panic!("Expected FileTransferSnapshot response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_transfer_action_request_returns_structured_provider_status() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let response = server
+            .handle_request(IpcRequest::RequestFileTransferAction {
+                transfer_id: "missing-transfer".to_string(),
+                action: mrd_ipc::FileTransferActionKind::Cancel,
+            })
+            .await;
+
+        match response {
+            IpcResponse::FileTransferActionRequested { result } => {
+                assert_eq!(result.transfer_id, "missing-transfer");
+                assert_eq!(result.action, mrd_ipc::FileTransferActionKind::Cancel);
+                assert!(!result.accepted);
+                assert!(!result.supported);
+                assert!(result.message.contains("provider"));
+            }
+            other => panic!("Expected FileTransferActionRequested response, got {other:?}"),
         }
     }
 

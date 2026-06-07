@@ -1062,6 +1062,25 @@ mod wire {
         pub updated_at_ms: Option<u64>,
     }
 
+    /// Service-owned action for one file transfer task.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileTransferActionKind {
+        Pause,
+        Resume,
+        Cancel,
+    }
+
+    /// Result of a file transfer action request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferActionResult {
+        pub transfer_id: String,
+        pub action: FileTransferActionKind,
+        pub accepted: bool,
+        pub supported: bool,
+        pub message: String,
+    }
+
     // === Core IPC Types ===
 
     /// IPC request from Rdesk to mrd-service
@@ -1081,6 +1100,11 @@ mod wire {
         RefreshLanDiscovery,
         /// Get file transfer provider and task state.
         FileTransferSnapshot,
+        /// Request a service-owned action for a file transfer task.
+        RequestFileTransferAction {
+            transfer_id: String,
+            action: FileTransferActionKind,
+        },
         /// List all active sessions
         ListSessions,
         /// Start a new session as controller
@@ -1299,6 +1323,8 @@ mod wire {
             /// Current provider/task snapshot.
             snapshot: FileTransferSnapshot,
         },
+        /// File transfer task action result.
+        FileTransferActionRequested { result: FileTransferActionResult },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },
         /// Session started successfully
