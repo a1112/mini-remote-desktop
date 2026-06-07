@@ -160,11 +160,20 @@ fn rfile_runtime_endpoint_capabilities() -> Vec<String> {
     let http_host =
         env_string("RFILE_SERVICE_HOST").unwrap_or_else(|| RFILE_DEFAULT_HTTP_HOST.to_string());
     let http_port = env_u16("RFILE_SERVICE_PORT").unwrap_or(RFILE_DEFAULT_HTTP_PORT);
-    let quic_host = normalize_endpoint_host(
-        &env_string("RFILE_QUIC_HOST").unwrap_or_else(|| RFILE_DEFAULT_QUIC_HOST.to_string()),
-    );
+    let quic_host =
+        env_string("RFILE_QUIC_HOST").unwrap_or_else(|| RFILE_DEFAULT_QUIC_HOST.to_string());
     let quic_port = env_u16("RFILE_QUIC_PORT").unwrap_or(RFILE_DEFAULT_QUIC_PORT);
 
+    rfile_runtime_endpoint_capabilities_from_values(&http_host, http_port, &quic_host, quic_port)
+}
+
+fn rfile_runtime_endpoint_capabilities_from_values(
+    http_host: &str,
+    http_port: u16,
+    quic_host: &str,
+    quic_port: u16,
+) -> Vec<String> {
+    let quic_host = normalize_endpoint_host(quic_host);
     vec![
         format!("file.transfer.rfile.endpoint.http://{http_host}:{http_port}"),
         format!("file.transfer.rfile.quic_endpoint.{quic_host}:{quic_port}"),
@@ -248,5 +257,21 @@ mod tests {
             .provider
             .capabilities
             .contains(&"file.transfer.rfile.quic_endpoint.127.0.0.1:18081".to_string()));
+    }
+
+    #[test]
+    fn rfile_runtime_endpoint_capabilities_map_wildcard_quic_to_localhost() {
+        let capabilities = rfile_runtime_endpoint_capabilities_from_values(
+            "192.168.1.20",
+            28080,
+            "0.0.0.0",
+            28081,
+        );
+
+        assert!(capabilities
+            .contains(&"file.transfer.rfile.endpoint.http://192.168.1.20:28080".to_string()));
+        assert!(
+            capabilities.contains(&"file.transfer.rfile.quic_endpoint.127.0.0.1:28081".to_string())
+        );
     }
 }
