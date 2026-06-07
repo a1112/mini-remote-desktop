@@ -45,6 +45,7 @@ const remoteDisplayLauncherMock = vi.hoisted(() => ({
 const tauriAdapterMock = vi.hoisted(() => ({
   ipcCancelFileTransfer: vi.fn(),
   ipcListDirectory: vi.fn(),
+  ipcListFileTransferProviders: vi.fn(),
   ipcListFileTransfers: vi.fn(),
   ipcStartFileTransfer: vi.fn(),
 }));
@@ -87,6 +88,7 @@ vi.mock("../services/ipcSessionService", () => ({
 vi.mock("../adapters/tauri", () => ({
   ipcCancelFileTransfer: tauriAdapterMock.ipcCancelFileTransfer,
   ipcListDirectory: tauriAdapterMock.ipcListDirectory,
+  ipcListFileTransferProviders: tauriAdapterMock.ipcListFileTransferProviders,
   ipcListFileTransfers: tauriAdapterMock.ipcListFileTransfers,
   ipcStartFileTransfer: tauriAdapterMock.ipcStartFileTransfer,
 }));
@@ -102,6 +104,7 @@ beforeEach(() => {
   remoteDisplayLauncherMock.prepareRemoteApplicationCatalogForDevice.mockReset();
   tauriAdapterMock.ipcCancelFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockReset();
+  tauriAdapterMock.ipcListFileTransferProviders.mockReset();
   tauriAdapterMock.ipcListFileTransfers.mockReset();
   tauriAdapterMock.ipcStartFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockResolvedValue({
@@ -148,6 +151,25 @@ beforeEach(() => {
   tauriAdapterMock.ipcListFileTransfers.mockResolvedValue({
     ok: true,
     value: [],
+  });
+  tauriAdapterMock.ipcListFileTransferProviders.mockResolvedValue({
+    ok: true,
+    value: [
+      {
+        provider_kind: "mrd-local",
+        display_name: "MRD local file transfer",
+        status: "available",
+        capabilities: ["service.file_transfer.local"],
+        reason: null,
+      },
+      {
+        provider_kind: "r-file",
+        display_name: "R-File external bridge",
+        status: "unimplemented",
+        capabilities: ["service.file_transfer.external_bridge"],
+        reason: "reserved provider bridge",
+      },
+    ],
   });
   tauriAdapterMock.ipcCancelFileTransfer.mockResolvedValue({
     ok: true,
@@ -275,8 +297,27 @@ describe("DeviceDetailPage info tab", () => {
         target_path: "C:\\Users\\tester",
         conflict_policy: "rename",
         transport_hint: "local",
+        provider_hint: "mrd-local",
       });
     });
+  });
+
+  it("shows local and reserved file transfer providers in the file transfer tab", async () => {
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes>
+          <Route path="/devices/:id" element={<DeviceDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(tauriAdapterMock.ipcListFileTransferProviders).toHaveBeenCalled();
+    });
+    expect(screen.getByText("传输 Provider")).toBeInTheDocument();
+    expect(screen.getByText("MRD local file transfer")).toBeInTheDocument();
+    expect(screen.getByText("R-File external bridge")).toBeInTheDocument();
+    expect(screen.getByText("预留")).toBeInTheDocument();
   });
 
   it("shows service-owned file transfer task snapshots in the file transfer tab", async () => {
@@ -316,7 +357,7 @@ describe("DeviceDetailPage info tab", () => {
     expect(screen.getByText("file-transfer-1")).toBeInTheDocument();
     expect(screen.getByText("完成 3/3")).toBeInTheDocument();
     expect(screen.getByText("3 KB / 3 KB")).toBeInTheDocument();
-    expect(screen.getByText("mrd-local")).toBeInTheDocument();
+    expect(screen.getAllByText("mrd-local").length).toBeGreaterThan(0);
   });
 
   it("cancels a running service-owned file transfer task from the file transfer tab", async () => {

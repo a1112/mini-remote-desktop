@@ -19,10 +19,12 @@ import {
 import {
   ipcCancelFileTransfer,
   ipcListDirectory,
+  ipcListFileTransferProviders,
   ipcListFileTransfers,
   ipcStartFileTransfer,
   type FileEntry,
   type FileEntryKind,
+  type FileTransferProviderDescriptor,
   type FileTransferEntry,
   type FileTransferStatus,
   type FileTransferTaskSnapshot,
@@ -777,6 +779,23 @@ function fileTransferByteLabel(transfer: FileTransferTaskSnapshot): string {
   return `${formatFileSize(transfer.copied_bytes)} / ${formatFileSize(transfer.total_bytes)}`;
 }
 
+function fileTransferProviderStatusLabel(
+  status: FileTransferProviderDescriptor["status"]
+): string {
+  switch (status) {
+    case "available":
+      return "可用";
+    case "unimplemented":
+      return "预留";
+    case "unsupported":
+      return "不支持";
+    case "degraded":
+      return "降级";
+    default:
+      return status;
+  }
+}
+
 function isCancellableFileTransfer(status: FileTransferStatus): boolean {
   return status === "queued" || status === "running";
 }
@@ -1132,6 +1151,8 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fileTransfers, setFileTransfers] = useState<FileTransferTaskSnapshot[]>([]);
   const [transferListError, setTransferListError] = useState<string | null>(null);
+  const [fileTransferProviders, setFileTransferProviders] = useState<FileTransferProviderDescriptor[]>([]);
+  const [providerListError, setProviderListError] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
 
   const onlineDevices = devices.filter(d => d.status === "online");
@@ -1148,6 +1169,16 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     setFileTransfers(result.value);
   }, []);
 
+  const refreshFileTransferProviders = useCallback(async () => {
+    const result = await ipcListFileTransferProviders();
+    if (!result.ok) {
+      setProviderListError(result.error.message);
+      return;
+    }
+    setProviderListError(null);
+    setFileTransferProviders(result.value);
+  }, []);
+
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node) && addBtnRef.current && !addBtnRef.current.contains(e.target as Node)) setShowAddMenu(false);
@@ -1158,7 +1189,8 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
 
   useEffect(() => {
     void refreshFileTransfers();
-  }, [refreshFileTransfers]);
+    void refreshFileTransferProviders();
+  }, [refreshFileTransferProviders, refreshFileTransfers]);
 
   const handleAddDevice = (dId: string) => {
     if (addMenuSide === "right") setRightDeviceId(dId);
@@ -1176,6 +1208,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
       target_path: request.targetPath,
       conflict_policy: "rename",
       transport_hint: "local",
+      provider_hint: "mrd-local",
     });
     if (!result.ok) {
       setTransferError(result.error.message);
@@ -1215,7 +1248,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   }
 
   return (
-    <div className={`relative flex h-full overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+    <div className={`relative flex h-full flex-col overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
       {(transferMessage || transferError) && (
         <div
           role="status"
@@ -1317,6 +1350,61 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           )}
         </div>
       )}
+      {(fileTransferProviders.length > 0 || providerListError) && (
+        <div
+          role="region"
+          aria-label="传输 Provider"
+          className={`shrink-0 border-b px-4 py-2 ${
+            isDark
+              ? "border-gray-700 bg-[#202020] text-gray-200"
+              : "border-gray-200 bg-white text-gray-800"
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2">
+              <Server className="h-3.5 w-3.5 text-indigo-500" />
+              <span className="font-medium" style={{ fontSize: 12 }}>传输 Provider</span>
+            </div>
+            {providerListError ? (
+              <span className={isDark ? "text-red-300" : "text-red-700"} style={{ fontSize: 11 }}>
+                读取失败：{providerListError}
+              </span>
+            ) : (
+              fileTransferProviders.map((provider) => (
+                <div key={provider.provider_kind} className={`flex min-w-0 max-w-full items-center gap-2 rounded-md border px-2 py-1 ${
+                  isDark ? "border-gray-700 bg-[#252525]" : "border-gray-200 bg-gray-50"
+                }`}>
+                  <span className="truncate" style={{ fontSize: 11 }}>
+                    {provider.display_name}
+                  </span>
+                  <span className={isDark ? "font-mono text-gray-500" : "font-mono text-gray-400"} style={{ fontSize: 10 }}>
+                    {provider.provider_kind}
+                  </span>
+                  <span
+                    title={provider.reason ?? provider.capabilities?.join(", ") ?? provider.status}
+                    className={`shrink-0 rounded px-1.5 py-0.5 ${
+                      provider.status === "available"
+                        ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
+                        : isDark ? "bg-amber-950 text-amber-300" : "bg-amber-50 text-amber-700"
+                    }`}
+                    style={{ fontSize: 10 }}
+                  >
+                    {fileTransferProviderStatusLabel(provider.status)}
+                  </span>
+                </div>
+              ))
+            )}
+            <button
+              onClick={() => void refreshFileTransferProviders()}
+              className={`rounded-md p-1 transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`}
+              title="刷新传输 Provider"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* Left pane */}
       <div
         className="flex-1 flex flex-col min-w-0"
@@ -1431,6 +1519,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
             </button>
           </div>
         )}
+      </div>
       </div>
     </div>
   );
