@@ -1810,6 +1810,45 @@ async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
     }
 }
 
+/// Revoke a paired device identity via IPC.
+#[tauri::command]
+async fn ipc_revoke_device(device_id: String) -> Result<mrd_ipc::DeviceIdentitySnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RevokeDevice {
+            device_id: DeviceId(device_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::PairingUpdated { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get local device identity and pairing state via IPC.
+#[tauri::command]
+async fn ipc_device_identity_snapshot() -> Result<mrd_ipc::DeviceIdentitySnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::GetDeviceIdentitySnapshot)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DeviceIdentitySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Get LAN peer discovery snapshot via IPC.
 #[tauri::command]
 async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
@@ -3895,6 +3934,8 @@ fn main() {
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
+            ipc_revoke_device,
+            ipc_device_identity_snapshot,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
             ipc_file_transfer_snapshot,

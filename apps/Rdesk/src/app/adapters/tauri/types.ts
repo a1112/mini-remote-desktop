@@ -545,6 +545,22 @@ export interface DeviceInfo {
   is_online: boolean;
 }
 
+export interface PairedDeviceIdentity {
+  device_id: string;
+  display_name: string;
+  certificate_fingerprint?: string | null;
+  trust_status: string;
+  last_seen_ms?: number | null;
+}
+
+export interface DeviceIdentitySnapshot {
+  local_device_id?: string | null;
+  display_name?: string | null;
+  certificate_fingerprint?: string | null;
+  consent_required: boolean;
+  paired_devices: PairedDeviceIdentity[];
+}
+
 export interface LanPeerInfo {
   device_id: string;
   device_name: string;

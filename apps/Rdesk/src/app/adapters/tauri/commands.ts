@@ -12,6 +12,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AdapterResult,
   ClientDiagnostics,
+  DeviceIdentitySnapshot,
   DeviceInfo,
   LanDiscoverySnapshot,
   FileTransferSnapshot,
@@ -550,6 +551,24 @@ export async function ipcRegisterDevice(
  */
 export async function ipcListDevices(): Promise<AdapterResult<DeviceInfo[]>> {
   return invokeAdapter<DeviceInfo[]>('ipc_list_devices');
+}
+
+/**
+ * Revoke a paired device identity via IPC.
+ */
+export async function ipcRevokeDevice(
+  deviceId: string
+): Promise<AdapterResult<DeviceIdentitySnapshot>> {
+  return invokeAdapter<DeviceIdentitySnapshot>('ipc_revoke_device', {
+    deviceId,
+  });
+}
+
+/**
+ * Get local device identity and pairing state via IPC.
+ */
+export async function ipcDeviceIdentitySnapshot(): Promise<AdapterResult<DeviceIdentitySnapshot>> {
+  return invokeAdapter<DeviceIdentitySnapshot>('ipc_device_identity_snapshot');
 }
 
 /**

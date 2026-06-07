@@ -252,7 +252,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTr
   };
 
   const handleRemoveDevice = async (deviceId: string, deviceName: string) => {
-    removeDeviceLocally(deviceId);
+    await removeDeviceLocally(deviceId);
     setContextMenu(null);
     setSubmenuOpen(null);
     await refresh();

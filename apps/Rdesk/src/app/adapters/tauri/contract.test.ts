@@ -346,6 +346,36 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenCalledWith('ipc_list_devices', undefined);
     });
 
+    it('device identity commands call correct command names', async () => {
+      const mockInvoke = getMockInvoke();
+      const snapshot = {
+        local_device_id: 'local-device',
+        display_name: 'Local PC',
+        certificate_fingerprint: null,
+        consent_required: true,
+        paired_devices: [
+          {
+            device_id: 'agent-device',
+            display_name: 'Agent PC',
+            certificate_fingerprint: null,
+            trust_status: 'revoked',
+            last_seen_ms: 1,
+          },
+        ],
+      };
+      mockInvoke.mockResolvedValue(snapshot);
+
+      const revokeResult = await adapter.ipcRevokeDevice('agent-device');
+      const snapshotResult = await adapter.ipcDeviceIdentitySnapshot();
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'ipc_revoke_device', {
+        deviceId: 'agent-device',
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_device_identity_snapshot', undefined);
+      expect(revokeResult.ok && revokeResult.value.paired_devices[0]?.trust_status).toBe('revoked');
+      expect(snapshotResult.ok && snapshotResult.value.local_device_id).toBe('local-device');
+    });
+
     it('LAN discovery commands call correct command names', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue({

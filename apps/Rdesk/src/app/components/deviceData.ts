@@ -3,6 +3,7 @@ import { Laptop, Monitor, Server, Smartphone } from "lucide-react";
 import {
   ipcLanDiscoverySnapshot,
   ipcRefreshLanDiscovery,
+  ipcRevokeDevice,
   type LanPeerInfo,
 } from "../adapters/tauri";
 import { deviceService } from "../services/deviceService";
@@ -132,7 +133,7 @@ export function setDeviceDisabled(deviceId: string, disabled: boolean) {
   });
 }
 
-export function removeDeviceLocally(deviceId: string) {
+export async function removeDeviceLocally(deviceId: string) {
   const state = readDeviceLocalState();
   writeDeviceLocalState({
     ...state,
@@ -140,6 +141,12 @@ export function removeDeviceLocally(deviceId: string) {
     disabled: setMembership(state.disabled, deviceId, false),
     removed: setMembership(state.removed, deviceId, true),
   });
+  if (isTauriRuntime()) {
+    const result = await ipcRevokeDevice(deviceId);
+    if (!result.ok) {
+      console.warn("[deviceData] mrd-service device revoke failed:", result.error.message);
+    }
+  }
 }
 
 function applyDeviceLocalState(devices: Device[]): Device[] {

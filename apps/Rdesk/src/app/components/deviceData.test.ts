@@ -189,10 +189,10 @@ describe("mergeDevices", () => {
     });
   });
 
-  it("hides locally removed peers but never hides the local device", () => {
+  it("hides locally removed peers but never hides the local device", async () => {
     setDeviceDisabled("peer-removed", true);
-    removeDeviceLocally("peer-removed");
-    removeDeviceLocally("local-device");
+    await removeDeviceLocally("peer-removed");
+    await removeDeviceLocally("local-device");
 
     const merged = mergeDevices(
       [],
