@@ -2696,6 +2696,8 @@ describe("RemoteDisplayWindowPage", () => {
             chroma_subsampling: "4:2:0",
             pixel_format: "nv12",
             hdr_enabled: false,
+            color_mode: "full",
+            color_pipeline: "sdr8",
           },
           selected: {
             width: 1920,
@@ -2708,6 +2710,8 @@ describe("RemoteDisplayWindowPage", () => {
             chroma_subsampling: "4:2:0",
             pixel_format: "nv12",
             hdr_enabled: false,
+            color_mode: "full",
+            color_pipeline: "sdr8",
           },
           status: "accepted",
           reason: null,
@@ -2751,6 +2755,8 @@ describe("RemoteDisplayWindowPage", () => {
           chroma_subsampling: "4:2:0",
           pixel_format: "nv12",
           hdr_enabled: false,
+          color_mode: "full",
+          color_pipeline: "sdr8",
         },
       });
     });

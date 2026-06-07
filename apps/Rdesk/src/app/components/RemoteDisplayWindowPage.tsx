@@ -73,6 +73,7 @@ import {
   type CaptureSource,
   type CaptureSourceSelection,
   type MediaAdaptationSnapshot,
+  type MediaProfile,
   type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
@@ -3430,7 +3431,7 @@ export function RemoteDisplayWindowPage() {
               !capabilities.available_encoders.includes("nvenc_h264"))
           ? "WebCodecs 2K144 需要 Windows DXGI + NVENC H.264"
           : null;
-  const buildRemoteMediaProfile = useCallback(() => {
+  const buildRemoteMediaProfile = useCallback((): MediaProfile => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
     const main10 = encoder === "nvenc_hevc_main10";
@@ -3445,6 +3446,8 @@ export function RemoteDisplayWindowPage() {
       chroma_subsampling: "4:2:0",
       pixel_format: main10 ? "p010" : "nv12",
       hdr_enabled: false,
+      color_mode: "full",
+      color_pipeline: main10 ? "hdr_main10" : "sdr8",
     };
   }, [bitrate, encoder, fps, resolution]);
   const buildRemoteAdaptiveMediaConfig = useCallback(

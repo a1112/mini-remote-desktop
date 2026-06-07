@@ -113,6 +113,12 @@ mod wire {
         /// Whether HDR is expected for this media profile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hdr_enabled: Option<bool>,
+        /// GPU-side color transform, for example `full`, `grayscale`, `monochrome`, or `low_chroma`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_mode: Option<String>,
+        /// Bit-depth/transfer pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_pipeline: Option<String>,
     }
 
     impl Default for MediaProfile {
@@ -128,6 +134,8 @@ mod wire {
                 chroma_subsampling: None,
                 pixel_format: None,
                 hdr_enabled: None,
+                color_mode: None,
+                color_pipeline: None,
             }
         }
     }
@@ -1628,12 +1636,15 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("grayscale".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         };
 
         let encoded = serde_json::to_string(&profile).unwrap();
         assert!(encoded.contains("\"codec\":\"hevc\""));
         assert!(encoded.contains("\"chroma_subsampling\":\"4:2:0\""));
         assert!(encoded.contains("\"hdr_enabled\":false"));
+        assert!(encoded.contains("\"color_mode\":\"grayscale\""));
 
         let decoded: MediaProfile = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, profile);

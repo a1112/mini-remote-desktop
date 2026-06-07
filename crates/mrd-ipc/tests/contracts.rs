@@ -31,6 +31,8 @@ fn test_media_profile() -> MediaProfile {
         fps: 144,
         bitrate_mbps: 64,
         codec: "h264".to_string(),
+        color_mode: Some("grayscale".to_string()),
+        color_pipeline: Some("sdr8".to_string()),
         ..MediaProfile::default()
     }
 }
@@ -166,6 +168,8 @@ fn serialize_deserialize_start_lan_remote_session_with_media_profile() {
 
     let json = serde_json::to_string(&request).unwrap();
     assert!(json.contains("requested_profile"));
+    assert!(json.contains("color_mode"));
+    assert!(json.contains("grayscale"));
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);
@@ -179,6 +183,7 @@ fn serialize_deserialize_update_media_profile() {
     };
 
     let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("color_pipeline"));
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
     assert_eq!(request, deserialized);

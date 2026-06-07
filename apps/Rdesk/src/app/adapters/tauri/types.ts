@@ -775,6 +775,8 @@ export interface MediaProfile {
   chroma_subsampling?: string | null;
   pixel_format?: string | null;
   hdr_enabled?: boolean | null;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | null;
 }
 
 export interface MediaProfileNegotiation {

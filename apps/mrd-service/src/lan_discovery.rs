@@ -3561,8 +3561,14 @@ fn missing_capability_groups(
 
 fn format_media_profile(profile: &MediaProfile) -> String {
     format!(
-        "{}x{} @ {} FPS / {} Mbps / {}",
-        profile.width, profile.height, profile.fps, profile.bitrate_mbps, profile.codec
+        "{}x{} @ {} FPS / {} Mbps / {} / color_mode={} / color_pipeline={}",
+        profile.width,
+        profile.height,
+        profile.fps,
+        profile.bitrate_mbps,
+        profile.codec,
+        profile.color_mode.as_deref().unwrap_or("full"),
+        profile.color_pipeline.as_deref().unwrap_or("sdr8")
     )
 }
 
@@ -9346,12 +9352,19 @@ fn lan_media_codec_name(codec: u8) -> &'static str {
 }
 
 fn lan_media_profile_id(profile: &MediaProfile) -> u32 {
-    let mut bytes = Vec::with_capacity(20 + profile.codec.len());
+    let color_mode = profile.color_mode.as_deref().unwrap_or("full");
+    let color_pipeline = profile.color_pipeline.as_deref().unwrap_or("sdr8");
+    let mut bytes =
+        Vec::with_capacity(22 + profile.codec.len() + color_mode.len() + color_pipeline.len());
     bytes.extend_from_slice(&profile.width.to_le_bytes());
     bytes.extend_from_slice(&profile.height.to_le_bytes());
     bytes.extend_from_slice(&profile.fps.to_le_bytes());
     bytes.extend_from_slice(&profile.bitrate_mbps.to_le_bytes());
     bytes.extend_from_slice(profile.codec.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(color_mode.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(color_pipeline.as_bytes());
     fnv1a64(&bytes) as u32
 }
 
@@ -9442,6 +9455,19 @@ fn validate_media_profile(profile: &MediaProfile) -> Result<()> {
     if profile.width == 0 || profile.height == 0 || profile.fps == 0 || profile.bitrate_mbps == 0 {
         anyhow::bail!("media profile width, height, fps and bitrate must be greater than zero");
     }
+    if let Some(color_mode) = profile.color_mode.as_deref() {
+        if !matches!(
+            color_mode,
+            "full" | "grayscale" | "monochrome" | "low_chroma"
+        ) {
+            anyhow::bail!("unsupported media profile color_mode: {color_mode}");
+        }
+    }
+    if let Some(color_pipeline) = profile.color_pipeline.as_deref() {
+        if !matches!(color_pipeline, "sdr8" | "hdr_main10") {
+            anyhow::bail!("unsupported media profile color_pipeline: {color_pipeline}");
+        }
+    }
     Ok(())
 }
 
@@ -9458,6 +9484,7 @@ fn normalize_lan_media_profile(profile: &mut MediaProfile) {
             profile.chroma_subsampling = None;
             profile.pixel_format = None;
             profile.hdr_enabled = None;
+            apply_lan_color_profile_defaults(profile);
         }
     }
 }
@@ -9474,6 +9501,7 @@ fn lan_runtime_media_profile(
         profile.chroma_subsampling = Some("4:2:0".to_string());
         profile.pixel_format = Some("nv12".to_string());
         profile.hdr_enabled = Some(false);
+        apply_lan_color_profile_defaults(&mut profile);
     } else {
         apply_lan_media_profile_defaults(&mut profile);
     }
@@ -9498,6 +9526,24 @@ fn apply_lan_media_profile_defaults(profile: &mut MediaProfile) {
         if profile.hdr_enabled.is_none() {
             profile.hdr_enabled = Some(false);
         }
+    }
+    apply_lan_color_profile_defaults(profile);
+}
+
+fn apply_lan_color_profile_defaults(profile: &mut MediaProfile) {
+    if profile.color_mode.is_none() {
+        profile.color_mode = Some("full".to_string());
+    }
+    if profile.color_pipeline.is_none() {
+        let main10 = profile
+            .codec_profile
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("main10"))
+            || profile.bit_depth == Some(10)
+            || profile.pixel_format.as_deref().is_some_and(|value| {
+                value.eq_ignore_ascii_case("p010") || value.eq_ignore_ascii_case("p016")
+            });
+        profile.color_pipeline = Some(if main10 { "hdr_main10" } else { "sdr8" }.to_string());
     }
 }
 
@@ -9709,6 +9755,18 @@ fn fnv1a64_media_metadata(
     hash = fnv1a64_extend(hash, &profile.fps.to_le_bytes());
     hash = fnv1a64_extend(hash, &profile.bitrate_mbps.to_le_bytes());
     hash = fnv1a64_extend(hash, profile.codec.as_bytes());
+    hash = fnv1a64_extend(
+        hash,
+        profile.color_mode.as_deref().unwrap_or("full").as_bytes(),
+    );
+    hash = fnv1a64_extend(
+        hash,
+        profile
+            .color_pipeline
+            .as_deref()
+            .unwrap_or("sdr8")
+            .as_bytes(),
+    );
     hash = fnv1a64_extend(hash, &sequence.to_le_bytes());
     hash = fnv1a64_extend(hash, &timestamp_us.to_le_bytes());
     hash = fnv1a64_extend(hash, &(encoded_payload_len as u64).to_le_bytes());
@@ -12226,6 +12284,8 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("low_chroma".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         }))
         .unwrap();
 
@@ -12238,6 +12298,41 @@ mod tests {
         );
         assert_eq!(negotiation.selected.pixel_format.as_deref(), Some("nv12"));
         assert_eq!(negotiation.selected.hdr_enabled, Some(false));
+        assert_eq!(
+            negotiation.selected.color_mode.as_deref(),
+            Some("low_chroma")
+        );
+        assert_eq!(negotiation.selected.color_pipeline.as_deref(), Some("sdr8"));
+    }
+
+    #[test]
+    fn media_profile_negotiation_defaults_and_distinguishes_color_pipeline() {
+        let mut full = MediaProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_mbps: 20,
+            codec: "hevc".to_string(),
+            ..MediaProfile::default()
+        };
+        let mut grayscale = MediaProfile {
+            color_mode: Some("grayscale".to_string()),
+            ..full.clone()
+        };
+        apply_lan_media_profile_defaults(&mut full);
+        apply_lan_media_profile_defaults(&mut grayscale);
+
+        assert_eq!(full.color_mode.as_deref(), Some("full"));
+        assert_eq!(full.color_pipeline.as_deref(), Some("sdr8"));
+        assert_eq!(grayscale.color_mode.as_deref(), Some("grayscale"));
+        assert_ne!(
+            lan_media_profile_id(&full),
+            lan_media_profile_id(&grayscale)
+        );
+        assert_ne!(
+            fnv1a64_media_metadata(&full, 7, 99_000, 4096),
+            fnv1a64_media_metadata(&grayscale, 7, 99_000, 4096)
+        );
     }
 
     #[test]
@@ -14099,6 +14194,8 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         };
         let encoded = encode_lan_media_envelope(LanMediaEnvelope {
             payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
@@ -14239,6 +14336,8 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         };
         app_state.media_profiles.lock().await.set(
             session_id.clone(),

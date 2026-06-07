@@ -2798,6 +2798,8 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         };
 
         registry.set_active_media_profile(session_id.clone(), &profile);

@@ -10,7 +10,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getMockInvoke } from '@/test/mocks/tauri';
 import * as adapter from './index';
-import type { TestConfig } from './types';
+import type { MediaProfile, TestConfig } from './types';
 
 describe('Tauri Adapter Contract', () => {
   beforeEach(() => {
@@ -429,7 +429,7 @@ describe('Tauri Adapter Contract', () => {
     it('ipc_start_lan_remote_session passes requested media profile', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue('session-123');
-      const requestedProfile = {
+      const requestedProfile: MediaProfile = {
         width: 2560,
         height: 1440,
         fps: 144,
@@ -454,12 +454,14 @@ describe('Tauri Adapter Contract', () => {
 
     it('ipc_update_media_profile calls correct command with args', async () => {
       const mockInvoke = getMockInvoke();
-      const requestedProfile = {
+      const requestedProfile: MediaProfile = {
         width: 1920,
         height: 1080,
         fps: 60,
         bitrate_mbps: 20,
         codec: 'h264',
+        color_mode: 'grayscale',
+        color_pipeline: 'sdr8',
       };
       mockInvoke.mockResolvedValue({
         requested: requestedProfile,

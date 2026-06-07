@@ -41,6 +41,8 @@ const DEFAULT_REMOTE_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 const DEFAULT_REMOTE_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
@@ -54,6 +56,8 @@ const DEFAULT_REMOTE_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 function defaultRemoteMediaProfileForTarget(targetOs?: string): MediaProfile {
