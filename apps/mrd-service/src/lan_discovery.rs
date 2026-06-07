@@ -3024,7 +3024,7 @@ fn reconcile_negotiation_to_capture_source(
     negotiation.selected_width = Some(negotiation.selected.width);
     negotiation.selected_height = Some(negotiation.selected.height);
 
-    if negotiation.selected != negotiation.requested {
+    if !lan_media_profiles_equivalent(&negotiation.selected, &negotiation.requested) {
         negotiation.status = "downgraded".to_string();
         negotiation.reason = downgrade_reason
             .clone()
@@ -3063,7 +3063,7 @@ fn reconcile_negotiation_to_display_mode(
     negotiation.selected_width = Some(negotiation.selected.width);
     negotiation.selected_height = Some(negotiation.selected.height);
 
-    if negotiation.selected != negotiation.requested {
+    if !lan_media_profiles_equivalent(&negotiation.selected, &negotiation.requested) {
         negotiation.status = "downgraded".to_string();
         if changed_for_display {
             let reason = "matched active display mode dimensions and refresh rate".to_string();
@@ -9490,7 +9490,7 @@ fn negotiate_media_profile(
     selected.bitrate_mbps = selected.bitrate_mbps.min(LAN_MEDIA_TARGET_BITRATE_MBPS);
     normalize_lan_media_profile(&mut selected);
 
-    let changed = selected != requested;
+    let changed = !lan_media_profiles_equivalent(&selected, &requested);
     Ok(MediaProfileNegotiation {
         requested,
         selected: selected.clone(),
@@ -9547,6 +9547,16 @@ fn normalize_lan_media_profile(profile: &mut MediaProfile) {
             apply_lan_color_profile_defaults(profile);
         }
     }
+}
+
+fn normalized_lan_media_profile(profile: &MediaProfile) -> MediaProfile {
+    let mut normalized = profile.clone();
+    normalize_lan_media_profile(&mut normalized);
+    normalized
+}
+
+fn lan_media_profiles_equivalent(left: &MediaProfile, right: &MediaProfile) -> bool {
+    normalized_lan_media_profile(left) == normalized_lan_media_profile(right)
 }
 
 fn lan_runtime_media_profile(
@@ -13055,6 +13065,10 @@ mod tests {
         ]
     }
 
+    fn test_h264_receiver_media_capabilities() -> Vec<String> {
+        vec!["decode.software".to_string()]
+    }
+
     fn test_quic_media_frame(frame_id: u32, is_keyframe: bool) -> QuicMediaFrame {
         QuicMediaFrame {
             payload_type: QuicMediaPayloadType::AccessUnit,
@@ -14391,7 +14405,7 @@ mod tests {
 
     #[test]
     fn lan_media_v2_envelope_round_trips_h264_access_unit() {
-        let profile = MediaProfile {
+        let mut profile = MediaProfile {
             width: 1920,
             height: 1080,
             fps: 144,
@@ -14399,6 +14413,7 @@ mod tests {
             codec: "h264".to_string(),
             ..MediaProfile::default()
         };
+        apply_lan_media_profile_defaults(&mut profile);
         let encoded = encode_lan_media_envelope(LanMediaEnvelope {
             payload_type: LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT,
             codec: LAN_MEDIA_CODEC_H264,
@@ -14509,7 +14524,7 @@ mod tests {
     async fn lan_media_v3_frame_converts_to_receiver_envelope() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("media-v3-session".to_string());
-        let profile = MediaProfile {
+        let mut profile = MediaProfile {
             width: 1920,
             height: 1080,
             fps: 144,
@@ -14517,6 +14532,7 @@ mod tests {
             codec: "h264".to_string(),
             ..MediaProfile::default()
         };
+        apply_lan_media_profile_defaults(&mut profile);
         app_state.media_profiles.lock().await.set(
             session_id.clone(),
             MediaProfileNegotiation {
@@ -15966,6 +15982,11 @@ mod tests {
                 receiver_active: false,
             },
         );
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .set(session_id.clone(), test_h264_receiver_media_capabilities());
 
         let negotiation = accept_lan_media_profile_update(
             &app_state,
@@ -16461,6 +16482,11 @@ mod tests {
                 reason: None,
             },
         );
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .set(session_id.clone(), test_h264_receiver_media_capabilities());
 
         let negotiation = accept_lan_media_profile_update(
             &app_state,
