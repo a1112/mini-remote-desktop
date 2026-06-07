@@ -338,6 +338,7 @@ impl LanDiscoveryState {
             service_build_id: announcement.service_build_id,
             media_protocol_version: announcement.media_protocol_version,
             media_capabilities: announcement.media_capabilities,
+            wake_mac_address: announcement.wake_mac_address,
             last_seen_ms: now_ms(),
         };
 
@@ -430,6 +431,15 @@ impl LanDiscoveryState {
             capabilities
         })
     }
+
+    pub async fn peer_wake_mac_address(&self, device_id: &DeviceId) -> Option<String> {
+        self.prune_stale_peers().await;
+        self.peers
+            .lock()
+            .await
+            .get(&device_id.0)
+            .and_then(|peer| peer.wake_mac_address.clone())
+    }
 }
 
 impl Default for LanDiscoveryState {
@@ -450,6 +460,7 @@ struct StoredLanPeer {
     service_build_id: Option<String>,
     media_protocol_version: Option<u32>,
     media_capabilities: Vec<String>,
+    wake_mac_address: Option<String>,
     last_seen_ms: u64,
 }
 
@@ -690,6 +701,8 @@ struct LanAnnouncement {
     media_protocol_version: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     media_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wake_mac_address: Option<String>,
     timestamp_ms: u64,
 }
 
@@ -3012,8 +3025,40 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
+        wake_mac_address: wake_mac_address_from_env(),
         timestamp_ms: now_ms(),
     })
+}
+
+fn wake_mac_address_from_env() -> Option<String> {
+    wake_mac_address_from_lookup(|key| std::env::var(key).ok())
+}
+
+fn wake_mac_address_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let value = lookup("MRD_WAKE_MAC_ADDRESS")?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    normalize_wake_mac_address(value).ok()
+}
+
+fn normalize_wake_mac_address(value: &str) -> Result<String> {
+    let hex = value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() != 12 {
+        anyhow::bail!("Wake-on-LAN MAC address must contain 12 hex digits");
+    }
+
+    let mut bytes = Vec::with_capacity(6);
+    for index in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[index..index + 2], 16)
+            .context("invalid Wake-on-LAN MAC address")?;
+        bytes.push(format!("{byte:02X}"));
+    }
+    Ok(bytes.join(":"))
 }
 
 fn service_build_id() -> String {
@@ -10617,6 +10662,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -10653,6 +10699,7 @@ mod tests {
                     service_build_id: Some("build-a".to_string()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: lan_media_capabilities(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -10861,6 +10908,15 @@ mod tests {
         assert_eq!(build_id, "peer-runtime-build");
     }
 
+    #[test]
+    fn wake_mac_address_from_lookup_normalizes_hex_separators() {
+        let mac = wake_mac_address_from_lookup(|key| {
+            (key == "MRD_WAKE_MAC_ADDRESS").then(|| "aa-bb:cc dd.ee.ff".to_string())
+        });
+
+        assert_eq!(mac.as_deref(), Some("AA:BB:CC:DD:EE:FF"));
+    }
+
     #[tokio::test]
     async fn peer_control_addr_returns_discovered_endpoint() {
         let state = LanDiscoveryState::default();
@@ -10879,6 +10935,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),
@@ -10891,6 +10948,40 @@ mod tests {
             .expect("peer addr");
 
         assert_eq!(addr.to_string(), "192.168.1.50:21117");
+    }
+
+    #[tokio::test]
+    async fn peer_wake_mac_address_returns_discovered_wol_mac() {
+        let state = LanDiscoveryState::default();
+        state
+            .upsert_peer(
+                LanAnnouncement {
+                    magic: DISCOVERY_MAGIC.to_string(),
+                    app_id: DISCOVERY_APP_ID.to_string(),
+                    instance_id: "remote-instance".to_string(),
+                    device_id: "remote-device".to_string(),
+                    device_name: "Remote Device".to_string(),
+                    device_type: "rdesk".to_string(),
+                    protocol_version: 1,
+                    discovery_port: 21117,
+                    transports: vec!["webrtc".to_string()],
+                    service_build_id: None,
+                    media_protocol_version: None,
+                    media_capabilities: Vec::new(),
+                    wake_mac_address: Some("AA:BB:CC:DD:EE:FF".to_string()),
+                    timestamp_ms: now_ms(),
+                },
+                "192.168.1.50:21116".parse().unwrap(),
+            )
+            .await;
+
+        assert_eq!(
+            state
+                .peer_wake_mac_address(&DeviceId("remote-device".to_string()))
+                .await
+                .as_deref(),
+            Some("AA:BB:CC:DD:EE:FF")
+        );
     }
 
     #[tokio::test]
@@ -10977,6 +11068,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11096,6 +11188,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11222,6 +11315,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11371,6 +11465,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11619,6 +11714,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11767,6 +11863,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: vec![LAN_INPUT_CONTROL_CAPABILITY.to_string()],
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -11988,6 +12085,7 @@ mod tests {
                     service_build_id: Some(service_build_id()),
                     media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
                     media_capabilities: lan_media_capabilities(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 service_addr,
@@ -12101,6 +12199,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 peer_addr,
@@ -12146,6 +12245,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 peer_addr,
@@ -12184,6 +12284,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "127.0.0.1:21116".parse().unwrap(),
@@ -12218,6 +12319,7 @@ mod tests {
                     service_build_id: None,
                     media_protocol_version: None,
                     media_capabilities: Vec::new(),
+                    wake_mac_address: None,
                     timestamp_ms: now_ms(),
                 },
                 "192.168.1.50:21116".parse().unwrap(),

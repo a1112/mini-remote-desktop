@@ -1755,9 +1755,9 @@ mod tests {
             IpcResponse::DeviceActionRequested { result } => {
                 assert_eq!(result.device_id, DeviceId("local-device".to_string()));
                 assert_eq!(result.action, mrd_ipc::DeviceActionKind::WakeOnLan);
-                assert!(result.accepted);
+                assert!(!result.accepted);
                 assert!(!result.supported);
-                assert!(result.message.contains("provider is reserved"));
+                assert!(result.message.contains("MRD_WAKE_MAC_ADDRESS"));
             }
             other => panic!("expected device action response, got {other:?}"),
         }

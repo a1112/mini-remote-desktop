@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    sync::Arc,
+};
 
 use mrd_ipc::{
     DeviceActionKind, DeviceActionResult, DeviceIdentitySnapshot, DeviceInfo, IpcResponse,
@@ -119,16 +122,30 @@ pub async fn request_device_action(
             .any(|identity| identity.device_id == device_id);
 
     let (accepted, supported, message) = match action {
-        DeviceActionKind::WakeOnLan => (
-            known_device,
-            false,
-            if known_device {
-                "Wake-on-LAN provider is reserved; no MAC address binding is available yet."
-                    .to_string()
-            } else {
-                "Device is not known to the local service.".to_string()
+        DeviceActionKind::WakeOnLan => match app_state
+            .lan_discovery
+            .peer_wake_mac_address(&device_id)
+            .await
+        {
+            Some(mac_address) => match send_wake_on_lan_magic_packet(&mac_address).await {
+                Ok(()) => (
+                    true,
+                    true,
+                    format!("Wake-on-LAN magic packet sent to {mac_address}."),
+                ),
+                Err(error) => (false, true, error.to_string()),
             },
-        ),
+            None if known_device => (
+                false,
+                false,
+                "Wake-on-LAN requires the peer to advertise MRD_WAKE_MAC_ADDRESS.".to_string(),
+            ),
+            None => (
+                false,
+                false,
+                "Device is not known to the local service.".to_string(),
+            ),
+        },
         DeviceActionKind::RemoteTerminal => (
             false,
             false,
@@ -155,5 +172,55 @@ pub async fn request_device_action(
             supported,
             message,
         },
+    }
+}
+
+async fn send_wake_on_lan_magic_packet(mac_address: &str) -> anyhow::Result<()> {
+    let packet = wake_on_lan_magic_packet(mac_address)?;
+    let socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+    socket.set_broadcast(true)?;
+    socket
+        .send_to(&packet, SocketAddrV4::new(Ipv4Addr::BROADCAST, 9))
+        .await?;
+    Ok(())
+}
+
+fn wake_on_lan_magic_packet(mac_address: &str) -> anyhow::Result<[u8; 102]> {
+    let mac = parse_mac_address(mac_address)?;
+    let mut packet = [0xFF_u8; 102];
+    for chunk in packet[6..].chunks_exact_mut(6) {
+        chunk.copy_from_slice(&mac);
+    }
+    Ok(packet)
+}
+
+fn parse_mac_address(mac_address: &str) -> anyhow::Result<[u8; 6]> {
+    let hex = mac_address
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>();
+    if hex.len() != 12 {
+        anyhow::bail!("Wake-on-LAN MAC address must contain 12 hex digits");
+    }
+
+    let mut mac = [0_u8; 6];
+    for (index, chunk_start) in (0..hex.len()).step_by(2).enumerate() {
+        mac[index] = u8::from_str_radix(&hex[chunk_start..chunk_start + 2], 16)?;
+    }
+    Ok(mac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wake_on_lan_magic_packet_repeats_mac_sixteen_times() {
+        let packet = wake_on_lan_magic_packet("AA:bb-CC:dd-EE:ff").expect("magic packet");
+
+        assert_eq!(&packet[..6], &[0xFF; 6]);
+        for chunk in packet[6..].chunks_exact(6) {
+            assert_eq!(chunk, &[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        }
     }
 }
