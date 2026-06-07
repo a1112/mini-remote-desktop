@@ -250,7 +250,7 @@ pub async fn send_control_input(
             .control_input()
             .lock()
             .await
-            .handle_event(&event)
+            .handle_session_event(&session_id, &event)
             .map_err(Into::into)
     };
 
@@ -547,7 +547,7 @@ async fn release_control_input_for_terminal_session(
             .control_input()
             .lock()
             .await
-            .handle_event(&ControlInputEvent::ReleaseAll)
+            .handle_session_event(session_id, &ControlInputEvent::ReleaseAll)
             .map(|_| ())
             .map_err(Into::into)
     };

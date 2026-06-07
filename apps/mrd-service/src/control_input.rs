@@ -6,6 +6,7 @@ use mrd_ipc::{
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
 };
 use mrd_proto::SessionId;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlInputResult {
@@ -37,6 +38,7 @@ pub struct ControlInputRegistry {
     injector: TrackedInputInjector<Box<dyn InputInjector>>,
     reliable: ControlLaneCounters,
     realtime: ControlLaneCounters,
+    last_realtime_mouse_move_by_session: HashMap<SessionId, (i32, i32)>,
 }
 
 impl ControlInputRegistry {
@@ -61,6 +63,7 @@ impl ControlInputRegistry {
             injector: TrackedInputInjector::new(Box::new(injector)),
             reliable: ControlLaneCounters::default(),
             realtime: ControlLaneCounters::default(),
+            last_realtime_mouse_move_by_session: HashMap::new(),
         }
     }
 
@@ -72,8 +75,33 @@ impl ControlInputRegistry {
         &mut self,
         event: &ControlInputEvent,
     ) -> Result<ControlInputResult, InputError> {
+        self.handle_event_inner(None, event)
+    }
+
+    pub fn handle_session_event(
+        &mut self,
+        session_id: &SessionId,
+        event: &ControlInputEvent,
+    ) -> Result<ControlInputResult, InputError> {
+        self.handle_event_inner(Some(session_id), event)
+    }
+
+    fn handle_event_inner(
+        &mut self,
+        session_id: Option<&SessionId>,
+        event: &ControlInputEvent,
+    ) -> Result<ControlInputResult, InputError> {
         let lane = input_lane(event);
         counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).accepted_messages += 1;
+
+        if self.should_coalesce_realtime_event(session_id, event) {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
+                .coalesced_messages += 1;
+            return Ok(ControlInputResult {
+                lane,
+                event_count: 0,
+            });
+        }
 
         let result: Result<u32, InputError> = match event {
             ControlInputEvent::ReleaseAll => self
@@ -87,6 +115,7 @@ impl ControlInputRegistry {
 
         match result {
             Ok(event_count) => {
+                self.record_successful_realtime_event(session_id, event);
                 counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
                     .injected_messages += u64::from(event_count);
                 Ok(ControlInputResult { lane, event_count })
@@ -97,6 +126,43 @@ impl ControlInputRegistry {
                 counter.last_error = Some(error.to_string());
                 Err(error)
             }
+        }
+    }
+
+    fn should_coalesce_realtime_event(
+        &self,
+        session_id: Option<&SessionId>,
+        event: &ControlInputEvent,
+    ) -> bool {
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        match *event {
+            ControlInputEvent::MouseMove { x, y } => self
+                .last_realtime_mouse_move_by_session
+                .get(session_id)
+                .is_some_and(|last| *last == (x, y)),
+            _ => false,
+        }
+    }
+
+    fn record_successful_realtime_event(
+        &mut self,
+        session_id: Option<&SessionId>,
+        event: &ControlInputEvent,
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        match *event {
+            ControlInputEvent::MouseMove { x, y } => {
+                self.last_realtime_mouse_move_by_session
+                    .insert(session_id.clone(), (x, y));
+            }
+            ControlInputEvent::ReleaseAll => {
+                self.last_realtime_mouse_move_by_session.remove(session_id);
+            }
+            _ => {}
         }
     }
 
@@ -277,6 +343,54 @@ mod tests {
             input_lane(&ControlInputEvent::MouseHorizontalWheel { delta: 120 }),
             ControlInputLane::Realtime
         );
+    }
+
+    #[test]
+    fn duplicate_mouse_moves_are_coalesced_on_realtime_lane() {
+        let mut registry =
+            ControlInputRegistry::with_injector(mrd_input::RecordingInputInjector::available());
+        let session_id = SessionId("control-session".to_string());
+
+        let first = registry
+            .handle_session_event(&session_id, &ControlInputEvent::MouseMove { x: 10, y: 20 })
+            .expect("first mouse move");
+        let duplicate = registry
+            .handle_session_event(&session_id, &ControlInputEvent::MouseMove { x: 10, y: 20 })
+            .expect("duplicate mouse move");
+        let snapshot = registry.snapshot(session_id);
+
+        assert_eq!(first.event_count, 1);
+        assert_eq!(duplicate.event_count, 0);
+        assert_eq!(snapshot.realtime.accepted_messages, 2);
+        assert_eq!(snapshot.realtime.injected_messages, 1);
+        assert_eq!(snapshot.realtime.coalesced_messages, 1);
+    }
+
+    #[test]
+    fn mouse_move_coalescing_is_scoped_to_session() {
+        let mut registry =
+            ControlInputRegistry::with_injector(mrd_input::RecordingInputInjector::available());
+        let first_session = SessionId("first-control-session".to_string());
+        let second_session = SessionId("second-control-session".to_string());
+
+        registry
+            .handle_session_event(
+                &first_session,
+                &ControlInputEvent::MouseMove { x: 10, y: 20 },
+            )
+            .expect("first session mouse move");
+        let second = registry
+            .handle_session_event(
+                &second_session,
+                &ControlInputEvent::MouseMove { x: 10, y: 20 },
+            )
+            .expect("second session same mouse move");
+        let snapshot = registry.snapshot(first_session);
+
+        assert_eq!(second.event_count, 1);
+        assert_eq!(snapshot.realtime.accepted_messages, 2);
+        assert_eq!(snapshot.realtime.injected_messages, 2);
+        assert_eq!(snapshot.realtime.coalesced_messages, 0);
     }
 
     #[test]

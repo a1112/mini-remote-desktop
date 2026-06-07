@@ -209,7 +209,7 @@ async fn accept_lan_control_input(
         .control_input()
         .lock()
         .await
-        .handle_event(&event)
+        .handle_session_event(session_id, &event)
         .map_err(Into::into)
 }
 
