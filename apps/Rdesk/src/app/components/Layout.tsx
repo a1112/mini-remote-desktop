@@ -33,6 +33,7 @@ export function Layout() {
           collapsed={collapsed}
           onOpenConnections={() => setShowConnections(true)}
           onOpenSettings={() => setShowSettings(true)}
+          onOpenTransfers={() => setShowTransfers(true)}
         />
         <div className="flex flex-col flex-1 overflow-hidden">
           <TitleBar

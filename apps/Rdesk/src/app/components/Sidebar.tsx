@@ -41,6 +41,7 @@ interface SidebarProps {
   collapsed: boolean;
   onOpenConnections: () => void;
   onOpenSettings: () => void;
+  onOpenTransfers: () => void;
 }
 
 const navItems = [
@@ -75,7 +76,7 @@ type DeviceMenuItem = {
 
 const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
 
-export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
+export function Sidebar({ collapsed, onOpenConnections, onOpenSettings, onOpenTransfers }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
   const [devicesExpanded, setDevicesExpanded] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -238,7 +239,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     if (isContextOnline) {
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
-        { icon: FolderIcon, label: "文件传输", disabled: true, title: unsupportedDeviceActionTitle },
+        { icon: FolderIcon, label: "文件传输", action: () => { onOpenTransfers(); setContextMenu(null); } },
         { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
         { type: "divider" as const }
       );
@@ -310,7 +311,16 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
     { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
     { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Info, label: "设备信息", disabled: true, title: unsupportedDeviceActionTitle },
+    {
+      icon: Info,
+      label: "设备信息",
+      action: () => {
+        if (!contextMenuDevice) return;
+        navigate(`/devices/${contextMenuDevice.id}`);
+        setContextMenu(null);
+        setSubmenuOpen(null);
+      },
+    },
   ];
 
   return (
@@ -691,6 +701,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                           key={subIndex}
                           disabled={subItem.disabled}
                           title={subItem.title}
+                          onClick={() => { if (subItem.action) void subItem.action(); }}
                           className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
                             subItem.disabled
                               ? isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-400 cursor-not-allowed"

@@ -27,6 +27,9 @@ const serviceMock = vi.hoisted(() => ({
   renameDevice: vi.fn(),
   unbindDevice: vi.fn(),
 }));
+const layoutActionMock = vi.hoisted(() => ({
+  openTransfers: vi.fn(),
+}));
 
 vi.mock("./ThemeContext", () => ({
   useTheme: () => ({
@@ -87,6 +90,7 @@ function renderSidebar() {
         collapsed={false}
         onOpenConnections={vi.fn()}
         onOpenSettings={vi.fn()}
+        onOpenTransfers={layoutActionMock.openTransfers}
       />
     </MemoryRouter>
   );
@@ -110,12 +114,12 @@ describe("Sidebar device actions", () => {
     };
   });
 
-  it("disables device menu entries that do not have a real implementation", () => {
+  it("disables only device menu entries that do not have a real implementation", () => {
     renderSidebar();
 
     openDeviceMenu();
 
-    expect(screen.getByRole("button", { name: "文件传输" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "文件传输" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "收藏设备" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "禁用设备" })).toBeDisabled();
@@ -127,7 +131,18 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "设备信息" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "设备信息" })).toBeEnabled();
+  });
+
+  it("opens the service-backed transfer panel from an online device menu", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "文件传输" }));
+
+    expect(layoutActionMock.openTransfers).toHaveBeenCalled();
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {
