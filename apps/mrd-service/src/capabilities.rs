@@ -2128,9 +2128,7 @@ mod tests {
             None,
         );
 
-        let selected = evaluation
-            .selected_profile
-            .expect("selected media profile");
+        let selected = evaluation.selected_profile.expect("selected media profile");
         assert_eq!(selected.color_mode.as_deref(), Some("full"));
         assert_eq!(selected.color_pipeline.as_deref(), Some("sdr8"));
     }

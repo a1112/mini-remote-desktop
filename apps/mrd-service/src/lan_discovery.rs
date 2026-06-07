@@ -2516,33 +2516,47 @@ async fn accept_lan_device_action_request(
     let is_local_target = local_device_id
         .as_ref()
         .is_some_and(|device_id| device_id == target_device_id);
-    let message = if is_local_target {
+    let (accepted, supported, message) = if is_local_target {
         match action {
-            DeviceActionKind::RemoteTerminal => {
-                "Remote terminal requires explicit peer consent and a service-owned command executor."
-            }
-            DeviceActionKind::Restart => {
-                "Remote restart requires explicit peer consent and a privileged service executor."
-            }
-            DeviceActionKind::Shutdown => {
-                "Remote shutdown requires explicit peer consent and a privileged service executor."
-            }
-            DeviceActionKind::Disconnect => {
-                "Disconnect is handled by the requesting service session registry."
-            }
-            DeviceActionKind::WakeOnLan => {
-                "Wake-on-LAN must be sent by the requesting device before the peer is awake."
-            }
+            DeviceActionKind::RemoteTerminal => (
+                true,
+                false,
+                "Remote terminal request reserved; waiting for explicit peer consent and a service-owned command executor.",
+            ),
+            DeviceActionKind::Restart => (
+                false,
+                false,
+                "Remote restart requires explicit peer consent and a privileged service executor.",
+            ),
+            DeviceActionKind::Shutdown => (
+                false,
+                false,
+                "Remote shutdown requires explicit peer consent and a privileged service executor.",
+            ),
+            DeviceActionKind::Disconnect => (
+                false,
+                false,
+                "Disconnect is handled by the requesting service session registry.",
+            ),
+            DeviceActionKind::WakeOnLan => (
+                false,
+                false,
+                "Wake-on-LAN must be sent by the requesting device before the peer is awake.",
+            ),
         }
     } else {
-        "Device action target does not match this local service."
+        (
+            false,
+            false,
+            "Device action target does not match this local service.",
+        )
     };
 
     DeviceActionResult {
         device_id: DeviceId(target_device_id.to_string()),
         action,
-        accepted: false,
-        supported: false,
+        accepted,
+        supported,
         message: message.to_string(),
     }
 }
@@ -11386,6 +11400,53 @@ mod tests {
         assert!(!result.supported);
         assert!(result.message.contains("consent"));
         handler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn peer_accepts_remote_terminal_as_reserved_consent_gated_action() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("target-device".to_string()), "Target".to_string());
+
+        let result = accept_lan_device_action_request(
+            &app_state,
+            "target-device",
+            mrd_ipc::DeviceActionKind::RemoteTerminal,
+        )
+        .await;
+
+        assert_eq!(result.device_id, DeviceId("target-device".to_string()));
+        assert_eq!(result.action, mrd_ipc::DeviceActionKind::RemoteTerminal);
+        assert!(result.accepted);
+        assert!(!result.supported);
+        assert!(result.message.contains("consent"));
+        assert!(result.message.contains("command executor"));
+    }
+
+    #[tokio::test]
+    async fn peer_rejects_remote_power_actions_until_privileged_executor_exists() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(DeviceId("target-device".to_string()), "Target".to_string());
+
+        for action in [
+            mrd_ipc::DeviceActionKind::Restart,
+            mrd_ipc::DeviceActionKind::Shutdown,
+        ] {
+            let result =
+                accept_lan_device_action_request(&app_state, "target-device", action).await;
+
+            assert_eq!(result.action, action);
+            assert!(!result.accepted);
+            assert!(!result.supported);
+            assert!(result.message.contains("privileged service executor"));
+        }
     }
 
     #[cfg(windows)]
