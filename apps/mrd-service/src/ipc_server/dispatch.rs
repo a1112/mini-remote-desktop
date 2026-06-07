@@ -55,6 +55,8 @@ impl IpcServer {
 
             IpcRequest::ListFileTransfers => files::list_file_transfers(&self.app_state).await,
 
+            IpcRequest::ListFileTransferProviders => files::list_file_transfer_providers(),
+
             IpcRequest::CancelFileTransfer { transfer_id } => {
                 files::cancel_file_transfer(&self.app_state, transfer_id).await
             }

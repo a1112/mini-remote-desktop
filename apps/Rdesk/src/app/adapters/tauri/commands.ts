@@ -43,6 +43,7 @@ import type {
   ControlInputAccepted,
   ControlInputEvent,
   DirectoryList,
+  FileTransferProviderDescriptor,
   FileTransferStartRequest,
   FileTransferTaskSnapshot,
   AdaptiveMediaConfig,
@@ -647,6 +648,17 @@ export async function ipcListFileTransfers(): Promise<AdapterResult<FileTransfer
     undefined,
     { type: 'ListFileTransfers' },
     responseField<FileTransferTaskSnapshot[]>('transfers')
+  );
+}
+
+export async function ipcListFileTransferProviders(): Promise<
+  AdapterResult<FileTransferProviderDescriptor[]>
+> {
+  return invokeBridgeOrTauri<FileTransferProviderDescriptor[]>(
+    'ipc_list_file_transfer_providers',
+    undefined,
+    { type: 'ListFileTransferProviders' },
+    responseField<FileTransferProviderDescriptor[]>('providers')
   );
 }
 

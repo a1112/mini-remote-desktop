@@ -1995,6 +1995,25 @@ async fn ipc_list_file_transfers() -> Result<Vec<mrd_ipc::FileTransferTaskSnapsh
     }
 }
 
+/// List available and reserved file transfer providers through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_file_transfer_providers(
+) -> Result<Vec<mrd_ipc::FileTransferProviderDescriptor>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListFileTransferProviders)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferProviderList { providers } => Ok(providers),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Cancel a service-owned file transfer task through mrd-service IPC.
 #[tauri::command]
 async fn ipc_cancel_file_transfer(
@@ -4151,6 +4170,7 @@ fn main() {
             ipc_list_directory,
             ipc_start_file_transfer,
             ipc_list_file_transfers,
+            ipc_list_file_transfer_providers,
             ipc_cancel_file_transfer,
             ipc_wake_on_lan,
             ipc_request_remote_device_power_action,

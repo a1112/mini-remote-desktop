@@ -495,6 +495,23 @@ mod wire {
         pub provider_hint: Option<String>,
     }
 
+    /// One file transfer provider known by the local service.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferProviderDescriptor {
+        /// Stable provider id used by `FileTransferStartRequest.provider_hint`.
+        pub provider_kind: String,
+        /// Human-readable provider label.
+        pub display_name: String,
+        /// Runtime state of this provider.
+        pub status: CapabilityStatus,
+        /// Stable capability ids exposed by this provider.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+        /// Short explanation when the provider is not available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+    }
+
     /// Service-owned file transfer lifecycle status.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
@@ -1177,6 +1194,8 @@ mod wire {
         },
         /// List service-owned file transfer task snapshots.
         ListFileTransfers,
+        /// List available and reserved file transfer providers.
+        ListFileTransferProviders,
         /// Cancel a service-owned file transfer task when it is still active.
         CancelFileTransfer {
             /// Transfer id returned by `StartFileTransfer`.
@@ -1476,6 +1495,11 @@ mod wire {
         FileTransferList {
             /// Ordered transfer snapshots.
             transfers: Vec<FileTransferTaskSnapshot>,
+        },
+        /// File transfer providers known by the local service host.
+        FileTransferProviderList {
+            /// Ordered provider descriptors.
+            providers: Vec<FileTransferProviderDescriptor>,
         },
         /// File transfer cancellation result.
         FileTransferCancelled {

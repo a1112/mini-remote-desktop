@@ -9,12 +9,12 @@ use mrd_ipc::{
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
     DeviceIdentitySnapshot, DeviceInfo, DevicePreference, DevicePreferenceUpdate, DirectoryList,
     FileEntry, FileEntryKind, FileTransferConflictPolicy, FileTransferEntry,
-    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcRequest,
-    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics, PairedDeviceIdentity,
-    ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap,
-    SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary,
-    TransportPolicyConfig, TransportPolicySnapshot,
+    FileTransferProviderDescriptor, FileTransferStartRequest, FileTransferStatus,
+    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
+    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
+    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -731,6 +731,38 @@ fn serialize_deserialize_file_transfer_contracts() {
     };
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("FileTransferList"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let request = IpcRequest::ListFileTransferProviders;
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListFileTransferProviders"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let response = IpcResponse::FileTransferProviderList {
+        providers: vec![
+            FileTransferProviderDescriptor {
+                provider_kind: "mrd-local".to_string(),
+                display_name: "MRD local file transfer".to_string(),
+                status: CapabilityStatus::Available,
+                capabilities: vec!["service.file_transfer.local".to_string()],
+                reason: None,
+            },
+            FileTransferProviderDescriptor {
+                provider_kind: "r-file".to_string(),
+                display_name: "R-File external bridge".to_string(),
+                status: CapabilityStatus::Unimplemented,
+                capabilities: vec!["service.file_transfer.external_bridge".to_string()],
+                reason: Some("reserved provider bridge".to_string()),
+            },
+        ],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferProviderList"));
+    assert!(json.contains("\"provider_kind\":\"r-file\""));
+    assert!(json.contains("\"status\":\"unimplemented\""));
+    assert!(json.contains("\"service.file_transfer.external_bridge\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }

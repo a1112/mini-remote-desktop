@@ -3,6 +3,7 @@ import { getMockInvoke } from '@/test/mocks/tauri';
 import {
   ipcCancelFileTransfer,
   ipcListDirectory,
+  ipcListFileTransferProviders,
   ipcListFileTransfers,
   ipcStartFileTransfer,
 } from './commands';
@@ -203,6 +204,69 @@ describe('file directory command adapter', () => {
 
     expect(result.ok && result.value[0]?.transfer_id).toBe('file-transfer-1');
     expect(invoke).toHaveBeenCalledWith('ipc_list_file_transfers', undefined);
+  });
+
+  it('lists reserved file transfer providers through the Tauri command', async () => {
+    const invoke = getMockInvoke();
+    invoke.mockResolvedValue([
+      {
+        provider_kind: 'mrd-local',
+        display_name: 'MRD local file transfer',
+        status: 'available',
+        capabilities: ['service.file_transfer.local'],
+        reason: null,
+      },
+      {
+        provider_kind: 'r-file',
+        display_name: 'R-File external bridge',
+        status: 'unimplemented',
+        capabilities: ['service.file_transfer.external_bridge'],
+        reason: 'reserved provider bridge',
+      },
+    ]);
+
+    const result = await ipcListFileTransferProviders();
+
+    expect(result.ok && result.value[1]?.provider_kind).toBe('r-file');
+    expect(result.ok && result.value[1]?.status).toBe('unimplemented');
+    expect(invoke).toHaveBeenCalledWith('ipc_list_file_transfer_providers', undefined);
+  });
+
+  it('lists reserved file transfer providers through the browser service bridge', async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'FileTransferProviderList',
+          providers: [
+            {
+              provider_kind: 'mrd-local',
+              display_name: 'MRD local file transfer',
+              status: 'available',
+              capabilities: ['service.file_transfer.local'],
+              reason: null,
+            },
+            {
+              provider_kind: 'r-file',
+              display_name: 'R-File external bridge',
+              status: 'unimplemented',
+              capabilities: ['service.file_transfer.external_bridge'],
+              reason: 'reserved provider bridge',
+            },
+          ],
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await ipcListFileTransferProviders();
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok && result.value[0]?.provider_kind).toBe('mrd-local');
+    expect(requestBody.request).toEqual({ type: 'ListFileTransferProviders' });
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it('cancels a file transfer task through the Tauri command', async () => {

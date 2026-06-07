@@ -1,7 +1,8 @@
 use crate::app_state::AppState;
 use mrd_ipc::{
-    DirectoryList, FileEntry, FileEntryKind, FileTransferConflictPolicy, FileTransferEntry,
-    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcResponse,
+    CapabilityStatus, DirectoryList, FileEntry, FileEntryKind, FileTransferConflictPolicy,
+    FileTransferEntry, FileTransferProviderDescriptor, FileTransferStartRequest,
+    FileTransferStatus, FileTransferTaskSnapshot, IpcResponse,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +11,10 @@ use std::time::UNIX_EPOCH;
 
 const LOCAL_FILE_TRANSFER_PROVIDER: &str = "mrd-local";
 const LOCAL_FILE_TRANSFER_CAPABILITY: &str = "service.file_transfer.local";
+const RFILE_FILE_TRANSFER_PROVIDER: &str = "r-file";
 const EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY: &str = "service.file_transfer.external_bridge";
+const EXTERNAL_FILE_TRANSFER_BRIDGE_REASON: &str =
+    "reserved provider bridge for future R-File integration";
 
 pub fn list_directory(path: Option<String>) -> IpcResponse {
     match read_directory(path) {
@@ -112,6 +116,12 @@ pub async fn list_file_transfers(app_state: &Arc<AppState>) -> IpcResponse {
     }
 }
 
+pub fn list_file_transfer_providers() -> IpcResponse {
+    IpcResponse::FileTransferProviderList {
+        providers: file_transfer_provider_descriptors(),
+    }
+}
+
 pub async fn cancel_file_transfer(app_state: &Arc<AppState>, transfer_id: String) -> IpcResponse {
     match app_state.file_transfers.lock().await.cancel(&transfer_id) {
         Some(transfer) => IpcResponse::FileTransferCancelled { transfer },
@@ -120,6 +130,25 @@ pub async fn cancel_file_transfer(app_state: &Arc<AppState>, transfer_id: String
             message: format!("file transfer not found: {transfer_id}"),
         },
     }
+}
+
+fn file_transfer_provider_descriptors() -> Vec<FileTransferProviderDescriptor> {
+    vec![
+        FileTransferProviderDescriptor {
+            provider_kind: LOCAL_FILE_TRANSFER_PROVIDER.to_string(),
+            display_name: "MRD local file transfer".to_string(),
+            status: CapabilityStatus::Available,
+            capabilities: vec![LOCAL_FILE_TRANSFER_CAPABILITY.to_string()],
+            reason: None,
+        },
+        FileTransferProviderDescriptor {
+            provider_kind: RFILE_FILE_TRANSFER_PROVIDER.to_string(),
+            display_name: "R-File external bridge".to_string(),
+            status: CapabilityStatus::Unimplemented,
+            capabilities: vec![EXTERNAL_FILE_TRANSFER_BRIDGE_CAPABILITY.to_string()],
+            reason: Some(EXTERNAL_FILE_TRANSFER_BRIDGE_REASON.to_string()),
+        },
+    ]
 }
 
 fn unsupported_file_transfer_provider_hint(provider_hint: &Option<String>) -> Option<String> {
@@ -706,5 +735,35 @@ mod tests {
         assert!(transfers.is_empty());
 
         std::fs::remove_dir_all(root).expect("remove temp directory");
+    }
+
+    #[test]
+    fn list_file_transfer_providers_exposes_local_and_reserved_external_bridge() {
+        let response = list_file_transfer_providers();
+
+        let IpcResponse::FileTransferProviderList { providers } = response else {
+            panic!("expected file transfer provider list");
+        };
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].provider_kind, "mrd-local");
+        assert_eq!(providers[0].status, mrd_ipc::CapabilityStatus::Available);
+        assert_eq!(
+            providers[0].capabilities,
+            vec!["service.file_transfer.local".to_string()]
+        );
+        assert_eq!(providers[1].provider_kind, "r-file");
+        assert_eq!(
+            providers[1].status,
+            mrd_ipc::CapabilityStatus::Unimplemented
+        );
+        assert_eq!(
+            providers[1].capabilities,
+            vec!["service.file_transfer.external_bridge".to_string()]
+        );
+        assert!(providers[1]
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reserved"));
     }
 }

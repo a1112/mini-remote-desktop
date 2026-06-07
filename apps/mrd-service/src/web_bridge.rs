@@ -514,6 +514,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::ListDirectory { .. }
             | IpcRequest::StartFileTransfer { .. }
             | IpcRequest::ListFileTransfers
+            | IpcRequest::ListFileTransferProviders
             | IpcRequest::CancelFileTransfer { .. }
             | IpcRequest::WakeOnLan { .. }
             | IpcRequest::RequestRemoteDevicePowerAction { .. }
@@ -749,6 +750,9 @@ mod tests {
             },
         }));
         assert!(is_ipc_request_allowed(&IpcRequest::ListFileTransfers));
+        assert!(is_ipc_request_allowed(
+            &IpcRequest::ListFileTransferProviders
+        ));
         assert!(is_ipc_request_allowed(&IpcRequest::CancelFileTransfer {
             transfer_id: "file-transfer-1".to_string(),
         }));

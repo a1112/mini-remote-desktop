@@ -306,6 +306,14 @@ export interface FileTransferStartRequest {
   provider_hint?: string | null;
 }
 
+export interface FileTransferProviderDescriptor {
+  provider_kind: string;
+  display_name: string;
+  status: CapabilityStatus;
+  capabilities?: string[];
+  reason?: string | null;
+}
+
 export interface FileTransferTaskSnapshot {
   transfer_id: string;
   status: FileTransferStatus;
