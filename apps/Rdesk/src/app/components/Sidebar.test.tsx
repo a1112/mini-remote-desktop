@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Monitor } from "lucide-react";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Sidebar } from "./Sidebar";
@@ -26,6 +26,24 @@ const authMock = vi.hoisted(() => ({
 const serviceMock = vi.hoisted(() => ({
   renameDevice: vi.fn(),
   unbindDevice: vi.fn(),
+}));
+
+const actionServiceMock = vi.hoisted(() => ({
+  setDeviceFavorite: vi.fn(),
+  markDeviceRemoved: vi.fn(),
+  setDeviceDisabled: vi.fn(),
+  requestRemoteDevicePowerAction: vi.fn(),
+  wakeOnLan: vi.fn(),
+}));
+
+const sessionServiceMock = vi.hoisted(() => ({
+  listSessions: vi.fn(),
+  stopSession: vi.fn(),
+}));
+
+const capabilityMock = vi.hoisted(() => ({
+  ipcCapabilitySnapshot: vi.fn(),
+  ipcPeerCapabilitySnapshot: vi.fn(),
 }));
 
 vi.mock("./ThemeContext", () => ({
@@ -55,6 +73,26 @@ vi.mock("../services/deviceService", () => ({
   },
 }));
 
+vi.mock("../services/deviceActionService", () => ({
+  deviceActionService: {
+    setDeviceFavorite: actionServiceMock.setDeviceFavorite,
+    markDeviceRemoved: actionServiceMock.markDeviceRemoved,
+    setDeviceDisabled: actionServiceMock.setDeviceDisabled,
+    requestRemoteDevicePowerAction: actionServiceMock.requestRemoteDevicePowerAction,
+    wakeOnLan: actionServiceMock.wakeOnLan,
+  },
+}));
+
+vi.mock("../services/ipcSessionService", () => ({
+  listSessions: sessionServiceMock.listSessions,
+  stopSession: sessionServiceMock.stopSession,
+}));
+
+vi.mock("../adapters/tauri", () => ({
+  ipcCapabilitySnapshot: capabilityMock.ipcCapabilitySnapshot,
+  ipcPeerCapabilitySnapshot: capabilityMock.ipcPeerCapabilitySnapshot,
+}));
+
 const device = (overrides: Partial<Device>): Device => ({
   id: "agent-device",
   name: "Agent PC",
@@ -80,14 +118,26 @@ const device = (overrides: Partial<Device>): Device => ({
   ...overrides,
 });
 
-function renderSidebar() {
+function LocationProbe() {
+  const location = useLocation();
+  return <div data-testid="location">{`${location.pathname}${location.search}`}</div>;
+}
+
+function renderSidebar({
+  collapsed = false,
+  onOpenConnections = vi.fn(),
+}: {
+  collapsed?: boolean;
+  onOpenConnections?: () => void;
+} = {}) {
   render(
     <MemoryRouter>
       <Sidebar
-        collapsed={false}
-        onOpenConnections={vi.fn()}
+        collapsed={collapsed}
+        onOpenConnections={onOpenConnections}
         onOpenSettings={vi.fn()}
       />
+      <LocationProbe />
     </MemoryRouter>
   );
 }
@@ -99,6 +149,33 @@ function openDeviceMenu() {
 describe("Sidebar device actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    actionServiceMock.setDeviceFavorite.mockReturnValue({
+      deviceId: "agent-device",
+      favorite: true,
+      removed: false,
+    });
+    actionServiceMock.markDeviceRemoved.mockReturnValue({
+      deviceId: "agent-device",
+      favorite: false,
+      removed: true,
+    });
+    actionServiceMock.setDeviceDisabled.mockReturnValue({
+      deviceId: "agent-device",
+      disabled: true,
+    });
+    actionServiceMock.wakeOnLan.mockResolvedValue({
+      device_id: "agent-device",
+      mac_address: "AA:BB:CC:DD:EE:FF",
+      broadcast_addr: "255.255.255.255:9",
+      packet_bytes: 102,
+    });
+    actionServiceMock.requestRemoteDevicePowerAction.mockRejectedValue(
+      new Error("remote power unsupported")
+    );
+    capabilityMock.ipcCapabilitySnapshot.mockResolvedValue({ ok: false });
+    capabilityMock.ipcPeerCapabilitySnapshot.mockResolvedValue({ ok: false });
+    sessionServiceMock.listSessions.mockResolvedValue([]);
+    sessionServiceMock.stopSession.mockResolvedValue("session-1");
     deviceDataMock.devices = [device({})];
     deviceDataMock.currentDeviceId = "local-device";
     authMock.value = {
@@ -110,24 +187,407 @@ describe("Sidebar device actions", () => {
     };
   });
 
-  it("disables device menu entries that do not have a real implementation", () => {
+  it("enables implemented device menu entries and keeps unsupported operations disabled", () => {
     renderSidebar();
 
     openDeviceMenu();
 
-    expect(screen.getByRole("button", { name: "文件传输" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "远程终端" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "收藏设备" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "禁用设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "文件传输" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "远程终端" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "禁用设备" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "断开连接" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "移除设备" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "移除设备" })).not.toBeDisabled();
 
     fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
 
+    expect(screen.getByRole("button", { name: "重启" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "关机" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
+  });
+
+  it("opens the connection dialog from the add device toolbar button", async () => {
+    const onOpenConnections = vi.fn();
+    const user = userEvent.setup();
+
+    renderSidebar({ onOpenConnections });
+
+    await user.click(screen.getByTitle("添加设备"));
+
+    expect(onOpenConnections).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends Wake-on-LAN for an offline device with a known MAC address", async () => {
+    deviceDataMock.devices = [
+      device({
+        status: "offline",
+        macAddress: "AA:BB:CC:DD:EE:FF",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    const wakeButton = screen.getByRole("button", { name: "Wake-on-LAN" });
+    expect(wakeButton).not.toBeDisabled();
+
+    await user.click(wakeButton);
+
+    expect(actionServiceMock.wakeOnLan).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      macAddress: "AA:BB:CC:DD:EE:FF",
+      broadcastAddr: undefined,
+    });
+    await waitFor(() => {
+      expect(screen.getByText("已发送唤醒包：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("navigates to existing detail routes for file transfer and device info", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "文件传输" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=files");
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "设备信息" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/devices/agent-device?tab=info");
+  });
+
+  it("keeps route ids separate from stable device ids for merged device actions", async () => {
+    deviceDataMock.devices = [
+      device({
+        id: "server-row-123",
+        deviceId: "stable-device-abc",
+        macAddress: "AA:BB:CC:DD:EE:FF",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "文件传输" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/server-row-123?tab=files"
+    );
+
+    openDeviceMenu();
+    await user.click(screen.getByRole("button", { name: "收藏设备" }));
+    expect(actionServiceMock.setDeviceFavorite).toHaveBeenCalledWith(
+      "stable-device-abc",
+      true
+    );
+
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+    await user.click(screen.getByRole("button", { name: "设备信息" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/stable-device-abc?tab=info"
+    );
+  });
+
+  it("opens the device action menu from collapsed sidebar device items", () => {
+    renderSidebar({ collapsed: true });
+
+    fireEvent.contextMenu(screen.getByTitle("Agent PC (在线)"));
+
+    expect(screen.getByRole("button", { name: "收藏设备" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "禁用设备" })).not.toBeDisabled();
+  });
+
+  it("opens remote terminal through the remote application terminal focus route", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "远程终端" }));
+
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      "/devices/agent-device?tab=terminal"
+    );
+  });
+
+  it("requests remote restart through the service IPC action path", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await user.click(screen.getByRole("button", { name: "重启" }));
+
+    expect(actionServiceMock.requestRemoteDevicePowerAction).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      action: "restart",
+    });
+    await waitFor(() => {
+      expect(screen.getByText("远端重启失败：remote power unsupported")).toBeInTheDocument();
+    });
+  });
+
+  it("requests remote shutdown through the service IPC action path", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await user.click(screen.getByRole("button", { name: "关机" }));
+
+    expect(actionServiceMock.requestRemoteDevicePowerAction).toHaveBeenCalledWith({
+      deviceId: "agent-device",
+      action: "shutdown",
+    });
+    await waitFor(() => {
+      expect(screen.getByText("远端关机失败：remote power unsupported")).toBeInTheDocument();
+    });
+  });
+
+  it("toggles favorite state through local device action preferences", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "收藏设备" }));
+
+    expect(actionServiceMock.setDeviceFavorite).toHaveBeenCalledWith("agent-device", true);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已收藏：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("marks non-local devices as removed through local device action preferences", async () => {
+    Object.defineProperty(window, "confirm", {
+      configurable: true,
+      writable: true,
+      value: vi.fn(() => true),
+    });
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "移除设备" }));
+
+    expect(actionServiceMock.markDeviceRemoved).toHaveBeenCalledWith("agent-device");
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已移除：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("disables a non-local device through local device action preferences", async () => {
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "禁用设备" }));
+
+    expect(actionServiceMock.setDeviceDisabled).toHaveBeenCalledWith("agent-device", true);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已禁用：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("re-enables a locally disabled device from the same device menu", async () => {
+    actionServiceMock.setDeviceDisabled.mockReturnValue({
+      deviceId: "agent-device",
+      disabled: false,
+    });
+    deviceDataMock.devices = [
+      device({
+        disabled: true,
+        status: "offline",
+      }),
+    ];
+    const user = userEvent.setup();
+
+    renderSidebar();
+    openDeviceMenu();
+
+    await user.click(screen.getByRole("button", { name: "解除禁用" }));
+
+    expect(actionServiceMock.setDeviceDisabled).toHaveBeenCalledWith("agent-device", false);
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已解除禁用：Agent PC")).toBeInTheDocument();
+    });
+  });
+
+  it("blocks remote power actions for disabled devices even if the record is still online", () => {
+    deviceDataMock.devices = [
+      device({
+        disabled: true,
+        status: "online",
+      }),
+    ];
+
+    renderSidebar();
+    openDeviceMenu();
+
+    expect(screen.getByRole("button", { name: "解除禁用" })).not.toBeDisabled();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
     expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Wake-on-LAN" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "设备信息" })).toBeDisabled();
+  });
+
+  it("blocks remote power actions when service capability marks them unsupported", async () => {
+    capabilityMock.ipcCapabilitySnapshot.mockResolvedValue({
+      ok: true,
+      value: {
+        schema_version: 1,
+        platform: "windows",
+        service_version: "test",
+        capabilities: [
+          {
+            id: "control.remote_power",
+            label: "Remote restart and shutdown",
+            domain: "control",
+            status: "unsupported",
+            platform: "windows",
+            reason: "Set MRD_ENABLE_REMOTE_POWER_ACTIONS=1 on this peer",
+            detail: null,
+            requires: [],
+            conflicts_with: [],
+            depends_on: [],
+            fallback_ids: [],
+            last_probe_time_ms: null,
+          },
+        ],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      },
+    });
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+    });
+    expect(screen.getByRole("button", { name: "重启" })).toHaveAttribute(
+      "title",
+      "Set MRD_ENABLE_REMOTE_POWER_ACTIONS=1 on this peer"
+    );
+  });
+
+  it("blocks remote power actions when the selected peer does not advertise support", async () => {
+    capabilityMock.ipcCapabilitySnapshot.mockResolvedValue({
+      ok: true,
+      value: {
+        schema_version: 1,
+        platform: "windows",
+        service_version: "test",
+        capabilities: [
+          {
+            id: "control.remote_power",
+            label: "Remote restart and shutdown",
+            domain: "control",
+            status: "available",
+            platform: "windows",
+            reason: null,
+            detail: null,
+            requires: [],
+            conflicts_with: [],
+            depends_on: [],
+            fallback_ids: [],
+            last_probe_time_ms: null,
+          },
+        ],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      },
+    });
+    capabilityMock.ipcPeerCapabilitySnapshot.mockResolvedValue({
+      ok: true,
+      value: {
+        schema_version: 1,
+        platform: "windows",
+        service_version: "peer",
+        capabilities: [
+          {
+            id: "control.remote_power",
+            label: "Remote restart and shutdown",
+            domain: "control",
+            status: "unsupported",
+            platform: "windows",
+            reason: "peer has not enabled MRD_ENABLE_REMOTE_POWER_ACTIONS",
+            detail: null,
+            requires: [],
+            conflicts_with: [],
+            depends_on: [],
+            fallback_ids: [],
+            last_probe_time_ms: null,
+          },
+        ],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      },
+    });
+
+    renderSidebar();
+    openDeviceMenu();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "管理" }));
+
+    await waitFor(() => {
+      expect(capabilityMock.ipcPeerCapabilitySnapshot).toHaveBeenCalledWith("agent-device");
+      expect(screen.getByRole("button", { name: "重启" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "关机" })).toBeDisabled();
+    });
+    expect(screen.getByRole("button", { name: "重启" })).toHaveAttribute(
+      "title",
+      "peer has not enabled MRD_ENABLE_REMOTE_POWER_ACTIONS"
+    );
+  });
+
+  it("disconnects the active peer session for the selected device", async () => {
+    sessionServiceMock.listSessions.mockResolvedValue([
+      {
+        session_id: "session-1",
+        role: "controller",
+        state: "streaming",
+        transport_kind: "quic",
+        peer_device_id: "agent-device",
+        last_error: null,
+        sender_active: false,
+        receiver_active: true,
+      },
+    ]);
+    const user = userEvent.setup();
+
+    renderSidebar();
+
+    await waitFor(() => {
+      expect(sessionServiceMock.listSessions).toHaveBeenCalled();
+    });
+    openDeviceMenu();
+    const disconnect = screen.getByRole("button", { name: "断开连接" });
+    expect(disconnect).not.toBeDisabled();
+
+    await user.click(disconnect);
+
+    expect(sessionServiceMock.stopSession).toHaveBeenCalledWith("session-1");
+    expect(deviceDataMock.refresh).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByText("已断开连接：Agent PC")).toBeInTheDocument();
+    });
   });
 
   it("unbinds the selected device through the device service for a logged-in user", async () => {

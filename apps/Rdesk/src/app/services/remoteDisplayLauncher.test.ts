@@ -28,6 +28,8 @@ const DEFAULT_HEVC_1080P60_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 const MACOS_HEVC_2K144_PROFILE = {
@@ -41,6 +43,8 @@ const MACOS_HEVC_2K144_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 vi.mock("../adapters/tauri", () => ({

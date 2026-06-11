@@ -214,7 +214,31 @@ pub async fn send_control_input(
                 ),
             };
         }
-        Some(snapshot) => snapshot.target_device_id.is_some(),
+        Some(snapshot) => {
+            let route_to_peer = snapshot.target_device_id.is_some();
+            if route_to_peer
+                && (snapshot.lifecycle_state != SessionLifecycleState::Streaming
+                    || !snapshot.receiver_active)
+            {
+                return IpcResponse::Error {
+                    code: "E_CONTROL_INPUT".to_string(),
+                    message: format!(
+                        "control input requires a streaming receiver for session {}",
+                        session_id.0
+                    ),
+                };
+            }
+            if !route_to_peer && !snapshot.sender_active {
+                return IpcResponse::Error {
+                    code: "E_CONTROL_INPUT".to_string(),
+                    message: format!(
+                        "control input requires an active local sender for session {}",
+                        session_id.0
+                    ),
+                };
+            }
+            route_to_peer
+        }
         None => {
             return IpcResponse::Error {
                 code: "E_CONTROL_INPUT".to_string(),
@@ -230,7 +254,7 @@ pub async fn send_control_input(
             .control_input()
             .lock()
             .await
-            .handle_event(&event)
+            .handle_session_event(&session_id, &event)
             .map_err(Into::into)
     };
 
@@ -540,8 +564,16 @@ pub async fn accept_session(
 pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Stopping session: {}", session_id.0);
 
-    let mut sessions = app_state.sessions.lock().await;
-    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+    let snapshot = {
+        let sessions = app_state.sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+
+    if let Some(snapshot) = snapshot {
+        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "stopping")
+            .await;
+
+        let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
@@ -553,37 +585,12 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             },
         );
         drop(sessions);
-        if let Err(error) = app_state
-            .control_input()
-            .lock()
-            .await
-            .handle_event(&ControlInputEvent::ReleaseAll)
-        {
-            tracing::warn!(
-                session_id = %session_id.0,
-                %error,
-                "failed to release active control input while stopping session"
-            );
-        }
         app_state
             .media_tasks
             .lock()
             .await
             .abort_session(&session_id);
-        app_state.media_profiles.lock().await.remove(&session_id);
-        app_state.capture_sources.lock().await.remove(&session_id);
-        app_state
-            .peer_media_capabilities
-            .lock()
-            .await
-            .remove(&session_id);
-        #[cfg(windows)]
-        app_state
-            .media_surface_renderers
-            .lock()
-            .await
-            .detach_session(&session_id);
-        app_state.media_pipelines.lock().await.remove(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
         return IpcResponse::SessionStopped { session_id };
     }
 
@@ -601,8 +608,16 @@ pub async fn fail_session(
 ) -> IpcResponse {
     tracing::warn!("Failing session: {} reason={}", session_id.0, reason);
 
-    let mut sessions = app_state.sessions.lock().await;
-    if let Some(snapshot) = sessions.get(&session_id).cloned() {
+    let snapshot = {
+        let sessions = app_state.sessions.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+
+    if let Some(snapshot) = snapshot {
+        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "failing")
+            .await;
+
+        let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
             SessionSnapshot {
@@ -621,13 +636,7 @@ pub async fn fail_session(
             .lock()
             .await
             .abort_session(&session_id);
-        #[cfg(windows)]
-        app_state
-            .media_surface_renderers
-            .lock()
-            .await
-            .detach_session(&session_id);
-        app_state.media_pipelines.lock().await.remove(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
 
         let mut shell = app_state.shell.lock().await;
         shell.last_error = Some(reason);
@@ -638,6 +647,58 @@ pub async fn fail_session(
     IpcResponse::Error {
         code: "E404".to_string(),
         message: format!("Session not found: {}", session_id.0),
+    }
+}
+
+async fn clear_session_media_state(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.media_profiles.lock().await.remove(session_id);
+    app_state.capture_sources.lock().await.remove(session_id);
+    app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .remove(session_id);
+    #[cfg(windows)]
+    app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .detach_session(session_id);
+    app_state.media_pipelines.lock().await.remove(session_id);
+}
+
+async fn release_control_input_for_terminal_session(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    snapshot: &SessionSnapshot,
+    action: &'static str,
+) {
+    let route_release_to_peer = snapshot.target_device_id.is_some()
+        && snapshot.lifecycle_state == SessionLifecycleState::Streaming
+        && snapshot.receiver_active;
+    let result = if route_release_to_peer {
+        crate::lan_discovery::request_lan_control_input(
+            app_state,
+            session_id,
+            ControlInputEvent::ReleaseAll,
+        )
+        .await
+        .map(|_| ())
+    } else {
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_session_event(session_id, &ControlInputEvent::ReleaseAll)
+            .map(|_| ())
+            .map_err(Into::into)
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            session_id = %session_id.0,
+            %error,
+            "failed to release active control input while {action} session"
+        );
     }
 }
 
@@ -672,61 +733,120 @@ pub async fn recover_session(app_state: &Arc<AppState>, session_id: SessionId) -
     }
 }
 
+/// Handle session list request.
+pub async fn list_sessions(app_state: &Arc<AppState>) -> IpcResponse {
+    let sessions = app_state.sessions.lock().await;
+    let session_list = sessions
+        .list_all()
+        .into_iter()
+        .map(|snap| mrd_ipc::SessionInfo {
+            session_id: snap.session_id.clone(),
+            role: session_role(&snap),
+            state: snap.lifecycle_state.as_str().to_string(),
+            transport_kind: snap.transport.clone(),
+            last_error: snap.last_error.clone(),
+            sender_active: snap.sender_active,
+            receiver_active: snap.receiver_active,
+            peer_device_id: peer_device_id(&snap),
+        })
+        .collect();
+
+    IpcResponse::SessionList {
+        sessions: session_list,
+    }
+}
+
+/// Handle aggregated runtime snapshot request.
+pub async fn runtime_snapshot(app_state: &Arc<AppState>) -> IpcResponse {
+    let sessions = app_state.sessions.lock().await;
+    let session_snapshots: Vec<mrd_ipc::SessionRuntimeSnapshot> = sessions
+        .list_all()
+        .into_iter()
+        .map(|snap| session_runtime_snapshot(&snap))
+        .collect();
+    drop(sessions);
+
+    let devices = app_state.devices.lock().await;
+    let device_id = devices.get_local_device().map(|(id, _)| id.clone());
+
+    IpcResponse::RuntimeSnapshot {
+        snapshot: mrd_ipc::RuntimeSnapshot {
+            sessions: session_snapshots,
+            device_id,
+            is_registered: devices.is_registered(),
+        },
+    }
+}
+
 /// Handle session snapshot request
 pub async fn session_snapshot(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     let sessions = app_state.sessions.lock().await;
     let snap = sessions.get(&session_id);
 
     match snap {
-        Some(s) => {
-            // Convert to IPC snapshot using explicit state
-            let role = if s.target_device_id.is_some() {
-                "controller"
-            } else if s.source_device_id.is_some() {
-                "agent"
-            } else {
-                "unknown"
-            }
-            .to_string();
-
-            IpcResponse::SessionSnapshot {
-                snapshot: mrd_ipc::SessionRuntimeSnapshot {
-                    session_id: s.session_id.clone(),
-                    role,
-                    state: s.lifecycle_state.as_str().to_string(),
-                    transport_kind: s.transport.clone(),
-                    local_bootstrap: if s.local_listen_addr.is_some()
-                        || s.local_server_name.is_some()
-                    {
-                        Some(mrd_ipc::SessionBootstrap {
-                            listen_addr: s.local_listen_addr.clone(),
-                            server_name: s.local_server_name.clone(),
-                            cert_der: s.local_cert_der_b64.clone(),
-                        })
-                    } else {
-                        None
-                    },
-                    remote_bootstrap: if s.remote_listen_addr.is_some()
-                        || s.remote_server_name.is_some()
-                    {
-                        Some(mrd_ipc::SessionBootstrap {
-                            listen_addr: s.remote_listen_addr.clone(),
-                            server_name: s.remote_server_name.clone(),
-                            cert_der: s.remote_cert_der_b64.clone(),
-                        })
-                    } else {
-                        None
-                    },
-                    last_error: s.last_error.clone(),
-                    sender_active: s.sender_active,
-                    receiver_active: s.receiver_active,
-                },
-            }
-        }
+        Some(s) => IpcResponse::SessionSnapshot {
+            snapshot: session_runtime_snapshot(s),
+        },
         None => IpcResponse::Error {
             code: "E404".to_string(),
             message: format!("Session not found: {}", session_id.0),
         },
+    }
+}
+
+fn session_runtime_snapshot(s: &SessionSnapshot) -> mrd_ipc::SessionRuntimeSnapshot {
+    mrd_ipc::SessionRuntimeSnapshot {
+        session_id: s.session_id.clone(),
+        role: session_role(s),
+        state: s.lifecycle_state.as_str().to_string(),
+        transport_kind: s.transport.clone(),
+        local_bootstrap: bootstrap(
+            &s.local_listen_addr,
+            &s.local_server_name,
+            &s.local_cert_der_b64,
+        ),
+        remote_bootstrap: bootstrap(
+            &s.remote_listen_addr,
+            &s.remote_server_name,
+            &s.remote_cert_der_b64,
+        ),
+        last_error: s.last_error.clone(),
+        sender_active: s.sender_active,
+        receiver_active: s.receiver_active,
+        peer_device_id: peer_device_id(s),
+    }
+}
+
+fn session_role(s: &SessionSnapshot) -> String {
+    if s.target_device_id.is_some() {
+        "controller"
+    } else if s.source_device_id.is_some() {
+        "agent"
+    } else {
+        "unknown"
+    }
+    .to_string()
+}
+
+fn peer_device_id(s: &SessionSnapshot) -> Option<DeviceId> {
+    s.target_device_id
+        .clone()
+        .or_else(|| s.source_device_id.clone())
+}
+
+fn bootstrap(
+    listen_addr: &Option<String>,
+    server_name: &Option<String>,
+    cert_der: &Option<String>,
+) -> Option<mrd_ipc::SessionBootstrap> {
+    if listen_addr.is_some() || server_name.is_some() {
+        Some(mrd_ipc::SessionBootstrap {
+            listen_addr: listen_addr.clone(),
+            server_name: server_name.clone(),
+            cert_der: cert_der.clone(),
+        })
+    } else {
+        None
     }
 }
 
@@ -811,6 +931,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_sessions_returns_peer_device_context() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("listed-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: None,
+                    target_device_id: Some(DeviceId("agent".to_string())),
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Streaming,
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: true,
+                },
+            );
+        }
+
+        let response = list_sessions(&app_state).await;
+
+        match response {
+            IpcResponse::SessionList { sessions } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].session_id, session_id);
+                assert_eq!(sessions[0].role, "controller");
+                assert_eq!(
+                    sessions[0].peer_device_id,
+                    Some(DeviceId("agent".to_string()))
+                );
+            }
+            other => panic!("Expected SessionList response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_reports_device_and_session_state() {
+        let app_state = Arc::new(AppState::new());
+        let device_id = DeviceId("local-device".to_string());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(device_id.clone(), "Local Device".to_string());
+        let session_id = SessionId("runtime-session".to_string());
+        let _ = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("agent".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+
+        let response = runtime_snapshot(&app_state).await;
+
+        match response {
+            IpcResponse::RuntimeSnapshot { snapshot } => {
+                assert!(snapshot.is_registered);
+                assert_eq!(snapshot.device_id, Some(device_id));
+                assert_eq!(snapshot.sessions.len(), 1);
+                assert_eq!(snapshot.sessions[0].session_id, session_id);
+                assert_eq!(
+                    snapshot.sessions[0].peer_device_id,
+                    Some(DeviceId("agent".to_string()))
+                );
+            }
+            other => panic!("Expected RuntimeSnapshot response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn stop_session_removes_from_registry() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("test-session".to_string());
@@ -888,6 +1086,210 @@ mod tests {
         let snapshot = app_state.control_input().lock().await.snapshot(session_id);
         assert_eq!(snapshot.reliable.accepted_messages, 2);
         assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_session_releases_active_control_input() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("control-fail-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Listening,
+                    last_error: None,
+                    sender_active: true,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_event(&mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            })
+            .expect("key down");
+
+        let response =
+            fail_session(&app_state, session_id.clone(), "transport lost".to_string()).await;
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
+
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 2);
+        assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_session_clears_media_negotiation_state() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("media-fail-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Streaming,
+                    last_error: None,
+                    sender_active: true,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        let profile = MediaProfile {
+            codec: "av1".to_string(),
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            ..MediaProfile::default()
+        };
+        app_state.media_profiles.lock().await.set(
+            session_id.clone(),
+            mrd_ipc::MediaProfileNegotiation {
+                requested: profile.clone(),
+                selected: profile,
+                status: "accepted".to_string(),
+                reason: None,
+                selected_source_id: Some("display:0".to_string()),
+                selected_width: Some(2560),
+                selected_height: Some(1440),
+                downgrade_reason: None,
+            },
+        );
+        app_state.capture_sources.lock().await.set(
+            session_id.clone(),
+            mrd_ipc::CaptureSourceSelection {
+                session_id: session_id.clone(),
+                source: mrd_ipc::CaptureSource {
+                    id: "display:0".to_string(),
+                    platform: "windows".to_string(),
+                    source_kind: "display".to_string(),
+                    title: "Primary".to_string(),
+                    class_name: String::new(),
+                    width: 2560,
+                    height: 1440,
+                    process_id: 0,
+                    app_name: None,
+                    bundle_identifier: None,
+                    preview_data_url: None,
+                    preview_width: None,
+                    preview_height: None,
+                },
+                status: "selected".to_string(),
+                reason: None,
+            },
+        );
+        app_state.peer_media_capabilities.lock().await.set(
+            session_id.clone(),
+            vec![
+                "media.codec.av1".to_string(),
+                "media.color_mode_v1".to_string(),
+            ],
+        );
+
+        let response =
+            fail_session(&app_state, session_id.clone(), "transport lost".to_string()).await;
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
+
+        assert!(app_state
+            .media_profiles
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none());
+        assert!(app_state
+            .capture_sources
+            .lock()
+            .await
+            .get(&session_id)
+            .is_none());
+        assert!(!app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .supports(&session_id, "media.codec.av1"));
+    }
+
+    #[tokio::test]
+    async fn inactive_local_sender_session_rejects_control_input_without_injection() {
+        let app_state = Arc::new(AppState::new());
+        app_state
+            .replace_control_input_for_test(mrd_input::RecordingInputInjector::available())
+            .await;
+        let session_id = SessionId("inactive-local-input-session".to_string());
+        {
+            let mut sessions = app_state.sessions.lock().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionSnapshot {
+                    session_id: session_id.clone(),
+                    transport: "quic".to_string(),
+                    source_device_id: Some(DeviceId("controller-device".to_string())),
+                    target_device_id: None,
+                    local_listen_addr: None,
+                    local_server_name: None,
+                    local_cert_der_b64: None,
+                    remote_listen_addr: None,
+                    remote_server_name: None,
+                    remote_cert_der_b64: None,
+                    lifecycle_state: SessionLifecycleState::Connected,
+                    last_error: None,
+                    sender_active: false,
+                    receiver_active: false,
+                },
+            );
+        }
+
+        let response = send_control_input(
+            &app_state,
+            session_id.clone(),
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+        )
+        .await;
+
+        match response {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "E_CONTROL_INPUT");
+                assert!(message.contains("active local sender"));
+            }
+            other => panic!("expected inactive local sender control input error, got {other:?}"),
+        }
+
+        let snapshot = app_state.control_input().lock().await.snapshot(session_id);
+        assert_eq!(snapshot.reliable.accepted_messages, 0);
+        assert_eq!(snapshot.reliable.injected_messages, 0);
     }
 
     #[tokio::test]

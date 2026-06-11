@@ -11,6 +11,12 @@ pub struct NativeSurfaceRect {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSurfaceControlFrameSize {
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NativeRenderSurfaceSnapshot {
     pub label: String,
@@ -36,6 +42,7 @@ impl RemoteDisplaySurfaceManager {
         rect: NativeSurfaceRect,
         enabled: bool,
         visible: bool,
+        control_frame_size: Option<NativeSurfaceControlFrameSize>,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         let label = window.label().to_string();
 
@@ -59,11 +66,11 @@ impl RemoteDisplaySurfaceManager {
         let rect = normalize_rect(rect);
 
         if let Some(surface) = self.surfaces.get_mut(&label) {
-            surface.move_to(rect, visible)?;
+            surface.move_to(rect, visible, control_frame_size)?;
             return Ok(surface.snapshot(label, rect));
         }
 
-        let surface = NativeRenderSurface::create(parent_hwnd, rect, visible)?;
+        let surface = NativeRenderSurface::create(parent_hwnd, rect, visible, control_frame_size)?;
         let snapshot = surface.snapshot(label.clone(), rect);
         self.surfaces.insert(label, surface);
         Ok(snapshot)
@@ -76,6 +83,7 @@ impl RemoteDisplaySurfaceManager {
         rect: NativeSurfaceRect,
         enabled: bool,
         visible: bool,
+        _control_frame_size: Option<NativeSurfaceControlFrameSize>,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         let label = window.label().to_string();
         let rect = normalize_rect(rect);
@@ -137,6 +145,7 @@ impl RemoteDisplaySurfaceManager {
         rect: NativeSurfaceRect,
         enabled: bool,
         visible: bool,
+        _control_frame_size: Option<NativeSurfaceControlFrameSize>,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         let label = window.label().to_string();
         let rect = normalize_rect(rect);
@@ -231,6 +240,7 @@ impl RemoteDisplaySurfaceManager {
         rect: NativeSurfaceRect,
         enabled: bool,
         _visible: bool,
+        _control_frame_size: Option<NativeSurfaceControlFrameSize>,
     ) -> Result<NativeRenderSurfaceSnapshot, String> {
         if enabled {
             return Err(
@@ -286,6 +296,39 @@ pub fn install_control_input_forwarder(
 #[cfg(windows)]
 struct WindowsSurfaceInputContext {
     session_id: Option<String>,
+    geometry: Option<WindowsSurfaceInputGeometry>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsSurfaceInputGeometry {
+    surface_width: i32,
+    surface_height: i32,
+    control_frame_width: i32,
+    control_frame_height: i32,
+}
+
+#[cfg(windows)]
+impl WindowsSurfaceInputGeometry {
+    fn from_rect_and_control_frame(
+        rect: NativeSurfaceRect,
+        control_frame_size: Option<NativeSurfaceControlFrameSize>,
+    ) -> Option<Self> {
+        let control_frame_size = control_frame_size?;
+        if rect.width <= 0
+            || rect.height <= 0
+            || control_frame_size.width <= 0
+            || control_frame_size.height <= 0
+        {
+            return None;
+        }
+        Some(Self {
+            surface_width: rect.width,
+            surface_height: rect.height,
+            control_frame_width: control_frame_size.width,
+            control_frame_height: control_frame_size.height,
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -302,42 +345,120 @@ fn windows_signed_high_word(value: usize) -> i32 {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSurfaceInputSideEffect {
+    Focus,
+    CaptureMouse,
+    ReleaseMouseCapture,
+}
+
+#[cfg(windows)]
+fn windows_surface_input_side_effects_from_message(
+    message: u32,
+) -> Vec<WindowsSurfaceInputSideEffect> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WM_CANCELMODE, WM_CAPTURECHANGED, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    };
+
+    match message {
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => vec![
+            WindowsSurfaceInputSideEffect::Focus,
+            WindowsSurfaceInputSideEffect::CaptureMouse,
+        ],
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP | WM_KILLFOCUS
+        | WM_CANCELMODE | WM_CAPTURECHANGED => {
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn apply_windows_surface_input_side_effect(
+    hwnd: windows::Win32::Foundation::HWND,
+    side_effect: WindowsSurfaceInputSideEffect,
+) {
+    match side_effect {
+        WindowsSurfaceInputSideEffect::Focus => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+        },
+        WindowsSurfaceInputSideEffect::CaptureMouse => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+        },
+        WindowsSurfaceInputSideEffect::ReleaseMouseCapture => unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        },
+    }
+}
+
+#[cfg(windows)]
 fn windows_surface_input_events_from_message(
     message: u32,
     wparam: usize,
     lparam: isize,
 ) -> Vec<mrd_ipc::ControlInputEvent> {
+    windows_surface_input_events_from_message_with_geometry(message, wparam, lparam, None)
+}
+
+#[cfg(windows)]
+fn windows_surface_input_events_from_message_with_geometry(
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    geometry: Option<WindowsSurfaceInputGeometry>,
+) -> Vec<mrd_ipc::ControlInputEvent> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        WM_CANCELMODE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+        WM_ACTIVATEAPP, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
     };
 
     match message {
         WM_MOUSEMOVE => {
             let (x, y) = windows_mouse_coordinates_from_lparam(lparam);
+            let (x, y) = scale_windows_surface_input_point(x, y, geometry);
             vec![mrd_ipc::ControlInputEvent::MouseMove { x, y }]
         }
         WM_MOUSEWHEEL => vec![mrd_ipc::ControlInputEvent::MouseWheel {
             delta: windows_signed_high_word(wparam),
         }],
-        WM_LBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, true),
-        WM_LBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, false),
-        WM_RBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, true),
-        WM_RBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, false),
-        WM_MBUTTONDOWN => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, true),
-        WM_MBUTTONUP => mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, false),
+        WM_MOUSEHWHEEL => vec![mrd_ipc::ControlInputEvent::MouseHorizontalWheel {
+            delta: windows_signed_high_word(wparam),
+        }],
+        WM_LBUTTONDOWN => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, true, geometry)
+        }
+        WM_LBUTTONUP => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Left, false, geometry)
+        }
+        WM_RBUTTONDOWN => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, true, geometry)
+        }
+        WM_RBUTTONUP => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Right, false, geometry)
+        }
+        WM_MBUTTONDOWN => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, true, geometry)
+        }
+        WM_MBUTTONUP => {
+            mouse_button_events(lparam, mrd_ipc::ControlInputButton::Middle, false, geometry)
+        }
         WM_XBUTTONDOWN | WM_XBUTTONUP => {
             let button = match (wparam >> 16) & 0xffff {
                 1 => mrd_ipc::ControlInputButton::X1,
                 2 => mrd_ipc::ControlInputButton::X2,
                 _ => return Vec::new(),
             };
-            mouse_button_events(lparam, button, message == WM_XBUTTONDOWN)
+            mouse_button_events(lparam, button, message == WM_XBUTTONDOWN, geometry)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => key_event(wparam, true).into_iter().collect(),
         WM_KEYUP | WM_SYSKEYUP => key_event(wparam, false).into_iter().collect(),
-        WM_KILLFOCUS | WM_CANCELMODE => vec![mrd_ipc::ControlInputEvent::ReleaseAll],
+        WM_KILLFOCUS | WM_CANCELMODE | WM_CAPTURECHANGED => {
+            vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        }
+        WM_ACTIVATEAPP if wparam == 0 => vec![mrd_ipc::ControlInputEvent::ReleaseAll],
         _ => Vec::new(),
     }
 }
@@ -347,12 +468,39 @@ fn mouse_button_events(
     lparam: isize,
     button: mrd_ipc::ControlInputButton,
     pressed: bool,
+    geometry: Option<WindowsSurfaceInputGeometry>,
 ) -> Vec<mrd_ipc::ControlInputEvent> {
     let (x, y) = windows_mouse_coordinates_from_lparam(lparam);
+    let (x, y) = scale_windows_surface_input_point(x, y, geometry);
     vec![
         mrd_ipc::ControlInputEvent::MouseMove { x, y },
         mouse_button_event(button, pressed),
     ]
+}
+
+#[cfg(windows)]
+fn scale_windows_surface_input_point(
+    x: i32,
+    y: i32,
+    geometry: Option<WindowsSurfaceInputGeometry>,
+) -> (i32, i32) {
+    let Some(geometry) = geometry else {
+        return (x, y);
+    };
+    let scaled_x =
+        scale_windows_surface_input_axis(x, geometry.surface_width, geometry.control_frame_width);
+    let scaled_y =
+        scale_windows_surface_input_axis(y, geometry.surface_height, geometry.control_frame_height);
+    (scaled_x, scaled_y)
+}
+
+#[cfg(windows)]
+fn scale_windows_surface_input_axis(value: i32, surface_extent: i32, frame_extent: i32) -> i32 {
+    if surface_extent <= 0 || frame_extent <= 0 {
+        return value;
+    }
+    let scaled = (i64::from(value) * i64::from(frame_extent)) / i64::from(surface_extent);
+    scaled.clamp(0, i64::from(frame_extent - 1)) as i32
 }
 
 #[cfg(windows)]
@@ -398,6 +546,18 @@ fn forward_windows_surface_input(
 }
 
 #[cfg(windows)]
+fn windows_surface_input_geometry(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Option<WindowsSurfaceInputGeometry> {
+    unsafe { windows_surface_input_context_mut(hwnd).and_then(|context| context.geometry) }
+}
+
+#[cfg(windows)]
+fn release_windows_surface_input(hwnd: windows::Win32::Foundation::HWND) {
+    forward_windows_surface_input(hwnd, mrd_ipc::ControlInputEvent::ReleaseAll);
+}
+
+#[cfg(windows)]
 struct NativeRenderSurface {
     parent_hwnd: isize,
     hwnd: windows::Win32::Foundation::HWND,
@@ -406,7 +566,12 @@ struct NativeRenderSurface {
 
 #[cfg(windows)]
 impl NativeRenderSurface {
-    fn create(parent_hwnd: isize, rect: NativeSurfaceRect, visible: bool) -> Result<Self, String> {
+    fn create(
+        parent_hwnd: isize,
+        rect: NativeSurfaceRect,
+        visible: bool,
+        control_frame_size: Option<NativeSurfaceControlFrameSize>,
+    ) -> Result<Self, String> {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
@@ -425,7 +590,15 @@ impl NativeRenderSurface {
             wparam: WPARAM,
             lparam: LPARAM,
         ) -> LRESULT {
-            let events = windows_surface_input_events_from_message(message, wparam.0, lparam.0);
+            for side_effect in windows_surface_input_side_effects_from_message(message) {
+                apply_windows_surface_input_side_effect(hwnd, side_effect);
+            }
+            let events = windows_surface_input_events_from_message_with_geometry(
+                message,
+                wparam.0,
+                lparam.0,
+                windows_surface_input_geometry(hwnd),
+            );
             if !events.is_empty() {
                 for event in events {
                     forward_windows_surface_input(hwnd, event);
@@ -488,7 +661,13 @@ impl NativeRenderSurface {
             return Err("create native render surface failed".to_string());
         }
 
-        let context = Box::new(WindowsSurfaceInputContext { session_id: None });
+        let context = Box::new(WindowsSurfaceInputContext {
+            session_id: None,
+            geometry: WindowsSurfaceInputGeometry::from_rect_and_control_frame(
+                rect,
+                control_frame_size,
+            ),
+        });
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(context) as isize);
         }
@@ -518,7 +697,12 @@ impl NativeRenderSurface {
         })
     }
 
-    fn move_to(&mut self, rect: NativeSurfaceRect, visible: bool) -> Result<(), String> {
+    fn move_to(
+        &mut self,
+        rect: NativeSurfaceRect,
+        visible: bool,
+        control_frame_size: Option<NativeSurfaceControlFrameSize>,
+    ) -> Result<(), String> {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             SetWindowPos, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_SHOWWINDOW,
@@ -542,6 +726,7 @@ impl NativeRenderSurface {
             .map_err(|error| format!("position native render surface failed: {error}"))?;
         }
         self.visible = visible;
+        self.set_control_input_geometry(rect, control_frame_size);
         Ok(())
     }
 
@@ -568,6 +753,21 @@ impl NativeRenderSurface {
             }
         }
     }
+
+    fn set_control_input_geometry(
+        &mut self,
+        rect: NativeSurfaceRect,
+        control_frame_size: Option<NativeSurfaceControlFrameSize>,
+    ) {
+        unsafe {
+            if let Some(context) = windows_surface_input_context_mut(self.hwnd) {
+                context.geometry = WindowsSurfaceInputGeometry::from_rect_and_control_frame(
+                    rect,
+                    control_frame_size,
+                );
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -575,6 +775,7 @@ impl Drop for NativeRenderSurface {
     fn drop(&mut self) {
         unsafe {
             use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_USERDATA};
+            release_windows_surface_input(self.hwnd);
             let ptr =
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) as *mut WindowsSurfaceInputContext;
             if !ptr.is_null() {
@@ -766,8 +967,9 @@ mod remote_display_surface_input_tests {
         BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
         PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow, ShowWindow,
         TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, HMENU, MSG, PM_REMOVE, SW_SHOW,
-        WINDOW_EX_STYLE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
+        WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WNDCLASSW,
+        WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
     };
 
     fn lparam(x: i16, y: i16) -> isize {
@@ -1325,6 +1527,10 @@ mod remote_display_surface_input_tests {
             windows_surface_input_events_from_message(WM_MOUSEWHEEL, (120_u16 as usize) << 16, 0),
             vec![mrd_ipc::ControlInputEvent::MouseWheel { delta: 120 }]
         );
+        assert_eq!(
+            windows_surface_input_events_from_message(WM_MOUSEHWHEEL, (120_u16 as usize) << 16, 0),
+            vec![mrd_ipc::ControlInputEvent::MouseHorizontalWheel { delta: 120 }]
+        );
     }
 
     #[test]
@@ -1338,6 +1544,60 @@ mod remote_display_surface_input_tests {
                     pressed: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_scales_surface_coordinates_to_control_frame() {
+        let geometry = WindowsSurfaceInputGeometry {
+            surface_width: 1280,
+            surface_height: 720,
+            control_frame_width: 2560,
+            control_frame_height: 1440,
+        };
+
+        assert_eq!(
+            windows_surface_input_events_from_message_with_geometry(
+                WM_MOUSEMOVE,
+                0,
+                lparam(640, 360),
+                Some(geometry)
+            ),
+            vec![mrd_ipc::ControlInputEvent::MouseMove { x: 1280, y: 720 }]
+        );
+        assert_eq!(
+            windows_surface_input_events_from_message_with_geometry(
+                WM_LBUTTONDOWN,
+                0,
+                lparam(1279, 719),
+                Some(geometry)
+            ),
+            vec![
+                mrd_ipc::ControlInputEvent::MouseMove { x: 2558, y: 1438 },
+                mrd_ipc::ControlInputEvent::MouseButton {
+                    button: mrd_ipc::ControlInputButton::Left,
+                    pressed: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_display_surface_input_focuses_and_captures_on_button_drag() {
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_LBUTTONDOWN),
+            vec![
+                WindowsSurfaceInputSideEffect::Focus,
+                WindowsSurfaceInputSideEffect::CaptureMouse,
+            ]
+        );
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_LBUTTONUP),
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
+        );
+        assert_eq!(
+            windows_surface_input_side_effects_from_message(WM_CAPTURECHANGED),
+            vec![WindowsSurfaceInputSideEffect::ReleaseMouseCapture]
         );
     }
 
@@ -1361,6 +1621,18 @@ mod remote_display_surface_input_tests {
             windows_surface_input_events_from_message(WM_KILLFOCUS, 0, 0),
             vec![mrd_ipc::ControlInputEvent::ReleaseAll]
         );
+        assert_eq!(
+            windows_surface_input_events_from_message(WM_CAPTURECHANGED, 0, 0),
+            vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        );
+        assert_eq!(
+            windows_surface_input_events_from_message(WM_ACTIVATEAPP, 0, 0),
+            vec![mrd_ipc::ControlInputEvent::ReleaseAll]
+        );
+        assert!(
+            windows_surface_input_events_from_message(WM_ACTIVATEAPP, 1, 0).is_empty(),
+            "activating the app must not synthesize input"
+        );
     }
 
     #[test]
@@ -1382,6 +1654,10 @@ mod remote_display_surface_input_tests {
                 height: 128,
             },
             false,
+            Some(NativeSurfaceControlFrameSize {
+                width: 256,
+                height: 256,
+            }),
         )
         .expect("create native render surface");
         surface.set_control_session_id(Some("native-forward-session".to_string()));
@@ -1401,8 +1677,16 @@ mod remote_display_surface_input_tests {
         assert_eq!(input.session_id, "native-forward-session");
         assert_eq!(
             input.event,
-            mrd_ipc::ControlInputEvent::MouseMove { x: 42, y: 24 }
+            mrd_ipc::ControlInputEvent::MouseMove { x: 84, y: 48 }
         );
+
+        drop(surface);
+
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping native surface should release active control input");
+        assert_eq!(release.session_id, "native-forward-session");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
     }
 
     #[tokio::test]
@@ -1555,6 +1839,7 @@ mod remote_display_surface_input_tests {
                 height: 128,
             },
             false,
+            None,
         )
         .expect("create native render surface");
         surface.set_control_session_id(Some(session_id.0.clone()));

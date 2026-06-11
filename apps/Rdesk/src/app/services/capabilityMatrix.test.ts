@@ -281,6 +281,13 @@ describe("buildCapabilitySnapshotFromIpc", () => {
           fps: 30,
           bitrate_mbps: 8,
           codec: "h264",
+          codec_profile: "main10",
+          bit_depth: 10,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "p010",
+          hdr_enabled: true,
+          color_mode: "low_chroma",
+          color_pipeline: "hdr_main10",
           required_capabilities: ["capture.pipewire", "transport.quic_datagram"],
         },
       ],
@@ -298,6 +305,15 @@ describe("buildCapabilitySnapshotFromIpc", () => {
       "capture.pipewire",
       "transport.quic_datagram",
     ]);
+    expect(snapshot.profiles[0]).toMatchObject({
+      codec_profile: "main10",
+      bit_depth: 10,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "p010",
+      hdr_enabled: true,
+      color_mode: "low_chroma",
+      color_pipeline: "hdr_main10",
+    });
     expect(snapshot.recent_profile_results).toEqual([]);
 
     const support = evaluateProfileSupport("smoke.720p30", snapshot);
@@ -767,6 +783,52 @@ describe("capability profiles", () => {
     expect(profile?.required_capabilities).toContain("transport.media_profile_control_v1");
   });
 
+  it("exposes LAN color and Main10 media capabilities in the baseline matrix", () => {
+    const snapshot = buildCapabilitySnapshotFromEnvironment(windowsEnvironment);
+
+    expect(snapshot.capabilities).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "media.color_mode_v1",
+          status: "supported",
+        }),
+        expect.objectContaining({
+          id: "media.hevc_main10_420_10bit",
+          status: "supported",
+        }),
+      ])
+    );
+  });
+
+  it("exposes a LAN 2K144 Main10 profile with required media capabilities", () => {
+    const profile = getCapabilityProfile("lan.2k144.main10");
+
+    expect(profile).toMatchObject({
+      id: "lan.2k144.main10",
+      width: 2560,
+      height: 1440,
+      fps: 144,
+      bitrate_mbps: 80,
+      codec: "hevc",
+      codec_profile: "main10",
+      bit_depth: 10,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "p010",
+      hdr_enabled: true,
+      color_mode: "full",
+      color_pipeline: "hdr_main10",
+    });
+    expect(profile?.required_capabilities).toEqual([
+      "encode.nvenc_hevc_main10",
+      "decode.nvdec_hevc_main10",
+      "media.hevc_main10_420_10bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ]);
+  });
+
   it("exposes a native macOS 2K144 profile", () => {
     const profile = getCapabilityProfile("lan.macos.2k144");
 
@@ -977,6 +1039,54 @@ describe("capability profiles", () => {
     );
 
     expect(result.status).toBe("passed");
+  });
+
+  it("includes profile media metadata in runtime mismatch diagnostics", () => {
+    const probe: ProbeSnapshot = {
+      session_id: "session-1",
+      frames_received: 30,
+      frames_decoded: 30,
+      frames_dropped: 0,
+      current_fps: 144,
+      bitrate_mbps: 64,
+      media_probe_valid: true,
+      media_probe_format: "compressed_hevc_test_pattern",
+      media_probe_width: 1920,
+      media_probe_height: 1080,
+      media_probe_target_fps: 60,
+      media_probe_target_bitrate_mbps: 20,
+      media_probe_payload_bytes: 1000,
+      last_error: null,
+    };
+
+    const result = evaluateProfileProbe(
+      {
+        id: "runtime.main10.color",
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: "hevc",
+        codec_profile: "main10",
+        bit_depth: 10,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "p010",
+        hdr_enabled: true,
+        color_mode: "low_chroma",
+        color_pipeline: "hdr_main10",
+        required_capabilities: [],
+      },
+      probe
+    );
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("hevc/main10");
+    expect(result.error).toContain("10-bit");
+    expect(result.error).toContain("4:2:0");
+    expect(result.error).toContain("p010");
+    expect(result.error).toContain("HDR");
+    expect(result.error).toContain("color=low_chroma");
+    expect(result.error).toContain("pipeline=hdr_main10");
   });
 });
 

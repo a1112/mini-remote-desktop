@@ -7,12 +7,16 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    CrossE2EFaultInjectionResult, DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse,
-    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
-    PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus,
-    SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle,
-    TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
+    CrossE2EFaultInjectionResult, DeviceIdentitySnapshot, DeviceInfo, DevicePreference,
+    DevicePreferenceUpdate, DirectoryList, FileEntry, FileEntryKind, FileTransferConflictPolicy,
+    FileTransferEntry, FileTransferProviderDescriptor, FileTransferProviderHandoffHint,
+    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcRequest,
+    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
+    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot, PairedDeviceIdentity, ScenarioEvaluation,
+    ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot,
+    TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig,
+    TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -90,6 +94,13 @@ fn test_capability_snapshot() -> CapabilitySnapshot {
                 fps: 144,
                 bitrate_mbps: 64,
                 codec: "h264".to_string(),
+                codec_profile: None,
+                bit_depth: None,
+                chroma_subsampling: None,
+                pixel_format: None,
+                hdr_enabled: None,
+                color_mode: None,
+                color_pipeline: None,
                 latency_budget_ms: None,
                 min_stable_fps_ratio: Some(0.8),
                 max_drop_ratio: Some(0.02),
@@ -105,6 +116,13 @@ fn test_capability_snapshot() -> CapabilitySnapshot {
                 fps: 165,
                 bitrate_mbps: 80,
                 codec: "h264".to_string(),
+                codec_profile: None,
+                bit_depth: None,
+                chroma_subsampling: None,
+                pixel_format: None,
+                hdr_enabled: None,
+                color_mode: None,
+                color_pipeline: None,
                 latency_budget_ms: None,
                 min_stable_fps_ratio: Some(0.8),
                 max_drop_ratio: Some(0.02),
@@ -614,6 +632,15 @@ fn serialize_deserialize_control_input_contracts() {
     let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
     assert_eq!(release_request, deserialized);
 
+    let horizontal_wheel_request = IpcRequest::SendControlInput {
+        session_id: session_id.clone(),
+        event: ControlInputEvent::MouseHorizontalWheel { delta: 120 },
+    };
+    let json = serde_json::to_string(&horizontal_wheel_request).unwrap();
+    assert!(json.contains("\"kind\":\"mouse_horizontal_wheel\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(horizontal_wheel_request, deserialized);
+
     let response = IpcResponse::ControlInputAccepted {
         session_id,
         lane: ControlInputLane::Reliable,
@@ -622,6 +649,175 @@ fn serialize_deserialize_control_input_contracts() {
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("ControlInputAccepted"));
     assert!(json.contains("\"lane\":\"reliable\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_file_directory_contracts() {
+    let request = IpcRequest::ListDirectory {
+        path: Some("C:\\Users\\tester".to_string()),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListDirectory"));
+    assert!(json.contains("C:\\\\Users\\\\tester"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let listing = DirectoryList {
+        path: "C:\\Users\\tester".to_string(),
+        parent_path: Some("C:\\Users".to_string()),
+        entries: vec![FileEntry {
+            name: "Downloads".to_string(),
+            path: "C:\\Users\\tester\\Downloads".to_string(),
+            kind: FileEntryKind::Directory,
+            size_bytes: None,
+            modified_ms: Some(1_776_000_000_000),
+            readonly: false,
+        }],
+    };
+    let response = IpcResponse::DirectoryList { listing };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DirectoryList"));
+    assert!(json.contains("\"kind\":\"directory\""));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_file_transfer_contracts() {
+    let request = IpcRequest::StartFileTransfer {
+        request: FileTransferStartRequest {
+            source_device_id: Some(DeviceId("source-device".to_string())),
+            target_device_id: Some(DeviceId("target-device".to_string())),
+            entries: vec![FileTransferEntry {
+                source_path: "C:\\Users\\tester\\source.txt".to_string(),
+                file_name: Some("source.txt".to_string()),
+                kind: FileEntryKind::File,
+            }],
+            target_path: "C:\\Users\\tester\\Downloads".to_string(),
+            conflict_policy: FileTransferConflictPolicy::Rename,
+            transport_hint: Some("local".to_string()),
+            provider_hint: Some("mrd-local".to_string()),
+        },
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("StartFileTransfer"));
+    assert!(json.contains("\"source_device_id\":\"source-device\""));
+    assert!(json.contains("\"conflict_policy\":\"rename\""));
+    assert!(json.contains("\"transport_hint\":\"local\""));
+    assert!(json.contains("\"provider_hint\":\"mrd-local\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let request = IpcRequest::ListFileTransfers;
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListFileTransfers"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let request = IpcRequest::CancelFileTransfer {
+        transfer_id: "file-transfer-1".to_string(),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("CancelFileTransfer"));
+    assert!(json.contains("\"transfer_id\":\"file-transfer-1\""));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let transfer = FileTransferTaskSnapshot {
+        transfer_id: "file-transfer-1".to_string(),
+        status: FileTransferStatus::Completed,
+        source_device_id: Some(DeviceId("source-device".to_string())),
+        target_device_id: Some(DeviceId("target-device".to_string())),
+        transport_kind: "local".to_string(),
+        provider_kind: "mrd-local".to_string(),
+        provider_capabilities: vec!["service.file_transfer.local".to_string()],
+        total_entries: 1,
+        copied_entries: 1,
+        total_bytes: Some(5),
+        copied_bytes: 5,
+        error: None,
+        entries: vec![FileEntry {
+            name: "source.txt".to_string(),
+            path: "C:\\Users\\tester\\Downloads\\source.txt".to_string(),
+            kind: FileEntryKind::File,
+            size_bytes: Some(5),
+            modified_ms: None,
+            readonly: false,
+        }],
+    };
+    let response = IpcResponse::FileTransferStarted {
+        transfer: transfer.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferStarted"));
+    assert!(json.contains("\"status\":\"completed\""));
+    assert!(json.contains("\"provider_kind\":\"mrd-local\""));
+    assert!(json.contains("\"service.file_transfer.local\""));
+    assert!(json.contains("\"copied_bytes\":5"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::FileTransferCancelled {
+        transfer: transfer.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferCancelled"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::FileTransferList {
+        transfers: vec![transfer],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferList"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let request = IpcRequest::ListFileTransferProviders;
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("ListFileTransferProviders"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let response = IpcResponse::FileTransferProviderList {
+        providers: vec![
+            FileTransferProviderDescriptor {
+                provider_kind: "mrd-local".to_string(),
+                display_name: "MRD local file transfer".to_string(),
+                status: CapabilityStatus::Available,
+                capabilities: vec!["service.file_transfer.local".to_string()],
+                reason: None,
+                handoff_hint: None,
+            },
+            FileTransferProviderDescriptor {
+                provider_kind: "r-file".to_string(),
+                display_name: "R-File external bridge".to_string(),
+                status: CapabilityStatus::Unimplemented,
+                capabilities: vec!["service.file_transfer.external_bridge".to_string()],
+                reason: Some("reserved provider bridge".to_string()),
+                handoff_hint: Some(FileTransferProviderHandoffHint {
+                    external_app: "R-File".to_string(),
+                    bridge_service: "rfile-bridge".to_string(),
+                    control_endpoint: Some("http://127.0.0.1:18100".to_string()),
+                    data_endpoint: Some("http://127.0.0.1:18080".to_string()),
+                    capabilities: vec![
+                        "rfile.bridge.session_v1".to_string(),
+                        "rfile.watch.http_v1".to_string(),
+                        "rfile.remote_mount.v1".to_string(),
+                    ],
+                }),
+            },
+        ],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("FileTransferProviderList"));
+    assert!(json.contains("\"provider_kind\":\"r-file\""));
+    assert!(json.contains("\"status\":\"unimplemented\""));
+    assert!(json.contains("\"service.file_transfer.external_bridge\""));
+    assert!(json.contains("\"bridge_service\":\"rfile-bridge\""));
+    assert!(json.contains("\"control_endpoint\":\"http://127.0.0.1:18100\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }
@@ -655,6 +851,51 @@ fn serialize_deserialize_device_list_response() {
 }
 
 #[test]
+fn serialize_deserialize_device_preference_contracts() {
+    let update_request = IpcRequest::UpdateDevicePreference {
+        device_id: test_device_id(),
+        update: DevicePreferenceUpdate {
+            favorite: Some(true),
+            disabled: Some(false),
+            removed: Some(false),
+        },
+    };
+    let json = serde_json::to_string(&update_request).unwrap();
+    assert!(json.contains("UpdateDevicePreference"));
+    assert!(json.contains("\"favorite\":true"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(update_request, deserialized);
+
+    let list_request = IpcRequest::GetDevicePreferences;
+    let json = serde_json::to_string(&list_request).unwrap();
+    assert!(json.contains("GetDevicePreferences"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(list_request, deserialized);
+
+    let preference = DevicePreference {
+        device_id: test_device_id(),
+        favorite: true,
+        disabled: false,
+        removed: false,
+    };
+    let response = IpcResponse::DevicePreferenceUpdated {
+        preference: preference.clone(),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DevicePreferenceUpdated"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+
+    let response = IpcResponse::DevicePreferences {
+        preferences: vec![preference],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("DevicePreferences"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
 fn serialize_deserialize_session_snapshot_response() {
     let response = IpcResponse::SessionSnapshot {
         snapshot: SessionRuntimeSnapshot {
@@ -671,10 +912,12 @@ fn serialize_deserialize_session_snapshot_response() {
             last_error: None,
             sender_active: false,
             receiver_active: false,
+            peer_device_id: Some(test_device_id()),
         },
     };
 
     let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"peer_device_id\""));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
 
     assert_eq!(response, deserialized);
@@ -789,6 +1032,8 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             active_chroma_subsampling: Some("4:2:0".to_string()),
             active_pixel_format: Some("d3d11_shared_nv12".to_string()),
             active_hdr_enabled: Some(false),
+            active_color_mode: Some("monochrome".to_string()),
+            active_color_pipeline: Some("sdr8".to_string()),
             active_width: Some(2560),
             active_height: Some(1440),
             active_fps: Some(144),

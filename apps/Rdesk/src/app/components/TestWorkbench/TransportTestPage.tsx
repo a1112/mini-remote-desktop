@@ -733,6 +733,8 @@ function mediaProfileForTestProfile(testProfile: TestProfile): MediaProfile {
     chroma_subsampling: "4:2:0",
     pixel_format: "nv12",
     hdr_enabled: false,
+    color_mode: "full",
+    color_pipeline: "sdr8",
   };
 }
 
@@ -765,17 +767,37 @@ function peerHasMediaCapabilities(peer: LanPeerInfo, capabilityGroups: string[][
   );
 }
 
+function mediaProfileRequestsNonFullColor(profile: MediaProfile): boolean {
+  const colorMode = profile.color_mode?.toLowerCase();
+  return Boolean(colorMode && colorMode !== "full");
+}
+
+function mediaProfileRequestsHevcMain10(profile: MediaProfile): boolean {
+  if ((profile.codec?.toLowerCase() ?? "h264") !== "hevc") return false;
+  return (
+    profile.codec_profile?.toLowerCase() === "main10" ||
+    profile.bit_depth === 10 ||
+    profile.pixel_format?.toLowerCase() === "p010" ||
+    profile.color_pipeline?.toLowerCase() === "hdr_main10"
+  );
+}
+
 function peerSupportsMacosVideoToolboxProfile(
   peer: LanPeerInfo,
   requestedProfile: MediaProfile
 ): boolean {
   const codec = requestedProfile.codec?.toLowerCase() ?? "h264";
+  const hevcMain10 = mediaProfileRequestsHevcMain10(requestedProfile);
   const codecEncoder =
-    codec === "hevc"
+    codec === "hevc" && hevcMain10
+      ? ["videotoolbox_hevc_main10", "encode.videotoolbox_hevc_main10"]
+      : codec === "hevc"
       ? ["videotoolbox_hevc", "encode.videotoolbox_hevc"]
       : ["videotoolbox_h264", "encode.videotoolbox_h264"];
   const codecDecoder =
-    codec === "hevc"
+    codec === "hevc" && hevcMain10
+      ? ["decode.videotoolbox_hevc_main10"]
+      : codec === "hevc"
       ? ["decode.videotoolbox_hevc"]
       : ["decode.videotoolbox_h264"];
   const capabilityGroups = [
@@ -785,7 +807,12 @@ function peerSupportsMacosVideoToolboxProfile(
     ["macos_native_render", "render.macos"],
   ];
   if (codec === "hevc") {
-    capabilityGroups.push(["media.hevc_main_420_8bit"]);
+    capabilityGroups.push([
+      hevcMain10 ? "media.hevc_main10_420_10bit" : "media.hevc_main_420_8bit",
+    ]);
+  }
+  if (mediaProfileRequestsNonFullColor(requestedProfile)) {
+    capabilityGroups.push(["media.color_mode_v1"]);
   }
   return peerHasMediaCapabilities(peer, capabilityGroups);
 }
@@ -804,6 +831,8 @@ export function crossDeviceConfigForPeer(
     bitrate: requestedProfile.bitrate_mbps * 1_000_000,
     duration_ms: 15_000,
     warmup_ms: 500,
+    color_mode: requestedProfile.color_mode ?? "full",
+    color_pipeline: requestedProfile.color_pipeline ?? "sdr8",
   };
   if (peerSupportsMacosVideoToolboxProfile(peer, requestedProfile)) {
     return {
@@ -818,7 +847,12 @@ export function crossDeviceConfigForPeer(
   return {
     ...common,
     capture_type: "dxgi",
-    encoder_type: codec === "hevc" ? "nvenc_hevc" : "nvenc_h264",
+    encoder_type:
+      codec === "hevc"
+        ? mediaProfileRequestsHevcMain10(requestedProfile)
+          ? "nvenc_hevc_main10"
+          : "nvenc_hevc"
+        : "nvenc_h264",
     decoder_type: "nvdec",
     renderer_type: "d3d11",
     zero_copy: true,

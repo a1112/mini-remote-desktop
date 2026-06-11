@@ -1,5 +1,5 @@
 import { useCallback, useState, useEffect, useRef } from "react";
-import { useParams, useNavigate } from "react-router";
+import { useLocation, useParams, useNavigate } from "react-router";
 import { type Device, useDeviceById, useDevices } from "./deviceData";
 import {
   launchRemoteApplicationForDevice,
@@ -16,6 +16,19 @@ import {
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
+import {
+  ipcCancelFileTransfer,
+  ipcListDirectory,
+  ipcListFileTransferProviders,
+  ipcListFileTransfers,
+  ipcStartFileTransfer,
+  type FileEntry,
+  type FileEntryKind,
+  type FileTransferProviderDescriptor,
+  type FileTransferEntry,
+  type FileTransferStatus,
+  type FileTransferTaskSnapshot,
+} from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import {
   ArrowLeft,
@@ -83,7 +96,29 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
 
-type TabType = "remote" | "files" | "apps";
+type TabType = "remote" | "files" | "apps" | "terminal" | "info";
+
+export function deviceDetailTabFromSearch(search: string): TabType {
+  const tab = new URLSearchParams(search).get("tab");
+  return tab === "files" || tab === "apps" || tab === "terminal" || tab === "info" || tab === "remote"
+    ? tab
+    : "remote";
+}
+
+export function remoteApplicationSourceMatchesTerminalFocus(
+  source: Pick<CaptureSource, "app_name" | "title">
+): boolean {
+  const haystack = `${source.app_name ?? ""} ${source.title ?? ""}`.toLowerCase();
+  return /\b(cmd|command prompt|powershell|pwsh|terminal|wt\.exe)\b/.test(haystack);
+}
+
+export function remoteStartUnavailableReason(
+  device: Pick<Device, "disabled" | "status">
+): string | null {
+  if (device.disabled) return "设备已禁用";
+  if (device.status !== "online") return "设备当前离线";
+  return null;
+}
 
 const remoteFiles = [
   { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03" },
@@ -124,9 +159,12 @@ const localFiles = [
 export function DeviceDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const { devices, loading } = useDevices();
   const device = useDeviceById(id, devices);
-  const [activeTab, setActiveTab] = useState<TabType>("remote");
+  const [activeTab, setActiveTab] = useState<TabType>(() =>
+    deviceDetailTabFromSearch(location.search)
+  );
   const { isDark } = useTheme();
   const detailBar = useDetailBar();
 
@@ -136,6 +174,8 @@ export function DeviceDetailPage() {
     { key: "remote", label: "远程桌面", icon: Monitor },
     { key: "files", label: "文件传输", icon: FolderOpen },
     { key: "apps", label: "远程应用", icon: AppWindow },
+    { key: "terminal", label: "远程终端", icon: Terminal },
+    { key: "info", label: "设备信息", icon: Info },
   ];
 
   const handleCollapse = () => {
@@ -163,6 +203,10 @@ export function DeviceDetailPage() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
+
+  useEffect(() => {
+    setActiveTab(deviceDetailTabFromSearch(location.search));
+  }, [location.search]);
 
   // Clean up context when leaving this page
   useEffect(() => {
@@ -289,6 +333,8 @@ export function DeviceDetailPage() {
         {activeTab === "remote" && <RemoteTab device={device} />}
         {activeTab === "files" && <FilesTab device={device} devices={devices} />}
         {activeTab === "apps" && <AppsTab device={device} />}
+        {activeTab === "terminal" && <AppsTab device={device} terminalFocus />}
+        {activeTab === "info" && <InfoTab device={device} />}
       </div>
 
       {/* Performance monitoring footer */}
@@ -315,6 +361,7 @@ function RemoteTab({ device }: { device: Device }) {
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const isOnline = device.status === "online";
+  const remoteUnavailableReason = remoteStartUnavailableReason(device);
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
   const preferredTransport = device.p2pAvailable
     ? "quic"
@@ -370,6 +417,10 @@ function RemoteTab({ device }: { device: Device }) {
   };
 
   const handleStartRemote = async () => {
+    if (remoteUnavailableReason) {
+      setConnectionError(remoteUnavailableReason);
+      return;
+    }
     setLaunching(true);
     setConnectionError(null);
     try {
@@ -391,7 +442,6 @@ function RemoteTab({ device }: { device: Device }) {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Open remote display failed";
       setConnectionError(message);
-      alert(message);
     } finally {
       setLaunching(false);
     }
@@ -458,12 +508,22 @@ function RemoteTab({ device }: { device: Device }) {
           </div>
           <button
             onClick={() => void handleStartRemote()}
-            disabled={launching}
+            disabled={launching || Boolean(remoteUnavailableReason)}
             className="w-full px-8 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm disabled:cursor-not-allowed disabled:opacity-60"
             style={{ fontSize: 14 }}
           >
-            发起远程连接
+            {remoteUnavailableReason ?? "发起远程连接"}
           </button>
+          {connectionError ? (
+            <div
+              role="alert"
+              className={`mt-4 flex items-start gap-2 rounded-lg border px-3 py-2 text-left ${isDark ? "border-red-500/25 bg-red-500/10 text-red-200" : "border-red-200 bg-red-50 text-red-700"}`}
+              style={{ fontSize: 12 }}
+            >
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{connectionError}</span>
+            </div>
+          ) : null}
         </div>
       </div>
     );
@@ -581,7 +641,177 @@ function RemoteTab({ device }: { device: Device }) {
 }
 
 /* ======================== File Transfer Tab ======================== */
-type FileItem = { name: string; type: "folder" | "file"; size: string; modified: string; fileKind: string };
+export type FileItem = {
+  name: string;
+  path?: string;
+  kind?: FileEntryKind;
+  type: "folder" | "file";
+  size: string;
+  modified: string;
+  fileKind: string;
+};
+
+function formatFileSize(sizeBytes: number | null | undefined): string {
+  if (sizeBytes === null || sizeBytes === undefined) return "--";
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${Math.round(sizeBytes / 1024)} KB`;
+  if (sizeBytes < 1024 * 1024 * 1024) return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(sizeBytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function formatModifiedTime(modifiedMs: number | null | undefined): string {
+  if (!modifiedMs) return "--";
+  const date = new Date(modifiedMs);
+  if (Number.isNaN(date.getTime())) return "--";
+  return date.toISOString().slice(0, 10);
+}
+
+function fileKindLabel(entry: FileEntry): string {
+  if (entry.kind === "directory") return "文件夹";
+  if (entry.kind === "symlink") return "符号链接";
+  if (entry.kind === "other") return "其他";
+  const ext = entry.name.split(".").pop()?.toLowerCase();
+  if (ext === "pdf") return "PDF 文档";
+  if (ext === "json") return "JSON 文件";
+  if (ext === "png" || ext === "jpg" || ext === "jpeg") return "图片";
+  if (ext === "txt" || ext === "md") return "文本文件";
+  return "文件";
+}
+
+function fileEntryToItem(entry: FileEntry): FileItem {
+  return {
+    name: entry.name,
+    path: entry.path,
+    kind: entry.kind,
+    type: entry.kind === "directory" ? "folder" : "file",
+    size: entry.kind === "directory" ? "--" : formatFileSize(entry.size_bytes),
+    modified: formatModifiedTime(entry.modified_ms),
+    fileKind: fileKindLabel(entry),
+  };
+}
+
+function pathSegmentsFromDirectory(path: string | null, fallback: string[]): string[] {
+  if (!path) return fallback;
+  const segments = path.split(/[\\/]+/).filter(Boolean);
+  return segments.length > 0 ? segments : [path];
+}
+
+type FileTransferDragPayload = {
+  files: string[];
+  entries: FileTransferEntry[];
+  fromSide: "left" | "right";
+  fromDeviceId: string;
+};
+
+export type FileTransferDropRequest = {
+  sourceDeviceId: string;
+  targetDeviceId: string;
+  entries: FileTransferEntry[];
+  targetPath: string;
+};
+
+export function fileTransferEntriesFromSelection(
+  files: FileItem[],
+  selectedNames: string[],
+  contextFileName: string
+): FileTransferEntry[] {
+  const transferNames = selectedNames.includes(contextFileName)
+    ? selectedNames
+    : [contextFileName];
+  return transferNames
+    .map((name) => files.find((candidate) => candidate.name === name))
+    .filter((file): file is FileItem => Boolean(file?.path))
+    .map((file) => ({
+      source_path: file.path ?? "",
+      file_name: file.name,
+      kind: file.kind ?? (file.type === "folder" ? "directory" : "file"),
+    }));
+}
+
+export function fileTransferDropRequestForSendToOther({
+  sourceDeviceId,
+  targetDeviceId,
+  targetPath,
+  files,
+  selectedNames,
+  contextFileName,
+}: {
+  sourceDeviceId: string;
+  targetDeviceId: string | null | undefined;
+  targetPath: string | null | undefined;
+  files: FileItem[];
+  selectedNames: string[];
+  contextFileName: string;
+}): FileTransferDropRequest | null {
+  if (!targetDeviceId || !targetPath) return null;
+  const entries = fileTransferEntriesFromSelection(files, selectedNames, contextFileName);
+  if (entries.length === 0) return null;
+  return {
+    sourceDeviceId,
+    targetDeviceId,
+    targetPath,
+    entries,
+  };
+}
+
+function fileTransferStatusLabel(status: FileTransferStatus): string {
+  switch (status) {
+    case "queued":
+      return "排队";
+    case "running":
+      return "运行中";
+    case "completed":
+      return "完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status;
+  }
+}
+
+function fileTransferProgressLabel(transfer: FileTransferTaskSnapshot): string {
+  return `${fileTransferStatusLabel(transfer.status)} ${transfer.copied_entries}/${transfer.total_entries}`;
+}
+
+function fileTransferByteLabel(transfer: FileTransferTaskSnapshot): string {
+  return `${formatFileSize(transfer.copied_bytes)} / ${formatFileSize(transfer.total_bytes)}`;
+}
+
+function fileTransferProviderStatusLabel(
+  status: FileTransferProviderDescriptor["status"]
+): string {
+  switch (status) {
+    case "available":
+      return "可用";
+    case "unimplemented":
+      return "预留";
+    case "unsupported":
+      return "不支持";
+    case "degraded":
+      return "降级";
+    default:
+      return status;
+  }
+}
+
+function isCancellableFileTransfer(status: FileTransferStatus): boolean {
+  return status === "queued" || status === "running";
+}
+
+function upsertFileTransferTask(
+  transfers: FileTransferTaskSnapshot[],
+  nextTransfer: FileTransferTaskSnapshot
+): FileTransferTaskSnapshot[] {
+  const index = transfers.findIndex(
+    (transfer) => transfer.transfer_id === nextTransfer.transfer_id
+  );
+  if (index === -1) return [nextTransfer, ...transfers];
+  const nextTransfers = [...transfers];
+  nextTransfers[index] = nextTransfer;
+  return nextTransfers;
+}
 
 // Helper to get file system for a device
 function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
@@ -598,10 +828,24 @@ function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
 }
 
 function FilePane({
-  deviceId, side, otherDeviceName, isDark, onSendToOther, dragOver, devices,
+  deviceId,
+  side,
+  otherDeviceName,
+  targetDeviceId,
+  targetPath,
+  isDark,
+  onPathChange,
+  onFileTransferDrop,
+  dragOver,
+  devices,
 }: {
   deviceId: string; side: "left" | "right"; otherDeviceName: string | null; isDark: boolean;
-  onSendToOther: (fileNames: string[]) => void; dragOver: boolean; devices: Device[];
+  targetDeviceId: string | null;
+  targetPath: string | null;
+  onPathChange: (path: string | null) => void;
+  onFileTransferDrop: (request: FileTransferDropRequest) => void;
+  dragOver: boolean;
+  devices: Device[];
 }) {
   const dev = devices.find(d => d.id === deviceId);
   const devName = dev?.name ?? "未知设备";
@@ -611,8 +855,42 @@ function FilePane({
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [searchQuery, setSearchQuery] = useState("");
   const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number; fileName: string; fileType: string } | null>(null);
+  const [serviceFiles, setServiceFiles] = useState<FileItem[] | null>(null);
+  const [servicePath, setServicePath] = useState<string | null>(null);
+  const [serviceParentPath, setServiceParentPath] = useState<string | null>(null);
+  const [serviceLoading, setServiceLoading] = useState(false);
+  const [serviceError, setServiceError] = useState<string | null>(null);
 
-  const files = (deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices)).filter(f =>
+  const loadDirectory = useCallback(async (path: string | null) => {
+    setServiceLoading(true);
+    setServiceError(null);
+    const result = await ipcListDirectory(path);
+    if (!result.ok) {
+      setServiceError(result.error.message);
+      setServiceLoading(false);
+      return;
+    }
+    setServicePath(result.value.path);
+    onPathChange(result.value.path);
+    setServiceParentPath(result.value.parent_path ?? null);
+    setServiceFiles(result.value.entries.map(fileEntryToItem));
+    setCurrentPath(pathSegmentsFromDirectory(result.value.path, [devName]));
+    setSelectedFiles(new Set());
+    setServiceLoading(false);
+  }, [devName, onPathChange]);
+
+  useEffect(() => {
+    setServiceFiles(null);
+    setServicePath(null);
+    onPathChange(null);
+    setServiceParentPath(null);
+    setCurrentPath([devName]);
+    setSelectedFiles(new Set());
+    void loadDirectory(null);
+  }, [devName, deviceId, loadDirectory, onPathChange]);
+
+  const fallbackFiles: FileItem[] = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
+  const files: FileItem[] = (serviceFiles ?? fallbackFiles).filter(f =>
     searchQuery ? f.name.toLowerCase().includes(searchQuery.toLowerCase()) : true
   );
 
@@ -630,23 +908,64 @@ function FilePane({
       setSelectedFiles(prev => { const n = new Set(prev); if (n.has(fileName)) n.delete(fileName); else n.add(fileName); return n; });
     } else setSelectedFiles(new Set([fileName]));
   };
-  const handleDoubleClick = (f: FileItem) => { if (f.type === "folder") { setCurrentPath(p => [...p, f.name]); setSelectedFiles(new Set()); } };
-  const navigateUp = () => { if (currentPath.length > 1) { setCurrentPath(p => p.slice(0, -1)); setSelectedFiles(new Set()); } };
-  const navigateHome = () => { setCurrentPath([devName, "Users", "Admin"]); setSelectedFiles(new Set()); };
+  const handleDoubleClick = (f: FileItem) => {
+    if (f.type === "folder") {
+      if (f.path) void loadDirectory(f.path);
+      else {
+        setCurrentPath(p => [...p, f.name]);
+        setSelectedFiles(new Set());
+      }
+    }
+  };
+  const navigateUp = () => {
+    if (serviceParentPath) {
+      void loadDirectory(serviceParentPath);
+      return;
+    }
+    if (currentPath.length > 1) { setCurrentPath(p => p.slice(0, -1)); setSelectedFiles(new Set()); }
+  };
+  const navigateHome = () => {
+    void loadDirectory(null);
+  };
   const navigateTo = (i: number) => { setCurrentPath(p => p.slice(0, i + 1)); setSelectedFiles(new Set()); };
 
   const handleDragStart = (e: React.DragEvent, fileName: string) => {
     const dragFiles = selectedFiles.has(fileName) ? Array.from(selectedFiles) : [fileName];
-    e.dataTransfer.setData("fileTransfer", JSON.stringify({ files: dragFiles, fromSide: side, fromDeviceId: deviceId }));
+    const entries = fileTransferEntriesFromSelection(files, dragFiles, fileName);
+    e.dataTransfer.setData(
+      "fileTransfer",
+      JSON.stringify({ files: dragFiles, entries, fromSide: side, fromDeviceId: deviceId })
+    );
     e.dataTransfer.effectAllowed = "copy";
   };
 
   const handlePaneDrop = (e: React.DragEvent) => {
     e.preventDefault();
     try {
-      const parsed = JSON.parse(e.dataTransfer.getData("fileTransfer"));
-      if (parsed.fromSide !== side) console.log(`Transfer ${parsed.files.join(", ")} → ${devName}`);
+      const parsed = JSON.parse(e.dataTransfer.getData("fileTransfer")) as FileTransferDragPayload;
+      if (parsed.fromSide !== side && servicePath && parsed.entries.length > 0) {
+        onFileTransferDrop({
+          sourceDeviceId: parsed.fromDeviceId,
+          targetDeviceId: deviceId,
+          entries: parsed.entries,
+          targetPath: servicePath,
+        });
+      }
     } catch {}
+  };
+
+  const handleSendContextFileToOther = () => {
+    if (!contextMenuState) return;
+    const request = fileTransferDropRequestForSendToOther({
+      sourceDeviceId: deviceId,
+      targetDeviceId,
+      targetPath,
+      files,
+      selectedNames: Array.from(selectedFiles),
+      contextFileName: contextMenuState.fileName,
+    });
+    if (request) onFileTransferDrop(request);
+    setContextMenuState(null);
   };
 
   const DevIcon = dev?.icon ?? Monitor;
@@ -682,7 +1001,7 @@ function FilePane({
         <button onClick={navigateHome} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="主目录">
           <Home style={{ width: 13, height: 13 }} />
         </button>
-        <button className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="刷新">
+        <button onClick={() => void loadDirectory(servicePath)} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="刷新">
           <RefreshCw style={{ width: 12, height: 12 }} />
         </button>
         <div className={`flex-1 flex items-center gap-0.5 px-2 py-0.5 rounded-md min-w-0 ${isDark ? "bg-[#2a2a2a] border border-gray-700" : "bg-gray-50 border border-gray-200"}`}>
@@ -719,6 +1038,17 @@ function FilePane({
         onClick={(e) => { if (e.target === e.currentTarget) setSelectedFiles(new Set()); }}
         onContextMenu={(e) => { if (e.target === e.currentTarget) { e.preventDefault(); setContextMenuState({ x: e.clientX, y: e.clientY, fileName: "", fileType: "background" }); } }}
       >
+        {serviceError && (
+          <div role="alert" className={`px-3 py-2 border-b ${isDark ? "border-red-900/40 bg-red-950/20 text-red-300" : "border-red-100 bg-red-50 text-red-700"}`} style={{ fontSize: 11 }}>
+            目录读取失败：{serviceError}
+          </div>
+        )}
+        {serviceLoading && (
+          <div className={`flex items-center gap-2 px-3 py-2 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
+            <Loader2 className="w-3 h-3 animate-spin" />
+            正在读取目录...
+          </div>
+        )}
         {viewMode === "list" ? (
           <div>
             {files.map((f) => {
@@ -779,7 +1109,7 @@ function FilePane({
               <CtxItem icon={<Download style={{ width: 13, height: 13 }} />} label="下载到本地" onClick={() => setContextMenuState(null)} isDark={isDark} />
               {otherDeviceName && (
                 <CtxItem icon={<Send style={{ width: 13, height: 13 }} />} label={`发送到 ${otherDeviceName}`}
-                  onClick={() => { onSendToOther([contextMenuState.fileName]); setContextMenuState(null); }} isDark={isDark} />
+                  onClick={handleSendContextFileToOther} isDark={isDark} />
               )}
               <div className={`h-px mx-2 my-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
               <CtxItem icon={<Scissors style={{ width: 13, height: 13 }} />} label="剪切" onClick={() => setContextMenuState(null)} isDark={isDark} />
@@ -806,19 +1136,48 @@ function FilePane({
 
 function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   const { isDark } = useTheme();
-  const isOnline = device.status === "online";
+  const unavailableReason = remoteStartUnavailableReason(device);
 
   const [leftDeviceId, setLeftDeviceId] = useState(device.id);
   const [rightDeviceId, setRightDeviceId] = useState<string | null>(null);
+  const [leftPanePath, setLeftPanePath] = useState<string | null>(null);
+  const [rightPanePath, setRightPanePath] = useState<string | null>(null);
   const [showAddMenu, setShowAddMenu] = useState(false);
   const [addMenuSide, setAddMenuSide] = useState<"left" | "right">("right");
   const addMenuRef = useRef<HTMLDivElement>(null);
   const addBtnRef = useRef<HTMLButtonElement>(null);
   const [dragOverSide, setDragOverSide] = useState<"left" | "right" | null>(null);
+  const [transferMessage, setTransferMessage] = useState<string | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
+  const [fileTransfers, setFileTransfers] = useState<FileTransferTaskSnapshot[]>([]);
+  const [transferListError, setTransferListError] = useState<string | null>(null);
+  const [fileTransferProviders, setFileTransferProviders] = useState<FileTransferProviderDescriptor[]>([]);
+  const [providerListError, setProviderListError] = useState<string | null>(null);
+  const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
 
   const onlineDevices = devices.filter(d => d.status === "online");
   const leftDevice = devices.find(d => d.id === leftDeviceId);
   const rightDevice = rightDeviceId ? devices.find(d => d.id === rightDeviceId) : null;
+
+  const refreshFileTransfers = useCallback(async () => {
+    const result = await ipcListFileTransfers();
+    if (!result.ok) {
+      setTransferListError(result.error.message);
+      return;
+    }
+    setTransferListError(null);
+    setFileTransfers(result.value);
+  }, []);
+
+  const refreshFileTransferProviders = useCallback(async () => {
+    const result = await ipcListFileTransferProviders();
+    if (!result.ok) {
+      setProviderListError(result.error.message);
+      return;
+    }
+    setProviderListError(null);
+    setFileTransferProviders(result.value);
+  }, []);
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -828,25 +1187,239 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     return () => document.removeEventListener("mousedown", handler);
   }, []);
 
+  useEffect(() => {
+    void refreshFileTransfers();
+    void refreshFileTransferProviders();
+  }, [refreshFileTransferProviders, refreshFileTransfers]);
+
   const handleAddDevice = (dId: string) => {
     if (addMenuSide === "right") setRightDeviceId(dId);
     else setLeftDeviceId(dId);
     setShowAddMenu(false);
   };
 
-  if (!isOnline) {
+  const handleFileTransferDrop = useCallback(async (request: FileTransferDropRequest) => {
+    setTransferMessage(null);
+    setTransferError(null);
+    const result = await ipcStartFileTransfer({
+      source_device_id: request.sourceDeviceId,
+      target_device_id: request.targetDeviceId,
+      entries: request.entries,
+      target_path: request.targetPath,
+      conflict_policy: "rename",
+      transport_hint: "local",
+      provider_hint: "mrd-local",
+    });
+    if (!result.ok) {
+      setTransferError(result.error.message);
+      return;
+    }
+    if (result.value.status === "failed") {
+      setTransferError(result.value.error ?? "文件传输失败");
+      return;
+    }
+    setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
+    setTransferMessage(
+      `已传输 ${result.value.copied_entries}/${result.value.total_entries} 个文件`
+    );
+  }, []);
+
+  const handleCancelFileTransfer = useCallback(async (transferId: string) => {
+    setCancellingTransferId(transferId);
+    setTransferError(null);
+    const result = await ipcCancelFileTransfer(transferId);
+    setCancellingTransferId(null);
+    if (!result.ok) {
+      setTransferError(result.error.message);
+      return;
+    }
+    setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
+  }, []);
+
+  if (unavailableReason) {
     return (
       <div className={`flex items-center justify-center h-full ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
         <div className="text-center">
           <WifiOff className={`w-12 h-12 mx-auto mb-3 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
-          <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 16 }}>设备离线，无法传输文件</div>
+          <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 16 }}>{unavailableReason}，无法传输文件</div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className={`flex h-full overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+    <div className={`relative flex h-full flex-col overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
+      {(transferMessage || transferError) && (
+        <div
+          role="status"
+          className={`absolute right-4 top-20 z-30 rounded-md border px-3 py-2 shadow-sm ${
+            transferError
+              ? isDark
+                ? "border-red-900/50 bg-red-950 text-red-200"
+                : "border-red-100 bg-red-50 text-red-700"
+              : isDark
+                ? "border-emerald-900/50 bg-emerald-950 text-emerald-200"
+                : "border-emerald-100 bg-emerald-50 text-emerald-700"
+          }`}
+          style={{ fontSize: 12 }}
+        >
+          {transferError ?? transferMessage}
+        </div>
+      )}
+      {(fileTransfers.length > 0 || transferListError) && (
+        <div
+          role="region"
+          aria-label="传输任务"
+          className={`absolute bottom-3 right-4 z-30 w-[380px] max-w-[calc(100%-2rem)] rounded-lg border shadow-lg ${
+            isDark
+              ? "border-gray-700 bg-[#202020] text-gray-200"
+              : "border-gray-200 bg-white text-gray-800"
+          }`}
+        >
+          <div className={`flex items-center justify-between border-b px-3 py-2 ${isDark ? "border-gray-700" : "border-gray-100"}`}>
+            <div className="flex items-center gap-2">
+              <ArrowRightLeft className="h-3.5 w-3.5 text-blue-500" />
+              <span className="font-medium" style={{ fontSize: 12 }}>传输任务</span>
+            </div>
+            <button
+              onClick={() => void refreshFileTransfers()}
+              className={`rounded-md p-1 transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`}
+              title="刷新传输任务"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          {transferListError ? (
+            <div className={`px-3 py-2 ${isDark ? "text-red-300" : "text-red-700"}`} style={{ fontSize: 11 }}>
+              读取传输任务失败：{transferListError}
+            </div>
+          ) : (
+            <div className="max-h-48 overflow-y-auto py-1">
+              {fileTransfers.map((transfer) => (
+                <div
+                  key={transfer.transfer_id}
+                  className={`flex items-start gap-2 px-3 py-2 ${isDark ? "hover:bg-[#292929]" : "hover:bg-gray-50"}`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="truncate font-mono" style={{ fontSize: 11 }}>{transfer.transfer_id}</span>
+                      <span
+                        className={`shrink-0 rounded px-1.5 py-0.5 ${
+                          transfer.status === "failed"
+                            ? isDark ? "bg-red-950 text-red-300" : "bg-red-50 text-red-700"
+                            : transfer.status === "completed"
+                              ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
+                              : isDark ? "bg-blue-950 text-blue-300" : "bg-blue-50 text-blue-700"
+                        }`}
+                        style={{ fontSize: 10 }}
+                      >
+                        {fileTransferProgressLabel(transfer)}
+                      </span>
+                    </div>
+                    <div className={`mt-1 flex items-center gap-2 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>
+                      <span>{fileTransferByteLabel(transfer)}</span>
+                      <span>·</span>
+                      <span>{transfer.transport_kind}</span>
+                      <span>·</span>
+                      <span>{transfer.provider_kind ?? "mrd-local"}</span>
+                    </div>
+                    {transfer.error ? (
+                      <div className={isDark ? "mt-1 text-red-300" : "mt-1 text-red-700"} style={{ fontSize: 10 }}>
+                        {transfer.error}
+                      </div>
+                    ) : null}
+                  </div>
+                  {isCancellableFileTransfer(transfer.status) ? (
+                    <button
+                      onClick={() => void handleCancelFileTransfer(transfer.transfer_id)}
+                      disabled={cancellingTransferId === transfer.transfer_id}
+                      aria-label={`取消 ${transfer.transfer_id}`}
+                      className={`shrink-0 rounded-md border px-2 py-1 transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                        isDark
+                          ? "border-gray-700 text-gray-300 hover:border-red-500 hover:text-red-300"
+                          : "border-gray-200 text-gray-600 hover:border-red-300 hover:text-red-600"
+                      }`}
+                      style={{ fontSize: 11 }}
+                    >
+                      {cancellingTransferId === transfer.transfer_id ? "取消中" : "取消"}
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+      {(fileTransferProviders.length > 0 || providerListError) && (
+        <div
+          role="region"
+          aria-label="传输 Provider"
+          className={`shrink-0 border-b px-4 py-2 ${
+            isDark
+              ? "border-gray-700 bg-[#202020] text-gray-200"
+              : "border-gray-200 bg-white text-gray-800"
+          }`}
+        >
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-2">
+              <Server className="h-3.5 w-3.5 text-indigo-500" />
+              <span className="font-medium" style={{ fontSize: 12 }}>传输 Provider</span>
+            </div>
+            {providerListError ? (
+              <span className={isDark ? "text-red-300" : "text-red-700"} style={{ fontSize: 11 }}>
+                读取失败：{providerListError}
+              </span>
+            ) : (
+              fileTransferProviders.map((provider) => (
+                <div key={provider.provider_kind} className={`flex min-w-0 max-w-full flex-col gap-1 rounded-md border px-2 py-1 ${
+                  isDark ? "border-gray-700 bg-[#252525]" : "border-gray-200 bg-gray-50"
+                }`}>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate" style={{ fontSize: 11 }}>
+                      {provider.display_name}
+                    </span>
+                    <span className={isDark ? "font-mono text-gray-500" : "font-mono text-gray-400"} style={{ fontSize: 10 }}>
+                      {provider.provider_kind}
+                    </span>
+                    <span
+                      title={provider.reason ?? provider.capabilities?.join(", ") ?? provider.status}
+                      className={`shrink-0 rounded px-1.5 py-0.5 ${
+                        provider.status === "available"
+                          ? isDark ? "bg-emerald-950 text-emerald-300" : "bg-emerald-50 text-emerald-700"
+                          : isDark ? "bg-amber-950 text-amber-300" : "bg-amber-50 text-amber-700"
+                      }`}
+                      style={{ fontSize: 10 }}
+                    >
+                      {fileTransferProviderStatusLabel(provider.status)}
+                    </span>
+                  </div>
+                  {provider.handoff_hint ? (
+                    <div className={`flex min-w-0 flex-wrap items-center gap-1 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>
+                      <span>{provider.handoff_hint.external_app}</span>
+                      <span>·</span>
+                      <span className="font-mono">{provider.handoff_hint.bridge_service}</span>
+                      {provider.handoff_hint.control_endpoint ? (
+                        <>
+                          <span>·</span>
+                          <span className="font-mono">{provider.handoff_hint.control_endpoint}</span>
+                        </>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              ))
+            )}
+            <button
+              onClick={() => void refreshFileTransferProviders()}
+              className={`rounded-md p-1 transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`}
+              title="刷新传输 Provider"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 overflow-hidden">
       {/* Left pane */}
       <div
         className="flex-1 flex flex-col min-w-0"
@@ -858,8 +1431,11 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           deviceId={leftDeviceId}
           side="left"
           otherDeviceName={rightDevice?.name ?? null}
+          targetDeviceId={rightDeviceId}
+          targetPath={rightPanePath}
           isDark={isDark}
-          onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to right pane`)}
+          onPathChange={setLeftPanePath}
+          onFileTransferDrop={handleFileTransferDrop}
           dragOver={dragOverSide === "left"}
           devices={devices}
         />
@@ -933,8 +1509,11 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
             deviceId={rightDeviceId}
             side="right"
             otherDeviceName={leftDevice?.name ?? null}
+            targetDeviceId={leftDeviceId}
+            targetPath={leftPanePath}
             isDark={isDark}
-            onSendToOther={(fileNames) => console.log(`Send ${fileNames.join(", ")} to left pane`)}
+            onPathChange={setRightPanePath}
+            onFileTransferDrop={handleFileTransferDrop}
             dragOver={dragOverSide === "right"}
             devices={devices}
           />
@@ -956,6 +1535,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           </div>
         )}
       </div>
+      </div>
     </div>
   );
 }
@@ -969,9 +1549,16 @@ function CtxItem({ icon, label, onClick, isDark, danger }: { icon: React.ReactNo
 }
 
 /* ======================== Remote Apps Tab ======================== */
-function AppsTab({ device }: { device: Device }) {
+function AppsTab({
+  device,
+  terminalFocus: terminalFocusProp = false,
+}: {
+  device: Device;
+  terminalFocus?: boolean;
+}) {
   const { isDark } = useTheme();
   const navigate = useNavigate();
+  const location = useLocation();
   const [catalog, setCatalog] = useState<RemoteApplicationCatalogResult | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [openingSourceId, setOpeningSourceId] = useState<string | null>(null);
@@ -982,9 +1569,10 @@ function AppsTab({ device }: { device: Device }) {
   const appSessionIdRef = useRef<string | null>(null);
   const sessionHandedOffRef = useRef(false);
   const isOnline = device.status === "online";
+  const remoteUnavailableReason = remoteStartUnavailableReason(device);
   const desktopRuntime = isTauriRuntime();
   const isLanP2PRemote = device.p2pAvailable && !device.isLocal;
-  const canUseRemoteApplications = desktopRuntime && isLanP2PRemote;
+  const canUseRemoteApplications = !remoteUnavailableReason && desktopRuntime && isLanP2PRemote;
 
   useEffect(() => {
     return () => {
@@ -1044,6 +1632,10 @@ function AppsTab({ device }: { device: Device }) {
   ]);
 
   const handleOpenDesktop = async () => {
+    if (remoteUnavailableReason) {
+      setAppsError(remoteUnavailableReason);
+      return;
+    }
     setOpeningDesktop(true);
     setAppsError(null);
     try {
@@ -1115,15 +1707,28 @@ function AppsTab({ device }: { device: Device }) {
     );
   }
 
-  const unavailableReason = !desktopRuntime
-    ? "远程应用需要桌面端运行"
-    : device.isLocal
-      ? "本机设备请使用本地测试工作台"
-      : !device.p2pAvailable
-        ? "当前设备未建立 LAN P2P 通道"
-        : null;
+  const unavailableReason =
+    remoteUnavailableReason ??
+    (!desktopRuntime
+      ? "远程应用需要桌面端运行"
+      : device.isLocal
+        ? "本机设备请使用本地测试工作台"
+        : !device.p2pAvailable
+          ? "当前设备未建立 LAN P2P 通道"
+          : null);
   const remoteWindows = catalog?.windows ?? [];
   const displaySources = catalog?.displays ?? [];
+  const terminalFocus =
+    terminalFocusProp || new URLSearchParams(location.search).get("tab") === "terminal";
+  const visibleRemoteWindows = terminalFocus
+    ? remoteWindows.filter(remoteApplicationSourceMatchesTerminalFocus)
+    : remoteWindows;
+  const orderedRemoteWindows = terminalFocus
+    ? [...visibleRemoteWindows].sort((left, right) =>
+        Number(remoteApplicationSourceMatchesTerminalFocus(right)) -
+        Number(remoteApplicationSourceMatchesTerminalFocus(left))
+      )
+    : visibleRemoteWindows;
 
   if (!canUseRemoteApplications) {
     return (
@@ -1163,16 +1768,20 @@ function AppsTab({ device }: { device: Device }) {
         <div className={`mb-5 rounded-xl border p-4 shadow-sm ${isDark ? "bg-[#202020] border-gray-700" : "bg-white border-gray-200"}`}>
           <div className="flex flex-wrap items-center gap-3">
             <div className={`flex h-11 w-11 items-center justify-center rounded-xl ${isDark ? "bg-cyan-900/30" : "bg-cyan-50"}`}>
-              <AppWindow className="h-5 w-5 text-cyan-500" />
+              {terminalFocus ? (
+                <Terminal className="h-5 w-5 text-cyan-500" />
+              ) : (
+                <AppWindow className="h-5 w-5 text-cyan-500" />
+              )}
             </div>
             <div className="min-w-0 flex-1">
-              <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>远程应用</div>
+              <div className={`font-semibold ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>{terminalFocus ? "远程终端" : "远程应用"}</div>
               <div className={`mt-0.5 truncate ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
                 {device.name} · {device.ip} · LAN QUIC 窗口流
               </div>
             </div>
             <div className={`rounded-lg border px-3 py-1.5 ${isDark ? "border-gray-700 bg-[#181818] text-gray-400" : "border-gray-200 bg-gray-50 text-gray-600"}`} style={{ fontSize: 12 }}>
-              {catalog ? `${remoteWindows.length} 个窗口 / ${displaySources.length} 个屏幕` : "等待枚举"}
+              {catalog ? `${visibleRemoteWindows.length} 个窗口 / ${displaySources.length} 个屏幕` : "等待枚举"}
             </div>
             <button
               onClick={() => void loadRemoteApplications()}
@@ -1214,12 +1823,20 @@ function AppsTab({ device }: { device: Device }) {
           </div>
         )}
 
-        {!sourcesLoading && catalog && remoteWindows.length === 0 && (
+        {!sourcesLoading && catalog && visibleRemoteWindows.length === 0 && (
           <div className={`rounded-xl border p-6 text-center ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
-            <AppWindow className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
-            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 15 }}>未发现可独立捕获的窗口</div>
+            {terminalFocus ? (
+              <Terminal className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
+            ) : (
+              <AppWindow className={`mx-auto mb-3 h-10 w-10 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
+            )}
+            <div className={isDark ? "text-gray-300" : "text-gray-700"} style={{ fontSize: 15 }}>
+              {terminalFocus ? "未发现远程终端窗口" : "未发现可独立捕获的窗口"}
+            </div>
             <div className={`mt-1 ${isDark ? "text-gray-500" : "text-gray-500"}`} style={{ fontSize: 12 }}>
-              已发现 {catalog.sources.length} 个采集源，可先打开远程桌面或在远端启动目标应用后刷新。
+              {terminalFocus
+                ? `已发现 ${remoteWindows.length} 个窗口，但没有匹配 PowerShell、cmd 或 Windows Terminal。`
+                : `已发现 ${catalog.sources.length} 个采集源，可先打开远程桌面或在远端启动目标应用后刷新。`}
             </div>
             <button
               onClick={() => void handleOpenDesktop()}
@@ -1235,7 +1852,7 @@ function AppsTab({ device }: { device: Device }) {
 
         {remoteWindows.length > 0 && (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {remoteWindows.map((source) => {
+            {orderedRemoteWindows.map((source) => {
               const SourceIcon = remoteCaptureSourceIcon(source);
               const opening = openingSourceId === source.id;
               return (
@@ -1328,6 +1945,104 @@ function remoteCaptureSourceAccent(source: CaptureSource): string {
   if (text.includes("excel")) return "bg-green-600";
   if (text.includes("word") || text.includes("office") || text.includes("pdf")) return "bg-indigo-600";
   return "bg-cyan-600";
+}
+
+/* ======================== Device Info Tab ======================== */
+function InfoTab({ device }: { device: Device }) {
+  const { isDark } = useTheme();
+  const Icon = device.icon;
+  const statusLabel = device.status === "online" ? "在线" : "离线";
+  const discoverySourceLabel = device.discoverySources
+    .map((source) => {
+      if (source === "lan_p2p") return "P2P 局域网";
+      if (source === "server") return "服务器";
+      if (source === "local") return "本机";
+      return source;
+    })
+    .join(" / ");
+
+  const rows = [
+    ["设备 ID", device.deviceId],
+    ["系统", device.os],
+    ["地址", device.ip],
+    ["位置", device.location],
+    ["分组", device.group],
+    ["最后在线", device.lastSeen],
+    ["发现来源", device.sourceLabel],
+    ["原始来源", discoverySourceLabel || "未知"],
+  ];
+
+  const capabilityBadges = [
+    device.p2pAvailable ? "P2P 可用" : "P2P 不可用",
+    device.serverAvailable ? "服务器可用" : "服务器不可用",
+    device.isLocal ? "本机设备" : "远程设备",
+    device.favorite ? "已收藏" : "未收藏",
+  ];
+
+  return (
+    <div className={`h-full overflow-y-auto ${isDark ? "bg-[#181818]" : "bg-[#f6f7f9]"}`}>
+      <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-5">
+        <div className={`flex items-center gap-4 border-b pb-4 ${isDark ? "border-gray-700" : "border-gray-200"}`}>
+          <div className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-lg ${device.status === "online" ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "bg-gray-800" : "bg-gray-100")}`}>
+            <Icon className={device.status === "online" ? "text-blue-600" : "text-gray-400"} style={{ width: 24, height: 24 }} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className={`truncate font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 18 }}>{device.name}</div>
+            <div className={`mt-1 flex flex-wrap items-center gap-2 ${isDark ? "text-gray-400" : "text-gray-500"}`} style={{ fontSize: 12 }}>
+              <span>{statusLabel}</span>
+              <span>{device.os}</span>
+              <span>{device.ip}</span>
+              {device.ping !== null && <span>{device.ping}ms</span>}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
+          <div className={`overflow-hidden rounded-lg border ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+            {rows.map(([label, value], index) => (
+              <div
+                key={label}
+                className={`grid grid-cols-[120px_1fr] gap-4 px-4 py-3 ${
+                  index > 0 ? isDark ? "border-t border-gray-700" : "border-t border-gray-100" : ""
+                }`}
+              >
+                <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 12 }}>{label}</div>
+                <div className={`min-w-0 break-all font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>{value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="flex flex-col gap-4">
+            <div className={`rounded-lg border p-4 ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+              <div className={`mb-3 font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>连接状态</div>
+              <div className="flex flex-wrap gap-2">
+                {capabilityBadges.map((badge) => (
+                  <span
+                    key={badge}
+                    className={`rounded px-2 py-1 ${isDark ? "bg-gray-800 text-gray-300" : "bg-gray-100 text-gray-700"}`}
+                    style={{ fontSize: 12 }}
+                  >
+                    {badge}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {(device.cpu !== null || device.ram !== null || device.disk !== null) && (
+              <div className={`rounded-lg border p-4 ${isDark ? "border-gray-700 bg-[#202020]" : "border-gray-200 bg-white"}`}>
+                <div className={`mb-3 font-medium ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 13 }}>资源</div>
+                <div className="space-y-2">
+                  {device.cpu !== null && <ResourcePill label="CPU" value={device.cpu} color="blue" />}
+                  {device.ram !== null && <ResourcePill label="RAM" value={device.ram} color="purple" />}
+                  {device.disk !== null && <ResourcePill label="DISK" value={device.disk} color="green" />}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /* ======================== Performance Monitoring Footer ======================== */

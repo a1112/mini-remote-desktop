@@ -788,6 +788,12 @@ function parseRequestedProfile(searchParams: URLSearchParams): LanE2EAutomationO
   const codec = parseProfileCodec(searchParams.get("codec") ?? searchParams.get("profileCodec"));
   const bitDepth = parsePositiveNumber(searchParams.get("bitDepth") ?? searchParams.get("profileBitDepth"));
   const hdrEnabled = parseOptionalBoolean(searchParams.get("hdrEnabled") ?? searchParams.get("profileHdrEnabled"));
+  const colorMode = parseProfileColorMode(
+    searchParams.get("colorMode") ?? searchParams.get("profileColorMode")
+  );
+  const colorPipeline = parseProfileColorPipeline(
+    searchParams.get("colorPipeline") ?? searchParams.get("profileColorPipeline")
+  );
   const profile: NonNullable<LanE2EAutomationOptions["requestedProfile"]> = {
     width,
     height,
@@ -804,12 +810,45 @@ function parseRequestedProfile(searchParams: URLSearchParams): LanE2EAutomationO
   if (chromaSubsampling) profile.chroma_subsampling = chromaSubsampling;
   if (pixelFormat) profile.pixel_format = pixelFormat;
   if (hdrEnabled !== undefined) profile.hdr_enabled = hdrEnabled;
+  if (colorMode) profile.color_mode = colorMode;
+  if (colorPipeline) profile.color_pipeline = colorPipeline;
   return profile;
 }
 
-function parseProfileCodec(value: string | null): "h264" | "hevc" {
+function parseProfileCodec(value: string | null): "h264" | "hevc" | "av1" {
   const normalized = value?.trim().toLowerCase();
-  return normalized === "hevc" || normalized === "h265" || normalized === "h.265" ? "hevc" : "h264";
+  if (normalized === "hevc" || normalized === "h265" || normalized === "h.265") {
+    return "hevc";
+  }
+  if (normalized === "av1" || normalized === "aom-av1") {
+    return "av1";
+  }
+  return "h264";
+}
+
+function parseProfileColorMode(
+  value: string | null
+): NonNullable<LanE2EAutomationOptions["requestedProfile"]>["color_mode"] | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "full" ||
+    normalized === "grayscale" ||
+    normalized === "monochrome" ||
+    normalized === "low_chroma"
+  ) {
+    return normalized;
+  }
+  return undefined;
+}
+
+function parseProfileColorPipeline(
+  value: string | null
+): NonNullable<LanE2EAutomationOptions["requestedProfile"]>["color_pipeline"] | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "sdr8" || normalized === "hdr_main10") {
+    return normalized;
+  }
+  return undefined;
 }
 
 function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId | undefined {

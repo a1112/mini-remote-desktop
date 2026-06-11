@@ -36,6 +36,7 @@ import {
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
   getSystemResourceSnapshot,
+  ipcLanDiscoverySnapshot,
   ipcMediaPipelineSnapshot,
   ipcSendControlInput,
   presentTestHarnessFrameOnNativeSurface,
@@ -52,6 +53,7 @@ import {
   type EncoderType,
   type EnvironmentSnapshot,
   type HarnessMetrics,
+  type LanDiscoverySnapshot,
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
@@ -73,6 +75,7 @@ import {
   type CaptureSource,
   type CaptureSourceSelection,
   type MediaAdaptationSnapshot,
+  type MediaProfile,
   type MediaProfileNegotiation,
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
@@ -108,6 +111,7 @@ type LocalTestSelection = Partial<LocalWebViewProfile> & {
 const METRICS_POLL_MS = 500;
 const REMOTE_NATIVE_DIAGNOSTICS_POLL_MS = 500;
 const REMOTE_WEB_DIAGNOSTICS_POLL_MS = 1_000;
+const PEER_CONTROL_CAPABILITY_POLL_MS = 2_000;
 const WEB_PREVIEW_CONNECT_TIMEOUT_MS = 8_000;
 const WEB_VIEW_MAX_FPS = 144;
 const DIAGNOSTICS_SAMPLE_LIMIT = 60;
@@ -501,6 +505,10 @@ function isNvencSharedTextureEncoder(encoder: EncoderType) {
 
 function isHevcEncoder(encoder: EncoderType) {
   return encoder === "nvenc_hevc" || encoder === "nvenc_hevc_main10" || encoder === "videotoolbox_hevc";
+}
+
+function isAv1Encoder(encoder: EncoderType) {
+  return encoder === "nvenc_av1";
 }
 
 function isNvencHevcEncoder(encoder: EncoderType) {
@@ -1436,10 +1444,11 @@ function bitrateFromSearch(searchParams: URLSearchParams): BitrateKey | null {
   );
 }
 
-function profileCodecFromSearch(searchParams: URLSearchParams): "h264" | "hevc" | null {
+function profileCodecFromSearch(searchParams: URLSearchParams): "h264" | "hevc" | "av1" | null {
   const value = searchParams.get("codec") ?? searchParams.get("profileCodec");
   const normalized = value?.trim().toLowerCase();
   if (!normalized) return null;
+  if (normalized === "av1" || normalized === "av01") return "av1";
   if (normalized === "hevc" || normalized === "h265" || normalized === "h.265") return "hevc";
   return "h264";
 }
@@ -1455,8 +1464,33 @@ function profileBitDepthFromSearch(searchParams: URLSearchParams): number | null
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function profileColorModeFromSearch(searchParams: URLSearchParams): MediaProfile["color_mode"] | null {
+  const value = searchParams.get("colorMode") ?? searchParams.get("profileColorMode");
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === "full" ||
+    normalized === "grayscale" ||
+    normalized === "monochrome" ||
+    normalized === "low_chroma"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+function profileColorPipelineFromSearch(
+  searchParams: URLSearchParams
+): MediaProfile["color_pipeline"] | null {
+  const value = searchParams.get("colorPipeline") ?? searchParams.get("profileColorPipeline");
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "sdr8" || normalized === "hdr_main10") {
+    return normalized;
+  }
+  return null;
+}
+
 function encoderForRequestedProfileCodec(
-  codec: "h264" | "hevc",
+  codec: "h264" | "hevc" | "av1",
   hostOs: HostOs,
   availableEncoders: readonly string[] | undefined,
   codecProfile: string | null,
@@ -1466,7 +1500,9 @@ function encoderForRequestedProfileCodec(
     codec === "hevc" &&
     (codecProfile?.trim().toLowerCase() === "main10" || bitDepth === 10);
   const candidates: EncoderType[] =
-    codec === "hevc"
+    codec === "av1"
+      ? ["nvenc_av1"]
+      : codec === "hevc"
       ? main10
         ? ["nvenc_hevc_main10", "nvenc_hevc", "videotoolbox_hevc"]
         : hostOs === "macos"
@@ -1488,13 +1524,26 @@ function resolutionDimensions(resolution: ResolutionKey): { width: number; heigh
 }
 
 function keyboardMouseControlAvailable(
-  capabilities: EnvironmentSnapshot | null,
+  _capabilities: EnvironmentSnapshot | null,
   sessionSnapshot: SessionRuntimeSnapshot | null,
-  isLocalPipelinePreview: boolean
+  isLocalPipelinePreview: boolean,
+  peerInputControlAvailable: boolean
 ): boolean {
   if (isLocalPipelinePreview) return false;
   if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
-  return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
+  if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
+    return false;
+  }
+  return peerInputControlAvailable;
+}
+
+function peerKeyboardMouseControlAvailable(
+  peerDeviceId: string | null | undefined,
+  lanDiscovery: LanDiscoverySnapshot | null
+): boolean {
+  if (!peerDeviceId) return false;
+  const peer = lanDiscovery?.peers.find((peer) => peer.device_id === peerDeviceId);
+  return peer?.media_capabilities?.includes("control.keyboard_mouse") ?? false;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -1507,7 +1556,14 @@ function mapClientPointToRemoteFrame(
   rect: DOMRect,
   frameSize: { width: number; height: number }
 ): { x: number; y: number } | null {
-  if (rect.width <= 0 || rect.height <= 0 || frameSize.width <= 0 || frameSize.height <= 0) {
+  if (
+    !Number.isFinite(clientX) ||
+    !Number.isFinite(clientY) ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    frameSize.width <= 0 ||
+    frameSize.height <= 0
+  ) {
     return null;
   }
 
@@ -1555,6 +1611,35 @@ function virtualKeyFromKeyboardEvent(
   if (/^Key[A-Z]$/.test(event.code)) return event.code.charCodeAt(3);
   if (/^Digit[0-9]$/.test(event.code)) return event.code.charCodeAt(5);
   if (/^Numpad[0-9]$/.test(event.code)) return 0x60 + Number(event.code.slice(6));
+  const numpadVirtualKeys: Record<string, number> = {
+    NumpadMultiply: 0x6a,
+    NumpadAdd: 0x6b,
+    NumpadEqual: 0xbb,
+    NumpadSubtract: 0x6d,
+    NumpadDecimal: 0x6e,
+    NumpadDivide: 0x6f,
+  };
+  const numpadVirtualKey = numpadVirtualKeys[event.code];
+  if (numpadVirtualKey !== undefined) return numpadVirtualKey;
+  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(event.code)) {
+    return 0x70 + Number(event.code.slice(1)) - 1;
+  }
+
+  const oemVirtualKeys: Record<string, number> = {
+    Semicolon: 0xba,
+    Equal: 0xbb,
+    Comma: 0xbc,
+    Minus: 0xbd,
+    Period: 0xbe,
+    Slash: 0xbf,
+    Backquote: 0xc0,
+    BracketLeft: 0xdb,
+    Backslash: 0xdc,
+    BracketRight: 0xdd,
+    Quote: 0xde,
+  };
+  const oemVirtualKey = oemVirtualKeys[event.code];
+  if (oemVirtualKey !== undefined) return oemVirtualKey;
 
   switch (event.key) {
     case "Backspace":
@@ -1575,6 +1660,8 @@ function virtualKeyFromKeyboardEvent(
       return 0x14;
     case "Escape":
       return 0x1b;
+    case "PrintScreen":
+      return 0x2c;
     case " ":
     case "Spacebar":
       return 0x20;
@@ -1600,6 +1687,12 @@ function virtualKeyFromKeyboardEvent(
       return 0x2e;
     case "Meta":
       return 0x5b;
+    case "ContextMenu":
+      return 0x5d;
+    case "NumLock":
+      return 0x90;
+    case "ScrollLock":
+      return 0x91;
     default:
       return null;
   }
@@ -2170,6 +2263,7 @@ export function RemoteDisplayWindowPage() {
   const webRtcReceiverStatsRef = useRef<WebRtcReceiverStats | null>(null);
   const webPresentationLatencyStatsRef = useRef<WebRtcPresentationLatencyStats | null>(null);
   const lastRemoteControlPointRef = useRef<{ x: number; y: number } | null>(null);
+  const activeRemotePointerIdsRef = useRef<Set<number>>(new Set());
 
   const [context, setContext] = useState<RemoteDisplayWindowContext | null>(null);
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
@@ -2226,6 +2320,7 @@ export function RemoteDisplayWindowPage() {
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
+  const [peerInputControlAvailable, setPeerInputControlAvailable] = useState(false);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [mediaPipelineSnapshot, setMediaPipelineSnapshot] =
     useState<MediaPipelineSnapshot | null>(null);
@@ -2276,6 +2371,11 @@ export function RemoteDisplayWindowPage() {
     [searchParams]
   );
   const requestedBitDepth = useMemo(() => profileBitDepthFromSearch(searchParams), [searchParams]);
+  const requestedColorMode = useMemo(() => profileColorModeFromSearch(searchParams), [searchParams]);
+  const requestedColorPipeline = useMemo(
+    () => profileColorPipelineFromSearch(searchParams),
+    [searchParams]
+  );
   const requestedEncoder = requestedCodec
     ? encoderForRequestedProfileCodec(
         requestedCodec,
@@ -2290,14 +2390,20 @@ export function RemoteDisplayWindowPage() {
       requestedResolution !== null ||
       requestedFps !== null ||
       requestedBitrate !== null ||
-      requestedCodec !== null
+      requestedCodec !== null ||
+      requestedColorMode !== null ||
+      requestedColorPipeline !== null
         ? `${sessionId}:${requestedResolution ?? ""}:${requestedFps ?? ""}:${
             requestedBitrate ?? ""
           }:${requestedCodec ?? ""}:${requestedCodecProfile ?? ""}:${
             requestedBitDepth ?? ""
-          }:${requestedEncoder ?? ""}`
+          }:${requestedEncoder ?? ""}:${requestedColorMode ?? ""}:${
+            requestedColorPipeline ?? ""
+          }`
         : null,
     [
+      requestedColorMode,
+      requestedColorPipeline,
       requestedBitDepth,
       requestedBitrate,
       requestedCodec,
@@ -2590,6 +2696,19 @@ export function RemoteDisplayWindowPage() {
 
   useEffect(() => {
     if (
+      encoder === "videotoolbox_hevc" &&
+      (decoder === "videotoolbox" || decoder === "none") &&
+      capabilities?.available_decoders?.length &&
+      !decoderOptionAvailable(capabilities.available_decoders, "videotoolbox", encoder)
+    ) {
+      setDecoder(
+        decoderOptionAvailable(capabilities.available_decoders, "software", encoder)
+          ? "software"
+          : "none"
+      );
+      return;
+    }
+    if (
       decoder === "videotoolbox" &&
       capabilities?.available_decoders?.length &&
       !decoderOptionAvailable(capabilities.available_decoders, decoder, encoder)
@@ -2674,10 +2793,56 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.media_probe_width,
     resolution,
   ]);
+
+  useEffect(() => {
+    if (
+      isLocalPipelinePreview ||
+      sessionSnapshot?.role !== "controller" ||
+      sessionSnapshot?.state !== "streaming" ||
+      sessionSnapshot.receiver_active !== true
+    ) {
+      setPeerInputControlAvailable(false);
+      return;
+    }
+
+    let cancelled = false;
+    const refreshPeerInputCapability = async () => {
+      const discoveryResult = await ipcLanDiscoverySnapshot();
+      if (cancelled) return;
+      const discovery =
+        discoveryResult.ok &&
+        discoveryResult.value &&
+        Array.isArray(discoveryResult.value.peers)
+          ? discoveryResult.value
+          : null;
+      setPeerInputControlAvailable(
+        peerKeyboardMouseControlAvailable(sessionSnapshot.peer_device_id, discovery)
+      );
+    };
+
+    void refreshPeerInputCapability();
+    const interval = window.setInterval(
+      () => void refreshPeerInputCapability(),
+      PEER_CONTROL_CAPABILITY_POLL_MS
+    );
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    isLocalPipelinePreview,
+    sessionId,
+    sessionSnapshot?.peer_device_id,
+    sessionSnapshot?.receiver_active,
+    sessionSnapshot?.role,
+    sessionSnapshot?.state,
+  ]);
+
   const controlInputEnabled = keyboardMouseControlAvailable(
     capabilities,
     sessionSnapshot,
-    isLocalPipelinePreview
+    isLocalPipelinePreview,
+    peerInputControlAvailable
   );
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
@@ -3088,11 +3253,21 @@ export function RemoteDisplayWindowPage() {
     (event: ControlInputEvent) => {
       if (!controlInputEnabled) return;
       void ipcSendControlInput(sessionId, event).then((result) => {
-        if (!result.ok) setLastError(result.error.message);
+        if (result.ok) {
+          setLastError(null);
+        } else {
+          setLastError(result.error.message);
+        }
       });
     },
     [controlInputEnabled, sessionId]
   );
+
+  const releaseRemoteControlInput = useCallback(() => {
+    activeRemotePointerIdsRef.current.clear();
+    lastRemoteControlPointRef.current = null;
+    sendControlInputEvent({ kind: "release_all" });
+  }, [sendControlInputEvent]);
 
   const sendRemotePointerMoveIfNeeded = useCallback(
     (point: { x: number; y: number }) => {
@@ -3104,17 +3279,23 @@ export function RemoteDisplayWindowPage() {
     [sendControlInputEvent]
   );
 
-  const controlPointFromPointerEvent = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const rect = event.currentTarget.getBoundingClientRect();
+  const controlPointFromClientPoint = useCallback(
+    (target: HTMLDivElement, clientX: number, clientY: number) => {
+      const rect = target.getBoundingClientRect();
       return mapClientPointToRemoteFrame(
-        event.clientX,
-        event.clientY,
+        clientX,
+        clientY,
         rect,
         remoteInputFrameSize
       );
     },
     [remoteInputFrameSize]
+  );
+
+  const controlPointFromPointerEvent = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) =>
+      controlPointFromClientPoint(event.currentTarget, event.clientX, event.clientY),
+    [controlPointFromClientPoint]
   );
 
   const handleRemotePointerMove = useCallback(
@@ -3138,6 +3319,7 @@ export function RemoteDisplayWindowPage() {
       event.preventDefault();
       event.currentTarget.focus();
       event.currentTarget.setPointerCapture?.(event.pointerId);
+      activeRemotePointerIdsRef.current.add(event.pointerId);
       sendRemotePointerMoveIfNeeded(point);
       sendControlInputEvent({
         kind: "mouse_button",
@@ -3158,11 +3340,13 @@ export function RemoteDisplayWindowPage() {
       if (!controlInputEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
+      const hadActivePointer = activeRemotePointerIdsRef.current.has(event.pointerId);
       const point = controlPointFromPointerEvent(event);
-      if (!point) return;
+      if (!point && !hadActivePointer) return;
       event.preventDefault();
+      activeRemotePointerIdsRef.current.delete(event.pointerId);
       event.currentTarget.releasePointerCapture?.(event.pointerId);
-      sendRemotePointerMoveIfNeeded(point);
+      if (point) sendRemotePointerMoveIfNeeded(point);
       sendControlInputEvent({
         kind: "mouse_button",
         button,
@@ -3177,15 +3361,57 @@ export function RemoteDisplayWindowPage() {
     ]
   );
 
+  const handleRemotePointerCancel = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      event.preventDefault();
+      releaseRemoteControlInput();
+    },
+    [controlInputEnabled, releaseRemoteControlInput]
+  );
+
+  const handleRemoteLostPointerCapture = useCallback(
+    (_event: ReactPointerEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled || activeRemotePointerIdsRef.current.size === 0) return;
+      releaseRemoteControlInput();
+    },
+    [controlInputEnabled, releaseRemoteControlInput]
+  );
+
+  const handleRemoteContextMenu = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      if (!controlInputEnabled) return;
+      event.preventDefault();
+      releaseRemoteControlInput();
+    },
+    [controlInputEnabled, releaseRemoteControlInput]
+  );
+
   const handleRemoteWheel = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
       if (!controlInputEnabled) return;
-      const delta = Math.trunc(-event.deltaY);
-      if (delta === 0) return;
+      const verticalDelta = Math.trunc(-event.deltaY);
+      const horizontalDelta = Math.trunc(-event.deltaX);
+      if (verticalDelta === 0 && horizontalDelta === 0) return;
+      const point = controlPointFromClientPoint(event.currentTarget, event.clientX, event.clientY);
       event.preventDefault();
-      sendControlInputEvent({ kind: "mouse_wheel", delta });
+      if (point) sendRemotePointerMoveIfNeeded(point);
+      if (verticalDelta !== 0) {
+        sendControlInputEvent({ kind: "mouse_wheel", delta: verticalDelta });
+      }
+      if (horizontalDelta !== 0) {
+        sendControlInputEvent({
+          kind: "mouse_horizontal_wheel",
+          delta: horizontalDelta,
+        });
+      }
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [
+      controlInputEnabled,
+      controlPointFromClientPoint,
+      sendControlInputEvent,
+      sendRemotePointerMoveIfNeeded,
+    ]
   );
 
   const handleRemoteKeyDown = useCallback(
@@ -3220,19 +3446,36 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemoteBlur = useCallback(
     (_event: ReactFocusEvent<HTMLDivElement>) => {
-      lastRemoteControlPointRef.current = null;
-      sendControlInputEvent({ kind: "release_all" });
+      releaseRemoteControlInput();
     },
-    [sendControlInputEvent]
+    [releaseRemoteControlInput]
   );
 
   useEffect(() => {
     if (!controlInputEnabled) return;
     return () => {
+      activeRemotePointerIdsRef.current.clear();
       lastRemoteControlPointRef.current = null;
       void ipcSendControlInput(sessionId, { kind: "release_all" });
     };
   }, [controlInputEnabled, sessionId]);
+
+  useEffect(() => {
+    if (!controlInputEnabled) return;
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        releaseRemoteControlInput();
+      }
+    };
+    window.addEventListener("blur", releaseRemoteControlInput);
+    window.addEventListener("pagehide", releaseRemoteControlInput);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("blur", releaseRemoteControlInput);
+      window.removeEventListener("pagehide", releaseRemoteControlInput);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [controlInputEnabled, releaseRemoteControlInput]);
 
   const title = useMemo(() => {
     if (context?.label) return context.label;
@@ -3430,23 +3673,31 @@ export function RemoteDisplayWindowPage() {
               !capabilities.available_encoders.includes("nvenc_h264"))
           ? "WebCodecs 2K144 需要 Windows DXGI + NVENC H.264"
           : null;
-  const buildRemoteMediaProfile = useCallback(() => {
+  const buildRemoteMediaProfile = useCallback((): MediaProfile => {
     const [width, height] = resolution.split("x").map(Number) as [number, number];
     const hevc = isHevcEncoder(encoder);
+    const av1 = isAv1Encoder(encoder);
     const main10 = encoder === "nvenc_hevc_main10";
-    return {
+    const profile: MediaProfile = {
       width,
       height,
       fps: Number(fps),
       bitrate_mbps: Number(bitrate),
-      codec: hevc ? "hevc" : "h264",
-      codec_profile: hevc ? (main10 ? "main10" : "main") : "high",
+      codec: av1 ? "av1" : hevc ? "hevc" : "h264",
+      codec_profile: av1 ? "main" : hevc ? (main10 ? "main10" : "main") : "high",
       bit_depth: main10 ? 10 : 8,
       chroma_subsampling: "4:2:0",
       pixel_format: main10 ? "p010" : "nv12",
       hdr_enabled: false,
     };
-  }, [bitrate, encoder, fps, resolution]);
+    if (requestedColorMode) {
+      profile.color_mode = requestedColorMode;
+    }
+    if (requestedColorPipeline) {
+      profile.color_pipeline = requestedColorPipeline;
+    }
+    return profile;
+  }, [bitrate, encoder, fps, requestedColorMode, requestedColorPipeline, resolution]);
   const buildRemoteAdaptiveMediaConfig = useCallback(
     (enabled: boolean): AdaptiveMediaConfig => {
       const ceilingProfile = buildRemoteMediaProfile();
@@ -3668,6 +3919,13 @@ export function RemoteDisplayWindowPage() {
     const enabled = isNative && nativeRenderAvailable;
     const visible = enabled && (options?.visible ?? !testSettingsOpen);
     const scale = nativeRendererType === "macos" ? 1 : window.devicePixelRatio || 1;
+    const controlFrameSize =
+      remoteInputFrameSize.width > 0 && remoteInputFrameSize.height > 0
+        ? {
+            width: remoteInputFrameSize.width,
+            height: remoteInputFrameSize.height,
+          }
+        : undefined;
     const payload = {
       enabled,
       visible,
@@ -3677,6 +3935,7 @@ export function RemoteDisplayWindowPage() {
         width: Math.round(rect.width * scale),
         height: Math.round(rect.height * scale),
       },
+      ...(controlFrameSize ? { controlFrameSize } : {}),
     };
     const key = JSON.stringify(payload);
     const currentSync = nativeSurfaceSyncStateRef.current;
@@ -3709,7 +3968,13 @@ export function RemoteDisplayWindowPage() {
       inFlight,
     };
     return inFlight;
-  }, [isNative, nativeRenderAvailable, nativeRendererType, testSettingsOpen]);
+  }, [
+    isNative,
+    nativeRenderAvailable,
+    nativeRendererType,
+    remoteInputFrameSize,
+    testSettingsOpen,
+  ]);
 
   const openTestSettings = useCallback(() => {
     setTestSettingsOpen(true);
@@ -5516,6 +5781,12 @@ export function RemoteDisplayWindowPage() {
   };
 
   const handleClose = async () => {
+    if (controlInputEnabled) {
+      activeRemotePointerIdsRef.current.clear();
+      lastRemoteControlPointRef.current = null;
+      const releaseResult = await ipcSendControlInput(sessionId, { kind: "release_all" });
+      if (!releaseResult.ok) setLastError(releaseResult.error.message);
+    }
     if (isTauriRuntime() && context?.label) {
       const result = await closeRemoteDisplayWindow(context.label);
       if (!result.ok) setLastError(result.error.message);
@@ -6731,6 +7002,9 @@ export function RemoteDisplayWindowPage() {
         onPointerMove={handleRemotePointerMove}
         onPointerDown={handleRemotePointerDown}
         onPointerUp={handleRemotePointerUp}
+        onPointerCancel={handleRemotePointerCancel}
+        onLostPointerCapture={handleRemoteLostPointerCapture}
+        onContextMenu={handleRemoteContextMenu}
         onWheel={handleRemoteWheel}
         onKeyDown={handleRemoteKeyDown}
         onKeyUp={handleRemoteKeyUp}

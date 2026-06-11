@@ -39,6 +39,51 @@ describe('control input command adapter', () => {
     });
   });
 
+  it.each([
+    [
+      'mouse_move',
+      { kind: 'mouse_move', x: 42, y: 24 },
+      'realtime',
+    ],
+    [
+      'mouse_wheel',
+      { kind: 'mouse_wheel', delta: -120 },
+      'realtime',
+    ],
+    [
+      'mouse_horizontal_wheel',
+      { kind: 'mouse_horizontal_wheel', delta: 120 },
+      'realtime',
+    ],
+    [
+      'key',
+      { kind: 'key', key: { kind: 'virtual_key', code: 0x41 }, pressed: true },
+      'reliable',
+    ],
+  ] as const)('sends %s control input events through the Tauri command', async (_name, event, lane) => {
+    const invoke = getMockInvoke();
+    invoke.mockResolvedValue({
+      session_id: 'session-1',
+      lane,
+      event_count: 1,
+    });
+
+    const result = await ipcSendControlInput('session-1', event);
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        session_id: 'session-1',
+        lane,
+        event_count: 1,
+      },
+    });
+    expect(invoke).toHaveBeenCalledWith('ipc_send_control_input', {
+      sessionId: 'session-1',
+      event,
+    });
+  });
+
   it('sends typed control input events through the browser service bridge', async () => {
     (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
     const invoke = getMockInvoke();

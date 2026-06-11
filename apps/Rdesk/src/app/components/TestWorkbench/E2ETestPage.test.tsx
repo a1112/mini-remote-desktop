@@ -582,7 +582,7 @@ describe("E2ETestPage LAN automation", () => {
     render(
       <MemoryRouter
         initialEntries={[
-          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false",
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10",
         ]}
       >
         <E2ETestPage />
@@ -606,6 +606,46 @@ describe("E2ETestPage LAN automation", () => {
             chroma_subsampling: "4:2:0",
             pixel_format: "nv12",
             hdr_enabled: false,
+            color_mode: "monochrome",
+            color_pipeline: "hdr_main10",
+          },
+        })
+      );
+    });
+  });
+
+  it("autoruns LAN remote display automation with AV1 profile metadata", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=av1&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=full&colorPipeline=sdr8",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_start_lan_remote_session",
+        expect.objectContaining({
+          targetDeviceId: "agent-device",
+          transportKind: "quic",
+          requestedProfile: {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "av1",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
+            color_mode: "full",
+            color_pipeline: "sdr8",
           },
         })
       );

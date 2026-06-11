@@ -3,6 +3,7 @@ import {
   runLanE2EAutomation,
   type LanE2EAutomationCommands,
 } from "./lanE2eAutomationService";
+import type { MediaProfile } from "../adapters/tauri";
 
 function ok<T>(value: T) {
   return { ok: true as const, value };
@@ -12,7 +13,7 @@ function err(message: string) {
   return { ok: false as const, error: { message } };
 }
 
-const DEFAULT_REQUESTED_PROFILE = {
+const DEFAULT_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1600,
   fps: 165,
@@ -23,25 +24,31 @@ const DEFAULT_REQUESTED_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const H264_FALLBACK_REQUESTED_PROFILE = {
+const H264_FALLBACK_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1600,
   fps: 165,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const MACOS_H264_2K144_REQUESTED_PROFILE = {
+const MACOS_H264_2K144_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1440,
   fps: 144,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
-const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
+const MACOS_HEVC_2K144_REQUESTED_PROFILE: MediaProfile = {
   width: 2560,
   height: 1440,
   fps: 144,
@@ -52,6 +59,8 @@ const MACOS_HEVC_2K144_REQUESTED_PROFILE = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 
 const DEFAULT_CAPTURE_SOURCES = [
@@ -1704,6 +1713,66 @@ describe("runLanE2EAutomation", () => {
     expect(result.errorMessage).toContain(
       "2560x1600 @ 165 FPS / 80 Mbps / h264"
     );
+  });
+
+  it("fails when the runtime pipeline color profile does not match the requested profile", async () => {
+    const requestedProfile = {
+      ...DEFAULT_REQUESTED_PROFILE,
+      codec_profile: "main10",
+      bit_depth: 10,
+      pixel_format: "p010",
+      hdr_enabled: true,
+      color_mode: "monochrome" as const,
+      color_pipeline: "hdr_main10" as const,
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
+            active_decoder: "nvdec",
+            active_renderer: "d3d11",
+            active_codec: "hevc",
+            active_codec_profile: "main10",
+            active_bit_depth: 10,
+            active_chroma_subsampling: "4:2:0",
+            active_pixel_format: "p010",
+            active_hdr_enabled: true,
+            active_color_mode: "full",
+            active_color_pipeline: "sdr8",
+            active_width: 2560,
+            active_height: 1600,
+            active_fps: 165,
+            active_bitrate_mbps: 80,
+            queue_depth: 1,
+            dropped_frames: 0,
+            stage_metrics: [],
+            adaptation: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.errorMessage).toContain("Runtime media pipeline profile mismatch");
+    expect(result.errorMessage).toContain(
+      "requested 2560x1600 @ 165 FPS / 80 Mbps / hevc main10 / 10-bit / p010 / HDR / color=monochrome / pipeline=hdr_main10"
+    );
+    expect(result.errorMessage).toContain("color_mode monochrome/full");
+    expect(result.errorMessage).toContain("color_pipeline hdr_main10/sdr8");
   });
 
   it("keeps sampling transient profile mismatches until the profile stabilizes", async () => {

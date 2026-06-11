@@ -68,6 +68,13 @@ export interface CapabilityProfile {
   fps: number;
   bitrate_mbps: number;
   codec: string;
+  codec_profile?: string;
+  bit_depth?: number;
+  chroma_subsampling?: string;
+  pixel_format?: string;
+  hdr_enabled?: boolean;
+  color_mode?: string;
+  color_pipeline?: string;
   latency_budget_ms?: number;
   min_stable_fps_ratio?: number;
   max_drop_ratio?: number;
@@ -178,6 +185,8 @@ const KNOWN_STATUS_BY_ID: Record<string, CapabilityStatus> = {
   "memory.d3d11_shared": "available",
   "service.ffmpeg": "available",
   "media.hevc_main_420_8bit": "supported",
+  "media.hevc_main10_420_10bit": "supported",
+  "media.color_mode_v1": "supported",
 };
 
 const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
@@ -272,6 +281,22 @@ const DOMAIN_BASELINE_ITEMS: Array<Omit<CapabilityItem, "platform">> = [
     status: "supported",
     reason: "LAN high-performance HEVC profile metadata; encoder and decoder capabilities still gate runtime use",
   },
+  {
+    id: "media.hevc_main10_420_10bit",
+    domain: "service",
+    label: "HEVC Main10 10-bit 4:2:0",
+    status: "supported",
+    reason:
+      "LAN HEVC Main10 profile metadata; NVENC Main10 encode and Main10 decode capabilities still gate runtime use",
+  },
+  {
+    id: "media.color_mode_v1",
+    domain: "service",
+    label: "GPU color mode transform",
+    status: "supported",
+    reason:
+      "LAN color mode profile metadata and GPU-side transform contract for full, grayscale, monochrome, and low-chroma modes",
+  },
 ];
 
 const BUILTIN_CAPABILITY_CONSTRAINTS: CapabilityConstraint[] = [
@@ -305,6 +330,44 @@ const BUILTIN_CAPABILITY_CONSTRAINTS: CapabilityConstraint[] = [
   },
 ];
 
+const SDR8_FULL_420_8 = {
+  codec_profile: "main",
+  bit_depth: 8,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "nv12",
+  hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
+} satisfies Pick<
+  CapabilityProfile,
+  | "codec_profile"
+  | "bit_depth"
+  | "chroma_subsampling"
+  | "pixel_format"
+  | "hdr_enabled"
+  | "color_mode"
+  | "color_pipeline"
+>;
+
+const HDR_MAIN10_420_10 = {
+  codec_profile: "main10",
+  bit_depth: 10,
+  chroma_subsampling: "4:2:0",
+  pixel_format: "p010",
+  hdr_enabled: true,
+  color_mode: "full",
+  color_pipeline: "hdr_main10",
+} satisfies Pick<
+  CapabilityProfile,
+  | "codec_profile"
+  | "bit_depth"
+  | "chroma_subsampling"
+  | "pixel_format"
+  | "hdr_enabled"
+  | "color_mode"
+  | "color_pipeline"
+>;
+
 export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
   {
     id: "smoke.720p30",
@@ -313,6 +376,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 8,
     codec: "h264",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: ["transport.loopback", "encode.openh264", "decode.software"],
@@ -324,6 +388,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 20,
     codec: "hevc",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -343,6 +408,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 20,
     codec: "h264",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -361,6 +427,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 64,
     codec: "hevc",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -374,12 +441,33 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     ],
   },
   {
+    id: "lan.2k144.main10",
+    width: 2560,
+    height: 1440,
+    fps: 144,
+    bitrate_mbps: 80,
+    codec: "hevc",
+    ...HDR_MAIN10_420_10,
+    min_stable_fps_ratio: 0.8,
+    max_drop_ratio: 0.02,
+    required_capabilities: [
+      "encode.nvenc_hevc_main10",
+      "decode.nvdec_hevc_main10",
+      "media.hevc_main10_420_10bit",
+      "render.d3d11",
+      "memory.d3d11_shared",
+      "transport.quic_datagram",
+      "transport.media_profile_control_v1",
+    ],
+  },
+  {
     id: "lan.macos.2k144",
     width: 2560,
     height: 1440,
     fps: 144,
     bitrate_mbps: 80,
     codec: "h264",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -398,6 +486,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 144,
     bitrate_mbps: 40,
     codec: "hevc",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -417,6 +506,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 165,
     bitrate_mbps: 80,
     codec: "hevc",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -436,6 +526,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 60,
     bitrate_mbps: 80,
     codec: "hevc",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -455,6 +546,7 @@ export const BUILTIN_CAPABILITY_PROFILES: CapabilityProfile[] = [
     fps: 30,
     bitrate_mbps: 6,
     codec: "h264",
+    ...SDR8_FULL_420_8,
     min_stable_fps_ratio: 0.8,
     max_drop_ratio: 0.02,
     required_capabilities: [
@@ -519,6 +611,17 @@ export function buildCapabilitySnapshotFromIpc(snapshot: IpcCapabilitySnapshot):
             fps: profile.fps,
             bitrate_mbps: profile.bitrate_mbps,
             codec: profile.codec,
+            ...(profile.codec_profile ? { codec_profile: profile.codec_profile } : {}),
+            ...(profile.bit_depth ? { bit_depth: profile.bit_depth } : {}),
+            ...(profile.chroma_subsampling
+              ? { chroma_subsampling: profile.chroma_subsampling }
+              : {}),
+            ...(profile.pixel_format ? { pixel_format: profile.pixel_format } : {}),
+            ...(profile.hdr_enabled !== undefined && profile.hdr_enabled !== null
+              ? { hdr_enabled: profile.hdr_enabled }
+              : {}),
+            ...(profile.color_mode ? { color_mode: profile.color_mode } : {}),
+            ...(profile.color_pipeline ? { color_pipeline: profile.color_pipeline } : {}),
             ...(profile.latency_budget_ms ? { latency_budget_ms: profile.latency_budget_ms } : {}),
             ...(profile.min_stable_fps_ratio
               ? { min_stable_fps_ratio: profile.min_stable_fps_ratio }
@@ -891,9 +994,21 @@ function isProfileCapabilityUsable(item: CapabilityItem): boolean {
 }
 
 function formatProfile(profile: CapabilityProfile): string {
-  return `${profile.width}x${profile.height} @ ${
-    profile.fps
-  } FPS / ${profile.bitrate_mbps} Mbps / ${normalizeProfileCodec(profile.codec)}`;
+  const codecParts = [normalizeProfileCodec(profile.codec), profile.codec_profile]
+    .filter(Boolean)
+    .join("/");
+  const metadataParts = [
+    profile.bit_depth ? `${profile.bit_depth}-bit` : null,
+    profile.chroma_subsampling,
+    profile.pixel_format,
+    profile.hdr_enabled === true ? "HDR" : null,
+    profile.color_mode ? `color=${profile.color_mode}` : null,
+    profile.color_pipeline ? `pipeline=${profile.color_pipeline}` : null,
+  ].filter(Boolean);
+  const metadata = metadataParts.length > 0 ? ` / ${metadataParts.join(" / ")}` : "";
+  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${
+    profile.bitrate_mbps
+  } Mbps / ${codecParts}${metadata}`;
 }
 
 function formatActualProfile(profile: {

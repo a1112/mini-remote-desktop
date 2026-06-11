@@ -311,6 +311,8 @@ const DEFAULT_LAN_HEVC_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -318,6 +320,8 @@ const DEFAULT_LAN_H264_FALLBACK_MEDIA_PROFILE: MediaProfile = {
   fps: 165,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -330,6 +334,8 @@ const DEFAULT_LAN_MACOS_HEVC_MEDIA_PROFILE: MediaProfile = {
   chroma_subsampling: "4:2:0",
   pixel_format: "nv12",
   hdr_enabled: false,
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
   width: 2560,
@@ -337,6 +343,8 @@ const DEFAULT_LAN_MACOS_H264_MEDIA_PROFILE: MediaProfile = {
   fps: 144,
   bitrate_mbps: 80,
   codec: "h264",
+  color_mode: "full",
+  color_pipeline: "sdr8",
 };
 const ADAPTIVE_STARTUP_SAFE_MIN_FPS = 120;
 const ADAPTIVE_STARTUP_SAFE_MIN_BITRATE_MBPS = 80;
@@ -951,7 +959,9 @@ export async function runLanE2EAutomation(
         captureSource,
         validationMode
       );
-      const profileMismatch = describeProfileProbeFailure(profileProbeResult);
+      const profileMismatch =
+        describeProfileProbeFailure(profileProbeResult) ??
+        describeMediaPipelineProfileMismatch(mediaPipelineSnapshot, requestedProfile);
       const sampleReadinessDurationMs = sampleFpsBaseline
         ? sampleFpsElapsedMs ?? 0
         : sampleDurationMs;
@@ -1866,6 +1876,67 @@ function describeProfileProbeFailure(result: ProfileProbeResult | undefined): st
   return result.error ?? `Runtime media profile probe failed: ${result.status}`;
 }
 
+function describeMediaPipelineProfileMismatch(
+  snapshot: MediaPipelineSnapshot | undefined,
+  requestedProfile: MediaProfile | undefined
+): string | null {
+  if (!snapshot || !requestedProfile) return null;
+
+  const mismatches = [
+    compareOptionalProfileString(
+      "color_mode",
+      requestedProfile.color_mode,
+      snapshot.active_color_mode
+    ),
+    compareOptionalProfileString(
+      "color_pipeline",
+      requestedProfile.color_pipeline,
+      snapshot.active_color_pipeline
+    ),
+    compareOptionalProfileBoolean(
+      "hdr_enabled",
+      requestedProfile.hdr_enabled,
+      snapshot.active_hdr_enabled
+    ),
+  ].filter((entry): entry is string => Boolean(entry));
+
+  if (mismatches.length === 0) return null;
+  return `Runtime media pipeline profile mismatch: requested ${formatMediaProfile(
+    requestedProfile
+  )}; ${mismatches.join(", ")}`;
+}
+
+function compareOptionalProfileString(
+  label: string,
+  expected: string | null | undefined,
+  actual: string | null | undefined
+): string | null {
+  if (!expected) return null;
+  const normalizedExpected = expected.trim().toLowerCase();
+  const normalizedActual = actual?.trim().toLowerCase();
+  if (!normalizedActual && isDefaultProfileMetadataValue(label, normalizedExpected)) return null;
+  if (normalizedExpected === normalizedActual) return null;
+  return `${label} ${normalizedExpected}/${normalizedActual ?? "missing"}`;
+}
+
+function compareOptionalProfileBoolean(
+  label: string,
+  expected: boolean | null | undefined,
+  actual: boolean | null | undefined
+): string | null {
+  if (expected == null) return null;
+  if (actual == null && expected === false) return null;
+  if (expected === actual) return null;
+  return `${label} ${expected}/${actual ?? "missing"}`;
+}
+
+function isDefaultProfileMetadataValue(label: string, value: string): boolean {
+  return (
+    (label === "color_mode" && value === "full") ||
+    (label === "color_pipeline" && value === "sdr8")
+  );
+}
+
 function isExpectedProfileDowngrade(
   probe: ProbeSnapshot,
   requestedProfile: MediaProfile,
@@ -1929,7 +2000,21 @@ function isActualProfileDowngraded(
 }
 
 function formatMediaProfile(profile: MediaProfile): string {
-  return `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`;
+  const codec = [normalizeMediaCodec(profile.codec), profile.codec_profile]
+    .filter(Boolean)
+    .join(" ");
+  const parts = [
+    `${profile.width}x${profile.height} @ ${profile.fps} FPS / ${profile.bitrate_mbps} Mbps`,
+    codec,
+  ];
+
+  if (profile.bit_depth) parts.push(`${profile.bit_depth}-bit`);
+  if (profile.pixel_format) parts.push(profile.pixel_format);
+  if (profile.hdr_enabled === true) parts.push("HDR");
+  if (profile.color_mode) parts.push(`color=${profile.color_mode}`);
+  if (profile.color_pipeline) parts.push(`pipeline=${profile.color_pipeline}`);
+
+  return parts.filter(Boolean).join(" / ");
 }
 
 function formatProbeProfile(probe: ProbeSnapshot): string {
@@ -1946,6 +2031,15 @@ function toCapabilityProfile(profile: MediaProfile): CapabilityProfile {
     fps: profile.fps,
     bitrate_mbps: profile.bitrate_mbps,
     codec: normalizeMediaCodec(profile.codec),
+    ...(profile.codec_profile ? { codec_profile: profile.codec_profile } : {}),
+    ...(profile.bit_depth ? { bit_depth: profile.bit_depth } : {}),
+    ...(profile.chroma_subsampling ? { chroma_subsampling: profile.chroma_subsampling } : {}),
+    ...(profile.pixel_format ? { pixel_format: profile.pixel_format } : {}),
+    ...(profile.hdr_enabled !== undefined && profile.hdr_enabled !== null
+      ? { hdr_enabled: profile.hdr_enabled }
+      : {}),
+    ...(profile.color_mode ? { color_mode: profile.color_mode } : {}),
+    ...(profile.color_pipeline ? { color_pipeline: profile.color_pipeline } : {}),
     required_capabilities: [],
   };
 }

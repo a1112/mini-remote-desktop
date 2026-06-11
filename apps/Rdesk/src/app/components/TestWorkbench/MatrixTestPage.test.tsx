@@ -237,6 +237,29 @@ describe("MatrixTestPage failure handling", () => {
     });
   });
 
+  it("carries color mode and pipeline into cross-device media profiles", () => {
+    expect(
+      mediaProfileFromConfig({
+        encoder_type: "nvenc_hevc_main10",
+        resolution: [2560, 1440],
+        fps: 144,
+        bitrate: 80_000_000,
+        color_mode: "monochrome",
+        color_pipeline: "hdr_main10",
+      })
+    ).toEqual(
+      expect.objectContaining({
+        width: 2560,
+        height: 1440,
+        codec: "hevc",
+        codec_profile: "main10",
+        bit_depth: 10,
+        color_mode: "monochrome",
+        color_pipeline: "hdr_main10",
+      })
+    );
+  });
+
   it("requires HEVC peer media capabilities for HEVC cross-device matrix profiles", () => {
     const peer = {
       device_id: "windows-peer",
@@ -371,6 +394,94 @@ describe("MatrixTestPage failure handling", () => {
     });
 
     expect(skipReason).toContain("decode.videotoolbox_hevc");
+  });
+
+  it("requires Main10 peer media capabilities for HEVC Main10 cross-device matrix profiles", () => {
+    const peer = {
+      device_id: "windows-peer",
+      device_name: "Windows Peer",
+      device_type: "desktop",
+      ip: "192.168.1.51",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.51:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [
+        "quic_datagram_media_v3",
+        "dxgi_capture",
+        "encode.nvenc_hevc_main10",
+        "decode.nvdec_hevc_main10",
+        "media.hevc_main10_420_10bit",
+        "d3d11_native_render",
+      ],
+      age_ms: 20,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDevicePeerSkipReason(peer, "quic", {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: "hevc",
+        codec_profile: "main10",
+        bit_depth: 10,
+        chroma_subsampling: "4:2:0",
+        pixel_format: "p010",
+        color_pipeline: "hdr_main10",
+      })
+    ).toBeNull();
+  });
+
+  it("requires peer color-mode capability for non-full cross-device matrix profiles", () => {
+    const peer = {
+      device_id: "windows-peer",
+      device_name: "Windows Peer",
+      device_type: "desktop",
+      ip: "192.168.1.51",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.51:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      service_build_id: "test-build",
+      media_protocol_version: 3,
+      media_capabilities: [
+        "quic_datagram_media_v3",
+        "dxgi_capture",
+        "encode.nvenc_h264",
+        "decode.nvdec",
+        "d3d11_native_render",
+      ],
+      age_ms: 20,
+      p2p_available: true,
+    };
+
+    const skipReason = crossDevicePeerSkipReason(peer, "quic", {
+      width: 1920,
+      height: 1080,
+      fps: 60,
+      bitrate_mbps: 12,
+      codec: "h264",
+      color_mode: "grayscale",
+      color_pipeline: "sdr8",
+    });
+
+    expect(skipReason).toContain("media.color_mode_v1");
   });
 
   it("formats matrix media profiles with HEVC codec and chroma metadata", () => {
@@ -1258,10 +1369,17 @@ describe("MatrixTestPage failure handling", () => {
     render(<MatrixTestPage runDelayMs={0} />);
 
     await screen.findByLabelText("Metal");
-    fireEvent.click(screen.getByLabelText("OpenH264"));
-    fireEvent.click(screen.getByLabelText("720p"));
-    fireEvent.click(screen.getByLabelText("30 FPS"));
-    fireEvent.click(screen.getByLabelText("Metal"));
+    setLabeledCheckbox("VideoToolbox H.264", false);
+    setLabeledCheckbox("VideoToolbox HEVC", false);
+    setLabeledCheckbox("OpenH264", true);
+    setLabeledCheckbox("VideoToolbox", false);
+    setLabeledCheckbox("软件", true);
+    setLabeledCheckbox("720p", true);
+    setLabeledCheckbox("1080p", false);
+    setLabeledCheckbox("30 FPS", true);
+    setLabeledCheckbox("60 FPS", false);
+    setLabeledCheckbox("No display", false);
+    setLabeledCheckbox("Metal", true);
     fireEvent.click(screen.getByRole("button", { name: /启动矩阵测试/ }));
 
     await waitFor(() => {
@@ -1711,13 +1829,15 @@ describe("MatrixTestPage failure handling", () => {
         expect.objectContaining({
           targetDeviceId: "linux-agent",
           transportKind: "quic",
-          requestedProfile: {
+          requestedProfile: expect.objectContaining({
             width: 1920,
             height: 1080,
             fps: 60,
             bitrate_mbps: 8,
             codec: "h264",
-          },
+            color_mode: "full",
+            color_pipeline: "sdr8",
+          }),
         })
       );
     });

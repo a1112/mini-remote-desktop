@@ -6,6 +6,7 @@ import {
   type LanPeerInfo,
 } from "../adapters/tauri";
 import { deviceService } from "../services/deviceService";
+import { deviceActionService } from "../services/deviceActionService";
 import { isTauriRuntime } from "../utils/runtime";
 import { useAuth } from "./AuthContext";
 
@@ -18,6 +19,7 @@ export interface Device {
   os: string;
   icon: typeof Monitor;
   status: "online" | "offline";
+  disabled?: boolean;
   location: string;
   ping: number | null;
   lastSeen: string;
@@ -25,6 +27,7 @@ export interface Device {
   ram: number | null;
   disk: number | null;
   ip: string;
+  macAddress?: string | null;
   group: string;
   favorite: boolean;
   discoverySources: DeviceDiscoverySource[];
@@ -49,6 +52,7 @@ type DeviceApi = {
   ram: number | null;
   disk: number | null;
   ip: string;
+  mac_address?: string | null;
   group: string;
   favorite: boolean;
 };
@@ -122,6 +126,7 @@ const toServerDevice = (item: DeviceApi): Device =>
     ram: item.ram,
     disk: item.disk,
     ip: item.ip,
+    macAddress: item.mac_address ?? null,
     group: item.group,
     favorite: item.favorite,
   });
@@ -195,7 +200,7 @@ function mergeLanPeers(peerSets: LanPeerInfo[][]): LanPeerInfo[] {
   return Array.from(byDeviceId.values());
 }
 
-const lanPeerToDevice = (peer: LanPeerInfo): Device =>
+export const lanPeerToDevice = (peer: LanPeerInfo): Device =>
   baseDevice("lan_p2p", {
     id: peer.device_id,
     name: peer.device_name,
@@ -210,6 +215,7 @@ const lanPeerToDevice = (peer: LanPeerInfo): Device =>
     ram: null,
     disk: null,
     ip: peer.ip,
+    macAddress: peer.mac_address ?? null,
     group: "LAN P2P",
     favorite: false,
   });
@@ -285,6 +291,13 @@ function mergeDevice(existing: Device, incoming: Device): Device {
     ram: serverSide?.ram ?? existing.ram ?? incoming.ram,
     disk: serverSide?.disk ?? existing.disk ?? incoming.disk,
     ip: p2pSide?.ip ?? serverSide?.ip ?? localSide?.ip ?? incoming.ip,
+    macAddress:
+      p2pSide?.macAddress ??
+      serverSide?.macAddress ??
+      localSide?.macAddress ??
+      existing.macAddress ??
+      incoming.macAddress ??
+      null,
     group: localSide?.group ?? p2pSide?.group ?? serverSide?.group ?? incoming.group,
     favorite: existing.favorite || incoming.favorite,
     discoverySources,
@@ -311,7 +324,7 @@ export function mergeDevices(
   lanDevices.forEach(add);
   if (localDevice) add(localDevice);
 
-  return Array.from(byDeviceId.values()).sort((a, b) => {
+  return deviceActionService.applyDevicePreferences(Array.from(byDeviceId.values())).sort((a, b) => {
     if (a.isLocal !== b.isLocal) return a.isLocal ? -1 : 1;
     if (a.status !== b.status) return a.status === "online" ? -1 : 1;
     if (a.p2pAvailable !== b.p2pAvailable) return a.p2pAvailable ? -1 : 1;
@@ -350,6 +363,7 @@ export function useDevices(options?: UseDevicesOptions) {
       [lanDevices, localDevice] = await Promise.all([
         fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
         fetchLocalDevice(),
+        deviceActionService.refreshDevicePreferences(),
       ]);
       setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
 
@@ -422,6 +436,10 @@ export function useDevices(options?: UseDevicesOptions) {
   return { devices, loading, error, lastUpdated, refresh, currentDeviceId };
 }
 
+export function findDeviceByRouteId(devices: Device[], id: string | undefined) {
+  return devices.find((device) => device.id === id || device.deviceId === id);
+}
+
 export function useDeviceById(id: string | undefined, devices: Device[]) {
-  return useMemo(() => devices.find((d) => d.id === id), [id, devices]);
+  return useMemo(() => findDeviceByRouteId(devices, id), [id, devices]);
 }

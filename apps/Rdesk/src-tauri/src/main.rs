@@ -33,7 +33,8 @@ use device_info::HardwareInfo;
 use mrd_pipeline_core::VideoCodec;
 use mrd_proto::SessionId;
 use remote_display_surface::{
-    NativeRenderSurfaceSnapshot, NativeSurfaceRect, RemoteDisplaySurfaceManager,
+    NativeRenderSurfaceSnapshot, NativeSurfaceControlFrameSize, NativeSurfaceRect,
+    RemoteDisplaySurfaceManager,
 };
 use render_window_registry::{
     NativeSurfaceServiceAction, PendingRenderWindow, RenderWindowContext, RenderWindowRegistry,
@@ -78,6 +79,8 @@ const LAN_E2E_PROFILE_BIT_DEPTH_ENV: &str = "MRD_LAN_E2E_PROFILE_BIT_DEPTH";
 const LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV: &str = "MRD_LAN_E2E_PROFILE_CHROMA_SUBSAMPLING";
 const LAN_E2E_PROFILE_PIXEL_FORMAT_ENV: &str = "MRD_LAN_E2E_PROFILE_PIXEL_FORMAT";
 const LAN_E2E_PROFILE_HDR_ENABLED_ENV: &str = "MRD_LAN_E2E_PROFILE_HDR_ENABLED";
+const LAN_E2E_PROFILE_COLOR_MODE_ENV: &str = "MRD_LAN_E2E_PROFILE_COLOR_MODE";
+const LAN_E2E_PROFILE_COLOR_PIPELINE_ENV: &str = "MRD_LAN_E2E_PROFILE_COLOR_PIPELINE";
 const LAN_E2E_DISPLAY_MODE_POLICY_ENV: &str = "MRD_LAN_E2E_DISPLAY_MODE_POLICY";
 const LAN_E2E_CAPTURE_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_ID";
 const LAN_E2E_CAPTURE_SOURCE_KIND_ENV: &str = "MRD_LAN_E2E_CAPTURE_SOURCE_KIND";
@@ -136,6 +139,20 @@ struct ControlInputAcceptedDto {
     session_id: String,
     lane: mrd_ipc::ControlInputLane,
     event_count: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct WakeOnLanSentDto {
+    device_id: String,
+    mac_address: String,
+    broadcast_addr: String,
+    packet_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteDevicePowerActionAcceptedDto {
+    device_id: String,
+    action: mrd_ipc::RemoteDevicePowerAction,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +289,8 @@ fn open_remote_display_window(
     profile_chroma_subsampling: Option<String>,
     profile_pixel_format: Option<String>,
     profile_hdr_enabled: Option<bool>,
+    profile_color_mode: Option<String>,
+    profile_color_pipeline: Option<String>,
 ) -> Result<RenderWindowContext, String> {
     let spec = {
         let mut registry = state.render_window_registry.lock().unwrap();
@@ -286,6 +305,8 @@ fn open_remote_display_window(
             profile_chroma_subsampling,
             profile_pixel_format,
             profile_hdr_enabled,
+            profile_color_mode,
+            profile_color_pipeline,
         );
         let session_id = SessionId(session_id);
         if query_params.is_empty() {
@@ -347,6 +368,8 @@ fn remote_display_profile_query_params(
     profile_chroma_subsampling: Option<String>,
     profile_pixel_format: Option<String>,
     profile_hdr_enabled: Option<bool>,
+    profile_color_mode: Option<String>,
+    profile_color_pipeline: Option<String>,
 ) -> Vec<(String, String)> {
     let mut params = Vec::new();
     push_remote_display_query_param(&mut params, "profileWidth", profile_width);
@@ -363,6 +386,8 @@ fn remote_display_profile_query_params(
     );
     push_remote_display_query_param(&mut params, "profilePixelFormat", profile_pixel_format);
     push_remote_display_query_param(&mut params, "profileHdrEnabled", profile_hdr_enabled);
+    push_remote_display_query_param(&mut params, "profileColorMode", profile_color_mode);
+    push_remote_display_query_param(&mut params, "profileColorPipeline", profile_color_pipeline);
     params
 }
 
@@ -373,6 +398,32 @@ fn push_remote_display_query_param<T: ToString>(
 ) {
     if let Some(value) = value {
         params.push((key.to_string(), value.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod remote_display_profile_query_tests {
+    use super::*;
+
+    #[test]
+    fn remote_display_profile_query_params_include_color_metadata() {
+        let params = remote_display_profile_query_params(
+            Some(2560),
+            Some(1440),
+            Some(144),
+            Some(40),
+            Some("hevc".to_string()),
+            Some("main10".to_string()),
+            Some(10),
+            Some("4:2:0".to_string()),
+            Some("p010".to_string()),
+            Some(true),
+            Some("monochrome".to_string()),
+            Some("hdr_main10".to_string()),
+        );
+
+        assert!(params.contains(&("profileColorMode".to_string(), "monochrome".to_string())));
+        assert!(params.contains(&("profileColorPipeline".to_string(), "hdr_main10".to_string())));
     }
 }
 
@@ -933,6 +984,7 @@ async fn configure_remote_display_native_surface(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: Option<bool>,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let label = window.label().to_string();
     let app_handle = window.app_handle().clone();
@@ -945,6 +997,7 @@ async fn configure_remote_display_native_surface(
         rect,
         enabled,
         visible.unwrap_or(enabled),
+        control_frame_size,
     )?;
     drop(window);
 
@@ -1149,6 +1202,7 @@ fn configure_native_surface_for_window(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: bool,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let scheduler_window = window.clone();
     let surface_window = window.clone();
@@ -1160,6 +1214,7 @@ fn configure_native_surface_for_window(
                 rect,
                 enabled,
                 visible,
+                control_frame_size,
             );
             let _ = sender.send(result);
         })
@@ -1177,12 +1232,15 @@ fn configure_native_surface_for_window(
     rect: NativeSurfaceRect,
     enabled: bool,
     visible: bool,
+    control_frame_size: Option<NativeSurfaceControlFrameSize>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
-    state
-        .remote_display_surfaces
-        .lock()
-        .unwrap()
-        .configure(window, rect, enabled, visible)
+    state.remote_display_surfaces.lock().unwrap().configure(
+        window,
+        rect,
+        enabled,
+        visible,
+        control_frame_size,
+    )
 }
 
 #[cfg(windows)]
@@ -2144,6 +2202,49 @@ async fn ipc_list_devices() -> Result<Vec<mrd_ipc::DeviceInfo>, String> {
     }
 }
 
+/// List service-owned device preferences via IPC.
+#[tauri::command]
+async fn ipc_get_device_preferences() -> Result<Vec<mrd_ipc::DevicePreference>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::GetDevicePreferences)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DevicePreferences { preferences } => Ok(preferences),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Update service-owned device preferences via IPC.
+#[tauri::command]
+async fn ipc_update_device_preference(
+    device_id: String,
+    update: mrd_ipc::DevicePreferenceUpdate,
+) -> Result<mrd_ipc::DevicePreference, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::UpdateDevicePreference {
+            device_id: DeviceId(device_id),
+            update,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DevicePreferenceUpdated { preference } => Ok(preference),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
 /// Get LAN peer discovery snapshot via IPC.
 #[tauri::command]
 async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
@@ -2175,6 +2276,168 @@ async fn ipc_refresh_lan_discovery() -> Result<mrd_ipc::LanDiscoverySnapshot, St
 
     match response {
         IpcResponse::LanDiscoverySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List a local directory through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_directory(path: Option<String>) -> Result<mrd_ipc::DirectoryList, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListDirectory { path })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::DirectoryList { listing } => Ok(listing),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Start a service-owned file transfer through mrd-service IPC.
+#[tauri::command]
+async fn ipc_start_file_transfer(
+    request: mrd_ipc::FileTransferStartRequest,
+) -> Result<mrd_ipc::FileTransferTaskSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::StartFileTransfer { request })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferStarted { transfer } => Ok(transfer),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List service-owned file transfer tasks through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_file_transfers() -> Result<Vec<mrd_ipc::FileTransferTaskSnapshot>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListFileTransfers)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferList { transfers } => Ok(transfers),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// List available and reserved file transfer providers through mrd-service IPC.
+#[tauri::command]
+async fn ipc_list_file_transfer_providers(
+) -> Result<Vec<mrd_ipc::FileTransferProviderDescriptor>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::ListFileTransferProviders)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferProviderList { providers } => Ok(providers),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Cancel a service-owned file transfer task through mrd-service IPC.
+#[tauri::command]
+async fn ipc_cancel_file_transfer(
+    transfer_id: String,
+) -> Result<mrd_ipc::FileTransferTaskSnapshot, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::CancelFileTransfer { transfer_id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::FileTransferCancelled { transfer } => Ok(transfer),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Send a Wake-on-LAN magic packet via mrd-service IPC.
+#[tauri::command]
+async fn ipc_wake_on_lan(
+    device_id: String,
+    mac_address: String,
+    broadcast_addr: Option<String>,
+) -> Result<WakeOnLanSentDto, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::WakeOnLan {
+            device_id: DeviceId(device_id),
+            mac_address,
+            broadcast_addr,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::WakeOnLanSent {
+            device_id,
+            mac_address,
+            broadcast_addr,
+            packet_bytes,
+        } => Ok(WakeOnLanSentDto {
+            device_id: device_id.0,
+            mac_address,
+            broadcast_addr,
+            packet_bytes,
+        }),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Request a remote device restart/shutdown through mrd-service IPC.
+#[tauri::command]
+async fn ipc_request_remote_device_power_action(
+    device_id: String,
+    action: mrd_ipc::RemoteDevicePowerAction,
+) -> Result<RemoteDevicePowerActionAcceptedDto, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::RequestRemoteDevicePowerAction {
+            device_id: DeviceId(device_id),
+            action,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::RemoteDevicePowerActionAccepted { device_id, action } => {
+            Ok(RemoteDevicePowerActionAcceptedDto {
+                device_id: device_id.0,
+                action,
+            })
+        }
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -2716,6 +2979,29 @@ async fn ipc_capability_snapshot() -> Result<mrd_ipc::CapabilitySnapshot, String
 
     match response {
         IpcResponse::CapabilitySnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Get a discovered LAN peer capability snapshot via IPC.
+#[tauri::command]
+async fn ipc_peer_capability_snapshot(
+    peer_device_id: String,
+) -> Result<Option<mrd_ipc::CapabilitySnapshot>, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::DeviceId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::GetPeerCapabilitySnapshot {
+            peer_device_id: DeviceId(peer_device_id),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::PeerCapabilitySnapshot { snapshot, .. } => Ok(snapshot),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -3428,6 +3714,8 @@ struct LanE2eAutorunLaunchConfig {
     profile_chroma_subsampling: Option<String>,
     profile_pixel_format: Option<String>,
     profile_hdr_enabled: Option<String>,
+    profile_color_mode: Option<String>,
+    profile_color_pipeline: Option<String>,
     display_mode_policy: Option<String>,
     capture_source_id: Option<String>,
     capture_source_kind: Option<String>,
@@ -3470,6 +3758,8 @@ where
         profile_chroma_subsampling: non_empty_env(env(LAN_E2E_PROFILE_CHROMA_SUBSAMPLING_ENV)),
         profile_pixel_format: non_empty_env(env(LAN_E2E_PROFILE_PIXEL_FORMAT_ENV)),
         profile_hdr_enabled: non_empty_env(env(LAN_E2E_PROFILE_HDR_ENABLED_ENV)),
+        profile_color_mode: non_empty_env(env(LAN_E2E_PROFILE_COLOR_MODE_ENV)),
+        profile_color_pipeline: non_empty_env(env(LAN_E2E_PROFILE_COLOR_PIPELINE_ENV)),
         display_mode_policy: non_empty_env(env(LAN_E2E_DISPLAY_MODE_POLICY_ENV)),
         capture_source_id: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_ID_ENV)),
         capture_source_kind: non_empty_env(env(LAN_E2E_CAPTURE_SOURCE_KIND_ENV)),
@@ -3510,6 +3800,8 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     );
     push_query_param(&mut params, "pixelFormat", config.profile_pixel_format);
     push_query_param(&mut params, "hdrEnabled", config.profile_hdr_enabled);
+    push_query_param(&mut params, "colorMode", config.profile_color_mode);
+    push_query_param(&mut params, "colorPipeline", config.profile_color_pipeline);
     push_query_param(&mut params, "displayModePolicy", config.display_mode_policy);
     push_query_param(&mut params, "captureSourceId", config.capture_source_id);
     push_query_param(&mut params, "captureSourceKind", config.capture_source_kind);
@@ -3628,6 +3920,8 @@ mod tray_tests {
             profile_chroma_subsampling: Some("4:2:0".to_string()),
             profile_pixel_format: Some("nv12".to_string()),
             profile_hdr_enabled: Some("false".to_string()),
+            profile_color_mode: Some("monochrome".to_string()),
+            profile_color_pipeline: Some("hdr_main10".to_string()),
             display_mode_policy: Some("temporary".to_string()),
             capture_source_id: Some("windows:display-shared:1".to_string()),
             capture_source_kind: Some("display".to_string()),
@@ -3640,7 +3934,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
         );
     }
 
@@ -4242,8 +4536,17 @@ fn main() {
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
             ipc_list_devices,
+            ipc_get_device_preferences,
+            ipc_update_device_preference,
             ipc_lan_discovery_snapshot,
             ipc_refresh_lan_discovery,
+            ipc_list_directory,
+            ipc_start_file_transfer,
+            ipc_list_file_transfers,
+            ipc_list_file_transfer_providers,
+            ipc_cancel_file_transfer,
+            ipc_wake_on_lan,
+            ipc_request_remote_device_power_action,
             ipc_list_sessions,
             ipc_start_session,
             ipc_start_lan_remote_session,
@@ -4265,6 +4568,7 @@ fn main() {
             ipc_runtime_snapshot,
             ipc_audit_log,
             ipc_capability_snapshot,
+            ipc_peer_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,
             ipc_media_pipeline_snapshot,

@@ -1,7 +1,14 @@
 import { useDevices } from "./deviceData";
 import { AppVersionBadge } from "./AppVersionBadge";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { deviceService } from "../services/deviceService";
+import { deviceActionService } from "../services/deviceActionService";
+import {
+  listSessions,
+  stopSession,
+  type SessionInfo,
+} from "../services/ipcSessionService";
+import { ipcCapabilitySnapshot, ipcPeerCapabilitySnapshot } from "../adapters/tauri";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
@@ -74,6 +81,44 @@ type DeviceMenuItem = {
 };
 
 const unsupportedDeviceActionTitle = "暂未接入本机服务能力";
+const terminalSessionStates = new Set(["failed", "closed"]);
+const runnableCapabilityStatuses = new Set(["available", "usable", "supported", "degraded"]);
+
+type CapabilitySnapshotLike = {
+  capabilities?: Array<{
+    id?: string;
+    status?: string;
+    reason?: string | null;
+    detail?: string | null;
+  }>;
+};
+
+function activePeerSessionForDevice(
+  sessions: SessionInfo[],
+  deviceId: string
+): SessionInfo | null {
+  return sessions.find(
+    (session) =>
+      session.peer_device_id === deviceId &&
+      !terminalSessionStates.has(session.state)
+  ) ?? null;
+}
+
+function remotePowerUnavailableReasonFromSnapshot(
+  snapshot: CapabilitySnapshotLike
+): string | null {
+  const capability = snapshot.capabilities?.find(
+    (item) => item.id === "control.remote_power"
+  );
+  if (!capability) return null;
+  const status = capability.status?.trim().toLowerCase();
+  if (status && runnableCapabilityStatuses.has(status)) return null;
+  return (
+    capability.reason?.trim() ||
+    capability.detail?.trim() ||
+    "远程重启/关机能力未启用"
+  );
+}
 
 export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
@@ -81,12 +126,23 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const [refreshing, setRefreshing] = useState(false);
   const [submenuOpen, setSubmenuOpen] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<DeviceActionStatus | null>(null);
+  const [sessionSummaries, setSessionSummaries] = useState<SessionInfo[]>([]);
+  const [remotePowerUnavailableReason, setRemotePowerUnavailableReason] = useState<string | null>(null);
+  const [peerRemotePowerUnavailableReason, setPeerRemotePowerUnavailableReason] = useState<string | null>(null);
   const actionStatusTimerRef = useRef<number | null>(null);
   const { isLoggedIn, user } = useAuth();
 
+  const refreshSessionSummaries = useCallback(async () => {
+    try {
+      setSessionSummaries(await listSessions());
+    } catch {
+      setSessionSummaries([]);
+    }
+  }, []);
+
   const handleRefresh = async () => {
     setRefreshing(true);
-    await refresh();
+    await Promise.all([refresh(), refreshSessionSummaries()]);
     setTimeout(() => setRefreshing(false), 500);
   };
   const [contextMenu, setContextMenu] = useState<{ deviceId: string; x: number; y: number } | null>(null);
@@ -117,6 +173,31 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     if (actionStatusTimerRef.current !== null) {
       window.clearTimeout(actionStatusTimerRef.current);
     }
+  }, []);
+
+  useEffect(() => {
+    void refreshSessionSummaries();
+  }, [refreshSessionSummaries]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void ipcCapabilitySnapshot()
+      .then((result) => {
+        if (cancelled) return;
+        if (!result.ok) {
+          setRemotePowerUnavailableReason(null);
+          return;
+        }
+        setRemotePowerUnavailableReason(
+          remotePowerUnavailableReasonFromSnapshot(result.value)
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setRemotePowerUnavailableReason(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -158,6 +239,44 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
   const contextMenuDevice = contextMenu ? devices.find((d) => d.id === contextMenu.deviceId) : null;
   const isContextOnline = contextMenuDevice?.status === "online";
+  const isContextDisabled = Boolean(contextMenuDevice?.disabled);
+  const isContextRemoteActionAvailable =
+    Boolean(contextMenuDevice) &&
+    isContextOnline &&
+    !isContextDisabled &&
+    !contextMenuDevice?.isLocal;
+  const contextActiveSession = contextMenuDevice
+    ? activePeerSessionForDevice(sessionSummaries, contextMenuDevice.deviceId)
+    : null;
+
+  useEffect(() => {
+    let cancelled = false;
+    setPeerRemotePowerUnavailableReason(null);
+    if (!contextMenuDevice || contextMenuDevice.isLocal) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void ipcPeerCapabilitySnapshot(contextMenuDevice.deviceId)
+      .then((result) => {
+        if (cancelled) return;
+        if (!result.ok || !result.value) {
+          setPeerRemotePowerUnavailableReason(null);
+          return;
+        }
+        setPeerRemotePowerUnavailableReason(
+          remotePowerUnavailableReasonFromSnapshot(result.value)
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setPeerRemotePowerUnavailableReason(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [contextMenuDevice?.deviceId, contextMenuDevice?.isLocal]);
 
   // 重命名设备
   const handleStartRename = (deviceId: string, currentName: string) => {
@@ -225,6 +344,114 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
   };
 
+  const handleOpenDeviceTab = (deviceId: string, tab: "remote" | "files" | "apps" | "info" | "terminal") => {
+    navigate(`/devices/${deviceId}?tab=${tab}`);
+    setContextMenu(null);
+    setSubmenuOpen(null);
+  };
+
+  const handleToggleFavorite = async (deviceId: string, deviceName: string, favorite: boolean) => {
+    await deviceActionService.setDeviceFavorite(deviceId, favorite);
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: favorite ? `已收藏：${deviceName}` : `已取消收藏：${deviceName}`,
+    });
+  };
+
+  const handleRemoveDevice = async (deviceId: string, deviceName: string, isLocal: boolean) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    if (isLocal) {
+      showActionStatus({ kind: "error", message: "不能移除本机设备" });
+      return;
+    }
+    if (
+      typeof window.confirm === "function" &&
+      !window.confirm(`移除设备“${deviceName}”？可通过重新发现或重新登录恢复。`)
+    ) {
+      return;
+    }
+    await deviceActionService.markDeviceRemoved(deviceId);
+    await refresh();
+    showActionStatus({ kind: "success", message: `已移除：${deviceName}` });
+  };
+
+  const handleToggleDisabled = async (
+    deviceId: string,
+    deviceName: string,
+    disabled: boolean,
+    isLocal: boolean
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    if (isLocal) {
+      showActionStatus({ kind: "error", message: "不能禁用本机设备" });
+      return;
+    }
+    await deviceActionService.setDeviceDisabled(deviceId, disabled);
+    await refresh();
+    showActionStatus({
+      kind: "success",
+      message: disabled ? `已禁用：${deviceName}` : `已解除禁用：${deviceName}`,
+    });
+  };
+
+  const handleDisconnectDevice = async (sessionId: string, deviceName: string) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      await stopSession(sessionId);
+      await Promise.all([refresh(), refreshSessionSummaries()]);
+      showActionStatus({ kind: "success", message: `已断开连接：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `断开连接失败：${message}` });
+    }
+  };
+
+  const handleWakeOnLan = async (
+    deviceId: string,
+    deviceName: string,
+    macAddress: string
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    try {
+      await deviceActionService.wakeOnLan({
+        deviceId,
+        macAddress,
+        broadcastAddr: undefined,
+      });
+      showActionStatus({ kind: "success", message: `已发送唤醒包：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `唤醒失败：${message}` });
+    }
+  };
+
+  const handleRemotePowerAction = async (
+    deviceId: string,
+    deviceName: string,
+    action: "restart" | "shutdown"
+  ) => {
+    setContextMenu(null);
+    setSubmenuOpen(null);
+    const actionLabel = action === "restart" ? "重启" : "关机";
+    try {
+      await deviceActionService.requestRemoteDevicePowerAction({
+        deviceId,
+        action,
+      });
+      showActionStatus({ kind: "success", message: `已请求远端${actionLabel}：${deviceName}` });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      showActionStatus({ kind: "error", message: `远端${actionLabel}失败：${message}` });
+    }
+  };
+
   // 菜单项定义（用于非二级菜单渲染）
   const getTopLevelMenuItems = () => {
     const items: DeviceMenuItem[] = [];
@@ -235,11 +462,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     }
 
     // 在线设备特有菜单
-    if (isContextOnline) {
+    if (isContextOnline && !isContextDisabled) {
       items.push(
         { icon: Play, label: "远程桌面", action: () => { navigate(`/devices/${activeContextMenu.deviceId}`); setContextMenu(null); } },
-        { icon: FolderIcon, label: "文件传输", disabled: true, title: unsupportedDeviceActionTitle },
-        { icon: Terminal, label: "远程终端", disabled: true, title: unsupportedDeviceActionTitle },
+        {
+          icon: FolderIcon,
+          label: "文件传输",
+          action: () => handleOpenDeviceTab(activeContextMenu.deviceId, "files"),
+        },
+        {
+          icon: Terminal,
+          label: "远程终端",
+          action: () => handleOpenDeviceTab(activeContextMenu.deviceId, "terminal"),
+        },
         { type: "divider" as const }
       );
     }
@@ -255,7 +490,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           }
         },
       },
-      { icon: Star, label: "收藏设备", disabled: true, title: unsupportedDeviceActionTitle },
+      {
+        icon: Star,
+        label: contextMenuDevice?.favorite ? "取消收藏" : "收藏设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleToggleFavorite(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              !contextMenuDevice.favorite
+            );
+          }
+        },
+      },
       {
         icon: Copy,
         label: "复制 ID",
@@ -271,15 +518,25 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     // 启用/禁用
     items.push({
       icon: Ban,
-      label: "禁用设备",
-      disabled: true,
-      title: unsupportedDeviceActionTitle,
+      label: contextMenuDevice?.disabled ? "解除禁用" : "禁用设备",
+      action: () => {
+        if (contextMenuDevice) {
+          return handleToggleDisabled(
+            contextMenuDevice.deviceId,
+            contextMenuDevice.name,
+            !contextMenuDevice.disabled,
+            contextMenuDevice.isLocal
+          );
+        }
+      },
+      disabled: contextMenuDevice?.isLocal,
+      title: contextMenuDevice?.isLocal ? "不能禁用本机设备" : undefined,
     });
 
     items.push({ type: "divider" as const });
 
     // 在线设备特有菜单
-    if (isContextOnline) {
+    if (isContextOnline && !isContextDisabled) {
       items.push(
         {
           icon: LogOut,
@@ -292,26 +549,140 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           disabled: !isLoggedIn || !user,
           title: !isLoggedIn || !user ? "请先登录后再退出绑定" : undefined,
         },
-        { icon: Power, label: "断开连接", disabled: true, title: unsupportedDeviceActionTitle, danger: true }
+        {
+          icon: Power,
+          label: "断开连接",
+          action: () => {
+            if (contextMenuDevice && contextActiveSession) {
+              return handleDisconnectDevice(
+                contextActiveSession.session_id,
+                contextMenuDevice.name
+              );
+            }
+          },
+          disabled: !contextActiveSession || !isContextRemoteActionAvailable,
+          title: !isContextRemoteActionAvailable
+            ? isContextDisabled
+              ? "设备已禁用"
+              : contextMenuDevice?.isLocal
+                ? "不能断开本机设备"
+                : "设备离线"
+            : contextActiveSession
+              ? undefined
+              : "没有可断开的活跃会话",
+          danger: true,
+        }
       );
     }
 
     // 移除设备和管理子菜单
     items.push(
-      { icon: Trash2, label: "移除设备", disabled: true, title: unsupportedDeviceActionTitle, danger: true },
-      { icon: Settings, label: "管理", submenu: "management", title: unsupportedDeviceActionTitle }
+      {
+        icon: Trash2,
+        label: "移除设备",
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemoveDevice(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              contextMenuDevice.isLocal
+            );
+          }
+        },
+        disabled: contextMenuDevice?.isLocal,
+        title: contextMenuDevice?.isLocal ? "不能移除本机设备" : undefined,
+        danger: true,
+      },
+      { icon: Settings, label: "管理", submenu: "management" }
     );
 
     return items;
   };
 
   // 管理子菜单项
-  const getManagementSubmenuItems = () => [
-    { icon: RotateCw, label: "重启", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Power, label: "关机", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Zap, label: "Wake-on-LAN", disabled: true, title: unsupportedDeviceActionTitle },
-    { icon: Info, label: "设备信息", disabled: true, title: unsupportedDeviceActionTitle },
-  ];
+  const getManagementSubmenuItems = () => {
+    const canWakeOnLan =
+      Boolean(contextMenuDevice?.macAddress) &&
+      contextMenuDevice?.status === "offline" &&
+      !contextMenuDevice?.disabled &&
+      !contextMenuDevice?.isLocal;
+    const wakeDisabledReason = contextMenuDevice?.isLocal
+      ? "不能唤醒本机设备"
+      : contextMenuDevice?.disabled
+        ? "设备已禁用"
+      : contextMenuDevice?.status === "online"
+        ? "设备当前在线"
+        : contextMenuDevice?.macAddress
+          ? undefined
+          : "缺少设备 MAC 地址";
+    const remotePowerDisabledReason = isContextDisabled
+      ? "设备已禁用"
+      : !isContextOnline
+        ? "设备离线"
+        : contextMenuDevice?.isLocal
+          ? "不能远端控制本机电源"
+          : peerRemotePowerUnavailableReason ?? remotePowerUnavailableReason ?? undefined;
+    const remotePowerDisabled =
+      !isContextRemoteActionAvailable ||
+      Boolean(peerRemotePowerUnavailableReason ?? remotePowerUnavailableReason);
+
+    return [
+      {
+        icon: RotateCw,
+        label: "重启",
+        disabled: remotePowerDisabled,
+        title: remotePowerDisabledReason,
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemotePowerAction(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              "restart"
+            );
+          }
+        },
+      },
+      {
+        icon: Power,
+        label: "关机",
+        disabled: remotePowerDisabled,
+        title: remotePowerDisabledReason,
+        action: () => {
+          if (contextMenuDevice) {
+            return handleRemotePowerAction(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              "shutdown"
+            );
+          }
+        },
+      },
+      {
+        icon: Zap,
+        label: "Wake-on-LAN",
+        disabled: !canWakeOnLan,
+        title: wakeDisabledReason,
+        action: () => {
+          if (contextMenuDevice?.macAddress) {
+            return handleWakeOnLan(
+              contextMenuDevice.deviceId,
+              contextMenuDevice.name,
+              contextMenuDevice.macAddress
+            );
+          }
+        },
+      },
+      {
+        icon: Info,
+        label: "设备信息",
+        action: () => {
+          if (contextMenuDevice) {
+            handleOpenDeviceTab(contextMenuDevice.deviceId, "info");
+          }
+        },
+      },
+    ];
+  };
 
   return (
     <aside
@@ -399,6 +770,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                 <RefreshCw style={{ width: 14, height: 14 }} />
               </button>
               <button
+                onClick={onOpenConnections}
                 className={`p-0.5 rounded transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"}`}
                 title="添加设备"
               >
@@ -593,6 +965,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
               <button
                 key={device.id}
                 onClick={() => navigate(`/devices/${device.id}`)}
+                onContextMenu={(e) => handleContextMenu(e, device.id)}
                 className={`w-full flex items-center justify-center p-2 rounded-md transition-all relative ${
                   isActive ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "hover:bg-gray-800" : "hover:bg-gray-50")
                 }`}
@@ -691,6 +1064,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                           key={subIndex}
                           disabled={subItem.disabled}
                           title={subItem.title}
+                          onClick={() => { if (subItem.action) void subItem.action(); }}
                           className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
                             subItem.disabled
                               ? isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-400 cursor-not-allowed"

@@ -133,6 +133,8 @@ describe('Tauri Adapter Contract', () => {
           chroma_subsampling: '4:2:0',
           pixel_format: 'nv12',
           hdr_enabled: false,
+          color_mode: 'grayscale',
+          color_pipeline: 'sdr8',
         },
       });
 
@@ -151,6 +153,8 @@ describe('Tauri Adapter Contract', () => {
         profileChromaSubsampling: '4:2:0',
         profilePixelFormat: 'nv12',
         profileHdrEnabled: false,
+        profileColorMode: 'grayscale',
+        profileColorPipeline: 'sdr8',
       });
     });
 
@@ -363,6 +367,68 @@ describe('Tauri Adapter Contract', () => {
       expect(mockInvoke).toHaveBeenNthCalledWith(1, 'ipc_lan_discovery_snapshot', undefined);
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'ipc_refresh_lan_discovery', undefined);
     });
+
+    it('ipc_wake_on_lan calls correct command with device and MAC arguments', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        device_id: 'agent-device',
+        mac_address: 'AA:BB:CC:DD:EE:FF',
+        broadcast_addr: '192.168.1.255:9',
+        packet_bytes: 102,
+      });
+
+      const result = await adapter.ipcWakeOnLan({
+        deviceId: 'agent-device',
+        macAddress: 'AA:BB:CC:DD:EE:FF',
+        broadcastAddr: '192.168.1.255:9',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_wake_on_lan', {
+        deviceId: 'agent-device',
+        macAddress: 'AA:BB:CC:DD:EE:FF',
+        broadcastAddr: '192.168.1.255:9',
+      });
+      expect(result.ok).toBe(true);
+    });
+
+    it('ipc_request_remote_device_power_action calls correct command with args', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        device_id: 'agent-device',
+        action: 'restart',
+      });
+
+      const result = await adapter.ipcRequestRemoteDevicePowerAction({
+        deviceId: 'agent-device',
+        action: 'restart',
+      });
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_request_remote_device_power_action', {
+        deviceId: 'agent-device',
+        action: 'restart',
+      });
+      expect(result.ok).toBe(true);
+    });
+
+    it('ipc_peer_capability_snapshot calls correct command with peer device id', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        schema_version: 1,
+        platform: 'windows',
+        service_version: 'peer',
+        capabilities: [],
+        constraints: [],
+        profiles: [],
+        updated_at_ms: 0,
+      });
+
+      const result = await adapter.ipcPeerCapabilitySnapshot('agent-device');
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_peer_capability_snapshot', {
+        peerDeviceId: 'agent-device',
+      });
+      expect(result.ok).toBe(true);
+    });
   });
 
   /**
@@ -430,6 +496,37 @@ describe('Tauri Adapter Contract', () => {
         bitrate_mbps: 20,
         codec: 'h264',
       };
+      mockInvoke.mockResolvedValue({
+        requested: requestedProfile,
+        selected: requestedProfile,
+        status: 'accepted',
+        reason: null,
+      });
+
+      await adapter.ipcUpdateMediaProfile('session-123', requestedProfile);
+
+      expect(mockInvoke).toHaveBeenCalledWith('ipc_update_media_profile', {
+        sessionId: 'session-123',
+        requestedProfile,
+      });
+    });
+
+    it('ipc_update_media_profile preserves extended color and HDR fields', async () => {
+      const mockInvoke = getMockInvoke();
+      const requestedProfile = {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 80,
+        codec: 'hevc',
+        codec_profile: 'main10',
+        bit_depth: 10,
+        chroma_subsampling: '4:2:0',
+        pixel_format: 'p010',
+        hdr_enabled: true,
+        color_mode: 'low_chroma',
+        color_pipeline: 'hdr_main10',
+      } as const;
       mockInvoke.mockResolvedValue({
         requested: requestedProfile,
         selected: requestedProfile,

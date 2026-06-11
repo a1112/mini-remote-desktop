@@ -79,6 +79,13 @@ mod wire {
         AfterSessions,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteDevicePowerAction {
+        Restart,
+        Shutdown,
+    }
+
     /// Shell/service status snapshot
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ShellStatusSnapshot {
@@ -113,6 +120,12 @@ mod wire {
         /// Whether HDR is expected for this media profile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hdr_enabled: Option<bool>,
+        /// Optional color transform requested before encode, for example `full` or `grayscale`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_mode: Option<String>,
+        /// Optional media color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_pipeline: Option<String>,
     }
 
     impl Default for MediaProfile {
@@ -128,6 +141,8 @@ mod wire {
                 chroma_subsampling: None,
                 pixel_format: None,
                 hdr_enabled: None,
+                color_mode: None,
+                color_pipeline: None,
             }
         }
     }
@@ -326,6 +341,12 @@ mod wire {
         /// Whether HDR metadata is enabled for the active profile.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub active_hdr_enabled: Option<bool>,
+        /// Active color transform mode, for example `full`, `grayscale`, or `monochrome`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_color_mode: Option<String>,
+        /// Active color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_color_pipeline: Option<String>,
         /// Active negotiated width in pixels.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub active_width: Option<u32>,
@@ -413,6 +434,154 @@ mod wire {
         pub source: CaptureSource,
         pub status: String,
         pub reason: Option<String>,
+    }
+
+    /// File-system entry kind for service-owned file browsing.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileEntryKind {
+        File,
+        Directory,
+        Symlink,
+        Other,
+    }
+
+    /// File-system entry returned by a service-owned directory listing.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileEntry {
+        pub name: String,
+        pub path: String,
+        pub kind: FileEntryKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub size_bytes: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub modified_ms: Option<u64>,
+        pub readonly: bool,
+    }
+
+    /// Directory listing returned by the local service kernel.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DirectoryList {
+        pub path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub parent_path: Option<String>,
+        pub entries: Vec<FileEntry>,
+    }
+
+    /// Conflict policy for service-owned file transfer writes.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileTransferConflictPolicy {
+        Reject,
+        #[default]
+        Rename,
+        Replace,
+    }
+
+    fn default_file_transfer_provider_kind() -> String {
+        "mrd-local".to_string()
+    }
+
+    /// One source entry in a service-owned file transfer request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferEntry {
+        pub source_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub file_name: Option<String>,
+        pub kind: FileEntryKind,
+    }
+
+    /// Request to copy files through the local service runtime.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferStartRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_device_id: Option<DeviceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<DeviceId>,
+        pub entries: Vec<FileTransferEntry>,
+        pub target_path: String,
+        #[serde(default)]
+        pub conflict_policy: FileTransferConflictPolicy,
+        /// Reserved for future LAN/QUIC routing. The MVP executes `local`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub transport_hint: Option<String>,
+        /// Reserved provider preference for future external file engines, such as R-File.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub provider_hint: Option<String>,
+    }
+
+    /// Reserved external handoff metadata for a file transfer provider.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferProviderHandoffHint {
+        /// External application expected to own the feature path.
+        pub external_app: String,
+        /// External bridge service expected to receive the handoff.
+        pub bridge_service: String,
+        /// Optional control-plane endpoint hint for local discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub control_endpoint: Option<String>,
+        /// Optional data-plane endpoint hint for local discovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_endpoint: Option<String>,
+        /// External capability ids MRD reserves without executing directly.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+    }
+
+    /// One file transfer provider known by the local service.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferProviderDescriptor {
+        /// Stable provider id used by `FileTransferStartRequest.provider_hint`.
+        pub provider_kind: String,
+        /// Human-readable provider label.
+        pub display_name: String,
+        /// Runtime state of this provider.
+        pub status: CapabilityStatus,
+        /// Stable capability ids exposed by this provider.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub capabilities: Vec<String>,
+        /// Short explanation when the provider is not available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+        /// External handoff details for reserved providers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub handoff_hint: Option<FileTransferProviderHandoffHint>,
+    }
+
+    /// Service-owned file transfer lifecycle status.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileTransferStatus {
+        Queued,
+        Running,
+        Completed,
+        Failed,
+        Cancelled,
+    }
+
+    /// Snapshot of one service-owned file transfer task.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct FileTransferTaskSnapshot {
+        pub transfer_id: String,
+        pub status: FileTransferStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_device_id: Option<DeviceId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_device_id: Option<DeviceId>,
+        pub transport_kind: String,
+        #[serde(default = "default_file_transfer_provider_kind")]
+        pub provider_kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub provider_capabilities: Vec<String>,
+        pub total_entries: usize,
+        pub copied_entries: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub total_bytes: Option<u64>,
+        pub copied_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub entries: Vec<FileEntry>,
     }
 
     /// A display output mode that can be applied to a remote capture display.
@@ -616,6 +785,27 @@ mod wire {
         pub bitrate_mbps: u32,
         /// Requested codec, for example `h264`.
         pub codec: String,
+        /// Codec profile name, for example `main` or `main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub codec_profile: Option<String>,
+        /// Video bit depth. HEVC Main uses 8, HEVC Main10 uses 10.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bit_depth: Option<u8>,
+        /// Chroma subsampling label such as `4:2:0`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub chroma_subsampling: Option<String>,
+        /// Runtime pixel format associated with this profile, for example `nv12`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pixel_format: Option<String>,
+        /// Whether HDR is expected for this media profile.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hdr_enabled: Option<bool>,
+        /// Optional color transform requested before encode, for example `full` or `grayscale`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_mode: Option<String>,
+        /// Optional media color pipeline, for example `sdr8` or `hdr_main10`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color_pipeline: Option<String>,
         /// Optional latency budget in milliseconds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub latency_budget_ms: Option<u32>,
@@ -845,6 +1035,11 @@ mod wire {
             /// Wheel delta.
             delta: i32,
         },
+        /// Horizontal mouse wheel delta.
+        MouseHorizontalWheel {
+            /// Horizontal wheel delta.
+            delta: i32,
+        },
         /// Keyboard key transition.
         Key {
             /// Key id.
@@ -1010,10 +1205,52 @@ mod wire {
         },
         /// List available devices
         ListDevices,
+        /// List service-owned device preferences.
+        GetDevicePreferences,
+        /// Update service-owned preference flags for one device.
+        UpdateDevicePreference {
+            /// Target device id.
+            device_id: DeviceId,
+            /// Partial preference update.
+            update: DevicePreferenceUpdate,
+        },
         /// Get the current LAN peer discovery snapshot.
         LanDiscoverySnapshot,
         /// Send an immediate LAN discovery probe and return the current snapshot.
         RefreshLanDiscovery,
+        /// List files/directories from the local service host.
+        ListDirectory {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            path: Option<String>,
+        },
+        /// Start a local-service-owned file transfer task.
+        StartFileTransfer {
+            /// File transfer request.
+            request: FileTransferStartRequest,
+        },
+        /// List service-owned file transfer task snapshots.
+        ListFileTransfers,
+        /// List available and reserved file transfer providers.
+        ListFileTransferProviders,
+        /// Cancel a service-owned file transfer task when it is still active.
+        CancelFileTransfer {
+            /// Transfer id returned by `StartFileTransfer`.
+            transfer_id: String,
+        },
+        /// Send a Wake-on-LAN magic packet for a known device MAC address.
+        WakeOnLan {
+            /// Peer device id associated with the wake request.
+            device_id: DeviceId,
+            /// Target MAC address, for example `AA:BB:CC:DD:EE:FF`.
+            mac_address: String,
+            /// Optional UDP broadcast endpoint, defaults to `255.255.255.255:9`.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            broadcast_addr: Option<String>,
+        },
+        RequestRemoteDevicePowerAction {
+            device_id: DeviceId,
+            action: RemoteDevicePowerAction,
+        },
         /// List all active sessions
         ListSessions,
         /// Start a new session as controller
@@ -1220,10 +1457,35 @@ mod wire {
         DeviceRegistered { device_id: DeviceId },
         /// List of available devices
         DeviceList { devices: Vec<DeviceInfo> },
+        /// Service-owned preference flags for known devices.
+        DevicePreferences {
+            /// Current preference records.
+            preferences: Vec<DevicePreference>,
+        },
+        /// Updated service-owned preference for one device.
+        DevicePreferenceUpdated {
+            /// Preference after applying the update.
+            preference: DevicePreference,
+        },
         /// LAN peer discovery snapshot.
         LanDiscoverySnapshot {
             /// Current discovery state.
             snapshot: LanDiscoverySnapshot,
+        },
+        /// Wake-on-LAN magic packet was sent.
+        WakeOnLanSent {
+            /// Peer device id associated with the wake request.
+            device_id: DeviceId,
+            /// Normalized target MAC address.
+            mac_address: String,
+            /// UDP endpoint used for the magic packet.
+            broadcast_addr: String,
+            /// Number of bytes in the magic packet payload.
+            packet_bytes: usize,
+        },
+        RemoteDevicePowerActionAccepted {
+            device_id: DeviceId,
+            action: RemoteDevicePowerAction,
         },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },
@@ -1267,6 +1529,28 @@ mod wire {
         DisplayModeList {
             session_id: SessionId,
             modes: Vec<DisplayMode>,
+        },
+        /// Directory listing returned by the local service host.
+        DirectoryList { listing: DirectoryList },
+        /// File transfer task accepted or completed by the local service host.
+        FileTransferStarted {
+            /// Current transfer snapshot.
+            transfer: FileTransferTaskSnapshot,
+        },
+        /// File transfer task snapshots known by the local service host.
+        FileTransferList {
+            /// Ordered transfer snapshots.
+            transfers: Vec<FileTransferTaskSnapshot>,
+        },
+        /// File transfer providers known by the local service host.
+        FileTransferProviderList {
+            /// Ordered provider descriptors.
+            providers: Vec<FileTransferProviderDescriptor>,
+        },
+        /// File transfer cancellation result.
+        FileTransferCancelled {
+            /// Current transfer snapshot.
+            transfer: FileTransferTaskSnapshot,
         },
         /// Display mode change or restore result.
         DisplayModeChanged {
@@ -1381,6 +1665,33 @@ mod wire {
         pub is_online: bool,
     }
 
+    /// Service-owned preference flags for one device.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct DevicePreference {
+        /// Device id the preference applies to.
+        pub device_id: DeviceId,
+        /// Whether the device should be surfaced as a favorite.
+        pub favorite: bool,
+        /// Whether user actions should be blocked for this device.
+        pub disabled: bool,
+        /// Whether the device should be hidden from normal device lists.
+        pub removed: bool,
+    }
+
+    /// Partial service-owned device preference update.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    pub struct DevicePreferenceUpdate {
+        /// New favorite flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub favorite: Option<bool>,
+        /// New disabled flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub disabled: Option<bool>,
+        /// New removed flag when present.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub removed: Option<bool>,
+    }
+
     /// Discovered LAN peer information.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct LanPeerInfo {
@@ -1409,6 +1720,9 @@ mod wire {
         /// Structured media capabilities advertised by the peer.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub media_capabilities: Vec<String>,
+        /// Optional MAC address advertised by the peer for Wake-on-LAN flows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mac_address: Option<String>,
         /// Milliseconds since this peer was last observed.
         pub age_ms: u64,
         /// Whether this peer was discovered through the local P2P LAN path.
@@ -1444,6 +1758,9 @@ mod wire {
         pub sender_active: bool,
         /// Whether the media receiver is currently marked active.
         pub receiver_active: bool,
+        /// Peer device associated with this session, from the controller or agent perspective.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub peer_device_id: Option<DeviceId>,
     }
 
     /// Session runtime snapshot DTO (stable IPC contract)
@@ -1459,6 +1776,9 @@ mod wire {
         /// Media pipeline state
         pub sender_active: bool,
         pub receiver_active: bool,
+        /// Peer device associated with this session, from the controller or agent perspective.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub peer_device_id: Option<DeviceId>,
     }
 
     /// Session bootstrap metadata
@@ -1608,14 +1928,75 @@ mod tests {
             chroma_subsampling: Some("4:2:0".to_string()),
             pixel_format: Some("nv12".to_string()),
             hdr_enabled: Some(false),
+            color_mode: Some("grayscale".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
         };
 
         let encoded = serde_json::to_string(&profile).unwrap();
         assert!(encoded.contains("\"codec\":\"hevc\""));
         assert!(encoded.contains("\"chroma_subsampling\":\"4:2:0\""));
         assert!(encoded.contains("\"hdr_enabled\":false"));
+        assert!(encoded.contains("\"color_mode\":\"grayscale\""));
+        assert!(encoded.contains("\"color_pipeline\":\"sdr8\""));
 
         let decoded: MediaProfile = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn wake_on_lan_request_and_response_are_stable_ipc_messages() {
+        let request = IpcRequest::WakeOnLan {
+            device_id: DeviceId("agent-device".to_string()),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_addr: Some("192.168.1.255:9".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("WakeOnLan"));
+        assert!(encoded.contains("\"mac_address\":\"AA:BB:CC:DD:EE:FF\""));
+        assert!(encoded.contains("\"broadcast_addr\":\"192.168.1.255:9\""));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = IpcResponse::WakeOnLanSent {
+            device_id: DeviceId("agent-device".to_string()),
+            mac_address: "AA:BB:CC:DD:EE:FF".to_string(),
+            broadcast_addr: "192.168.1.255:9".to_string(),
+            packet_bytes: 102,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("WakeOnLanSent"));
+        assert!(encoded.contains("\"packet_bytes\":102"));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn remote_device_power_request_is_a_stable_ipc_message() {
+        let request = IpcRequest::RequestRemoteDevicePowerAction {
+            device_id: DeviceId("agent-device".to_string()),
+            action: RemoteDevicePowerAction::Restart,
+        };
+
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("RequestRemoteDevicePowerAction"));
+        assert!(encoded.contains("\"device_id\":\"agent-device\""));
+        assert!(encoded.contains("\"action\":\"restart\""));
+
+        let decoded: IpcRequest = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, request);
+
+        let response = IpcResponse::RemoteDevicePowerActionAccepted {
+            device_id: DeviceId("agent-device".to_string()),
+            action: RemoteDevicePowerAction::Shutdown,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(encoded.contains("RemoteDevicePowerActionAccepted"));
+        assert!(encoded.contains("\"action\":\"shutdown\""));
+
+        let decoded: IpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, response);
     }
 }

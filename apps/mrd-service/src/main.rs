@@ -22,6 +22,7 @@ mod lan_discovery;
 mod media_adaptation;
 mod resource_monitor;
 mod shell;
+mod wake_on_lan;
 mod web_bridge;
 
 use anyhow::Result;

@@ -21,6 +21,7 @@ pub enum InputEvent {
     MouseMove { x: i32, y: i32 },
     MouseButton { button: InputButton, pressed: bool },
     MouseWheel { delta: i32 },
+    MouseHorizontalWheel { delta: i32 },
     Key { key: InputKey, pressed: bool },
 }
 
@@ -183,7 +184,9 @@ impl<I: InputInjector> TrackedInputInjector<I> {
                     self.active_keys.retain(|active| *active != key);
                 }
             }
-            InputEvent::MouseMove { .. } | InputEvent::MouseWheel { .. } => {}
+            InputEvent::MouseMove { .. }
+            | InputEvent::MouseWheel { .. }
+            | InputEvent::MouseHorizontalWheel { .. } => {}
         }
     }
 }
@@ -216,6 +219,7 @@ mod tests {
         let events = [
             InputEvent::MouseMove { x: 10, y: 20 },
             InputEvent::MouseWheel { delta: -120 },
+            InputEvent::MouseHorizontalWheel { delta: 120 },
             InputEvent::MouseButton {
                 button: InputButton::Left,
                 pressed: true,

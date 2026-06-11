@@ -317,6 +317,161 @@ describe("TransportTestPage execution targets", () => {
     });
   });
 
+  it("does not select macOS VideoToolbox HEVC when non-full color lacks peer color capability", () => {
+    const peer = {
+      device_id: "mac-agent",
+      device_name: "Mac Agent",
+      device_type: "desktop",
+      ip: "192.168.1.52",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.52:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      media_protocol_version: 3,
+      media_capabilities: [
+        "macos_capture",
+        "videotoolbox_hevc",
+        "decode.videotoolbox_hevc",
+        "media.hevc_main_420_8bit",
+        "macos_native_render",
+      ],
+      age_ms: 40,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDeviceConfigForPeer(
+        peer,
+        {
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+          color_mode: "grayscale",
+          color_pipeline: "sdr8",
+        },
+        "quic"
+      )
+    ).not.toMatchObject({
+      capture_type: "macos",
+      encoder_type: "videotoolbox_hevc",
+      decoder_type: "videotoolbox",
+    });
+    expect(
+      crossDeviceConfigForPeer(
+        peer,
+        {
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main",
+          bit_depth: 8,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "nv12",
+          hdr_enabled: false,
+          color_mode: "grayscale",
+          color_pipeline: "sdr8",
+        },
+        "quic"
+      )
+    ).toMatchObject({
+      color_mode: "grayscale",
+      color_pipeline: "sdr8",
+    });
+  });
+
+  it("does not select macOS VideoToolbox HEVC when Main10 lacks peer media capability", () => {
+    const peer = {
+      device_id: "mac-agent",
+      device_name: "Mac Agent",
+      device_type: "desktop",
+      ip: "192.168.1.52",
+      discovery_port: 21116,
+      p2p_control_addr: "192.168.1.52:21116",
+      transports: [
+        "quic",
+        "quic_datagram",
+        "quic_datagram_2k144",
+        "quic_datagram_media_v3",
+        "media_profile_control_v1",
+      ],
+      protocol_version: 1,
+      media_protocol_version: 3,
+      media_capabilities: [
+        "macos_capture",
+        "videotoolbox_hevc",
+        "decode.videotoolbox_hevc",
+        "media.hevc_main_420_8bit",
+        "macos_native_render",
+      ],
+      age_ms: 40,
+      p2p_available: true,
+    };
+
+    expect(
+      crossDeviceConfigForPeer(
+        peer,
+        {
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main10",
+          bit_depth: 10,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "p010",
+          hdr_enabled: true,
+          color_mode: "full",
+          color_pipeline: "hdr_main10",
+        },
+        "quic"
+      )
+    ).not.toMatchObject({
+      capture_type: "macos",
+      encoder_type: "videotoolbox_hevc",
+      decoder_type: "videotoolbox",
+    });
+    expect(
+      crossDeviceConfigForPeer(
+        peer,
+        {
+          width: 1280,
+          height: 720,
+          fps: 30,
+          bitrate_mbps: 20,
+          codec: "hevc",
+          codec_profile: "main10",
+          bit_depth: 10,
+          chroma_subsampling: "4:2:0",
+          pixel_format: "p010",
+          hdr_enabled: true,
+          color_mode: "full",
+          color_pipeline: "hdr_main10",
+        },
+        "quic"
+      )
+    ).toMatchObject({
+      encoder_type: "nvenc_hevc_main10",
+      color_mode: "full",
+      color_pipeline: "hdr_main10",
+    });
+  });
+
   it("runs a cross-device transport test against the selected discovered peer", async () => {
     const mockInvoke = getMockInvoke();
     const peer = {
@@ -534,6 +689,8 @@ describe("TransportTestPage execution targets", () => {
             chroma_subsampling: "4:2:0",
             pixel_format: "nv12",
             hdr_enabled: false,
+            color_mode: "full",
+            color_pipeline: "sdr8",
           },
         })
       );

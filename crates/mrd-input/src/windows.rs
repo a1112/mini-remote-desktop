@@ -22,6 +22,9 @@ pub enum WindowsInputCommand {
     MouseWheel {
         delta: i32,
     },
+    MouseHorizontalWheel {
+        delta: i32,
+    },
     Key {
         virtual_key: u16,
         pressed: bool,
@@ -59,6 +62,9 @@ pub fn map_windows_input(event: &InputEvent) -> Result<WindowsInputCommand, Inpu
     match *event {
         InputEvent::MouseMove { x, y } => Ok(WindowsInputCommand::MouseMove { x, y }),
         InputEvent::MouseWheel { delta } => Ok(WindowsInputCommand::MouseWheel { delta }),
+        InputEvent::MouseHorizontalWheel { delta } => {
+            Ok(WindowsInputCommand::MouseHorizontalWheel { delta })
+        }
         InputEvent::MouseButton { button, pressed } => Ok(WindowsInputCommand::MouseButton {
             button: map_mouse_button(button)?,
             pressed,
@@ -98,6 +104,9 @@ fn send_windows_input(command: WindowsInputCommand) -> Result<(), InputError> {
             send_input(mouse_button_input(button, pressed))
         }
         WindowsInputCommand::MouseWheel { delta } => send_input(mouse_wheel_input(delta)),
+        WindowsInputCommand::MouseHorizontalWheel { delta } => {
+            send_input(mouse_horizontal_wheel_input(delta))
+        }
         WindowsInputCommand::Key {
             virtual_key,
             pressed,
@@ -234,6 +243,28 @@ fn mouse_wheel_input(delta: i32) -> ::windows::Win32::UI::Input::KeyboardAndMous
     }
 }
 
+fn mouse_horizontal_wheel_input(
+    delta: i32,
+) -> ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_HWHEEL, MOUSEINPUT,
+    };
+
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: delta as u32,
+                dwFlags: MOUSEEVENTF_HWHEEL,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
 fn key_input(
     virtual_key: u16,
     pressed: bool,
@@ -329,10 +360,64 @@ mod tests {
     }
 
     #[test]
+    fn windows_mapping_extended_mouse_buttons_preserves_button_and_pressed_state() {
+        let cases = [
+            (
+                InputEvent::MouseButton {
+                    button: InputButton::Other(1),
+                    pressed: true,
+                },
+                WindowsInputCommand::MouseButton {
+                    button: WindowsMouseButton::X1,
+                    pressed: true,
+                },
+            ),
+            (
+                InputEvent::MouseButton {
+                    button: InputButton::Other(2),
+                    pressed: false,
+                },
+                WindowsInputCommand::MouseButton {
+                    button: WindowsMouseButton::X2,
+                    pressed: false,
+                },
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                map_windows_input(&event).expect("map extended button"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn windows_mapping_rejects_unsupported_extended_mouse_buttons() {
+        assert_eq!(
+            map_windows_input(&InputEvent::MouseButton {
+                button: InputButton::Other(3),
+                pressed: true,
+            })
+            .expect_err("unsupported extended button should be invalid"),
+            InputError::InvalidEvent("unsupported mouse button 3".to_string())
+        );
+    }
+
+    #[test]
     fn windows_mapping_wheel_delta_is_preserved() {
         assert_eq!(
             map_windows_input(&InputEvent::MouseWheel { delta: -240 }).expect("map wheel"),
             WindowsInputCommand::MouseWheel { delta: -240 }
+        );
+    }
+
+    #[test]
+    fn windows_mapping_horizontal_wheel_delta_is_preserved() {
+        assert_eq!(
+            map_windows_input(&InputEvent::MouseHorizontalWheel { delta: 120 })
+                .expect("map horizontal wheel"),
+            WindowsInputCommand::MouseHorizontalWheel { delta: 120 }
         );
     }
 

@@ -13,8 +13,13 @@ import type {
   AdapterResult,
   ClientDiagnostics,
   DeviceInfo,
+  DevicePreference,
+  DevicePreferenceUpdate,
   LanDiscoverySnapshot,
   DeviceRegistrationResponse,
+  RemoteDevicePowerAction,
+  RemoteDevicePowerActionAccepted,
+  WakeOnLanSent,
   DecodePolicy,
   DecodePolicyResponse,
   AppSettings,
@@ -39,6 +44,10 @@ import type {
   ControlInputEvent,
   CrossE2EFaultInjectionResult,
   CrossE2EFaultType,
+  DirectoryList,
+  FileTransferProviderDescriptor,
+  FileTransferStartRequest,
+  FileTransferTaskSnapshot,
   AdaptiveMediaConfig,
   MediaAdaptationSnapshot,
   MediaProfile,
@@ -62,6 +71,7 @@ import type {
   CaptureShareSourceTarget,
   RemoteDisplayWindowContext,
   NativeSurfaceRect,
+  NativeSurfaceControlFrameSize,
   NativeRenderSurfaceSnapshot,
   BrowserWebrtcPreviewAnswer,
   TestMatrixConfig,
@@ -296,6 +306,8 @@ function remoteDisplayProfileArgs(profile?: MediaProfile | null) {
     profileChromaSubsampling: profile.chroma_subsampling ?? null,
     profilePixelFormat: profile.pixel_format ?? null,
     profileHdrEnabled: profile.hdr_enabled ?? null,
+    profileColorMode: profile.color_mode ?? null,
+    profileColorPipeline: profile.color_pipeline ?? null,
   };
 }
 
@@ -328,6 +340,7 @@ export async function configureRemoteDisplayNativeSurface(params: {
   rect: NativeSurfaceRect;
   enabled: boolean;
   visible?: boolean;
+  controlFrameSize?: NativeSurfaceControlFrameSize;
 }): Promise<AdapterResult<NativeRenderSurfaceSnapshot>> {
   return invokeAdapter<NativeRenderSurfaceSnapshot>(
     'configure_remote_display_native_surface',
@@ -553,6 +566,34 @@ export async function ipcListDevices(): Promise<AdapterResult<DeviceInfo[]>> {
   return invokeAdapter<DeviceInfo[]>('ipc_list_devices');
 }
 
+export async function ipcGetDevicePreferences(): Promise<AdapterResult<DevicePreference[]>> {
+  return invokeBridgeOrTauri<DevicePreference[]>(
+    'ipc_get_device_preferences',
+    undefined,
+    { type: 'GetDevicePreferences' },
+    responseField<DevicePreference[]>('preferences')
+  );
+}
+
+export async function ipcUpdateDevicePreference(
+  deviceId: string,
+  update: DevicePreferenceUpdate
+): Promise<AdapterResult<DevicePreference>> {
+  return invokeBridgeOrTauri<DevicePreference>(
+    'ipc_update_device_preference',
+    {
+      deviceId,
+      update,
+    },
+    {
+      type: 'UpdateDevicePreference',
+      device_id: deviceId,
+      update,
+    },
+    responseField<DevicePreference>('preference')
+  );
+}
+
 /**
  * Get LAN P2P discovery snapshot via IPC.
  */
@@ -574,6 +615,117 @@ export async function ipcRefreshLanDiscovery(): Promise<AdapterResult<LanDiscove
     undefined,
     { type: 'RefreshLanDiscovery' },
     responseField<LanDiscoverySnapshot>('snapshot')
+  );
+}
+
+export async function ipcListDirectory(path?: string | null): Promise<AdapterResult<DirectoryList>> {
+  return invokeBridgeOrTauri<DirectoryList>(
+    'ipc_list_directory',
+    {
+      path: path ?? null,
+    },
+    {
+      type: 'ListDirectory',
+      path: path ?? null,
+    },
+    responseField<DirectoryList>('listing')
+  );
+}
+
+export async function ipcStartFileTransfer(
+  request: FileTransferStartRequest
+): Promise<AdapterResult<FileTransferTaskSnapshot>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot>(
+    'ipc_start_file_transfer',
+    { request },
+    {
+      type: 'StartFileTransfer',
+      request,
+    },
+    responseField<FileTransferTaskSnapshot>('transfer')
+  );
+}
+
+export async function ipcListFileTransfers(): Promise<AdapterResult<FileTransferTaskSnapshot[]>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot[]>(
+    'ipc_list_file_transfers',
+    undefined,
+    { type: 'ListFileTransfers' },
+    responseField<FileTransferTaskSnapshot[]>('transfers')
+  );
+}
+
+export async function ipcListFileTransferProviders(): Promise<
+  AdapterResult<FileTransferProviderDescriptor[]>
+> {
+  return invokeBridgeOrTauri<FileTransferProviderDescriptor[]>(
+    'ipc_list_file_transfer_providers',
+    undefined,
+    { type: 'ListFileTransferProviders' },
+    responseField<FileTransferProviderDescriptor[]>('providers')
+  );
+}
+
+export async function ipcCancelFileTransfer(
+  transferId: string
+): Promise<AdapterResult<FileTransferTaskSnapshot>> {
+  return invokeBridgeOrTauri<FileTransferTaskSnapshot>(
+    'ipc_cancel_file_transfer',
+    { transferId },
+    {
+      type: 'CancelFileTransfer',
+      transfer_id: transferId,
+    },
+    responseField<FileTransferTaskSnapshot>('transfer')
+  );
+}
+
+export async function ipcWakeOnLan(params: {
+  deviceId: string;
+  macAddress: string;
+  broadcastAddr?: string | null;
+}): Promise<AdapterResult<WakeOnLanSent>> {
+  return invokeBridgeOrTauri<WakeOnLanSent>(
+    'ipc_wake_on_lan',
+    {
+      deviceId: params.deviceId,
+      macAddress: params.macAddress,
+      broadcastAddr: params.broadcastAddr ?? null,
+    },
+    {
+      type: 'WakeOnLan',
+      device_id: params.deviceId,
+      mac_address: params.macAddress,
+      broadcast_addr: params.broadcastAddr ?? null,
+    },
+    (response) => ({
+      device_id: response.device_id as string,
+      mac_address: response.mac_address as string,
+      broadcast_addr: response.broadcast_addr as string,
+      packet_bytes: response.packet_bytes as number,
+    })
+  );
+}
+
+export async function ipcRequestRemoteDevicePowerAction(params: {
+  deviceId: string;
+  action: RemoteDevicePowerAction;
+}): Promise<AdapterResult<RemoteDevicePowerActionAccepted>> {
+  return invokeBridgeOrTauri<RemoteDevicePowerActionAccepted>(
+    'ipc_request_remote_device_power_action',
+    {
+      deviceId: params.deviceId,
+      action: params.action,
+    },
+    {
+      type: 'RequestRemoteDevicePowerAction',
+      device_id: params.deviceId,
+      action: params.action,
+    },
+    (response) => ({
+      device_id: response.device_id as string,
+      action: response.action as RemoteDevicePowerAction,
+    })
   );
 }
 
@@ -963,6 +1115,25 @@ export async function ipcCapabilitySnapshot(): Promise<AdapterResult<CapabilityS
     undefined,
     { type: 'CapabilitySnapshot' },
     responseField<CapabilitySnapshot>('snapshot')
+  );
+}
+
+/**
+ * Get a discovered peer capability snapshot from mrd-service.
+ */
+export async function ipcPeerCapabilitySnapshot(
+  peerDeviceId: string
+): Promise<AdapterResult<CapabilitySnapshot | null>> {
+  return invokeBridgeOrTauri<CapabilitySnapshot | null>(
+    'ipc_peer_capability_snapshot',
+    {
+      peerDeviceId,
+    },
+    {
+      type: 'GetPeerCapabilitySnapshot',
+      peer_device_id: peerDeviceId,
+    },
+    responseField<CapabilitySnapshot | null>('snapshot')
   );
 }
 

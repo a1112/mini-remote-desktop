@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use mrd_ipc::{IpcRequest, IpcResponse, ShutdownMode};
+use mrd_ipc::{IpcRequest, IpcResponse, RemoteDevicePowerAction, ShutdownMode};
 use mrd_service::{
     app_state::AppState,
     browser_webrtc_preview::sanitize_browser_preview_fps,
@@ -31,6 +31,23 @@ fn bridge_allows_only_browser_safe_ipc_requests() {
     assert!(is_ipc_request_allowed(&IpcRequest::RefreshLanDiscovery));
     assert!(is_ipc_request_allowed(&IpcRequest::ServiceHealth));
     assert!(is_ipc_request_allowed(&IpcRequest::GetShellStatus));
+    assert!(is_ipc_request_allowed(&IpcRequest::GetDevicePreferences));
+    assert!(is_ipc_request_allowed(
+        &IpcRequest::UpdateDevicePreference {
+            device_id: mrd_proto::DeviceId("agent-device".to_string()),
+            update: mrd_ipc::DevicePreferenceUpdate {
+                favorite: Some(true),
+                disabled: None,
+                removed: None,
+            },
+        }
+    ));
+    assert!(is_ipc_request_allowed(
+        &IpcRequest::RequestRemoteDevicePowerAction {
+            device_id: mrd_proto::DeviceId("agent-device".to_string()),
+            action: RemoteDevicePowerAction::Restart,
+        }
+    ));
 
     assert!(!is_ipc_request_allowed(&IpcRequest::ShutdownService {
         mode: ShutdownMode::Graceful

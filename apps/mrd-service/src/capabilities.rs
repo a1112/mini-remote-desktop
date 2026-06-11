@@ -9,6 +9,7 @@ use std::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
+const REMOTE_POWER_ACTIONS_ENABLED_ENV: &str = "MRD_ENABLE_REMOTE_POWER_ACTIONS";
 
 #[derive(Clone, Copy)]
 enum CapabilityProbeMode {
@@ -232,7 +233,13 @@ fn profile_to_media(profile: &CapabilityProfile) -> MediaProfile {
         fps: profile.fps,
         bitrate_mbps: profile.bitrate_mbps,
         codec: profile.codec.clone(),
-        ..MediaProfile::default()
+        codec_profile: profile.codec_profile.clone(),
+        bit_depth: profile.bit_depth,
+        chroma_subsampling: profile.chroma_subsampling.clone(),
+        pixel_format: profile.pixel_format.clone(),
+        hdr_enabled: profile.hdr_enabled,
+        color_mode: profile.color_mode.clone(),
+        color_pipeline: profile.color_pipeline.clone(),
     }
 }
 
@@ -543,7 +550,7 @@ fn add_encode_capabilities(
         Some(hevc_main10_reason.as_str()),
     );
 
-    let (av1_status, av1_reason) = nvenc_av1_status(platform);
+    let (av1_status, av1_reason) = nvenc_av1_status(platform, probe_mode);
     push_item(
         items,
         platform,
@@ -1287,16 +1294,41 @@ fn probe_nvenc_hevc_main10_status(platform: &CapabilityPlatform) -> (CapabilityS
     }
 }
 
-fn nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
-    if matches!(
-        platform,
-        CapabilityPlatform::Windows | CapabilityPlatform::Linux
-    ) {
-        (
-            CapabilityStatus::Unimplemented,
-            "NVENC AV1 is declared as a harness capability; service-owned runtime probe and LAN sender integration are not wired yet.".to_string(),
-        )
-    } else {
+fn nvenc_av1_status(
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return unsupported_nvenc_status("NVENC AV1");
+    }
+
+    match probe_mode {
+        CapabilityProbeMode::Static => static_windows_runtime_status("NVENC AV1"),
+        CapabilityProbeMode::Runtime => probe_nvenc_av1_status(platform),
+    }
+}
+
+fn probe_nvenc_av1_status(platform: &CapabilityPlatform) -> (CapabilityStatus, String) {
+    if !matches!(platform, CapabilityPlatform::Windows) {
+        return unsupported_nvenc_status("NVENC AV1");
+    }
+
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| {
+                classify_runtime_probe(
+                    "NVENC AV1",
+                    mrd_encode_nvenc_av1::NvencAv1Encoder::probe_av1_available()
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .clone()
+    }
+
+    #[cfg(not(windows))]
+    {
         unsupported_nvenc_status("NVENC AV1")
     }
 }
@@ -1609,6 +1641,44 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             Some("Input injection is currently implemented only for Windows SendInput."),
         );
     }
+    let (remote_power_status, remote_power_reason) =
+        remote_power_control_status_from_env_lookup(|key| std::env::var(key).ok());
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Control,
+        "control.remote_power",
+        "Remote restart and shutdown",
+        remote_power_status,
+        Some(remote_power_reason.as_str()),
+    );
+}
+
+fn remote_power_control_status_from_env_lookup<E>(env_lookup: E) -> (CapabilityStatus, String)
+where
+    E: Fn(&str) -> Option<String>,
+{
+    let enabled = matches!(
+        env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV)
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    );
+    if enabled {
+        (
+            CapabilityStatus::Available,
+            "Remote restart/shutdown executor is enabled for LAN peer control.".to_string(),
+        )
+    } else {
+        (
+            CapabilityStatus::Unsupported,
+            format!(
+                "Remote restart/shutdown executor is disabled. Set {REMOTE_POWER_ACTIONS_ENABLED_ENV}=1 on this peer to allow LAN remote power actions."
+            ),
+        )
+    }
 }
 
 fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -1658,6 +1728,24 @@ fn add_service_capabilities(
         "Autostart",
         "Autostart support is provided by platform shell adapters.",
     );
+    push_available(
+        items,
+        platform,
+        CapabilityDomain::Service,
+        "service.file_transfer.local",
+        "Local file transfer",
+    );
+    push_item(
+        items,
+        platform,
+        CapabilityDomain::Service,
+        "service.file_transfer.external_bridge",
+        "External file transfer bridge",
+        CapabilityStatus::Unimplemented,
+        Some(
+            "Reserved for R-File provider integration; MRD currently keeps service-owned local copy/list/cancel as the active path.",
+        ),
+    );
     if matches!(
         platform,
         CapabilityPlatform::Windows | CapabilityPlatform::Linux | CapabilityPlatform::Macos
@@ -1679,6 +1767,24 @@ fn add_service_capabilities(
             "HEVC Main 8-bit 4:2:0",
             status,
             Some(reason.as_str()),
+        );
+    }
+    if matches!(platform, CapabilityPlatform::Windows) {
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Service,
+            "media.hevc_main10_420_10bit",
+            "HEVC Main10 10-bit 4:2:0",
+            "LAN HEVC Main10 profile metadata; NVENC Main10 encode and Main10 decode probes still gate runtime use.",
+        );
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Service,
+            "media.color_mode_v1",
+            "GPU color mode transform",
+            "LAN color mode profile metadata and GPU-side transform contract for full, grayscale, monochrome, and low-chroma modes.",
         );
     }
     let (ffmpeg_status, ffmpeg_reason) = ffmpeg_tool_status(probe_mode);
@@ -1815,6 +1921,23 @@ fn default_profiles() -> Vec<CapabilityProfile> {
             ],
         ),
         profile(
+            "lan.2k144.main10",
+            2560,
+            1440,
+            144,
+            80,
+            "hevc",
+            vec![
+                "encode.nvenc_hevc_main10",
+                "decode.nvdec_hevc_main10",
+                "media.hevc_main10_420_10bit",
+                "render.d3d11",
+                "memory.d3d11_shared",
+                "transport.quic_datagram",
+                "transport.media_profile_control_v1",
+            ],
+        ),
+        profile(
             "lan.macos.2k144",
             2560,
             1440,
@@ -1907,6 +2030,7 @@ fn profile(
     codec: &str,
     required_capabilities: Vec<&str>,
 ) -> CapabilityProfile {
+    let metadata = default_profile_media_metadata(id, codec);
     CapabilityProfile {
         id: id.to_string(),
         width,
@@ -1914,6 +2038,13 @@ fn profile(
         fps,
         bitrate_mbps,
         codec: codec.to_string(),
+        codec_profile: metadata.codec_profile,
+        bit_depth: metadata.bit_depth,
+        chroma_subsampling: metadata.chroma_subsampling,
+        pixel_format: metadata.pixel_format,
+        hdr_enabled: metadata.hdr_enabled,
+        color_mode: metadata.color_mode,
+        color_pipeline: metadata.color_pipeline,
         latency_budget_ms: None,
         min_stable_fps_ratio: Some(0.8),
         max_drop_ratio: Some(0.02),
@@ -1921,6 +2052,62 @@ fn profile(
             .into_iter()
             .map(ToString::to_string)
             .collect(),
+    }
+}
+
+struct CapabilityProfileMediaMetadata {
+    codec_profile: Option<String>,
+    bit_depth: Option<u8>,
+    chroma_subsampling: Option<String>,
+    pixel_format: Option<String>,
+    hdr_enabled: Option<bool>,
+    color_mode: Option<String>,
+    color_pipeline: Option<String>,
+}
+
+fn default_profile_media_metadata(id: &str, codec: &str) -> CapabilityProfileMediaMetadata {
+    let normalized_codec = codec.trim().to_ascii_lowercase().replace('.', "");
+    let requests_main10 = id.to_ascii_lowercase().contains("main10");
+    if (normalized_codec == "hevc" || normalized_codec == "h265") && requests_main10 {
+        return CapabilityProfileMediaMetadata {
+            codec_profile: Some("main10".to_string()),
+            bit_depth: Some(10),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("p010".to_string()),
+            hdr_enabled: Some(true),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("hdr_main10".to_string()),
+        };
+    }
+
+    match normalized_codec.as_str() {
+        "hevc" | "h265" => CapabilityProfileMediaMetadata {
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
+        },
+        "h264" | "av1" => CapabilityProfileMediaMetadata {
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            color_mode: Some("full".to_string()),
+            color_pipeline: Some("sdr8".to_string()),
+        },
+        _ => CapabilityProfileMediaMetadata {
+            codec_profile: None,
+            bit_depth: None,
+            chroma_subsampling: None,
+            pixel_format: None,
+            hdr_enabled: None,
+            color_mode: None,
+            color_pipeline: None,
+        },
     }
 }
 
@@ -2145,6 +2332,60 @@ mod tests {
     }
 
     #[test]
+    fn static_snapshot_reserves_file_transfer_provider_capabilities() {
+        let snapshot = local_capability_snapshot_static();
+
+        let local = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "service.file_transfer.local")
+            .expect("local file transfer capability");
+        assert_eq!(local.status, CapabilityStatus::Available);
+
+        let external_bridge = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "service.file_transfer.external_bridge")
+            .expect("external file transfer bridge reservation");
+        assert_eq!(external_bridge.status, CapabilityStatus::Unimplemented);
+        assert!(external_bridge
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("R-File"));
+    }
+
+    #[test]
+    fn remote_power_control_capability_tracks_executor_opt_in() {
+        let disabled = remote_power_control_status_from_env_lookup(|_| None);
+        assert_eq!(disabled.0, CapabilityStatus::Unsupported);
+        assert!(disabled.1.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS"));
+
+        let enabled = remote_power_control_status_from_env_lookup(|key| match key {
+            "MRD_ENABLE_REMOTE_POWER_ACTIONS" => Some("yes".to_string()),
+            _ => None,
+        });
+        assert_eq!(enabled.0, CapabilityStatus::Available);
+    }
+
+    #[test]
+    fn local_snapshot_advertises_remote_power_control_capability() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+        let remote_power = capabilities
+            .iter()
+            .find(|item| item.id == "control.remote_power")
+            .expect("remote power control capability");
+
+        assert_eq!(remote_power.domain, CapabilityDomain::Control);
+        assert_eq!(remote_power.status, CapabilityStatus::Unsupported);
+        assert!(remote_power
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS")));
+    }
+
+    #[test]
     fn macos_videotoolbox_decode_is_advertised_for_lan_receiver_path() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
@@ -2184,6 +2425,95 @@ mod tests {
             .expect("macOS HEVC Main 8-bit 4:2:0 media capability");
 
         assert_eq!(media.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn windows_color_and_main10_media_profile_capabilities_are_advertised() {
+        let capabilities =
+            local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
+
+        let color = capabilities
+            .iter()
+            .find(|item| item.id == "media.color_mode_v1")
+            .expect("LAN color mode media capability");
+        let main10 = capabilities
+            .iter()
+            .find(|item| item.id == "media.hevc_main10_420_10bit")
+            .expect("HEVC Main10 10-bit 4:2:0 media capability");
+
+        assert_eq!(color.status, CapabilityStatus::Supported);
+        assert_eq!(main10.status, CapabilityStatus::Supported);
+    }
+
+    #[test]
+    fn snapshot_exposes_lan_2k144_main10_profile() {
+        let snapshot = local_capability_snapshot_static();
+
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "lan.2k144.main10")
+            .expect("lan.2k144.main10 profile");
+
+        assert_eq!(profile.width, 2560);
+        assert_eq!(profile.height, 1440);
+        assert_eq!(profile.fps, 144);
+        assert_eq!(profile.bitrate_mbps, 80);
+        assert_eq!(profile.codec, "hevc");
+        assert_eq!(profile.codec_profile.as_deref(), Some("main10"));
+        assert_eq!(profile.bit_depth, Some(10));
+        assert_eq!(profile.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(profile.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(profile.hdr_enabled, Some(true));
+        assert_eq!(profile.color_mode.as_deref(), Some("full"));
+        assert_eq!(profile.color_pipeline.as_deref(), Some("hdr_main10"));
+        assert_eq!(
+            profile.required_capabilities,
+            vec![
+                "encode.nvenc_hevc_main10".to_string(),
+                "decode.nvdec_hevc_main10".to_string(),
+                "media.hevc_main10_420_10bit".to_string(),
+                "render.d3d11".to_string(),
+                "memory.d3d11_shared".to_string(),
+                "transport.quic_datagram".to_string(),
+                "transport.media_profile_control_v1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scenario_evaluation_preserves_lan_2k144_main10_media_metadata() {
+        let snapshot = CapabilitySnapshot {
+            schema_version: SCHEMA_VERSION,
+            platform: CapabilityPlatform::Windows,
+            service_version: "test".to_string(),
+            capabilities: local_capabilities(
+                CapabilityPlatform::Windows,
+                CapabilityProbeMode::Static,
+            ),
+            constraints: default_constraints(),
+            profiles: default_profiles(),
+            updated_at_ms: 1,
+        };
+
+        let evaluation =
+            evaluate_scenario_profile_against_snapshot(&snapshot, "lan.2k144.main10", None);
+        let selected = evaluation
+            .selected_profile
+            .expect("lan.2k144.main10 selected media profile");
+
+        assert_eq!(selected.width, 2560);
+        assert_eq!(selected.height, 1440);
+        assert_eq!(selected.fps, 144);
+        assert_eq!(selected.bitrate_mbps, 80);
+        assert_eq!(selected.codec, "hevc");
+        assert_eq!(selected.codec_profile.as_deref(), Some("main10"));
+        assert_eq!(selected.bit_depth, Some(10));
+        assert_eq!(selected.chroma_subsampling.as_deref(), Some("4:2:0"));
+        assert_eq!(selected.pixel_format.as_deref(), Some("p010"));
+        assert_eq!(selected.hdr_enabled, Some(true));
+        assert_eq!(selected.color_mode.as_deref(), Some("full"));
+        assert_eq!(selected.color_pipeline.as_deref(), Some("hdr_main10"));
     }
 
     #[test]
@@ -2282,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn unwired_nvenc_av1_is_not_advertised_as_runnable() {
+    fn wired_nvenc_av1_is_advertised_as_static_supported() {
         let capabilities =
             local_capabilities(CapabilityPlatform::Windows, CapabilityProbeMode::Static);
         let av1 = capabilities
@@ -2290,7 +2620,12 @@ mod tests {
             .find(|item| item.id == "encode.nvenc_av1")
             .expect("NVENC AV1 capability");
 
-        assert_eq!(av1.status, CapabilityStatus::Unimplemented);
+        assert_eq!(av1.status, CapabilityStatus::Supported);
+        assert!(av1
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime probe refresh is pending"));
     }
 
     #[test]
@@ -2327,6 +2662,7 @@ mod tests {
                 "encode.software_vvc".to_string(),
                 "decode.software_h266".to_string(),
             ],
+            mac_address: None,
             age_ms: 0,
             p2p_available: true,
         };

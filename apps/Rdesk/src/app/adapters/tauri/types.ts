@@ -245,6 +245,10 @@ export type ControlInputEvent =
       delta: number;
     }
   | {
+      kind: "mouse_horizontal_wheel";
+      delta: number;
+    }
+  | {
       kind: "key";
       key: ControlInputKey;
       pressed: boolean;
@@ -271,6 +275,80 @@ export interface CrossE2EFaultInjectionResult {
   duration_ms?: number | null;
   affected_surface_ids?: string[];
   impairment?: MediaTestImpairmentSnapshot | null;
+}
+
+export type FileEntryKind = "file" | "directory" | "symlink" | "other";
+
+export interface FileEntry {
+  name: string;
+  path: string;
+  kind: FileEntryKind;
+  size_bytes?: number | null;
+  modified_ms?: number | null;
+  readonly: boolean;
+}
+
+export interface DirectoryList {
+  path: string;
+  parent_path?: string | null;
+  entries: FileEntry[];
+}
+
+export type FileTransferConflictPolicy = "reject" | "rename" | "replace";
+export type FileTransferStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface FileTransferEntry {
+  source_path: string;
+  file_name?: string | null;
+  kind: FileEntryKind;
+}
+
+export interface FileTransferStartRequest {
+  source_device_id?: string | null;
+  target_device_id?: string | null;
+  entries: FileTransferEntry[];
+  target_path: string;
+  conflict_policy?: FileTransferConflictPolicy;
+  transport_hint?: string | null;
+  provider_hint?: string | null;
+}
+
+export interface FileTransferProviderHandoffHint {
+  external_app: string;
+  bridge_service: string;
+  control_endpoint?: string | null;
+  data_endpoint?: string | null;
+  capabilities?: string[];
+}
+
+export interface FileTransferProviderDescriptor {
+  provider_kind: string;
+  display_name: string;
+  status: CapabilityStatus;
+  capabilities?: string[];
+  reason?: string | null;
+  handoff_hint?: FileTransferProviderHandoffHint | null;
+}
+
+export interface FileTransferTaskSnapshot {
+  transfer_id: string;
+  status: FileTransferStatus;
+  source_device_id?: string | null;
+  target_device_id?: string | null;
+  transport_kind: string;
+  provider_kind?: string | null;
+  provider_capabilities?: string[];
+  total_entries: number;
+  copied_entries: number;
+  total_bytes?: number | null;
+  copied_bytes: number;
+  error?: string | null;
+  entries: FileEntry[];
 }
 
 export interface WindowCaptureTarget {
@@ -327,6 +405,11 @@ export interface RemoteDisplayWindowContext {
 export interface NativeSurfaceRect {
   x: number;
   y: number;
+  width: number;
+  height: number;
+}
+
+export interface NativeSurfaceControlFrameSize {
   width: number;
   height: number;
 }
@@ -557,6 +640,19 @@ export interface DeviceInfo {
   is_online: boolean;
 }
 
+export interface DevicePreference {
+  device_id: string;
+  favorite: boolean;
+  disabled: boolean;
+  removed: boolean;
+}
+
+export interface DevicePreferenceUpdate {
+  favorite?: boolean;
+  disabled?: boolean;
+  removed?: boolean;
+}
+
 export interface LanPeerInfo {
   device_id: string;
   device_name: string;
@@ -569,6 +665,7 @@ export interface LanPeerInfo {
   service_build_id?: string | null;
   media_protocol_version?: number | null;
   media_capabilities?: string[];
+  mac_address?: string | null;
   age_ms: number;
   p2p_available: boolean;
 }
@@ -580,6 +677,20 @@ export interface LanDiscoverySnapshot {
   instance_id: string;
   last_probe_ms?: number | null;
   peers: LanPeerInfo[];
+}
+
+export interface WakeOnLanSent {
+  device_id: string;
+  mac_address: string;
+  broadcast_addr: string;
+  packet_bytes: number;
+}
+
+export type RemoteDevicePowerAction = "restart" | "shutdown";
+
+export interface RemoteDevicePowerActionAccepted {
+  device_id: string;
+  action: RemoteDevicePowerAction;
 }
 
 export type CapabilityPlatform =
@@ -653,6 +764,13 @@ export interface CapabilityProfile {
   fps: number;
   bitrate_mbps: number;
   codec: "h264" | "hevc" | "av1" | string;
+  codec_profile?: string | null;
+  bit_depth?: number | null;
+  chroma_subsampling?: string | null;
+  pixel_format?: string | null;
+  hdr_enabled?: boolean | null;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | string | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | string | null;
   latency_budget_ms?: number | null;
   min_stable_fps_ratio?: number | null;
   max_drop_ratio?: number | null;
@@ -703,6 +821,7 @@ export interface SessionRuntimeSnapshot {
   last_error?: string;
   sender_active: boolean;
   receiver_active: boolean;
+  peer_device_id?: string | null;
 }
 
 export interface SessionInfo {
@@ -720,6 +839,7 @@ export interface SessionInfo {
   last_error?: string | null;
   sender_active: boolean;
   receiver_active: boolean;
+  peer_device_id?: string | null;
 }
 
 export interface RuntimeSnapshot {
@@ -758,6 +878,8 @@ export interface MediaProfile {
   chroma_subsampling?: string | null;
   pixel_format?: string | null;
   hdr_enabled?: boolean | null;
+  color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | null;
+  color_pipeline?: "sdr8" | "hdr_main10" | null;
 }
 
 export interface MediaProfileNegotiation {
@@ -901,6 +1023,8 @@ export interface MediaPipelineSnapshot {
   active_chroma_subsampling?: string | null;
   active_pixel_format?: string | null;
   active_hdr_enabled?: boolean | null;
+  active_color_mode?: "full" | "grayscale" | "monochrome" | "low_chroma" | string | null;
+  active_color_pipeline?: "sdr8" | "hdr_main10" | string | null;
   active_width?: number | null;
   active_height?: number | null;
   active_fps?: number | null;
