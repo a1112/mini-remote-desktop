@@ -1258,7 +1258,8 @@ describe("MatrixTestPage failure handling", () => {
     render(<MatrixTestPage runDelayMs={0} />);
 
     await screen.findByLabelText("Metal");
-    fireEvent.click(screen.getByLabelText("OpenH264"));
+    setLabeledCheckbox("VideoToolbox H.264", false);
+    setLabeledCheckbox("OpenH264", true);
     fireEvent.click(screen.getByLabelText("720p"));
     fireEvent.click(screen.getByLabelText("30 FPS"));
     fireEvent.click(screen.getByLabelText("Metal"));
