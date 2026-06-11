@@ -14,6 +14,8 @@ import type {
   RemoteDisplayWindowContext,
   RuntimeSnapshot,
   SessionRuntimeSnapshot,
+  ControlInputAccepted,
+  ControlInputEvent,
 } from "../adapters/tauri";
 import {
   evaluateProfileProbe,
@@ -27,6 +29,7 @@ export type CrossDeviceScenarioId =
   | "lan.e2e.remote_display"
   | "cross.e2e.discovery"
   | "cross.e2e.remote_display_smoke"
+  | "cross.e2e.input_control"
   | "cross.e2e.media_profile"
   | "cross.fault.recovery";
 
@@ -58,6 +61,8 @@ export type LanE2EFailureReason =
   | "display_mode_failed"
   | "receiver_start_failed"
   | "display_window_failed"
+  | "control_input_unsupported"
+  | "control_input_failed"
   | "fault_injection_unsupported"
   | "fault_injection_failed"
   | "no_remote_frames"
@@ -68,7 +73,7 @@ export type LanE2EFailureReason =
   | "stop_failed";
 
 export interface LanE2EStageEvent {
-  stage: "preflight" | "pairing" | "session" | "capture_source" | "display_mode" | "adaptation" | "receiver" | "display" | "fault" | "sample" | "assert" | "cleanup";
+  stage: "preflight" | "pairing" | "session" | "capture_source" | "display_mode" | "adaptation" | "receiver" | "display" | "control" | "fault" | "sample" | "assert" | "cleanup";
   status: "started" | "completed" | "failed" | "skipped";
   timestamp: number;
   error?: string;
@@ -114,6 +119,7 @@ export interface LanE2EAutomationReport {
   mediaPipelineSnapshot?: MediaPipelineSnapshot;
   mediaAdaptationSnapshot?: MediaAdaptationSnapshot;
   profileProbeResult?: ProfileProbeResult;
+  controlInputAck?: ControlInputAccepted;
   requestedProfile?: MediaProfile;
   faultPlan?: CrossDeviceFaultPlan;
   faultEvents: CrossDeviceFaultEvent[];
@@ -130,6 +136,9 @@ export interface LanE2EAutomationReport {
   sampleFpsTargetDurationMs?: number;
   sampleObservedFps?: number;
   sampleObservedFpsAtTargetDuration?: number;
+  firstFrameAt?: number;
+  firstFrameTimeMs?: number;
+  maxZeroFrameWindowAfterFirstFrameMs?: number;
   sampleRenderFramesPresented: number;
   sampleObservedRenderFps?: number;
   sampleObservedRenderFpsAtTargetDuration?: number;
@@ -191,6 +200,10 @@ export interface LanE2EAutomationCommands {
     avoidCaptureSourceId?: string;
     requestedProfile?: MediaProfile;
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
+  ipcSendControlInput?(
+    sessionId: string,
+    event: ControlInputEvent
+  ): Promise<AdapterResult<ControlInputAccepted>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
   ipcMediaPipelineSnapshot(sessionId: string): Promise<AdapterResult<MediaPipelineSnapshot>>;
@@ -331,6 +344,11 @@ const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
 const SAMPLE_DURATION_TOLERANCE_MS = 250;
 const REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS = 10_000;
 const REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS = 100;
+const INPUT_CONTROL_ACK_PROBE_EVENT: ControlInputEvent = {
+  kind: "mouse_move",
+  x: 1,
+  y: 1,
+};
 
 export async function runLanE2EAutomation(
   commands: LanE2EAutomationCommands,
@@ -370,6 +388,7 @@ export async function runLanE2EAutomation(
   let mediaPipelineSnapshot: MediaPipelineSnapshot | undefined;
   let mediaAdaptationSnapshot: MediaAdaptationSnapshot | undefined;
   let profileProbeResult: ProfileProbeResult | undefined;
+  let controlInputAck: ControlInputAccepted | undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
   let sampleDurationMs = 0;
@@ -382,6 +401,11 @@ export async function runLanE2EAutomation(
   let sampleFpsTargetDurationMs: number | undefined;
   let sampleObservedFps: number | undefined;
   let sampleObservedFpsAtTargetDuration: number | undefined;
+  let firstFrameAt: number | undefined;
+  let firstFrameTimeMs: number | undefined;
+  let maxZeroFrameWindowAfterFirstFrameMs: number | undefined;
+  let lastFrameProgressAt: number | undefined;
+  let lastFrameProgressDecodedCount = 0;
   let sampleRenderFramesPresented = 0;
   let sampleObservedRenderFps: number | undefined;
   let sampleObservedRenderFpsAtTargetDuration: number | undefined;
@@ -430,6 +454,7 @@ export async function runLanE2EAutomation(
     mediaPipelineSnapshot,
     mediaAdaptationSnapshot,
     profileProbeResult,
+    controlInputAck,
     requestedProfile,
     faultPlan: options.faultPlan,
     faultEvents,
@@ -449,6 +474,9 @@ export async function runLanE2EAutomation(
     sampleFpsTargetDurationMs,
     sampleObservedFps,
     sampleObservedFpsAtTargetDuration,
+    firstFrameAt,
+    firstFrameTimeMs,
+    maxZeroFrameWindowAfterFirstFrameMs,
     sampleRenderFramesPresented,
     sampleObservedRenderFps,
     sampleObservedRenderFpsAtTargetDuration,
@@ -490,6 +518,18 @@ export async function runLanE2EAutomation(
       stage("preflight", "failed", "No LAN peer available");
       return finish("failed", "peer_not_found", "No LAN peer available");
     }
+    if (scenarioId === "cross.e2e.input_control") {
+      const inputControlGate = describeInputControlPeerGate(selectedPeer, transportKind);
+      if (inputControlGate) {
+        stage("preflight", "failed", inputControlGate);
+        return finish("failed", "peer_not_ready", inputControlGate);
+      }
+      if (!commands.ipcSendControlInput) {
+        const message = "Cross-device input control requires ipcSendControlInput support";
+        stage("control", "skipped", message);
+        return finish("skipped", "control_input_unsupported", message);
+      }
+    }
     if (
       options.expectedPeerBuildId &&
       !lanBuildIdsMatch(selectedPeer.service_build_id, options.expectedPeerBuildId)
@@ -498,6 +538,13 @@ export async function runLanE2EAutomation(
       const message = `LAN peer build mismatch: expected ${options.expectedPeerBuildId}, got ${actualBuild}. Rebuild and restart the peer before running paired media canaries.`;
       stage("preflight", "skipped", message);
       return finish("skipped", "peer_version_mismatch", message);
+    }
+    if (scenarioId === "cross.e2e.discovery") {
+      const discoveryGate = describeCrossDeviceDiscoveryEvidenceGate(selectedPeer);
+      if (discoveryGate) {
+        stage("preflight", "skipped", discoveryGate);
+        return finish("skipped", "peer_not_ready", discoveryGate);
+      }
     }
     stage("preflight", "completed");
 
@@ -511,6 +558,15 @@ export async function runLanE2EAutomation(
     }
     const sessionStartProfile =
       options.adaptive ? buildAdaptiveStartupMediaProfile(requestedProfile) : requestedProfile;
+    const performanceProfileGate = describePerformanceProfilePeerGate(
+      selectedPeer,
+      requestedProfile,
+      transportKind
+    );
+    if (performanceProfileGate) {
+      stage("preflight", "skipped", performanceProfileGate);
+      return finish("skipped", "peer_not_ready", performanceProfileGate);
+    }
 
     if (scenarioId === "cross.fault.recovery" && !commands.crossE2EInjectFault) {
       const message = "Cross-device fault recovery requires mrd-service fault injection support";
@@ -537,6 +593,19 @@ export async function runLanE2EAutomation(
     );
     sessionStarted = true;
     stage("pairing", "completed");
+
+    if (scenarioId === "cross.e2e.input_control") {
+      stage("control", "started");
+      controlInputAck = await runControlInputAckProbe(commands, sessionId);
+      if (controlInputAck.event_count < 1) {
+        const message = `Control input ACK did not confirm any events for ${sessionId}`;
+        stage("control", "failed", message);
+        return finish("failed", "control_input_failed", message);
+      }
+      stage("control", "completed");
+      stage("assert", "completed");
+      return finish("completed");
+    }
 
     stage("capture_source", "started");
     captureSourceSelection = await selectRemoteCaptureSourceForSession(
@@ -733,6 +802,11 @@ export async function runLanE2EAutomation(
         sampleFpsTargetDurationMs = undefined;
         sampleObservedFps = undefined;
         sampleObservedFpsAtTargetDuration = undefined;
+        firstFrameAt = undefined;
+        firstFrameTimeMs = undefined;
+        maxZeroFrameWindowAfterFirstFrameMs = undefined;
+        lastFrameProgressAt = undefined;
+        lastFrameProgressDecodedCount = 0;
         sampleRenderFramesPresented = 0;
         sampleObservedRenderFps = undefined;
         sampleObservedRenderFpsAtTargetDuration = undefined;
@@ -743,7 +817,31 @@ export async function runLanE2EAutomation(
         await sleep(sampleIntervalMs);
         continue;
       }
-      sampleDurationMs = now() - sampleStartedAt;
+      const sampleObservedAt = now();
+      sampleDurationMs = sampleObservedAt - sampleStartedAt;
+      if (probeSnapshot.frames_decoded > 0) {
+        if (firstFrameAt == null) {
+          firstFrameAt = sampleObservedAt;
+          firstFrameTimeMs = Math.max(0, sampleObservedAt - startedAt);
+          maxZeroFrameWindowAfterFirstFrameMs = 0;
+          lastFrameProgressAt = sampleObservedAt;
+          lastFrameProgressDecodedCount = probeSnapshot.frames_decoded;
+        } else if (probeSnapshot.frames_decoded > lastFrameProgressDecodedCount) {
+          if (lastFrameProgressAt != null) {
+            maxZeroFrameWindowAfterFirstFrameMs = Math.max(
+              maxZeroFrameWindowAfterFirstFrameMs ?? 0,
+              sampleObservedAt - lastFrameProgressAt
+            );
+          }
+          lastFrameProgressAt = sampleObservedAt;
+          lastFrameProgressDecodedCount = probeSnapshot.frames_decoded;
+        } else if (lastFrameProgressAt != null) {
+          maxZeroFrameWindowAfterFirstFrameMs = Math.max(
+            maxZeroFrameWindowAfterFirstFrameMs ?? 0,
+            sampleObservedAt - lastFrameProgressAt
+          );
+        }
+      }
       const renderPresentedFrames = mediaPipelineSnapshot.render_presented_frames;
       const sampleFpsBaselineReady =
         !displayWindow ||
@@ -862,8 +960,13 @@ export async function runLanE2EAutomation(
         minSampleDurationMs
       );
       if (!options.adaptive && profileMismatch && sampleDurationReady) {
-        stage("assert", "failed", profileMismatch);
-        return finish("failed", "media_profile_mismatch", profileMismatch);
+        const exactProfileRequired = scenarioRequiresExactProfileMatch(scenarioId);
+        stage("assert", exactProfileRequired ? "failed" : "skipped", profileMismatch);
+        return finish(
+          exactProfileRequired ? "failed" : "skipped",
+          exactProfileRequired ? "media_profile_mismatch" : "profile_downgraded",
+          profileMismatch
+        );
       }
       if (
         !options.adaptive &&
@@ -938,6 +1041,22 @@ function syncDisplayWindowFromPipeline(
     native_surface_attached: true,
     render_mode: renderModeForAttachedSurface(attachedSurface.backend),
   };
+}
+
+async function runControlInputAckProbe(
+  commands: LanE2EAutomationCommands,
+  sessionId: string
+): Promise<ControlInputAccepted> {
+  if (!commands.ipcSendControlInput) {
+    throw new LanE2ECommandError(
+      "control_input_unsupported",
+      "Cross-device input control requires ipcSendControlInput support"
+    );
+  }
+  return unwrap(
+    commands.ipcSendControlInput(sessionId, INPUT_CONTROL_ACK_PROBE_EVENT),
+    "control_input_failed"
+  );
 }
 
 async function waitForRemoteDisplayNativeSurface(
@@ -1463,11 +1582,15 @@ function isPeerReady(peer: LanPeerInfo, transportKind: string): boolean {
 }
 
 function scenarioRequiresReadyPeer(scenarioId: CrossDeviceScenarioId): boolean {
-  return scenarioId !== "cross.e2e.discovery";
+  return scenarioId !== "cross.e2e.discovery" && scenarioId !== "cross.e2e.input_control";
 }
 
 function scenarioRequiresMediaPipeline(scenarioId: CrossDeviceScenarioId): boolean {
-  return scenarioId !== "cross.e2e.discovery";
+  return scenarioId !== "cross.e2e.discovery" && scenarioId !== "cross.e2e.input_control";
+}
+
+function scenarioRequiresExactProfileMatch(scenarioId: CrossDeviceScenarioId): boolean {
+  return scenarioId === "cross.e2e.media_profile";
 }
 
 function shouldRequestMediaProfile(
@@ -1475,6 +1598,81 @@ function shouldRequestMediaProfile(
   transportKind: string
 ): boolean {
   return scenarioRequiresMediaPipeline(scenarioId) && transportKind === "quic";
+}
+
+function describeCrossDeviceDiscoveryEvidenceGate(peer: LanPeerInfo): string | null {
+  if (!peer.service_build_id?.trim()) {
+    return `LAN peer ${peer.device_id} is missing service build id; restart both sides from the same mainline build before cross-device E2E.`;
+  }
+  if (!peer.media_capabilities || peer.media_capabilities.length === 0) {
+    return `LAN peer ${peer.device_id} is missing media capability snapshot; restart the peer mrd-service/Rdesk and verify capability reporting before cross-device E2E.`;
+  }
+  return null;
+}
+
+function describePerformanceProfilePeerGate(
+  peer: LanPeerInfo,
+  requestedProfile: MediaProfile | undefined,
+  transportKind: string
+): string | null {
+  if (transportKind !== "quic" || !isPerformanceMediaProfile(requestedProfile)) {
+    return null;
+  }
+
+  const discoveryGate = describeCrossDeviceDiscoveryEvidenceGate(peer);
+  if (discoveryGate) {
+    return `Performance profile ${formatMediaProfile(
+      requestedProfile
+    )} requires peer build/capability evidence: ${discoveryGate}`;
+  }
+
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  const platformProfile = findSupportedPlatformMediaCapabilityProfile(mediaCapabilities);
+  if (!platformProfile) {
+    return `Performance profile ${formatMediaProfile(
+      requestedProfile
+    )} requires a complete native media capability snapshot for peer ${
+      peer.device_id
+    }. Missing by profile [${describeMissingPlatformMediaCapabilities(mediaCapabilities)}].`;
+  }
+
+  const transports = peer.transports.map((transport) => transport.toLowerCase());
+  const mediaProtocolVersion = peer.media_protocol_version ?? 0;
+  const supportsMediaProtocol =
+    (mediaProtocolVersion >= 3 &&
+      (transports.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY) ||
+        mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V3_CAPABILITY))) ||
+    (mediaProtocolVersion >= 2 &&
+      (transports.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY) ||
+        mediaCapabilities.includes(QUIC_DATAGRAM_MEDIA_V2_CAPABILITY)));
+  if (!supportsMediaProtocol) {
+    return `Performance profile ${formatMediaProfile(
+      requestedProfile
+    )} requires compatible QUIC media protocol evidence for peer ${
+      peer.device_id
+    }, got media protocol ${mediaProtocolVersion || "unknown"}.`;
+  }
+
+  return null;
+}
+
+function describeInputControlPeerGate(peer: LanPeerInfo, transportKind: string): string | null {
+  if (!peer.p2p_available) {
+    return `LAN peer is discovered but not P2P available for input control: ${peer.device_id}`;
+  }
+  const transports = peer.transports.map((transport) => transport.toLowerCase());
+  if (!transports.includes(transportKind.toLowerCase())) {
+    const transportList = peer.transports.length > 0 ? peer.transports.join(", ") : "none";
+    return `LAN peer does not support ${transportKind} for input control: ${peer.device_id} supports ${transportList}`;
+  }
+  return null;
+}
+
+function isPerformanceMediaProfile(profile: MediaProfile | undefined): profile is MediaProfile {
+  if (!profile) return false;
+  return profile.fps >= 120 || profile.width * profile.height >= 2560 * 1440;
 }
 
 function peerSupportsTransport(peer: LanPeerInfo, transportKind: string): boolean {
@@ -1839,6 +2037,9 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
       return "receiver";
     case "display_window_failed":
       return "display";
+    case "control_input_unsupported":
+    case "control_input_failed":
+      return "control";
     case "fault_injection_unsupported":
     case "fault_injection_failed":
       return "fault";

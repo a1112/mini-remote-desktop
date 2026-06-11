@@ -377,6 +377,91 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("skips cross-device discovery when the peer lacks build evidence", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: ["quic"],
+              protocol_version: 1,
+              media_capabilities: ["quic_datagram_media_v3"],
+              age_ms: 20,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.discovery",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("peer_not_ready");
+    expect(result.errorMessage).toContain("missing service build id");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("skips cross-device discovery when the peer lacks capability evidence", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: ["quic"],
+              protocol_version: 1,
+              service_build_id: "test-build",
+              media_capabilities: [],
+              age_ms: 20,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.discovery",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("peer_not_ready");
+    expect(result.errorMessage).toContain("missing media capability snapshot");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
   it("skips cross-device fault recovery when service fault injection is unavailable", async () => {
     const commands = createCommands();
 
@@ -433,6 +518,71 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("skips cross-device input control when the ACK command is unavailable", async () => {
+    const commands = createCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.input_control",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("control_input_unsupported");
+    expect(result.errorMessage).toContain("ipcSendControlInput");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("runs cross-device input control with a service ACK and skips media sampling", async () => {
+    const ipcSendControlInput = vi.fn().mockResolvedValue(
+      ok({
+        session_id: "lan-e2e-test-session",
+        lane: "realtime",
+        event_count: 1,
+      })
+    );
+    const commands = createCommands({ ipcSendControlInput });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.input_control",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.dataPlaneVerified).toBe(false);
+    expect(result.mediaVerified).toBe(false);
+    expect(result.controlInputAck).toEqual({
+      session_id: "lan-e2e-test-session",
+      lane: "realtime",
+      event_count: 1,
+    });
+    expect(ipcSendControlInput).toHaveBeenCalledWith("lan-e2e-test-session", {
+      kind: "mouse_move",
+      x: 1,
+      y: 1,
+    });
+    expect(commands.ipcStartLanRemoteSession).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "agent-device",
+      "quic",
+      undefined
+    );
+    expect(commands.ipcListRemoteCaptureSources).not.toHaveBeenCalled();
+    expect(commands.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+    expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
+    expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
+      "control:completed"
+    );
+  });
+
   it("discovers a LAN peer, starts remote display, validates frames, and stops the session", async () => {
     const commands = createCommands();
 
@@ -450,6 +600,9 @@ describe("runLanE2EAutomation", () => {
     expect(result.sessionId).toBe("lan-e2e-test-session");
     expect(result.peer?.device_id).toBe("agent-device");
     expect(result.probeSnapshot?.frames_decoded).toBe(3);
+    expect(result.firstFrameAt).toBeGreaterThanOrEqual(result.startedAt);
+    expect(result.firstFrameTimeMs).toBeGreaterThanOrEqual(0);
+    expect(result.maxZeroFrameWindowAfterFirstFrameMs).toBe(0);
     expect(result.mediaPipelineSnapshot?.active_decoder).toBe("nvdec");
     expect(result.mediaPipelineSnapshot?.queue_depth).toBe(1);
     expect(result.mediaVerified).toBe(true);
@@ -1325,7 +1478,7 @@ describe("runLanE2EAutomation", () => {
       current_fps: 180,
       bitrate_mbps: 120,
       media_probe_valid: true,
-      media_probe_format: "compressed_h264_test_pattern",
+      media_probe_format: "compressed_hevc_test_pattern",
       media_probe_width: 2560,
       media_probe_height: 1440,
       media_probe_target_fps: 180,
@@ -1417,7 +1570,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
   });
 
-  it("fails when the QUIC media probe target does not match the requested profile", async () => {
+  it("marks QUIC media probe target mismatch as a downgrade outside exact profile scenarios", async () => {
     const commands = withCaptureSourceCommands(
       createCommands({
         ipcProbeSnapshot: vi.fn().mockResolvedValue(
@@ -1454,13 +1607,57 @@ describe("runLanE2EAutomation", () => {
       createSessionId: () => "lan-e2e-test-session",
     });
 
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("profile_downgraded");
+    expect(result.errorMessage).toContain("Runtime media profile mismatch");
+    expect(result.errorMessage).toContain("2560x1600 @ 165 FPS / 80 Mbps");
+  });
+
+  it("fails exact profile scenarios when the QUIC media probe target does not match", async () => {
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcProbeSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            frames_received: 4,
+            frames_decoded: 3,
+            frames_dropped: 0,
+            current_fps: 144,
+            bitrate_mbps: 64,
+            media_probe_valid: true,
+            media_probe_format: "compressed_test_pattern",
+            media_probe_width: 1920,
+            media_probe_height: 1080,
+            media_probe_target_fps: 60,
+            media_probe_target_bitrate_mbps: 20,
+            media_probe_payload_bytes: 55555,
+            last_media_sequence: 3,
+            last_media_timestamp_us: 123456,
+            last_media_payload_hash: "fnv1a64:abc123",
+            last_error: null,
+          })
+        ),
+      })
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.media_profile",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
     expect(result.status).toBe("failed");
     expect(result.failureReason).toBe("media_profile_mismatch");
     expect(result.errorMessage).toContain("Runtime media profile mismatch");
     expect(result.errorMessage).toContain("2560x1600 @ 165 FPS / 80 Mbps");
   });
 
-  it("fails when the QUIC media probe codec does not match the requested profile", async () => {
+  it("marks QUIC media probe codec mismatch as a downgrade outside exact profile scenarios", async () => {
     const commands = withCaptureSourceCommands(
       createCommands({
         ipcProbeSnapshot: vi.fn().mockResolvedValue(
@@ -1498,8 +1695,8 @@ describe("runLanE2EAutomation", () => {
       createSessionId: () => "lan-e2e-test-session",
     });
 
-    expect(result.status).toBe("failed");
-    expect(result.failureReason).toBe("media_profile_mismatch");
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("profile_downgraded");
     expect(result.errorMessage).toContain("Runtime media profile mismatch");
     expect(result.errorMessage).toContain(
       "2560x1600 @ 165 FPS / 80 Mbps / hevc"
@@ -2373,7 +2570,30 @@ describe("runLanE2EAutomation", () => {
           ],
         })
       );
-    const commands = createCommands({ ipcRefreshLanDiscovery });
+    const commands = createCommands({
+      ipcRefreshLanDiscovery,
+      ipcProbeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          frames_received: 4,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 165,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_width: 2560,
+          media_probe_height: 1600,
+          media_probe_target_fps: 165,
+          media_probe_target_bitrate_mbps: 80,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      ),
+    });
 
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",
@@ -2436,7 +2656,30 @@ describe("runLanE2EAutomation", () => {
         ],
       })
     );
-    const commands = createCommands({ ipcRefreshLanDiscovery });
+    const commands = createCommands({
+      ipcRefreshLanDiscovery,
+      ipcProbeSnapshot: vi.fn().mockResolvedValue(
+        ok({
+          session_id: "unused",
+          frames_received: 4,
+          frames_decoded: 3,
+          frames_dropped: 0,
+          current_fps: 165,
+          bitrate_mbps: 80,
+          media_probe_valid: true,
+          media_probe_format: "compressed_h264_test_pattern",
+          media_probe_width: 2560,
+          media_probe_height: 1600,
+          media_probe_target_fps: 165,
+          media_probe_target_bitrate_mbps: 80,
+          media_probe_payload_bytes: 55555,
+          last_media_sequence: 3,
+          last_media_timestamp_us: 123456,
+          last_media_payload_hash: "fnv1a64:abc123",
+          last_error: null,
+        })
+      ),
+    });
 
     const result = await runLanE2EAutomation(commands, {
       targetDeviceId: "agent-device",
@@ -2644,6 +2887,67 @@ describe("runLanE2EAutomation", () => {
     expect(result.failureReason).toBe("peer_version_mismatch");
     expect(result.errorMessage).toContain("expected newer-build");
     expect(result.errorMessage).toContain("got test-build");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("skips performance profiles before session startup when the peer build id is missing", async () => {
+    const commands = createCommands({
+      ipcRefreshLanDiscovery: vi.fn().mockResolvedValue(
+        ok({
+          enabled: true,
+          running: true,
+          discovery_port: 37777,
+          instance_id: "controller-instance",
+          last_probe_ms: 10,
+          peers: [
+            {
+              device_id: "agent-device",
+              device_name: "Agent PC",
+              device_type: "desktop",
+              ip: "192.168.1.24",
+              discovery_port: 37777,
+              p2p_control_addr: "192.168.1.24:37778",
+              transports: [
+                "quic",
+                "quic_datagram",
+                "quic_datagram_2k144",
+                "quic_datagram_media_v2",
+                "quic_datagram_media_v3",
+                "media_profile_control_v1",
+              ],
+              protocol_version: 1,
+              media_protocol_version: 3,
+              media_capabilities: [
+                "quic_datagram_media_v3",
+                "dxgi_capture",
+                "nvenc_hevc",
+                "nvdec_hevc",
+                "media.hevc_main_420_8bit",
+                "nvenc_h264",
+                "nvdec",
+                "d3d11_native_render",
+              ],
+              age_ms: 20,
+              p2p_available: true,
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("peer_not_ready");
+    expect(result.requestedProfile).toEqual(DEFAULT_REQUESTED_PROFILE);
+    expect(result.errorMessage).toContain("Performance profile");
+    expect(result.errorMessage).toContain("missing service build id");
     expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
   });
 

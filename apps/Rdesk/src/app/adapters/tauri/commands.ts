@@ -37,6 +37,8 @@ import type {
   DisplayModeChange,
   ControlInputAccepted,
   ControlInputEvent,
+  CrossE2EFaultInjectionResult,
+  CrossE2EFaultType,
   AdaptiveMediaConfig,
   MediaAdaptationSnapshot,
   MediaProfile,
@@ -690,6 +692,31 @@ export async function ipcSendControlInput(
       lane: response.lane as ControlInputAccepted['lane'],
       event_count: response.event_count as number,
     })
+  );
+}
+
+/**
+ * Inject a test-only cross-device E2E fault into an active remote session.
+ */
+export async function crossE2EInjectFault(
+  sessionId: string,
+  faultType: CrossE2EFaultType,
+  durationMs?: number
+): Promise<AdapterResult<CrossE2EFaultInjectionResult>> {
+  return invokeBridgeOrTauri<CrossE2EFaultInjectionResult>(
+    'cross_e2e_inject_fault',
+    {
+      sessionId,
+      faultType,
+      ...(durationMs === undefined ? {} : { durationMs }),
+    },
+    {
+      type: 'CrossE2EInjectFault',
+      session_id: sessionId,
+      fault_type: faultType,
+      ...(durationMs === undefined ? {} : { duration_ms: durationMs }),
+    },
+    responseField<CrossE2EFaultInjectionResult>('result')
   );
 }
 

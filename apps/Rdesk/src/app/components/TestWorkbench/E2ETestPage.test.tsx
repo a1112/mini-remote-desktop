@@ -400,16 +400,120 @@ describe("E2ETestPage LAN automation", () => {
         "automation_write_report",
         expect.objectContaining({
           report: expect.objectContaining({
-            status: "completed",
-            scenarioId: "cross.e2e.discovery",
-            dataPlaneVerified: false,
-            mediaVerified: false,
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.discovery",
+            metrics_csv: expect.stringContaining("frames_decoded"),
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.discovery",
+              dataPlaneVerified: false,
+              mediaVerified: false,
+            }),
           }),
         })
       );
     });
     expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_start_lan_remote_session")).toBe(false);
     expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
+  });
+
+  it("autoruns the cross-device input control ACK scenario", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.input_control&targetDeviceId=agent-device&transport=quic",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_send_control_input",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          event: {
+            kind: "mouse_move",
+            x: 1,
+            y: 1,
+          },
+        })
+      );
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_start_receiver")).toBe(false);
+    expect(mockInvoke.mock.calls.some(([command]) => command === "open_remote_display_window")).toBe(false);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.input_control",
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.input_control",
+              controlInputAck: expect.objectContaining({
+                lane: "realtime",
+                event_count: 1,
+              }),
+              dataPlaneVerified: false,
+              mediaVerified: false,
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("autoruns the cross-device fault recovery scenario through the fault command", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent-device&transport=quic",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "cross_e2e_inject_fault",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          faultType: "network.pause_peer",
+          durationMs: 1000,
+        })
+      );
+    });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "completed",
+            scenario_id: "cross.fault.recovery",
+            report: expect.objectContaining({
+              status: "completed",
+              faultEvents: [
+                expect.objectContaining({
+                  type: "network.pause_peer",
+                  status: "injected",
+                  message: "recorded test network pause impairment for 1000 ms",
+                }),
+              ],
+            }),
+          }),
+        })
+      );
+    });
   });
 
   it("autoruns LAN remote display automation from URL query parameters", async () => {
@@ -448,8 +552,24 @@ describe("E2ETestPage LAN automation", () => {
         "automation_write_report",
         expect.objectContaining({
           report: expect.objectContaining({
-            status: "completed",
-            scenarioId: "cross.e2e.remote_display_smoke",
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.remote_display_smoke",
+            requested_profile: expect.objectContaining({
+              width: 1920,
+              height: 1080,
+              fps: 180,
+            }),
+            summary: expect.objectContaining({
+              total_duration_ms: expect.any(Number),
+            }),
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.remote_display_smoke",
+              probeSnapshot: expect.objectContaining({
+                frames_decoded: 25,
+              }),
+            }),
           }),
         })
       );
@@ -603,8 +723,12 @@ describe("E2ETestPage LAN automation", () => {
         "automation_write_report",
         expect.objectContaining({
           report: expect.objectContaining({
-            status: "completed",
-            displayWindow: undefined,
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            report: expect.objectContaining({
+              status: "completed",
+              displayWindow: undefined,
+            }),
           }),
         })
       );
@@ -706,6 +830,22 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
         activeProfile = requestedProfile;
       }
       return Promise.resolve("started");
+    }
+    if (command === "ipc_send_control_input") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        lane: "realtime",
+        event_count: 1,
+      });
+    }
+    if (command === "cross_e2e_inject_fault") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        fault_type: args?.faultType,
+        status: "injected",
+        message: `recorded test network pause impairment for ${args?.durationMs ?? 1000} ms`,
+        duration_ms: args?.durationMs ?? 1000,
+      });
     }
     if (command === "ipc_list_remote_capture_sources") {
       return Promise.resolve([

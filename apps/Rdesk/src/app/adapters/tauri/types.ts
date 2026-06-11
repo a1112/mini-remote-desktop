@@ -261,6 +261,18 @@ export interface ControlInputAccepted {
   event_count: number;
 }
 
+export type CrossE2EFaultType = "network.pause_peer" | "renderer.detach_surface";
+
+export interface CrossE2EFaultInjectionResult {
+  session_id: string;
+  fault_type: CrossE2EFaultType | string;
+  status: "injected" | "unsupported" | "failed" | string;
+  message: string;
+  duration_ms?: number | null;
+  affected_surface_ids?: string[];
+  impairment?: MediaTestImpairmentSnapshot | null;
+}
+
 export interface WindowCaptureTarget {
   id?: string;
   platform?: "windows" | "macos" | string;

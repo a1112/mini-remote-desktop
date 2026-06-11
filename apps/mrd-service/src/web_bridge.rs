@@ -518,6 +518,7 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::SetRemoteDisplayMode { .. }
             | IpcRequest::RestoreRemoteDisplayMode { .. }
             | IpcRequest::SendControlInput { .. }
+            | IpcRequest::CrossE2EInjectFault { .. }
             | IpcRequest::StartReceiver { .. }
             | IpcRequest::SessionRuntimeSnapshot { .. }
             | IpcRequest::RuntimeSnapshot
@@ -721,6 +722,15 @@ mod tests {
         assert!(is_ipc_request_allowed(&IpcRequest::SendControlInput {
             session_id: mrd_proto::SessionId("control-session".to_string()),
             event: mrd_ipc::ControlInputEvent::MouseMove { x: 10, y: 20 },
+        }));
+    }
+
+    #[test]
+    fn web_bridge_allows_cross_e2e_fault_requests() {
+        assert!(is_ipc_request_allowed(&IpcRequest::CrossE2EInjectFault {
+            session_id: mrd_proto::SessionId("fault-session".to_string()),
+            fault_type: "network.pause_peer".to_string(),
+            duration_ms: Some(500),
         }));
     }
 }

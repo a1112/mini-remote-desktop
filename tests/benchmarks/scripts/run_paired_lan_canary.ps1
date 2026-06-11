@@ -3,6 +3,7 @@ param(
   [string]$OutputDir = "target/codex-matrix-compare",
   [string]$TargetDeviceId,
   [string]$TargetAddress,
+  [string[]]$ScenarioId = @("cross.e2e.remote_display_smoke"),
   [string[]]$ProfileId,
   [int]$DurationSecs = 30,
   [int]$BitrateMbps = 20,
@@ -257,8 +258,9 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, 
   }
 }
 
-function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [string]$CaptureSourceId, [string]$CaptureSourceKind, [int]$RenderMaxFps, [switch]$NoRenderProfileCap, [switch]$KeepTauriOpen) {
-  $reportPath = Join-Path $OutputRoot ("raw/cross-$($Profile.id).json")
+function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId, [string]$ScenarioId, [int]$TimeoutMs, [string]$DisplayModePolicy, [string]$GitCommit, [string]$Codec, [string]$CodecProfile, [int]$BitDepth, [string]$ChromaSubsampling, [string]$PixelFormat, [bool]$HdrEnabled, [string]$CaptureSourceId, [string]$CaptureSourceKind, [int]$RenderMaxFps, [switch]$NoRenderProfileCap, [switch]$KeepTauriOpen) {
+  $scenarioSlug = $ScenarioId.Replace(".", "-")
+  $reportPath = Join-Path $OutputRoot ("raw/cross-$scenarioSlug-$($Profile.id).json")
   $logsDir = Join-Path $OutputRoot "logs"
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $reportPath), $logsDir | Out-Null
   Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
@@ -267,6 +269,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
   $process = $null
   try {
     Set-EnvVar "MRD_LAN_E2E_AUTORUN" "1" $savedEnv
+    Set-EnvVar "MRD_LAN_E2E_SCENARIO" $ScenarioId $savedEnv
     Set-EnvVar "MRD_LAN_E2E_TRANSPORT" "quic" $savedEnv
     Set-EnvVar "MRD_LAN_E2E_TIMEOUT_MS" ([string]$TimeoutMs) $savedEnv
     Set-EnvVar "MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS" ([string]($Profile.duration_secs * 1000)) $savedEnv
@@ -313,8 +316,8 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
       Set-EnvVar "MRD_LAN_E2E_CAPTURE_SOURCE_KIND" $CaptureSourceKind.Trim() $savedEnv
     }
 
-    $stdout = Join-Path $logsDir "cross-$($Profile.id).stdout.log"
-    $stderr = Join-Path $logsDir "cross-$($Profile.id).stderr.log"
+    $stdout = Join-Path $logsDir "cross-$scenarioSlug-$($Profile.id).stdout.log"
+    $stderr = Join-Path $logsDir "cross-$scenarioSlug-$($Profile.id).stderr.log"
     $process = Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "pnpm", "tauri:dev") -WorkingDirectory (Join-Path $Repo "apps/Rdesk") -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs + 60000)
@@ -323,8 +326,10 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     while ((Get-Date) -lt $deadline) {
       if (Test-Path $reportPath) {
         try {
-          $report = Get-Content $reportPath -Raw | ConvertFrom-Json
-          if ($report.status -in @("completed", "failed", "skipped")) {
+          $reportCandidate = Get-Content $reportPath -Raw | ConvertFrom-Json
+          $normalizedReport = Resolve-LanE2EAutomationReport -Report $reportCandidate
+          if ($normalizedReport.status -in @("completed", "failed", "skipped")) {
+            $report = $reportCandidate
             break
           }
         } catch {
@@ -362,6 +367,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     }
 
     $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $report -ReportPath $reportPath -RequestedCodec $Codec
+    $row | Add-Member -Force -NotePropertyName "requested_scenario_id" -NotePropertyValue $ScenarioId
     $row | Add-Member -Force -NotePropertyName "requested_codec_profile" -NotePropertyValue $(if ($CodecProfile.Trim()) { $CodecProfile.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_bit_depth" -NotePropertyValue $(if ($BitDepth -gt 0) { $BitDepth } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
@@ -396,6 +402,26 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
   }
 }
 
+$allowedScenarios = @(
+  "cross.e2e.remote_display_smoke",
+  "cross.e2e.media_profile",
+  "cross.e2e.input_control",
+  "cross.fault.recovery"
+)
+$requestedScenarios = @(
+  $ScenarioId |
+    ForEach-Object { $_ -split "," } |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ }
+)
+if ($requestedScenarios.Count -eq 0) {
+  $requestedScenarios = @("cross.e2e.remote_display_smoke")
+}
+$unknownScenarios = @($requestedScenarios | Where-Object { $allowedScenarios -notcontains $_ })
+if ($unknownScenarios.Count -gt 0) {
+  throw "Unsupported paired LAN canary scenario(s): $($unknownScenarios -join ', ')"
+}
+
 if (-not $NoBuild) {
   $savedBuildEnv = @{}
   try {
@@ -421,13 +447,15 @@ if (-not $SkipCross) {
   if (-not $TargetDeviceId -and $effectiveTargetDeviceId) {
     Write-Host "Auto-selected LAN target $effectiveTargetDeviceId from discovery diagnostics"
   }
-  foreach ($profile in $profiles) {
-    Write-Host "Running cross-device canary $($profile.id)"
-    $timeoutMs = ($profile.duration_secs * 1000) + 30000
-    if ($profile.adaptive) {
-      $timeoutMs += 90000
+  foreach ($scenario in $requestedScenarios) {
+    foreach ($profile in $profiles) {
+      Write-Host "Running cross-device canary $scenario $($profile.id)"
+      $timeoutMs = ($profile.duration_secs * 1000) + 30000
+      if ($profile.adaptive) {
+        $timeoutMs += 90000
+      }
+      $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -ScenarioId $scenario -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -CaptureSourceId $CaptureSourceId -CaptureSourceKind $CaptureSourceKind -RenderMaxFps $RenderMaxFps -NoRenderProfileCap:$NoRenderProfileCap -KeepTauriOpen:$KeepTauriOpen
     }
-    $crossRows += Invoke-CrossCanaryProfile -Repo $repo -Profile $profile -OutputRoot $outputRoot -TargetDeviceId $effectiveTargetDeviceId -TimeoutMs $timeoutMs -DisplayModePolicy $DisplayModePolicy -GitCommit $gitCommit -Codec $Codec -CodecProfile $CodecProfile -BitDepth $BitDepth -ChromaSubsampling $ChromaSubsampling -PixelFormat $PixelFormat -HdrEnabled $HdrEnabled -CaptureSourceId $CaptureSourceId -CaptureSourceKind $CaptureSourceKind -RenderMaxFps $RenderMaxFps -NoRenderProfileCap:$NoRenderProfileCap -KeepTauriOpen:$KeepTauriOpen
   }
 }
 
@@ -444,6 +472,7 @@ $codecRequest = [pscustomobject]@{
 }
 $localReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue $codecRequest
 $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NotePropertyValue $codecRequest
+$crossReport | Add-Member -Force -NotePropertyName "scenario_ids" -NotePropertyValue $requestedScenarios
 $crossReport | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $comparisonRows = @(Compare-PairedLanCanaryRows -LocalRows $localRows -CrossRows $crossRows -RatioThreshold $RatioThreshold)
 

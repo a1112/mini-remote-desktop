@@ -59,6 +59,7 @@ const TRAY_MENU_QUIT_ID: &str = "rdesk-tray-quit";
 const SINGLE_INSTANCE_ADDR: &str = "127.0.0.1:47631";
 const RDESK_SINGLE_INSTANCE_ADDR_ENV: &str = "MRD_RDESK_SINGLE_INSTANCE_ADDR";
 const LAN_E2E_AUTORUN_ENV: &str = "MRD_LAN_E2E_AUTORUN";
+const LAN_E2E_SCENARIO_ENV: &str = "MRD_LAN_E2E_SCENARIO";
 const LAN_E2E_TARGET_DEVICE_ID_ENV: &str = "MRD_LAN_E2E_TARGET_DEVICE_ID";
 const LAN_E2E_TRANSPORT_ENV: &str = "MRD_LAN_E2E_TRANSPORT";
 const LAN_E2E_TIMEOUT_MS_ENV: &str = "MRD_LAN_E2E_TIMEOUT_MS";
@@ -85,6 +86,8 @@ const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUIL
 const LAN_E2E_RENDER_PROFILE_CAP_ENV: &str = "MRD_LAN_E2E_RENDER_PROFILE_CAP";
 const LAN_E2E_RENDER_DISPLAY_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY";
 const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
+const MAINLINE_E2E_ARTIFACT_ROOT_ENV: &str = "MRD_E2E_ARTIFACT_ROOT";
+const MAINLINE_E2E_ARTIFACT_KIND: &str = "mainline_e2e_artifacts_v1";
 
 static APP_IS_QUITTING: AtomicBool = AtomicBool::new(false);
 
@@ -1504,27 +1507,358 @@ fn open_diagnostics_folder() -> Result<(), String> {
 
 #[tauri::command]
 fn automation_write_report(report: serde_json::Value) -> Result<Option<String>, String> {
-    let Ok(path) = std::env::var(LAN_E2E_REPORT_PATH_ENV) else {
+    if is_mainline_e2e_artifact_report(&report) {
+        let artifact_dir = write_mainline_e2e_artifacts(&report)?;
+        if let Some(path) = lan_e2e_report_path() {
+            write_json_file(&path, &report, "automation report")?;
+        }
+        return Ok(Some(artifact_dir.display().to_string()));
+    }
+
+    let Some(path) = lan_e2e_report_path() else {
         return Ok(None);
+    };
+    write_json_file(&path, &report, "automation report")?;
+    Ok(Some(path.display().to_string()))
+}
+
+fn lan_e2e_report_path() -> Option<std::path::PathBuf> {
+    let Ok(path) = std::env::var(LAN_E2E_REPORT_PATH_ENV) else {
+        return None;
     };
     let path = path.trim();
     if path.is_empty() {
-        return Ok(None);
+        return None;
     }
+    Some(std::path::PathBuf::from(path))
+}
 
-    let path = std::path::PathBuf::from(path);
+fn write_json_file(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
-                .map_err(|error| format!("create automation report directory failed: {error}"))?;
+                .map_err(|error| format!("create {label} directory failed: {error}"))?;
         }
     }
 
-    let content = serde_json::to_vec_pretty(&report)
-        .map_err(|error| format!("serialize automation report failed: {error}"))?;
-    std::fs::write(&path, content)
-        .map_err(|error| format!("write automation report failed: {error}"))?;
-    Ok(Some(path.display().to_string()))
+    let content = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("serialize {label} failed: {error}"))?;
+    std::fs::write(&path, content).map_err(|error| format!("write {label} failed: {error}"))?;
+    Ok(())
+}
+
+fn is_mainline_e2e_artifact_report(report: &serde_json::Value) -> bool {
+    report.get("kind").and_then(serde_json::Value::as_str) == Some(MAINLINE_E2E_ARTIFACT_KIND)
+}
+
+fn write_mainline_e2e_artifacts(report: &serde_json::Value) -> Result<std::path::PathBuf, String> {
+    let run_id = report
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .map(safe_artifact_path_segment)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "mainline E2E report is missing run_id".to_string())?;
+    let artifact_date = report
+        .get("artifact_date")
+        .and_then(serde_json::Value::as_str)
+        .map(safe_artifact_path_segment)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown-date".to_string());
+    let artifact_dir = mainline_e2e_artifact_root()
+        .join(artifact_date)
+        .join(run_id);
+    std::fs::create_dir_all(&artifact_dir)
+        .map_err(|error| format!("create mainline E2E artifact directory failed: {error}"))?;
+
+    let mut summary = report.clone();
+    if let Some(object) = summary.as_object_mut() {
+        object.remove("metrics_csv");
+    }
+    write_json_file(
+        &artifact_dir.join("summary.json"),
+        &summary,
+        "mainline E2E summary",
+    )?;
+
+    let timeline = serde_json::json!({
+        "run_id": report.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "scenario_id": report.get("scenario_id").cloned().unwrap_or(serde_json::Value::Null),
+        "generated_at": report.get("generated_at").cloned().unwrap_or(serde_json::Value::Null),
+        "stage_events": report.get("stage_events").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "fault_events": report.get("fault_events").cloned().unwrap_or_else(|| serde_json::json!([])),
+    });
+    write_json_file(
+        &artifact_dir.join("timeline.json"),
+        &timeline,
+        "mainline E2E timeline",
+    )?;
+
+    let metrics_csv = report
+        .get("metrics_csv")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(
+            "timestamp,sample_duration_ms,frames_decoded,frames_dropped,render_frames_presented\n",
+        );
+    std::fs::write(artifact_dir.join("metrics.csv"), metrics_csv)
+        .map_err(|error| format!("write mainline E2E metrics failed: {error}"))?;
+
+    write_mainline_e2e_structured_logs(&artifact_dir, report)?;
+    let first_frame_written = write_optional_base64_png(
+        report,
+        "first_frame_png_base64",
+        &artifact_dir.join("first-frame.png"),
+    )?;
+    let last_frame_written = write_optional_base64_png(
+        report,
+        "last_frame_png_base64",
+        &artifact_dir.join("last-frame.png"),
+    )?;
+
+    let mut generated_paths = vec![
+        "summary.json".to_string(),
+        "timeline.json".to_string(),
+        "metrics.csv".to_string(),
+        "controller.log".to_string(),
+        "agent.log".to_string(),
+    ];
+    if first_frame_written {
+        generated_paths.push("first-frame.png".to_string());
+    }
+    if last_frame_written {
+        generated_paths.push("last-frame.png".to_string());
+    }
+
+    if report
+        .get("final_status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status != "completed")
+        || report.get("failure_reason").is_some()
+        || report.get("human_message").is_some()
+    {
+        let failure_reason = report
+            .get("failure_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("none");
+        let human_message = report
+            .get("human_message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let failure_text = format!(
+            "status: {}\nfailure_reason: {failure_reason}\nhuman_message: {human_message}\n",
+            report
+                .get("final_status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        std::fs::write(artifact_dir.join("failure.txt"), failure_text)
+            .map_err(|error| format!("write mainline E2E failure report failed: {error}"))?;
+        generated_paths.push("failure.txt".to_string());
+    }
+
+    let missing_optional_paths = [
+        (!first_frame_written).then_some("first-frame.png"),
+        (!last_frame_written).then_some("last-frame.png"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    generated_paths.push("artifact_manifest.json".to_string());
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "run_id": report.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "scenario_id": report.get("scenario_id").cloned().unwrap_or(serde_json::Value::Null),
+        "generated_at": report.get("generated_at").cloned().unwrap_or(serde_json::Value::Null),
+        "artifact_descriptors": report.get("artifacts").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "generated_paths": generated_paths,
+        "missing_optional_paths": missing_optional_paths,
+    });
+    write_json_file(
+        &artifact_dir.join("artifact_manifest.json"),
+        &manifest,
+        "mainline E2E artifact manifest",
+    )?;
+
+    Ok(artifact_dir)
+}
+
+fn write_mainline_e2e_structured_logs(
+    artifact_dir: &std::path::Path,
+    report: &serde_json::Value,
+) -> Result<(), String> {
+    let controller_log = serde_json::json!({
+        "role": "controller",
+        "run_id": report.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "scenario_id": report.get("scenario_id").cloned().unwrap_or(serde_json::Value::Null),
+        "git_commit": report.get("git_commit").cloned().unwrap_or(serde_json::Value::Null),
+        "controller": report.get("controller").cloned().unwrap_or(serde_json::Value::Null),
+        "summary": report.get("summary").cloned().unwrap_or(serde_json::Value::Null),
+        "classification": report.get("classification").cloned().unwrap_or(serde_json::Value::Null),
+    });
+    write_structured_log_file(
+        &artifact_dir.join("controller.log"),
+        "Mainline E2E Controller Log",
+        &controller_log,
+    )?;
+
+    let agent_log = serde_json::json!({
+        "role": "agent",
+        "run_id": report.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "scenario_id": report.get("scenario_id").cloned().unwrap_or(serde_json::Value::Null),
+        "agent": report.get("agent").cloned().unwrap_or(serde_json::Value::Null),
+        "available": report.get("agent").is_some(),
+    });
+    write_structured_log_file(
+        &artifact_dir.join("agent.log"),
+        "Mainline E2E Agent Log",
+        &agent_log,
+    )
+}
+
+fn write_structured_log_file(
+    path: &std::path::Path,
+    title: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("serialize mainline E2E structured log failed: {error}"))?;
+    std::fs::write(path, format!("# {title}\n\n{json}\n"))
+        .map_err(|error| format!("write mainline E2E structured log failed: {error}"))
+}
+
+fn write_optional_base64_png(
+    report: &serde_json::Value,
+    field: &str,
+    path: &std::path::Path,
+) -> Result<bool, String> {
+    let Some(encoded) = report
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    let encoded = encoded
+        .split_once("base64,")
+        .map(|(_, payload)| payload)
+        .unwrap_or(encoded);
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("decode {field} failed: {error}"))?;
+    std::fs::write(path, bytes).map_err(|error| format!("write {field} failed: {error}"))?;
+    Ok(true)
+}
+
+fn mainline_e2e_artifact_root() -> std::path::PathBuf {
+    std::env::var(MAINLINE_E2E_ARTIFACT_ROOT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("artifacts")
+                .join("e2e")
+        })
+}
+
+fn safe_artifact_path_segment(value: &str) -> String {
+    let trimmed = value.trim().trim_matches('.');
+    let mut segment = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            segment.push(ch);
+        } else {
+            segment.push('-');
+        }
+    }
+    segment.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod automation_report_tests {
+    use super::*;
+
+    #[test]
+    fn mainline_e2e_artifact_writer_creates_canonical_files() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test-e2e-artifacts")
+            .join(format!("writer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var(MAINLINE_E2E_ARTIFACT_ROOT_ENV, &root);
+
+        let report = serde_json::json!({
+            "kind": MAINLINE_E2E_ARTIFACT_KIND,
+            "schema_version": 1,
+            "run_id": "run:one",
+            "artifact_date": "2026-06-11",
+            "generated_at": 1781157600000u64,
+            "git_commit": "abc123",
+            "scenario_id": "cross.e2e.remote_display_smoke",
+            "final_status": "failed",
+            "failure_reason": "no_remote_frames",
+            "human_message": "no frames arrived",
+            "agent": {
+                "device_id": "agent-device",
+                "service_build_id": "abc123"
+            },
+            "artifacts": [
+                {
+                    "path": "summary.json",
+                    "kind": "summary_json",
+                    "required": true,
+                    "status": "generated"
+                }
+            ],
+            "stage_events": [{"stage": "sample", "status": "failed"}],
+            "fault_events": [],
+            "metrics_csv": "timestamp,frames_decoded\n1781157600000,0\n",
+            "first_frame_png_base64": "AQID",
+        });
+
+        let artifact_dir = write_mainline_e2e_artifacts(&report).unwrap();
+
+        assert_eq!(artifact_dir, root.join("2026-06-11").join("run-one"));
+        assert!(artifact_dir.join("summary.json").exists());
+        assert!(artifact_dir.join("timeline.json").exists());
+        assert!(artifact_dir.join("controller.log").exists());
+        assert!(artifact_dir.join("agent.log").exists());
+        assert!(artifact_dir.join("artifact_manifest.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(artifact_dir.join("metrics.csv")).unwrap(),
+            "timestamp,frames_decoded\n1781157600000,0\n"
+        );
+        assert_eq!(
+            std::fs::read(artifact_dir.join("first-frame.png")).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(std::fs::read_to_string(artifact_dir.join("failure.txt"))
+            .unwrap()
+            .contains("failure_reason: no_remote_frames"));
+        let manifest =
+            std::fs::read_to_string(artifact_dir.join("artifact_manifest.json")).unwrap();
+        assert!(manifest.contains("first-frame.png"));
+        assert!(manifest.contains("last-frame.png"));
+
+        std::env::remove_var(MAINLINE_E2E_ARTIFACT_ROOT_ENV);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn safe_artifact_path_segment_removes_path_separators() {
+        assert_eq!(
+            safe_artifact_path_segment("../run:one/device id"),
+            "run-one-device-id"
+        );
+    }
 }
 
 // nvdec_runtime_probe - moved to rdesk-legacy-harness package
@@ -1980,6 +2314,33 @@ async fn ipc_send_control_input(
             lane,
             event_count,
         }),
+        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+/// Inject a test-only cross-device E2E fault via mrd-service IPC.
+#[tauri::command]
+async fn cross_e2e_inject_fault(
+    session_id: String,
+    fault_type: String,
+    duration_ms: Option<u64>,
+) -> Result<mrd_ipc::CrossE2EFaultInjectionResult, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    use mrd_proto::SessionId;
+
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let response = client
+        .send_request(IpcRequest::CrossE2EInjectFault {
+            session_id: SessionId(session_id),
+            fault_type,
+            duration_ms,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        IpcResponse::CrossE2EFaultInjected { result } => Ok(result),
         IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
         _ => Err("Unexpected response".to_string()),
     }
@@ -3049,6 +3410,7 @@ fn apply_tray_action(app: &AppHandle, action: TrayAction) -> Result<(), String> 
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LanE2eAutorunLaunchConfig {
+    scenario_id: Option<String>,
     target_device_id: Option<String>,
     transport: Option<String>,
     timeout_ms: Option<String>,
@@ -3090,6 +3452,7 @@ where
     }
 
     Some(LanE2eAutorunLaunchConfig {
+        scenario_id: non_empty_env(env(LAN_E2E_SCENARIO_ENV)),
         target_device_id: non_empty_env(env(LAN_E2E_TARGET_DEVICE_ID_ENV)),
         transport: non_empty_env(env(LAN_E2E_TRANSPORT_ENV)),
         timeout_ms: non_empty_env(env(LAN_E2E_TIMEOUT_MS_ENV)),
@@ -3121,6 +3484,7 @@ where
 fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     let mut params = vec![("autorun".to_string(), "lan-e2e".to_string())];
 
+    push_query_param(&mut params, "scenario", config.scenario_id);
     push_query_param(&mut params, "targetDeviceId", config.target_device_id);
     push_query_param(&mut params, "transport", config.transport);
     push_query_param(&mut params, "timeoutMs", config.timeout_ms);
@@ -3246,6 +3610,7 @@ mod tray_tests {
     #[test]
     fn lan_e2e_autorun_route_uses_env_configuration() {
         let route = build_lan_e2e_autorun_route(LanE2eAutorunLaunchConfig {
+            scenario_id: Some("cross.fault.recovery".to_string()),
             target_device_id: Some("agent device/1".to_string()),
             transport: Some("quic".to_string()),
             timeout_ms: Some("2500".to_string()),
@@ -3275,7 +3640,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
         );
     }
 
@@ -3885,6 +4250,7 @@ fn main() {
             ipc_update_media_profile,
             ipc_configure_media_adaptation,
             ipc_send_control_input,
+            cross_e2e_inject_fault,
             ipc_list_local_capture_sources,
             ipc_list_remote_capture_sources,
             ipc_select_remote_capture_source,
