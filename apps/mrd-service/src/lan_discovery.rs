@@ -15629,6 +15629,11 @@ mod tests {
                 receiver_active: false,
             },
         );
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .set(session_id.clone(), vec!["decode.nvdec".to_string()]);
 
         let negotiation = accept_lan_media_profile_update(
             &app_state,
@@ -16101,6 +16106,11 @@ mod tests {
                 receiver_active: false,
             },
         );
+        app_state
+            .peer_media_capabilities
+            .lock()
+            .await
+            .set(session_id.clone(), vec!["decode.nvdec".to_string()]);
         app_state.capture_sources.lock().await.set(
             session_id.clone(),
             CaptureSourceSelection {

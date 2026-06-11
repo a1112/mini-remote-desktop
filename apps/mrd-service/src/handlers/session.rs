@@ -4,9 +4,13 @@
 
 use crate::app_state::AppState;
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
-use mrd_ipc::{ControlInputEvent, DisplayMode, IpcResponse, MediaProfile};
+use mrd_ipc::{
+    ControlInputEvent, CrossE2EFaultInjectionResult, DisplayMode, IpcResponse, MediaProfile,
+    MediaTestImpairmentSnapshot,
+};
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Handle session start request
 pub async fn start_session(
@@ -241,6 +245,144 @@ pub async fn send_control_input(
             message: error.to_string(),
         },
     }
+}
+
+/// Inject a test-only cross-device E2E fault into an active session.
+pub async fn cross_e2e_inject_fault(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    fault_type: String,
+    duration_ms: Option<u64>,
+) -> IpcResponse {
+    if let Some(error) = validate_fault_session(app_state, &session_id).await {
+        return error;
+    }
+
+    match fault_type.as_str() {
+        "renderer.detach_surface" => {
+            let surface_ids: Vec<String> = app_state
+                .media_pipelines
+                .lock()
+                .await
+                .snapshot(&session_id)
+                .attached_surfaces
+                .into_iter()
+                .map(|surface| surface.surface_id)
+                .collect();
+            if surface_ids.is_empty() {
+                return IpcResponse::Error {
+                    code: "E_CROSS_E2E_FAULT".to_string(),
+                    message: format!("no attached render surfaces for session {}", session_id.0),
+                };
+            }
+
+            {
+                let mut pipelines = app_state.media_pipelines.lock().await;
+                for surface_id in &surface_ids {
+                    pipelines.detach_surface(&session_id, surface_id);
+                }
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            {
+                let mut renderers = app_state.media_surface_renderers.lock().await;
+                for surface_id in &surface_ids {
+                    renderers.detach_surface(&session_id, surface_id);
+                }
+            }
+
+            IpcResponse::CrossE2EFaultInjected {
+                result: CrossE2EFaultInjectionResult {
+                    session_id,
+                    fault_type,
+                    status: "injected".to_string(),
+                    message: format!("detached {} native render surface(s)", surface_ids.len()),
+                    duration_ms,
+                    affected_surface_ids: surface_ids,
+                    impairment: None,
+                },
+            }
+        }
+        "network.pause_peer" => {
+            let pause_ms = duration_ms.unwrap_or(1_000).max(1);
+            let impairment = MediaTestImpairmentSnapshot {
+                loss_pct: 1.0,
+                base_delay_ms: pause_ms,
+                jitter_ms: 0,
+                mtu_bytes: None,
+                seed: now_unix_ms_lossy(),
+                datagrams_sent: 0,
+                datagrams_dropped: 0,
+                datagrams_delayed: 0,
+                datagrams_fragmented_by_mtu: 0,
+            };
+            app_state
+                .media_pipelines
+                .lock()
+                .await
+                .set_test_impairment(session_id.clone(), Some(impairment.clone()));
+            app_state.probes.lock().await.record_transient_frame_drop(
+                &session_id,
+                0,
+                now_unix_ms_lossy(),
+            );
+
+            let app_state_for_restore = app_state.clone();
+            let session_id_for_restore = session_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(pause_ms)).await;
+                app_state_for_restore
+                    .media_pipelines
+                    .lock()
+                    .await
+                    .set_test_impairment(session_id_for_restore, None);
+            });
+
+            IpcResponse::CrossE2EFaultInjected {
+                result: CrossE2EFaultInjectionResult {
+                    session_id,
+                    fault_type,
+                    status: "injected".to_string(),
+                    message: format!("recorded test network pause impairment for {} ms", pause_ms),
+                    duration_ms: Some(pause_ms),
+                    affected_surface_ids: vec![],
+                    impairment: Some(impairment),
+                },
+            }
+        }
+        _ => IpcResponse::Error {
+            code: "E_CROSS_E2E_FAULT".to_string(),
+            message: format!("unsupported cross-device E2E fault: {fault_type}"),
+        },
+    }
+}
+
+async fn validate_fault_session(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Option<IpcResponse> {
+    match app_state.sessions.lock().await.get(session_id).cloned() {
+        Some(snapshot) if snapshot.lifecycle_state.is_terminal() => Some(IpcResponse::Error {
+            code: "E_CROSS_E2E_FAULT".to_string(),
+            message: format!(
+                "fault injection rejected for {} session",
+                snapshot.lifecycle_state
+            ),
+        }),
+        Some(_) => None,
+        None => Some(IpcResponse::Error {
+            code: "E_CROSS_E2E_FAULT".to_string(),
+            message: format!("session not found: {}", session_id.0),
+        }),
+    }
+}
+
+fn now_unix_ms_lossy() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 /// Handle a remote capture source listing request.

@@ -7,11 +7,12 @@ use mrd_ipc::{
     CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
-    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
-    MediaStageMetrics, PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason,
-    ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef,
-    TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
+    CrossE2EFaultInjectionResult, DeviceIdentitySnapshot, DeviceInfo, IpcRequest, IpcResponse,
+    MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation,
+    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    PairedDeviceIdentity, ScenarioEvaluation, ScenarioEvaluationReason, ScenarioEvaluationStatus,
+    SessionBootstrap, SessionRuntimeSnapshot, TelemetryArtifactRef, TelemetryBundle,
+    TelemetryMetricSummary, TransportPolicyConfig, TransportPolicySnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
 
@@ -533,6 +534,45 @@ fn serialize_deserialize_policy_identity_control_and_telemetry_contracts() {
     let response = IpcResponse::TelemetryBundle { bundle };
     let json = serde_json::to_string(&response).unwrap();
     assert!(json.contains("TelemetryBundle"));
+    let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(response, deserialized);
+}
+
+#[test]
+fn serialize_deserialize_cross_e2e_fault_injection_contracts() {
+    let request = IpcRequest::CrossE2EInjectFault {
+        session_id: test_session_id(),
+        fault_type: "network.pause_peer".to_string(),
+        duration_ms: Some(500),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("CrossE2EInjectFault"));
+    assert!(json.contains("network.pause_peer"));
+    let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(request, deserialized);
+
+    let result = CrossE2EFaultInjectionResult {
+        session_id: test_session_id(),
+        fault_type: "network.pause_peer".to_string(),
+        status: "injected".to_string(),
+        message: "network pause fault injected".to_string(),
+        duration_ms: Some(500),
+        affected_surface_ids: vec![],
+        impairment: Some(MediaTestImpairmentSnapshot {
+            loss_pct: 1.0,
+            base_delay_ms: 500,
+            jitter_ms: 0,
+            mtu_bytes: None,
+            seed: 1,
+            datagrams_sent: 0,
+            datagrams_dropped: 0,
+            datagrams_delayed: 0,
+            datagrams_fragmented_by_mtu: 0,
+        }),
+    };
+    let response = IpcResponse::CrossE2EFaultInjected { result };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("CrossE2EFaultInjected"));
     let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(response, deserialized);
 }

@@ -212,6 +212,80 @@ $peerMissingRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $
 Assert-Equal $peerMissingRow.status "skipped" "Missing LAN peer is an environment skip"
 Assert-Equal $peerMissingRow.classification "unsupported" "Missing LAN peer is classified as unsupported"
 
+$peerMissingPayloadRow = Convert-CrossReportToCanaryRow `
+  -Profile $profiles[0] `
+  -Report ([pscustomobject]@{
+    kind = "mainline_e2e_artifacts_v1"
+    report = $peerMissingReport
+  }) `
+  -ReportPath "raw/cross-1080p60-payload.json"
+Assert-Equal $peerMissingPayloadRow.classification "unsupported" "Mainline E2E artifact payloads are unwrapped before row conversion"
+
+$boundaryController = [pscustomobject]@{
+  process = [pscustomobject]@{ Id = 101 }
+  pipe_endpoint = "\\.\pipe\mrd-controller"
+  discovery_port = 21216
+  probe_endpoint = "127.0.0.1:21217"
+  device_id = "controller-device"
+}
+$boundaryPeer = [pscustomobject]@{
+  process = [pscustomobject]@{ Id = 202 }
+  pipe_endpoint = "\\.\pipe\mrd-peer"
+  discovery_port = 21217
+  probe_endpoint = "127.0.0.1:21216"
+  device_id = "peer-device"
+}
+$boundaryReport = [pscustomobject]@{
+  status = "completed"
+  sessionId = "session-1"
+  stages = @([pscustomobject]@{ stage = "cleanup"; status = "completed" })
+  sessionSnapshot = [pscustomobject]@{ session_id = "session-1"; state = "closed" }
+  probeSnapshot = [pscustomobject]@{ session_id = "session-1"; frames_decoded = 120 }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    session_id = "session-1"
+    attached_surfaces = @([pscustomobject]@{ surface_id = "surface-1"; backend = "d3d11"; attached = $true })
+  }
+  displayWindow = [pscustomobject]@{
+    session_id = "session-1"
+    surface_id = "surface-1"
+    native_surface_attached = $true
+    render_mode = "d3d11_native"
+  }
+}
+$boundaryEvidence = New-LocalDualProcessServiceBoundaryEvidence `
+  -Controller $boundaryController `
+  -Peer $boundaryPeer `
+  -Report ([pscustomobject]@{ kind = "mainline_e2e_artifacts_v1"; report = $boundaryReport }) `
+  -ReportPath "raw/local-dual.json" `
+  -RunDir "runs/local-dual"
+Assert-True $boundaryEvidence.gate.passed "Complete local dual-process evidence passes the service boundary gate"
+Assert-True $boundaryEvidence.distinct_processes "Service boundary evidence proves distinct processes"
+Assert-True $boundaryEvidence.distinct_ipc_endpoints "Service boundary evidence proves distinct IPC endpoints"
+Assert-True $boundaryEvidence.discovery_path_verified "Service boundary evidence proves loopback LAN discovery path"
+Assert-Equal $boundaryEvidence.session_id "session-1" "Service boundary evidence records the consistent session id"
+Assert-True $boundaryEvidence.session_cleanup_completed "Service boundary evidence records cleanup completion"
+Assert-True $boundaryEvidence.native_display_verified "Service boundary evidence requires native display attachment"
+
+$webOnlyBoundaryReport = $boundaryReport.PSObject.Copy()
+$webOnlyBoundaryReport.displayWindow = [pscustomobject]@{
+  session_id = "session-1"
+  surface_id = "surface-1"
+  native_surface_attached = $false
+  render_mode = "web"
+}
+$webOnlyBoundaryReport.mediaPipelineSnapshot = [pscustomobject]@{
+  session_id = "session-1"
+  attached_surfaces = @()
+}
+$webOnlyEvidence = New-LocalDualProcessServiceBoundaryEvidence `
+  -Controller $boundaryController `
+  -Peer $boundaryPeer `
+  -Report $webOnlyBoundaryReport `
+  -ReportPath "raw/local-dual-web.json" `
+  -RunDir "runs/local-dual-web"
+Assert-True (-not $webOnlyEvidence.gate.passed) "Web-only display evidence fails the service boundary gate"
+Assert-True (@($webOnlyEvidence.gate.failures) -contains "native_display_not_verified") "Web-only display failure is explicit"
+
 $displayLimitedReport = [pscustomobject]@{
   status = "completed"
   failureReason = $null
@@ -256,6 +330,8 @@ $sampleFpsReport = [pscustomobject]@{
   sampleSequenceGapDrops = 2
   sampleDecodeErrorDrops = 3
   sampleTransientDrops = 4
+  firstFrameTimeMs = 420.0
+  maxZeroFrameWindowAfterFirstFrameMs = 1500.0
   probeSnapshot = [pscustomobject]@{
     current_fps = 44.0
     frames_decoded = 484
@@ -292,10 +368,46 @@ Assert-Equal $sampleFpsRow.sample_probe_dropped_frames 1 "Cross row carries samp
 Assert-Equal $sampleFpsRow.sample_sequence_gap_drops 2 "Cross row carries sample-window sequence gap drops separately"
 Assert-Equal $sampleFpsRow.sample_decode_error_drops 3 "Cross row carries sample-window decode/probe error drops separately"
 Assert-Equal $sampleFpsRow.sample_transient_drops 4 "Cross row carries sample-window transient drops separately"
+Assert-Equal $sampleFpsRow.first_frame_time_ms 420.0 "Cross row carries first-frame timing evidence"
+Assert-Equal $sampleFpsRow.max_zero_frame_window_after_first_frame_ms 1500.0 "Cross row carries post-first-frame zero-window evidence"
 Assert-Equal $sampleFpsRow.sequence_gap_drops 5 "Cross row keeps cumulative sequence gap drops"
 Assert-Equal $sampleFpsRow.decode_error_drops 6 "Cross row keeps cumulative decode/probe error drops"
 Assert-Equal $sampleFpsRow.transient_drops 7 "Cross row keeps cumulative transient drops"
 Assert-Equal $sampleFpsRow.test_impairment.datagrams_dropped 1 "Cross row carries media impairment counters"
+
+$slowFirstFrameReport = [pscustomobject]@{
+  status = "completed"
+  scenarioId = "cross.e2e.remote_display_smoke"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 57.0
+  firstFrameTimeMs = 5001.0
+  maxZeroFrameWindowAfterFirstFrameMs = 0.0
+  probeSnapshot = $sampleFpsReport.probeSnapshot
+  mediaPipelineSnapshot = $sampleFpsReport.mediaPipelineSnapshot
+  sessionSnapshot = $sampleFpsReport.sessionSnapshot
+}
+$slowFirstFrameRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $slowFirstFrameReport -ReportPath "raw/cross-1080p60-slow-first-frame.json"
+Assert-Equal $slowFirstFrameRow.status "failed" "Slow first frame fails the cross-device gate"
+Assert-Equal $slowFirstFrameRow.classification "threshold_miss" "Slow first frame is classified as a threshold miss"
+Assert-True ($slowFirstFrameRow.error_message -match "First frame time") "Slow first-frame row explains the gate failure"
+
+$zeroFrameWindowReport = [pscustomobject]@{
+  status = "completed"
+  scenarioId = "cross.e2e.remote_display_smoke"
+  failureReason = $null
+  errorMessage = $null
+  sampleObservedFps = 57.0
+  firstFrameTimeMs = 420.0
+  maxZeroFrameWindowAfterFirstFrameMs = 3001.0
+  probeSnapshot = $sampleFpsReport.probeSnapshot
+  mediaPipelineSnapshot = $sampleFpsReport.mediaPipelineSnapshot
+  sessionSnapshot = $sampleFpsReport.sessionSnapshot
+}
+$zeroFrameWindowRow = Convert-CrossReportToCanaryRow -Profile $profiles[0] -Report $zeroFrameWindowReport -ReportPath "raw/cross-1080p60-zero-window.json"
+Assert-Equal $zeroFrameWindowRow.status "failed" "Long zero-frame window fails the cross-device gate"
+Assert-Equal $zeroFrameWindowRow.classification "threshold_miss" "Long zero-frame window is classified as a threshold miss"
+Assert-True ($zeroFrameWindowRow.error_message -match "zero-frame window") "Zero-frame row explains the gate failure"
 
 $adaptiveDowngradeReport = [pscustomobject]@{
   status = "completed"
@@ -725,6 +837,10 @@ Assert-Equal $tauriBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "
 $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
 $pairedLanScript = Get-Content -Path (Join-Path $scriptDir "run_paired_lan_canary.ps1") -Raw
 Assert-True ($pairedLanScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Paired LAN canary accepts AV1 codec selection"
+Assert-True ($pairedLanScript -match '\[string\[\]\]\$ScenarioId = @\("cross\.e2e\.remote_display_smoke"\)') "Paired LAN canary defaults to the L4 remote-display scenario"
+Assert-True ($pairedLanScript -match '"cross\.fault\.recovery"') "Paired LAN canary accepts the L5 fault recovery scenario"
+Assert-True ($pairedLanScript -match 'MRD_LAN_E2E_SCENARIO') "Paired LAN canary forwards the scenario id to Tauri autorun"
+Assert-True ($pairedLanScript -match 'requested_scenario_id') "Paired LAN rows record the requested scenario id"
 Assert-True ($localDualScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Local dual canary accepts AV1 codec selection"
 Assert-True ($pairedLanScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Paired LAN canary accepts AV1 mode selection"
 Assert-True ($localDualScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Local dual canary accepts AV1 mode selection"

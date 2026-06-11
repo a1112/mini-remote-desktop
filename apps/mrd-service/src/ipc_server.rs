@@ -542,6 +542,20 @@ impl IpcServer {
                 session::send_control_input(&self.app_state, session_id, event).await
             }
 
+            IpcRequest::CrossE2EInjectFault {
+                session_id,
+                fault_type,
+                duration_ms,
+            } => {
+                session::cross_e2e_inject_fault(
+                    &self.app_state,
+                    session_id,
+                    fault_type,
+                    duration_ms,
+                )
+                .await
+            }
+
             IpcRequest::PairDevice {
                 device_id,
                 certificate_fingerprint,
@@ -1839,6 +1853,124 @@ mod tests {
             snapshot.reliable.last_error.as_deref(),
             Some("input injector unavailable: blocked by test")
         );
+    }
+
+    #[tokio::test]
+    async fn cross_e2e_renderer_detach_fault_removes_attached_surfaces() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("renderer-detach-fault-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), active_test_session(session_id.clone()));
+        app_state.media_pipelines.lock().await.attach_surface(
+            session_id.clone(),
+            mrd_ipc::AttachedRenderSurface {
+                surface_id: "surface-1".to_string(),
+                backend: "d3d11".to_string(),
+                window_handle: Some(1234),
+                render_proxy_endpoint: None,
+            },
+        );
+
+        let response = server
+            .handle_request(IpcRequest::CrossE2EInjectFault {
+                session_id: session_id.clone(),
+                fault_type: "renderer.detach_surface".to_string(),
+                duration_ms: None,
+            })
+            .await;
+
+        match response {
+            IpcResponse::CrossE2EFaultInjected { result } => {
+                assert_eq!(result.session_id, session_id);
+                assert_eq!(result.fault_type, "renderer.detach_surface");
+                assert_eq!(result.status, "injected");
+                assert_eq!(result.affected_surface_ids, vec!["surface-1"]);
+            }
+            other => panic!("expected renderer detach fault result, got {other:?}"),
+        }
+
+        let snapshot = app_state
+            .media_pipelines
+            .lock()
+            .await
+            .snapshot(&SessionId("renderer-detach-fault-session".to_string()));
+        assert!(snapshot.attached_surfaces.is_empty());
+        assert!(snapshot.active_renderer.is_none());
+    }
+
+    #[tokio::test]
+    async fn cross_e2e_network_pause_fault_records_impairment_and_transient_drop() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("network-pause-fault-session".to_string());
+        app_state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), active_test_session(session_id.clone()));
+
+        let response = server
+            .handle_request(IpcRequest::CrossE2EInjectFault {
+                session_id: session_id.clone(),
+                fault_type: "network.pause_peer".to_string(),
+                duration_ms: Some(1_000),
+            })
+            .await;
+
+        match response {
+            IpcResponse::CrossE2EFaultInjected { result } => {
+                assert_eq!(result.session_id, session_id);
+                assert_eq!(result.fault_type, "network.pause_peer");
+                assert_eq!(result.status, "injected");
+                assert_eq!(result.duration_ms, Some(1_000));
+                assert_eq!(
+                    result.impairment.as_ref().map(|item| item.loss_pct),
+                    Some(1.0)
+                );
+            }
+            other => panic!("expected network pause fault result, got {other:?}"),
+        }
+
+        let pipeline = app_state
+            .media_pipelines
+            .lock()
+            .await
+            .snapshot(&SessionId("network-pause-fault-session".to_string()));
+        assert_eq!(
+            pipeline.test_impairment.as_ref().map(|item| item.loss_pct),
+            Some(1.0)
+        );
+
+        let probe = app_state
+            .probes
+            .lock()
+            .await
+            .snapshot(&SessionId("network-pause-fault-session".to_string()));
+        assert_eq!(probe.frames_dropped, 1);
+        assert_eq!(probe.transient_drops, 1);
+    }
+
+    fn active_test_session(session_id: SessionId) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id,
+            transport: "quic".to_string(),
+            source_device_id: None,
+            target_device_id: Some(DeviceId("agent-device".to_string())),
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: SessionLifecycleState::Connected,
+            last_error: None,
+            sender_active: false,
+            receiver_active: true,
+        }
     }
 
     fn set_capability_status(

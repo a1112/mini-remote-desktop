@@ -11,7 +11,10 @@ import {
   type LanE2EAutomationReport,
   type LanE2EStatus,
 } from "../../services/lanE2eAutomationService";
-import { externalRunRecordFromLanE2EReport } from "../../services/lanE2eTelemetryService";
+import {
+  externalRunRecordFromLanE2EReport,
+  mainlineE2EArtifactPayloadFromReport,
+} from "../../services/lanE2eTelemetryService";
 import {
   capabilityAvailable,
   chooseCapability,
@@ -154,6 +157,15 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRestoreRemoteDisplayMode: commands.ipcRestoreRemoteDisplayMode,
   ipcStartReceiver: commands.ipcStartReceiver,
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
+  ipcSendControlInput: commands.ipcSendControlInput,
+  crossE2EInjectFault: async (sessionId, faultPlan) => {
+    const result = await commands.crossE2EInjectFault(
+      sessionId,
+      faultPlan.type,
+      faultPlan.durationMs
+    );
+    return result.ok ? { ok: true, value: result.value.message } : result;
+  },
   ipcSessionSnapshot: commands.ipcSessionSnapshot,
   ipcProbeSnapshot: commands.ipcProbeSnapshot,
   ipcMediaPipelineSnapshot: commands.ipcMediaPipelineSnapshot,
@@ -293,15 +305,19 @@ export function E2ETestPage() {
     setLanReport(report);
     setLanRunState(report.status);
     publishLanAutomationReport(report);
+    const reportConfig = configFromLanReport(currentConfig, report);
+    const reportOptions = {
+      environment: capabilities,
+      peer: report.peer ?? null,
+      runMode: "manual",
+      runIdPrefix: "e2e-lan",
+    } as const;
     void commands.testRecordExternalRun(
-      externalRunRecordFromLanE2EReport(report, configFromLanReport(currentConfig, report), {
-        environment: capabilities,
-        peer: report.peer ?? null,
-        runMode: "manual",
-        runIdPrefix: "e2e-lan",
-      })
+      externalRunRecordFromLanE2EReport(report, reportConfig, reportOptions)
     );
-    void commands.automationWriteReport(report).then((result) => {
+    void commands.automationWriteReport(
+      mainlineE2EArtifactPayloadFromReport(report, reportConfig, reportOptions)
+    ).then((result) => {
       if (!result.ok) {
         console.error("Failed to write LAN E2E automation report", result.error);
       }
@@ -426,6 +442,7 @@ export function E2ETestPage() {
             >
               <option value="cross.e2e.discovery">发现/配对预检</option>
               <option value="cross.e2e.remote_display_smoke">远程显示 Smoke</option>
+              <option value="cross.e2e.input_control">输入控制 ACK</option>
               <option value="cross.e2e.media_profile">媒体画像校验</option>
               <option value="cross.fault.recovery">故障恢复预检</option>
             </select>
@@ -656,6 +673,8 @@ function formatCrossDeviceScenario(scenarioId: CrossDeviceScenarioId): string {
       return "发现/配对预检";
     case "cross.e2e.remote_display_smoke":
       return "远程显示 Smoke";
+    case "cross.e2e.input_control":
+      return "输入控制 ACK";
     case "cross.e2e.media_profile":
       return "媒体画像校验";
     case "cross.fault.recovery":
@@ -798,6 +817,7 @@ function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId
     value === "lan.e2e.remote_display" ||
     value === "cross.e2e.discovery" ||
     value === "cross.e2e.remote_display_smoke" ||
+    value === "cross.e2e.input_control" ||
     value === "cross.e2e.media_profile" ||
     value === "cross.fault.recovery"
   ) {

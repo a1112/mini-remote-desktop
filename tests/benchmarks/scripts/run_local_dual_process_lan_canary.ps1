@@ -493,8 +493,10 @@ function Invoke-LocalDualProcessProfile {
     while ((Get-Date) -lt $deadline) {
       if (Test-Path $reportPath) {
         try {
-          $report = Get-Content $reportPath -Raw | ConvertFrom-Json
-          if ($report.status -in @("completed", "failed", "skipped")) {
+          $reportCandidate = Get-Content $reportPath -Raw | ConvertFrom-Json
+          $normalizedReport = Resolve-LanE2EAutomationReport -Report $reportCandidate
+          if ($normalizedReport.status -in @("completed", "failed", "skipped")) {
+            $report = $reportCandidate
             break
           }
         } catch {
@@ -548,10 +550,24 @@ function Invoke-LocalDualProcessProfile {
       $report | ConvertTo-Json -Depth 16 | Set-Content -Path $reportPath -Encoding Ascii
     }
 
-    $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $report -ReportPath $reportPath
+    $automationReport = Resolve-LanE2EAutomationReport -Report $report
+    $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $automationReport -ReportPath $reportPath
+    $serviceBoundary = New-LocalDualProcessServiceBoundaryEvidence `
+      -Controller $controller `
+      -Peer $peer `
+      -Report $automationReport `
+      -ReportPath $reportPath `
+      -RunDir $runDir
     $row | Add-Member -Force -NotePropertyName "mode" -NotePropertyValue "local-dual-process"
     $backends = Get-CanaryCodecBackends -Codec $Codec
     $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$($backends.encoder)/quic_datagram_media_v3_or_v2/$($backends.decoder)/d3d11_shared"
+    $row | Add-Member -Force -NotePropertyName "service_boundary" -NotePropertyValue $serviceBoundary
+    $row | Add-Member -Force -NotePropertyName "service_boundary_gate" -NotePropertyValue $serviceBoundary.gate
+    if (-not $serviceBoundary.gate.passed) {
+      $row | Add-Member -Force -NotePropertyName "status" -NotePropertyValue "failed"
+      $row | Add-Member -Force -NotePropertyName "classification" -NotePropertyValue "service_boundary_failed"
+      $row | Add-Member -Force -NotePropertyName "error_message" -NotePropertyValue ("service boundary gate failed: {0}" -f (($serviceBoundary.gate.failures | ForEach-Object { [string]$_ }) -join ", "))
+    }
     $row | Add-Member -Force -NotePropertyName "controller_pipe" -NotePropertyValue $controllerPipe
     $row | Add-Member -Force -NotePropertyName "peer_pipe" -NotePropertyValue $peerPipe
     $row | Add-Member -Force -NotePropertyName "controller_discovery_port" -NotePropertyValue $ports.controller
@@ -566,21 +582,21 @@ function Invoke-LocalDualProcessProfile {
     $row | Add-Member -Force -NotePropertyName "requested_chroma_subsampling" -NotePropertyValue $(if ($ChromaSubsampling.Trim()) { $ChromaSubsampling.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_pixel_format" -NotePropertyValue $(if ($PixelFormat.Trim()) { $PixelFormat.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
-    $row | Add-Member -Force -NotePropertyName "active_codec" -NotePropertyValue $report.mediaPipelineSnapshot.active_codec
-    $row | Add-Member -Force -NotePropertyName "active_codec_profile" -NotePropertyValue $report.mediaPipelineSnapshot.active_codec_profile
-    $row | Add-Member -Force -NotePropertyName "active_bit_depth" -NotePropertyValue $report.mediaPipelineSnapshot.active_bit_depth
-    $row | Add-Member -Force -NotePropertyName "active_chroma_subsampling" -NotePropertyValue $report.mediaPipelineSnapshot.active_chroma_subsampling
-    $row | Add-Member -Force -NotePropertyName "active_pixel_format" -NotePropertyValue $report.mediaPipelineSnapshot.active_pixel_format
-    $row | Add-Member -Force -NotePropertyName "active_hdr_enabled" -NotePropertyValue $report.mediaPipelineSnapshot.active_hdr_enabled
-    $row | Add-Member -Force -NotePropertyName "active_width" -NotePropertyValue $report.mediaPipelineSnapshot.active_width
-    $row | Add-Member -Force -NotePropertyName "active_height" -NotePropertyValue $report.mediaPipelineSnapshot.active_height
-    $row | Add-Member -Force -NotePropertyName "active_fps" -NotePropertyValue $report.mediaPipelineSnapshot.active_fps
-    $row | Add-Member -Force -NotePropertyName "active_bitrate_mbps" -NotePropertyValue $report.mediaPipelineSnapshot.active_bitrate_mbps
-    $row | Add-Member -Force -NotePropertyName "actual_capture_source_id" -NotePropertyValue $report.captureSource.id
-    $row | Add-Member -Force -NotePropertyName "actual_capture_source_kind" -NotePropertyValue $report.captureSource.source_kind
+    $row | Add-Member -Force -NotePropertyName "active_codec" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_codec
+    $row | Add-Member -Force -NotePropertyName "active_codec_profile" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_codec_profile
+    $row | Add-Member -Force -NotePropertyName "active_bit_depth" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_bit_depth
+    $row | Add-Member -Force -NotePropertyName "active_chroma_subsampling" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_chroma_subsampling
+    $row | Add-Member -Force -NotePropertyName "active_pixel_format" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_pixel_format
+    $row | Add-Member -Force -NotePropertyName "active_hdr_enabled" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_hdr_enabled
+    $row | Add-Member -Force -NotePropertyName "active_width" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_width
+    $row | Add-Member -Force -NotePropertyName "active_height" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_height
+    $row | Add-Member -Force -NotePropertyName "active_fps" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_fps
+    $row | Add-Member -Force -NotePropertyName "active_bitrate_mbps" -NotePropertyValue $automationReport.mediaPipelineSnapshot.active_bitrate_mbps
+    $row | Add-Member -Force -NotePropertyName "actual_capture_source_id" -NotePropertyValue $automationReport.captureSource.id
+    $row | Add-Member -Force -NotePropertyName "actual_capture_source_kind" -NotePropertyValue $automationReport.captureSource.source_kind
     $row | Add-Member -Force -NotePropertyName "motion_stimulus_title" -NotePropertyValue $(if ($NoMotionStimulus) { $null } else { $motionStimulusTitle })
     $row | Add-Member -Force -NotePropertyName "motion_stimulus_pid" -NotePropertyValue $(if ($motionStimulus) { $motionStimulus.Id } else { $null })
-    if ($report.captureSource.source_kind -match "^display") {
+    if ($automationReport.captureSource.source_kind -match "^display") {
       $row | Add-Member -Force -NotePropertyName "fixture_warning" -NotePropertyValue "same_host_display_capture_can_feedback_with_receiver_render_window"
     }
     $row
@@ -666,6 +682,22 @@ foreach ($profile in $profiles) {
 $report = New-PairedLanCanaryReport -Mode "local-dual-process" -Rows $rows -GitCommit $gitCommit -Codec $Codec
 $backends = Get-CanaryCodecBackends -Codec $Codec
 $report | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$($backends.encoder)/quic_datagram_media_v3_or_v2/$($backends.decoder)/d3d11_shared"
+$serviceBoundaryFailures = @(
+  $rows |
+    Where-Object { $_.service_boundary_gate -and -not $_.service_boundary_gate.passed } |
+    ForEach-Object {
+      [pscustomobject]@{
+        id = $_.id
+        failures = @($_.service_boundary_gate.failures)
+        run_dir = $_.run_dir
+      }
+    }
+)
+$report | Add-Member -Force -NotePropertyName "service_boundary_gate" -NotePropertyValue ([pscustomobject]@{
+  passed = ($serviceBoundaryFailures.Count -eq 0)
+  failure_count = $serviceBoundaryFailures.Count
+  failures = @($serviceBoundaryFailures)
+})
 $report | Add-Member -Force -NotePropertyName "test_impairment_config" -NotePropertyValue $impairment
 $report | Add-Member -Force -NotePropertyName "capture_source_request" -NotePropertyValue ([pscustomobject]@{
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
@@ -695,6 +727,17 @@ Write-CanaryJsonAndMarkdown `
   -JsonPath $jsonPath `
   -MarkdownPath $markdownPath `
   -Title "Local Dual-Process LAN Canary Report"
+
+Add-Content -Path $markdownPath -Encoding Ascii -Value @(
+  "",
+  "## Service Boundary Gate",
+  "",
+  "- Passed: $($report.service_boundary_gate.passed)",
+  "- FailureCount: $($report.service_boundary_gate.failure_count)"
+)
+foreach ($failure in @($report.service_boundary_gate.failures)) {
+  Add-Content -Path $markdownPath -Encoding Ascii -Value "- $($failure.id): $($failure.failures -join ', ')"
+}
 
 Add-Content -Path $markdownPath -Encoding Ascii -Value @(
   "",

@@ -185,6 +185,21 @@ mod wire {
         pub datagrams_fragmented_by_mtu: u64,
     }
 
+    /// Result of a test-only cross-device E2E fault injection request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct CrossE2EFaultInjectionResult {
+        pub session_id: SessionId,
+        pub fault_type: String,
+        pub status: String,
+        pub message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub affected_surface_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub impairment: Option<MediaTestImpairmentSnapshot>,
+    }
+
     /// Sender-side LAN media transport counters.
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     pub struct MediaSenderTransportSnapshot {
@@ -1127,6 +1142,16 @@ mod wire {
             /// Normalized input event.
             event: ControlInputEvent,
         },
+        /// Inject a test-only cross-device E2E fault into an active session.
+        CrossE2EInjectFault {
+            /// Target session id.
+            session_id: SessionId,
+            /// Fault type, for example `network.pause_peer` or `renderer.detach_surface`.
+            fault_type: String,
+            /// Optional fault duration.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            duration_ms: Option<u64>,
+        },
         /// Start or refresh local pairing intent for a device.
         PairDevice {
             /// Peer device id.
@@ -1300,6 +1325,11 @@ mod wire {
             lane: ControlInputLane,
             /// Number of input events applied or queued.
             event_count: u32,
+        },
+        /// Cross-device E2E fault injection result.
+        CrossE2EFaultInjected {
+            /// Structured fault injection result.
+            result: CrossE2EFaultInjectionResult,
         },
         /// Pairing operation result.
         PairingUpdated {

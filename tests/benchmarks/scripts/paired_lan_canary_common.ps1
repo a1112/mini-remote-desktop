@@ -4,6 +4,8 @@ $script:CanaryMaxProbeDropRatio = 0.05
 $script:CanaryMaxRenderDropRatio = 0.03
 $script:CanaryMinPacedRenderFpsRatio = 0.88
 $script:CanaryMaxPacedPresentGapMultiplier = 1.5
+$script:CanaryMaxFirstFrameTimeMs = 5000.0
+$script:CanaryMaxZeroFrameWindowAfterFirstFrameMs = 3000.0
 
 function Select-CanaryValue {
   param($Value, $Fallback)
@@ -45,6 +47,232 @@ function Select-CanaryStageMapValue {
     if ($null -ne $value) { return $value }
   }
   $Fallback
+}
+
+function Get-CanaryReportFirstFrameTimeMs {
+  param($Report)
+
+  $firstFrameTimeMs = Select-CanaryObjectPropertyValue $Report "firstFrameTimeMs" $null
+  if ($null -ne $firstFrameTimeMs) { return $firstFrameTimeMs }
+
+  $firstFrameAt = Select-CanaryObjectPropertyValue $Report "firstFrameAt" $null
+  $startedAt = Select-CanaryObjectPropertyValue $Report "startedAt" $null
+  if ($null -eq $firstFrameAt -or $null -eq $startedAt) {
+    return $null
+  }
+
+  try {
+    $derivedFirstFrameTimeMs = [double]$firstFrameAt - [double]$startedAt
+    if ($derivedFirstFrameTimeMs -ge 0) {
+      return $derivedFirstFrameTimeMs
+    }
+  } catch {
+    return $null
+  }
+  $null
+}
+
+function Get-CrossCanaryFrameGateFailureReason {
+  param($Report)
+
+  $scenarioId = [string](Select-CanaryObjectPropertyValue $Report "scenarioId" "")
+  $requiresFrameGateEvidence = ($scenarioId -eq "cross.e2e.remote_display_smoke")
+  $probe = Select-CanaryObjectPropertyValue $Report "probeSnapshot" $null
+  $firstFrameTimeMs = Get-CanaryReportFirstFrameTimeMs -Report $Report
+  $maxZeroFrameWindowAfterFirstFrameMs = Select-CanaryObjectPropertyValue $Report "maxZeroFrameWindowAfterFirstFrameMs" $null
+  $framesDecoded = [int64](Select-CanaryValue (Select-CanaryObjectPropertyValue $probe "frames_decoded" 0) 0)
+  $firstFrameSeen = ($framesDecoded -gt 0) -or ($null -ne $firstFrameTimeMs)
+
+  if ($requiresFrameGateEvidence -and -not $firstFrameSeen) {
+    return "First frame was not observed"
+  }
+  if ($requiresFrameGateEvidence -and $null -eq $firstFrameTimeMs) {
+    return "First frame time was not reported"
+  }
+  if ($null -ne $firstFrameTimeMs -and ([double]$firstFrameTimeMs) -gt $script:CanaryMaxFirstFrameTimeMs) {
+    return "First frame time $($firstFrameTimeMs)ms exceeded $($script:CanaryMaxFirstFrameTimeMs)ms"
+  }
+  if ($requiresFrameGateEvidence -and $null -eq $maxZeroFrameWindowAfterFirstFrameMs) {
+    return "Post-first-frame zero-frame window was not reported"
+  }
+  if (
+    $null -ne $maxZeroFrameWindowAfterFirstFrameMs -and
+    ([double]$maxZeroFrameWindowAfterFirstFrameMs) -gt $script:CanaryMaxZeroFrameWindowAfterFirstFrameMs
+  ) {
+    return "Post-first-frame zero-frame window $($maxZeroFrameWindowAfterFirstFrameMs)ms exceeded $($script:CanaryMaxZeroFrameWindowAfterFirstFrameMs)ms"
+  }
+
+  $null
+}
+
+function Resolve-LanE2EAutomationReport {
+  param($Report)
+
+  if (
+    $Report -and
+    ([string](Select-CanaryObjectPropertyValue $Report "kind" "") -eq "mainline_e2e_artifacts_v1")
+  ) {
+    $nested = Select-CanaryObjectPropertyValue $Report "report" $null
+    if ($nested) { return $nested }
+  }
+  $Report
+}
+
+function Get-CanaryReportSessionIdRefs {
+  param($Report)
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  $ids = @()
+  foreach ($path in @(
+    @("sessionId"),
+    @("session_id"),
+    @("sessionSnapshot", "session_id"),
+    @("probeSnapshot", "session_id"),
+    @("mediaPipelineSnapshot", "session_id"),
+    @("displayWindow", "session_id")
+  )) {
+    $cursor = $Report
+    foreach ($segment in $path) {
+      $cursor = Select-CanaryObjectPropertyValue $cursor $segment $null
+      if ($null -eq $cursor) { break }
+    }
+    if ($null -ne $cursor -and ([string]$cursor).Trim()) {
+      $ids += [string]$cursor
+    }
+  }
+  @($ids | Where-Object { $_ } | Select-Object -Unique)
+}
+
+function Test-CanaryNativeDisplayVerified {
+  param($Report)
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  $displayWindow = Select-CanaryObjectPropertyValue $Report "displayWindow" $null
+  if ($displayWindow) {
+    $renderMode = [string](Select-CanaryObjectPropertyValue $displayWindow "render_mode" "")
+    $nativeAttached = [bool](Select-CanaryObjectPropertyValue $displayWindow "native_surface_attached" $false)
+    if ($nativeAttached -and $renderMode -and $renderMode -notmatch "^web$") {
+      return $true
+    }
+  }
+
+  $pipeline = Select-CanaryObjectPropertyValue $Report "mediaPipelineSnapshot" $null
+  foreach ($surface in @((Select-CanaryObjectPropertyValue $pipeline "attached_surfaces" @()))) {
+    $backend = [string](Select-CanaryObjectPropertyValue $surface "backend" "")
+    $attached = [bool](Select-CanaryObjectPropertyValue $surface "attached" $true)
+    if ($attached -and $backend -and $backend -notmatch "^web$") {
+      return $true
+    }
+  }
+
+  $false
+}
+
+function Test-LanE2EReportCleanupCompleted {
+  param($Report)
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  foreach ($stage in @((Select-CanaryObjectPropertyValue $Report "stages" @()))) {
+    if (
+      ([string](Select-CanaryObjectPropertyValue $stage "stage" "") -eq "cleanup") -and
+      ([string](Select-CanaryObjectPropertyValue $stage "status" "") -eq "completed")
+    ) {
+      return $true
+    }
+  }
+  $false
+}
+
+function Test-LocalDualProcessServiceBoundaryEvidence {
+  param($Evidence)
+
+  $failures = @()
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "distinct_processes" $false)) {
+    $failures += "processes_not_distinct"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "distinct_ipc_endpoints" $false)) {
+    $failures += "ipc_endpoints_not_distinct"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "discovery_path_verified" $false)) {
+    $failures += "discovery_path_missing"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "session_id_consistent" $false)) {
+    $failures += "session_id_missing_or_inconsistent"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "session_cleanup_completed" $false)) {
+    $failures += "session_cleanup_not_completed"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $Evidence "native_display_verified" $false)) {
+    $failures += "native_display_not_verified"
+  }
+
+  [pscustomobject]@{
+    passed = ($failures.Count -eq 0)
+    failures = @($failures)
+  }
+}
+
+function New-LocalDualProcessServiceBoundaryEvidence {
+  param(
+    [Parameter(Mandatory = $true)]$Controller,
+    [Parameter(Mandatory = $true)]$Peer,
+    [Parameter(Mandatory = $true)]$Report,
+    [string]$ReportPath,
+    [string]$RunDir
+  )
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  $controllerProcess = Select-CanaryObjectPropertyValue $Controller "process" $null
+  $peerProcess = Select-CanaryObjectPropertyValue $Peer "process" $null
+  $controllerProcessId = Select-CanaryObjectPropertyValue $controllerProcess "Id" $null
+  $peerProcessId = Select-CanaryObjectPropertyValue $peerProcess "Id" $null
+  $controllerIpcEndpoint = [string](Select-CanaryObjectPropertyValue $Controller "pipe_endpoint" "")
+  $peerIpcEndpoint = [string](Select-CanaryObjectPropertyValue $Peer "pipe_endpoint" "")
+  $controllerProbeEndpoint = [string](Select-CanaryObjectPropertyValue $Controller "probe_endpoint" "")
+  $peerProbeEndpoint = [string](Select-CanaryObjectPropertyValue $Peer "probe_endpoint" "")
+  $sessionIds = @(Get-CanaryReportSessionIdRefs -Report $Report)
+  $sessionId = if ($sessionIds.Count -gt 0) { $sessionIds[0] } else { $null }
+
+  $evidence = [pscustomobject]@{
+    mode = "local-dual-process"
+    controller_process_id = $controllerProcessId
+    peer_process_id = $peerProcessId
+    distinct_processes = (
+      $null -ne $controllerProcessId -and
+      $null -ne $peerProcessId -and
+      ([int64]$controllerProcessId) -ne ([int64]$peerProcessId)
+    )
+    controller_ipc_endpoint = $controllerIpcEndpoint
+    peer_ipc_endpoint = $peerIpcEndpoint
+    distinct_ipc_endpoints = (
+      $controllerIpcEndpoint.Trim() -and
+      $peerIpcEndpoint.Trim() -and
+      $controllerIpcEndpoint -ne $peerIpcEndpoint
+    )
+    controller_discovery_port = Select-CanaryObjectPropertyValue $Controller "discovery_port" $null
+    peer_discovery_port = Select-CanaryObjectPropertyValue $Peer "discovery_port" $null
+    controller_probe_endpoint = $controllerProbeEndpoint
+    peer_probe_endpoint = $peerProbeEndpoint
+    discovery_path = "udp_loopback_probe"
+    discovery_path_verified = (
+      $controllerProbeEndpoint -match "^127\.0\.0\.1:\d+$" -and
+      $peerProbeEndpoint -match "^127\.0\.0\.1:\d+$"
+    )
+    controller_device_id = Select-CanaryObjectPropertyValue $Controller "device_id" $null
+    peer_device_id = Select-CanaryObjectPropertyValue $Peer "device_id" $null
+    session_id = $sessionId
+    session_id_refs = @($sessionIds)
+    session_id_consistent = ($sessionIds.Count -eq 1)
+    session_cleanup_completed = Test-LanE2EReportCleanupCompleted -Report $Report
+    native_display_required = $true
+    native_display_verified = Test-CanaryNativeDisplayVerified -Report $Report
+    process_cleanup = "process_tree_stop_finally"
+    report_path = $ReportPath
+    run_dir = $RunDir
+  }
+  $gate = Test-LocalDualProcessServiceBoundaryEvidence -Evidence $evidence
+  $evidence | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue $gate
+  $evidence
 }
 
 function Normalize-CanaryCodec {
@@ -387,6 +615,7 @@ function Convert-CrossReportToCanaryRow {
     [string]$RequestedCodec = "h264"
   )
 
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
   $probe = $Report.probeSnapshot
   $pipeline = $Report.mediaPipelineSnapshot
   $adaptation = if ($Report.mediaAdaptationSnapshot) { $Report.mediaAdaptationSnapshot } elseif ($pipeline) { $pipeline.adaptation } else { $null }
@@ -395,6 +624,7 @@ function Convert-CrossReportToCanaryRow {
   } else {
     New-CanarySelectedProfile -Width $Profile.width -Height $Profile.height -Fps $Profile.fps -BitrateMbps $Profile.bitrate_mbps
   }
+  $frameGateFailureReason = Get-CrossCanaryFrameGateFailureReason -Report $Report
   $baseClassification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
   $renderCoalesceRatio = [double](Get-CanaryRenderCoalesceRatio -Probe $probe -Pipeline $pipeline)
   $pacedRenderCoalescing = ($renderCoalesceRatio -gt $script:CanaryMaxRenderDropRatio) -and
@@ -424,6 +654,8 @@ function Convert-CrossReportToCanaryRow {
   $senderTransport = Select-CanaryObjectPropertyValue $pipeline "sender_transport" $null
   $captureSource = Select-CanaryObjectPropertyValue $Report "captureSource" $null
   $activeDisplayMode = Select-CanaryObjectPropertyValue (Select-CanaryObjectPropertyValue $Report "displayModeChange" $null) "active" $null
+  $firstFrameTimeMs = Get-CanaryReportFirstFrameTimeMs -Report $Report
+  $maxZeroFrameWindowAfterFirstFrameMs = Select-CanaryObjectPropertyValue $Report "maxZeroFrameWindowAfterFirstFrameMs" $null
 
   [pscustomobject]@{
     id = $Profile.id
@@ -438,8 +670,9 @@ function Convert-CrossReportToCanaryRow {
     fps_observed = [double](Select-CanaryValue (Select-CanaryValue $Report.sampleObservedFps $probe.current_fps) 0)
     selected_profile = $selected
     session_established = [bool]($Report.sessionSnapshot -and $Report.sessionSnapshot.state -ne "failed")
-    first_frame_seen = [bool]($probe -and $probe.frames_decoded -gt 0)
-    first_frame_time_ms = $null
+    first_frame_seen = [bool](($null -ne $firstFrameTimeMs) -or ($probe -and $probe.frames_decoded -gt 0))
+    first_frame_time_ms = $firstFrameTimeMs
+    max_zero_frame_window_after_first_frame_ms = $maxZeroFrameWindowAfterFirstFrameMs
     decoded_frames = [int64](Select-CanaryValue $probe.frames_decoded 0)
     dropped_frames = $probeDropped
     probe_dropped_frames = $probeDropped
@@ -477,7 +710,7 @@ function Convert-CrossReportToCanaryRow {
     active_display_mode_source_id = Select-CanaryValue $activeDisplayMode.source_id $null
     active_display_refresh_hz = Select-CanaryValue $activeDisplayMode.refresh_hz $null
     raw_report_path = $ReportPath
-    error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue $displayLimitReason)
+    error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue (Select-CanaryValue $displayLimitReason $frameGateFailureReason))
     visual_integrity_status = if ($visualIntegrityIssue) { "risk" } elseif ($pacedRenderCoalescing) { "paced" } else { "ok" }
     visual_integrity_message = $visualIntegrityIssue
     actual_capture_source_id = Select-CanaryValue $captureSource.id $null
@@ -511,6 +744,7 @@ function Get-CrossCanaryStatus {
     return "skipped"
   }
   if ($Classification -eq "visual_integrity_risk") { return "failed" }
+  if ($Classification -eq "threshold_miss") { return "failed" }
   if ($Report.status -eq "completed") { return "completed" }
   if ($Report.status -eq "skipped") { return "skipped" }
   return [string]$Report.status
@@ -542,6 +776,9 @@ function Get-CrossCanaryClassification {
     return "profile_downgraded"
   }
   if ($Report.status -eq "completed") {
+    if (Get-CrossCanaryFrameGateFailureReason -Report $Report) {
+      return "threshold_miss"
+    }
     return "completed"
   }
   if ($Report.status -eq "skipped") {
@@ -988,8 +1225,8 @@ function Write-CanaryJsonAndMarkdown {
     "- Skipped: $($Report.skipped)",
     "- Failed: $($Report.failed)",
     "",
-    "| Profile | Status | Class | FPS | Render FPS | Render Target | Selected | Source | Display Mode | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Sender Drop cap/budget/impair | Render Coalesce | Render Stale Drop | Render Lock Drop | Present Skip | Queue | Error |",
-    "| --- | --- | --- | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
+    "| Profile | Status | Class | FPS | First Frame ms | Max Zero ms | Render FPS | Render Target | Selected | Source | Display Mode | Adaptive | Visual | Enc P50/P95 | Send P50/P95 | Present Gap P95 | Sample/Probe Drop | Drop Breakdown gap/decode/transient | Sender Drop cap/budget/impair | Render Coalesce | Render Stale Drop | Render Lock Drop | Present Skip | Queue | Error |",
+    "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |"
   )
   foreach ($row in $Report.rows) {
     $selected = "$($row.selected_profile.width)x$($row.selected_profile.height)@$($row.selected_profile.fps)/$($row.selected_profile.bitrate_mbps)Mbps"
@@ -1005,6 +1242,8 @@ function Write-CanaryJsonAndMarkdown {
     $sendP50 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p50_ms -Fallback 0), 2)
     $sendP95 = [Math]::Round([double](Select-CanarySenderSendStageValue -StageMap $row.stage_p95_ms -Fallback 0), 2)
     $estimatedRenderFps = [Math]::Round([double](Select-CanaryValue $row.estimated_render_fps 0), 2)
+    $firstFrameMs = Select-CanaryValue $row.first_frame_time_ms "-"
+    $maxZeroFrameWindowMs = Select-CanaryValue $row.max_zero_frame_window_after_first_frame_ms "-"
     $renderTargetFps = Select-CanaryValue $row.render_pacing_target_fps "-"
     $presentGapP95 = [Math]::Round([double](Select-CanaryValue $row.render_present_gap_p95_ms 0), 2)
     $probeDrops = Select-CanaryValue $row.sample_probe_dropped_frames (Select-CanaryValue $row.probe_dropped_frames $row.dropped_frames)
@@ -1020,7 +1259,7 @@ function Write-CanaryJsonAndMarkdown {
     $renderStaleDrops = Select-CanaryValue $row.render_stale_frame_drops 0
     $renderDrops = Select-CanaryValue $row.render_lock_drops 0
     $presentSkips = Select-CanaryValue $row.render_present_skips 0
-    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $estimatedRenderFps | $renderTargetFps | $selected | $source | $displayMode | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $senderDropBreakdown | $renderCoalesce | $renderStaleDrops | $renderDrops | $presentSkips | $($row.queue_depth) | $error |"
+    $lines += "| $($row.id) | $($row.status) | $($row.classification) | $([Math]::Round([double](Select-CanaryValue $row.fps_observed 0), 2)) | $firstFrameMs | $maxZeroFrameWindowMs | $estimatedRenderFps | $renderTargetFps | $selected | $source | $displayMode | $adaptive | $visual | $encodeP50/$encodeP95 | $sendP50/$sendP95 | $presentGapP95 | $probeDrops | $dropBreakdown | $senderDropBreakdown | $renderCoalesce | $renderStaleDrops | $renderDrops | $presentSkips | $($row.queue_depth) | $error |"
   }
   if ($Report.codec_request) {
     $lines += ""

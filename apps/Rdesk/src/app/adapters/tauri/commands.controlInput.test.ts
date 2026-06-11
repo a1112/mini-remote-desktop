@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getMockInvoke } from '@/test/mocks/tauri';
-import { ipcSendControlInput } from './commands';
+import { crossE2EInjectFault, ipcSendControlInput } from './commands';
 import { resetServiceBridgeConfigForTest } from '../serviceBridge/client';
 
 describe('control input command adapter', () => {
@@ -64,6 +64,59 @@ describe('control input command adapter', () => {
       type: 'SendControlInput',
       session_id: 'session-1',
       event,
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('injects cross-device E2E faults through the Tauri command', async () => {
+    const invoke = getMockInvoke();
+    invoke.mockResolvedValue({
+      session_id: 'session-1',
+      fault_type: 'renderer.detach_surface',
+      status: 'injected',
+      message: 'detached 1 native render surface(s)',
+      affected_surface_ids: ['surface-1'],
+    });
+
+    const result = await crossE2EInjectFault('session-1', 'renderer.detach_surface', 250);
+
+    expect(result.ok && result.value.message).toBe('detached 1 native render surface(s)');
+    expect(invoke).toHaveBeenCalledWith('cross_e2e_inject_fault', {
+      sessionId: 'session-1',
+      faultType: 'renderer.detach_surface',
+      durationMs: 250,
+    });
+  });
+
+  it('injects cross-device E2E faults through the browser service bridge', async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const invoke = getMockInvoke();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        response: {
+          type: 'CrossE2EFaultInjected',
+          result: {
+            session_id: 'session-1',
+            fault_type: 'network.pause_peer',
+            status: 'injected',
+            message: 'recorded test network pause impairment for 500 ms',
+            duration_ms: 500,
+          },
+        },
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await crossE2EInjectFault('session-1', 'network.pause_peer', 500);
+    const requestBody = JSON.parse((fetchMock.mock.calls[0]?.[1] as RequestInit).body as string);
+
+    expect(result.ok && result.value.duration_ms).toBe(500);
+    expect(requestBody.request).toEqual({
+      type: 'CrossE2EInjectFault',
+      session_id: 'session-1',
+      fault_type: 'network.pause_peer',
+      duration_ms: 500,
     });
     expect(invoke).not.toHaveBeenCalled();
   });
