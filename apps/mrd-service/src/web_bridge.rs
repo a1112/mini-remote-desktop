@@ -1,10 +1,11 @@
+#[cfg(feature = "browser-webrtc-preview")]
+use crate::browser_webrtc_preview::{
+    BrowserWebrtcPreviewHost, BrowserWebrtcPreviewStartRequest, BrowserWebrtcPreviewStopRequest,
+};
 use crate::{
     browser_webcodecs_preview::{
         spawn_browser_webcodecs_capture_sender, BrowserWebcodecsPreviewControlMessage,
         BrowserWebcodecsPreviewOutbound,
-    },
-    browser_webrtc_preview::{
-        BrowserWebrtcPreviewHost, BrowserWebrtcPreviewStartRequest, BrowserWebrtcPreviewStopRequest,
     },
     ipc_server::IpcServer,
     resource_monitor::{ResourceMonitor, ResourceSnapshotRequest},
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     future::pending,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -102,6 +103,7 @@ impl WebBridgeConfig {
 struct WebBridgeState {
     config: WebBridgeConfig,
     ipc_server: IpcServer,
+    #[cfg(feature = "browser-webrtc-preview")]
     browser_webrtc_preview: Arc<Mutex<BrowserWebrtcPreviewHost>>,
     resource_monitor: Arc<Mutex<ResourceMonitor>>,
 }
@@ -130,6 +132,7 @@ struct BridgeErrorPayload {
     message: String,
 }
 
+#[cfg(feature = "browser-webrtc-preview")]
 #[derive(Debug, Serialize)]
 struct BrowserWebrtcPreviewStopResponse {
     stopped: bool,
@@ -167,9 +170,10 @@ pub async fn wait_for_task(task: Option<JoinHandle<Result<()>>>) -> Result<()> {
 }
 
 pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
+    let cors_config = config.clone();
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin, _| {
-            is_localhost_origin(origin)
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            is_allowed_browser_origin(&cors_config, origin)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
@@ -198,6 +202,7 @@ pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
         .with_state(WebBridgeState {
             config,
             ipc_server,
+            #[cfg(feature = "browser-webrtc-preview")]
             browser_webrtc_preview: Arc::new(Mutex::new(BrowserWebrtcPreviewHost::default())),
             resource_monitor: Arc::new(Mutex::new(ResourceMonitor::new())),
         })
@@ -264,6 +269,7 @@ async fn browser_webcodecs_preview_ws_handler(
     ws.on_upgrade(move |socket| handle_browser_webcodecs_ws(socket, auth_error))
 }
 
+#[cfg(feature = "browser-webrtc-preview")]
 async fn browser_webrtc_preview_start(
     State(state): State<WebBridgeState>,
     headers: HeaderMap,
@@ -292,6 +298,27 @@ async fn browser_webrtc_preview_start(
     }
 }
 
+#[cfg(not(feature = "browser-webrtc-preview"))]
+async fn browser_webrtc_preview_start(
+    State(state): State<WebBridgeState>,
+    headers: HeaderMap,
+    Json(_request): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_headers(&state.config, &headers) {
+        return bridge_error_from_ipc_response(response).into_response();
+    }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(BridgeErrorPayload {
+            code: "E_BROWSER_WEBRTC_PREVIEW_DISABLED".to_string(),
+            message: "browser WebRTC preview is not compiled into this mrd-service build; rebuild with --features browser-webrtc-preview".to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "browser-webrtc-preview")]
 async fn browser_webrtc_preview_stop(
     State(state): State<WebBridgeState>,
     headers: HeaderMap,
@@ -318,6 +345,26 @@ async fn browser_webrtc_preview_stop(
         )
             .into_response(),
     }
+}
+
+#[cfg(not(feature = "browser-webrtc-preview"))]
+async fn browser_webrtc_preview_stop(
+    State(state): State<WebBridgeState>,
+    headers: HeaderMap,
+    Json(_request): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize_headers(&state.config, &headers) {
+        return bridge_error_from_ipc_response(response).into_response();
+    }
+
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(BridgeErrorPayload {
+            code: "E_BROWSER_WEBRTC_PREVIEW_DISABLED".to_string(),
+            message: "browser WebRTC preview is not compiled into this mrd-service build; rebuild with --features browser-webrtc-preview".to_string(),
+        }),
+    )
+        .into_response()
 }
 
 fn bridge_error_from_ipc_response(response: IpcResponse) -> (StatusCode, Json<BridgeErrorPayload>) {
@@ -659,18 +706,34 @@ fn is_loopback_addr(addr: &SocketAddr) -> bool {
 }
 
 fn is_localhost_origin(origin: &HeaderValue) -> bool {
-    let Ok(origin) = origin.to_str() else {
+    let Some(host) = origin_host(origin) else {
         return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+}
+
+fn is_allowed_browser_origin(config: &WebBridgeConfig, origin: &HeaderValue) -> bool {
+    is_localhost_origin(origin) || (config.requires_token() && is_private_lan_origin(origin))
+}
+
+fn is_private_lan_origin(origin: &HeaderValue) -> bool {
+    origin_host(origin)
+        .and_then(|host| host.parse::<Ipv4Addr>().ok())
+        .is_some_and(|ip| ip.is_private())
+}
+
+fn origin_host(origin: &HeaderValue) -> Option<&str> {
+    let Ok(origin) = origin.to_str() else {
+        return None;
     };
     let Some(rest) = origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
     else {
-        return false;
+        return None;
     };
     let host = rest.split('/').next().unwrap_or(rest);
-    let host = host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host);
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    Some(host.rsplit_once(':').map(|(host, _)| host).unwrap_or(host))
 }
 
 #[cfg(test)]
@@ -688,6 +751,24 @@ mod tests {
         assert!(!is_localhost_origin(&HeaderValue::from_static(
             "http://192.168.1.20:9531"
         )));
+    }
+
+    #[test]
+    fn private_lan_origins_require_tokenized_bridge() {
+        let loopback_config =
+            WebBridgeConfig::new("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None).unwrap();
+        let lan_config = WebBridgeConfig::new(
+            "0.0.0.0:9533".parse::<SocketAddr>().unwrap(),
+            Some("secret".to_string()),
+        )
+        .expect("LAN bridge config with token");
+
+        let lan_origin = HeaderValue::from_static("http://192.168.1.52:9531");
+        let public_origin = HeaderValue::from_static("http://203.0.113.10:9531");
+
+        assert!(!is_allowed_browser_origin(&loopback_config, &lan_origin));
+        assert!(is_allowed_browser_origin(&lan_config, &lan_origin));
+        assert!(!is_allowed_browser_origin(&lan_config, &public_origin));
     }
 
     #[test]
@@ -714,6 +795,30 @@ mod tests {
         assert!(html.contains("/health"));
         assert!(html.contains("/ipc"));
         assert!(html.contains("/ws"));
+    }
+
+    #[cfg(not(feature = "browser-webrtc-preview"))]
+    #[tokio::test]
+    async fn browser_webrtc_preview_reports_disabled_without_feature() {
+        let config =
+            WebBridgeConfig::new("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None).unwrap();
+        let state = WebBridgeState {
+            config,
+            ipc_server: IpcServer::new(Arc::new(crate::app_state::AppState::new())),
+            resource_monitor: Arc::new(Mutex::new(ResourceMonitor::new())),
+        };
+
+        let response = browser_webrtc_preview_start(
+            State(state),
+            HeaderMap::new(),
+            Json(serde_json::json!({
+                "session_id": "preview-session",
+                "offer_sdp": "v=0"
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]

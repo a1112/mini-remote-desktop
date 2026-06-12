@@ -65,6 +65,9 @@ bytes = "1"
 [patch.crates-io]
 nvenc = { path = "vendor/nvenc" }
 
+[profile.dev]
+debug = 1
+
 [profile.dev.package.app]
 codegen-units = 1
 opt-level = 2

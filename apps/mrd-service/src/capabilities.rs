@@ -1543,7 +1543,9 @@ fn software_vvc_combined_status(probe_mode: CapabilityProbeMode) -> (CapabilityS
 }
 
 fn software_vvc_encode_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
-    if !cfg!(feature = "production-vvc-software-codec") {
+    #[cfg(not(feature = "production-vvc-software-codec"))]
+    {
+        let _ = probe_mode;
         return (
             CapabilityStatus::Unimplemented,
             "H.266/VVC software encode requires mrd-service feature production-vvc-software-codec, mrd-encode-vvenc feature software-vvenc, and libvvenc >= 1.13.0."
@@ -1551,24 +1553,27 @@ fn software_vvc_encode_status(probe_mode: CapabilityProbeMode) -> (CapabilitySta
         );
     }
 
-    match probe_mode {
-        CapabilityProbeMode::Static => (
-            CapabilityStatus::Supported,
-            "H.266/VVC software encode is compiled through VVenC; runtime probe is pending."
-                .to_string(),
-        ),
-        CapabilityProbeMode::Runtime => {
-            match mrd_encode_vvenc::probe_vvenc_software_encoder_available() {
-                Ok(()) => (
-                    CapabilityStatus::Available,
-                    "H.266/VVC software encode is available through VVenC.".to_string(),
-                ),
-                Err(error) => (
-                    CapabilityStatus::DriverMissing,
-                    format!(
+    #[cfg(feature = "production-vvc-software-codec")]
+    {
+        match probe_mode {
+            CapabilityProbeMode::Static => (
+                CapabilityStatus::Supported,
+                "H.266/VVC software encode is compiled through VVenC; runtime probe is pending."
+                    .to_string(),
+            ),
+            CapabilityProbeMode::Runtime => {
+                match mrd_encode_vvenc::probe_vvenc_software_encoder_available() {
+                    Ok(()) => (
+                        CapabilityStatus::Available,
+                        "H.266/VVC software encode is available through VVenC.".to_string(),
+                    ),
+                    Err(error) => (
+                        CapabilityStatus::DriverMissing,
+                        format!(
                         "H.266/VVC software encode requires a working libvvenc runtime: {error}"
                     ),
-                ),
+                    ),
+                }
             }
         }
     }

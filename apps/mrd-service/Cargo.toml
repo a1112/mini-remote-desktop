@@ -18,7 +18,7 @@ axum = { workspace = true, features = ["ws"] }
 mrd-application = { path = "../../crates/mrd-application" }
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
-mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc" }
+mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }
 mrd-input = { path = "../../crates/mrd-input" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
@@ -26,7 +26,7 @@ mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
 mrd-render = { path = "../../crates/mrd-render" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
-mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
+mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc", optional = true }
 base64 = "0.22"
 bytes.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -38,7 +38,7 @@ tokio.workspace = true
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-webrtc = "0.12"
+webrtc = { version = "0.12", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-dxgi = { path = "../../crates/mrd-capture-dxgi" }
@@ -61,7 +61,9 @@ mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 
 [features]
 default = []
+browser-webrtc-preview = ["dep:mrd-transport-webrtc", "dep:webrtc"]
 production-vvc-software-codec = [
+  "dep:mrd-encode-vvenc",
   "mrd-decode/production-vvc-software-codec",
   "mrd-encode-vvenc/production-vvc-software-codec",
 ]

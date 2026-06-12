@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  hasConfiguredServiceBridgeEndpoint,
   invokeServiceBridgeIpc,
   resetServiceBridgeConfigForTest,
   serviceBridgeHealth,
+  serviceBridgeWebSocketUrl,
+  setServiceBridgeEndpointForTest,
 } from './client';
 
 describe('service bridge client', () => {
@@ -66,5 +69,14 @@ describe('service bridge client', () => {
 
     expect(result.ok).toBe(false);
     expect(result.ok ? '' : result.error.message).toContain('E_WEB_BRIDGE_FORBIDDEN');
+  });
+
+  it('treats an explicit endpoint override as configured for LAN browser mode', () => {
+    setServiceBridgeEndpointForTest('http://192.168.1.52:9533');
+
+    expect(hasConfiguredServiceBridgeEndpoint()).toBe(true);
+    expect(serviceBridgeWebSocketUrl('/browser/webcodecs-preview/ws')).toBe(
+      'ws://192.168.1.52:9533/browser/webcodecs-preview/ws'
+    );
   });
 });

@@ -1,9 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use mrd_ipc::{IpcRequest, IpcResponse, RemoteDevicePowerAction, ShutdownMode};
+#[cfg(feature = "browser-webrtc-preview")]
+use mrd_service::browser_webrtc_preview::sanitize_browser_preview_fps;
 use mrd_service::{
     app_state::AppState,
-    browser_webrtc_preview::sanitize_browser_preview_fps,
     ipc_server::IpcServer,
     web_bridge::{dispatch_ipc_for_test, is_ipc_request_allowed, WebBridgeConfig},
 };
@@ -54,6 +55,7 @@ fn bridge_allows_only_browser_safe_ipc_requests() {
     }));
 }
 
+#[cfg(feature = "browser-webrtc-preview")]
 #[test]
 fn browser_webrtc_preview_allows_144_fps_followup_target() {
     assert_eq!(sanitize_browser_preview_fps(Some(120)), 120);

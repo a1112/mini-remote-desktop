@@ -5,6 +5,7 @@
 pub mod app_state;
 mod browser_preview_capture;
 pub mod browser_webcodecs_preview;
+#[cfg(feature = "browser-webrtc-preview")]
 pub mod browser_webrtc_preview;
 pub mod capabilities;
 pub mod capture_source;

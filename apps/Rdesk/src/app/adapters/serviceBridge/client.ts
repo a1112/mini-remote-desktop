@@ -22,6 +22,8 @@ export interface ServiceBridgeHealth {
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:9532';
 const ENDPOINT_STORAGE_KEY = 'mrd.serviceBridge.endpoint';
 const TOKEN_STORAGE_KEY = 'mrd.serviceBridge.token';
+const ENV_ENDPOINT = envString('VITE_MRD_SERVICE_BRIDGE_ENDPOINT');
+const ENV_TOKEN = envString('VITE_MRD_SERVICE_BRIDGE_TOKEN');
 
 let endpointOverrideForTest: string | null = null;
 
@@ -29,7 +31,16 @@ export function serviceBridgeEndpoint(): string {
   if (endpointOverrideForTest) return endpointOverrideForTest;
   if (typeof window === 'undefined') return DEFAULT_ENDPOINT;
   const configured = window.localStorage?.getItem(ENDPOINT_STORAGE_KEY)?.trim();
-  return configured || DEFAULT_ENDPOINT;
+  return configured || ENV_ENDPOINT || DEFAULT_ENDPOINT;
+}
+
+export function hasConfiguredServiceBridgeEndpoint(): boolean {
+  if (endpointOverrideForTest) return true;
+  if (typeof window !== 'undefined') {
+    const configured = window.localStorage?.getItem(ENDPOINT_STORAGE_KEY)?.trim();
+    if (configured) return true;
+  }
+  return Boolean(ENV_ENDPOINT);
 }
 
 export function serviceBridgeWebSocketUrl(path: string): string {
@@ -38,7 +49,7 @@ export function serviceBridgeWebSocketUrl(path: string): string {
   url.pathname = path;
   url.search = '';
   if (typeof window !== 'undefined') {
-    const token = window.localStorage?.getItem(TOKEN_STORAGE_KEY)?.trim();
+    const token = serviceBridgeToken();
     if (token) url.searchParams.set('token', token);
   }
   return url.toString();
@@ -135,12 +146,14 @@ function requestHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  const token =
-    typeof window === 'undefined'
-      ? null
-      : window.localStorage?.getItem(TOKEN_STORAGE_KEY)?.trim();
+  const token = serviceBridgeToken();
   if (token) headers['X-MRD-Bridge-Token'] = token;
   return headers;
+}
+
+function serviceBridgeToken(): string {
+  if (typeof window === 'undefined') return ENV_TOKEN;
+  return window.localStorage?.getItem(TOKEN_STORAGE_KEY)?.trim() || ENV_TOKEN;
 }
 
 function adapterError<T = never>(message: string): AdapterResult<T> {
@@ -149,4 +162,11 @@ function adapterError<T = never>(message: string): AdapterResult<T> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function envString(key: string): string {
+  const value = ((import.meta as unknown as { env?: Record<string, string | undefined> }).env?.[
+    key
+  ] ?? '').trim();
+  return value;
 }

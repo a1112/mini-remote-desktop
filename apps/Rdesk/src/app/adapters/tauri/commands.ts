@@ -80,6 +80,7 @@ import type {
 import {
   invokeServiceBridgeIpc,
   postServiceBridgeJson,
+  hasConfiguredServiceBridgeEndpoint,
   serviceBridgeHealth,
   serviceBridgeWebSocketUrl,
   type ServiceBridgeIpcRequest,
@@ -162,18 +163,26 @@ function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): Enviro
 }
 
 function isLocalBrowserFallbackAllowed(): boolean {
+  return isBrowserContext() && isLoopbackBrowserHost();
+}
+
+function isBrowserContext(): boolean {
   if (typeof window === 'undefined') return false;
   if ('__TAURI_INTERNALS__' in window) return false;
+  return true;
+}
+
+function isLoopbackBrowserHost(): boolean {
   const host = window.location.hostname;
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
 function shouldUseServiceBridge(): boolean {
-  if (!isLocalBrowserFallbackAllowed()) return false;
+  if (!isBrowserContext()) return false;
   if (import.meta.env.MODE === 'test') {
     return Boolean((window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__);
   }
-  return true;
+  return isLoopbackBrowserHost() || hasConfiguredServiceBridgeEndpoint();
 }
 
 function browserDevCapabilities(): EnvironmentSnapshot | null {
