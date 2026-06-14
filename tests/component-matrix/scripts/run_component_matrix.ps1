@@ -4,6 +4,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path $RepoRoot).Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "component_matrix_common.ps1")
+$powershell = Resolve-ComponentMatrixPowerShellExecutable
 $cases = @(
   "tests/component-matrix/cases/capture.dxgi.json",
   "tests/component-matrix/cases/encode.openh264.json",
@@ -22,7 +25,7 @@ $cases = @(
 )
 
 foreach ($casePath in $cases) {
-  powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/component-matrix/scripts/run_component_case.ps1') `
+  & $powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/component-matrix/scripts/run_component_case.ps1') `
     -CasePath $casePath `
     -RepoRoot $repo
 }

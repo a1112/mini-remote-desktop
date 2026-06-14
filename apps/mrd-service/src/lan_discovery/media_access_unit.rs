@@ -77,8 +77,23 @@ pub(super) fn h264_access_unit_is_keyframe(metadata_is_keyframe: bool, payload: 
 pub(super) fn describe_lan_access_unit(codec: LanAccessUnitCodec, payload: &[u8]) -> String {
     match codec {
         LanAccessUnitCodec::H264 => describe_h264_access_unit(payload),
-        LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => describe_hevc_access_unit(payload),
+        LanAccessUnitCodec::Hevc => describe_hevc_access_unit(payload),
+        LanAccessUnitCodec::Av1 => describe_av1_access_unit(payload),
     }
+}
+
+fn describe_av1_access_unit(payload: &[u8]) -> String {
+    let prefix_hex = payload
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "AV1 access unit bytes={} prefix=[{}]",
+        payload.len(),
+        prefix_hex
+    )
 }
 
 fn describe_hevc_access_unit(payload: &[u8]) -> String {

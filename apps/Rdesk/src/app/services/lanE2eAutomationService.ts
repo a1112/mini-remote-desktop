@@ -22,6 +22,7 @@ import {
   type CapabilityProfile,
   type ProfileProbeResult,
 } from "./capabilityMatrix";
+import { captureSourceAvailableForAutoSelect } from "./captureSourceAvailability";
 
 export type LanE2EStatus = "running" | "completed" | "failed" | "skipped";
 
@@ -97,6 +98,7 @@ export interface LanE2EAutomationOptions {
   expectedPeerBuildId?: string;
   renderProfileCap?: boolean;
   renderDisplay?: boolean;
+  fitRequestedProfileToCaptureSource?: boolean;
   adaptive?: boolean;
   adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
@@ -382,6 +384,8 @@ export async function runLanE2EAutomation(
   const displayModePolicy = options.displayModePolicy ?? "none";
   const renderProfileCapEnabled = options.renderProfileCap ?? true;
   const renderDisplayEnabled = options.renderDisplay ?? true;
+  const fitRequestedProfileToCaptureSource =
+    options.fitRequestedProfileToCaptureSource ?? false;
   const requestMediaProfile = shouldRequestMediaProfile(scenarioId, transportKind);
   let requestedProfile = options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
@@ -625,6 +629,14 @@ export async function runLanE2EAutomation(
     );
     captureSource = captureSourceSelection.source;
     stage("capture_source", "completed");
+    if (fitRequestedProfileToCaptureSource && requestedProfile && captureSource) {
+      requestedProfile = await maybeFitRequestedProfileToCaptureSource(
+        commands,
+        sessionId,
+        requestedProfile,
+        captureSource
+      );
+    }
 
     if (displayModePolicy !== "none" && requestedProfile) {
       stage("display_mode", "started");
@@ -959,9 +971,13 @@ export async function runLanE2EAutomation(
         captureSource,
         validationMode
       );
+      const profileProbeMismatch = describeProfileProbeFailure(profileProbeResult);
+      const pipelineProfileMismatch = describeMediaPipelineProfileMismatch(
+        mediaPipelineSnapshot,
+        requestedProfile
+      );
       const profileMismatch =
-        describeProfileProbeFailure(profileProbeResult) ??
-        describeMediaPipelineProfileMismatch(mediaPipelineSnapshot, requestedProfile);
+        profileProbeMismatch ?? pipelineProfileMismatch?.message ?? null;
       const sampleReadinessDurationMs = sampleFpsBaseline
         ? sampleFpsElapsedMs ?? 0
         : sampleDurationMs;
@@ -970,7 +986,9 @@ export async function runLanE2EAutomation(
         minSampleDurationMs
       );
       if (!options.adaptive && profileMismatch && sampleDurationReady) {
-        const exactProfileRequired = scenarioRequiresExactProfileMatch(scenarioId);
+        const exactProfileRequired =
+          scenarioRequiresExactProfileMatch(scenarioId) ||
+          pipelineProfileMismatch?.exactRequired === true;
         stage("assert", exactProfileRequired ? "failed" : "skipped", profileMismatch);
         return finish(
           exactProfileRequired ? "failed" : "skipped",
@@ -1153,6 +1171,96 @@ function buildRenderCappedMediaProfile(
     ...requestedProfile,
     fps: Math.max(1, Math.floor(renderTargetFps)),
   };
+}
+
+async function maybeFitRequestedProfileToCaptureSource(
+  commands: LanE2EAutomationCommands,
+  sessionId: string,
+  requestedProfile: MediaProfile,
+  captureSource: CaptureSource
+): Promise<MediaProfile> {
+  const fittedProfile = buildCaptureSourceFittedMediaProfile(
+    requestedProfile,
+    captureSource
+  );
+  if (!fittedProfile) return requestedProfile;
+  if (!commands.ipcUpdateMediaProfile) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      "Source-fitted media profile requires ipcUpdateMediaProfile support"
+    );
+  }
+  let nextProfile = fittedProfile;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const negotiation = await unwrap(
+      commands.ipcUpdateMediaProfile(sessionId, nextProfile),
+      "runtime_error"
+    );
+    const selectedProfile = selectedProfileFromNegotiation(negotiation, nextProfile);
+    if (mediaProfilesMatch(selectedProfile, nextProfile)) {
+      return selectedProfile;
+    }
+    nextProfile = selectedProfile;
+  }
+  return nextProfile;
+}
+
+function buildCaptureSourceFittedMediaProfile(
+  requestedProfile: MediaProfile,
+  captureSource: CaptureSource
+): MediaProfile | undefined {
+  const fit = fitSourceWithinProfile(captureSource, requestedProfile);
+  if (!fit) return undefined;
+  if (fit.width === requestedProfile.width && fit.height === requestedProfile.height) {
+    return undefined;
+  }
+  return {
+    ...requestedProfile,
+    width: fit.width,
+    height: fit.height,
+  };
+}
+
+function selectedProfileFromNegotiation(
+  negotiation: unknown,
+  fallback: MediaProfile
+): MediaProfile {
+  if (
+    negotiation &&
+    typeof negotiation === "object" &&
+    "selected" in negotiation &&
+    isMediaProfileLike((negotiation as { selected?: unknown }).selected)
+  ) {
+    return (negotiation as { selected: MediaProfile }).selected;
+  }
+  return fallback;
+}
+
+function isMediaProfileLike(value: unknown): value is MediaProfile {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    typeof (value as MediaProfile).width === "number" &&
+    typeof (value as MediaProfile).height === "number" &&
+    typeof (value as MediaProfile).fps === "number" &&
+    typeof (value as MediaProfile).bitrate_mbps === "number" &&
+    typeof (value as MediaProfile).codec === "string"
+  );
+}
+
+function mediaProfilesMatch(left: MediaProfile, right: MediaProfile): boolean {
+  return (
+    left.width === right.width &&
+    left.height === right.height &&
+    left.fps === right.fps &&
+    left.bitrate_mbps === right.bitrate_mbps &&
+    normalizeMediaCodec(left.codec) === normalizeMediaCodec(right.codec) &&
+    (left.codec_profile ?? null) === (right.codec_profile ?? null) &&
+    (left.bit_depth ?? null) === (right.bit_depth ?? null) &&
+    (left.chroma_subsampling ?? null) === (right.chroma_subsampling ?? null) &&
+    (left.pixel_format ?? null) === (right.pixel_format ?? null) &&
+    (left.hdr_enabled ?? null) === (right.hdr_enabled ?? null)
+  );
 }
 
 function hasReachedSampleDuration(
@@ -1363,7 +1471,7 @@ async function selectRemoteCaptureSourceForSession(
   if (!preferredSource) {
     throw new LanE2ECommandError(
       "capture_source_failed",
-      "No remote capture source available for LAN E2E"
+      noAutoSelectableCaptureSourceMessage(sources, preferredSourceKind)
     );
   }
 
@@ -1472,15 +1580,23 @@ function displayCaptureCandidatesForProfile(
   const normalizedPreferredKind = preferredSourceKind?.trim();
   const isDisplaySource = (source: CaptureSource) =>
     source.source_kind === "display_shared" || source.source_kind === "display";
+  const availableDisplaySource = (source: CaptureSource) =>
+    isDisplaySource(source) && captureSourceAvailableForAutoSelect(source);
   if (normalizedPreferredKind) {
     return sources.filter(
-      (source) => source.source_kind === normalizedPreferredKind && isDisplaySource(source)
+      (source) => source.source_kind === normalizedPreferredKind && availableDisplaySource(source)
     );
   }
 
-  const sharedDisplays = sources.filter((source) => source.source_kind === "display_shared");
+  const sharedDisplays = sources.filter(
+    (source) =>
+      source.source_kind === "display_shared" && captureSourceAvailableForAutoSelect(source)
+  );
   if (sharedDisplays.length > 1) return sharedDisplays;
-  const displays = sources.filter((source) => source.source_kind === "display");
+  const displays = sources.filter(
+    (source) =>
+      source.source_kind === "display" && captureSourceAvailableForAutoSelect(source)
+  );
   if (displays.length > 1) return displays;
   return [];
 }
@@ -1501,16 +1617,62 @@ function pickPreferredCaptureSource(
   preferredSourceKind?: string
 ): CaptureSource | undefined {
   const normalizedPreferredKind = preferredSourceKind?.trim();
+  const autoSelectableSources = sources.filter(captureSourceAvailableForAutoSelect);
   if (normalizedPreferredKind) {
-    const matchingKind = sources.find((source) => source.source_kind === normalizedPreferredKind);
+    const matchingKind = autoSelectableSources.find(
+      (source) => source.source_kind === normalizedPreferredKind
+    );
     if (matchingKind) return matchingKind;
   }
   return (
-    sources.find((source) => source.source_kind === "display_shared") ??
-    sources.find((source) => source.source_kind === "display") ??
-    sources.find((source) => source.source_kind === "window") ??
-    sources[0]
+    autoSelectableSources.find((source) => source.source_kind === "display_shared") ??
+    autoSelectableSources.find((source) => source.source_kind === "display") ??
+    autoSelectableSources.find((source) => source.source_kind === "window") ??
+    autoSelectableSources[0]
   );
+}
+
+function noAutoSelectableCaptureSourceMessage(
+  sources: CaptureSource[],
+  preferredSourceKind?: string
+): string {
+  if (sources.length === 0) return "No remote capture source available for LAN E2E";
+
+  const normalizedPreferredKind = preferredSourceKind?.trim();
+  const unavailableSources = sources.filter((source) => !captureSourceAvailableForAutoSelect(source));
+  const classSummary = summarizeCaptureSourceClasses(unavailableSources);
+  const reasonSummary = unavailableSources
+    .map(captureSourceUnavailableReason)
+    .filter((reason): reason is string => Boolean(reason))
+    .slice(0, 2)
+    .join("; ");
+  const kindSummary = normalizedPreferredKind ? ` matching '${normalizedPreferredKind}'` : "";
+  return [
+    `No remote capture source available for LAN E2E: ${sources.length} remote source(s) listed, but no automatically selectable${kindSummary} source was available`,
+    classSummary ? `unavailable classes: ${classSummary}` : "",
+    reasonSummary,
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+function summarizeCaptureSourceClasses(sources: CaptureSource[]): string {
+  const counts = new Map<string, number>();
+  for (const source of sources) {
+    const className = source.class_name.trim() || "unknown";
+    counts.set(className, (counts.get(className) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([className, count]) => `${className}=${count}`)
+    .join(", ");
+}
+
+function captureSourceUnavailableReason(source: CaptureSource): string | undefined {
+  const appName = source.app_name?.trim();
+  if (appName?.toLowerCase().includes("unavailable")) return appName;
+  const title = source.title.trim() || source.id;
+  const className = source.class_name.trim();
+  return className ? `${source.source_kind} '${title}' is unavailable (${className})` : undefined;
 }
 
 async function waitForLanPeer(
@@ -1876,10 +2038,15 @@ function describeProfileProbeFailure(result: ProfileProbeResult | undefined): st
   return result.error ?? `Runtime media profile probe failed: ${result.status}`;
 }
 
+type MediaPipelineProfileMismatch = {
+  message: string;
+  exactRequired: boolean;
+};
+
 function describeMediaPipelineProfileMismatch(
   snapshot: MediaPipelineSnapshot | undefined,
   requestedProfile: MediaProfile | undefined
-): string | null {
+): MediaPipelineProfileMismatch | null {
   if (!snapshot || !requestedProfile) return null;
 
   const mismatches = [
@@ -1901,9 +2068,12 @@ function describeMediaPipelineProfileMismatch(
   ].filter((entry): entry is string => Boolean(entry));
 
   if (mismatches.length === 0) return null;
-  return `Runtime media pipeline profile mismatch: requested ${formatMediaProfile(
-    requestedProfile
-  )}; ${mismatches.join(", ")}`;
+  return {
+    message: `Runtime media pipeline profile mismatch: requested ${formatMediaProfile(
+      requestedProfile
+    )}; ${mismatches.join(", ")}`,
+    exactRequired: true,
+  };
 }
 
 function compareOptionalProfileString(

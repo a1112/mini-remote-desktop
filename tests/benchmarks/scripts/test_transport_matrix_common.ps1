@@ -365,10 +365,11 @@ foreach ($spec in $scenarioSpecs) {
 $processTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-process-{0}" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $processTmp | Out-Null
 try {
+  $powershell = Resolve-TransportMatrixPowerShellExecutable
   $stdout = Join-Path $processTmp "stdout.log"
   $stderr = Join-Path $processTmp "stderr.log"
   $exitCode = Invoke-TransportMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powershell `
     -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
     -WorkingDirectory $processTmp `
     -StdoutPath $stdout `
@@ -380,7 +381,7 @@ try {
   if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
 
   $timeoutResult = Invoke-TransportMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powershell `
     -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 5; Write-Output 'too-late'; exit 0") `
     -WorkingDirectory $processTmp `
     -StdoutPath $stdout `

@@ -162,11 +162,11 @@ pub(super) fn parse_windows_window_source_id(source_id: &str) -> Result<isize> {
     crate::capture_source::parse_windows_window_hwnd_source_id(source_id)
 }
 
-pub(super) fn is_windows_window_source_id(source_id: &str) -> bool {
-    source_id
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("windows:window:")
+pub(super) fn is_window_source_id(source_id: &str) -> bool {
+    let normalized = source_id.trim().to_ascii_lowercase();
+    normalized.starts_with("windows:window:")
+        || normalized.starts_with("macos:window:")
+        || normalized.starts_with("linux:window:")
 }
 
 #[cfg(test)]
@@ -256,6 +256,28 @@ mod tests {
         );
 
         assert_eq!(message, "display source failed");
+    }
+
+    #[test]
+    fn window_source_id_matches_all_supported_platforms() {
+        assert!(is_window_source_id("windows:window:0x1234"));
+        assert!(is_window_source_id("macos:window:0x5B2"));
+        assert!(is_window_source_id("linux:window:42"));
+        assert!(!is_window_source_id("macos:display:0x1"));
+        assert!(!is_window_source_id("windows:display-shared:0"));
+    }
+
+    #[test]
+    fn macos_window_capture_failure_gets_window_error_code() {
+        let message = format_capture_source_failure(
+            "macos:window:0x5B2",
+            "failed to capture LAN desktop frame: macOS LAN capture pump timed out waiting for a captured frame"
+                .to_string(),
+            is_window_source_id,
+        );
+
+        assert!(message.contains("WINDOW_CAPTURE_SOURCE_NOT_FOUND"));
+        assert!(message.contains("macos:window:0x5B2"));
     }
 
     #[cfg(windows)]

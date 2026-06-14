@@ -39,6 +39,8 @@ pub(super) const LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "videotoolbox_h
 #[cfg(target_os = "macos")]
 pub(super) const LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "videotoolbox_hevc";
 #[cfg(target_os = "macos")]
+pub(super) const LAN_ENCODE_VIDEOTOOLBOX_AV1_CAPABILITY: &str = "videotoolbox_av1";
+#[cfg(target_os = "macos")]
 pub(super) const LAN_DECODE_VIDEOTOOLBOX_CAPABILITY: &str = "videotoolbox";
 #[cfg(target_os = "macos")]
 pub(super) const LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY: &str = "decode.videotoolbox_h264";
@@ -111,6 +113,7 @@ pub(super) fn lan_media_capabilities_with_input_control(
 pub(super) struct MacosLanMediaCapabilityProbe {
     pub(super) videotoolbox_h264_encoder: bool,
     pub(super) videotoolbox_hevc_encoder: bool,
+    pub(super) videotoolbox_av1_encoder: bool,
     pub(super) videotoolbox_h264_decoder: bool,
     pub(super) videotoolbox_hevc_decoder: bool,
 }
@@ -138,6 +141,8 @@ pub(super) fn probe_macos_lan_media_capabilities() -> MacosLanMediaCapabilityPro
             640, 480, 30,
         )
         .is_ok(),
+        videotoolbox_av1_encoder: mrd_codec_videotoolbox::VideoToolboxAv1Encoder::new(640, 480, 30)
+            .is_ok(),
         videotoolbox_h264_decoder: videotoolbox_decoder_enabled()
             && mrd_codec_videotoolbox::VideoToolboxH264Decoder::new().is_ok(),
         videotoolbox_hevc_decoder: videotoolbox_decoder_enabled()
@@ -154,6 +159,8 @@ pub(super) fn macos_lan_media_capabilities_from_probe(
         LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string(),
         "openh264_fallback".to_string(),
         "software_decode".to_string(),
+        "software_av1".to_string(),
+        "decode.software_av1".to_string(),
     ];
     if probe.videotoolbox_h264_encoder {
         capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());
@@ -161,6 +168,11 @@ pub(super) fn macos_lan_media_capabilities_from_probe(
     if probe.videotoolbox_hevc_encoder {
         capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string());
         capabilities.push(LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string());
+    }
+    if probe.videotoolbox_av1_encoder {
+        capabilities.push(LAN_ENCODE_VIDEOTOOLBOX_AV1_CAPABILITY.to_string());
+        capabilities.push("encode.videotoolbox_av1".to_string());
+        capabilities.push(LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string());
     }
     if probe.videotoolbox_h264_decoder {
         capabilities.push(LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string());

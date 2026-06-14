@@ -1,16 +1,52 @@
+function Get-ComponentChildProcessIds {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int]$ParentProcessId
+  )
+
+  if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.ParentProcessId -eq $ParentProcessId } |
+      ForEach-Object { [int]$_.ProcessId })
+  }
+
+  $pgrep = Get-Command pgrep -ErrorAction SilentlyContinue
+  if ($pgrep) {
+    return @(& $pgrep.Source -P $ParentProcessId 2> $null |
+      Where-Object { $_ -match '^\d+$' } |
+      ForEach-Object { [int]$_ })
+  }
+
+  return @()
+}
+
 function Stop-ComponentProcessTree {
   param(
     [Parameter(Mandatory = $true)]
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-ComponentProcessTree -ProcessId $child.ProcessId
+  foreach ($childProcessId in @(Get-ComponentChildProcessIds -ParentProcessId $ProcessId)) {
+    Stop-ComponentProcessTree -ProcessId $childProcessId
   }
 
   Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Resolve-ComponentMatrixPowerShellExecutable {
+  $currentProcess = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentProcess -and -not [string]::IsNullOrWhiteSpace($currentProcess.Path)) {
+    return $currentProcess.Path
+  }
+
+  foreach ($candidate in @("pwsh", "powershell", "powershell.exe")) {
+    $command = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+      return $command.Source
+    }
+  }
+
+  throw "Unable to find a PowerShell executable. Install PowerShell 7 (pwsh) or Windows PowerShell."
 }
 
 function Invoke-ComponentMatrixCommand {
@@ -42,10 +78,11 @@ function Invoke-ComponentMatrixCommand {
 
   $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
   if ($null -eq $completed) {
-    $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.ParentProcessId -eq $job.ChildJobs[0].ProcessId })
-    foreach ($child in $childProcesses) {
-      Stop-ComponentProcessTree -ProcessId $child.ProcessId
+    $jobProcessId = $job.ChildJobs[0].ProcessId
+    if ($null -ne $jobProcessId) {
+      foreach ($childProcessId in @(Get-ComponentChildProcessIds -ParentProcessId $jobProcessId)) {
+        Stop-ComponentProcessTree -ProcessId $childProcessId
+      }
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
@@ -82,7 +119,8 @@ function Invoke-ComponentMatrixSummaryIfAvailable {
   if ($ThresholdPath) {
     $args += @("-ThresholdPath", $ThresholdPath)
   }
-  & powershell @args
+  $powershell = Resolve-ComponentMatrixPowerShellExecutable
+  & $powershell @args
   if ($LASTEXITCODE -ne 0) {
     throw "component summary failed with exit code $LASTEXITCODE for $RunDir"
   }

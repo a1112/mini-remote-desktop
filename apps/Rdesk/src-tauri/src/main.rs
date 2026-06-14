@@ -88,6 +88,7 @@ const LAN_E2E_RENDER_DISPLAY_SOURCE_ID_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY_S
 const LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV: &str = "MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID";
 const LAN_E2E_RENDER_PROFILE_CAP_ENV: &str = "MRD_LAN_E2E_RENDER_PROFILE_CAP";
 const LAN_E2E_RENDER_DISPLAY_ENV: &str = "MRD_LAN_E2E_RENDER_DISPLAY";
+const LAN_E2E_SOURCE_FIT_PROFILE_ENV: &str = "MRD_LAN_E2E_SOURCE_FIT_PROFILE";
 const LAN_E2E_ADAPTIVE_ENV: &str = "MRD_LAN_E2E_ADAPTIVE";
 const MAINLINE_E2E_ARTIFACT_ROOT_ENV: &str = "MRD_E2E_ARTIFACT_ROOT";
 const MAINLINE_E2E_ARTIFACT_KIND: &str = "mainline_e2e_artifacts_v1";
@@ -3273,6 +3274,7 @@ fn test_harness_set_custom(
         | "sw_h264" => EncoderType::OpenH264,
         "videotoolbox_h264" | "videotoolbox" => EncoderType::VideoToolboxH264,
         "videotoolbox_hevc" => EncoderType::VideoToolboxHevc,
+        "videotoolbox_av1" => EncoderType::VideoToolboxAv1,
         _ => return Err(format!("Unsupported encoder type: {}", encoder)),
     };
     let decoder = match decoder.as_str() {
@@ -3723,6 +3725,7 @@ struct LanE2eAutorunLaunchConfig {
     expected_peer_build_id: Option<String>,
     render_profile_cap: Option<String>,
     render_display: Option<String>,
+    source_fit_profile: Option<String>,
     adaptive: Option<String>,
 }
 
@@ -3767,6 +3770,7 @@ where
         expected_peer_build_id: non_empty_env(env(LAN_E2E_EXPECTED_PEER_BUILD_ID_ENV)),
         render_profile_cap: non_empty_env(env(LAN_E2E_RENDER_PROFILE_CAP_ENV)),
         render_display: non_empty_env(env(LAN_E2E_RENDER_DISPLAY_ENV)),
+        source_fit_profile: non_empty_env(env(LAN_E2E_SOURCE_FIT_PROFILE_ENV)),
         adaptive: non_empty_env(env(LAN_E2E_ADAPTIVE_ENV)),
     })
 }
@@ -3817,6 +3821,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     );
     push_query_param(&mut params, "renderProfileCap", config.render_profile_cap);
     push_query_param(&mut params, "renderDisplay", config.render_display);
+    push_query_param(&mut params, "sourceFitProfile", config.source_fit_profile);
     push_query_param(&mut params, "adaptive", config.adaptive);
 
     let query = params
@@ -3929,12 +3934,13 @@ mod tray_tests {
             expected_peer_build_id: Some("abc123def456".to_string()),
             render_profile_cap: Some("false".to_string()),
             render_display: Some("false".to_string()),
+            source_fit_profile: Some("true".to_string()),
             adaptive: Some("true".to_string()),
         });
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&sourceFitProfile=true&adaptive=true"
         );
     }
 

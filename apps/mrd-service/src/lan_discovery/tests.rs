@@ -861,6 +861,7 @@ fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
         macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
             videotoolbox_h264_encoder: false,
             videotoolbox_hevc_encoder: false,
+            videotoolbox_av1_encoder: false,
             videotoolbox_h264_decoder: false,
             videotoolbox_hevc_decoder: false,
         });
@@ -868,6 +869,9 @@ fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
     assert!(without_videotoolbox.contains(&LAN_RENDER_MACOS_NATIVE_CAPABILITY.to_string()));
     assert!(!without_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
     assert!(!without_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
+    assert!(without_videotoolbox.contains(&"software_av1".to_string()));
+    assert!(without_videotoolbox.contains(&"decode.software_av1".to_string()));
+    assert!(!without_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_AV1_CAPABILITY.to_string()));
     assert!(!without_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
     assert!(!without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
     assert!(!without_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
@@ -876,6 +880,7 @@ fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
     let h264_decode_only = macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
         videotoolbox_h264_encoder: false,
         videotoolbox_hevc_encoder: false,
+        videotoolbox_av1_encoder: false,
         videotoolbox_h264_decoder: true,
         videotoolbox_hevc_decoder: false,
     });
@@ -886,6 +891,7 @@ fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
     let hevc_decode_only = macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
         videotoolbox_h264_encoder: false,
         videotoolbox_hevc_encoder: false,
+        videotoolbox_av1_encoder: false,
         videotoolbox_h264_decoder: false,
         videotoolbox_hevc_decoder: true,
     });
@@ -896,11 +902,15 @@ fn macos_lan_media_capabilities_follow_videotoolbox_probe() {
     let with_videotoolbox = macos_lan_media_capabilities_from_probe(MacosLanMediaCapabilityProbe {
         videotoolbox_h264_encoder: true,
         videotoolbox_hevc_encoder: true,
+        videotoolbox_av1_encoder: true,
         videotoolbox_h264_decoder: true,
         videotoolbox_hevc_decoder: true,
     });
     assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
     assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
+    assert!(with_videotoolbox.contains(&LAN_ENCODE_VIDEOTOOLBOX_AV1_CAPABILITY.to_string()));
+    assert!(with_videotoolbox.contains(&"encode.videotoolbox_av1".to_string()));
+    assert!(with_videotoolbox.contains(&LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string()));
     assert!(with_videotoolbox.contains(&LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string()));
     assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY.to_string()));
     assert!(with_videotoolbox.contains(&LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY.to_string()));
@@ -4334,6 +4344,85 @@ fn macos_capture_pump_repeat_grace_uses_capture_headroom() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_capture_pump_repeat_latest_defaults_to_profiles_with_render_headroom() {
+    let high_refresh = MediaProfile {
+        width: 2560,
+        height: 1440,
+        fps: 144,
+        bitrate_mbps: 40,
+        codec: "hevc".to_string(),
+        ..MediaProfile::default()
+    };
+    let baseline_refresh = MediaProfile {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264".to_string(),
+        ..MediaProfile::default()
+    };
+    let low_refresh = MediaProfile {
+        fps: 30,
+        ..baseline_refresh.clone()
+    };
+
+    assert!(lan_capture_pump_repeat_latest_for_profile_with_override(
+        &high_refresh,
+        None,
+        Some(144)
+    ));
+    assert!(!lan_capture_pump_repeat_latest_for_profile_with_override(
+        &high_refresh,
+        None,
+        Some(120)
+    ));
+    assert!(lan_capture_pump_repeat_latest_for_profile_with_override(
+        &baseline_refresh,
+        None,
+        Some(144)
+    ));
+    assert!(!lan_capture_pump_repeat_latest_for_profile_with_override(
+        &baseline_refresh,
+        None,
+        Some(30)
+    ));
+    assert!(!lan_capture_pump_repeat_latest_for_profile_with_override(
+        &low_refresh,
+        None,
+        Some(144)
+    ));
+    assert!(lan_capture_pump_repeat_latest_for_profile_with_override(
+        &high_refresh,
+        Some(true),
+        Some(120)
+    ));
+    assert!(!lan_capture_pump_repeat_latest_for_profile_with_override(
+        &high_refresh,
+        Some(false),
+        Some(240)
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_capture_pump_wait_timeout_allows_first_frame_diagnostics() {
+    assert!(LAN_CAPTURE_PUMP_FIRST_FRAME_WAIT_TIMEOUT > LAN_CAPTURE_PUMP_WAIT_TIMEOUT);
+    assert_eq!(
+        macos_capture_pump_wait_timeout(0, false),
+        LAN_CAPTURE_PUMP_FIRST_FRAME_WAIT_TIMEOUT
+    );
+    assert_eq!(
+        macos_capture_pump_wait_timeout(1, false),
+        LAN_CAPTURE_PUMP_WAIT_TIMEOUT
+    );
+    assert_eq!(
+        macos_capture_pump_wait_timeout(0, true),
+        LAN_CAPTURE_PUMP_WAIT_TIMEOUT
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_capture_pump_waits_for_fresh_frame_before_repeating_latest() {
     let latest_frame = CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 1, vec![0; 4]);
     let fresh_frame = CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 2, vec![1; 4]);
@@ -4360,6 +4449,7 @@ fn macos_capture_pump_waits_for_fresh_frame_before_repeating_latest() {
         shared,
         stop: Arc::new(AtomicBool::new(false)),
         worker: None,
+        repeat_latest: true,
         repeat_grace_timeout: Duration::from_millis(50),
     };
 

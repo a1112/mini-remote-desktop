@@ -18,6 +18,8 @@ mod imp {
     const CV_SUCCESS: i32 = 0;
     const CV_PIXEL_FORMAT_NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
     const CF_NUMBER_SINT32_TYPE: i32 = 3;
+    const CM_TIME_FLAGS_VALID: u32 = 1;
+    const CM_VIDEO_CODEC_TYPE_AV1: u32 = u32::from_be_bytes(*b"av01");
     const DEFAULT_H264_STARTUP_KEYFRAME_BURST_MS: u64 = 2_000;
     const DEFAULT_H264_STARTUP_KEYFRAME_INTERVAL_MS: u64 = 50;
     const DEFAULT_HEVC_STARTUP_KEYFRAME_BURST_MS: u64 = 2_000;
@@ -63,11 +65,14 @@ mod imp {
         fn CVPixelBufferGetHeightOfPlane(pixel_buffer: *mut c_void, plane_index: usize) -> usize;
         fn CVPixelBufferGetWidth(pixel_buffer: *mut c_void) -> usize;
         fn CVPixelBufferGetHeight(pixel_buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetPixelFormatType(pixel_buffer: *mut c_void) -> u32;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         static kCFAllocatorNull: *const c_void;
+        static kCFBooleanTrue: *const c_void;
+        static kCFBooleanFalse: *const c_void;
         fn CFRetain(cf: *const c_void) -> *const c_void;
         fn CFRelease(cf: *const c_void);
         fn CFNumberCreate(
@@ -111,6 +116,16 @@ mod imp {
         ),
     >;
 
+    type VTCompressionOutputCallback = Option<
+        unsafe extern "C" fn(
+            output_callback_ref_con: *mut c_void,
+            source_frame_ref_con: *mut c_void,
+            status: i32,
+            info_flags: u32,
+            sample_buffer: *mut c_void,
+        ),
+    >;
+
     #[repr(C, packed(4))]
     #[derive(Debug, Copy, Clone)]
     struct VTDecompressionOutputCallbackRecord {
@@ -142,6 +157,14 @@ mod imp {
             sample_size_array: *const usize,
             sample_buffer_out: *mut *mut c_void,
         ) -> i32;
+        fn CMSampleBufferGetDataBuffer(sample_buffer: *mut c_void) -> *mut c_void;
+        fn CMBlockBufferGetDataLength(the_buffer: *mut c_void) -> usize;
+        fn CMBlockBufferCopyDataBytes(
+            the_buffer: *mut c_void,
+            offset_to_data: usize,
+            data_length: usize,
+            destination: *mut c_void,
+        ) -> i32;
         fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
             allocator: *const c_void,
             parameter_set_count: usize,
@@ -163,6 +186,47 @@ mod imp {
 
     #[link(name = "VideoToolbox", kind = "framework")]
     unsafe extern "C" {
+        static kVTCompressionPropertyKey_AverageBitRate: *const c_void;
+        static kVTCompressionPropertyKey_ExpectedFrameRate: *const c_void;
+        static kVTCompressionPropertyKey_RealTime: *const c_void;
+        static kVTCompressionPropertyKey_AllowFrameReordering: *const c_void;
+        static kVTCompressionPropertyKey_AllowTemporalCompression: *const c_void;
+        static kVTCompressionPropertyKey_MaxKeyFrameInterval: *const c_void;
+        static kVTCompressionPropertyKey_MaxFrameDelayCount: *const c_void;
+        static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: *const c_void;
+        static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: *const c_void;
+        static kVTEncodeFrameOptionKey_ForceKeyFrame: *const c_void;
+        fn VTCompressionSessionCreate(
+            allocator: *const c_void,
+            width: i32,
+            height: i32,
+            codec_type: u32,
+            encoder_specification: *const c_void,
+            image_buffer_attributes: *const c_void,
+            compressed_data_allocator: *const c_void,
+            output_callback: VTCompressionOutputCallback,
+            output_callback_ref_con: *mut c_void,
+            compression_session_out: *mut *mut c_void,
+        ) -> i32;
+        fn VTCompressionSessionInvalidate(session: *mut c_void);
+        fn VTCompressionSessionEncodeFrame(
+            session: *mut c_void,
+            image_buffer: *mut c_void,
+            presentation_time_stamp: CMTime,
+            duration: CMTime,
+            frame_properties: *const c_void,
+            source_frame_ref_con: *mut c_void,
+            info_flags_out: *mut u32,
+        ) -> i32;
+        fn VTCompressionSessionCompleteFrames(
+            session: *mut c_void,
+            complete_until_presentation_time_stamp: CMTime,
+        ) -> i32;
+        fn VTSessionSetProperty(
+            session: *mut c_void,
+            property_key: *const c_void,
+            property_value: *const c_void,
+        ) -> i32;
         fn VTDecompressionSessionCreate(
             allocator: *const c_void,
             video_format_description: *mut c_void,
@@ -594,6 +658,279 @@ mod imp {
             self.force_next_keyframe = false;
             self.frame_index = self.frame_index.wrapping_add(1);
             self.drain_encoded()
+        }
+
+        fn request_keyframe(&mut self) {
+            self.force_next_keyframe = true;
+        }
+    }
+
+    pub struct VideoToolboxAv1Encoder {
+        session: *mut c_void,
+        width: usize,
+        height: usize,
+        fps: u32,
+        frame_index: u64,
+        force_next_keyframe: bool,
+        nv12: Vec<u8>,
+        output_queue: Box<Mutex<VecDeque<VideoToolboxAv1EncodedFrame>>>,
+    }
+
+    unsafe impl Send for VideoToolboxAv1Encoder {}
+
+    struct VideoToolboxAv1EncodedFrame {
+        timestamp_us: u64,
+        is_keyframe: bool,
+        bytes: Vec<u8>,
+    }
+
+    struct VideoToolboxAv1FrameRef {
+        timestamp_us: u64,
+        is_keyframe: bool,
+        pixel_buffer: *mut c_void,
+    }
+
+    impl Drop for VideoToolboxAv1FrameRef {
+        fn drop(&mut self) {
+            if !self.pixel_buffer.is_null() {
+                unsafe {
+                    CFRelease(self.pixel_buffer.cast_const());
+                }
+                self.pixel_buffer = ptr::null_mut();
+            }
+        }
+    }
+
+    impl VideoToolboxAv1Encoder {
+        pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
+            Self::new_with_bitrate(width, height, fps, 8_000_000)
+        }
+
+        pub fn new_with_bitrate(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            validate_even_dimensions(width, height, "videotoolbox AV1")?;
+            let fps = fps.max(1);
+            let width_i32 = i32::try_from(width).map_err(|_| {
+                PipelineError::message(format!("VideoToolbox AV1 width too large: {width}"))
+            })?;
+            let height_i32 = i32::try_from(height).map_err(|_| {
+                PipelineError::message(format!("VideoToolbox AV1 height too large: {height}"))
+            })?;
+            let output_queue = Box::new(Mutex::new(VecDeque::new()));
+            let mut session = ptr::null_mut();
+            let encoder_specification = cf_dictionary(&[(
+                unsafe { kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder },
+                unsafe { kCFBooleanTrue },
+            )])?;
+            let status = unsafe {
+                VTCompressionSessionCreate(
+                    ptr::null(),
+                    width_i32,
+                    height_i32,
+                    CM_VIDEO_CODEC_TYPE_AV1,
+                    encoder_specification.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    Some(av1_compression_output_callback),
+                    (&*output_queue as *const Mutex<VecDeque<VideoToolboxAv1EncodedFrame>>)
+                        .cast_mut()
+                        .cast(),
+                    &mut session,
+                )
+            };
+            check_os_status(status, "VTCompressionSessionCreate(AV1)")?;
+            if session.is_null() {
+                return Err(PipelineError::message(
+                    "VTCompressionSessionCreate(AV1) returned null",
+                ));
+            }
+
+            let configure_result = configure_av1_compression_session(session, fps, bitrate);
+            if let Err(error) = configure_result {
+                unsafe {
+                    VTCompressionSessionInvalidate(session);
+                    CFRelease(session.cast_const());
+                }
+                return Err(error);
+            }
+
+            Ok(Self {
+                session,
+                width,
+                height,
+                fps,
+                frame_index: 0,
+                force_next_keyframe: false,
+                nv12: vec![0; nv12_len(width, height)?],
+                output_queue,
+            })
+        }
+
+        fn drain_encoded(&mut self) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            let mut queue = self.output_queue.lock().map_err(|_| {
+                PipelineError::message("VideoToolbox AV1 output queue lock poisoned")
+            })?;
+            let mut units = Vec::with_capacity(queue.len());
+            while let Some(frame) = queue.pop_front() {
+                units.push(EncodedAccessUnit {
+                    codec: VideoCodec::Av1,
+                    timestamp_us: frame.timestamp_us,
+                    is_keyframe: frame.is_keyframe,
+                    bytes: frame.bytes,
+                });
+            }
+            Ok(units)
+        }
+
+        fn encode_pixel_buffer(
+            &mut self,
+            pixel_buffer: *mut c_void,
+            timestamp_us: u64,
+            force_keyframe: bool,
+            retain_pixel_buffer: bool,
+        ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            if retain_pixel_buffer {
+                unsafe {
+                    CFRetain(pixel_buffer.cast_const());
+                }
+            }
+            let frame_ref = Box::new(VideoToolboxAv1FrameRef {
+                timestamp_us,
+                is_keyframe: force_keyframe,
+                pixel_buffer,
+            });
+            let frame_ref_ptr = Box::into_raw(frame_ref).cast::<c_void>();
+            let frame_properties = if force_keyframe {
+                Some(cf_dictionary(&[(
+                    unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame },
+                    unsafe { kCFBooleanTrue },
+                )])?)
+            } else {
+                None
+            };
+            let frame_properties_ptr = frame_properties
+                .as_ref()
+                .map(|properties| properties.as_ptr().cast_const())
+                .unwrap_or_else(ptr::null);
+            let status = unsafe {
+                VTCompressionSessionEncodeFrame(
+                    self.session,
+                    pixel_buffer,
+                    cm_time(self.frame_index as i64, self.fps),
+                    invalid_cm_time(),
+                    frame_properties_ptr,
+                    frame_ref_ptr,
+                    ptr::null_mut(),
+                )
+            };
+            if status != CV_SUCCESS {
+                unsafe {
+                    drop(Box::from_raw(
+                        frame_ref_ptr.cast::<VideoToolboxAv1FrameRef>(),
+                    ));
+                }
+                return Err(PipelineError::message(format!(
+                    "VTCompressionSessionEncodeFrame(AV1) failed: status={status}"
+                )));
+            }
+            self.force_next_keyframe = false;
+            self.frame_index = self.frame_index.wrapping_add(1);
+            self.drain_encoded()
+        }
+    }
+
+    impl Drop for VideoToolboxAv1Encoder {
+        fn drop(&mut self) {
+            if self.session.is_null() {
+                return;
+            }
+            unsafe {
+                let _ = VTCompressionSessionCompleteFrames(self.session, invalid_cm_time());
+                VTCompressionSessionInvalidate(self.session);
+                CFRelease(self.session.cast_const());
+            }
+            self.session = ptr::null_mut();
+        }
+    }
+
+    impl VideoEncoder for VideoToolboxAv1Encoder {
+        fn input_memory_kind(&self) -> FrameMemoryKind {
+            FrameMemoryKind::MacosCvPixelBuffer
+        }
+
+        fn encode(
+            &mut self,
+            frame: &CapturedFrame,
+        ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            validate_even_dimensions(frame.width, frame.height, "videotoolbox AV1")?;
+            if frame.width != self.width || frame.height != self.height {
+                return Err(PipelineError::message(format!(
+                    "VideoToolbox AV1 frame size mismatch: expected {}x{}, got {}x{}",
+                    self.width, self.height, frame.width, frame.height
+                )));
+            }
+
+            let force_keyframe = self.force_next_keyframe
+                || self.frame_index == 0
+                || self
+                    .frame_index
+                    .is_multiple_of(u64::from(self.fps.max(1)).saturating_mul(2));
+
+            if let Some(pixel_buffer) = frame.macos_cv_pixel_buffer() {
+                if pixel_buffer.pixel_format != FramePixelFormat::Nv12 {
+                    return Err(PipelineError::message(format!(
+                        "VideoToolbox direct CVPixelBuffer AV1 encode requires NV12 input, got {:?}",
+                        pixel_buffer.pixel_format
+                    )));
+                }
+                if unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer.as_ptr()) }
+                    != CV_PIXEL_FORMAT_NV12_VIDEO_RANGE
+                {
+                    return Err(PipelineError::message(
+                        "VideoToolbox direct CVPixelBuffer AV1 encode requires 420v NV12 input",
+                    ));
+                }
+                return self.encode_pixel_buffer(
+                    pixel_buffer.as_ptr(),
+                    frame.timestamp_us,
+                    force_keyframe,
+                    true,
+                );
+            }
+
+            let y_size = self.width * self.height;
+            let expected_nv12 = nv12_len(self.width, self.height)?;
+            let pixel_buffer = VideoToolboxReusablePixelBuffer::new_nv12(self.width, self.height)?;
+            let (y_plane, uv_plane) = match frame.pixel_format {
+                FramePixelFormat::Nv12 => {
+                    if frame.data.len() != expected_nv12 {
+                        return Err(PipelineError::message(format!(
+                            "VideoToolbox AV1 NV12 frame bytes mismatch: expected {expected_nv12}, got {}",
+                            frame.data.len()
+                        )));
+                    }
+                    frame.data.split_at(y_size)
+                }
+                FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 | FramePixelFormat::Rgb24 => {
+                    write_nv12(frame, &mut self.nv12)?;
+                    self.nv12.split_at(y_size)
+                }
+            };
+            copy_nv12_planes_into_pixel_buffer(
+                pixel_buffer.as_ptr(),
+                self.width,
+                self.height,
+                y_plane,
+                uv_plane,
+                "VideoToolbox AV1",
+            )?;
+            let pixel_buffer_ptr = pixel_buffer.as_ptr();
+            std::mem::forget(pixel_buffer);
+            self.encode_pixel_buffer(pixel_buffer_ptr, frame.timestamp_us, force_keyframe, false)
         }
 
         fn request_keyframe(&mut self) {
@@ -1462,8 +1799,11 @@ mod imp {
 
     impl Drop for CoreFoundationOwned {
         fn drop(&mut self) {
-            unsafe {
-                CFRelease(self.ptr.cast_const());
+            if !self.ptr.is_null() {
+                unsafe {
+                    CFRelease(self.ptr.cast_const());
+                }
+                self.ptr = ptr::null_mut();
             }
         }
     }
@@ -1596,9 +1936,199 @@ mod imp {
         if status == CV_SUCCESS {
             Ok(())
         } else {
+            let status_name = os_status_name(status)
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default();
             Err(PipelineError::message(format!(
-                "{label} failed: status={status}"
+                "{label} failed: status={status}{status_name}"
             )))
+        }
+    }
+
+    fn os_status_name(status: i32) -> Option<&'static str> {
+        match status {
+            -12900 => Some("kVTPropertyNotSupportedErr"),
+            -12901 => Some("kVTPropertyReadOnlyErr"),
+            -12902 => Some("kVTParameterErr"),
+            -12903 => Some("kVTInvalidSessionErr"),
+            -12904 => Some("kVTAllocationFailedErr"),
+            -12905 => Some("kVTPixelTransferNotSupportedErr"),
+            -12906 => Some("kVTCouldNotFindVideoDecoderErr"),
+            -12907 => Some("kVTCouldNotCreateInstanceErr"),
+            -12908 => Some("kVTCouldNotFindVideoEncoderErr"),
+            -12909 => Some("kVTVideoDecoderBadDataErr"),
+            -12910 => Some("kVTVideoDecoderUnsupportedDataFormatErr"),
+            -12911 => Some("kVTVideoDecoderMalfunctionErr"),
+            -12912 => Some("kVTVideoEncoderMalfunctionErr"),
+            -12913 => Some("kVTVideoDecoderNotAvailableNowErr"),
+            -12914 => Some("kVTPixelRotationNotSupportedErr"),
+            -12915 => Some("kVTVideoEncoderNotAvailableNowErr"),
+            -12916 => Some("kVTFormatDescriptionChangeNotSupportedErr"),
+            -12917 => Some("kVTInsufficientSourceColorDataErr"),
+            -12918 => Some("kVTCouldNotCreateColorCorrectionDataErr"),
+            -12919 => Some("kVTColorSyncTransformConvertFailedErr"),
+            -12210 => Some("kVTVideoDecoderAuthorizationErr"),
+            -12211 => Some("kVTVideoEncoderAuthorizationErr"),
+            -12212 => Some("kVTColorCorrectionPixelTransferFailedErr"),
+            -12213 => Some("kVTMultiPassStorageIdentifierMismatchErr"),
+            -12214 => Some("kVTMultiPassStorageInvalidErr"),
+            -12215 => Some("kVTFrameSiloInvalidTimeStampErr"),
+            -12216 => Some("kVTFrameSiloInvalidTimeRangeErr"),
+            -12217 => Some("kVTCouldNotFindTemporalFilterErr"),
+            -12218 => Some("kVTPixelTransferNotPermittedErr"),
+            -12219 => Some("kVTColorCorrectionImageRotationFailedErr"),
+            -17690 => Some("kVTVideoDecoderRemovedErr"),
+            -17691 => Some("kVTSessionMalfunctionErr"),
+            -17692 => Some("kVTVideoDecoderNeedsRosettaErr"),
+            -17693 => Some("kVTVideoEncoderNeedsRosettaErr"),
+            -17694 => Some("kVTVideoDecoderReferenceMissingErr"),
+            -17695 => Some("kVTVideoDecoderCallbackMessagingErr"),
+            -17696 => Some("kVTVideoDecoderUnknownErr"),
+            -17697 => Some("kVTExtensionDisabledErr"),
+            -17698 => Some("kVTVideoEncoderMVHEVCVideoLayerIDsMismatchErr"),
+            -17699 => Some("kVTCouldNotOutputTaggedBufferGroupErr"),
+            -19510 => Some("kVTCouldNotFindExtensionErr"),
+            -19511 => Some("kVTExtensionConflictErr"),
+            -19512 => Some("kVTVideoEncoderAutoWhiteBalanceNotLockedErr"),
+            _ => None,
+        }
+    }
+
+    fn cm_time(value: i64, fps: u32) -> CMTime {
+        CMTime {
+            value,
+            timescale: i32::try_from(fps.max(1)).unwrap_or(i32::MAX),
+            flags: CM_TIME_FLAGS_VALID,
+            epoch: 0,
+        }
+    }
+
+    fn invalid_cm_time() -> CMTime {
+        CMTime {
+            value: 0,
+            timescale: 0,
+            flags: 0,
+            epoch: 0,
+        }
+    }
+
+    fn configure_av1_compression_session(
+        session: *mut c_void,
+        fps: u32,
+        bitrate: u32,
+    ) -> Result<(), PipelineError> {
+        let fps_i32 = i32::try_from(fps.max(1)).map_err(|_| {
+            PipelineError::message(format!("VideoToolbox AV1 fps too large: {fps}"))
+        })?;
+        let bitrate_i32 = i32::try_from(bitrate.max(1)).map_err(|_| {
+            PipelineError::message(format!("VideoToolbox AV1 bitrate too large: {bitrate}"))
+        })?;
+        set_vt_property_bool(session, unsafe { kVTCompressionPropertyKey_RealTime }, true)?;
+        set_vt_property_bool(
+            session,
+            unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
+            false,
+        )?;
+        set_vt_property_bool(
+            session,
+            unsafe { kVTCompressionPropertyKey_AllowTemporalCompression },
+            false,
+        )?;
+        let _ = set_vt_property_bool(
+            session,
+            unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
+            true,
+        );
+        set_vt_property_i32(
+            session,
+            unsafe { kVTCompressionPropertyKey_ExpectedFrameRate },
+            fps_i32,
+        )?;
+        set_vt_property_i32(
+            session,
+            unsafe { kVTCompressionPropertyKey_AverageBitRate },
+            bitrate_i32,
+        )?;
+        set_vt_property_i32(
+            session,
+            unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
+            fps_i32.saturating_mul(2).max(1),
+        )?;
+        set_vt_property_i32(
+            session,
+            unsafe { kVTCompressionPropertyKey_MaxFrameDelayCount },
+            1,
+        )?;
+        Ok(())
+    }
+
+    fn set_vt_property_bool(
+        session: *mut c_void,
+        key: *const c_void,
+        value: bool,
+    ) -> Result<(), PipelineError> {
+        let value = if value {
+            unsafe { kCFBooleanTrue }
+        } else {
+            unsafe { kCFBooleanFalse }
+        };
+        let status = unsafe { VTSessionSetProperty(session, key, value) };
+        check_os_status(status, "VTSessionSetProperty(bool)")
+    }
+
+    fn set_vt_property_i32(
+        session: *mut c_void,
+        key: *const c_void,
+        value: i32,
+    ) -> Result<(), PipelineError> {
+        let cf_value = cf_number_i32(value)?;
+        let status = unsafe { VTSessionSetProperty(session, key, cf_value.as_ptr().cast_const()) };
+        check_os_status(status, "VTSessionSetProperty(i32)")
+    }
+
+    unsafe extern "C" fn av1_compression_output_callback(
+        output_callback_ref_con: *mut c_void,
+        source_frame_ref_con: *mut c_void,
+        status: i32,
+        _info_flags: u32,
+        sample_buffer: *mut c_void,
+    ) {
+        let frame_ref = if source_frame_ref_con.is_null() {
+            None
+        } else {
+            Some(unsafe { Box::from_raw(source_frame_ref_con.cast::<VideoToolboxAv1FrameRef>()) })
+        };
+        if status != CV_SUCCESS
+            || output_callback_ref_con.is_null()
+            || sample_buffer.is_null()
+            || frame_ref.is_none()
+        {
+            return;
+        }
+        let frame_ref = frame_ref.expect("checked frame ref");
+        let data_buffer = unsafe { CMSampleBufferGetDataBuffer(sample_buffer) };
+        if data_buffer.is_null() {
+            return;
+        }
+        let block_len = unsafe { CMBlockBufferGetDataLength(data_buffer) };
+        if block_len == 0 {
+            return;
+        }
+        let mut bytes = vec![0u8; block_len];
+        let copy_status = unsafe {
+            CMBlockBufferCopyDataBytes(data_buffer, 0, block_len, bytes.as_mut_ptr().cast())
+        };
+        if copy_status != CV_SUCCESS {
+            return;
+        }
+        let output_queue =
+            output_callback_ref_con.cast::<Mutex<VecDeque<VideoToolboxAv1EncodedFrame>>>();
+        if let Ok(mut queue) = unsafe { &*output_queue }.lock() {
+            queue.push_back(VideoToolboxAv1EncodedFrame {
+                timestamp_us: frame_ref.timestamp_us,
+                is_keyframe: frame_ref.is_keyframe,
+                bytes,
+            });
         }
     }
 
@@ -1746,6 +2276,45 @@ mod imp {
                 uv_plane.len()
             )));
         }
+        Ok(())
+    }
+
+    fn copy_nv12_planes_into_pixel_buffer(
+        pixel_buffer: *mut c_void,
+        width: usize,
+        height: usize,
+        y_plane: &[u8],
+        uv_plane: &[u8],
+        label: &str,
+    ) -> Result<(), PipelineError> {
+        validate_nv12_planes(width, height, y_plane, uv_plane)?;
+        if pixel_buffer.is_null() {
+            return Err(PipelineError::message(format!(
+                "{label} CVPixelBufferCreate(NV12) returned null"
+            )));
+        }
+
+        let status = unsafe { CVPixelBufferLockBaseAddress(pixel_buffer, 0) };
+        if status != CV_SUCCESS {
+            return Err(PipelineError::message(format!(
+                "{label} CVPixelBufferLockBaseAddress(NV12) failed: status={status}"
+            )));
+        }
+
+        let copy_result = unsafe {
+            copy_nv12_plane(pixel_buffer, 0, y_plane, width, height)
+                .and_then(|_| copy_nv12_plane(pixel_buffer, 1, uv_plane, width, height.div_ceil(2)))
+        };
+        let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(pixel_buffer, 0) };
+        if let Err(error) = copy_result {
+            return Err(error);
+        }
+        if unlock_status != CV_SUCCESS {
+            return Err(PipelineError::message(format!(
+                "{label} CVPixelBufferUnlockBaseAddress(NV12) failed: status={unlock_status}"
+            )));
+        }
+
         Ok(())
     }
 
@@ -2294,6 +2863,15 @@ mod imp {
         use super::*;
 
         #[test]
+        fn os_status_name_labels_missing_video_encoder() {
+            assert_eq!(
+                os_status_name(-12908),
+                Some("kVTCouldNotFindVideoEncoderErr")
+            );
+            assert_eq!(os_status_name(0), None);
+        }
+
+        #[test]
         fn bgra_to_nv12_writes_expected_limited_range_planes() {
             let frame = CapturedFrame::from_cpu(
                 2,
@@ -2797,6 +3375,36 @@ mod imp {
         }
     }
 
+    pub struct VideoToolboxAv1Encoder;
+
+    impl VideoToolboxAv1Encoder {
+        pub fn new(_width: usize, _height: usize, _fps: u32) -> Result<Self, PipelineError> {
+            Err(PipelineError::message(
+                "VideoToolbox AV1 encoder is only available on macOS",
+            ))
+        }
+
+        pub fn new_with_bitrate(
+            _width: usize,
+            _height: usize,
+            _fps: u32,
+            _bitrate: u32,
+        ) -> Result<Self, PipelineError> {
+            Self::new(_width, _height, _fps)
+        }
+    }
+
+    impl VideoEncoder for VideoToolboxAv1Encoder {
+        fn encode(
+            &mut self,
+            _frame: &CapturedFrame,
+        ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            Err(PipelineError::message(
+                "VideoToolbox AV1 encoder is only available on macOS",
+            ))
+        }
+    }
+
     pub struct VideoToolboxH264Decoder;
 
     impl VideoToolboxH264Decoder {
@@ -2865,7 +3473,7 @@ mod imp {
 }
 
 pub use imp::{
-    VideoToolboxH264Decoder, VideoToolboxH264Encoder, VideoToolboxH264PixelBufferDecoder,
-    VideoToolboxHevcDecoder, VideoToolboxHevcEncoder, VideoToolboxHevcPixelBufferDecoder,
-    VideoToolboxPixelBufferFrame,
+    VideoToolboxAv1Encoder, VideoToolboxH264Decoder, VideoToolboxH264Encoder,
+    VideoToolboxH264PixelBufferDecoder, VideoToolboxHevcDecoder, VideoToolboxHevcEncoder,
+    VideoToolboxHevcPixelBufferDecoder, VideoToolboxPixelBufferFrame,
 };

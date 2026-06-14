@@ -12,6 +12,8 @@ import {
   browserSupportsWebCodecsWorkerRendering,
   browserWebrtcPreviewH264Profile,
   browserSupportsWebrtcVideoCodec,
+  encoderForRequestedProfileCodec,
+  resolveLocalWebViewPlan,
   webRtcPreviewCodecForEncoder,
   webCodecsPreviewCodecForEncoder,
   buildWebCodecsDecoderConfig,
@@ -313,6 +315,51 @@ describe("RemoteDisplayWindowPage", () => {
     expect(webRtcPreviewCodecForEncoder("nvenc_hevc")).toBe("hevc");
     expect(webRtcPreviewCodecForEncoder("nvenc_hevc_main10")).toBeNull();
     expect(webRtcPreviewCodecForEncoder("nvenc_av1")).toBe("av1");
+  });
+
+  it("does not auto-select unavailable AV1 encoders from an explicit profile codec", () => {
+    expect(
+      encoderForRequestedProfileCodec(
+        "av1",
+        "macos",
+        ["videotoolbox_h264", "videotoolbox_hevc", "openh264"],
+        null,
+        null
+      )
+    ).toBeNull();
+    expect(
+      encoderForRequestedProfileCodec("av1", "macos", undefined, null, null)
+    ).toBeNull();
+  });
+
+  it("does not select AV1 for macOS browser-preview local profiles", () => {
+    const plan = resolveLocalWebViewPlan({
+      capabilities: {
+        os_type: "macos",
+        cpu_brand: "Apple",
+        cpu_cores: 8,
+        memory_gb: 16,
+        gpu_info: "Apple GPU",
+        available_captures: ["macos"],
+        available_encoders: ["videotoolbox_av1", "openh264"],
+        available_decoders: ["software"],
+        available_renderers: ["macos", "webview"],
+        available_memory_modes: ["cpu"],
+      },
+      hostOs: "macos",
+      webPreviewEngine: "webrtc",
+      hevcWebRtcSupported: false,
+      capture: "macos",
+      encoder: "videotoolbox_av1",
+      decoder: "none",
+      transport: "webrtc",
+      fps: "60",
+      bitrate: "20",
+      capHighFpsBitrate: false,
+    });
+
+    expect(plan.profile).toBeNull();
+    expect(plan.reason).toContain("硬件浏览器预览编码器");
   });
 
   it("detects browser WebRTC HEVC receive capability beside H.264", () => {

@@ -249,7 +249,8 @@ function Invoke-LocalCanaryProfile($Repo, $Profile, $GitCommit, [string]$Codec, 
         $summarizeArgs += @("-ThresholdPath", $thresholdPath)
       }
     }
-    powershell @summarizeArgs
+    $powershell = Resolve-TransportMatrixPowerShellExecutable
+    & $powershell @summarizeArgs
     $summaryPath = Join-Path $runDir "summary.json"
     $summary = Get-Content $summaryPath -Raw | ConvertFrom-Json
     Convert-LocalSummaryToCanaryRow -Profile $Profile -Summary $summary -SummaryPath $summaryPath -RequestedCodec $Codec

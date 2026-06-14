@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use super::discovery_identity::now_ms;
+#[cfg(target_os = "macos")]
+use super::macos_render_proxy_compressed_media_enabled_for_profile;
 #[cfg(any(windows, target_os = "macos"))]
 use super::media_frame_preparation::decoded_frame_to_render_frame;
 #[cfg(target_os = "macos")]

@@ -281,6 +281,23 @@ impl MediaPipelineRegistry {
             .sender_transport = transport;
     }
 
+    pub fn set_sender_transport_last_frame_error(
+        &mut self,
+        session_id: SessionId,
+        source_id: Option<String>,
+        source_kind: Option<String>,
+        last_frame_error: Option<String>,
+    ) {
+        let sender_transport = &mut self
+            .pipelines
+            .entry(session_id)
+            .or_default()
+            .sender_transport;
+        sender_transport.capture_source_id = source_id;
+        sender_transport.capture_source_kind = source_kind;
+        sender_transport.last_frame_error = last_frame_error;
+    }
+
     pub fn set_adaptation(
         &mut self,
         session_id: SessionId,
@@ -410,5 +427,51 @@ mod tests {
             .expect("sender capture metrics");
         assert_eq!(capture.p50_ms, Some(140.0));
         assert_eq!(capture.p95_ms, Some(247.0));
+    }
+
+    #[test]
+    fn records_sender_last_frame_error_without_resetting_counters() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("sender-error-session".to_string());
+        registry.set_sender_transport(
+            session_id.clone(),
+            MediaSenderTransportSnapshot {
+                frames_completed: 7,
+                ..MediaSenderTransportSnapshot::default()
+            },
+        );
+
+        registry.set_sender_transport_last_frame_error(
+            session_id.clone(),
+            Some("macos:display:0x1".to_string()),
+            Some("display".to_string()),
+            Some("screen recording permission required".to_string()),
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(snapshot.sender_transport.frames_completed, 7);
+        assert_eq!(
+            snapshot.sender_transport.capture_source_id.as_deref(),
+            Some("macos:display:0x1")
+        );
+        assert_eq!(
+            snapshot.sender_transport.last_frame_error.as_deref(),
+            Some("screen recording permission required")
+        );
+
+        registry.set_sender_transport_last_frame_error(
+            session_id.clone(),
+            Some("macos:display:0x1".to_string()),
+            Some("display".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            registry
+                .snapshot(&session_id)
+                .sender_transport
+                .last_frame_error,
+            None
+        );
     }
 }

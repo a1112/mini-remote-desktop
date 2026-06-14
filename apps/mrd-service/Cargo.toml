@@ -16,7 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 mrd-application = { path = "../../crates/mrd-application" }
-mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-decode = { path = "../../crates/mrd-decode", features = ["software-dav1d"] }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }

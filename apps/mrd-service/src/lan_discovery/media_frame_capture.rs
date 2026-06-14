@@ -8,8 +8,10 @@ use super::media_frame_preparation::window_h264_capture_dimensions;
 use super::now_ms;
 #[cfg(target_os = "macos")]
 use super::{
-    lan_capture_pump_drives_sender, lan_capture_pump_enabled, lan_capture_pump_repeat_latest,
-    macos_capture_pump_repeat_grace_timeout, now_us,
+    lan_capture_pump_drives_sender, lan_capture_pump_enabled,
+    lan_capture_pump_repeat_latest_for_profile, macos_capture_pump_repeat_grace_timeout, now_us,
+    LAN_CAPTURE_PUMP_ERROR_BACKOFF, LAN_CAPTURE_PUMP_FIRST_FRAME_WAIT_TIMEOUT,
+    LAN_CAPTURE_PUMP_QUEUE_CAPACITY, LAN_CAPTURE_PUMP_WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use super::{
@@ -114,6 +116,7 @@ impl LanSenderFrameCapture {
             if matches!(capture, LanFrameCapture::Macos(_)) && lan_capture_pump_enabled() {
                 return Ok(Self::Pumped(MacosPumpedLanFrameCapture::new(
                     capture,
+                    lan_capture_pump_repeat_latest_for_profile(_profile),
                     macos_capture_pump_repeat_grace_timeout(_profile),
                 )?));
             }
@@ -145,7 +148,7 @@ impl LanSenderFrameCapture {
         match self {
             Self::Direct(_) => false,
             #[cfg(target_os = "macos")]
-            Self::Pumped(_) => lan_capture_pump_repeat_latest(),
+            Self::Pumped(capture) => capture.repeats_latest_frame(),
         }
     }
 }
@@ -155,6 +158,7 @@ pub(super) struct MacosPumpedLanFrameCapture {
     pub(super) shared: Arc<(StdMutex<MacosPumpedLanFrameState>, StdCondvar)>,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) worker: Option<thread::JoinHandle<()>>,
+    pub(super) repeat_latest: bool,
     pub(super) repeat_grace_timeout: Duration,
 }
 
@@ -169,7 +173,11 @@ pub(super) struct MacosPumpedLanFrameState {
 
 #[cfg(target_os = "macos")]
 impl MacosPumpedLanFrameCapture {
-    fn new(mut capture: LanFrameCapture, repeat_grace_timeout: Duration) -> Result<Self> {
+    fn new(
+        mut capture: LanFrameCapture,
+        repeat_latest: bool,
+        repeat_grace_timeout: Duration,
+    ) -> Result<Self> {
         let shared = Arc::new((
             StdMutex::new(MacosPumpedLanFrameState {
                 frames: VecDeque::new(),
@@ -217,16 +225,23 @@ impl MacosPumpedLanFrameCapture {
             shared,
             stop,
             worker: Some(worker),
+            repeat_latest,
             repeat_grace_timeout,
         })
     }
 
+    pub(super) fn repeats_latest_frame(&self) -> bool {
+        self.repeat_latest
+    }
+
     pub(super) fn capture_frame(&mut self) -> Result<LanCapturedSenderFrame> {
-        let deadline = StdInstant::now() + LAN_CAPTURE_PUMP_WAIT_TIMEOUT;
+        let started = StdInstant::now();
         let (lock, cvar) = &*self.shared;
         let mut state = lock
             .lock()
             .map_err(|_| anyhow::anyhow!("macOS LAN capture pump state poisoned"))?;
+        let deadline =
+            started + macos_capture_pump_wait_timeout(state.sequence, state.latest_frame.is_some());
         let mut waited_for_repeat_grace = false;
 
         loop {
@@ -242,7 +257,7 @@ impl MacosPumpedLanFrameCapture {
                 anyhow::bail!("macOS LAN capture pump failed: {error}");
             }
 
-            if lan_capture_pump_repeat_latest() {
+            if self.repeat_latest {
                 if state.latest_frame.is_some()
                     && !waited_for_repeat_grace
                     && !self.repeat_grace_timeout.is_zero()
@@ -283,6 +298,14 @@ impl MacosPumpedLanFrameCapture {
             state = guard;
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn macos_capture_pump_wait_timeout(sequence: u64, has_latest_frame: bool) -> Duration {
+    if sequence == 0 && !has_latest_frame {
+        return LAN_CAPTURE_PUMP_FIRST_FRAME_WAIT_TIMEOUT;
+    }
+    LAN_CAPTURE_PUMP_WAIT_TIMEOUT
 }
 
 #[cfg(target_os = "macos")]

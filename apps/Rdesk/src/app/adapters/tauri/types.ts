@@ -100,7 +100,8 @@ export interface TestConfig {
     | "openh264"
     | "software_vvc"
     | "videotoolbox_h264"
-    | "videotoolbox_hevc";
+    | "videotoolbox_hevc"
+    | "videotoolbox_av1";
   decoder_type?: "none" | "nvdec" | "software" | "ffmpeg_h264" | "ffmpeg_hevc" | "ffmpeg_vvc" | "linux_h264" | "linux_hevc" | "linux_hevc_main10" | "videotoolbox";
   renderer_type?: "d3d11" | "d3d12" | "opengl" | "macos" | "linux" | "webview";
   render_display?: boolean;
@@ -996,6 +997,7 @@ export interface MediaSenderTransportSnapshot {
   capture_rgba32_frames?: number;
   capture_rgb24_frames?: number;
   capture_nv12_frames?: number;
+  last_frame_error?: string | null;
   access_units_encoded?: number;
   keyframes_encoded?: number;
   encoded_access_unit_bytes?: number;
@@ -1237,7 +1239,8 @@ export type EncoderType =
   | 'openh264'
   | 'software_vvc'
   | 'videotoolbox_h264'
-  | 'videotoolbox_hevc';
+  | 'videotoolbox_hevc'
+  | 'videotoolbox_av1';
 export type DecoderType = 'none' | 'nvdec' | 'software' | 'ffmpeg_h264' | 'ffmpeg_hevc' | 'ffmpeg_vvc' | 'linux_h264' | 'linux_hevc' | 'linux_hevc_main10' | 'videotoolbox';
 
 export interface TestMatrixConfig {

@@ -281,7 +281,15 @@ fn missing_profile_media_capabilities(
             ),
         ],
         LanAccessUnitCodec::Av1 => vec![
-            ("av1 encoder", vec!["encode.nvenc_av1", "nvenc_av1"]),
+            (
+                "av1 encoder",
+                vec![
+                    "encode.nvenc_av1",
+                    "nvenc_av1",
+                    "encode.videotoolbox_av1",
+                    "videotoolbox_av1",
+                ],
+            ),
             (
                 LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY,
                 vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY],
@@ -384,6 +392,7 @@ pub(crate) fn missing_profile_receiver_media_capabilities(
                     "decode.software_av1",
                     "software_av1",
                     "av1_software",
+                    "software_decode",
                 ],
             ),
             (
@@ -624,6 +633,29 @@ mod tests {
             missing,
             vec![LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string()]
         );
+    }
+
+    #[test]
+    fn requested_av1_sender_accepts_videotoolbox_encoder_capability() {
+        let profile = MediaProfile {
+            codec: "av1".to_string(),
+            codec_profile: Some("main".to_string()),
+            bit_depth: Some(8),
+            chroma_subsampling: Some("4:2:0".to_string()),
+            pixel_format: Some("nv12".to_string()),
+            hdr_enabled: Some(false),
+            ..default_media_profile()
+        };
+
+        let missing = missing_profile_media_capabilities(
+            &profile,
+            &[
+                "encode.videotoolbox_av1".to_string(),
+                LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY.to_string(),
+            ],
+        );
+
+        assert!(missing.is_empty());
     }
 
     #[test]

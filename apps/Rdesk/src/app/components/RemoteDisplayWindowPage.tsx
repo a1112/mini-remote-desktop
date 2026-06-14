@@ -80,6 +80,7 @@ import {
   type ProbeSnapshot,
   type SessionRuntimeSnapshot,
 } from "../services/ipcSessionService";
+import { captureSourceAvailableForAutoSelect } from "../services/captureSourceAvailability";
 import { decoderCapabilityAvailableForConfig } from "./TestWorkbench/capabilityMeta";
 import { isTauriRuntime } from "../utils/runtime";
 import { withTauriWindow } from "../utils/tauriWindow";
@@ -339,6 +340,7 @@ const encoderOptions: Option<EncoderType>[] = [
   { value: "nvenc_hevc_main10", label: "NVENC HEVC Main10" },
   { value: "videotoolbox_h264", label: "VideoToolbox H.264" },
   { value: "videotoolbox_hevc", label: "VideoToolbox HEVC" },
+  { value: "videotoolbox_av1", label: "VideoToolbox AV1" },
   { value: "openh264", label: "OpenH264" },
   { value: "nvenc_av1", label: "NVENC AV1" },
 ];
@@ -473,11 +475,12 @@ export function localThreeFrameLatencyStatus(
 }
 
 function pickPreferredCaptureSource(sources: CaptureSource[]) {
+  const autoSelectableSources = sources.filter(captureSourceAvailableForAutoSelect);
   return (
-    sources.find((source) => source.source_kind === "display_shared") ??
-    sources.find((source) => source.source_kind === "display") ??
-    sources.find((source) => source.source_kind === "window") ??
-    sources[0] ??
+    autoSelectableSources.find((source) => source.source_kind === "display_shared") ??
+    autoSelectableSources.find((source) => source.source_kind === "display") ??
+    autoSelectableSources.find((source) => source.source_kind === "window") ??
+    autoSelectableSources[0] ??
     null
   );
 }
@@ -1210,7 +1213,7 @@ function isH264PreviewEncoder(encoder: EncoderType) {
 
 export function webRtcPreviewCodecForEncoder(encoder: EncoderType): "h264" | "hevc" | "av1" | null {
   if (encoder === "nvenc_hevc" || encoder === "videotoolbox_hevc") return "hevc";
-  if (encoder === "nvenc_av1") return "av1";
+  if (encoder === "nvenc_av1" || encoder === "videotoolbox_av1") return "av1";
   if (isH264PreviewEncoder(encoder)) return "h264";
   return null;
 }
@@ -1489,19 +1492,21 @@ function profileColorPipelineFromSearch(
   return null;
 }
 
-function encoderForRequestedProfileCodec(
+export function encoderForRequestedProfileCodec(
   codec: "h264" | "hevc" | "av1",
   hostOs: HostOs,
   availableEncoders: readonly string[] | undefined,
   codecProfile: string | null,
   bitDepth: number | null
-): EncoderType {
+): EncoderType | null {
   const main10 =
     codec === "hevc" &&
     (codecProfile?.trim().toLowerCase() === "main10" || bitDepth === 10);
   const candidates: EncoderType[] =
     codec === "av1"
-      ? ["nvenc_av1"]
+      ? hostOs === "macos"
+        ? ["videotoolbox_av1", "nvenc_av1"]
+        : ["nvenc_av1", "videotoolbox_av1"]
       : codec === "hevc"
       ? main10
         ? ["nvenc_hevc_main10", "nvenc_hevc", "videotoolbox_hevc"]
@@ -1514,8 +1519,10 @@ function encoderForRequestedProfileCodec(
           ? ["nvenc_h264", "videotoolbox_h264", "openh264"]
           : ["openh264", "nvenc_h264", "videotoolbox_h264"];
   const fallback = candidates[0] ?? "openh264";
-  if (!availableEncoders || availableEncoders.length === 0) return fallback;
-  return candidates.find((candidate) => availableEncoders.includes(candidate)) ?? fallback;
+  if (!availableEncoders || availableEncoders.length === 0) {
+    return codec === "av1" ? null : fallback;
+  }
+  return candidates.find((candidate) => availableEncoders.includes(candidate)) ?? null;
 }
 
 function resolutionDimensions(resolution: ResolutionKey): { width: number; height: number } {
@@ -1734,7 +1741,7 @@ function isExplicitBrowser2k144LowLatencyProfile({
   );
 }
 
-function resolveLocalWebViewPlan({
+export function resolveLocalWebViewPlan({
   capabilities,
   hostOs,
   webPreviewEngine,
@@ -1790,7 +1797,11 @@ function resolveLocalWebViewPlan({
       capabilities?.available_encoders?.includes("videotoolbox_hevc"));
   const preferredEncoders: EncoderType[] =
     hostOs === "macos"
-      ? [...(hevcPreviewAllowed ? (["videotoolbox_hevc"] as const) : []), "videotoolbox_h264", "openh264"]
+      ? [
+          ...(hevcPreviewAllowed ? (["videotoolbox_hevc"] as const) : []),
+          "videotoolbox_h264",
+          "openh264",
+        ]
       : hostOs === "windows"
         ? ["nvenc_h264", ...(hevcPreviewAllowed ? (["nvenc_hevc"] as const) : []), "openh264"]
         : ["openh264"];
@@ -2731,10 +2742,20 @@ export function RemoteDisplayWindowPage() {
       );
     }
     if (
-      encoder === "nvenc_av1" &&
+      (encoder === "nvenc_av1" || encoder === "videotoolbox_av1") &&
       (decoder === "linux_h264" || decoder === "linux_hevc" || decoder === "linux_hevc_main10")
     ) {
       setDecoder(capabilities?.available_decoders.includes("nvdec") ? "nvdec" : "none");
+    }
+    if (
+      hostOs === "macos" &&
+      isLocalPipelinePreview &&
+      renderMode !== "web" &&
+      (encoder === "videotoolbox_hevc" || encoder === "videotoolbox_av1") &&
+      decoder === "none" &&
+      decoderOptionAvailable(capabilities?.available_decoders, "software", encoder)
+    ) {
+      setDecoder("software");
     }
     if (
       (encoder === "nvenc_h264" || encoder === "openh264" || encoder === "videotoolbox_h264") &&
@@ -2742,7 +2763,7 @@ export function RemoteDisplayWindowPage() {
     ) {
       setDecoder(capabilities?.available_decoders.includes("linux_h264") ? "linux_h264" : "software");
     }
-  }, [capabilities?.available_decoders, decoder, encoder]);
+  }, [capabilities?.available_decoders, decoder, encoder, hostOs, isLocalPipelinePreview, renderMode]);
 
   const renderModeLabel =
     renderMode === "metal_native"
@@ -3774,7 +3795,7 @@ export function RemoteDisplayWindowPage() {
       const nextEncoder = pickAvailable(
         encoder,
         capabilities.available_encoders,
-        ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+        ["videotoolbox_hevc", "videotoolbox_av1", "videotoolbox_h264", "openh264"],
         "videotoolbox_hevc"
       );
       setEncoder(nextEncoder);

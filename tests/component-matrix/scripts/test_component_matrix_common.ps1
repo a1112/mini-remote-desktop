@@ -18,10 +18,11 @@ function Assert-True($Condition, [string]$Message) {
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-component-common-{0}" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
+  $powershell = Resolve-ComponentMatrixPowerShellExecutable
   $stdout = Join-Path $tmp "stdout.log"
   $stderr = Join-Path $tmp "stderr.log"
   $result = Invoke-ComponentMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powershell `
     -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
     -WorkingDirectory $tmp `
     -StdoutPath $stdout `
@@ -36,7 +37,7 @@ try {
   $timeoutStdout = Join-Path $tmp "timeout.stdout.log"
   $timeoutStderr = Join-Path $tmp "timeout.stderr.log"
   $timeout = Invoke-ComponentMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powershell `
     -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 10") `
     -WorkingDirectory $tmp `
     -StdoutPath $timeoutStdout `

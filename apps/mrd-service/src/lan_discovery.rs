@@ -41,6 +41,8 @@ use std::sync::Condvar as StdCondvar;
 use std::sync::Mutex as StdMutex;
 #[cfg(any(windows, target_os = "macos"))]
 use std::sync::OnceLock;
+#[cfg(all(test, target_os = "macos"))]
+use std::thread;
 use std::time::Duration;
 #[cfg(all(test, target_os = "macos"))]
 use std::time::Instant as StdInstant;
@@ -113,8 +115,8 @@ use media_capabilities::{
     macos_lan_media_capabilities_from_probe, probe_macos_lan_media_capabilities,
     MacosLanMediaCapabilityProbe, LAN_CAPTURE_MACOS_CAPABILITY, LAN_DECODE_VIDEOTOOLBOX_CAPABILITY,
     LAN_DECODE_VIDEOTOOLBOX_H264_CAPABILITY, LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
-    LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY, LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
-    LAN_RENDER_MACOS_NATIVE_CAPABILITY,
+    LAN_ENCODE_VIDEOTOOLBOX_AV1_CAPABILITY, LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY,
+    LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY, LAN_RENDER_MACOS_NATIVE_CAPABILITY,
 };
 #[cfg(all(test, windows))]
 use media_capabilities::{
@@ -129,7 +131,7 @@ use media_capture_config::window_capture_source_error;
 #[cfg(all(test, windows))]
 use media_capture_config::windows_lan_window_capture_uses_shared_texture;
 use media_capture_config::{
-    dynamic_window_fps_config_key, format_capture_source_failure, is_windows_window_source_id,
+    dynamic_window_fps_config_key, format_capture_source_failure, is_window_source_id,
     lan_capture_config_key, lan_capture_config_matches, DynamicWindowFpsConfigKey,
     LanCaptureConfigKey,
 };
@@ -157,10 +159,12 @@ use media_frame_capture::{
     capture_source_kind_from_id, create_lan_frame_capture, selected_capture_source_id,
     LanSenderFrameCapture,
 };
+#[cfg(all(test, target_os = "macos"))]
+use media_frame_capture::{
+    macos_capture_pump_wait_timeout, MacosPumpedLanFrameCapture, MacosPumpedLanFrameState,
+};
 #[cfg(test)]
 use media_frame_capture::{synthetic_capture_source, TEST_SYNTHETIC_CAPTURE_SOURCE_ID};
-#[cfg(all(test, target_os = "macos"))]
-use media_frame_capture::{MacosPumpedLanFrameCapture, MacosPumpedLanFrameState};
 #[cfg(test)]
 use media_frame_preparation::decoded_frame_to_rgb24;
 #[cfg(test)]
@@ -202,6 +206,8 @@ use media_receiver_decoder_candidates::{
     default_lan_receiver_decoder_candidates, prioritize_lan_receiver_decoder_candidates,
 };
 use media_receiver_runtime::{quic_media_v3_frame_to_legacy_frame, record_lan_decoded_frames};
+#[cfg(any(target_os = "macos", all(test, windows)))]
+use media_render_policy::lan_render_pacing_target_fps_from_values;
 #[cfg(test)]
 use media_render_policy::{
     lan_media_payload_hash_for_mode, lan_media_payload_hash_mode_for_profile_with_override,
@@ -217,11 +223,10 @@ use media_render_policy::{
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use media_render_policy::{
     lan_render_pacing_enabled_for_profile, lan_render_pacing_render_start_delay,
-    lan_render_pacing_target_fps, lan_render_pacing_target_fps_from_values,
-    lan_render_queue_capacity_from_env_value, lan_render_queue_policy_for_profile_with_override,
-    lan_render_queue_policy_from_env_value, render_pacing_frame_interval,
-    render_pacing_precise_sleep_guard, render_profile_requests_high_resolution_timer,
-    should_interrupt_render_pacing_sleep,
+    lan_render_pacing_target_fps, lan_render_queue_capacity_from_env_value,
+    lan_render_queue_policy_for_profile_with_override, lan_render_queue_policy_from_env_value,
+    render_pacing_frame_interval, render_pacing_precise_sleep_guard,
+    render_profile_requests_high_resolution_timer, should_interrupt_render_pacing_sleep,
 };
 #[cfg(all(test, target_os = "macos"))]
 use media_render_worker::upload_lan_render_frame;
@@ -303,6 +308,8 @@ const LAN_CAPTURE_PUMP_DRIVES_SENDER_ENV: &str = "MRD_LAN_CAPTURE_PUMP_DRIVES_SE
 const LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_LATEST";
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_REPEAT_PACING_FPS_ENV: &str = "MRD_LAN_CAPTURE_PUMP_REPEAT_PACING_FPS";
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_REPEAT_LATEST_DEFAULT_MIN_FPS: u32 = 60;
 const LAN_RENDER_PACING_ENV: &str = "MRD_LAN_RENDER_PACING";
 const LAN_RENDER_MAX_FPS_ENV: &str = "MRD_LAN_RENDER_MAX_FPS";
 const LAN_RENDER_QUEUE_CAPACITY_ENV: &str = "MRD_LAN_RENDER_QUEUE_CAPACITY";
@@ -350,6 +357,8 @@ static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LAN_CAPTURE_PUMP_QUEUE_CAPACITY: usize = 2;
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(target_os = "macos")]
+const LAN_CAPTURE_PUMP_FIRST_FRAME_WAIT_TIMEOUT: Duration = Duration::from_millis(1_500);
 #[cfg(target_os = "macos")]
 const LAN_CAPTURE_PUMP_REPEAT_GRACE_MAX: Duration = Duration::from_millis(4);
 #[cfg(target_os = "macos")]
@@ -2486,7 +2495,7 @@ async fn send_quic_media_loop(
         let selected_config_key = lan_capture_config_key(&source_id, &profile);
         let selected_dynamic_window_fps_config_key =
             dynamic_window_fps_config_key(&source_id, &profile);
-        let selected_source_is_window = is_windows_window_source_id(&source_id);
+        let selected_source_is_window = is_window_source_id(&source_id);
         let selected_window_capture_count = if selected_source_is_window {
             active_window_capture_count(&app_state).await
         } else {
@@ -2563,7 +2572,7 @@ async fn send_quic_media_loop(
                             format_capture_source_failure(
                                 &source_id,
                                 format!("failed to initialize LAN capture sender: {error:#}"),
-                                is_windows_window_source_id,
+                                is_window_source_id,
                             ),
                             selected_source_is_window,
                         )
@@ -2591,7 +2600,7 @@ async fn send_quic_media_loop(
                         format_capture_source_failure(
                             &source_id,
                             format!("failed to create LAN capture source: {error:#}"),
-                            is_windows_window_source_id,
+                            is_window_source_id,
                         ),
                         selected_source_is_window,
                     )
@@ -2648,9 +2657,9 @@ async fn send_quic_media_loop(
                     format_capture_source_failure(
                         &error_source_id,
                         format!("{error:#}"),
-                        is_windows_window_source_id,
+                        is_window_source_id,
                     ),
-                    is_windows_window_source_id(&error_source_id),
+                    is_window_source_id(&error_source_id),
                 )
                 .await?;
                 continue;
@@ -3178,6 +3187,20 @@ async fn send_quic_media_loop(
         if consecutive_frame_errors > 0 {
             consecutive_frame_errors = 0;
             set_session_last_error(&app_state, &session_id, None).await;
+            app_state
+                .media_pipelines
+                .lock()
+                .await
+                .set_sender_transport_last_frame_error(
+                    session_id.clone(),
+                    active_capture_config
+                        .as_ref()
+                        .map(|config| config.source_id.clone()),
+                    active_capture_config
+                        .as_ref()
+                        .and_then(|config| capture_source_kind_from_id(&config.source_id)),
+                    None,
+                );
         }
     }
 }
@@ -3216,6 +3239,16 @@ async fn handle_media_sender_frame_error(
         );
     }
     set_session_last_error(app_state, session_id, Some(decorated_message.clone())).await;
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .set_sender_transport_last_frame_error(
+            session_id.clone(),
+            Some(source_id.to_string()),
+            capture_source_kind_from_id(source_id),
+            Some(decorated_message.clone()),
+        );
 
     if fail_after_limit
         && *consecutive_frame_errors >= LAN_MEDIA_SENDER_MAX_CONSECUTIVE_FRAME_ERRORS
@@ -3242,13 +3275,29 @@ fn lan_capture_pump_drives_sender() -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn lan_capture_pump_repeat_latest() -> bool {
-    env_bool_override(
-        std::env::var(LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV)
-            .ok()
-            .as_deref(),
+pub(super) fn lan_capture_pump_repeat_latest_for_profile(profile: &MediaProfile) -> bool {
+    lan_capture_pump_repeat_latest_for_profile_with_override(
+        profile,
+        env_bool_override(
+            std::env::var(LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV)
+                .ok()
+                .as_deref(),
+        ),
+        lan_local_render_refresh_hz(),
     )
-    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_repeat_latest_for_profile_with_override(
+    profile: &MediaProfile,
+    override_value: Option<bool>,
+    local_refresh_hz: Option<u32>,
+) -> bool {
+    if let Some(enabled) = override_value {
+        return enabled;
+    }
+    profile.fps >= LAN_CAPTURE_PUMP_REPEAT_LATEST_DEFAULT_MIN_FPS
+        && lan_render_pacing_target_fps_from_values(profile.fps, local_refresh_hz) >= profile.fps
 }
 
 #[cfg(target_os = "macos")]

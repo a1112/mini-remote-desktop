@@ -1114,11 +1114,254 @@ describe("runLanE2EAutomation", () => {
     );
   });
 
+  it("skips unavailable macOS display sources during automatic source selection", async () => {
+    const unavailableDisplay = {
+      id: "macos:display:0x1",
+      platform: "macos",
+      source_kind: "display",
+      title: "Display 1",
+      class_name: "ScreenCaptureKitDisplayUnavailable",
+      width: 3456,
+      height: 2234,
+      process_id: 0,
+      app_name:
+        "Display capture unavailable (screen_recording_preflight=true, shareable_displays=0)",
+    };
+    const windowSource = {
+      id: "macos:window:42",
+      platform: "macos",
+      source_kind: "window",
+      title: "Codex",
+      class_name: "NSWindow",
+      width: 1440,
+      height: 900,
+      process_id: 42,
+      app_name: "Codex",
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands(),
+      [unavailableDisplay, windowSource]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("macos:window:42");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:window:42"
+    );
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:display:0x1"
+    );
+  });
+
+  it("skips unavailable macOS window sources during automatic source selection", async () => {
+    const unavailableWindow = {
+      id: "macos:window:0x5B2",
+      platform: "macos",
+      source_kind: "window",
+      title: "Codex",
+      class_name: "ScreenCaptureKitWindowUnavailable",
+      width: 1180,
+      height: 724,
+      process_id: 42,
+      app_name:
+        "Window capture unavailable (screen_recording_preflight=true, shareable_displays=0, shareable_windows=44)",
+    };
+    const displaySource = {
+      id: "macos:display:0x1",
+      platform: "macos",
+      source_kind: "display",
+      title: "Main Display",
+      class_name: "ScreenCaptureKitDisplay",
+      width: 3456,
+      height: 2234,
+      process_id: 0,
+      app_name: "Display",
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands(),
+      [unavailableWindow, displaySource]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("macos:display:0x1");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:display:0x1"
+    );
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:window:0x5B2"
+    );
+  });
+
+  it("fails before receiver startup when all macOS capture sources are unavailable for auto selection", async () => {
+    const unavailableDisplay = {
+      id: "macos:display:0x1",
+      platform: "macos",
+      source_kind: "display",
+      title: "Display 1",
+      class_name: "ScreenCaptureKitDisplayUnavailable",
+      width: 3456,
+      height: 2234,
+      process_id: 0,
+      app_name:
+        "Display capture unavailable (screen_recording_preflight=true, shareable_displays=0, shareable_windows=44)",
+    };
+    const unavailableWindow = {
+      id: "macos:window:0x5B2",
+      platform: "macos",
+      source_kind: "window",
+      title: "Codex",
+      class_name: "ScreenCaptureKitWindowUnavailable",
+      width: 1180,
+      height: 724,
+      process_id: 42,
+      app_name:
+        "Window capture unavailable (screen_recording_preflight=true, shareable_displays=0, shareable_windows=44)",
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands(),
+      [unavailableDisplay, unavailableWindow]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("capture_source_failed");
+    expect(result.errorMessage).toContain("No remote capture source available");
+    expect(result.errorMessage).toContain("ScreenCaptureKitDisplayUnavailable=1");
+    expect(result.errorMessage).toContain("ScreenCaptureKitWindowUnavailable=1");
+    expect(result.errorMessage).toContain("shareable_displays=0");
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalled();
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+  });
+
+  it("honors an exact unavailable macOS display source id for explicit diagnostics", async () => {
+    const unavailableDisplay = {
+      id: "macos:display:0x1",
+      platform: "macos",
+      source_kind: "display",
+      title: "Display 1",
+      class_name: "ScreenCaptureKitDisplayUnavailable",
+      width: 3456,
+      height: 2234,
+      process_id: 0,
+      app_name:
+        "Display capture unavailable (screen_recording_preflight=true, shareable_displays=0)",
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands(),
+      [unavailableDisplay, DEFAULT_CAPTURE_SOURCES[0]!]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      preferredCaptureSourceId: "macos:display:0x1",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("macos:display:0x1");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:display:0x1"
+    );
+  });
+
+  it("honors an exact unavailable macOS window source id for explicit diagnostics", async () => {
+    const unavailableWindow = {
+      id: "macos:window:0x5B2",
+      platform: "macos",
+      source_kind: "window",
+      title: "Codex",
+      class_name: "ScreenCaptureKitWindowUnavailable",
+      width: 1180,
+      height: 724,
+      process_id: 42,
+      app_name:
+        "Window capture unavailable (screen_recording_preflight=true, shareable_displays=0, shareable_windows=44)",
+    };
+    const commands = withCaptureSourceCommands(
+      createCommands(),
+      [unavailableWindow, DEFAULT_CAPTURE_SOURCES[1]!]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      preferredCaptureSourceId: "macos:window:0x5B2",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.captureSource?.id).toBe("macos:window:0x5B2");
+    expect(commands.ipcSelectRemoteCaptureSource).toHaveBeenCalledWith(
+      "lan-e2e-test-session",
+      "macos:window:0x5B2"
+    );
+  });
+
   it("caps the media profile to the receiver render pacing target", async () => {
     let activeProfile = { ...DEFAULT_REQUESTED_PROFILE };
     const ipcUpdateMediaProfile = vi.fn().mockImplementation((_sessionId, profile) => {
+      if (profile.width === 2474 && profile.height === 1600) {
+        activeProfile = { ...profile, width: 2472, height: 1598 };
+        return Promise.resolve(
+          ok({
+            requested: profile,
+            selected: activeProfile,
+            status: "downgraded",
+            reason: "matched selected capture source dimensions and aspect ratio",
+          })
+        );
+      }
       activeProfile = profile;
-      return Promise.resolve(ok({ status: "selected" }));
+      return Promise.resolve(
+        ok({
+          requested: profile,
+          selected: profile,
+          status: "accepted",
+        })
+      );
     });
     const commands = withCaptureSourceCommands(
       createCommands({
@@ -1182,6 +1425,139 @@ describe("runLanE2EAutomation", () => {
       expect.objectContaining({ fps: 144 })
     );
     expect(result.requestedProfile?.fps).toBe(144);
+  });
+
+  it("can fit the requested media profile to the selected native capture source", async () => {
+    let activeProfile = {
+      width: 2560,
+      height: 1600,
+      fps: 120,
+      bitrate_mbps: 40,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    };
+    const nativeDisplaySource = {
+      id: "macos:display:0x1",
+      platform: "macos",
+      source_kind: "display",
+      title: "Built-in Liquid Retina XDR Display",
+      class_name: "ScreenCaptureKitDisplay",
+      width: 3456,
+      height: 2234,
+      process_id: 0,
+      app_name: null,
+    };
+    const ipcUpdateMediaProfile = vi.fn().mockImplementation((_sessionId, profile) => {
+      if (profile.width === 2474 && profile.height === 1600) {
+        activeProfile = { ...profile, width: 2472, height: 1598 };
+        return Promise.resolve(
+          ok({
+            requested: profile,
+            selected: activeProfile,
+            status: "downgraded",
+            reason: "matched selected capture source dimensions and aspect ratio",
+          })
+        );
+      }
+      activeProfile = profile;
+      return Promise.resolve(
+        ok({
+          requested: profile,
+          selected: profile,
+          status: "accepted",
+        })
+      );
+    });
+    const commands = withCaptureSourceCommands(
+      createCommands({
+        ipcUpdateMediaProfile,
+        ipcProbeSnapshot: vi.fn().mockImplementation(() =>
+          Promise.resolve(
+            ok({
+              session_id: "unused",
+              frames_received: 4,
+              frames_decoded: 3,
+              frames_dropped: 0,
+              current_fps: activeProfile.fps,
+              bitrate_mbps: activeProfile.bitrate_mbps,
+              media_probe_valid: true,
+              media_probe_format: "compressed_hevc_test_pattern",
+              media_probe_width: activeProfile.width,
+              media_probe_height: activeProfile.height,
+              media_probe_target_fps: activeProfile.fps,
+              media_probe_target_bitrate_mbps: activeProfile.bitrate_mbps,
+              media_probe_payload_bytes: 55555,
+              last_media_sequence: 3,
+              last_media_timestamp_us: 123456,
+              last_media_payload_hash: "fnv1a64:abc123",
+              last_error: null,
+            })
+          )
+        ),
+        ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
+          ok({
+            session_id: "unused",
+            attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
+            active_decoder: "videotoolbox_hevc",
+            active_renderer: "macos_native",
+            active_width: activeProfile.width,
+            active_height: activeProfile.height,
+            active_fps: activeProfile.fps,
+            active_bitrate_mbps: activeProfile.bitrate_mbps,
+            render_pacing_target_fps: 120,
+            queue_depth: 1,
+            dropped_frames: 0,
+            stage_metrics: [],
+            adaptation: null,
+          })
+        ),
+      }),
+      [nativeDisplaySource]
+    );
+
+    const result = await runLanE2EAutomation(commands, {
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: { ...activeProfile },
+      fitRequestedProfileToCaptureSource: true,
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(ipcUpdateMediaProfile).toHaveBeenNthCalledWith(1, "lan-e2e-test-session", {
+      width: 2474,
+      height: 1600,
+      fps: 120,
+      bitrate_mbps: 40,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    });
+    expect(ipcUpdateMediaProfile).toHaveBeenNthCalledWith(2, "lan-e2e-test-session", {
+      width: 2472,
+      height: 1598,
+      fps: 120,
+      bitrate_mbps: 40,
+      codec: "hevc",
+      codec_profile: "main",
+      bit_depth: 8,
+      chroma_subsampling: "4:2:0",
+      pixel_format: "nv12",
+      hdr_enabled: false,
+    });
+    expect(result.requestedProfile?.width).toBe(2472);
+    expect(result.requestedProfile?.height).toBe(1598);
   });
 
   it("can force a capture source kind for DXGI canary runs", async () => {

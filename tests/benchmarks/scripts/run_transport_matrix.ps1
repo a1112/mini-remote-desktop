@@ -108,7 +108,8 @@ if ($exitCode.ExitCode -ne 0) {
   throw "benchmark cargo test failed with exit code $($exitCode.ExitCode). See $hostStderr"
 }
 
-powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `
+$powershell = Resolve-TransportMatrixPowerShellExecutable
+& $powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scripts/summarize_transport_results.ps1') `
   -RunDir $runDir `
   -ThresholdPath $thresholdPath
 

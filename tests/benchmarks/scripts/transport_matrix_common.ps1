@@ -36,6 +36,22 @@ function Get-TransportMatrixCargoFeatureArgs {
   return @("--features", ($uniqueFeatures -join ","))
 }
 
+function Resolve-TransportMatrixPowerShellExecutable {
+  $currentProcess = Get-Process -Id $PID -ErrorAction SilentlyContinue
+  if ($currentProcess -and -not [string]::IsNullOrWhiteSpace($currentProcess.Path)) {
+    return $currentProcess.Path
+  }
+
+  foreach ($candidate in @("pwsh", "powershell", "powershell.exe")) {
+    $command = Get-Command $candidate -ErrorAction SilentlyContinue
+    if ($command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+      return $command.Source
+    }
+  }
+
+  throw "Unable to find a PowerShell executable. Install PowerShell 7 (pwsh) or Windows PowerShell."
+}
+
 function Get-TransportMatrixCargoTestArgs {
   param(
     [string]$EncodeBackend = "",
@@ -168,16 +184,36 @@ function Get-TransportMatrixRenderEnvironment {
   return $result
 }
 
+function Get-TransportChildProcessIds {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int]$ParentProcessId
+  )
+
+  if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+      Where-Object { $_.ParentProcessId -eq $ParentProcessId } |
+      ForEach-Object { [int]$_.ProcessId })
+  }
+
+  $pgrep = Get-Command pgrep -ErrorAction SilentlyContinue
+  if ($pgrep) {
+    return @(& $pgrep.Source -P $ParentProcessId 2> $null |
+      Where-Object { $_ -match '^\d+$' } |
+      ForEach-Object { [int]$_ })
+  }
+
+  return @()
+}
+
 function Stop-TransportProcessTree {
   param(
     [Parameter(Mandatory = $true)]
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-TransportProcessTree -ProcessId $child.ProcessId
+  foreach ($childProcessId in @(Get-TransportChildProcessIds -ParentProcessId $ProcessId)) {
+    Stop-TransportProcessTree -ProcessId $childProcessId
   }
 
   Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
@@ -214,10 +250,8 @@ function Invoke-TransportMatrixCommand {
   if ($null -eq $completed) {
     $jobProcessId = $job.ChildJobs[0].ProcessId
     if ($null -ne $jobProcessId) {
-      $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ParentProcessId -eq $jobProcessId })
-      foreach ($child in $childProcesses) {
-        Stop-TransportProcessTree -ProcessId $child.ProcessId
+      foreach ($childProcessId in @(Get-TransportChildProcessIds -ParentProcessId $jobProcessId)) {
+        Stop-TransportProcessTree -ProcessId $childProcessId
       }
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue

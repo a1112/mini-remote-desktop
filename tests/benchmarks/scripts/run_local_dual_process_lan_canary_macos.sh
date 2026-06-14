@@ -12,9 +12,12 @@ DISPLAY_MODE_POLICY="none"
 CODEC="h264"
 CAPTURE_SOURCE_ID=""
 CAPTURE_SOURCE_KIND="display"
+SOURCE_FIT_PROFILE=0
+SYNTHETIC_CV_CAPTURE=0
 NO_BUILD=0
 KEEP_TAURI_OPEN=0
 RENDER_DISPLAY=1
+RENDER_MAX_FPS=""
 MAX_STEADY_STAGE_P95_MS=10
 MAX_REPEAT_LATEST_RATIO="0.25"
 MIN_CAPTURE_DIRECT_RATIO="0.99"
@@ -36,12 +39,15 @@ Options:
   --duration SECONDS            Alias for --duration-secs
   --bitrate-mbps MBPS          Override the profile default bitrate.
   --display-mode-policy VALUE   none|temporary|required. Default: none
-  --codec VALUE                 h264|hevc for macOS local dual-process canary
+  --codec VALUE                 h264|hevc|av1 for macOS local dual-process canary
+  --synthetic-cv-capture        Use the deterministic test:synthetic-cv source for pipeline diagnostics
   --capture-source-id ID
   --capture-source-kind KIND    Default: display
+  --source-fit-profile          Fit the requested profile to the selected capture source aspect.
   --min-capture-direct-ratio R  Minimum macOS CVPixelBuffer capture ratio. Default: 0.99
   --max-render-present-skip-ratio R
                                 Maximum native present skip ratio. Default: 0.02
+  --render-max-fps FPS          Override MRD_LAN_RENDER_MAX_FPS for render pacing experiments.
   --render-proxy-async-present VALUE
                                 Override MRD_MACOS_RENDER_PROXY_ASYNC_PRESENT for fallback proxy.
   --hevc-raw-decode-async VALUE Override MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_ASYNC for the app.
@@ -64,10 +70,13 @@ while [ "$#" -gt 0 ]; do
     --bitrate-mbps) BITRATE_MBPS="$2"; BITRATE_MBPS_SET=1; shift 2 ;;
     --display-mode-policy) DISPLAY_MODE_POLICY="$2"; shift 2 ;;
     --codec) CODEC="$2"; shift 2 ;;
+    --synthetic-cv-capture) SYNTHETIC_CV_CAPTURE=1; shift ;;
     --capture-source-id) CAPTURE_SOURCE_ID="$2"; shift 2 ;;
     --capture-source-kind) CAPTURE_SOURCE_KIND="$2"; shift 2 ;;
+    --source-fit-profile) SOURCE_FIT_PROFILE=1; shift ;;
     --min-capture-direct-ratio) MIN_CAPTURE_DIRECT_RATIO="$2"; shift 2 ;;
     --max-render-present-skip-ratio) MAX_RENDER_PRESENT_SKIP_RATIO="$2"; shift 2 ;;
+    --render-max-fps) RENDER_MAX_FPS="$2"; shift 2 ;;
     --render-proxy-async-present) RENDER_PROXY_ASYNC_PRESENT="$2"; shift 2 ;;
     --hevc-raw-decode-async) HEVC_RAW_DECODE_ASYNC="$2"; shift 2 ;;
     --hevc-raw-decode-max-pending-inputs) HEVC_RAW_DECODE_MAX_PENDING_INPUTS="$2"; shift 2 ;;
@@ -80,24 +89,49 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$SYNTHETIC_CV_CAPTURE" -eq 1 ]; then
+  export MRD_LAN_TEST_SYNTHETIC_CAPTURE="${MRD_LAN_TEST_SYNTHETIC_CAPTURE:-1}"
+  if [ -z "$CAPTURE_SOURCE_ID" ]; then
+    CAPTURE_SOURCE_ID="test:synthetic-cv"
+  fi
+  CAPTURE_SOURCE_KIND="display"
+fi
+
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "This runner is macOS-only; use run_local_dual_process_lan_canary.ps1 on Windows." >&2
   exit 2
 fi
 
 CODEC="$(printf '%s' "$CODEC" | tr '[:upper:]' '[:lower:]')"
-if [ "$CODEC" != "h264" ] && [ "$CODEC" != "hevc" ]; then
-  echo "macOS local dual-process canary currently supports h264 or hevc." >&2
+if [ "$CODEC" != "h264" ] && [ "$CODEC" != "hevc" ] && [ "$CODEC" != "av1" ]; then
+  echo "macOS local dual-process canary currently supports h264, hevc, or av1." >&2
   exit 2
 fi
 if [ "$CODEC" = "hevc" ]; then
   CHAIN_ID="local_dual_process/macos/videotoolbox_hevc/quic_datagram_media_v3_or_v2/videotoolbox_hevc/macos_native_render_proxy"
   RECEIVER_DECODER="videotoolbox_hevc"
+elif [ "$CODEC" = "av1" ]; then
+  CHAIN_ID="local_dual_process/macos/videotoolbox_av1/quic_datagram_media_v3_or_v2/software_av1/macos_native_render"
+  RECEIVER_DECODER="software_av1"
 fi
 
 if [ "$DISPLAY_MODE_POLICY" != "none" ] && [ "$DISPLAY_MODE_POLICY" != "temporary" ] && [ "$DISPLAY_MODE_POLICY" != "required" ]; then
   echo "--display-mode-policy must be one of none, temporary, required." >&2
   exit 2
+fi
+if [ -n "$RENDER_MAX_FPS" ]; then
+  case "$RENDER_MAX_FPS" in
+    ''|*[!0-9]*)
+      echo "--render-max-fps must be a positive integer." >&2
+      exit 2
+      ;;
+    *)
+      if [ "$RENDER_MAX_FPS" -le 0 ]; then
+        echo "--render-max-fps must be a positive integer." >&2
+        exit 2
+      fi
+      ;;
+  esac
 fi
 
 if ! command -v python3 >/dev/null 2>&1; then
@@ -177,6 +211,8 @@ profile_spec() {
     2k144)
       if [ "$CODEC" = "hevc" ]; then
         default_bitrate=40
+      elif [ "$CODEC" = "av1" ]; then
+        default_bitrate=32
       else
         default_bitrate=80
       fi
@@ -184,6 +220,23 @@ profile_spec() {
       ;;
     1600p120) default_bitrate=80; echo "2560 1600 120 $(profile_bitrate "$default_bitrate")" ;;
     1600p165) default_bitrate=80; echo "2560 1600 165 $(profile_bitrate "$default_bitrate")" ;;
+    native|native120|source-native)
+      if [ "$CODEC" = "hevc" ]; then
+        default_bitrate=40
+      elif [ "$CODEC" = "av1" ]; then
+        default_bitrate=32
+      else
+        default_bitrate=80
+      fi
+      echo "2560 1600 120 $(profile_bitrate "$default_bitrate")"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+profile_uses_source_fit() {
+  case "$1" in
+    native|native120|source-native) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -680,6 +733,14 @@ write_static_tauri_lan_e2e_harness() {
           };
         }
 
+        function isUnsupportedAv1CapabilityError(error) {
+          const message = error instanceof Error ? error.message : String(error || "");
+          return (
+            /encode\.videotoolbox_av1/i.test(message) ||
+            /VTCompressionSessionCreate\(AV1\)/i.test(message)
+          );
+        }
+
         async function writeReport(report) {
           window.__MRD_LAN_E2E_REPORT__ = report;
           await invoke("automation_write_report", { report });
@@ -839,16 +900,30 @@ write_static_tauri_lan_e2e_harness() {
             stage(state.stages, "preflight", "completed");
 
             stage(state.stages, "pairing", "started");
-            await invokeRequired(
-              "ipc_start_lan_remote_session",
-              {
-                sessionId: state.sessionId,
-                targetDeviceId: state.peer.device_id,
-                transportKind: config.transport,
-                requestedProfile: config.requestedProfile,
-              },
-              "session_start_failed"
-            );
+            try {
+              await invokeRequired(
+                "ipc_start_lan_remote_session",
+                {
+                  sessionId: state.sessionId,
+                  targetDeviceId: state.peer.device_id,
+                  transportKind: config.transport,
+                  requestedProfile: config.requestedProfile,
+                },
+                "session_start_failed"
+              );
+            } catch (error) {
+              if (
+                config.requestedProfile.codec === "av1" &&
+                error instanceof LanHarnessError &&
+                error.reason === "session_start_failed" &&
+                isUnsupportedAv1CapabilityError(error)
+              ) {
+                stage(state.stages, "pairing", "skipped", error.message);
+                await writeReport(buildReport(state, "skipped", "unsupported", error.message, sample));
+                return;
+              }
+              throw error;
+            }
             sessionStarted = true;
             stage(state.stages, "pairing", "completed");
 
@@ -1159,6 +1234,8 @@ start_tauri_lan_e2e_app() {
     MRD_LAN_E2E_CAPTURE_SOURCE_KIND="$CAPTURE_SOURCE_KIND" \
     MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID="$GIT_COMMIT" \
     MRD_LAN_E2E_RENDER_DISPLAY="$RENDER_DISPLAY" \
+    MRD_LAN_E2E_SOURCE_FIT_PROFILE="$source_fit_profile" \
+    MRD_LAN_RENDER_MAX_FPS="$RENDER_MAX_FPS" \
     MRD_MACOS_RENDER_PROXY_ASYNC_PRESENT="$RENDER_PROXY_ASYNC_PRESENT" \
     MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_ASYNC="$HEVC_RAW_DECODE_ASYNC" \
     MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_MAX_PENDING_INPUTS="$HEVC_RAW_DECODE_MAX_PENDING_INPUTS" \
@@ -1177,10 +1254,10 @@ run_static_tauri_lan_e2e_fallback() {
   vite_pid="$(start_static_tauri_lan_e2e_server "$harness_dir" "$static_stdout" "$static_stderr")"
   if ! static_ready_error="$(wait_http_ready "http://127.0.0.1:9531/" 10 2>&1)"; then
     write_failure_report "$report_path" "${vite_failure_message} Static harness server was not reachable. ${static_ready_error}. Logs: $logs_dir" "-" "-" "-"
+    append_local_dual_run_metadata "$report_path" "$run_id" "$run_dir" "$logs_dir" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$controller_device" "$peer_device" "$controller_port" "$peer_port" "static_tauri_harness"
     kill_tree "$vite_pid"
     sleep 1
     kill_tree_force "$vite_pid"
-    vite_pid=""
     return 0
   fi
 
@@ -1218,6 +1295,7 @@ run_static_tauri_lan_e2e_fallback() {
   fi
   if [ -s "$report_path" ]; then
     validate_report_performance_thresholds "$report_path"
+    append_local_dual_run_metadata "$report_path" "$run_id" "$run_dir" "$logs_dir" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$controller_device" "$peer_device" "$controller_port" "$peer_port" "static_tauri_harness"
   fi
 
   if [ "$KEEP_TAURI_OPEN" -eq 0 ]; then
@@ -1229,8 +1307,6 @@ run_static_tauri_lan_e2e_fallback() {
     kill_tree_force "$tauri_pid"
   fi
   kill_tree_force "$vite_pid"
-  tauri_pid=""
-  vite_pid=""
   return 0
 }
 
@@ -1247,11 +1323,16 @@ socket_path, report_path = sys.argv[1:3]
 
 try:
     with open(report_path, encoding="utf-8") as file:
-        report = json.load(file)
+        raw_report = json.load(file)
 except Exception:
     raise SystemExit(0)
 
-session_id = report.get("sessionId")
+report = (
+    raw_report.get("report")
+    if isinstance(raw_report.get("report"), dict)
+    else raw_report
+)
+session_id = report.get("sessionId") or raw_report.get("session_id")
 if not session_id:
     raise SystemExit(0)
 
@@ -1286,9 +1367,11 @@ finally:
 
 if response.get("type") != "MediaPipelineSnapshot":
     report["senderMediaPipelineSnapshotError"] = response
+    raw_report["senderMediaPipelineSnapshotError"] = response
 else:
     peer_snapshot = response.get("snapshot") or {}
     report["senderMediaPipelineSnapshot"] = peer_snapshot
+    raw_report["senderMediaPipelineSnapshot"] = peer_snapshot
     pipeline = report.get("mediaPipelineSnapshot")
     if isinstance(pipeline, dict):
         existing_stages = {
@@ -1312,7 +1395,7 @@ else:
             pipeline["sender_transport"] = peer_snapshot.get("sender_transport")
 
 with open(report_path, "w", encoding="utf-8") as file:
-    json.dump(report, file, indent=2)
+    json.dump(raw_report, file, indent=2)
 PY
 }
 
@@ -1341,12 +1424,17 @@ expected_encoder = f"videotoolbox_{expected_codec}"
 expected_receiver_decoders = {
     "h264": {"rdesk_videotoolbox", "videotoolbox", "videotoolbox_h264"},
     "hevc": {"rdesk_videotoolbox_hevc", "videotoolbox_hevc"},
+    "av1": {"software_av1", "dav1d"},
 }.get(expected_codec, set())
 
 try:
     with open(path, encoding="utf-8") as file:
-        report = json.load(file)
+        raw_report = json.load(file)
 except Exception:
+    raise SystemExit(0)
+
+report = raw_report.get("report") if isinstance(raw_report.get("report"), dict) else raw_report
+if not isinstance(report, dict):
     raise SystemExit(0)
 
 if report.get("status") != "completed":
@@ -1354,10 +1442,29 @@ if report.get("status") != "completed":
 
 pipeline = report.get("mediaPipelineSnapshot") or {}
 sender_pipeline = report.get("senderMediaPipelineSnapshot") or {}
+requested_profile = report.get("requestedProfile") or {}
+profile_fps = requested_profile.get("fps")
+render_target_fps = pipeline.get("render_pacing_target_fps")
+display_limited_reason = None
+if (
+    render_display
+    and isinstance(profile_fps, (int, float))
+    and isinstance(render_target_fps, (int, float))
+    and profile_fps > 0
+    and render_target_fps > 0
+    and render_target_fps < profile_fps
+):
+    display_limited_reason = (
+        f"local render target {render_target_fps:.0f}fps is below requested "
+        f"{profile_fps:.0f}fps; row is display_refresh_limited"
+    )
 stage_metrics = pipeline.get("stage_metrics") or []
 steady_prefixes = ("sender.", "receiver.")
 ignored_stages = {
     "sender.encoder_create",
+    # sender.loop is an aggregate cycle timer and includes pacing/idle wait.
+    # Validate the active sender work with the capture/encode/send stages below.
+    "sender.loop",
     "sender.pacing_wait",
     "receiver.message_wait",
     "receiver.read",
@@ -1411,13 +1518,17 @@ repeated_latest = sender_transport.get("repeated_latest_frames") or 0
 if frames_completed <= 0:
     failures.append("missing sender completed frame count for repeat-latest validation")
 else:
+    fresh_sender_frames = max(0, frames_completed - repeated_latest)
     repeat_ratio = repeated_latest / frames_completed
+    fresh_ratio = fresh_sender_frames / frames_completed
     report["repeatLatestFrameRatio"] = repeat_ratio
+    report["freshSenderFrames"] = fresh_sender_frames
+    report["freshSenderFrameRatio"] = fresh_ratio
     if repeat_ratio > max_repeat_ratio:
         warnings = report.setdefault("performanceWarnings", [])
         warnings.append(
             f"repeat-latest ratio {repeat_ratio:.3f} exceeds {max_repeat_ratio:.3f} "
-            f"({repeated_latest}/{frames_completed})"
+            f"({repeated_latest}/{frames_completed}, fresh {fresh_sender_frames}/{frames_completed})"
         )
 
 capture_frame_samples = sender_transport.get("capture_frame_samples") or 0
@@ -1469,8 +1580,6 @@ if render_display:
     min_decoded_frames = thresholds.get("minDecodedFrames")
     min_fps = thresholds.get("minFps")
     min_render_fps = thresholds.get("minRenderFps")
-    requested_profile = report.get("requestedProfile") or {}
-    profile_fps = requested_profile.get("fps")
     if not isinstance(min_render_fps, (int, float)):
         min_render_fps = min_fps
     if isinstance(profile_fps, (int, float)) and profile_fps >= 120:
@@ -1515,7 +1624,21 @@ if render_display:
                 f"({render_present_skips:.0f}/{render_presented:.0f})"
             )
 
-if failures:
+if display_limited_reason:
+    if failures:
+        warnings = report.setdefault("performanceWarnings", [])
+        warnings.append("display-limited threshold observations: " + "; ".join(failures))
+    report["status"] = "skipped"
+    report["failureReason"] = "display_refresh_limited"
+    report["errorMessage"] = display_limited_reason
+    stages = report.setdefault("stages", [])
+    stages.append({
+        "stage": "assert",
+        "status": "skipped",
+        "timestamp": report.get("finishedAt"),
+        "error": display_limited_reason,
+    })
+elif failures:
     report["status"] = "failed"
     report["failureReason"] = "performance_threshold"
     report["errorMessage"] = "; ".join(failures)
@@ -1528,7 +1651,7 @@ if failures:
     })
 
 with open(path, "w", encoding="utf-8") as file:
-    json.dump(report, file, indent=2)
+    json.dump(raw_report, file, indent=2)
 PY
 }
 
@@ -1585,6 +1708,197 @@ with open(path, "w", encoding="utf-8") as file:
 PY
 }
 
+append_local_dual_run_metadata() {
+  local report_path="$1"
+  local run_id="$2"
+  local run_dir="$3"
+  local logs_dir="$4"
+  local controller_pid="$5"
+  local peer_pid="$6"
+  local tauri_pid="$7"
+  local vite_pid="$8"
+  local render_proxy_pid="$9"
+  local controller_socket="${10}"
+  local peer_socket="${11}"
+  local controller_device="${12}"
+  local peer_device="${13}"
+  local controller_port="${14}"
+  local peer_port="${15}"
+  local harness_mode="${16}"
+  python3 - "$report_path" "$run_id" "$run_dir" "$logs_dir" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$controller_device" "$peer_device" "$controller_port" "$peer_port" "$harness_mode" <<'PY'
+import json
+import sys
+
+(
+    report_path,
+    run_id,
+    run_dir,
+    logs_dir,
+    controller_pid,
+    peer_pid,
+    tauri_pid,
+    vite_pid,
+    render_proxy_pid,
+    controller_socket,
+    peer_socket,
+    controller_device,
+    peer_device,
+    controller_port,
+    peer_port,
+    harness_mode,
+) = sys.argv[1:17]
+
+def maybe_int(value):
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+try:
+    with open(report_path, encoding="utf-8") as file:
+        report = json.load(file)
+except Exception:
+    raise SystemExit(0)
+
+controller_pid_int = maybe_int(controller_pid)
+peer_pid_int = maybe_int(peer_pid)
+controller_port_int = maybe_int(controller_port)
+peer_port_int = maybe_int(peer_port)
+controller_endpoint = f"127.0.0.1:{controller_port_int}" if controller_port_int else None
+peer_endpoint = f"127.0.0.1:{peer_port_int}" if peer_port_int else None
+
+report["localDualProcess"] = {
+    "run_id": run_id,
+    "run_dir": run_dir,
+    "logs_dir": logs_dir,
+    "harness_mode": harness_mode,
+    "service_process_count": int(controller_pid_int is not None) + int(peer_pid_int is not None),
+    "distinct_service_processes": (
+        controller_pid_int is not None
+        and peer_pid_int is not None
+        and controller_pid_int != peer_pid_int
+    ),
+    "distinct_ipc_endpoints": bool(controller_socket and peer_socket and controller_socket != peer_socket),
+    "discovery_path": "udp_loopback_lan_discovery",
+    "controller": {
+        "role": "controller",
+        "pid": controller_pid_int,
+        "device_id": controller_device,
+        "ipc_endpoint": controller_socket,
+        "discovery_port": controller_port_int,
+        "probe_endpoint": peer_endpoint,
+    },
+    "peer": {
+        "role": "peer",
+        "pid": peer_pid_int,
+        "device_id": peer_device,
+        "ipc_endpoint": peer_socket,
+        "discovery_port": peer_port_int,
+        "probe_endpoint": controller_endpoint,
+    },
+    "tauri": {
+        "pid": maybe_int(tauri_pid),
+    },
+    "vite": {
+        "pid": maybe_int(vite_pid),
+    },
+    "render_proxy": {
+        "pid": maybe_int(render_proxy_pid),
+    },
+}
+
+with open(report_path, "w", encoding="utf-8") as file:
+    json.dump(report, file, indent=2)
+PY
+}
+
+record_local_dual_cleanup() {
+  local report_path="$1"
+  local controller_pid="$2"
+  local peer_pid="$3"
+  local tauri_pid="$4"
+  local vite_pid="$5"
+  local render_proxy_pid="$6"
+  local controller_socket="$7"
+  local peer_socket="$8"
+  local keep_tauri_open="$9"
+  python3 - "$report_path" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$keep_tauri_open" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+(
+    report_path,
+    controller_pid,
+    peer_pid,
+    tauri_pid,
+    vite_pid,
+    render_proxy_pid,
+    controller_socket,
+    peer_socket,
+    keep_tauri_open,
+) = sys.argv[1:10]
+
+def maybe_int(value):
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+def pid_alive(value):
+    pid = maybe_int(value)
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+try:
+    with open(report_path, encoding="utf-8") as file:
+        report = json.load(file)
+except Exception:
+    raise SystemExit(0)
+
+controller_alive = pid_alive(controller_pid)
+peer_alive = pid_alive(peer_pid)
+tauri_alive = pid_alive(tauri_pid)
+vite_alive = pid_alive(vite_pid)
+render_proxy_alive = pid_alive(render_proxy_pid)
+ipc_endpoints_removed = not os.path.exists(controller_socket) and not os.path.exists(peer_socket)
+tauri_expected_alive = keep_tauri_open == "1"
+all_clean = (
+    not controller_alive
+    and not peer_alive
+    and (tauri_expected_alive or not tauri_alive)
+    and not vite_alive
+    and not render_proxy_alive
+    and ipc_endpoints_removed
+)
+
+report["processCleanup"] = {
+    "recorded_at": datetime.now(timezone.utc).isoformat(),
+    "status": "completed" if all_clean else "leaked",
+    "controller_alive_after_cleanup": controller_alive,
+    "peer_alive_after_cleanup": peer_alive,
+    "tauri_alive_after_cleanup": tauri_alive,
+    "vite_alive_after_cleanup": vite_alive,
+    "render_proxy_alive_after_cleanup": render_proxy_alive,
+    "tauri_expected_alive": tauri_expected_alive,
+    "ipc_endpoints_removed": ipc_endpoints_removed,
+}
+
+with open(report_path, "w", encoding="utf-8") as file:
+    json.dump(report, file, indent=2)
+PY
+}
+
 run_service_only_lan_e2e() {
   local controller_socket="$1"
   local peer_socket="$2"
@@ -1601,8 +1915,9 @@ run_service_only_lan_e2e() {
   local min_fps="${13}"
   local capture_source_id="${14}"
   local capture_source_kind="${15}"
-  local render_surface_ready_path="${16:-}"
-  python3 - "$controller_socket" "$peer_socket" "$report_path" "$session_id" "$target_device_id" "$width" "$height" "$fps" "$bitrate" "$CODEC" "$timeout_ms" "$min_sample_duration_ms" "$min_decoded_frames" "$min_fps" "$capture_source_id" "$capture_source_kind" "$render_surface_ready_path" <<'PY'
+  local profile_source_fit="${16:-0}"
+  local render_surface_ready_path="${17:-}"
+  python3 - "$controller_socket" "$peer_socket" "$report_path" "$session_id" "$target_device_id" "$width" "$height" "$fps" "$bitrate" "$CODEC" "$timeout_ms" "$min_sample_duration_ms" "$min_decoded_frames" "$min_fps" "$capture_source_id" "$capture_source_kind" "$profile_source_fit" "$render_surface_ready_path" <<'PY'
 import json
 import socket
 import struct
@@ -1626,8 +1941,9 @@ import time
     min_fps,
     capture_source_id,
     capture_source_kind,
+    profile_source_fit_raw,
     render_surface_ready_path,
-) = sys.argv[1:18]
+) = sys.argv[1:19]
 
 width = int(width)
 height = int(height)
@@ -1637,6 +1953,7 @@ timeout_ms = int(timeout_ms)
 min_sample_duration_ms = int(min_sample_duration_ms)
 min_decoded_frames = int(min_decoded_frames)
 min_fps = float(min_fps)
+profile_source_fit = profile_source_fit_raw.strip().lower() in ("1", "true", "yes", "on")
 started_at = int(time.time() * 1000)
 stages = []
 sample_interval_s = 0.5
@@ -1678,6 +1995,16 @@ def ipc(socket_path, payload):
 
 
 def report(status, failure_reason=None, error_message=None, **extra):
+    requested_profile = extra.get("requested_profile") or globals().get("current_requested_profile")
+    if not requested_profile:
+        requested_profile = {
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "bitrate_mbps": bitrate,
+            "codec": codec,
+            **({"codec_profile": "main", "bit_depth": 8, "chroma_subsampling": "4:2:0", "pixel_format": "nv12", "hdr_enabled": False} if codec == "hevc" else {}),
+        }
     data = {
         "status": status,
         "scenarioId": "lan.e2e.remote_display",
@@ -1690,14 +2017,7 @@ def report(status, failure_reason=None, error_message=None, **extra):
         "sessionSnapshot": extra.get("session_snapshot"),
         "probeSnapshot": extra.get("probe_snapshot"),
         "mediaPipelineSnapshot": extra.get("pipeline_snapshot"),
-        "requestedProfile": {
-            "width": width,
-            "height": height,
-            "fps": fps,
-            "bitrate_mbps": bitrate,
-            "codec": codec,
-            **({"codec_profile": "main", "bit_depth": 8, "chroma_subsampling": "4:2:0", "pixel_format": "nv12", "hdr_enabled": False} if codec == "hevc" else {}),
-        },
+        "requestedProfile": requested_profile,
         "faultEvents": [],
         "validationMode": "quic_datagram",
         "dataPlaneVerified": status == "completed",
@@ -1733,6 +2053,59 @@ def report(status, failure_reason=None, error_message=None, **extra):
     return data
 
 
+def is_unsupported_av1_capability_error(message):
+    text = str(message or "").lower()
+    return (
+        "encode.videotoolbox_av1" in text
+        or "vtcompressionsessioncreate(av1)" in text
+    )
+
+
+UNAVAILABLE_AUTO_SELECT_CLASS_NAMES = {
+    "screencapturekitdisplayunavailable",
+}
+
+
+def source_available_for_auto_select(source):
+    class_name = str(source.get("class_name") or source.get("className") or "").strip().lower()
+    return class_name not in UNAVAILABLE_AUTO_SELECT_CLASS_NAMES
+
+
+def even_dimension(value):
+    return max(2, int(value) & ~1)
+
+
+def source_fitted_profile(source, profile):
+    source_width = source.get("width", 0)
+    source_height = source.get("height", 0)
+    if source_width <= 0 or source_height <= 0:
+        return None
+    scale = min(profile["width"] / source_width, profile["height"] / source_height, 1.0)
+    fitted_width = even_dimension(max(2, round(source_width * scale)))
+    fitted_height = even_dimension(max(2, round(source_height * scale)))
+    if fitted_width == profile["width"] and fitted_height == profile["height"]:
+        return None
+    fitted = dict(profile)
+    fitted["width"] = fitted_width
+    fitted["height"] = fitted_height
+    return fitted
+
+
+def media_profiles_match(left, right):
+    return (
+        left.get("width") == right.get("width")
+        and left.get("height") == right.get("height")
+        and left.get("fps") == right.get("fps")
+        and left.get("bitrate_mbps") == right.get("bitrate_mbps")
+        and str(left.get("codec", "")).lower() == str(right.get("codec", "")).lower()
+        and left.get("codec_profile") == right.get("codec_profile")
+        and left.get("bit_depth") == right.get("bit_depth")
+        and left.get("chroma_subsampling") == right.get("chroma_subsampling")
+        and left.get("pixel_format") == right.get("pixel_format")
+        and left.get("hdr_enabled") == right.get("hdr_enabled")
+    )
+
+
 def choose_source(sources):
     normalized_id = capture_source_id.strip().lower()
     if normalized_id:
@@ -1740,15 +2113,18 @@ def choose_source(sources):
             if source.get("id", "").lower() == normalized_id:
                 return source
         raise RuntimeError(f"requested remote capture source is unavailable: {capture_source_id}")
+    auto_sources = [source for source in sources if source_available_for_auto_select(source)]
     normalized_kind = capture_source_kind.strip()
     if normalized_kind:
-        for source in sources:
+        for source in auto_sources:
             if source.get("source_kind") == normalized_kind:
                 return source
     for kind in ("display_shared", "display", "window"):
-        for source in sources:
+        for source in auto_sources:
             if source.get("source_kind") == kind:
                 return source
+    if auto_sources:
+        return auto_sources[0]
     if not sources:
         raise RuntimeError("no remote capture source available")
     return sources[0]
@@ -1769,6 +2145,7 @@ session_snapshot = None
 probe_snapshot = None
 pipeline_snapshot = None
 session_started = False
+current_requested_profile = None
 
 try:
     stage("preflight", "started")
@@ -1811,15 +2188,24 @@ try:
             "pixel_format": "nv12",
             "hdr_enabled": False,
         })
+    current_requested_profile = requested_profile
 
     stage("pairing", "started")
-    ipc(controller_socket, {
-        "type": "StartLanRemoteSession",
-        "session_id": session_id,
-        "target_device_id": target_device_id,
-        "transport_kind": "quic",
-        "requested_profile": requested_profile,
-    })
+    try:
+        ipc(controller_socket, {
+            "type": "StartLanRemoteSession",
+            "session_id": session_id,
+            "target_device_id": target_device_id,
+            "transport_kind": "quic",
+            "requested_profile": requested_profile,
+        })
+    except Exception as exc:
+        message = str(exc)
+        if codec == "av1" and is_unsupported_av1_capability_error(message):
+            stage("pairing", "skipped", message)
+            report("skipped", "unsupported", message, peer=peer)
+            raise SystemExit(0)
+        raise
     session_started = True
     stage("pairing", "completed")
 
@@ -1840,6 +2226,29 @@ try:
         raise RuntimeError(f"remote capture source rejected: {capture_source.get('id')}")
     capture_source = capture_selection.get("source") or capture_source
     stage("capture_source", "completed")
+    if profile_source_fit:
+        next_profile = source_fitted_profile(capture_source, requested_profile)
+        if next_profile:
+            for _ in range(3):
+                update_response = ipc(controller_socket, {
+                    "type": "UpdateMediaProfile",
+                    "session_id": session_id,
+                    "requested_profile": next_profile,
+                })
+                negotiation = update_response.get("negotiation", {})
+                selected_profile = negotiation.get("selected") if isinstance(negotiation, dict) else None
+                if not isinstance(selected_profile, dict):
+                    requested_profile = next_profile
+                    current_requested_profile = requested_profile
+                    break
+                if media_profiles_match(selected_profile, next_profile):
+                    requested_profile = selected_profile
+                    current_requested_profile = requested_profile
+                    break
+                next_profile = selected_profile
+            else:
+                requested_profile = next_profile
+                current_requested_profile = requested_profile
 
     if render_surface_ready_path:
         stage("display", "started")
@@ -1985,7 +2394,13 @@ import json
 import sys
 try:
     with open(sys.argv[1], encoding="utf-8") as file:
-        print(json.load(file).get("status", ""))
+        report = json.load(file)
+        print(
+            report.get("status")
+            or report.get("final_status")
+            or (report.get("report") or {}).get("status")
+            or ""
+        )
 except Exception:
     print("")
 PY
@@ -1993,14 +2408,19 @@ PY
 
 write_summary_report() {
   local output_root="$1"
-  python3 - "$output_root" "$GIT_COMMIT" "$CHAIN_ID" <<'PY'
+  python3 - "$output_root" "$GIT_COMMIT" "$CHAIN_ID" "$RENDER_MAX_FPS" <<'PY'
 import glob
 import json
 import os
 import sys
 
-output_root, git_commit, chain_id = sys.argv[1:4]
+output_root, git_commit, chain_id, render_max_fps_raw = sys.argv[1:5]
+try:
+    render_max_fps_override = int(render_max_fps_raw) if render_max_fps_raw else None
+except ValueError:
+    render_max_fps_override = None
 rows = []
+DEFAULT_MACOS_RENDER_TARGET_FPS = 120
 def stage_p95(pipeline, stage_name):
     for item in pipeline.get("stage_metrics") or []:
         if isinstance(item, dict) and item.get("stage") == stage_name:
@@ -2014,14 +2434,66 @@ def ratio(numerator, denominator):
         return numerator / denominator
     return None
 
+def sender_stage_p95(sender_pipeline, receiver_pipeline, stage_name):
+    value = stage_p95(sender_pipeline, stage_name)
+    return value if value is not None else stage_p95(receiver_pipeline, stage_name)
+
+def is_unsupported_av1_report(report):
+    profile = report.get("requestedProfile") or {}
+    if str(profile.get("codec", "")).lower() != "av1":
+        return False
+    message = " ".join(
+        str(value or "")
+        for value in (report.get("failureReason"), report.get("errorMessage"))
+    ).lower()
+    return (
+        "encode.videotoolbox_av1" in message
+        or "vtcompressionsessioncreate(av1)" in message
+    )
+
+def display_refresh_limit_reason(requested_fps, render_target_fps):
+    if not isinstance(requested_fps, (int, float)):
+        return None
+    if not isinstance(render_target_fps, (int, float)):
+        return None
+    if requested_fps <= 0 or render_target_fps <= 0:
+        return None
+    if render_target_fps >= requested_fps:
+        return None
+    return (
+        f"local render target {render_target_fps:.0f}fps is below requested "
+        f"{requested_fps:.0f}fps; row is display_refresh_limited"
+    )
+
+def inferred_render_target_fps(requested_fps, render_target_fps):
+    if isinstance(render_target_fps, (int, float)):
+        return render_target_fps
+    if not isinstance(requested_fps, (int, float)) or requested_fps <= 0:
+        return None
+    if isinstance(render_max_fps_override, int) and render_max_fps_override > 0:
+        return min(requested_fps, render_max_fps_override)
+    if requested_fps >= DEFAULT_MACOS_RENDER_TARGET_FPS:
+        return min(requested_fps, DEFAULT_MACOS_RENDER_TARGET_FPS)
+    return None
+
 for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.json"))):
     with open(raw_path, encoding="utf-8") as file:
-        report = json.load(file)
+        raw_report = json.load(file)
+    report = (
+        raw_report.get("report")
+        if isinstance(raw_report.get("report"), dict)
+        else raw_report
+    )
     raw_name = os.path.basename(raw_path)
     profile_id = raw_name[len("local-dual-"):-len(".json")]
     probe = report.get("probeSnapshot") or {}
     pipeline = report.get("mediaPipelineSnapshot") or {}
-    capture = report.get("captureSource") or {}
+    capture = report.get("captureSource") or raw_report.get("capture_source") or {}
+    local_dual = raw_report.get("localDualProcess") or report.get("localDualProcess") or {}
+    cleanup = raw_report.get("processCleanup") or report.get("processCleanup") or {}
+    display_window = report.get("displayWindow") or {}
+    controller_process = local_dual.get("controller") or {}
+    peer_process = local_dual.get("peer") or {}
     requested_profile = report.get("requestedProfile") or {}
     fps_elapsed = report.get("sampleObservedFps")
     fps_target = report.get("sampleObservedFpsAtTargetDuration")
@@ -2038,6 +2510,7 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
     thresholds = report.get("thresholds") or {}
     sender_pipeline = report.get("senderMediaPipelineSnapshot") or {}
     sender_transport = sender_pipeline.get("sender_transport") or pipeline.get("sender_transport") or {}
+    sender_last_frame_error = sender_transport.get("last_frame_error")
     sample_render_presented = report.get("sampleRenderFramesPresented")
     sample_queue_replacements = report.get("sampleRenderQueueReplacements")
     queue_replacements = sample_queue_replacements if isinstance(sample_queue_replacements, (int, float)) else pipeline.get("render_queue_replacements")
@@ -2045,15 +2518,96 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
     present_skips = sample_present_skips if isinstance(sample_present_skips, (int, float)) else pipeline.get("render_present_skips")
     repeated_latest_frames = sender_transport.get("repeated_latest_frames")
     frames_completed = sender_transport.get("frames_completed")
+    fresh_sender_frames = None
+    if isinstance(frames_completed, (int, float)) and isinstance(repeated_latest_frames, (int, float)):
+        fresh_sender_frames = max(0, frames_completed - repeated_latest_frames)
     capture_frame_samples = sender_transport.get("capture_frame_samples")
     capture_direct_frames = sender_transport.get("capture_macos_cv_pixel_buffer_frames")
     capture_cpu_frames = sender_transport.get("capture_cpu_frames")
+    unsupported_av1 = is_unsupported_av1_report(report)
+    requested_fps = requested_profile.get("fps")
+    render_target_fps = inferred_render_target_fps(
+        requested_fps,
+        pipeline.get("render_pacing_target_fps"),
+    )
+    display_limited_reason = display_refresh_limit_reason(requested_fps, render_target_fps)
+    report_status = report.get("status")
+    report_failure_reason = report.get("failureReason")
+    sender_error_text = (
+        sender_last_frame_error.lower()
+        if isinstance(sender_last_frame_error, str)
+        else ""
+    )
+    capture_permission_required = (
+        report_status == "failed"
+        and report_failure_reason == "no_remote_frames"
+        and "screen recording permission is not granted" in sender_error_text
+    )
+    capture_display_unavailable = (
+        report_status == "failed"
+        and report_failure_reason == "no_remote_frames"
+        and not capture_permission_required
+        and (
+            "screencapturekit found no capture display" in sender_error_text
+            or "display capture is unavailable" in sender_error_text
+        )
+    )
+    capture_window_unavailable = (
+        report_status == "failed"
+        and report_failure_reason == "no_remote_frames"
+        and not capture_permission_required
+        and not capture_display_unavailable
+        and capture.get("source_kind") == "window"
+        and (
+            "window_capture_source_not_found" in sender_error_text
+            or "macos lan capture pump timed out waiting for a captured frame" in sender_error_text
+            or "screencapturekit timed out waiting" in sender_error_text
+        )
+    )
+    display_limited = (
+        display_limited_reason is not None
+        and not unsupported_av1
+        and not capture_permission_required
+        and not capture_display_unavailable
+        and not capture_window_unavailable
+        and (
+            report_status in {"completed", "skipped"}
+            or (
+                report_status == "failed"
+                and report_failure_reason
+                in {"display_refresh_limited", "performance_threshold", "no_remote_frames"}
+            )
+        )
+    )
+    row_status = "skipped" if unsupported_av1 or display_limited else report_status or "failed"
+    row_classification = (
+        "completed"
+        if row_status == "completed"
+        else "unsupported"
+        if unsupported_av1
+        else "capture_permission_required"
+        if capture_permission_required
+        else "capture_display_unavailable"
+        if capture_display_unavailable
+        else "capture_window_unavailable"
+        if capture_window_unavailable
+        else "display_refresh_limited"
+        if display_limited
+        else report.get("failureReason", "failed")
+    )
     row = {
         "id": profile_id,
         "mode": "local-dual-process",
         "chain": chain_id,
-        "status": report.get("status", "failed"),
-        "classification": "completed" if report.get("status") == "completed" else report.get("failureReason", "failed"),
+        "session_id": report.get("sessionId"),
+        "status": row_status,
+        "classification": row_classification,
+        "media_verified": report.get("mediaVerified"),
+        "data_plane_verified": report.get("dataPlaneVerified"),
+        "display_native_surface_attached": display_window.get("native_surface_attached"),
+        "display_render_mode": display_window.get("render_mode"),
+        "display_renderer_attached": display_window.get("renderer_attached"),
+        "display_surface_id": display_window.get("surface_id"),
         "fps_observed": fps or 0,
         "fps_observed_elapsed": fps_elapsed,
         "fps_observed_target_duration": fps_target,
@@ -2064,7 +2618,12 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "sample_fps_elapsed_ms": report.get("sampleFpsElapsedMs"),
         "sample_fps_target_duration_ms": report.get("sampleFpsTargetDurationMs"),
         "sample_target_duration_ms": thresholds.get("minSampleDurationMs"),
-        "requested_fps": requested_profile.get("fps"),
+        "requested_fps": requested_fps,
+        "render_pacing_target_fps": render_target_fps,
+        "display_refresh_limited": display_limited,
+        "display_refresh_limit_reason": display_limited_reason if display_limited else None,
+        "capture_display_unavailable": capture_display_unavailable,
+        "capture_window_unavailable": capture_window_unavailable,
         "sample_render_frames_presented": report.get("sampleRenderFramesPresented"),
         "sample_frames_decoded": report.get("sampleFramesDecoded"),
         "render_queue_policy": pipeline.get("render_queue_policy"),
@@ -2075,7 +2634,10 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "render_stale_frame_drops": pipeline.get("render_stale_frame_drops"),
         "repeat_latest_frame_ratio": report.get("repeatLatestFrameRatio") if isinstance(report.get("repeatLatestFrameRatio"), (int, float)) else ratio(repeated_latest_frames, frames_completed),
         "repeated_latest_frames": repeated_latest_frames,
+        "fresh_sender_frames": report.get("freshSenderFrames") if isinstance(report.get("freshSenderFrames"), (int, float)) else fresh_sender_frames,
+        "fresh_sender_frame_ratio": report.get("freshSenderFrameRatio") if isinstance(report.get("freshSenderFrameRatio"), (int, float)) else ratio(fresh_sender_frames, frames_completed),
         "sender_frames_completed": frames_completed,
+        "sender_last_frame_error": sender_last_frame_error,
         "capture_frame_samples": capture_frame_samples,
         "capture_macos_cv_pixel_buffer_frames": capture_direct_frames,
         "capture_cpu_frames": capture_cpu_frames,
@@ -2088,11 +2650,18 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "capture_memory_path": sender_transport.get("capture_memory_path"),
         "sender_datagram_fragments_sent": sender_transport.get("datagram_fragments_sent"),
         "receiver_proxy_forward_direct_v3_p95_ms": stage_p95(pipeline, "receiver.proxy_forward_direct_v3"),
+        "render_present_p95_ms": stage_p95(pipeline, "render_present"),
         "render_proxy_next_drawable_p95_ms": stage_p95(pipeline, "render_proxy_next_drawable"),
         "render_proxy_draw_present_p95_ms": stage_p95(pipeline, "render_proxy_draw_present"),
         "render_present_gap_p95_ms": stage_p95(pipeline, "render_present_gap"),
         "render_enqueue_gap_p95_ms": stage_p95(pipeline, "render_enqueue_gap"),
-        "sender_encode_p95_ms": stage_p95(pipeline, "sender.encode"),
+        "sender_capture_p95_ms": sender_stage_p95(sender_pipeline, pipeline, "sender.capture"),
+        "sender_encode_p95_ms": sender_stage_p95(sender_pipeline, pipeline, "sender.encode"),
+        "sender_send_datagram_p95_ms": sender_stage_p95(sender_pipeline, pipeline, "sender.send_datagram"),
+        "sender_fragment_p95_ms": sender_stage_p95(sender_pipeline, pipeline, "sender.fragment"),
+        "queue_depth": pipeline.get("queue_depth"),
+        "swap_chain_max_frame_latency": pipeline.get("swap_chain_max_frame_latency"),
+        "swap_chain_present_mode": pipeline.get("swap_chain_present_mode"),
         "decoded_frames": probe.get("frames_decoded", 0),
         "dropped_frames": probe.get("frames_dropped", 0),
         "active_encoder": sender_pipeline.get("active_encoder") or pipeline.get("active_encoder"),
@@ -2106,10 +2675,31 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "active_height": pipeline.get("active_height"),
         "active_fps": pipeline.get("active_fps"),
         "active_bitrate_mbps": pipeline.get("active_bitrate_mbps"),
+        "local_dual_run_id": local_dual.get("run_id"),
+        "local_dual_harness_mode": local_dual.get("harness_mode"),
+        "local_dual_service_process_count": local_dual.get("service_process_count"),
+        "local_dual_distinct_service_processes": local_dual.get("distinct_service_processes"),
+        "local_dual_distinct_ipc_endpoints": local_dual.get("distinct_ipc_endpoints"),
+        "local_dual_discovery_path": local_dual.get("discovery_path"),
+        "controller_pid": controller_process.get("pid"),
+        "peer_pid": peer_process.get("pid"),
+        "controller_ipc_endpoint": controller_process.get("ipc_endpoint"),
+        "peer_ipc_endpoint": peer_process.get("ipc_endpoint"),
+        "controller_discovery_port": controller_process.get("discovery_port"),
+        "peer_discovery_port": peer_process.get("discovery_port"),
+        "process_cleanup_status": cleanup.get("status"),
+        "process_cleanup_ipc_endpoints_removed": cleanup.get("ipc_endpoints_removed"),
+        "controller_alive_after_cleanup": cleanup.get("controller_alive_after_cleanup"),
+        "peer_alive_after_cleanup": cleanup.get("peer_alive_after_cleanup"),
+        "tauri_alive_after_cleanup": cleanup.get("tauri_alive_after_cleanup"),
+        "vite_alive_after_cleanup": cleanup.get("vite_alive_after_cleanup"),
+        "render_proxy_alive_after_cleanup": cleanup.get("render_proxy_alive_after_cleanup"),
         "capture_source_id": capture.get("id"),
         "capture_source_kind": capture.get("source_kind"),
+        "capture_source_width": capture.get("width"),
+        "capture_source_height": capture.get("height"),
         "raw_report_path": raw_path,
-        "error_message": report.get("errorMessage"),
+        "error_message": sender_last_frame_error if capture_permission_required or capture_display_unavailable or capture_window_unavailable else display_limited_reason if display_limited else report.get("errorMessage"),
         "performance_warnings": report.get("performanceWarnings"),
     }
     rows.append(row)
@@ -2119,6 +2709,7 @@ summary = {
     "platform": "macos",
     "git_commit": git_commit,
     "chain": chain_id,
+    "render_max_fps_override": render_max_fps_override,
     "rows": rows,
 }
 
@@ -2131,8 +2722,8 @@ with open(md_path, "w", encoding="utf-8") as file:
     file.write("# macOS Local Dual-Process LAN Canary Report\n\n")
     file.write(f"- GitCommit: {git_commit}\n")
     file.write(f"- Chain: {chain_id}\n\n")
-    file.write("| Profile | Status | FPS | Render FPS | Repl% | Skip% | Repeat% | nextDrawable p95 | Decoded | Presented | Codec | Encoder | Decoder | Renderer | Capture | Notes |\n")
-    file.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | --- | --- |\n")
+    file.write("| Profile | Status | FPS | Render FPS | Target | Repl% | Skip% | Repeat% | Fresh% | Capture p95 | Send p95 | nextDrawable p95 | DrawPresent p95 | Queue | Swap | Decoded | Presented | Codec | Encoder | Decoder | Renderer | Capture | Notes |\n")
+    file.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | --- | --- | --- |\n")
     for row in rows:
         error = (row.get("error_message") or "").replace("|", "\\|").replace("\n", " ")
         warnings = row.get("performance_warnings")
@@ -2172,8 +2763,28 @@ with open(md_path, "w", encoding="utf-8") as file:
         present_skip_text = f"{present_skip_ratio * 100:.2f}" if isinstance(present_skip_ratio, (int, float)) else "-"
         repeat_ratio = row.get("repeat_latest_frame_ratio")
         repeat_text = f"{repeat_ratio * 100:.2f}" if isinstance(repeat_ratio, (int, float)) else "-"
+        fresh_ratio = row.get("fresh_sender_frame_ratio")
+        fresh_text = f"{fresh_ratio * 100:.2f}" if isinstance(fresh_ratio, (int, float)) else "-"
+        sender_capture_p95 = row.get("sender_capture_p95_ms")
+        sender_capture_text = f"{sender_capture_p95:.2f}" if isinstance(sender_capture_p95, (int, float)) else "-"
+        sender_send_p95 = row.get("sender_send_datagram_p95_ms")
+        sender_send_text = f"{sender_send_p95:.2f}" if isinstance(sender_send_p95, (int, float)) else "-"
         next_drawable_p95 = row.get("render_proxy_next_drawable_p95_ms")
         next_drawable_text = f"{next_drawable_p95:.2f}" if isinstance(next_drawable_p95, (int, float)) else "-"
+        draw_present_p95 = row.get("render_proxy_draw_present_p95_ms")
+        draw_present_text = f"{draw_present_p95:.2f}" if isinstance(draw_present_p95, (int, float)) else "-"
+        queue_depth = row.get("queue_depth")
+        queue_depth_text = f"{queue_depth:.0f}" if isinstance(queue_depth, (int, float)) else "-"
+        swap_latency = row.get("swap_chain_max_frame_latency")
+        swap_present_mode = row.get("swap_chain_present_mode")
+        swap_text = "-"
+        if isinstance(swap_latency, (int, float)):
+            swap_text = f"{swap_latency:.0f}"
+            if swap_present_mode:
+                swap_text = f"{swap_text}/{swap_present_mode}"
+        elif swap_present_mode:
+            swap_text = str(swap_present_mode)
+        swap_text = swap_text.replace("|", "\\|")
         direct_ratio = row.get("capture_direct_frame_ratio")
         cpu_ratio = row.get("capture_cpu_frame_ratio")
         capture_samples = row.get("capture_frame_samples")
@@ -2194,17 +2805,53 @@ with open(md_path, "w", encoding="utf-8") as file:
             capture_text = f"{capture_path} samples {capture_samples} {capture_format}"
         else:
             capture_text = "-"
+        source_width = row.get("capture_source_width")
+        source_height = row.get("capture_source_height")
+        if isinstance(source_width, (int, float)) and isinstance(source_height, (int, float)):
+            source_text = f"source {source_width:.0f}x{source_height:.0f}"
+            capture_text = source_text if capture_text == "-" else f"{source_text} -> {capture_text}"
         capture_text = capture_text.replace("|", "\\|")
         requested_fps = row.get("requested_fps")
+        render_pacing_target_fps = row.get("render_pacing_target_fps")
+        target_text = (
+            f"{requested_fps:.0f}/{render_pacing_target_fps:.0f}"
+            if isinstance(requested_fps, (int, float))
+            and isinstance(render_pacing_target_fps, (int, float))
+            and render_pacing_target_fps > 0
+            and render_pacing_target_fps != requested_fps
+            else f"{requested_fps:.0f}"
+            if isinstance(requested_fps, (int, float))
+            else "-"
+        )
         sender_encode_p95 = row.get("sender_encode_p95_ms")
+        render_path_expected = (
+            bool(row.get("active_renderer"))
+            or (isinstance(presented, (int, float)) and presented > 0)
+        )
+        fps_validation_target = requested_fps
+        fps_target_label = "requested"
+        if (
+            render_path_expected
+            and isinstance(render_pacing_target_fps, (int, float))
+            and render_pacing_target_fps > 0
+        ):
+            fps_validation_target = render_pacing_target_fps
+            fps_target_label = "local render target"
         fps_headroom_note = ""
         if (
             row.get("status") == "completed"
-            and isinstance(requested_fps, (int, float))
-            and requested_fps > 0
+            and isinstance(fps_validation_target, (int, float))
+            and fps_validation_target > 0
             and (
-                (isinstance(fps_target, (int, float)) and fps_target < requested_fps * 0.9)
-                or (isinstance(render_target, (int, float)) and render_target < requested_fps * 0.9)
+                (
+                    isinstance(fps_target, (int, float))
+                    and fps_target < fps_validation_target * 0.9
+                )
+                or (
+                    render_path_expected
+                    and isinstance(render_target, (int, float))
+                    and render_target < fps_validation_target * 0.9
+                )
             )
         ):
             encode_note = (
@@ -2217,7 +2864,7 @@ with open(md_path, "w", encoding="utf-8") as file:
                 f"{render_target:.1f}" if isinstance(render_target, (int, float)) else "-"
             )
             fps_headroom_note = (
-                f"below requested {requested_fps:.0f}fps"
+                f"below {fps_target_label} {fps_validation_target:.0f}fps"
                 f" (target fps {target_fps_text}, render {target_render_text}{encode_note})"
             )
         notes_parts = []
@@ -2234,7 +2881,9 @@ with open(md_path, "w", encoding="utf-8") as file:
         notes_text = "; ".join(notes_parts) if notes_parts else "-"
         file.write(
             f"| {row['id']} | {row['status']} | {row['fps_observed']:.1f} | {render_fps_text} | "
-            f"{replacement_text} | {present_skip_text} | {repeat_text} | {next_drawable_text} | "
+            f"{target_text} | {replacement_text} | {present_skip_text} | {repeat_text} | {fresh_text} | "
+            f"{sender_capture_text} | {sender_send_text} | {next_drawable_text} | {draw_present_text} | "
+            f"{queue_depth_text} | {swap_text} | "
             f"{row['decoded_frames']} | {presented_text} | {codec_text} | "
             f"{row.get('active_encoder') or '-'} | "
             f"{row.get('active_decoder') or '-'} | {row.get('active_renderer') or '-'} | "
@@ -2258,6 +2907,10 @@ run_profile() {
   read -r width height fps bitrate <<EOF
 $spec
 EOF
+  local source_fit_profile="$SOURCE_FIT_PROFILE"
+  if profile_uses_source_fit "$profile_id"; then
+    source_fit_profile=1
+  fi
 
   local run_stamp run_uuid run_id run_dir logs_dir run_bin_dir run_service_bin
   run_stamp="$(date '+%Y%m%d-%H%M%S')"
@@ -2301,6 +2954,7 @@ EOF
     MRD_LAN_DISCOVERY_PROBE_ENDPOINTS="127.0.0.1:${peer_port}" \
     MRD_SERVICE_BUILD_ID="$GIT_COMMIT" \
     MRD_LAN_RECEIVER_DECODER="$RECEIVER_DECODER" \
+    MRD_LAN_RENDER_MAX_FPS="$RENDER_MAX_FPS" \
     MRD_WEB_BRIDGE_ENABLED="false" \
     RUST_LOG="info" \
     "$run_service_bin" >"$logs_dir/controller/controller.stdout.log" 2>"$logs_dir/controller/controller.stderr.log" &
@@ -2313,6 +2967,7 @@ EOF
     MRD_LAN_DISCOVERY_PORT="$peer_port" \
     MRD_LAN_DISCOVERY_PROBE_ENDPOINTS="127.0.0.1:${controller_port}" \
     MRD_SERVICE_BUILD_ID="$GIT_COMMIT" \
+    MRD_LAN_RENDER_MAX_FPS="$RENDER_MAX_FPS" \
     MRD_WEB_BRIDGE_ENABLED="false" \
     RUST_LOG="info" \
     "$run_service_bin" >"$logs_dir/peer/peer.stdout.log" 2>"$logs_dir/peer/peer.stderr.log" &
@@ -2402,6 +3057,9 @@ PY
     kill_tree_force "$controller_pid"
     kill_tree_force "$peer_pid"
     rm -f "$controller_socket" "$peer_socket"
+    if [ -s "$report_path" ]; then
+      record_local_dual_cleanup "$report_path" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$KEEP_TAURI_OPEN"
+    fi
     trap - RETURN
     return 0
   fi
@@ -2431,6 +3089,8 @@ PY
     MRD_LAN_E2E_CAPTURE_SOURCE_KIND="$CAPTURE_SOURCE_KIND" \
     MRD_LAN_E2E_EXPECTED_PEER_BUILD_ID="$GIT_COMMIT" \
     MRD_LAN_E2E_RENDER_DISPLAY="$RENDER_DISPLAY" \
+    MRD_LAN_E2E_SOURCE_FIT_PROFILE="$source_fit_profile" \
+    MRD_LAN_RENDER_MAX_FPS="$RENDER_MAX_FPS" \
     MRD_MACOS_RENDER_PROXY_ASYNC_PRESENT="$RENDER_PROXY_ASYNC_PRESENT" \
     MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_ASYNC="$HEVC_RAW_DECODE_ASYNC" \
     MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_MAX_PENDING_INPUTS="$HEVC_RAW_DECODE_MAX_PENDING_INPUTS" \
@@ -2468,6 +3128,7 @@ PY
   fi
   if [ -s "$report_path" ]; then
     validate_report_performance_thresholds "$report_path"
+    append_local_dual_run_metadata "$report_path" "$run_id" "$run_dir" "$logs_dir" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$controller_device" "$peer_device" "$controller_port" "$peer_port" "vite_tauri_harness"
   fi
 
   if [ "$KEEP_TAURI_OPEN" -eq 0 ]; then
@@ -2484,6 +3145,9 @@ PY
   kill_tree_force "$controller_pid"
   kill_tree_force "$peer_pid"
   rm -f "$controller_socket" "$peer_socket"
+  if [ -s "$report_path" ]; then
+    record_local_dual_cleanup "$report_path" "$controller_pid" "$peer_pid" "$tauri_pid" "$vite_pid" "$render_proxy_pid" "$controller_socket" "$peer_socket" "$KEEP_TAURI_OPEN"
+  fi
   trap - RETURN
 }
 

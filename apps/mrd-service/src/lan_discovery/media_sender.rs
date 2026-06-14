@@ -263,7 +263,32 @@ fn create_lan_av1_encoder(
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn create_lan_av1_encoder(
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+    profile: &MediaProfile,
+) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
+    let color_mode = lan_color_mode_for_profile(profile)?;
+    if color_mode != ColorMode::Full {
+        anyhow::bail!(
+            "VideoToolbox AV1 LAN encoding does not support color_mode={}",
+            color_mode.as_str()
+        );
+    }
+    mrd_codec_videotoolbox::VideoToolboxAv1Encoder::new_with_bitrate(width, height, fps, bitrate)
+        .map(|encoder| {
+            (
+                "videotoolbox_av1",
+                Box::new(encoder) as Box<dyn VideoEncoder + Send>,
+            )
+        })
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn create_lan_av1_encoder(
     _width: usize,
     _height: usize,
@@ -271,7 +296,7 @@ fn create_lan_av1_encoder(
     _bitrate: u32,
     _profile: &MediaProfile,
 ) -> Result<(&'static str, Box<dyn VideoEncoder + Send>)> {
-    anyhow::bail!("NVENC AV1 LAN encoding is unavailable on this platform")
+    anyhow::bail!("AV1 hardware encode is unavailable on this platform")
 }
 
 #[cfg(windows)]

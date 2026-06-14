@@ -23,6 +23,8 @@ pub const NVENC_DLL: &str = "nvEncodeAPI.dll";
 #[cfg(target_os = "linux")]
 /// Platform specific DLL name, `libnvidia-encode.so.1` on Linux, `nvEncodeAPI64.dll` on Windows
 pub const NVENC_DLL: &str = "libnvidia-encode.so.1";
+#[cfg(target_os = "macos")]
+pub const NVENC_DLL: &str = "libnvidia-encode.dylib";
 
 #[cfg(all(target_arch = "x86", windows))]
 #[macro_export]

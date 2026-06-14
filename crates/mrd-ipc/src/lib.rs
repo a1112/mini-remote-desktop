@@ -228,6 +228,8 @@ mod wire {
         pub dynamic_fps_tier: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub target_fps: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub last_frame_error: Option<String>,
         #[serde(default)]
         pub frames_completed: u64,
         #[serde(default)]
