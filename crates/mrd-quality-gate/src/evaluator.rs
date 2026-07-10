@@ -1,6 +1,7 @@
 use crate::{validate_artifact, ArtifactError, GatePolicy, RemoteExperienceRun, Verdict};
+use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Evaluation {
     pub verdict: Verdict,
     pub failures: Vec<String>,
