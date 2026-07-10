@@ -564,6 +564,11 @@ database or disk is full
   if ($report -notmatch "nvdec_shared_copy_last_error \\| shared texture copy succeeded") { throw "markdown report must include NVDEC shared copy last error" }
 
   $thresholdPath = Join-Path $summaryTmp "strict-thresholds.json"
+  $strictInput = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
+  $strictInput | Add-Member -Force -NotePropertyName encode_total_p95_ms -NotePropertyValue $null
+  $strictInput | Add-Member -Force -NotePropertyName send_write_p95_ms -NotePropertyValue $null
+  $strictInput | Add-Member -Force -NotePropertyName decode_total_p95_ms -NotePropertyValue $null
+  $strictInput | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "summary.json") -Encoding Ascii
   [ordered]@{
     max_first_frame_time_ms = 5000
     min_fps_observed = 120.0
@@ -592,6 +597,7 @@ database or disk is full
   if ($strict.failure_reason -notmatch "render shared resource p95") { throw "failure reason should include render shared resource threshold" }
   if ($strict.failure_reason -notmatch "render queue replacements") { throw "failure reason should include render queue replacement threshold" }
   if ($strict.failure_reason -notmatch "render present skipped rate") { throw "failure reason should include render present skipped rate threshold" }
+  if ($strict.failure_reason -notmatch "required evidence missing or non-finite") { throw "missing transport evidence should fail closed" }
   $strictCsv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($strictCsv.run_status -ne "FAIL") { throw "strict threshold CSV should expose FAIL run_status" }
 

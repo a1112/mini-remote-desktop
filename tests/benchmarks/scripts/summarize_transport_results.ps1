@@ -54,12 +54,31 @@ function New-RateValue($Count, $DurationSecs) {
   return [Math]::Round(([double]$Count / [double]$DurationSecs), 4)
 }
 
+function Test-FiniteNumber($Value) {
+  if ($null -eq $Value) { return $false }
+  try {
+    $number = [double]$Value
+    return -not ([double]::IsNaN($number) -or [double]::IsInfinity($number))
+  } catch {
+    return $false
+  }
+}
+
 $summary | Add-Member -Force -NotePropertyName render_queue_replacement_rate -NotePropertyValue (New-RateValue $summary.render_queue_replacements $summary.duration_secs)
 $summary | Add-Member -Force -NotePropertyName render_stale_frame_drop_rate -NotePropertyValue (New-RateValue $summary.render_stale_frame_drops $summary.duration_secs)
 $summary | Add-Member -Force -NotePropertyName render_present_skipped_rate -NotePropertyValue (New-RateValue $summary.render_present_skipped_frames $summary.duration_secs)
 
 if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
+  $requiredEvidence = [ordered]@{
+    first_frame_time_ms = $summary.first_frame_time_ms
+    fps_observed = $summary.fps_observed
+    encode_total_p95_ms = $summary.encode_total_p95_ms
+    send_write_p95_ms = $summary.send_write_p95_ms
+    decode_total_p95_ms = $summary.decode_total_p95_ms
+  }
+  $missingEvidence = @($requiredEvidence.GetEnumerator() | Where-Object { -not (Test-FiniteNumber $_.Value) } | ForEach-Object { $_.Key })
+  $requiredEvidenceValid = $missingEvidence.Count -eq 0
   $hasRenderPresentThreshold = Test-HasProperty $thresholds "max_render_present_p95_ms"
   $hasRenderExecuteThreshold = Test-HasProperty $thresholds "max_render_execute_p95_ms"
   $hasRenderPrepareWaitThreshold = Test-HasProperty $thresholds "max_render_prepare_wait_p95_ms"
@@ -70,6 +89,7 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
   $hasRenderSkippedThreshold = Test-HasProperty $thresholds "max_render_present_skipped_frames"
   $hasRenderSkippedRateThreshold = Test-HasProperty $thresholds "max_render_present_skipped_rate"
   $summary.run_passed = (
+    $requiredEvidenceValid -and
     $summary.run_passed -and
     $summary.session_established -and
     $summary.first_frame_seen -and
@@ -92,6 +112,7 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
   )
   if (-not $summary.run_passed -and [string]::IsNullOrWhiteSpace([string]$summary.failure_reason)) {
     $reasons = @()
+    if (-not $requiredEvidenceValid) { $reasons += "required evidence missing or non-finite: $($missingEvidence -join ', ')" }
     if (-not $summary.session_established) { $reasons += "session was not established" }
     if (-not $summary.first_frame_seen) { $reasons += "first frame was not observed" }
     if ($null -ne $summary.first_frame_time_ms -and $summary.first_frame_time_ms -gt $thresholds.max_first_frame_time_ms) {
