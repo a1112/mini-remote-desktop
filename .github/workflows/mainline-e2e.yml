@@ -138,6 +138,87 @@ jobs:
           path: target/e2e-matrix/
           if-no-files-found: ignore
 
+  quality-gate:
+    name: Gate 0 quality gate
+    needs: l0-l1-generic
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/Rdesk/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: apps/Rdesk
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Gate 0 contract suite
+        id: gate-tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p mrd-quality-gate 2>&1 | tee quality-gate-cargo.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/component-matrix/scripts/test_component_matrix_common.ps1 2>&1 | tee component-matrix.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_transport_matrix_common.ps1 2>&1 | tee transport-matrix.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_paired_lan_canary_common.ps1 2>&1 | tee paired-canary.log
+          pnpm --dir apps/Rdesk test -- --run src/app/services/lanE2eAutomationService.test.ts src/app/services/lanE2eTelemetryService.test.ts
+          pnpm --dir apps/Rdesk type-check
+
+      - name: Upload Gate 0 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-0-contract-artifacts
+          path: |
+            quality-gate-cargo.log
+            component-matrix.log
+            transport-matrix.log
+            paired-canary.log
+          if-no-files-found: warn
+
+      - name: Enforce quality gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.gate-tests.outcome }}" != "success" ]; then
+            echo "Gate 0 contract suite failed"
+            exit 2
+          fi
+
+  windows-release-policy:
+    name: Windows 1080p60 release policy
+    needs: quality-gate
+    if: ${{ always() && needs.quality-gate.result == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Evaluate Windows required row
+        shell: powershell
+        run: |
+          cargo run -p mrd-quality-gate --bin mrd-quality-gate -- `
+            --artifact tests/quality-gates/fixtures/valid-direct.json `
+            --policy tests/quality-gates/policies/windows-1080p60-direct.v1.json `
+            --output windows-1080p60-direct.evaluation.json
+      - name: Upload Windows policy evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-1080p60-release-policy
+          path: windows-1080p60-direct.evaluation.json
+
   windows-gpu-smoke:
     name: Windows GPU L0/L3 smoke
     needs: l0-l1-generic

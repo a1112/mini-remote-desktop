@@ -970,7 +970,9 @@ export async function runLanE2EAutomation(
         minSampleDurationMs
       );
       if (!options.adaptive && profileMismatch && sampleDurationReady) {
-        const exactProfileRequired = scenarioRequiresExactProfileMatch(scenarioId);
+        const exactProfileRequired =
+          scenarioRequiresExactProfileMatch(scenarioId) ||
+          (requestedProfile ? requestedProfileRequiresExactColorMatch(requestedProfile) : false);
         stage("assert", exactProfileRequired ? "failed" : "skipped", profileMismatch);
         return finish(
           exactProfileRequired ? "failed" : "skipped",
@@ -1601,6 +1603,16 @@ function scenarioRequiresMediaPipeline(scenarioId: CrossDeviceScenarioId): boole
 
 function scenarioRequiresExactProfileMatch(scenarioId: CrossDeviceScenarioId): boolean {
   return scenarioId === "cross.e2e.media_profile";
+}
+
+function requestedProfileRequiresExactColorMatch(profile: MediaProfile): boolean {
+  return (
+    profile.hdr_enabled === true ||
+    (profile.bit_depth ?? 8) > 8 ||
+    profile.pixel_format === "p010" ||
+    (profile.color_pipeline !== undefined && profile.color_pipeline !== "sdr8") ||
+    (profile.color_mode !== undefined && profile.color_mode !== "full")
+  );
 }
 
 function shouldRequestMediaProfile(
