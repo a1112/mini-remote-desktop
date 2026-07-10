@@ -35,6 +35,22 @@ import type {
   RuntimeSnapshot,
   AuditEvent,
   AuditLogQuery,
+  AuditEventPageV2,
+  AuditEventsQueryV2,
+  ConsentResponse,
+  DecimalU64,
+  RemoteFailure,
+  RemoteSessionRequest,
+  RemoteSessionSnapshot,
+  RouteEvidence,
+  SessionEventSubscription,
+  SessionEventSubscriptionQuery,
+  SessionPermissionChange,
+  TrustedDeviceApproval,
+  TrustedDeviceRotation,
+  TrustedDeviceSnapshot,
+  UnattendedAccessPolicy,
+  UnattendedAccessSnapshot,
   CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
@@ -117,6 +133,47 @@ async function invokeBridgeOrTauri<T>(
 
 function responseField<T>(field: string): (response: ServiceBridgeIpcResponse) => T {
   return (response) => response[field] as T;
+}
+
+async function invokeSecureRemoteContract<T>(
+  request: ServiceBridgeIpcRequest,
+  expectedType: string,
+  responseFieldName: string
+): Promise<AdapterResult<T>> {
+  const raw = shouldUseServiceBridge()
+    ? await invokeServiceBridgeIpc<ServiceBridgeIpcResponse>(request)
+    : await invokeAdapter<ServiceBridgeIpcResponse>('ipc_secure_remote', { request });
+  if (!raw.ok) return raw;
+
+  const response = raw.value;
+  if (response.type === 'RemoteAccessError') {
+    const failure = response.failure as RemoteFailure | undefined;
+    return {
+      ok: false,
+      error: {
+        code: failure?.code,
+        message: failure?.message ?? 'remote operation was rejected',
+      },
+    };
+  }
+  if (response.type === 'Error') {
+    return {
+      ok: false,
+      error: {
+        code: response.code,
+        message: response.message ?? 'mrd-service returned an IPC error',
+      },
+    };
+  }
+  if (response.type !== expectedType || !(responseFieldName in response)) {
+    return {
+      ok: false,
+      error: {
+        message: `unexpected secure IPC response: ${response.type}`,
+      },
+    };
+  }
+  return { ok: true, value: response[responseFieldName] as T };
 }
 
 function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): EnvironmentSnapshot {
@@ -1091,6 +1148,172 @@ export async function ipcListSessions(): Promise<AdapterResult<SessionInfo[]>> {
     undefined,
     { type: 'ListSessions' },
     responseField<SessionInfo[]>('sessions')
+  );
+}
+
+export async function ipcGetRemoteSession(
+  sessionId: string
+): Promise<AdapterResult<RemoteSessionSnapshot>> {
+  return invokeSecureRemoteContract<RemoteSessionSnapshot>(
+    { type: 'GetRemoteSession', session_id: sessionId },
+    'RemoteSession',
+    'session'
+  );
+}
+
+export async function ipcRequestRemoteSession(
+  request: RemoteSessionRequest
+): Promise<AdapterResult<RemoteSessionSnapshot>> {
+  return invokeSecureRemoteContract<RemoteSessionSnapshot>(
+    { type: 'RequestRemoteSession', request },
+    'RemoteSessionRequested',
+    'session'
+  );
+}
+
+export async function ipcRespondToConsent(
+  response: ConsentResponse
+): Promise<AdapterResult<RemoteSessionSnapshot>> {
+  return invokeSecureRemoteContract<RemoteSessionSnapshot>(
+    { type: 'RespondToConsent', response },
+    'ConsentRecorded',
+    'session'
+  );
+}
+
+export async function ipcEnableUnattendedAccess(
+  policy: UnattendedAccessPolicy
+): Promise<AdapterResult<UnattendedAccessSnapshot>> {
+  return invokeSecureRemoteContract<UnattendedAccessSnapshot>(
+    { type: 'EnableUnattendedAccess', policy },
+    'UnattendedAccessUpdated',
+    'access'
+  );
+}
+
+export async function ipcDisableUnattendedAccess(
+  expectedPolicyRevision: DecimalU64
+): Promise<AdapterResult<UnattendedAccessSnapshot>> {
+  return invokeSecureRemoteContract<UnattendedAccessSnapshot>(
+    {
+      type: 'DisableUnattendedAccess',
+      expected_policy_revision: expectedPolicyRevision,
+    },
+    'UnattendedAccessUpdated',
+    'access'
+  );
+}
+
+export async function ipcRotateUnattendedAccess(
+  expectedPolicyRevision: DecimalU64
+): Promise<AdapterResult<UnattendedAccessSnapshot>> {
+  return invokeSecureRemoteContract<UnattendedAccessSnapshot>(
+    {
+      type: 'RotateUnattendedAccess',
+      expected_policy_revision: expectedPolicyRevision,
+    },
+    'UnattendedAccessUpdated',
+    'access'
+  );
+}
+
+export async function ipcListTrustedDevices(
+  includeRevoked = false
+): Promise<AdapterResult<TrustedDeviceSnapshot[]>> {
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot[]>(
+    { type: 'ListTrustedDevices', include_revoked: includeRevoked },
+    'TrustedDeviceList',
+    'devices'
+  );
+}
+
+export async function ipcApproveTrustedDevice(
+  approval: TrustedDeviceApproval
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    { type: 'ApproveTrustedDevice', approval },
+    'TrustedDeviceUpdated',
+    'device'
+  );
+}
+
+export async function ipcSuspendTrustedDevice(
+  peerKeyId: string,
+  expectedTrustRevision: DecimalU64
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    {
+      type: 'SuspendTrustedDevice',
+      peer_key_id: peerKeyId,
+      expected_trust_revision: expectedTrustRevision,
+    },
+    'TrustedDeviceUpdated',
+    'device'
+  );
+}
+
+export async function ipcRevokeTrustedDevice(
+  peerKeyId: string,
+  expectedTrustRevision: DecimalU64
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    {
+      type: 'RevokeTrustedDevice',
+      peer_key_id: peerKeyId,
+      expected_trust_revision: expectedTrustRevision,
+    },
+    'TrustedDeviceUpdated',
+    'device'
+  );
+}
+
+export async function ipcRotateTrustedDevice(
+  rotation: TrustedDeviceRotation
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    { type: 'RotateTrustedDevice', rotation },
+    'TrustedDeviceUpdated',
+    'device'
+  );
+}
+
+export async function ipcChangeSessionPermissions(
+  change: SessionPermissionChange
+): Promise<AdapterResult<RemoteSessionSnapshot>> {
+  return invokeSecureRemoteContract<RemoteSessionSnapshot>(
+    { type: 'ChangeSessionPermissions', change },
+    'SessionPermissionsChanged',
+    'session'
+  );
+}
+
+export async function ipcSubscribeSessionEvents(
+  query: SessionEventSubscriptionQuery
+): Promise<AdapterResult<SessionEventSubscription>> {
+  return invokeSecureRemoteContract<SessionEventSubscription>(
+    { type: 'SubscribeSessionEvents', query },
+    'SessionEventsSubscribed',
+    'subscription'
+  );
+}
+
+export async function ipcGetRouteEvidence(
+  sessionId: string
+): Promise<AdapterResult<RouteEvidence>> {
+  return invokeSecureRemoteContract<RouteEvidence>(
+    { type: 'GetRouteEvidence', session_id: sessionId },
+    'RouteEvidence',
+    'evidence'
+  );
+}
+
+export async function ipcGetAuditEventsV2(
+  query: AuditEventsQueryV2
+): Promise<AdapterResult<AuditEventPageV2>> {
+  return invokeSecureRemoteContract<AuditEventPageV2>(
+    { type: 'GetAuditEventsV2', query },
+    'AuditEventsV2',
+    'page'
   );
 }
 

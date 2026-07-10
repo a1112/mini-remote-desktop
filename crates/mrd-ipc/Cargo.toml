@@ -9,5 +9,6 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mrd-proto = { path = "../mrd-proto" }
+mrd-session = { path = "../mrd-session" }
 tokio.workspace = true
 tracing.workspace = true

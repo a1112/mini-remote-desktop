@@ -2930,6 +2930,29 @@ async fn ipc_list_sessions() -> Result<Vec<mrd_ipc::SessionInfo>, String> {
     }
 }
 
+/// Reject requests outside the narrow secure remote-session passthrough surface.
+fn ensure_secure_remote_request(request: &mrd_ipc::IpcRequest) -> Result<(), String> {
+    if request.is_secure_remote() {
+        Ok(())
+    } else {
+        Err(
+            "E_SECURE_REMOTE_REQUEST_REQUIRED: ipc_secure_remote only accepts secure remote-session requests"
+                .to_string(),
+        )
+    }
+}
+
+/// Forward an allowlisted secure remote-session contract to the local service.
+#[tauri::command]
+async fn ipc_secure_remote(request: mrd_ipc::IpcRequest) -> Result<mrd_ipc::IpcResponse, String> {
+    ensure_secure_remote_request(&request)?;
+    let mut client = mrd_ipc::client::IpcClient::new();
+    client
+        .send_request(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 /// Get runtime snapshot via IPC (migrated version)
 #[tauri::command]
 async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
@@ -4330,6 +4353,43 @@ mod native_surface_control_forwarder_tests {
     }
 }
 
+#[cfg(test)]
+mod secure_remote_ipc_contract_tests {
+    use super::ensure_secure_remote_request;
+    use mrd_ipc::{IpcRequest, ShutdownMode};
+    use mrd_proto::SessionId;
+
+    #[test]
+    fn secure_remote_passthrough_is_declared_and_registered() {
+        let source = include_str!("main.rs");
+        let declaration = ["async fn ipc_", "secure_remote("].concat();
+        let registration = ["            ipc_", "secure_remote,"].concat();
+
+        assert!(source.contains(&declaration));
+        assert!(source.contains(&registration));
+    }
+
+    #[test]
+    fn secure_remote_passthrough_rejects_requests_outside_its_allowlist() {
+        assert!(ensure_secure_remote_request(&IpcRequest::GetRemoteSession {
+            session_id: SessionId("secure-session".to_string()),
+        })
+        .is_ok());
+        assert!(ensure_secure_remote_request(&IpcRequest::ShutdownService {
+            mode: ShutdownMode::Graceful,
+        })
+        .is_err());
+        assert!(
+            ensure_secure_remote_request(&IpcRequest::CrossE2EInjectFault {
+                session_id: SessionId("secure-session".to_string()),
+                fault_type: "disconnect".to_string(),
+                duration_ms: None,
+            })
+            .is_err()
+        );
+    }
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     prefer_x11_backend_for_linux_native_render();
@@ -4548,6 +4608,7 @@ fn main() {
             ipc_wake_on_lan,
             ipc_request_remote_device_power_action,
             ipc_list_sessions,
+            ipc_secure_remote,
             ipc_start_session,
             ipc_start_lan_remote_session,
             ipc_update_media_profile,

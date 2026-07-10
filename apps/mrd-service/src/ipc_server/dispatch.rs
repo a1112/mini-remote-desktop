@@ -73,6 +73,26 @@ impl IpcServer {
 
             IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
 
+            IpcRequest::GetRemoteSession { .. }
+            | IpcRequest::RequestRemoteSession { .. }
+            | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::EnableUnattendedAccess { .. }
+            | IpcRequest::DisableUnattendedAccess { .. }
+            | IpcRequest::RotateUnattendedAccess { .. }
+            | IpcRequest::ListTrustedDevices { .. }
+            | IpcRequest::ApproveTrustedDevice { .. }
+            | IpcRequest::SuspendTrustedDevice { .. }
+            | IpcRequest::RevokeTrustedDevice { .. }
+            | IpcRequest::RotateTrustedDevice { .. }
+            | IpcRequest::ChangeSessionPermissions { .. }
+            | IpcRequest::SubscribeSessionEvents { .. }
+            | IpcRequest::GetRouteEvidence { .. }
+            | IpcRequest::GetAuditEventsV2 { .. } => IpcResponse::Error {
+                code: "E_SECURE_REMOTE_UNAVAILABLE".to_string(),
+                message: "secure remote session operations are unavailable in this service build"
+                    .to_string(),
+            },
+
             IpcRequest::StartSession {
                 session_id,
                 target_device_id,
@@ -540,5 +560,44 @@ mod tests {
         let response = dispatch_request(&server, IpcRequest::CapabilitySnapshot).await;
 
         assert!(matches!(response, IpcResponse::CapabilitySnapshot { .. }));
+    }
+
+    #[tokio::test]
+    async fn secure_remote_contract_fails_closed_until_handlers_are_available() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+        let requests = [
+            serde_json::json!({"type":"GetRemoteSession","session_id":"session-1"}),
+            serde_json::json!({"type":"RequestRemoteSession","request":{"session_id":"session-1","target_device_id":"device-1","access_mode":"attended","requested_scopes":["screen.view"],"requested_profile":null}}),
+            serde_json::json!({"type":"RespondToConsent","response":{"session_id":"session-1","decision":"approve","approved_scopes":["screen.view"],"expected_policy_revision":"7"}}),
+            serde_json::json!({"type":"EnableUnattendedAccess","policy":{"trusted_devices_only":true,"allowed_peer_key_ids":["sha256:peer"],"permission_ceiling":["screen.view"],"expires_at_ms":null}}),
+            serde_json::json!({"type":"DisableUnattendedAccess","expected_policy_revision":"7"}),
+            serde_json::json!({"type":"RotateUnattendedAccess","expected_policy_revision":"7"}),
+            serde_json::json!({"type":"ListTrustedDevices","include_revoked":false}),
+            serde_json::json!({"type":"ApproveTrustedDevice","approval":{"peer_key_id":"sha256:peer","key_epoch":"2","permission_ceiling":["screen.view"]}}),
+            serde_json::json!({"type":"SuspendTrustedDevice","peer_key_id":"sha256:peer","expected_trust_revision":"9"}),
+            serde_json::json!({"type":"RevokeTrustedDevice","peer_key_id":"sha256:peer","expected_trust_revision":"9"}),
+            serde_json::json!({"type":"RotateTrustedDevice","rotation":{"peer_key_id":"sha256:peer","new_peer_key_id":"sha256:new-peer","new_key_epoch":"3","expected_trust_revision":"9"}}),
+            serde_json::json!({"type":"ChangeSessionPermissions","change":{"session_id":"session-1","requested_scopes":["screen.view"],"expected_policy_revision":"7"}}),
+            serde_json::json!({"type":"SubscribeSessionEvents","query":{"session_id":"session-1","after_sequence":"41","limit":32,"wait_timeout_ms":15000}}),
+            serde_json::json!({"type":"GetRouteEvidence","session_id":"session-1"}),
+            serde_json::json!({"type":"GetAuditEventsV2","query":{"after_sequence":"8","limit":50,"session_id":"session-1","action":"session.authorized","outcome":"allowed","peer_device_id":"device-1"}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value::<IpcRequest>(value).expect("valid secure request"));
+
+        for request in requests {
+            assert!(request.is_secure_remote());
+            let response = dispatch_request(&server, request).await;
+            assert_eq!(
+                response,
+                IpcResponse::Error {
+                    code: "E_SECURE_REMOTE_UNAVAILABLE".to_string(),
+                    message:
+                        "secure remote session operations are unavailable in this service build"
+                            .to_string(),
+                }
+            );
+        }
     }
 }

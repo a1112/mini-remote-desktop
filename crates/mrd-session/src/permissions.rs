@@ -14,7 +14,13 @@ pub enum PermissionScope {
     FileWrite,
     AudioListen,
     AudioTalk,
-    PowerAction,
+    DisplaySwitch,
+    DisplayMultiView,
+    PowerRestart,
+    PowerShutdown,
+    TerminalOpen,
+    PrivacyBlockLocalInput,
+    PrivacyBlankScreen,
     SecureDesktopView,
     SecureDesktopControl,
 }
@@ -33,11 +39,18 @@ impl EffectiveScopes {
         runtime_capabilities: PermissionScopes,
     ) -> Self {
         let mut result = requested;
-        for other in [peer_maximum, local_policy, local_approval, runtime_capabilities] {
+        for other in [
+            peer_maximum,
+            local_policy,
+            local_approval,
+            runtime_capabilities,
+        ] {
             result = result.intersection(&other).copied().collect();
         }
         Self(result)
     }
 
-    pub fn into_inner(self) -> PermissionScopes { self.0 }
+    pub fn into_inner(self) -> PermissionScopes {
+        self.0
+    }
 }

@@ -1335,6 +1335,433 @@ describe('Tauri Adapter Contract', () => {
     });
   });
 
+  describe('secure remote session IPC contracts', () => {
+    it('maps secure remote operations to the generic typed IPC passthrough', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({
+        type: 'RemoteAccessError',
+        session_id: null,
+        peer_key_id: null,
+        failure: {
+          code: 'trust_required',
+          message: 'not implemented in contract-only task',
+          suggested_action: null,
+        },
+      });
+
+      const scope = ['screen.view'] as const;
+      await adapter.ipcGetRemoteSession('session-1');
+      await adapter.ipcRequestRemoteSession({
+        session_id: 'session-1',
+        target_device_id: 'device-1',
+        access_mode: 'attended',
+        requested_scopes: [...scope],
+        requested_profile: null,
+      });
+      await adapter.ipcRespondToConsent({
+        session_id: 'session-1',
+        decision: 'approve',
+        approved_scopes: [...scope],
+        expected_policy_revision: '7',
+      });
+      await adapter.ipcEnableUnattendedAccess({
+        trusted_devices_only: true,
+        allowed_peer_key_ids: ['sha256:peer'],
+        permission_ceiling: [...scope],
+        expires_at_ms: null,
+      });
+      await adapter.ipcDisableUnattendedAccess('7');
+      await adapter.ipcRotateUnattendedAccess('7');
+      await adapter.ipcListTrustedDevices(true);
+      await adapter.ipcApproveTrustedDevice({
+        peer_key_id: 'sha256:peer',
+        key_epoch: '2',
+        permission_ceiling: [...scope],
+      });
+      await adapter.ipcSuspendTrustedDevice('sha256:peer', '9');
+      await adapter.ipcRevokeTrustedDevice('sha256:peer', '9');
+      await adapter.ipcRotateTrustedDevice({
+        peer_key_id: 'sha256:peer',
+        new_peer_key_id: 'sha256:new-peer',
+        new_key_epoch: '3',
+        expected_trust_revision: '9',
+      });
+      await adapter.ipcChangeSessionPermissions({
+        session_id: 'session-1',
+        requested_scopes: [...scope],
+        expected_policy_revision: '7',
+      });
+      await adapter.ipcSubscribeSessionEvents({
+        session_id: 'session-1',
+        after_sequence: '41',
+        limit: 32,
+        wait_timeout_ms: 15_000,
+      });
+      await adapter.ipcGetRouteEvidence('session-1');
+      await adapter.ipcGetAuditEventsV2({
+        after_sequence: '8',
+        limit: 50,
+        session_id: 'session-1',
+        action: 'session.authorized',
+        outcome: 'allowed',
+        peer_device_id: 'device-1',
+      });
+
+      const expectedRequests = [
+        { type: 'GetRemoteSession', session_id: 'session-1' },
+        {
+          type: 'RequestRemoteSession',
+          request: {
+            session_id: 'session-1',
+            target_device_id: 'device-1',
+            access_mode: 'attended',
+            requested_scopes: ['screen.view'],
+            requested_profile: null,
+          },
+        },
+        {
+          type: 'RespondToConsent',
+          response: {
+            session_id: 'session-1',
+            decision: 'approve',
+            approved_scopes: ['screen.view'],
+            expected_policy_revision: '7',
+          },
+        },
+        {
+          type: 'EnableUnattendedAccess',
+          policy: {
+            trusted_devices_only: true,
+            allowed_peer_key_ids: ['sha256:peer'],
+            permission_ceiling: ['screen.view'],
+            expires_at_ms: null,
+          },
+        },
+        { type: 'DisableUnattendedAccess', expected_policy_revision: '7' },
+        { type: 'RotateUnattendedAccess', expected_policy_revision: '7' },
+        { type: 'ListTrustedDevices', include_revoked: true },
+        {
+          type: 'ApproveTrustedDevice',
+          approval: {
+            peer_key_id: 'sha256:peer',
+            key_epoch: '2',
+            permission_ceiling: ['screen.view'],
+          },
+        },
+        {
+          type: 'SuspendTrustedDevice',
+          peer_key_id: 'sha256:peer',
+          expected_trust_revision: '9',
+        },
+        {
+          type: 'RevokeTrustedDevice',
+          peer_key_id: 'sha256:peer',
+          expected_trust_revision: '9',
+        },
+        {
+          type: 'RotateTrustedDevice',
+          rotation: {
+            peer_key_id: 'sha256:peer',
+            new_peer_key_id: 'sha256:new-peer',
+            new_key_epoch: '3',
+            expected_trust_revision: '9',
+          },
+        },
+        {
+          type: 'ChangeSessionPermissions',
+          change: {
+            session_id: 'session-1',
+            requested_scopes: ['screen.view'],
+            expected_policy_revision: '7',
+          },
+        },
+        {
+          type: 'SubscribeSessionEvents',
+          query: {
+            session_id: 'session-1',
+            after_sequence: '41',
+            limit: 32,
+            wait_timeout_ms: 15_000,
+          },
+        },
+        { type: 'GetRouteEvidence', session_id: 'session-1' },
+        {
+          type: 'GetAuditEventsV2',
+          query: {
+            after_sequence: '8',
+            limit: 50,
+            session_id: 'session-1',
+            action: 'session.authorized',
+            outcome: 'allowed',
+            peer_device_id: 'device-1',
+          },
+        },
+      ];
+
+      expectedRequests.forEach((request, index) => {
+        expect(mockInvoke).toHaveBeenNthCalledWith(index + 1, 'ipc_secure_remote', {
+          request,
+        });
+      });
+    });
+
+    it('unwraps every secure remote success response from its stable field', async () => {
+      const mockInvoke = getMockInvoke();
+      const session = {
+        session_id: 'session-1',
+        role: 'controller',
+        peer_device_id: 'device-1',
+        peer_key_id: 'sha256:peer',
+        access_mode: 'attended',
+        authorization_state: 'granted',
+        route_state: 'connected',
+        route_kind: 'lan_quic',
+        media_state: 'streaming',
+        presentation_state: 'streaming',
+        requested_scopes: ['screen.view'],
+        granted_scopes: ['screen.view'],
+        policy_revision: '7',
+        failure: null,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+      };
+      const access = {
+        enabled: true,
+        policy_revision: '7',
+        access_epoch: '3',
+        policy: {
+          trusted_devices_only: true,
+          allowed_peer_key_ids: ['sha256:peer'],
+          permission_ceiling: ['screen.view' as const],
+          expires_at_ms: null,
+        },
+        locked_until_ms: null,
+        updated_at_ms: 2,
+      };
+      const device = {
+        peer_key_id: 'sha256:peer',
+        display_name: 'Peer',
+        key_epoch: '2',
+        state: 'trusted',
+        permission_ceiling: ['screen.view'],
+        trust_revision: '9',
+        approved_at_ms: 1,
+        updated_at_ms: 2,
+      };
+      const subscription = {
+        events: [],
+        next_after_sequence: '41',
+        cursor_state: 'current',
+        has_more: false,
+        poll_after_ms: 1_000,
+      };
+      const evidence = {
+        session_id: 'session-1',
+        route_state: 'connected',
+        selected_route: 'lan_quic',
+        policy_revision: '7',
+        transport_fingerprint_sha256: 'sha256:transport',
+        candidates: [],
+        observed_at_ms: 2,
+      };
+      const page = {
+        events: [],
+        next_after_sequence: '8',
+        cursor_state: 'current',
+        has_more: false,
+        chain_verified: true,
+      };
+      const responseByRequest: Record<string, unknown> = {
+        GetRemoteSession: { type: 'RemoteSession', session },
+        RequestRemoteSession: { type: 'RemoteSessionRequested', session },
+        RespondToConsent: { type: 'ConsentRecorded', session },
+        EnableUnattendedAccess: { type: 'UnattendedAccessUpdated', access },
+        DisableUnattendedAccess: { type: 'UnattendedAccessUpdated', access },
+        RotateUnattendedAccess: { type: 'UnattendedAccessUpdated', access },
+        ListTrustedDevices: { type: 'TrustedDeviceList', devices: [device] },
+        ApproveTrustedDevice: { type: 'TrustedDeviceUpdated', device },
+        SuspendTrustedDevice: { type: 'TrustedDeviceUpdated', device },
+        RevokeTrustedDevice: { type: 'TrustedDeviceUpdated', device },
+        RotateTrustedDevice: { type: 'TrustedDeviceUpdated', device },
+        ChangeSessionPermissions: { type: 'SessionPermissionsChanged', session },
+        SubscribeSessionEvents: { type: 'SessionEventsSubscribed', subscription },
+        GetRouteEvidence: { type: 'RouteEvidence', evidence },
+        GetAuditEventsV2: { type: 'AuditEventsV2', page },
+      };
+      mockInvoke.mockImplementation(async (_command, args) => {
+        const request = (args as { request?: { type?: string } } | undefined)?.request;
+        return responseByRequest[request?.type ?? ''];
+      });
+
+      const results = [
+        [await adapter.ipcGetRemoteSession('session-1'), session],
+        [
+          await adapter.ipcRequestRemoteSession({
+            session_id: 'session-1',
+            target_device_id: 'device-1',
+            access_mode: 'attended',
+            requested_scopes: ['screen.view'],
+            requested_profile: null,
+          }),
+          session,
+        ],
+        [
+          await adapter.ipcRespondToConsent({
+            session_id: 'session-1',
+            decision: 'approve',
+            approved_scopes: ['screen.view'],
+            expected_policy_revision: '7',
+          }),
+          session,
+        ],
+        [await adapter.ipcEnableUnattendedAccess(access.policy), access],
+        [await adapter.ipcDisableUnattendedAccess('7'), access],
+        [await adapter.ipcRotateUnattendedAccess('7'), access],
+        [await adapter.ipcListTrustedDevices(), [device]],
+        [
+          await adapter.ipcApproveTrustedDevice({
+            peer_key_id: 'sha256:peer',
+            key_epoch: '2',
+            permission_ceiling: ['screen.view'],
+          }),
+          device,
+        ],
+        [await adapter.ipcSuspendTrustedDevice('sha256:peer', '9'), device],
+        [await adapter.ipcRevokeTrustedDevice('sha256:peer', '9'), device],
+        [
+          await adapter.ipcRotateTrustedDevice({
+            peer_key_id: 'sha256:peer',
+            new_peer_key_id: 'sha256:new-peer',
+            new_key_epoch: '3',
+            expected_trust_revision: '9',
+          }),
+          device,
+        ],
+        [
+          await adapter.ipcChangeSessionPermissions({
+            session_id: 'session-1',
+            requested_scopes: ['screen.view'],
+            expected_policy_revision: '7',
+          }),
+          session,
+        ],
+        [
+          await adapter.ipcSubscribeSessionEvents({
+            session_id: 'session-1',
+            after_sequence: '41',
+            limit: 32,
+            wait_timeout_ms: 15_000,
+          }),
+          subscription,
+        ],
+        [await adapter.ipcGetRouteEvidence('session-1'), evidence],
+        [
+          await adapter.ipcGetAuditEventsV2({ after_sequence: '8', limit: 50 }),
+          page,
+        ],
+      ];
+
+      for (const [result, expected] of results) {
+        expect(result).toEqual({ ok: true, value: expected });
+      }
+    });
+
+    it('unwraps typed responses and preserves stable remote error codes', async () => {
+      const mockInvoke = getMockInvoke();
+      const session = {
+        session_id: 'session-1',
+        role: 'controller',
+        peer_device_id: 'device-1',
+        peer_key_id: 'sha256:peer',
+        access_mode: 'attended',
+        authorization_state: 'authorizing',
+        route_state: 'idle',
+        route_kind: null,
+        media_state: 'idle',
+        presentation_state: 'authenticating',
+        requested_scopes: ['screen.view'],
+        granted_scopes: [],
+        policy_revision: '1',
+        failure: null,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+      };
+      mockInvoke
+        .mockResolvedValueOnce({ type: 'RemoteSession', session })
+        .mockResolvedValueOnce({
+          type: 'RemoteAccessError',
+          session_id: 'session-1',
+          peer_key_id: 'sha256:peer',
+          failure: {
+            code: 'trust_required',
+            message: 'peer approval is required',
+            suggested_action: 'approve the peer key',
+          },
+        });
+
+      const success = await adapter.ipcGetRemoteSession('session-1');
+      expect(success).toEqual({ ok: true, value: session });
+
+      const failure = await adapter.ipcGetRemoteSession('session-1');
+      expect(failure).toEqual({
+        ok: false,
+        error: { code: 'trust_required', message: 'peer approval is required' },
+      });
+    });
+
+    it('preserves generic and remote error codes through the browser bridge', async () => {
+      const testWindow = window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean };
+      testWindow.__MRD_FORCE_WEB_BRIDGE__ = true;
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+              response: {
+                type: 'Error',
+                code: 'E_SECURE_REMOTE_UNAVAILABLE',
+                message: 'secure remote session operations are unavailable',
+              },
+            }),
+          })
+          .mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+              response: {
+                type: 'RemoteAccessError',
+                session_id: 'session-1',
+                peer_key_id: 'sha256:peer',
+                failure: {
+                  code: 'trust_required',
+                  message: 'peer approval is required',
+                  suggested_action: null,
+                },
+              },
+            }),
+          })
+      );
+
+      try {
+        expect(await adapter.ipcGetRemoteSession('session-1')).toEqual({
+          ok: false,
+          error: {
+            code: 'E_SECURE_REMOTE_UNAVAILABLE',
+            message: 'secure remote session operations are unavailable',
+          },
+        });
+        expect(await adapter.ipcGetRemoteSession('session-1')).toEqual({
+          ok: false,
+          error: { code: 'trust_required', message: 'peer approval is required' },
+        });
+      } finally {
+        delete testWindow.__MRD_FORCE_WEB_BRIDGE__;
+        vi.unstubAllGlobals();
+      }
+    });
+  });
+
   /**
    * Error handling
    */

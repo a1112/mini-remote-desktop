@@ -857,8 +857,14 @@ git commit -m "feat: persist protected remote trust state"
 ### Task 15: Extend IPC for authorization, consent, trust, and route evidence
 
 **Files:**
+- Modify: crates/mrd-session/src/permissions.rs
+- Modify: crates/mrd-ipc/Cargo.toml
 - Modify: crates/mrd-ipc/src/lib.rs
 - Modify: crates/mrd-ipc/tests/contracts.rs
+- Modify: apps/mrd-service/src/ipc_server/dispatch.rs
+- Modify: apps/Rdesk/src-tauri/src/main.rs
+- Modify: apps/Rdesk/src/app/adapters/serviceBridge/client.ts
+- Modify: apps/Rdesk/src/app/adapters/serviceBridge/client.test.ts
 - Modify: apps/Rdesk/src/app/adapters/tauri/types.ts
 - Modify: apps/Rdesk/src/app/adapters/tauri/commands.ts
 - Modify: apps/Rdesk/src/app/adapters/tauri/contract.test.ts
@@ -892,18 +898,24 @@ Expected: FAIL until contracts and frontend mappings exist.
 
 **Step 3: Implement contracts without business logic**
 
-Reuse mrd-session scope/state DTOs through explicit wire projections. Do not expose private keys, credentials, proofs, or internal database identifiers.
+Reuse mrd-session scope/state DTOs through exhaustive wire projections. Use canonical decimal-string u64 values for revisions, epochs, and cursors. Define `after_sequence` as exclusive and return the greatest delivered value as `next_after_sequence`, with an explicit reset-required state for retention gaps. Use allowlisted typed audit metadata rather than arbitrary key/value details. Do not expose private keys, credentials, proofs, integrity HMACs, or internal database identifiers.
+
+The Tauri passthrough must allowlist exactly these secure-remote requests before opening IPC. Until business handlers land, mrd-service must reject all 15 operations with `E_SECURE_REMOTE_UNAVAILABLE`; it must not fall through to legacy session behavior. Browser-bridge and Tauri errors must preserve the same structured code/message shape.
+
+This Task 15 boundary is not yet a global authorization fence: legacy `StartSession`, remote power, file, and control entrypoints remain migration debt. Later handler tasks must gate or retire them before the secure-session surface is advertised as complete.
 
 **Step 4: Re-run contract tests**
 
 Run the same two commands.
+
+Also run the mrd-session/mrd-identity tests, the focused mrd-service fail-closed test, the Tauri allowlist tests, the service-bridge client test, and frontend type checking because the stable wire boundary spans those adapters.
 
 Expected: PASS.
 
 **Step 5: Commit**
 
 ~~~powershell
-git add crates/mrd-ipc apps/Rdesk/src/app/adapters/tauri
+git add crates/mrd-session/src/permissions.rs crates/mrd-ipc apps/mrd-service/src/ipc_server/dispatch.rs apps/Rdesk/src-tauri/src/main.rs apps/Rdesk/src/app/adapters/serviceBridge apps/Rdesk/src/app/adapters/tauri docs/plans/2026-07-11-market-remote-capability-alignment.md
 git commit -m "feat: define secure remote session ipc"
 ~~~
 
