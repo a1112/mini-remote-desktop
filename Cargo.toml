@@ -37,6 +37,7 @@ members = [
   "crates/mrd-transport-webrtc",
   "crates/mrd-buffer-pool",
   "crates/mrd-hardware",
+  "crates/mrd-identity",
   "crates/mrd-quality-gate",
   "heartbeat-rs",
   "tests/capture-render-demo",
@@ -62,6 +63,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
+ring = "0.17"
 
 [patch.crates-io]
 nvenc = { path = "vendor/nvenc" }
