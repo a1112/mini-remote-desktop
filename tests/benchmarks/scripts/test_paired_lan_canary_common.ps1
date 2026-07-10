@@ -818,6 +818,17 @@ $multiPeerDiagnostics = [pscustomobject]@{
 Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "") "" "Ambiguous discovered peers are not auto-selected"
 Assert-Equal (Resolve-PairedLanCanaryTargetDeviceId -Diagnostics $multiPeerDiagnostics -RequestedTargetDeviceId "explicit-peer") "explicit-peer" "Explicit target device id wins over discovery"
 
+$gatePass = Get-PairedLanCanaryGate `
+  -Rows @([pscustomobject]@{ id = "pass"; status = "completed"; error_message = $null }) `
+  -ComparisonRows @()
+Assert-Equal $gatePass.verdict "PASS" "Completed paired rows produce a PASS gate"
+
+$gateFail = Get-PairedLanCanaryGate `
+  -Rows @([pscustomobject]@{ id = "failed"; status = "failed"; error_message = "threshold" }) `
+  -ComparisonRows @()
+Assert-Equal $gateFail.verdict "PRODUCT_FAIL" "Failed paired rows produce a PRODUCT_FAIL gate"
+Assert-True (-not $gateFail.passed) "Failed paired rows must not be publishable"
+
 $tauriNoBuildEnv = New-LocalDualProcessTauriEnvPlan `
   -OutputRoot ([System.IO.Path]::Combine("tmp", "canary")) `
   -ServiceExe ([System.IO.Path]::Combine("tmp", "canary", "run", "mrd-service.exe")) `
@@ -856,5 +867,7 @@ Assert-True ($localDualScript -match "CARGO_TARGET_DIR") "Local dual canary keep
 Assert-True ($localDualScript -match "MRD_LAN_E2E_RENDER_DISPLAY_SOURCE_ID") "Local dual canary can route the receiver window to an explicit display source"
 Assert-True ($localDualScript -match "RenderPresentMode") "Local dual canary exposes render present mode selection"
 Assert-True ($localDualScript -match "MRD_D3D11_RENDER_WAITABLE_OBJECT") "Local dual canary can enable waitable D3D11 present"
+Assert-True ($pairedLanScript -match 'exit 2') "Paired LAN canary must fail the process when the gate fails"
+Assert-True ($localDualScript -match 'exit 2') "Local dual canary must fail the process when the gate fails"
 
 Write-Host "paired LAN canary common tests passed"

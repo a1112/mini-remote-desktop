@@ -475,6 +475,9 @@ $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NoteProperty
 $crossReport | Add-Member -Force -NotePropertyName "scenario_ids" -NotePropertyValue $requestedScenarios
 $crossReport | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $comparisonRows = @(Compare-PairedLanCanaryRows -LocalRows $localRows -CrossRows $crossRows -RatioThreshold $RatioThreshold)
+$gate = Get-PairedLanCanaryGate -Rows (@($localRows) + @($crossRows)) -ComparisonRows $comparisonRows
+$localReport | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue $gate
+$crossReport | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue $gate
 
 Write-CanaryJsonAndMarkdown -Report $localReport -JsonPath (Join-Path $outputRoot "local-canary-report.json") -MarkdownPath (Join-Path $outputRoot "local-canary-report.md") -Title "Local Canary Report"
 Write-CanaryJsonAndMarkdown -Report $crossReport -JsonPath (Join-Path $outputRoot "cross-device-canary-report.json") -MarkdownPath (Join-Path $outputRoot "cross-device-canary-report.md") -Title "Cross-Device Canary Report"
@@ -482,3 +485,7 @@ ConvertTo-Json -InputObject $comparisonRows -Depth 16 | Set-Content -Path (Join-
 Write-PairedLanComparisonMarkdown -Rows $comparisonRows -MarkdownPath (Join-Path $outputRoot "matrix-comparison-report.md") -GitCommit $gitCommit
 
 Write-Host "Paired LAN canary reports written to $outputRoot"
+if (-not $gate.passed) {
+  Write-Error ("Paired LAN canary gate failed: " + (($gate.failures | ForEach-Object { "$($_.id):$($_.reason)" }) -join ", "))
+  exit 2
+}

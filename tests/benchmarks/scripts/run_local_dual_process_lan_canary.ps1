@@ -698,6 +698,13 @@ $report | Add-Member -Force -NotePropertyName "service_boundary_gate" -NotePrope
   failure_count = $serviceBoundaryFailures.Count
   failures = @($serviceBoundaryFailures)
 })
+$localGateFailures = @($report.rows | Where-Object { $_.status -ne "completed" })
+$localGateFailures += @($report.service_boundary_gate.failures)
+$report | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue ([pscustomobject]@{
+  passed = ($localGateFailures.Count -eq 0)
+  verdict = if ($localGateFailures.Count -eq 0) { "PASS" } else { "PRODUCT_FAIL" }
+  failures = @($localGateFailures)
+})
 $report | Add-Member -Force -NotePropertyName "test_impairment_config" -NotePropertyValue $impairment
 $report | Add-Member -Force -NotePropertyName "capture_source_request" -NotePropertyValue ([pscustomobject]@{
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
@@ -784,3 +791,7 @@ if ($fixtureWarnings.Count -gt 0) {
 }
 
 Write-Host "Local dual-process LAN canary report written to $outputRoot"
+if (-not $report.gate.passed) {
+  Write-Error ("Local dual-process LAN canary gate failed with $($report.gate.failures.Count) failure(s)")
+  exit 2
+}

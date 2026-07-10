@@ -1204,6 +1204,30 @@ function New-PairedLanCanaryReport {
   }
 }
 
+function Get-PairedLanCanaryGate {
+  param(
+    [Parameter(Mandatory = $true)]$Rows,
+    [Parameter(Mandatory = $true)]$ComparisonRows
+  )
+
+  $failures = @()
+  foreach ($row in @($Rows)) {
+    if ($row.status -ne "completed") {
+      $failures += [pscustomobject]@{ id = $row.id; reason = "row_status_$($row.status)"; error = $row.error_message }
+    }
+  }
+  foreach ($row in @($ComparisonRows)) {
+    if ([bool](Select-CanaryValue $row.comparable $false) -and $row.status -ne "completed") {
+      $failures += [pscustomobject]@{ id = $row.id; reason = "comparison_status_$($row.status)"; error = $row.reason }
+    }
+  }
+  [pscustomobject]@{
+    passed = ($failures.Count -eq 0)
+    verdict = if ($failures.Count -eq 0) { "PASS" } else { "PRODUCT_FAIL" }
+    failures = @($failures)
+  }
+}
+
 function Write-CanaryJsonAndMarkdown {
   param(
     [Parameter(Mandatory = $true)]$Report,
