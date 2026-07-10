@@ -29,6 +29,7 @@ mod web_bridge;
 use anyhow::Result;
 use app_state::AppState;
 use ipc_server::IpcServer;
+use mrd_service::security;
 use std::sync::Arc;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -49,11 +50,8 @@ async fn main() -> Result<()> {
 
     let lan_discovery_config = lan_discovery::LanDiscoveryConfig::from_env()?;
 
-    // Initialize application state with tray
-    let app_state = Arc::new(AppState::with_tray_and_lan_discovery_config(
-        tray.clone(),
-        lan_discovery_config,
-    ));
+    // Open protected state before any LAN, Web, or IPC listener can start.
+    let app_state = open_protected_app_state(tray.clone(), lan_discovery_config)?;
     {
         let (device_id, device_name) = app_state::default_lan_device_identity();
         let mut devices = app_state.devices.lock().await;
@@ -121,4 +119,34 @@ async fn main() -> Result<()> {
 
     info!("mrd-service shutting down");
     Ok(())
+}
+
+fn open_protected_app_state(
+    tray: app_state::TrayPortRef,
+    lan_discovery_config: lan_discovery::LanDiscoveryConfig,
+) -> Result<Arc<AppState>> {
+    #[cfg(windows)]
+    {
+        let policy = security::ProductDirectoryAclPolicy::bootstrap();
+        let product_data =
+            security::verify_protected_product_data_dir(&policy).map_err(anyhow::Error::msg)?;
+        let protector = security::platform_secret_protector().map_err(anyhow::Error::msg)?;
+        Ok(Arc::new(
+            AppState::open_persistent_with_tray_and_lan_discovery_config(
+                tray,
+                lan_discovery_config,
+                product_data.join("security-state-v2.sqlite3"),
+                protector,
+            )?,
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (tray, lan_discovery_config);
+        Err(anyhow::Error::msg(
+            security::platform_secret_protector()
+                .err()
+                .unwrap_or_else(|| "protected machine state is unsupported".to_string()),
+        ))
+    }
 }

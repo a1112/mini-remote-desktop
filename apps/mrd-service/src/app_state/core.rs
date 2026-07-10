@@ -7,8 +7,17 @@ use super::{
 #[cfg(any(windows, target_os = "macos"))]
 use super::{MediaRenderQueueRegistry, MediaSurfaceRendererRegistry};
 use crate::control_input::ControlInputRegistry;
+use mrd_identity::DeviceIdentity;
 use mrd_ipc::CapabilitySnapshot;
-use std::sync::Arc;
+use mrd_store_sqlite::{PersistentStore, SecretProtector, StoreError};
+use ring::rand::SystemRandom;
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::Mutex;
 
 /// Application state for mrd-service
@@ -28,9 +37,11 @@ pub struct AppState {
     /// Device registry
     pub devices: Arc<Mutex<DeviceRegistry>>,
     /// Service-owned security and operations audit events.
-    pub audit_log: Arc<Mutex<AuditLogRegistry>>,
+    pub audit_log: Arc<AuditLogRegistry>,
     /// Service-owned device pairing and identity state.
-    pub device_identities: Arc<Mutex<DeviceIdentityRegistry>>,
+    pub device_identities: Arc<DeviceIdentityRegistry>,
+    /// Latched health of the authoritative security store.
+    security_healthy: Arc<AtomicBool>,
     /// Service-owned device preference flags.
     pub device_preferences: Arc<Mutex<DevicePreferenceRegistry>>,
     /// Shell state - UI presence and service lifecycle
@@ -68,12 +79,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
             crate::shell::NoOpTray::new(),
         )))
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn with_tray(tray: TrayPortRef) -> Self {
         Self::with_tray_and_lan_discovery_config(
             tray,
@@ -81,15 +94,63 @@ impl AppState {
         )
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub fn with_tray_and_lan_discovery_config(
         tray: TrayPortRef,
         lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,
     ) -> Self {
+        Self::with_security_adapters(
+            tray,
+            lan_discovery_config,
+            AuditLogRegistry::default(),
+            DeviceIdentityRegistry::default(),
+        )
+    }
+
+    /// Opens sealed machine identity, trust, and audit state for a service instance.
+    pub fn open_persistent(
+        store_path: impl AsRef<Path>,
+        protector: Arc<dyn SecretProtector>,
+    ) -> Result<Self, StoreError> {
+        Self::open_persistent_with_tray_and_lan_discovery_config(
+            Arc::new(std::sync::Mutex::new(crate::shell::NoOpTray::new())),
+            crate::lan_discovery::LanDiscoveryConfig::default(),
+            store_path,
+            protector,
+        )
+    }
+
+    /// Opens sealed security state while injecting production shell and LAN adapters.
+    pub fn open_persistent_with_tray_and_lan_discovery_config(
+        tray: TrayPortRef,
+        lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,
+        store_path: impl AsRef<Path>,
+        protector: Arc<dyn SecretProtector>,
+    ) -> Result<Self, StoreError> {
+        let store = Arc::new(PersistentStore::open(store_path, protector)?);
+        let machine_identity = store.load_or_create_identity(|| {
+            DeviceIdentity::generate(&SystemRandom::new()).map_err(|_| StoreError::InvalidIdentity)
+        })?;
+        Ok(Self::with_security_adapters(
+            tray,
+            lan_discovery_config,
+            AuditLogRegistry::persistent(store.clone()),
+            DeviceIdentityRegistry::persistent(store, machine_identity),
+        ))
+    }
+
+    fn with_security_adapters(
+        tray: TrayPortRef,
+        lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,
+        audit_log: AuditLogRegistry,
+        device_identities: DeviceIdentityRegistry,
+    ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
-            audit_log: Arc::new(Mutex::new(AuditLogRegistry::default())),
-            device_identities: Arc::new(Mutex::new(DeviceIdentityRegistry::default())),
+            audit_log: Arc::new(audit_log),
+            device_identities: Arc::new(device_identities),
+            security_healthy: Arc::new(AtomicBool::new(true)),
             device_preferences: Arc::new(Mutex::new(DevicePreferenceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
             tray,
@@ -126,18 +187,28 @@ impl AppState {
     }
 
     /// Get a clone of the service audit log registry.
-    pub fn audit_log(&self) -> Arc<Mutex<AuditLogRegistry>> {
+    pub fn audit_log(&self) -> Arc<AuditLogRegistry> {
         self.audit_log.clone()
     }
 
     /// Get a clone of the device identity registry.
-    pub fn device_identities(&self) -> Arc<Mutex<DeviceIdentityRegistry>> {
+    pub fn device_identities(&self) -> Arc<DeviceIdentityRegistry> {
         self.device_identities.clone()
     }
 
     /// Get a clone of the service-owned device preference registry.
     pub fn device_preferences(&self) -> Arc<Mutex<DevicePreferenceRegistry>> {
         self.device_preferences.clone()
+    }
+
+    /// Returns whether the authoritative security store has remained usable.
+    pub fn security_is_healthy(&self) -> bool {
+        self.security_healthy.load(Ordering::Acquire)
+    }
+
+    /// Permanently marks security state unavailable until process restart and re-verification.
+    pub fn mark_security_unhealthy(&self) {
+        self.security_healthy.store(false, Ordering::Release);
     }
 
     /// Get a clone of the shell Arc for injection into handlers
@@ -269,6 +340,7 @@ impl AppState {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 impl Default for AppState {
     fn default() -> Self {
         Self::new()

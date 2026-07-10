@@ -21,6 +21,7 @@ mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }
 mrd-input = { path = "../../crates/mrd-input" }
+mrd-identity = { path = "../../crates/mrd-identity" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
@@ -31,6 +32,7 @@ mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc", optional = 
 base64 = "0.22"
 bytes.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
+ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -69,3 +71,6 @@ production-vvc-software-codec = [
   "mrd-decode/production-vvc-software-codec",
   "mrd-encode-vvenc/production-vvc-software-codec",
 ]
+
+[dev-dependencies]
+rusqlite.workspace = true

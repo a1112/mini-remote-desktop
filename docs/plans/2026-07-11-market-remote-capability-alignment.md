@@ -923,16 +923,24 @@ git commit -m "feat: define secure remote session ipc"
 
 **Files:**
 - Modify: apps/mrd-service/Cargo.toml
+- Modify: apps/mrd-service/src/app_state.rs
 - Modify: apps/mrd-service/src/app_state/core.rs
 - Modify: apps/mrd-service/src/app_state/device_identity_registry.rs
 - Modify: apps/mrd-service/src/app_state/audit_log_registry.rs
 - Modify: apps/mrd-service/src/handlers/identity.rs
+- Modify: apps/mrd-service/src/handlers/telemetry.rs
+- Modify: apps/mrd-service/src/ipc_server/audit.rs
 - Modify: apps/mrd-service/src/ipc_server/dispatch.rs
+- Modify: apps/mrd-service/src/main.rs
 - Create: apps/mrd-service/tests/persistent_identity.rs
+- Modify: crates/mrd-store-sqlite/src/lib.rs
+- Modify: crates/mrd-store-sqlite/src/trust_store.rs
+- Modify: crates/mrd-store-sqlite/src/audit_store.rs
+- Modify: crates/mrd-store-sqlite/tests/persistence.rs
 
 **Step 1: Write failing service restart tests**
 
-Start a service state with a temporary data directory, approve and revoke peers, append audit events, destroy the state, reopen it, and assert identity/trust/audit persistence.
+Start a service state with a temporary data directory and authenticated test protector, approve a real Ed25519 peer key, append audit events, destroy the state, reopen it, and assert identity/trust/audit persistence. Prove stale revisions and revoked-key reactivation leave trust unchanged while committing stable denial audits. Prove the legacy DeviceId/fingerprint pairing path fails closed because it has no authenticated peer public key.
 
 **Step 2: Run the service integration test**
 
@@ -942,7 +950,7 @@ Expected: FAIL because AppState owns only in-memory registries.
 
 **Step 3: Inject persistent store ports**
 
-Keep in-memory fakes only for unit tests. Production AppState construction must require a protected store path and SecretProtector. Convert existing identity handlers to domain commands and persistent transactions.
+Keep in-memory fakes available only in test/debug builds. Production AppState construction must require a protected store path and SecretProtector, and the release entrypoint must verify the fixed protected ProgramData directory before opening the store or any listener. Run synchronous SQLite work behind a blocking boundary. Convert authenticated trust commands to combined trust-plus-audit transactions; expose durable list/suspend/revoke operations, but keep approval unavailable until an authenticated pending public key exists. Never fabricate a public key from a DeviceId or fingerprint. Latch real store failures into unhealthy service state, keep caller validation errors separate, and persist only stable error codes rather than human error text.
 
 **Step 4: Run service tests**
 
@@ -958,7 +966,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ~~~powershell
-git add apps/mrd-service
+git add apps/mrd-service crates/mrd-store-sqlite docs/plans/2026-07-11-market-remote-capability-alignment.md
 git commit -m "refactor: make trust and audit persistent"
 ~~~
 

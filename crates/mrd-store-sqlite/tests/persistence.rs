@@ -1,6 +1,7 @@
 use mrd_identity::DeviceIdentity;
 use mrd_store_sqlite::{
-    AuditDraft, PersistentStore, SecretBytes, SecretProtector, StoreError, TrustState,
+    AuditDraft, AuditQuery, AuditedTrustTransition, PersistentStore, SecretBytes, SecretProtector,
+    StoreError, TrustState, TrustTransitionRejection,
 };
 use ring::{
     aead,
@@ -10,7 +11,10 @@ use rusqlite::{params, Connection};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Barrier},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    },
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -78,6 +82,47 @@ impl SecretProtector for TestSecretProtector {
     }
 }
 
+struct FailNthAuditUnprotectProtector {
+    inner: TestSecretProtector,
+    audit_unprotect_calls: AtomicUsize,
+    fail_on_call: AtomicUsize,
+}
+
+impl FailNthAuditUnprotectProtector {
+    fn new(key: [u8; 32]) -> Self {
+        Self {
+            inner: TestSecretProtector::new(key),
+            audit_unprotect_calls: AtomicUsize::new(0),
+            fail_on_call: AtomicUsize::new(0),
+        }
+    }
+
+    fn fail_on_audit_unprotect(&self, call: usize) {
+        self.audit_unprotect_calls.store(0, Ordering::Release);
+        self.fail_on_call.store(call, Ordering::Release);
+    }
+
+    fn disable_failure(&self) {
+        self.fail_on_call.store(0, Ordering::Release);
+    }
+}
+
+impl SecretProtector for FailNthAuditUnprotectProtector {
+    fn protect(&self, purpose: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        self.inner.protect(purpose, plaintext)
+    }
+
+    fn unprotect(&self, purpose: &[u8], protected: &[u8]) -> Result<SecretBytes, String> {
+        if purpose.starts_with(b"MRD_AUDIT_HMAC_KEY_V1") {
+            let call = self.audit_unprotect_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == self.fail_on_call.load(Ordering::Acquire) {
+                return Err("injected audit-key unprotect failure".to_owned());
+            }
+        }
+        self.inner.unprotect(purpose, protected)
+    }
+}
+
 fn temp_db(name: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -105,6 +150,165 @@ fn audit(timestamp_ms: u64, action: &str, peer: &str) -> AuditDraft {
         reason_code: None,
         details: BTreeMap::new(),
     }
+}
+
+#[test]
+fn trust_mutations_and_audits_commit_atomically_and_are_queryable() {
+    let path = temp_db("audited-trust");
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    let peer_key_id = peer.key_id().to_owned();
+    let store = PersistentStore::open(&path, protector()).unwrap();
+
+    let (approved, approval_audit) = store
+        .insert_trusted_device_with_audit(
+            &peer_key_id,
+            peer.public_key(),
+            1,
+            TrustState::Trusted,
+            audit(1, "trust.approved", &peer_key_id),
+        )
+        .unwrap();
+    assert_eq!(approved.revision, 1);
+    assert_eq!(approval_audit.sequence, 1);
+
+    let stale = store
+        .transition_trust_with_audit(
+            &peer_key_id,
+            99,
+            TrustState::Suspended,
+            audit(2, "trust.suspended", &peer_key_id),
+        )
+        .unwrap();
+    assert_eq!(
+        stale,
+        AuditedTrustTransition::Rejected {
+            rejection: TrustTransitionRejection::RevisionMismatch,
+            audit_sequence: 2,
+        }
+    );
+    assert_eq!(store.trust_record(&peer_key_id).unwrap(), Some(approved));
+
+    let revoked = store
+        .transition_trust_with_audit(
+            &peer_key_id,
+            1,
+            TrustState::Revoked,
+            audit(3, "trust.revoked", &peer_key_id),
+        )
+        .unwrap();
+    let applied = revoked.into_applied().expect("revocation applies");
+    assert_eq!(applied.record.state, TrustState::Revoked);
+    assert_eq!(applied.record.revision, 2);
+    assert_eq!(applied.audit.sequence, 3);
+
+    let reactivation = store
+        .transition_trust_with_audit(
+            &peer_key_id,
+            2,
+            TrustState::Trusted,
+            audit(4, "trust.reactivated", &peer_key_id),
+        )
+        .unwrap();
+    assert_eq!(
+        reactivation,
+        AuditedTrustTransition::Rejected {
+            rejection: TrustTransitionRejection::RevokedTerminal,
+            audit_sequence: 4,
+        }
+    );
+
+    assert_eq!(
+        store.list_trusted_devices(true).unwrap(),
+        vec![applied.record.clone()]
+    );
+    let events = store
+        .query_audit(&AuditQuery {
+            after_sequence: None,
+            limit: 10,
+            session_id: None,
+            action: None,
+            outcome: None,
+            peer_device_id: None,
+        })
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| (
+                event.sequence,
+                event.draft.outcome.as_str(),
+                event.draft.reason_code.as_deref(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "allowed", None),
+            (2, "denied", Some("trust_revision_mismatch")),
+            (3, "allowed", None),
+            (4, "denied", Some("trust_revoked_terminal")),
+        ]
+    );
+
+    drop(store);
+    let reopened = PersistentStore::open(&path, protector()).unwrap();
+    assert_eq!(reopened.list_trusted_devices(true).unwrap().len(), 1);
+    assert_eq!(
+        reopened
+            .query_audit(&AuditQuery {
+                after_sequence: Some(1),
+                limit: 10,
+                session_id: None,
+                action: None,
+                outcome: None,
+                peer_device_id: None,
+            })
+            .unwrap()
+            .len(),
+        3
+    );
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn audit_append_failure_rolls_back_trust_and_manifest_together() {
+    let path = temp_db("audited-trust-rollback");
+    let protector = Arc::new(FailNthAuditUnprotectProtector::new([0x6b; 32]));
+    let store = PersistentStore::open(&path, protector.clone()).unwrap();
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+
+    // Snapshot verification loads the audit key once; the atomic append loads it again.
+    protector.fail_on_audit_unprotect(2);
+    assert!(matches!(
+        store.insert_trusted_device_with_audit(
+            peer.key_id(),
+            peer.public_key(),
+            1,
+            TrustState::Trusted,
+            audit(1, "trust.approved", peer.key_id()),
+        ),
+        Err(StoreError::SecretProtection(_))
+    ));
+
+    protector.disable_failure();
+    assert_eq!(store.trust_record(peer.key_id()).unwrap(), None);
+    assert!(store
+        .query_audit(&AuditQuery {
+            after_sequence: None,
+            limit: 10,
+            session_id: None,
+            action: None,
+            outcome: None,
+            peer_device_id: None,
+        })
+        .unwrap()
+        .is_empty());
+    store.verify_audit_chain().unwrap();
+
+    drop(store);
+    let reopened = PersistentStore::open(&path, protector).unwrap();
+    assert_eq!(reopened.trust_record(peer.key_id()).unwrap(), None);
+    drop(reopened);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -315,7 +519,7 @@ fn audit_rejects_secret_shaped_details() {
         .insert("password".to_owned(), "must-not-persist".to_owned());
     assert!(matches!(
         store.append_audit(draft),
-        Err(StoreError::AuditIntegrity { .. })
+        Err(StoreError::InvalidAuditEvent)
     ));
     let bytes = std::fs::read(&path).unwrap();
     assert!(!bytes

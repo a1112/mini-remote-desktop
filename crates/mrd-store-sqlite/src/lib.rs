@@ -6,8 +6,11 @@ mod integrity;
 mod migrations;
 mod trust_store;
 
-pub use audit_store::{AuditDraft, AuditRecord};
-pub use trust_store::{TrustRecord, TrustState};
+pub use audit_store::{AuditDraft, AuditQuery, AuditRecord};
+pub use trust_store::{
+    AppliedTrustTransition, AuditedTrustTransition, TrustRecord, TrustState,
+    TrustTransitionRejection,
+};
 
 use rusqlite::Connection;
 use std::{
@@ -78,6 +81,12 @@ pub enum StoreError {
     /// A trust state transition violated revision or terminal-state rules.
     #[error("trust transition rejected: {0}")]
     TrustTransition(String),
+    /// A caller supplied an audit event outside the durable redaction contract.
+    #[error("invalid audit event")]
+    InvalidAuditEvent,
+    /// A caller supplied an audit query outside the bounded query contract.
+    #[error("invalid audit query")]
+    InvalidAuditQuery,
     /// Audit chain verification failed at a sequence.
     #[error("audit integrity failed at sequence {sequence}")]
     AuditIntegrity { sequence: u64 },

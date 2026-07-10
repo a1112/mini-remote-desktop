@@ -1,4 +1,7 @@
-use super::{audit::audit_outcome, IpcServer};
+use super::{
+    audit::{audit_outcome, security_store_unavailable_response},
+    IpcServer,
+};
 use crate::handlers::control;
 use crate::handlers::{
     capability, device, files, identity, lan, preflight, session, shell as shell_handlers,
@@ -12,6 +15,19 @@ pub(super) async fn dispatch_request(server: &IpcServer, request: IpcRequest) ->
 
 impl IpcServer {
     async fn dispatch_request_inner(&self, request: IpcRequest) -> IpcResponse {
+        let mut security_unhealthy = !self.app_state.security_is_healthy();
+        if security_unhealthy && !allowed_when_security_unhealthy(&request) {
+            return security_store_unavailable_response();
+        }
+        if !security_unhealthy
+            && requires_durable_audit_preflight(&request)
+            && self.verify_audit_integrity().await.is_err()
+        {
+            security_unhealthy = true;
+            if !is_emergency_safety_command(&request) {
+                return security_store_unavailable_response();
+            }
+        }
         match request {
             IpcRequest::RegisterDevice {
                 device_id,
@@ -19,17 +35,23 @@ impl IpcServer {
             } => {
                 let response =
                     device::register_device(&self.app_state, device_id.clone(), device_name).await;
-                self.record_audit_event(
-                    "device.register",
-                    "success",
-                    None,
-                    Some(device_id.clone()),
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                )
-                .await;
+                if !security_unhealthy
+                    && self
+                        .record_audit_event(
+                            "device.register",
+                            "success",
+                            None,
+                            Some(device_id.clone()),
+                            None,
+                            None,
+                            None,
+                            Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -73,16 +95,46 @@ impl IpcServer {
 
             IpcRequest::ListSessions => session::list_sessions(&self.app_state).await,
 
+            IpcRequest::ListTrustedDevices { include_revoked } => {
+                identity::list_trusted_devices(&self.app_state, include_revoked).await
+            }
+
+            IpcRequest::ApproveTrustedDevice { .. } => IpcResponse::Error {
+                code: "E_AUTHENTICATED_PEER_REQUIRED".to_string(),
+                message: "trusted-device approval requires an authenticated pending peer key"
+                    .to_string(),
+            },
+
+            IpcRequest::SuspendTrustedDevice {
+                peer_key_id,
+                expected_trust_revision,
+            } => {
+                identity::suspend_trusted_device(
+                    &self.app_state,
+                    peer_key_id,
+                    expected_trust_revision.get(),
+                )
+                .await
+            }
+
+            IpcRequest::RevokeTrustedDevice {
+                peer_key_id,
+                expected_trust_revision,
+            } => {
+                identity::revoke_trusted_device(
+                    &self.app_state,
+                    peer_key_id,
+                    expected_trust_revision.get(),
+                )
+                .await
+            }
+
             IpcRequest::GetRemoteSession { .. }
             | IpcRequest::RequestRemoteSession { .. }
             | IpcRequest::RespondToConsent { .. }
             | IpcRequest::EnableUnattendedAccess { .. }
             | IpcRequest::DisableUnattendedAccess { .. }
             | IpcRequest::RotateUnattendedAccess { .. }
-            | IpcRequest::ListTrustedDevices { .. }
-            | IpcRequest::ApproveTrustedDevice { .. }
-            | IpcRequest::SuspendTrustedDevice { .. }
-            | IpcRequest::RevokeTrustedDevice { .. }
             | IpcRequest::RotateTrustedDevice { .. }
             | IpcRequest::ChangeSessionPermissions { .. }
             | IpcRequest::SubscribeSessionEvents { .. }
@@ -122,17 +174,23 @@ impl IpcServer {
                     },
                 };
                 let (outcome, reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.start",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    Some(target_device_id),
-                    Some(transport_kind),
-                    reason,
-                    Vec::new(),
-                )
-                .await;
+                if !security_unhealthy
+                    && self
+                        .record_audit_event(
+                            "session.start",
+                            outcome,
+                            Some(session_id),
+                            self.local_device_id().await,
+                            Some(target_device_id),
+                            Some(transport_kind),
+                            reason,
+                            Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -181,17 +239,22 @@ impl IpcServer {
                     },
                 };
                 let (outcome, reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.start_lan",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    Some(target_device_id),
-                    Some(transport_kind),
-                    reason,
-                    details,
-                )
-                .await;
+                if self
+                    .record_audit_event(
+                        "session.start_lan",
+                        outcome,
+                        Some(session_id),
+                        self.local_device_id().await,
+                        Some(target_device_id),
+                        Some(transport_kind),
+                        reason,
+                        details,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -297,17 +360,22 @@ impl IpcServer {
                 )
                 .await;
                 let (outcome, reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.accept",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    Some(source_device_id),
-                    None,
-                    reason,
-                    Vec::new(),
-                )
-                .await;
+                if self
+                    .record_audit_event(
+                        "session.accept",
+                        outcome,
+                        Some(session_id),
+                        self.local_device_id().await,
+                        Some(source_device_id),
+                        None,
+                        reason,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -324,17 +392,23 @@ impl IpcServer {
                     self.session_audit_context(&session_id).await;
                 let response = session::stop_session(&self.app_state, session_id.clone()).await;
                 let (outcome, reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.stop",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    peer_device_id,
-                    transport_kind,
-                    reason,
-                    Vec::new(),
-                )
-                .await;
+                if !security_unhealthy
+                    && self
+                        .record_audit_event(
+                            "session.stop",
+                            outcome,
+                            Some(session_id),
+                            self.local_device_id().await,
+                            peer_device_id,
+                            transport_kind,
+                            reason,
+                            Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -345,17 +419,23 @@ impl IpcServer {
                     session::fail_session(&self.app_state, session_id.clone(), reason.clone())
                         .await;
                 let (outcome, response_reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.fail",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    peer_device_id,
-                    transport_kind,
-                    response_reason.or(Some(reason)),
-                    Vec::new(),
-                )
-                .await;
+                if !security_unhealthy
+                    && self
+                        .record_audit_event(
+                            "session.fail",
+                            outcome,
+                            Some(session_id),
+                            self.local_device_id().await,
+                            peer_device_id,
+                            transport_kind,
+                            response_reason.or(Some("session_failed".to_string())),
+                            Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -364,17 +444,22 @@ impl IpcServer {
                     self.session_audit_context(&session_id).await;
                 let response = session::recover_session(&self.app_state, session_id.clone()).await;
                 let (outcome, reason) = audit_outcome(&response);
-                self.record_audit_event(
-                    "session.recover",
-                    outcome,
-                    Some(session_id),
-                    self.local_device_id().await,
-                    peer_device_id,
-                    transport_kind,
-                    reason,
-                    Vec::new(),
-                )
-                .await;
+                if self
+                    .record_audit_event(
+                        "session.recover",
+                        outcome,
+                        Some(session_id),
+                        self.local_device_id().await,
+                        peer_device_id,
+                        transport_kind,
+                        reason,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -444,49 +529,67 @@ impl IpcServer {
                     certificate_fingerprint,
                 )
                 .await;
-                self.record_audit_event(
-                    "device.pair",
-                    "success",
-                    None,
-                    self.local_device_id().await,
-                    Some(device_id),
-                    None,
-                    None,
-                    Vec::new(),
-                )
-                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                if self
+                    .record_audit_event(
+                        "device.pair",
+                        outcome,
+                        None,
+                        self.local_device_id().await,
+                        Some(device_id),
+                        None,
+                        reason,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
             IpcRequest::ApprovePairing { device_id } => {
                 let response = identity::approve_pairing(&self.app_state, device_id.clone()).await;
-                self.record_audit_event(
-                    "device.approve_pairing",
-                    "success",
-                    None,
-                    self.local_device_id().await,
-                    Some(device_id),
-                    None,
-                    None,
-                    Vec::new(),
-                )
-                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                if self
+                    .record_audit_event(
+                        "device.approve_pairing",
+                        outcome,
+                        None,
+                        self.local_device_id().await,
+                        Some(device_id),
+                        None,
+                        reason,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
             IpcRequest::RevokeDevice { device_id } => {
                 let response = identity::revoke_device(&self.app_state, device_id.clone()).await;
-                self.record_audit_event(
-                    "device.revoke",
-                    "success",
-                    None,
-                    self.local_device_id().await,
-                    Some(device_id),
-                    None,
-                    None,
-                    Vec::new(),
-                )
-                .await;
+                let (outcome, reason) = audit_outcome(&response);
+                if self
+                    .record_audit_event(
+                        "device.revoke",
+                        outcome,
+                        None,
+                        self.local_device_id().await,
+                        Some(device_id),
+                        None,
+                        reason,
+                        Vec::new(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    return security_store_unavailable_response();
+                }
                 response
             }
 
@@ -502,7 +605,7 @@ impl IpcServer {
                 transport_handlers::media_pipeline_snapshot(&self.app_state, session_id).await
             }
 
-            IpcRequest::ServiceHealth => telemetry::service_health(),
+            IpcRequest::ServiceHealth => telemetry::service_health(&self.app_state),
 
             IpcRequest::ProbeSnapshot { session_id } => {
                 transport_handlers::probe_snapshot(&self.app_state, session_id).await
@@ -542,6 +645,45 @@ impl IpcServer {
             IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(mode),
         }
     }
+}
+
+fn allowed_when_security_unhealthy(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::ServiceHealth
+            | IpcRequest::ListSessions
+            | IpcRequest::SessionRuntimeSnapshot { .. }
+            | IpcRequest::RuntimeSnapshot
+            | IpcRequest::StopSession { .. }
+            | IpcRequest::FailSession { .. }
+            | IpcRequest::SuspendTrustedDevice { .. }
+            | IpcRequest::RevokeTrustedDevice { .. }
+            | IpcRequest::GetShellStatus
+            | IpcRequest::ShutdownService { .. }
+    )
+}
+
+fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::RegisterDevice { .. }
+            | IpcRequest::StartSession { .. }
+            | IpcRequest::StartLanRemoteSession { .. }
+            | IpcRequest::AcceptSession { .. }
+            | IpcRequest::StopSession { .. }
+            | IpcRequest::FailSession { .. }
+            | IpcRequest::RecoverSession { .. }
+            | IpcRequest::PairDevice { .. }
+            | IpcRequest::ApprovePairing { .. }
+            | IpcRequest::RevokeDevice { .. }
+    )
+}
+
+fn is_emergency_safety_command(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::StopSession { .. } | IpcRequest::FailSession { .. }
+    )
 }
 
 #[cfg(test)]
@@ -589,15 +731,7 @@ mod tests {
         for request in requests {
             assert!(request.is_secure_remote());
             let response = dispatch_request(&server, request).await;
-            assert_eq!(
-                response,
-                IpcResponse::Error {
-                    code: "E_SECURE_REMOTE_UNAVAILABLE".to_string(),
-                    message:
-                        "secure remote session operations are unavailable in this service build"
-                            .to_string(),
-                }
-            );
+            assert!(matches!(response, IpcResponse::Error { .. }));
         }
     }
 }
