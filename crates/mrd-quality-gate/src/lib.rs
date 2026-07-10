@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+mod artifact;
+
+pub use artifact::{validate_artifact, ArtifactError, RemoteExperienceRun};
+
 /// Stable product-gate outcomes shared by scripts, CI, and release artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {

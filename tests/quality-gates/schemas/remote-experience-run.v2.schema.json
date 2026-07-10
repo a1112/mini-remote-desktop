@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mini-remote-desktop.invalid/schemas/remote-experience-run.v2.schema.json",
+  "type": "object",
+  "required": ["schema_version", "run_id", "scenario", "route", "media", "present", "resources", "producer_status", "gate_status", "audit_event_ids"],
+  "properties": {
+    "schema_version": {"const": "remote-experience-run.v2"},
+    "run_id": {"type": "string", "minLength": 1},
+    "scenario": {"type": "object", "required": ["id", "required"], "properties": {"id": {"type": "string"}, "required": {"type": "boolean"}}, "additionalProperties": false},
+    "route": {"type": "object", "required": ["requested", "selected", "candidate_pair"], "properties": {"requested": {"type": "string"}, "selected": {"type": "string"}, "candidate_pair": {"type": "string"}}, "additionalProperties": false},
+    "media": {"type": "object", "required": ["requested_profile", "selected_profile", "profile_downgraded"], "properties": {"requested_profile": {"type": "string"}, "selected_profile": {"type": "string"}, "profile_downgraded": {"type": "boolean"}}, "additionalProperties": false},
+    "present": {"type": "object", "required": ["visible_first_frame_ms", "input_to_photon_ms", "fps_windows", "freeze_count", "stall_ms"], "properties": {"visible_first_frame_ms": {"type": ["number", "null"]}, "input_to_photon_ms": {"type": "array", "items": {"type": "number"}}, "fps_windows": {"type": "array", "items": {"type": "number"}}, "freeze_count": {"type": "integer", "minimum": 0}, "stall_ms": {"type": "array", "items": {"type": "number"}}}, "additionalProperties": false},
+    "resources": {"type": "object", "required": ["cpu_percent", "gpu_percent", "rss_bytes", "vram_bytes"], "properties": {"cpu_percent": {"type": "array", "items": {"type": "number"}}, "gpu_percent": {"type": "array", "items": {"type": "number"}}, "rss_bytes": {"type": "array", "items": {"type": "number"}}, "vram_bytes": {"type": "array", "items": {"type": "number"}}}, "additionalProperties": false},
+    "producer_status": {"type": "string", "minLength": 1},
+    "gate_status": {"enum": ["PASS", "PRODUCT_FAIL", "INFRA_FAIL", "INVALID_ARTIFACT", "ALLOWED_SKIP"]},
+    "audit_event_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  },
+  "additionalProperties": false
+}
