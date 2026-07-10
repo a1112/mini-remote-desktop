@@ -26,15 +26,28 @@ foreach ($path in @($stdoutPath, $stderrPath)) {
   }
 }
 
-$passed = $true
+$passed = $false
 if ($ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
-  $passed = (
-    (($null -eq $result.success_ratio) -or ($result.success_ratio -ge $thresholds.min_success_ratio)) -and
-    (($null -eq $result.latency_ms.p95_ms) -or ($result.latency_ms.p95_ms -le $thresholds.max_latency_p95_ms)) -and
-    (($null -eq $result.latency_ms.p99_ms) -or ($result.latency_ms.p99_ms -le $thresholds.max_latency_p99_ms)) -and
-    ($result.throughput_fps -ge $thresholds.min_throughput_fps)
+  $required = @(
+    @{ Name = 'sample_count'; Value = $result.sample_count },
+    @{ Name = 'success_ratio'; Value = $result.success_ratio },
+    @{ Name = 'latency_ms.p95_ms'; Value = $result.latency_ms.p95_ms },
+    @{ Name = 'latency_ms.p99_ms'; Value = $result.latency_ms.p99_ms },
+    @{ Name = 'throughput_fps'; Value = $result.throughput_fps }
   )
+  $requiredFinite = $true
+  foreach ($metric in $required) {
+    if ($null -eq $metric.Value -or ($metric.Value -is [double] -and [double]::IsNaN($metric.Value)) -or ($metric.Value -is [double] -and [double]::IsInfinity($metric.Value))) {
+      $requiredFinite = $false
+    }
+  }
+  $passed = $requiredFinite -and
+    ($result.sample_count -gt 0) -and
+    ($result.success_ratio -ge $thresholds.min_success_ratio) -and
+    ($result.latency_ms.p95_ms -le $thresholds.max_latency_p95_ms) -and
+    ($result.latency_ms.p99_ms -le $thresholds.max_latency_p99_ms) -and
+    ($result.throughput_fps -ge $thresholds.min_throughput_fps)
 }
 
 $summary = [pscustomobject]@{

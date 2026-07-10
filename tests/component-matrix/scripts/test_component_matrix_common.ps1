@@ -89,6 +89,17 @@ try {
   Assert-True (Test-Path (Join-Path $runDir "summary.csv")) "summary.csv should be written when result.json exists"
   $summary = Import-Csv (Join-Path $runDir "summary.csv")
   Assert-Equal $summary.passed "True" "summary should evaluate thresholds"
+
+  foreach ($fixtureName in @('threshold-failure-result.json', 'null-latency-result.json')) {
+    $fixtureRun = Join-Path $tmp ([IO.Path]::GetFileNameWithoutExtension($fixtureName))
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtureRun 'logs'), (Join-Path $fixtureRun 'reports') | Out-Null
+    Copy-Item (Join-Path $scriptDir "../fixtures/$fixtureName") (Join-Path $fixtureRun 'result.json')
+    Copy-Item (Join-Path $runDir 'manifest.json') (Join-Path $fixtureRun 'manifest.json')
+    New-Item -ItemType File -Force -Path (Join-Path $fixtureRun 'logs/component.stdout.log'), (Join-Path $fixtureRun 'logs/component.stderr.log') | Out-Null
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $scriptDir 'summarize_component_results.ps1') -RunDir $fixtureRun -ThresholdPath (Join-Path $scriptDir '../thresholds/decode.json')
+    $fixtureSummary = Import-Csv (Join-Path $fixtureRun 'summary.csv')
+    Assert-Equal $fixtureSummary.passed "False" "$fixtureName should fail closed"
+  }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

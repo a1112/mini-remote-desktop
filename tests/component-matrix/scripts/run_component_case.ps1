@@ -68,5 +68,10 @@ if (-not $summaryWritten) {
   throw "component test did not write result.json at $resultPath"
 }
 
+$summary = Import-Csv (Join-Path $runDir 'summary.csv')
+if ($summary.passed -ne 'True') {
+  throw "component quality gate failed for $($case.case_name). See $runDir/summary.csv and reports/markdown-report.md"
+}
+
 Write-Output "Component case completed."
 Write-Output "Run directory: $runDir"
