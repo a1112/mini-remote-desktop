@@ -9,14 +9,14 @@ pub enum RouteKind {
     WebRtcRelay,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RouteState {
+    #[default]
     Idle,
     Establishing(RouteKind),
     Active(RouteKind),
-    Failed { kind: RouteKind, reason: String },
-}
-
-impl Default for RouteState {
-    fn default() -> Self { Self::Idle }
+    Failed {
+        kind: RouteKind,
+        reason: String,
+    },
 }

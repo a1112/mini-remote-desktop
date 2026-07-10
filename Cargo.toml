@@ -29,6 +29,7 @@ members = [
   "crates/mrd-render-macos",
   "crates/mrd-render-opengl",
   "crates/mrd-session",
+  "crates/mrd-store-sqlite",
   "crates/mrd-signal-client",
   "crates/mrd-signal-proto",
   "crates/mrd-signal-server",
@@ -64,6 +65,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 ring = "0.17"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
 
 [patch.crates-io]
 nvenc = { path = "vendor/nvenc" }

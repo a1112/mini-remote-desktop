@@ -4,6 +4,7 @@ use ring::{digest, rand::SystemRandom, signature, signature::KeyPair};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 mod replay;
 mod rotation;
@@ -15,7 +16,7 @@ pub use rotation::{RotationError, RotationProof};
 pub use sas::sas_code;
 pub use unattended::UnattendedCredential;
 
-pub use mrd_session::PermissionScope as PermissionScope;
+pub use mrd_session::PermissionScope;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IdentityError {
@@ -31,11 +32,28 @@ pub enum IdentityError {
     PeerBindingMismatch,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceIdentity {
     private_pkcs8: Vec<u8>,
     public_key: Vec<u8>,
     key_id: String,
+}
+
+impl std::fmt::Debug for DeviceIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeviceIdentity")
+            .field("private_pkcs8", &"REDACTED")
+            .field("public_key", &self.public_key)
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+impl Drop for DeviceIdentity {
+    fn drop(&mut self) {
+        self.private_pkcs8.zeroize();
+    }
 }
 
 impl DeviceIdentity {
@@ -50,25 +68,46 @@ impl DeviceIdentity {
             .map_err(|_| IdentityError::InvalidPrivateKey)?;
         let public_key = pair.public_key().as_ref().to_vec();
         let key_id = hex_digest(&public_key);
-        Ok(Self { private_pkcs8: bytes.to_vec(), public_key, key_id })
+        Ok(Self {
+            private_pkcs8: bytes.to_vec(),
+            public_key,
+            key_id,
+        })
     }
 
-    pub fn private_pkcs8(&self) -> &[u8] { &self.private_pkcs8 }
-    pub fn public_key(&self) -> &[u8] { &self.public_key }
-    pub fn key_id(&self) -> &str { &self.key_id }
+    pub fn private_pkcs8(&self) -> &[u8] {
+        &self.private_pkcs8
+    }
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
 
-    pub fn sign_intent(&self, payload: SessionIntent) -> Result<SignedSessionIntent, IdentityError> {
+    pub fn sign_intent(
+        &self,
+        payload: SessionIntent,
+    ) -> Result<SignedSessionIntent, IdentityError> {
         let bytes = canonical_bytes("MRD_SESSION_INTENT_V1", &payload)?;
         let pair = signature::Ed25519KeyPair::from_pkcs8(&self.private_pkcs8)
             .map_err(|_| IdentityError::InvalidPrivateKey)?;
-        Ok(SignedSessionIntent { payload, public_key: self.public_key.clone(), signature: pair.sign(&bytes).as_ref().to_vec() })
+        Ok(SignedSessionIntent {
+            payload,
+            public_key: self.public_key.clone(),
+            signature: pair.sign(&bytes).as_ref().to_vec(),
+        })
     }
 
     pub fn sign_grant(&self, payload: SignedGrantPayload) -> Result<SignedGrant, IdentityError> {
         let bytes = canonical_bytes("MRD_SESSION_GRANT_V1", &payload)?;
         let pair = signature::Ed25519KeyPair::from_pkcs8(&self.private_pkcs8)
             .map_err(|_| IdentityError::InvalidPrivateKey)?;
-        Ok(SignedGrant { payload, controller_public_key: self.public_key.clone(), signature: pair.sign(&bytes).as_ref().to_vec() })
+        Ok(SignedGrant {
+            payload,
+            controller_public_key: self.public_key.clone(),
+            signature: pair.sign(&bytes).as_ref().to_vec(),
+        })
     }
 }
 
@@ -112,10 +151,15 @@ pub struct SignedGrant {
 }
 
 impl SignedGrant {
-    pub fn verify_for(&self, controller_public_key: &[u8], target_public_key: &[u8]) -> Result<(), IdentityError> {
-        if self.controller_public_key != controller_public_key ||
-            self.payload.controller_public_key != controller_public_key ||
-            self.payload.target_public_key != target_public_key {
+    pub fn verify_for(
+        &self,
+        controller_public_key: &[u8],
+        target_public_key: &[u8],
+    ) -> Result<(), IdentityError> {
+        if self.controller_public_key != controller_public_key
+            || self.payload.controller_public_key != controller_public_key
+            || self.payload.target_public_key != target_public_key
+        {
             return Err(IdentityError::PeerBindingMismatch);
         }
         let bytes = canonical_bytes("MRD_SESSION_GRANT_V1", &self.payload)?;
@@ -125,10 +169,22 @@ impl SignedGrant {
     }
 }
 
-pub(crate) fn canonical_bytes<T: Serialize>(domain: &str, payload: &T) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn canonical_bytes<T: Serialize>(
+    domain: &str,
+    payload: &T,
+) -> Result<Vec<u8>, IdentityError> {
     #[derive(Serialize)]
-    struct Envelope<'a, T> { version: u8, domain: &'a str, payload: &'a T }
-    serde_json::to_vec(&Envelope { version: 1, domain, payload }).map_err(|_| IdentityError::PayloadEncoding)
+    struct Envelope<'a, T> {
+        version: u8,
+        domain: &'a str,
+        payload: &'a T,
+    }
+    serde_json::to_vec(&Envelope {
+        version: 1,
+        domain,
+        payload,
+    })
+    .map_err(|_| IdentityError::PayloadEncoding)
 }
 
 impl DeviceIdentity {
@@ -140,5 +196,9 @@ impl DeviceIdentity {
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    digest::digest(&digest::SHA256, bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect()
+    digest::digest(&digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

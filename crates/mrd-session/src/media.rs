@@ -2,15 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaState {
+    #[default]
     Idle,
     Starting,
     Streaming,
     Stopped,
-    Failed { reason: String },
-}
-
-impl Default for MediaState {
-    fn default() -> Self { Self::Idle }
+    Failed {
+        reason: String,
+    },
 }

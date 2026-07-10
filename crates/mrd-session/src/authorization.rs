@@ -2,14 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthorizationState {
+    #[default]
     Pending,
-    Granted { policy_revision: u64 },
-    Denied { reason: String },
-    Revoked { reason: String },
-}
-
-impl Default for AuthorizationState {
-    fn default() -> Self { Self::Pending }
+    Granted {
+        policy_revision: u64,
+    },
+    Denied {
+        reason: String,
+    },
+    Revoked {
+        reason: String,
+    },
 }

@@ -3,10 +3,14 @@
 use ring::{hmac, rand::SecureRandom};
 use std::fmt;
 
-pub struct UnattendedCredential { secret: [u8; 16] }
+pub struct UnattendedCredential {
+    secret: [u8; 16],
+}
 
 impl fmt::Debug for UnattendedCredential {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { formatter.write_str("UnattendedCredential(REDACTED)") }
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UnattendedCredential(REDACTED)")
+    }
 }
 
 impl UnattendedCredential {

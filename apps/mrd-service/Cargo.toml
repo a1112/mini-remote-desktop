@@ -25,6 +25,7 @@ mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
 mrd-render = { path = "../../crates/mrd-render" }
+mrd-store-sqlite = { path = "../../crates/mrd-store-sqlite" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc", optional = true }
 base64 = "0.22"
@@ -37,6 +38,7 @@ sysinfo = "0.30"
 tokio.workspace = true
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
+zeroize.workspace = true
 tracing-subscriber.workspace = true
 webrtc = { version = "0.12", optional = true }
 
@@ -47,7 +49,7 @@ mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc-av1 = { path = "../../crates/mrd-encode-nvenc-av1" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }

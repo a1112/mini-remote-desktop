@@ -25,8 +25,14 @@ fn rotation_requires_old_key_and_increasing_epoch() {
     let next = DeviceIdentity::generate(&rng).unwrap();
     let proof = old.sign_rotation(next.public_key().to_vec(), 2).unwrap();
     assert!(proof.verify(old.public_key(), 1, false).is_ok());
-    assert_eq!(proof.verify(old.public_key(), 2, false), Err(RotationError::EpochNotIncreasing));
-    assert_eq!(proof.verify(old.public_key(), 1, true), Err(RotationError::OldKeyRevoked));
+    assert_eq!(
+        proof.verify(old.public_key(), 2, false),
+        Err(RotationError::EpochNotIncreasing)
+    );
+    assert_eq!(
+        proof.verify(old.public_key(), 1, true),
+        Err(RotationError::OldKeyRevoked)
+    );
 }
 
 #[test]
@@ -36,4 +42,12 @@ fn unattended_proof_is_transcript_bound_and_not_replayable() {
     assert!(credential.verify(b"session-transcript", [4; 16], &proof));
     assert!(!credential.verify(b"tampered", [4; 16], &proof));
     assert!(!credential.verify(b"session-transcript", [5; 16], &proof));
+}
+
+#[test]
+fn identity_debug_output_redacts_private_key_material() {
+    let identity = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    let debug = format!("{identity:?}");
+    assert!(debug.contains("REDACTED"));
+    assert!(!debug.contains(&format!("{:?}", identity.private_pkcs8())));
 }

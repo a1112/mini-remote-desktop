@@ -779,11 +779,20 @@ git commit -m "feat: secure identity replay and rotation"
 - Modify: Cargo.toml
 - Create: crates/mrd-store-sqlite/Cargo.toml
 - Create: crates/mrd-store-sqlite/src/lib.rs
+- Create: crates/mrd-store-sqlite/src/integrity.rs
 - Create: crates/mrd-store-sqlite/src/migrations.rs
 - Create: crates/mrd-store-sqlite/src/identity_store.rs
 - Create: crates/mrd-store-sqlite/src/trust_store.rs
 - Create: crates/mrd-store-sqlite/src/audit_store.rs
 - Create: crates/mrd-store-sqlite/tests/persistence.rs
+- Modify: crates/mrd-identity/src/lib.rs
+- Modify: crates/mrd-identity/Cargo.toml
+- Modify: crates/mrd-identity/tests/trust_protocol.rs
+- Modify: crates/mrd-session/src/authorization.rs
+- Modify: crates/mrd-session/src/media.rs
+- Modify: crates/mrd-session/src/route.rs
+- Modify: apps/mrd-service/Cargo.toml
+- Modify: apps/mrd-service/src/lib.rs
 - Create: apps/mrd-service/src/security/mod.rs
 - Create: apps/mrd-service/src/security/windows_dpapi.rs
 - Create: apps/mrd-service/src/security/unsupported.rs
@@ -798,6 +807,14 @@ Tests must prove:
 - audit integrity-chain tampering is detected;
 - corrupt or unreadable identity state prevents new authorization;
 - plaintext private-key bytes are absent from the database file.
+- identity initialization metadata cannot be reset to silently replace the machine key;
+- revoked trust cannot be reactivated, deleted, or injected through direct SQL or a trigger;
+- deleting the audit key/events/head cannot restart the audit sequence;
+- missing tables or security metadata are not recreated on an existing database;
+- identity rows cannot be spliced between stores that share the same test protector;
+- concurrent first openers converge on one atomic store birth;
+- sensitive plaintext containers have a compiler-resistant zeroize-on-drop contract;
+- Windows directory provisioning rejects untrusted owners, files, junctions, ACL drift, and invalid service SIDs.
 
 **Step 2: Run the store tests**
 
@@ -807,7 +824,15 @@ Expected: FAIL because the crate is absent.
 
 **Step 3: Implement SQLite stores and SecretProtector**
 
-Use transactions and migrations. Define a SecretProtector port. On Windows use DPAPI machine scope and an explicit protected product directory; on unsupported platforms use a test-only/in-memory protector until their native secure stores are designed.
+Use immediate transactions and a sealed schema-v2 store manifest. Protect a dedicated random store-integrity key and commit the store ID, generation, canonical SQLite schema, identity row, sorted full trust snapshot, protected audit-key blob, and sealed audit head under HMAC. Verify the manifest and relevant committed state inside the same read snapshot or `BEGIN IMMEDIATE` write transaction before every operation. Never auto-repair a missing table, manifest, key, or initialized subsystem on an existing database. Reject triggers, views, and table/index drift through the sealed schema commitment so a legal write cannot launder injected state into a fresh manifest.
+
+Schema v2 is the first supported sealed format. The unsealed development-only v1 format is deliberately rejected fail-closed rather than trusted during migration; Task 14 is amended before release, so no supported installation depends on v1 data.
+
+Define a `SecretProtector` port whose plaintext result uses compiler-resistant zeroization on drop. On Windows use store-ID/purpose-bound DPAPI machine scope. Provision the product directory through a no-follow handle, reject reparse points and untrusted pre-existing owners before mutation, set and read back a protected owner/DACL, and require an explicit bootstrap or installed-service-SID policy. Task 26 resolves and configures the actual SCM service SID, then passes it to this adapter. On unsupported platforms fail closed in production. Keep the authenticated fixed-key protector private to store integration tests.
+
+Pin trust to a structurally validated Ed25519 public-key ID/epoch with terminal revocation. Protect a random audit HMAC key, verify the full chain before append, and bind its protected blob and current head into the store manifest so tail deletion or total audit-anchor reset is detected.
+
+The in-database manifest detects partial row/table/schema deletion, modification, splicing, and reset. It cannot distinguish deletion of the entire protected SQLite file or rollback of the file together with its valid manifest; the Windows DACL keeps that operation outside the standard-user threat boundary. Detecting privileged whole-file rollback would require a separate non-rollbackable TPM, remote checkpoint, or equivalent external monotonic anchor and is not claimed by this task.
 
 Never log database rows that contain encrypted secret blobs or credential verifiers.
 
@@ -825,7 +850,7 @@ Expected: PASS on Windows; non-Windows builds compile with explicit unsupported 
 **Step 5: Commit**
 
 ~~~powershell
-git add Cargo.toml crates/mrd-store-sqlite apps/mrd-service/src/security
+git add Cargo.toml crates/mrd-store-sqlite crates/mrd-identity crates/mrd-session apps/mrd-service/Cargo.toml apps/mrd-service/src/lib.rs apps/mrd-service/src/security docs/plans/2026-07-11-market-remote-capability-alignment.md
 git commit -m "feat: persist protected remote trust state"
 ~~~
 
