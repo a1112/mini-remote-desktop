@@ -5,6 +5,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
+mod replay;
+mod rotation;
+mod sas;
+mod unattended;
+
+pub use replay::{ReplayError, ReplayWindow};
+pub use rotation::{RotationError, RotationProof};
+pub use sas::sas_code;
+pub use unattended::UnattendedCredential;
+
 pub use mrd_session::PermissionScope as PermissionScope;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -115,10 +125,18 @@ impl SignedGrant {
     }
 }
 
-fn canonical_bytes<T: Serialize>(domain: &str, payload: &T) -> Result<Vec<u8>, IdentityError> {
+pub(crate) fn canonical_bytes<T: Serialize>(domain: &str, payload: &T) -> Result<Vec<u8>, IdentityError> {
     #[derive(Serialize)]
     struct Envelope<'a, T> { version: u8, domain: &'a str, payload: &'a T }
     serde_json::to_vec(&Envelope { version: 1, domain, payload }).map_err(|_| IdentityError::PayloadEncoding)
+}
+
+impl DeviceIdentity {
+    pub(crate) fn sign_domain_bytes(&self, bytes: &[u8]) -> Result<Vec<u8>, IdentityError> {
+        let pair = signature::Ed25519KeyPair::from_pkcs8(&self.private_pkcs8)
+            .map_err(|_| IdentityError::InvalidPrivateKey)?;
+        Ok(pair.sign(bytes).as_ref().to_vec())
+    }
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
