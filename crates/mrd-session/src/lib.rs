@@ -8,6 +8,19 @@
 
 /// Multi-session scheduling and resource isolation.
 pub mod scheduler;
+/// Authorization state for a session.
+pub mod authorization;
+/// Media state for a session.
+pub mod media;
+/// Service-owned remote session aggregate.
+pub mod remote_session;
+/// Route state for a session.
+pub mod route;
+
+pub use authorization::AuthorizationState;
+pub use media::MediaState;
+pub use remote_session::{RemoteSessionAggregate, SessionTransitionError};
+pub use route::{RouteKind, RouteState};
 
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
