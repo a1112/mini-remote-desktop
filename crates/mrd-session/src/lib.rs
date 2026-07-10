@@ -10,6 +10,10 @@
 pub mod scheduler;
 /// Authorization state for a session.
 pub mod authorization;
+/// Permission scope algebra and effective capability intersection.
+pub mod permissions;
+/// Session-bound capability grants.
+pub mod grant;
 /// Media state for a session.
 pub mod media;
 /// Service-owned remote session aggregate.
@@ -21,6 +25,8 @@ pub use authorization::AuthorizationState;
 pub use media::MediaState;
 pub use remote_session::{RemoteSessionAggregate, SessionTransitionError};
 pub use route::{RouteKind, RouteState};
+pub use grant::{GrantError, SessionGrant};
+pub use permissions::{EffectiveScopes, PermissionScope, PermissionScopes};
 
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};
