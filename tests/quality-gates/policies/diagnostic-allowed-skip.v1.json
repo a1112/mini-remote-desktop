@@ -1,0 +1,8 @@
+{
+  "id": "diagnostic-allowed-skip.v1",
+  "required_scenarios": [],
+  "allow_skips": [
+    {"scenario": "diagnostic.local", "capability": "gpu_probe", "reason": "hardware_unavailable"}
+  ],
+  "thresholds": []
+}
