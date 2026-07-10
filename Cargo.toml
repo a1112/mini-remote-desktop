@@ -37,6 +37,7 @@ members = [
   "crates/mrd-transport-webrtc",
   "crates/mrd-buffer-pool",
   "crates/mrd-hardware",
+  "crates/mrd-quality-gate",
   "heartbeat-rs",
   "tests/capture-render-demo",
   "tests/integration",
