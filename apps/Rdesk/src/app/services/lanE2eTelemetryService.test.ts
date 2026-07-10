@@ -235,6 +235,31 @@ describe("mainlineE2EArtifactPayloadFromReport", () => {
   });
 });
 
+describe("producer and gate status", () => {
+  it("does not infer product PASS from producer completion", () => {
+    const report = {
+      status: "completed",
+      scenarioId: "lan.e2e.remote_display",
+      startedAt: 0,
+      finishedAt: 1,
+      stages: [],
+      faultEvents: [],
+    } as unknown as LanE2EAutomationReport;
+    const payload = mainlineE2EArtifactPayloadFromReport(report, {
+      capture_type: "dxgi",
+      encoder_type: "nvenc_h264",
+      decoder_type: "nvdec",
+      renderer_type: "d3d11",
+      transport_kind: "quic",
+    });
+    expect(payload.producer_status).toBe("completed");
+    expect(payload.gate_status).toBe("UNKNOWN");
+    expect(payload.artifacts).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "failure.txt", required: true })])
+    );
+  });
+});
+
 describe("scriptClassificationFromLanE2EReport", () => {
   it("matches paired LAN canary failure classes", () => {
     expect(

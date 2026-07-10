@@ -19,6 +19,8 @@ export interface MainlineE2EArtifactPayload {
   generated_at: number;
   git_commit: string;
   scenario_id: string;
+  producer_status: LanE2EAutomationReport["status"];
+  gate_status: "PASS" | "PRODUCT_FAIL" | "INFRA_FAIL" | "INVALID_ARTIFACT" | "ALLOWED_SKIP" | "UNKNOWN";
   final_status: LanE2EAutomationReport["status"];
   failure_reason?: LanE2EAutomationReport["failureReason"];
   script_classification: MainlineE2EScriptClassification;
@@ -68,6 +70,26 @@ export interface MainlineE2EArtifactDescriptor {
   required: boolean;
   status: "generated" | "missing";
   description?: string;
+}
+
+function gateStatusFromLanE2EReport(
+  report: LanE2EAutomationReport
+): MainlineE2EArtifactPayload["gate_status"] {
+  const typedReport = report as LanE2EAutomationReport & {
+    gate_status?: MainlineE2EArtifactPayload["gate_status"];
+    gate?: { verdict?: MainlineE2EArtifactPayload["gate_status"] };
+  };
+  const candidate = typedReport.gate_status ?? typedReport.gate?.verdict;
+  if (
+    candidate === "PASS" ||
+    candidate === "PRODUCT_FAIL" ||
+    candidate === "INFRA_FAIL" ||
+    candidate === "INVALID_ARTIFACT" ||
+    candidate === "ALLOWED_SKIP"
+  ) {
+    return candidate;
+  }
+  return "UNKNOWN";
 }
 
 export interface E2EMetricSeriesRow {
@@ -235,6 +257,7 @@ export function mainlineE2EArtifactPayloadFromReport(
   const peer = options.peer ?? report.peer ?? null;
   const finalStatus = report.status;
   const failureReason = report.failureReason;
+  const gateStatus = gateStatusFromLanE2EReport(report);
   return {
     kind: MAINLINE_E2E_ARTIFACT_KIND,
     schema_version: 1,
@@ -243,6 +266,8 @@ export function mainlineE2EArtifactPayloadFromReport(
     generated_at: generatedAt,
     git_commit: normalizeGitCommit(options.gitCommit ?? runtimeGitCommit()),
     scenario_id: report.scenarioId,
+    producer_status: finalStatus,
+    gate_status: gateStatus,
     final_status: finalStatus,
     failure_reason: failureReason,
     script_classification: scriptClassificationFromLanE2EReport(report),
@@ -280,7 +305,7 @@ export function mainlineE2EArtifactPayloadFromReport(
       runScope: "cross_device",
       peer,
     }),
-    artifacts: mainlineArtifactDescriptors(Boolean(peer), finalStatus, failureReason),
+    artifacts: mainlineArtifactDescriptors(Boolean(peer), finalStatus, failureReason, gateStatus),
     metrics_csv: metricsCsvFromRows(metricSeries),
     report,
   };
@@ -289,7 +314,8 @@ export function mainlineE2EArtifactPayloadFromReport(
 function mainlineArtifactDescriptors(
   hasAgent: boolean,
   status: LanE2EAutomationReport["status"],
-  failureReason?: LanE2EAutomationReport["failureReason"]
+  failureReason?: LanE2EAutomationReport["failureReason"],
+  gateStatus: MainlineE2EArtifactPayload["gate_status"] = "UNKNOWN"
 ): MainlineE2EArtifactDescriptor[] {
   const artifacts: MainlineE2EArtifactDescriptor[] = [
     {
@@ -345,7 +371,7 @@ function mainlineArtifactDescriptors(
     },
   ];
 
-  if (status !== "completed" || failureReason) {
+  if (status !== "completed" || failureReason || gateStatus !== "PASS") {
     artifacts.push({
       path: "failure.txt",
       kind: "failure_text",
