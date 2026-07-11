@@ -32,9 +32,6 @@ const INBOUND_QUEUE_CAPACITY: usize = 32;
 const REPLAY_LEDGER_CAPACITY: usize = 4_096;
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Required environment variable naming the local machine-service endpoint.
-pub const AGENT_PRIVATE_ENDPOINT_ENV: &str = "MRD_AGENT_PRIVATE_ENDPOINT";
-
 /// Platform-local endpoint; network transports are deliberately unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateAgentEndpoint {
@@ -118,8 +115,42 @@ pub type PrivateAgentStream = tokio::net::UnixStream;
 pub async fn connect_private_endpoint(
     endpoint: &PrivateAgentEndpoint,
 ) -> Result<PrivateAgentStream, PrivateEndpointError> {
-    tokio::net::windows::named_pipe::ClientOptions::new()
-        .open(endpoint.as_pipe_name())
+    use std::os::windows::io::RawHandle;
+    use windows::{
+        core::PCWSTR,
+        Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+            FILE_SHARE_MODE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING,
+            SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE,
+        },
+    };
+
+    let wide: Vec<u16> = endpoint
+        .as_pipe_name()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let desired_access = FILE_READ_DATA.0
+        | FILE_WRITE_DATA.0
+        | FILE_READ_ATTRIBUTES.0
+        | FILE_WRITE_ATTRIBUTES.0
+        | SYNCHRONIZE.0;
+    let flags = FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            desired_access,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| PrivateEndpointError::Io(std::io::Error::last_os_error()))?;
+    // SAFETY: CreateFileW returned the sole owned overlapped pipe handle. Tokio
+    // takes ownership and closes it; the raw value is not used again.
+    unsafe { PrivateAgentStream::from_raw_handle(handle.0 as RawHandle) }
         .map_err(PrivateEndpointError::Io)
 }
 

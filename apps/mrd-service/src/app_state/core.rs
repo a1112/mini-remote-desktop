@@ -32,6 +32,8 @@ use tokio::sync::Mutex;
 /// - Shell/UI lifecycle state
 /// - Tray port (Phase 4)
 pub struct AppState {
+    /// Authenticated interactive-session agent registrations.
+    pub agent_registry: Arc<crate::agent_runtime::AgentRegistry>,
     /// Session registry - single source of truth for all sessions
     pub sessions: Arc<Mutex<SessionRegistry>>,
     /// Device registry
@@ -151,6 +153,7 @@ impl AppState {
         device_identities: DeviceIdentityRegistry,
     ) -> Self {
         Self {
+            agent_registry: Arc::new(crate::agent_runtime::AgentRegistry::default()),
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             audit_log: Arc::new(audit_log),
@@ -210,6 +213,11 @@ impl AppState {
         self.device_preferences.clone()
     }
 
+    /// Get the authenticated interactive-session agent registry.
+    pub fn agent_registry(&self) -> Arc<crate::agent_runtime::AgentRegistry> {
+        Arc::clone(&self.agent_registry)
+    }
+
     /// Returns whether the authoritative security store has remained usable.
     pub fn security_is_healthy(&self) -> bool {
         self.security_healthy.load(Ordering::Acquire)
@@ -223,6 +231,9 @@ impl AppState {
             .is_err()
         {
             return;
+        }
+        if let Err(error) = self.agent_registry.invalidate_all() {
+            tracing::error!(%error, "failed to revoke desktop agents after security became unhealthy");
         }
         let authorization_security_gate = Arc::clone(&self.authorization_security_gate);
         let control_input = Arc::clone(&self.control_input);

@@ -8,6 +8,7 @@
 // - IPC server for Rdesk UI shell
 // - Shell lifecycle (UI launcher, tray, autostart)
 
+mod agent_runtime;
 mod app_state;
 mod browser_preview_capture;
 mod browser_webcodecs_preview;

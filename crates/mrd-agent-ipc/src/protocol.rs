@@ -9,6 +9,26 @@ use thiserror::Error;
 
 /// Maximum lifetime of a one-shot registration challenge.
 pub const AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS: u64 = 30_000;
+/// Domain separator for hashes of validated Windows logon SID bytes.
+pub const AGENT_LOGON_SID_HASH_CONTEXT: &[u8] = b"mrd-agent-logon-sid-v1\0";
+/// Largest binary SID accepted by Windows (`SECURITY_MAX_SID_SIZE`).
+pub const AGENT_LOGON_SID_MAX_BYTES: usize = 68;
+
+/// Hash validated binary Windows logon SID bytes for protocol comparison.
+///
+/// The raw SID remains local to the OS security boundary. This helper rejects
+/// impossible lengths; callers must additionally use `IsValidSid` on Windows.
+pub fn hash_windows_logon_sid(sid_bytes: &[u8]) -> Option<[u8; 32]> {
+    if !(8..=AGENT_LOGON_SID_MAX_BYTES).contains(&sid_bytes.len()) {
+        return None;
+    }
+    let mut context = DigestContext::new(&SHA256);
+    context.update(AGENT_LOGON_SID_HASH_CONTEXT);
+    context.update(sid_bytes);
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(context.finish().as_ref());
+    Some(digest)
+}
 /// Maximum lifetime of an interactive consent request.
 pub const AGENT_CONSENT_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 /// Maximum UTF-8 bytes in protocol identifiers inherited from domain types.

@@ -2,9 +2,12 @@
 
 #![warn(missing_docs)]
 
+mod bootstrap;
 mod framing;
 mod grant;
 mod protocol;
+
+pub use bootstrap::*;
 
 pub use framing::{
     decode_frame, encode_frame, read_frame, write_frame, DecodedFrame, FrameError,

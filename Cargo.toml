@@ -66,6 +66,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
 ring = "0.17"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 zeroize = { version = "1.8.2", features = ["derive"] }

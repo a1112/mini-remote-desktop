@@ -17,6 +17,8 @@ anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 common-control-proto = { path = "../../common-control-proto" }
 mrd-application = { path = "../../crates/mrd-application" }
+mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
+thiserror.workspace = true
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }
@@ -53,7 +55,7 @@ mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc-av1 = { path = "../../crates/mrd-encode-nvenc-av1" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mrd-capture-macos = { path = "../../crates/mrd-capture-macos" }

@@ -2,6 +2,7 @@
 //
 // This library is used by tests to access the service's internal modules.
 
+pub mod agent_runtime;
 pub mod app_state;
 mod browser_preview_capture;
 pub mod browser_webcodecs_preview;
