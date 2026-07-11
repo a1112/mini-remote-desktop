@@ -3,7 +3,13 @@ import {
   runLanE2EAutomation,
   type LanE2EAutomationCommands,
 } from "./lanE2eAutomationService";
-import type { MediaProfile } from "../adapters/tauri";
+import type {
+  AuditEventPageV2,
+  MediaProfile,
+  RemoteSessionSnapshot,
+  RouteEvidence,
+  TrustedDeviceSnapshot,
+} from "../adapters/tauri";
 
 function ok<T>(value: T) {
   return { ok: true as const, value };
@@ -156,6 +162,7 @@ function createCommands(
               "quic_datagram_media_v2",
               "quic_datagram_media_v3",
               "media_profile_control_v1",
+              "input_control_v2",
             ],
             protocol_version: 1,
             service_build_id: "test-build",
@@ -169,6 +176,7 @@ function createCommands(
               "nvenc_h264",
               "nvdec",
               "d3d11_native_render",
+              "control.keyboard_mouse",
             ],
             age_ms: 20,
             p2p_available: true,
@@ -177,6 +185,9 @@ function createCommands(
       })
     ),
     ipcStartLanRemoteSession: vi.fn().mockResolvedValue(ok("session-started")),
+    ipcRequestRemoteSession: vi.fn().mockResolvedValue(
+      ok({ session_id: "session-started" } as RemoteSessionSnapshot)
+    ),
     ipcUpdateMediaProfile: vi.fn().mockResolvedValue(ok({ status: "selected" })),
     ipcConfigureMediaAdaptation: vi.fn().mockResolvedValue(
       ok({
@@ -273,7 +284,7 @@ function createCommands(
     openRemoteDisplayWindow: vi.fn().mockResolvedValue(
       ok({
         label: "remote-display-agent-device",
-        session_id: "unused",
+        session_id: "lan-e2e-test-session",
         surface_id: "surface-1",
         role: "controller",
         renderer_attached: true,
@@ -284,7 +295,7 @@ function createCommands(
     ),
     ipcSessionSnapshot: vi.fn().mockResolvedValue(
       ok({
-        session_id: "unused",
+        session_id: "lan-e2e-test-session",
         role: "controller",
         state: "streaming",
         transport_kind: "quic",
@@ -294,7 +305,7 @@ function createCommands(
     ),
     ipcProbeSnapshot: vi.fn().mockResolvedValue(
       ok({
-        session_id: "unused",
+        session_id: "lan-e2e-test-session",
         frames_received: 4,
         frames_decoded: 3,
         frames_dropped: 0,
@@ -315,12 +326,13 @@ function createCommands(
     ),
     ipcMediaPipelineSnapshot: vi.fn().mockResolvedValue(
       ok({
-        session_id: "unused",
+        session_id: "lan-e2e-test-session",
         attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
         active_decoder: "nvdec",
         active_renderer: "d3d11",
         queue_depth: 1,
         dropped_frames: 0,
+        render_presented_frames: 3,
         stage_metrics: [
           { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
           { stage: "render_present", p50_ms: 5.0, p95_ms: 7.0 },
@@ -330,6 +342,167 @@ function createCommands(
     ),
     ipcStopSession: vi.fn().mockResolvedValue(ok("stopped")),
     ...overrides,
+  };
+}
+
+const SECURE_SESSION_ID = "lan-e2e-test-session";
+const SECURE_PEER_KEY_ID = "sha256:agent-device-key";
+const SECURE_TRANSPORT_FINGERPRINT = `sha256:${"ab".repeat(32)}`;
+
+interface SecureCommandOverrides {
+  remoteSession?: Partial<RemoteSessionSnapshot>;
+  routeEvidence?: Partial<RouteEvidence>;
+  trustedDevice?: Partial<TrustedDeviceSnapshot>;
+  auditPage?: Partial<AuditEventPageV2>;
+  controlAck?: {
+    session_id?: string;
+    lane?: "reliable" | "realtime" | "cleanup";
+    event_count?: number;
+  };
+  commands?: Partial<LanE2EAutomationCommands>;
+}
+
+function createSecureScenarioCommands(overrides: SecureCommandOverrides = {}) {
+  const remoteSession: RemoteSessionSnapshot = {
+    session_id: SECURE_SESSION_ID,
+    role: "controller",
+    peer_device_id: "agent-device",
+    peer_key_id: SECURE_PEER_KEY_ID,
+    access_mode: "attended",
+    authorization_state: "granted",
+    route_state: "connected",
+    route_kind: "lan_quic",
+    media_state: "streaming",
+    presentation_state: "streaming",
+    requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+    granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+    policy_revision: "7",
+    failure: null,
+    created_at_ms: Date.now() - 1_000,
+    updated_at_ms: Date.now() - 100,
+    authorization_expires_at_ms: Date.now() + 60_000,
+    ...overrides.remoteSession,
+  };
+  const routeEvidence: RouteEvidence = {
+    session_id: SECURE_SESSION_ID,
+    route_state: "connected",
+    selected_route: "lan_quic",
+    policy_revision: "7",
+    transport_fingerprint_sha256: SECURE_TRANSPORT_FINGERPRINT,
+    candidates: [
+      {
+        route: "lan_quic",
+        state: "connected",
+        started_at_ms: Date.now() - 500,
+        completed_at_ms: Date.now() - 100,
+        round_trip_ms: 3,
+        failure: null,
+      },
+    ],
+    observed_at_ms: Date.now(),
+    ...overrides.routeEvidence,
+  };
+  const trustedDevice: TrustedDeviceSnapshot = {
+    peer_key_id: SECURE_PEER_KEY_ID,
+    display_name: "Agent PC",
+    key_epoch: "1",
+    state: "trusted",
+    permission_ceiling: ["screen.view", "input.pointer", "input.keyboard"],
+    trust_revision: "3",
+    approved_at_ms: Date.now() - 10_000,
+    updated_at_ms: Date.now() - 1_000,
+    ...overrides.trustedDevice,
+  };
+  const auditPage: AuditEventPageV2 = {
+    events: [
+      {
+        sequence: "40",
+        timestamp_ms: 0,
+        action: "session.start_lan",
+        outcome: "success",
+        session_id: SECURE_SESSION_ID,
+        actor_device_id: "controller-device",
+        peer_device_id: "agent-device",
+        peer_key_id: null,
+        transport_kind: "lan_quic",
+        reason_code: null,
+        metadata: {
+          authorization_state: "granted",
+          access_mode: "attended",
+          route_state: "connected",
+          media_state: "streaming",
+          requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+          granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+          policy_revision: "7",
+          trust_revision: "3",
+        },
+      },
+      {
+        sequence: "41",
+        timestamp_ms: 0,
+        action: "session.stop",
+        outcome: "success",
+        session_id: SECURE_SESSION_ID,
+        actor_device_id: "controller-device",
+        peer_device_id: "agent-device",
+        peer_key_id: null,
+        transport_kind: "lan_quic",
+        reason_code: null,
+        metadata: {
+          requested_scopes: [],
+          granted_scopes: [],
+        },
+      },
+    ],
+    next_after_sequence: "41",
+    cursor_state: "current",
+    has_more: false,
+    chain_verified: true,
+    ...overrides.auditPage,
+  };
+
+  const ipcGetRemoteSession = vi.fn().mockResolvedValue(ok(remoteSession));
+  const ipcRequestRemoteSession = vi.fn().mockResolvedValue(ok(remoteSession));
+  const ipcGetRouteEvidence = vi.fn().mockResolvedValue(ok(routeEvidence));
+  const ipcListTrustedDevices = vi.fn().mockResolvedValue(ok([trustedDevice]));
+  const ipcGetAuditEventsV2 = vi.fn().mockImplementation(() => {
+    const timestamp = Date.now();
+    return Promise.resolve(
+      ok({
+        ...auditPage,
+        events: auditPage.events.map((event) =>
+          event.timestamp_ms === 0 ? { ...event, timestamp_ms: timestamp } : event
+        ),
+      })
+    );
+  });
+  const ipcSendControlInput = vi.fn().mockResolvedValue(
+    ok({
+      session_id: overrides.controlAck?.session_id ?? SECURE_SESSION_ID,
+      lane: overrides.controlAck?.lane ?? "realtime",
+      event_count: overrides.controlAck?.event_count ?? 1,
+    })
+  );
+  const commands = createCommands({
+    ipcRequestRemoteSession,
+    ipcGetRemoteSession,
+    ipcGetRouteEvidence,
+    ipcListTrustedDevices,
+    ipcGetAuditEventsV2,
+    ipcSendControlInput,
+    ...overrides.commands,
+  });
+  return {
+    commands,
+    remoteSession,
+    routeEvidence,
+    trustedDevice,
+    ipcRequestRemoteSession,
+    ipcGetRemoteSession,
+    ipcGetRouteEvidence,
+    ipcListTrustedDevices,
+    ipcGetAuditEventsV2,
+    ipcSendControlInput,
   };
 }
 
@@ -590,6 +763,411 @@ describe("runLanE2EAutomation", () => {
     expect(result.stages.map((stage) => `${stage.stage}:${stage.status}`)).toContain(
       "control:completed"
     );
+  });
+
+  it("proves secure LAN identity, grant, QUIC media, authenticated input, and cleanup in one session", async () => {
+    const {
+      commands,
+      ipcGetRemoteSession,
+      ipcGetRouteEvidence,
+      ipcListTrustedDevices,
+      ipcRequestRemoteSession,
+      ipcSendControlInput,
+    } = createSecureScenarioCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => "lan-e2e-test-session",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(ipcRequestRemoteSession).toHaveBeenCalledWith({
+      session_id: SECURE_SESSION_ID,
+      target_device_id: "agent-device",
+      access_mode: "attended",
+      requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+      requested_profile: DEFAULT_REQUESTED_PROFILE,
+    });
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+    expect(ipcGetRemoteSession).toHaveBeenCalledWith("lan-e2e-test-session");
+    expect(ipcGetRouteEvidence).toHaveBeenCalledWith("lan-e2e-test-session");
+    expect(ipcListTrustedDevices).toHaveBeenCalledWith(true);
+    expect(ipcSendControlInput).toHaveBeenCalledWith("lan-e2e-test-session", {
+      kind: "mouse_move",
+      x: 1,
+      y: 1,
+    });
+    expect(result.controlInputAck?.event_count).toBe(1);
+    expect(result.secureSessionEvidence).toEqual({
+        trustedIdentityVerified: true,
+        authorizationGranted: true,
+        authorizationBasis: "consent",
+        scopeAuthorized: true,
+        selectedRoute: "lan_quic",
+        quicPeerAuthenticated: true,
+        realFramesVerified: true,
+        authorizedInputVerified: true,
+        cleanupCompleted: true,
+      });
+    expect(result.auditEventIds).toEqual(["40", "41"]);
+    expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
+  });
+
+  it.each([
+    {
+      name: "remote session belongs to another session",
+      overrides: { remoteSession: { session_id: "other-session" } },
+    },
+    {
+      name: "route policy revision differs",
+      overrides: { routeEvidence: { policy_revision: "8" } },
+    },
+    {
+      name: "trusted peer was revoked",
+      overrides: { trustedDevice: { state: "revoked" as const } },
+    },
+    {
+      name: "transport fingerprint is not a SHA-256 binding",
+      overrides: {
+        routeEvidence: { transport_fingerprint_sha256: "sha256:not-a-certificate" },
+      },
+    },
+  ])("fails closed when $name", async ({ overrides }) => {
+    const { commands, ipcSendControlInput } = createSecureScenarioCommands(overrides);
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.secureSessionEvidence?.trustedIdentityVerified).toBe(false);
+    expect(ipcSendControlInput).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "wrong session", controlAck: { session_id: "other-session" } },
+    { name: "wrong lane", controlAck: { lane: "reliable" as const } },
+  ])("rejects an authenticated input ACK for the $name", async ({ controlAck }) => {
+    const { commands } = createSecureScenarioCommands({ controlAck });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("control_input_failed");
+    expect(result.secureSessionEvidence?.authorizedInputVerified).toBe(false);
+  });
+
+  it("rejects secure media evidence returned for another session", async () => {
+    const { commands } = createSecureScenarioCommands();
+    const originalProbe = commands.ipcProbeSnapshot;
+    commands.ipcProbeSnapshot = async (sessionId) => {
+      const result = await originalProbe(sessionId);
+      return result.ok ? ok({ ...result.value, session_id: "other-session" }) : result;
+    };
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("probe snapshot belongs to other-session");
+  });
+
+  it("requires authoritative native frame presentation for a secure run", async () => {
+    const { commands } = createSecureScenarioCommands();
+    const originalPipeline = commands.ipcMediaPipelineSnapshot;
+    commands.ipcMediaPipelineSnapshot = async (sessionId) => {
+      const result = await originalPipeline(sessionId);
+      return result.ok ? ok({ ...result.value, render_presented_frames: 0 }) : result;
+    };
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("no_remote_frames");
+    expect(result.secureSessionEvidence?.realFramesVerified).toBe(false);
+  });
+
+  it("rejects a web render surface as secure native presentation evidence", async () => {
+    const { commands, ipcSendControlInput } = createSecureScenarioCommands();
+    commands.openRemoteDisplayWindow = vi.fn().mockResolvedValue(
+      ok({
+        label: "remote-display-agent-device",
+        session_id: SECURE_SESSION_ID,
+        surface_id: "surface-1",
+        role: "controller",
+        renderer_attached: true,
+        render_mode: "web",
+        native_surface_attached: false,
+        session_window_count: 1,
+      })
+    );
+    commands.ipcMediaPipelineSnapshot = vi.fn().mockResolvedValue(
+      ok({
+        session_id: SECURE_SESSION_ID,
+        attached_surfaces: [{ surface_id: "surface-1", backend: "web" }],
+        active_decoder: "software",
+        active_renderer: "web",
+        queue_depth: 0,
+        dropped_frames: 0,
+        render_presented_frames: 3,
+        stage_metrics: [],
+        adaptation: null,
+      })
+    );
+
+    let currentTime = Date.now();
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      now: () => (currentTime += 101),
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("display_window_failed");
+    expect(result.secureSessionEvidence?.realFramesVerified).toBe(false);
+    expect(ipcSendControlInput).not.toHaveBeenCalled();
+  });
+
+  it("rechecks the authority binding after media and input complete", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession } =
+      createSecureScenarioCommands();
+    ipcGetRemoteSession
+      .mockResolvedValueOnce(ok(remoteSession))
+      .mockResolvedValueOnce(ok({ ...remoteSession, policy_revision: "8" }));
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(ipcGetRemoteSession).toHaveBeenCalledTimes(2);
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("policy revisions differ");
+  });
+
+  it.each([
+    {
+      name: "cleanup command fails",
+      overrides: {
+        commands: { ipcStopSession: vi.fn().mockResolvedValue(err("stop failed")) },
+      },
+    },
+    {
+      name: "audit chain is not verified",
+      overrides: { auditPage: { chain_verified: false } },
+    },
+    {
+      name: "audit event is unrelated",
+      overrides: {
+        auditPage: {
+          events: [],
+          next_after_sequence: null,
+        },
+      },
+    },
+  ])("does not publish completed when $name", async ({ overrides }) => {
+    const { commands } = createSecureScenarioCommands(overrides);
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.dataPlaneVerified).toBe(false);
+  });
+
+  it("rejects lifecycle audit evidence whose stop precedes its start", async () => {
+    const { commands, ipcGetAuditEventsV2 } = createSecureScenarioCommands();
+    const base = await ipcGetAuditEventsV2({
+      after_sequence: "0",
+      limit: 200,
+      session_id: SECURE_SESSION_ID,
+    });
+    if (!base.ok) throw new Error(base.error.message);
+    const [startEvent, stopEvent] = base.value.events;
+    ipcGetAuditEventsV2.mockImplementation(async () => {
+      const timestamp = Date.now();
+      return ok({
+        ...base.value,
+        events: [
+          { ...stopEvent, sequence: "40", timestamp_ms: timestamp },
+          { ...startEvent, sequence: "41", timestamp_ms: timestamp },
+        ],
+      });
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("ordered start and stop");
+    expect(result.auditEventIds).toEqual([]);
+  });
+
+  it("turns a skipped secure run into failure when cleanup fails", async () => {
+    const { commands } = createSecureScenarioCommands({
+      commands: {
+        ipcStopSession: vi.fn().mockResolvedValue(err("stop failed after downgrade")),
+      },
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      requestedProfile: {
+        ...DEFAULT_REQUESTED_PROFILE,
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+      },
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("stop_failed");
+    expect(result.errorMessage).toContain("stop failed after downgrade");
+  });
+
+  it.each([
+    { name: "cleanup disabled", options: { stopOnComplete: false } },
+    { name: "rendering disabled", options: { renderDisplay: false } },
+  ])("rejects secure runs with $name", async ({ options }) => {
+    const { commands } = createSecureScenarioCommands();
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+      ...options,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("fails closed instead of falling back to legacy session startup when secure request IPC is unavailable", async () => {
+    const { commands } = createSecureScenarioCommands({
+      commands: { ipcRequestRemoteSession: undefined },
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("runtime_error");
+    expect(result.errorMessage).toContain("authoritative session and audit evidence");
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("attempts authoritative cleanup when a secure start request returns an error", async () => {
+    const ipcStopSession = vi.fn().mockResolvedValue(ok("stopped"));
+    const { commands } = createSecureScenarioCommands({
+      commands: {
+        ipcRequestRemoteSession: vi.fn().mockResolvedValue(err("audit append failed")),
+        ipcStopSession,
+      },
+    });
+
+    const result = await runLanE2EAutomation(commands, {
+      scenarioId: "cross.e2e.secure_remote_display",
+      targetDeviceId: "agent-device",
+      transportKind: "quic",
+      sampleIntervalMs: 0,
+      timeoutMs: 100,
+      minDecodedFrames: 1,
+      minFps: 1,
+      createSessionId: () => SECURE_SESSION_ID,
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("session_start_failed");
+    expect(ipcStopSession).toHaveBeenCalledWith(SECURE_SESSION_ID);
+    expect(result.secureSessionEvidence?.cleanupCompleted).toBe(true);
   });
 
   it("discovers a LAN peer, starts remote display, validates frames, and stops the session", async () => {

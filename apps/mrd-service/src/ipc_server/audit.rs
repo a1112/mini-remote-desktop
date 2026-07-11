@@ -81,6 +81,12 @@ impl IpcServer {
 pub(super) fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
     match response {
         IpcResponse::Error { code, .. } => ("error", Some(code.clone())),
+        IpcResponse::RemoteAccessError { failure, .. } => (
+            "denied",
+            Some(crate::lan_discovery::remote_reason_code_wire_name(
+                failure.code,
+            )),
+        ),
         _ => ("success", None),
     }
 }
@@ -89,5 +95,30 @@ pub(super) fn security_store_unavailable_response() -> IpcResponse {
     IpcResponse::Error {
         code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
         message: "authoritative security state is unavailable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_outcome;
+    use mrd_ipc::{IpcResponse, RemoteFailure, RemoteReasonCode};
+    use mrd_proto::SessionId;
+
+    #[test]
+    fn audit_outcome_preserves_typed_remote_access_rejections() {
+        let response = IpcResponse::RemoteAccessError {
+            session_id: Some(SessionId("certificate-session".to_string())),
+            peer_key_id: Some("sha256:peer".to_string()),
+            failure: RemoteFailure {
+                code: RemoteReasonCode::CertificateBindingMismatch,
+                message: "certificate binding mismatch".to_string(),
+                suggested_action: None,
+            },
+        };
+
+        assert_eq!(
+            audit_outcome(&response),
+            ("denied", Some("certificate_binding_mismatch".to_string()))
+        );
     }
 }

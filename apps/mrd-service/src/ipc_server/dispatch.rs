@@ -133,6 +133,14 @@ impl IpcServer {
                 session::get_remote_session(&self.app_state, session_id).await
             }
 
+            IpcRequest::GetRouteEvidence { session_id } => {
+                session::get_route_evidence(&self.app_state, session_id).await
+            }
+
+            IpcRequest::GetAuditEventsV2 { query } => {
+                telemetry::audit_events_v2(&self.app_state, query).await
+            }
+
             IpcRequest::RespondToConsent { response } => {
                 session::respond_to_consent(&self.app_state, response).await
             }
@@ -142,7 +150,64 @@ impl IpcServer {
             }
 
             IpcRequest::RequestRemoteSession { request } => {
-                session::request_remote_session(&self.app_state, request).await
+                let session_id = request.session_id.clone();
+                let target_device_id = request.target_device_id.clone();
+                let mut details = vec![(
+                    "requested_scopes".to_string(),
+                    serde_json::to_string(&request.requested_scopes)
+                        .unwrap_or_else(|_| "[]".to_string()),
+                )];
+                if let Some(access_mode) = audit_wire_name(&request.access_mode) {
+                    details.push(("access_mode".to_string(), access_mode));
+                }
+                if let Some(profile) = request.requested_profile.as_ref() {
+                    details.push((
+                        "requested_profile".to_string(),
+                        format!(
+                            "{}x{}@{}/{}Mbps/{}",
+                            profile.width,
+                            profile.height,
+                            profile.fps,
+                            profile.bitrate_mbps,
+                            profile.codec
+                        ),
+                    ));
+                }
+                let response = session::request_remote_session(&self.app_state, request).await;
+                if let Some(snapshot) = self
+                    .app_state
+                    .session_authorizations
+                    .snapshot(&session_id)
+                    .await
+                {
+                    details.push(("peer_key_id".to_string(), snapshot.peer_key_id));
+                    if let Some(state) = audit_wire_name(&snapshot.authorization_state) {
+                        details.push(("authorization_state".to_string(), state));
+                    }
+                    if let Some(state) = audit_wire_name(&snapshot.route_state) {
+                        details.push(("route_state".to_string(), state));
+                    }
+                    if let Some(state) = audit_wire_name(&snapshot.media_state) {
+                        details.push(("media_state".to_string(), state));
+                    }
+                    details.push((
+                        "granted_scopes".to_string(),
+                        serde_json::to_string(&snapshot.granted_scopes)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    ));
+                    details.push((
+                        "policy_revision".to_string(),
+                        snapshot.policy_revision.get().to_string(),
+                    ));
+                }
+                self.finish_lan_session_start_audit(
+                    response,
+                    session_id,
+                    target_device_id,
+                    "lan_quic".to_string(),
+                    details,
+                )
+                .await
             }
 
             IpcRequest::EnableUnattendedAccess { policy } => {
@@ -164,9 +229,7 @@ impl IpcServer {
             }
 
             IpcRequest::RotateTrustedDevice { .. }
-            | IpcRequest::ChangeSessionPermissions { .. }
-            | IpcRequest::GetRouteEvidence { .. }
-            | IpcRequest::GetAuditEventsV2 { .. } => IpcResponse::Error {
+            | IpcRequest::ChangeSessionPermissions { .. } => IpcResponse::Error {
                 code: "E_SECURE_REMOTE_UNAVAILABLE".to_string(),
                 message: "secure remote session operations are unavailable in this service build"
                     .to_string(),
@@ -265,24 +328,14 @@ impl IpcServer {
                         message,
                     },
                 };
-                let (outcome, reason) = audit_outcome(&response);
-                if self
-                    .record_audit_event(
-                        "session.start_lan",
-                        outcome,
-                        Some(session_id),
-                        self.local_device_id().await,
-                        Some(target_device_id),
-                        Some(transport_kind),
-                        reason,
-                        details,
-                    )
-                    .await
-                    .is_err()
-                {
-                    return security_store_unavailable_response();
-                }
-                response
+                self.finish_lan_session_start_audit(
+                    response,
+                    session_id,
+                    target_device_id,
+                    transport_kind,
+                    details,
+                )
+                .await
             }
 
             IpcRequest::UpdateMediaProfile {
@@ -529,7 +582,37 @@ impl IpcServer {
             }
 
             IpcRequest::SendControlInput { session_id, event } => {
-                session::send_control_input(&self.app_state, session_id, event).await
+                let authorization = self
+                    .app_state
+                    .session_authorizations
+                    .snapshot(&session_id)
+                    .await;
+                let response =
+                    session::send_control_input(&self.app_state, session_id.clone(), event).await;
+                if let IpcResponse::RemoteAccessError { failure, .. } = &response {
+                    let peer_device_id = authorization
+                        .as_ref()
+                        .map(|snapshot| snapshot.peer_device_id.clone());
+                    if self
+                        .record_audit_event(
+                            "session.control_input_decision",
+                            "denied",
+                            Some(session_id),
+                            self.local_device_id().await,
+                            peer_device_id,
+                            Some("lan_quic".to_string()),
+                            Some(crate::lan_discovery::remote_reason_code_wire_name(
+                                failure.code,
+                            )),
+                            Vec::new(),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return security_store_unavailable_response();
+                    }
+                }
+                response
             }
 
             IpcRequest::CrossE2EInjectFault {
@@ -674,6 +757,68 @@ impl IpcServer {
     }
 }
 
+impl IpcServer {
+    async fn finish_lan_session_start_audit(
+        &self,
+        response: IpcResponse,
+        session_id: mrd_proto::SessionId,
+        target_device_id: mrd_proto::DeviceId,
+        transport_kind: String,
+        details: Vec<(String, String)>,
+    ) -> IpcResponse {
+        let (outcome, reason) = audit_outcome(&response);
+        if self
+            .record_audit_event(
+                "session.start_lan",
+                outcome,
+                Some(session_id.clone()),
+                self.local_device_id().await,
+                Some(target_device_id),
+                Some(transport_kind),
+                reason,
+                details,
+            )
+            .await
+            .is_err()
+        {
+            let failed_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let _ = self
+                .app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    mrd_ipc::RemoteAuthorizationState::Revoked,
+                    mrd_ipc::RemoteFailure {
+                        code: mrd_ipc::RemoteReasonCode::PolicyChanged,
+                        message: "LAN session start could not be durably audited".to_string(),
+                        suggested_action: Some(
+                            "repair the local security store before reconnecting".to_string(),
+                        ),
+                    },
+                    failed_at_ms,
+                )
+                .await;
+            crate::lan_discovery::terminate_authorized_remote_sessions(
+                &self.app_state,
+                std::slice::from_ref(&session_id),
+            )
+            .await;
+            return security_store_unavailable_response();
+        }
+        response
+    }
+}
+
+fn audit_wire_name<T: serde::Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn allowed_when_security_unhealthy(request: &IpcRequest) -> bool {
     matches!(
         request,
@@ -724,9 +869,10 @@ mod tests {
     use crate::app_state::AppState;
     use crate::ipc_server::IpcServer;
     use crate::session_authorization::VerifiedIncomingAuthorizationRequest;
+    use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
     use mrd_ipc::{
-        DecimalU64, IpcRequest, IpcResponse, RemoteAccessMode, RemotePermissionScope,
-        RemoteReasonCode,
+        AuditLogQuery, DecimalU64, IpcRequest, IpcResponse, RemoteAccessMode,
+        RemotePermissionScope, RemoteReasonCode,
     };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
@@ -742,15 +888,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_secure_remote_operations_remain_fail_closed() {
+    async fn unsupported_secure_remote_mutations_remain_fail_closed() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);
         let requests = [
             serde_json::json!({"type":"ApproveTrustedDevice","approval":{"peer_key_id":"sha256:peer","key_epoch":"2","permission_ceiling":["screen.view"]}}),
             serde_json::json!({"type":"RotateTrustedDevice","rotation":{"peer_key_id":"sha256:peer","new_peer_key_id":"sha256:new-peer","new_key_epoch":"3","expected_trust_revision":"9"}}),
             serde_json::json!({"type":"ChangeSessionPermissions","change":{"session_id":"session-1","requested_scopes":["screen.view"],"expected_policy_revision":"7"}}),
-            serde_json::json!({"type":"GetRouteEvidence","session_id":"session-1"}),
-            serde_json::json!({"type":"GetAuditEventsV2","query":{"after_sequence":"8","limit":50,"session_id":"session-1","action":"session.authorized","outcome":"allowed","peer_device_id":"device-1"}}),
         ]
         .into_iter()
         .map(|value| serde_json::from_value::<IpcRequest>(value).expect("valid secure request"));
@@ -881,6 +1025,121 @@ mod tests {
             .await
             .is_none());
         assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn attended_remote_session_rejection_emits_typed_lan_lifecycle_audit() {
+        let app_state = Arc::new(AppState::new());
+        let controller_id = DeviceId("audit-controller".to_string());
+        app_state
+            .devices
+            .lock()
+            .await
+            .register(controller_id.clone(), "Audit Controller".to_string());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("audited-secure-request".to_string());
+        let target_device_id = DeviceId("untrusted-target".to_string());
+
+        let response = dispatch_request(
+            &server,
+            IpcRequest::RequestRemoteSession {
+                request: mrd_ipc::RemoteSessionRequest {
+                    session_id: session_id.clone(),
+                    target_device_id: target_device_id.clone(),
+                    access_mode: RemoteAccessMode::Attended,
+                    requested_scopes: vec![
+                        RemotePermissionScope::ScreenView,
+                        RemotePermissionScope::InputPointer,
+                        RemotePermissionScope::InputKeyboard,
+                    ],
+                    requested_profile: None,
+                },
+            },
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError { failure, .. } = response else {
+            panic!("untrusted target must be rejected, got {response:?}");
+        };
+        assert_eq!(failure.code, RemoteReasonCode::TrustRequired);
+        let events = app_state
+            .audit_log
+            .query(&AuditLogQuery {
+                session_id: Some(session_id),
+                action: Some("session.start_lan".to_string()),
+                limit: Some(8),
+            })
+            .expect("query secure request audit");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.outcome, "denied");
+        assert_eq!(event.actor_device_id.as_ref(), Some(&controller_id));
+        assert_eq!(event.peer_device_id.as_ref(), Some(&target_device_id));
+        assert_eq!(event.transport_kind.as_deref(), Some("lan_quic"));
+        assert_eq!(event.reason.as_deref(), Some("trust_required"));
+    }
+
+    #[tokio::test]
+    async fn lan_start_audit_append_failure_terminates_started_media() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("unaudited-start-cleanup".to_string());
+        let target_device_id = DeviceId("audit-failure-target".to_string());
+        app_state.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionSnapshot {
+                session_id: session_id.clone(),
+                transport: "quic".to_string(),
+                source_device_id: Some(DeviceId("audit-controller".to_string())),
+                target_device_id: Some(target_device_id.clone()),
+                local_listen_addr: None,
+                local_server_name: None,
+                local_cert_der_b64: None,
+                remote_listen_addr: None,
+                remote_server_name: None,
+                remote_cert_der_b64: None,
+                lifecycle_state: SessionLifecycleState::Streaming,
+                last_error: None,
+                sender_active: true,
+                receiver_active: false,
+            },
+        );
+        let media_task = tokio::spawn(std::future::pending::<()>());
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .register(session_id.clone(), media_task.abort_handle());
+        app_state.audit_log.fail_action("session.start_lan");
+
+        let response = server
+            .finish_lan_session_start_audit(
+                IpcResponse::SessionStarted {
+                    session_id: session_id.clone(),
+                },
+                session_id.clone(),
+                target_device_id,
+                "quic".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        let IpcResponse::Error { code, .. } = response else {
+            panic!("audit append failure must fail closed, got {response:?}");
+        };
+        assert_eq!(code, "E_SECURITY_STORE_UNAVAILABLE");
+        assert!(!app_state.security_is_healthy());
+        let sessions = app_state.sessions.lock().await;
+        let snapshot = sessions.get(&session_id).expect("closed session retained");
+        assert_eq!(snapshot.lifecycle_state, SessionLifecycleState::Closed);
+        assert!(!snapshot.sender_active);
+        assert!(!snapshot.receiver_active);
+        drop(sessions);
+        assert_eq!(
+            app_state.media_tasks.lock().await.active_count(&session_id),
+            0
+        );
+        assert!(media_task.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

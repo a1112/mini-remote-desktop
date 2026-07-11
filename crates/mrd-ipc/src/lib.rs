@@ -1347,6 +1347,7 @@ mod wire {
     #[serde(rename_all = "snake_case")]
     pub enum RemoteReasonCode {
         IdentityMismatch,
+        CertificateBindingMismatch,
         TrustRequired,
         ConsentDenied,
         CredentialInvalid,

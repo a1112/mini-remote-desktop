@@ -1,9 +1,9 @@
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_identity::DeviceIdentity;
 use mrd_ipc::{
-    AuditLogQuery, ConsentDecision, ConsentResponse, DecimalU64, IpcRequest, IpcResponse,
-    RemoteAccessMode, RemoteAuthorizationState, RemotePermissionScope, RemoteReasonCode,
-    TrustedDeviceState,
+    AuditEventsQueryV2, AuditLogQuery, ConsentDecision, ConsentResponse, DecimalU64, IpcRequest,
+    IpcResponse, RemoteAccessMode, RemoteAuthorizationState, RemotePermissionScope,
+    RemoteReasonCode, TrustedDeviceState,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::ipc_server::IpcServer;
@@ -606,6 +606,116 @@ async fn runtime_store_corruption_blocks_mutation_and_latches_unhealthy() {
 
     drop(server);
     drop(state);
+    remove_sqlite_files(&path);
+}
+
+#[tokio::test]
+async fn audit_events_v2_never_reports_a_tampered_chain_as_verified() {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x73; 32] });
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("persistent service security state"),
+    );
+    state
+        .audit_log
+        .record(
+            "session.authorization_grant",
+            "allowed",
+            Some(SessionId("tampered-audit-session".to_string())),
+            None,
+            Some(DeviceId("tampered-audit-peer".to_string())),
+            Some("quic".to_string()),
+            None,
+            Vec::new(),
+        )
+        .expect("persist audit event");
+
+    let connection = rusqlite::Connection::open(&path).expect("tamper connection");
+    connection
+        .execute(
+            "UPDATE audit_events SET outcome = 'tampered' WHERE sequence = 1",
+            [],
+        )
+        .expect("tamper audit row");
+    drop(connection);
+
+    let response = IpcServer::new(state.clone())
+        .handle_request(IpcRequest::GetAuditEventsV2 {
+            query: AuditEventsQueryV2 {
+                after_sequence: Some(DecimalU64::new(0)),
+                limit: 16,
+                session_id: None,
+                action: None,
+                outcome: None,
+                peer_device_id: None,
+            },
+        })
+        .await;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref code, .. } if code == "E_SECURITY_STORE_UNAVAILABLE"
+    ));
+    assert!(!state.security_is_healthy());
+
+    drop(state);
+    remove_sqlite_files(&path);
+}
+
+#[tokio::test]
+async fn audit_events_v2_pages_persisted_events_after_reopen() {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x74; 32] });
+    let session_id = SessionId("persisted-audit-page".to_string());
+    let peer_device_id = DeviceId("persisted-audit-peer".to_string());
+    {
+        let state = AppState::open_persistent(&path, protector.clone())
+            .expect("initial persistent service security state");
+        for outcome in ["pending", "allowed"] {
+            state
+                .audit_log
+                .record(
+                    "session.authorization_decision",
+                    outcome,
+                    Some(session_id.clone()),
+                    Some(DeviceId("persisted-local-device".to_string())),
+                    Some(peer_device_id.clone()),
+                    Some("quic".to_string()),
+                    None,
+                    Vec::new(),
+                )
+                .expect("persist typed audit source event");
+        }
+    }
+
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("reopened persistent service state"),
+    );
+    let response = IpcServer::new(state)
+        .handle_request(IpcRequest::GetAuditEventsV2 {
+            query: AuditEventsQueryV2 {
+                after_sequence: Some(DecimalU64::new(0)),
+                limit: 1,
+                session_id: Some(session_id.clone()),
+                action: Some("session.authorization_decision".to_string()),
+                outcome: None,
+                peer_device_id: Some(peer_device_id),
+            },
+        })
+        .await;
+    let IpcResponse::AuditEventsV2 { page } = response else {
+        panic!("expected persisted audit page, got {response:?}");
+    };
+    assert!(page.chain_verified);
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].session_id.as_ref(), Some(&session_id));
+    assert_eq!(page.events[0].outcome, "pending");
+    assert_eq!(
+        page.events[0].transport_kind,
+        Some(mrd_ipc::RemoteRouteKind::LanQuic)
+    );
+    assert!(page.has_more);
+    assert_eq!(page.next_after_sequence, Some(page.events[0].sequence));
+
     remove_sqlite_files(&path);
 }
 

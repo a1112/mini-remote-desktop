@@ -15,19 +15,21 @@ fn run() -> i32 {
         eprintln!("missing --policy");
         return Verdict::InfraFail.exit_code();
     };
-    let Some(output_path) = value_for(&args, "--output") else {
-        eprintln!("missing --output");
-        return Verdict::InfraFail.exit_code();
-    };
+    let output_path = value_for(&args, "--output");
 
-    let result = match (fs::read_to_string(&artifact_path), fs::read_to_string(&policy_path)) {
-        (Ok(artifact_raw), Ok(policy_raw)) => match serde_json::from_str::<RemoteExperienceRun>(&artifact_raw) {
-            Ok(artifact) => match serde_json::from_str::<GatePolicy>(&policy_raw) {
-                Ok(policy) => evaluate(&artifact, &policy),
-                Err(error) => infra(format!("policy is unreadable: {error}")),
-            },
-            Err(error) => invalid(format!("artifact is invalid: {error}")),
-        },
+    let result = match (
+        fs::read_to_string(&artifact_path),
+        fs::read_to_string(&policy_path),
+    ) {
+        (Ok(artifact_raw), Ok(policy_raw)) => {
+            match serde_json::from_str::<RemoteExperienceRun>(&artifact_raw) {
+                Ok(artifact) => match serde_json::from_str::<GatePolicy>(&policy_raw) {
+                    Ok(policy) => evaluate(&artifact, &policy),
+                    Err(error) => infra(format!("policy is unreadable: {error}")),
+                },
+                Err(error) => invalid(format!("artifact is invalid: {error}")),
+            }
+        }
         (Err(error), _) | (_, Err(error)) => infra(format!("input is unreadable: {error}")),
     };
 
@@ -38,22 +40,34 @@ fn run() -> i32 {
             return Verdict::InfraFail.exit_code();
         }
     };
-    if let Err(error) = fs::write(PathBuf::from(output_path), serialized) {
-        eprintln!("cannot write evaluation: {error}");
-        return Verdict::InfraFail.exit_code();
+    if let Some(output_path) = output_path {
+        if let Err(error) = fs::write(PathBuf::from(output_path), &serialized) {
+            eprintln!("cannot write evaluation: {error}");
+            return Verdict::InfraFail.exit_code();
+        }
+        println!("{:?}: {} failure(s)", result.verdict, result.failures.len());
+    } else {
+        println!("{serialized}");
     }
-    println!("{:?}: {} failure(s)", result.verdict, result.failures.len());
     result.verdict.exit_code()
 }
 
 fn value_for(args: &[String], flag: &str) -> Option<String> {
-    args.windows(2).find(|pair| pair[0] == flag).map(|pair| pair[1].clone())
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
 }
 
 fn invalid(message: String) -> Evaluation {
-    Evaluation { verdict: Verdict::InvalidArtifact, failures: vec![message] }
+    Evaluation {
+        verdict: Verdict::InvalidArtifact,
+        failures: vec![message],
+    }
 }
 
 fn infra(message: String) -> Evaluation {
-    Evaluation { verdict: Verdict::InfraFail, failures: vec![message] }
+    Evaluation {
+        verdict: Verdict::InfraFail,
+        failures: vec![message],
+    }
 }

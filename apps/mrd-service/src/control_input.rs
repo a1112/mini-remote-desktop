@@ -397,6 +397,13 @@ impl ControlInputRegistry {
             ),
         }
     }
+
+    #[cfg(test)]
+    pub fn injected_message_count(&self) -> u64 {
+        self.reliable
+            .injected_messages
+            .saturating_add(self.realtime.injected_messages)
+    }
 }
 
 impl Default for ControlInputRegistry {
@@ -581,6 +588,28 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn injected_message_count_combines_global_lane_totals() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = ControlInputRegistry::with_injector(SharedRecordingInputInjector {
+            events: Arc::clone(&events),
+        });
+
+        assert_eq!(registry.injected_message_count(), 0);
+        registry
+            .handle_event(&ControlInputEvent::Key {
+                key: ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            })
+            .expect("inject reliable event");
+        registry
+            .handle_event(&ControlInputEvent::MouseMove { x: 10, y: 20 })
+            .expect("inject realtime event");
+
+        assert_eq!(registry.injected_message_count(), 2);
+        assert_eq!(events.lock().expect("recorded events").len(), 2);
     }
 
     #[test]

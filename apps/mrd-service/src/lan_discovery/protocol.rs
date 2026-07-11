@@ -371,8 +371,8 @@ impl LanProtocolError {
             Self::InvalidKeyBinding
             | Self::InvalidKeyEpoch
             | Self::InvalidSignature
-            | Self::PeerBindingMismatch
-            | Self::CertificateFingerprintMismatch => RemoteReasonCode::IdentityMismatch,
+            | Self::PeerBindingMismatch => RemoteReasonCode::IdentityMismatch,
+            Self::CertificateFingerprintMismatch => RemoteReasonCode::CertificateBindingMismatch,
             Self::InvalidNonce => RemoteReasonCode::ReplayDetected,
             Self::PayloadEncoding
             | Self::SigningFailed

@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use mrd_ipc::{AuditLogQuery, IpcResponse, ServiceStatus, TelemetryBundle};
+use mrd_ipc::{AuditEventsQueryV2, AuditLogQuery, IpcResponse, ServiceStatus, TelemetryBundle};
 use mrd_proto::SessionId;
 use mrd_store_sqlite::StoreError;
 use std::sync::Arc;
@@ -9,6 +9,25 @@ pub async fn audit_log(app_state: &Arc<AppState>, query: AuditLogQuery) -> IpcRe
     let audit_log = app_state.audit_log.clone();
     match tokio::task::spawn_blocking(move || audit_log.query(&query)).await {
         Ok(Ok(events)) => IpcResponse::AuditLog { events },
+        Ok(Err(StoreError::InvalidAuditQuery)) => IpcResponse::Error {
+            code: "E_INVALID_AUDIT_QUERY".to_string(),
+            message: "audit query is outside the supported bounds".to_string(),
+        },
+        Ok(Err(_)) | Err(_) => {
+            app_state.mark_security_unhealthy();
+            IpcResponse::Error {
+                code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+                message: "authoritative security state is unavailable".to_string(),
+            }
+        }
+    }
+}
+
+/// Query the durable, typed audit projection used by secure-remote product evidence.
+pub async fn audit_events_v2(app_state: &Arc<AppState>, query: AuditEventsQueryV2) -> IpcResponse {
+    let audit_log = app_state.audit_log.clone();
+    match tokio::task::spawn_blocking(move || audit_log.query_v2(&query)).await {
+        Ok(Ok(page)) => IpcResponse::AuditEventsV2 { page },
         Ok(Err(StoreError::InvalidAuditQuery)) => IpcResponse::Error {
             code: "E_INVALID_AUDIT_QUERY".to_string(),
             message: "audit query is outside the supported bounds".to_string(),

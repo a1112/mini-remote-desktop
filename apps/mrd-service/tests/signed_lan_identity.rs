@@ -1,5 +1,5 @@
 use mrd_identity::DeviceIdentity;
-use mrd_ipc::{AuditLogQuery, MediaProfile, MediaProfileNegotiation};
+use mrd_ipc::{AuditLogQuery, MediaProfile, MediaProfileNegotiation, RemoteReasonCode};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::{
     handlers::session::start_lan_remote_session,
@@ -331,7 +331,17 @@ async fn untrusted_signed_peer_is_discoverable_but_not_controllable() {
         None,
     )
     .await;
-    assert!(matches!(response, mrd_ipc::IpcResponse::Error { .. }));
+    let mrd_ipc::IpcResponse::RemoteAccessError {
+        session_id: failed_session_id,
+        peer_key_id,
+        failure,
+    } = response
+    else {
+        panic!("expected typed trust rejection");
+    };
+    assert_eq!(failed_session_id, Some(session_id.clone()));
+    assert_eq!(peer_key_id, None);
+    assert_eq!(failure.code, RemoteReasonCode::TrustRequired);
     assert!(app_state.sessions.lock().await.get(&session_id).is_none());
 }
 

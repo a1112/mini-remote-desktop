@@ -2,8 +2,9 @@ use mrd_identity::{public_key_id, UnattendedCredential};
 use mrd_ipc::{
     ConsentDecision, ConsentResponse, DecimalU64, RemoteAccessMode, RemoteAuthorizationState,
     RemoteCursorState, RemoteFailure, RemoteMediaState, RemotePermissionScope,
-    RemotePresentationState, RemoteReasonCode, RemoteRouteState, RemoteSessionEvent,
-    RemoteSessionEventEnvelope, RemoteSessionRole, RemoteSessionSnapshot, SessionEventSubscription,
+    RemotePresentationState, RemoteReasonCode, RemoteRouteKind, RemoteRouteState,
+    RemoteSessionEvent, RemoteSessionEventEnvelope, RemoteSessionRole, RemoteSessionSnapshot,
+    RouteCandidateEvidence, RouteCandidateState, RouteEvidence, SessionEventSubscription,
     SessionEventSubscriptionQuery, UnattendedAccessPolicy, UnattendedAccessSnapshot,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -429,6 +430,28 @@ impl SessionAuthorizationRegistry {
             .records
             .get(session_id)
             .and_then(|record| record.grant.clone())
+    }
+
+    /// Project UI-safe route evidence from the exact active grant and session aggregate.
+    pub async fn verified_route_evidence_at(
+        &self,
+        session_id: &SessionId,
+        observed_at_ms: u64,
+    ) -> Result<Option<RouteEvidence>, RemoteFailure> {
+        let (expired, result) = {
+            let mut inner = self.inner.lock().await;
+            let expired = expire_grant_locked(&mut inner, session_id, observed_at_ms);
+            let result = inner
+                .records
+                .get(session_id)
+                .map(|record| project_verified_route_evidence(record, observed_at_ms))
+                .transpose();
+            (expired, result)
+        };
+        if expired {
+            self.changed.notify_waiters();
+        }
+        result
     }
 
     pub async fn bind_authenticated_peer_key(
@@ -1653,6 +1676,106 @@ fn failure(code: RemoteReasonCode, message: impl Into<String>) -> RemoteFailure 
         message: message.into(),
         suggested_action: None,
     }
+}
+
+fn project_verified_route_evidence(
+    record: &AuthorizationRecord,
+    observed_at_ms: u64,
+) -> Result<RouteEvidence, RemoteFailure> {
+    if record.snapshot.authorization_state != RemoteAuthorizationState::Granted {
+        return Err(record.snapshot.failure.clone().unwrap_or_else(|| {
+            failure(
+                RemoteReasonCode::PolicyChanged,
+                "route evidence requires an active verified session grant",
+            )
+        }));
+    }
+    let Some(grant) = record.grant.as_ref() else {
+        return Err(failure(
+            RemoteReasonCode::PolicyChanged,
+            "route evidence has no verified session grant",
+        ));
+    };
+    if record.request.session_id != record.snapshot.session_id
+        || record.request.peer_device_id != record.snapshot.peer_device_id
+        || record.request.peer_key_id != record.snapshot.peer_key_id
+        || grant.session_id != record.snapshot.session_id
+        || grant.issued_at_ms > observed_at_ms
+        || observed_at_ms > grant.expires_at_ms
+        || grant.policy_revision != record.snapshot.policy_revision.get()
+        || grant.granted_scopes != record.snapshot.granted_scopes
+        || grant.route_constraint != record.request.transport_kind
+        || grant.route_constraint != "quic"
+        || grant
+            .transport_fingerprint_sha256
+            .iter()
+            .all(|byte| *byte == 0)
+    {
+        return Err(failure(
+            RemoteReasonCode::PolicyChanged,
+            "route evidence grant no longer matches the active session",
+        ));
+    }
+    let Some(peer_public_key) = record.peer_public_key else {
+        return Err(failure(
+            RemoteReasonCode::IdentityMismatch,
+            "route evidence peer key has not been authenticated",
+        ));
+    };
+    if public_key_id(&peer_public_key) != record.request.peer_key_id {
+        return Err(failure(
+            RemoteReasonCode::IdentityMismatch,
+            "route evidence peer key binding is invalid",
+        ));
+    }
+    if record.snapshot.route_kind != Some(RemoteRouteKind::LanQuic) {
+        return Err(failure(
+            RemoteReasonCode::PolicyChanged,
+            "route evidence selected route does not match the verified LAN grant",
+        ));
+    }
+
+    let candidate_state = match record.snapshot.route_state {
+        RemoteRouteState::Idle => RouteCandidateState::NotTried,
+        RemoteRouteState::Gathering
+        | RemoteRouteState::Connecting
+        | RemoteRouteState::Migrating
+        | RemoteRouteState::Reconnecting => RouteCandidateState::Connecting,
+        RemoteRouteState::Connected => RouteCandidateState::Connected,
+        RemoteRouteState::Failed | RemoteRouteState::Closed => RouteCandidateState::Failed,
+    };
+    let completed_at_ms = matches!(
+        candidate_state,
+        RouteCandidateState::Connected | RouteCandidateState::Failed
+    )
+    .then_some(record.snapshot.updated_at_ms.max(grant.issued_at_ms));
+    let candidate_failure = (candidate_state == RouteCandidateState::Failed)
+        .then(|| record.snapshot.failure.clone())
+        .flatten();
+    Ok(RouteEvidence {
+        session_id: record.snapshot.session_id.clone(),
+        route_state: record.snapshot.route_state,
+        selected_route: record.snapshot.route_kind,
+        policy_revision: record.snapshot.policy_revision,
+        transport_fingerprint_sha256: Some(format!(
+            "sha256:{}",
+            hex_bytes(&grant.transport_fingerprint_sha256)
+        )),
+        candidates: vec![RouteCandidateEvidence {
+            route: RemoteRouteKind::LanQuic,
+            state: candidate_state,
+            started_at_ms: (candidate_state != RouteCandidateState::NotTried)
+                .then_some(grant.issued_at_ms),
+            completed_at_ms,
+            round_trip_ms: None,
+            failure: candidate_failure,
+        }],
+        observed_at_ms,
+    })
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn push_event(

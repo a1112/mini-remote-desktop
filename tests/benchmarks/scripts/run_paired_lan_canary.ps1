@@ -375,6 +375,48 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
+
+    if ($ScenarioId -eq "cross.e2e.secure_remote_display") {
+      $qualityDir = Join-Path $OutputRoot "quality/secure-lan"
+      New-Item -ItemType Directory -Force -Path $qualityDir | Out-Null
+      $artifactPath = Join-Path $qualityDir "$($Profile.id).artifact.json"
+      $evaluationPath = Join-Path $qualityDir "$($Profile.id).evaluation.json"
+      $qualityVerdict = $null
+      $qualityExitCode = $null
+
+      try {
+        $artifact = Convert-SecureLanReportToQualityArtifact `
+          -Report $report `
+          -RunId "secure-lan-$GitCommit-$($Profile.id)"
+        Write-CanaryUtf8Json -InputObject $artifact -Path $artifactPath
+        Remove-Item -LiteralPath $evaluationPath -Force -ErrorAction SilentlyContinue
+
+        & cargo run -p mrd-quality-gate --bin mrd-quality-gate -- `
+          --artifact $artifactPath `
+          --policy $script:SecureLanPositivePolicyPath `
+          --output $evaluationPath
+        $qualityExitCode = $LASTEXITCODE
+
+        if (Test-Path -LiteralPath $evaluationPath -PathType Leaf) {
+          $qualityEvaluation = Get-Content -LiteralPath $evaluationPath -Raw | ConvertFrom-Json
+          $qualityVerdict = [string]$qualityEvaluation.verdict
+        }
+        if ($qualityExitCode -ne 0 -or $qualityVerdict -ne "PASS") {
+          $row.status = "failed"
+          $row.classification = "security_verification_failed"
+          $row.error_message = "Secure LAN quality policy did not pass (exit=$qualityExitCode, verdict=$qualityVerdict)"
+        }
+      } catch {
+        $row.status = "failed"
+        $row.classification = "security_verification_failed"
+        $row.error_message = "Secure LAN quality evidence failed: $($_.Exception.Message)"
+      }
+
+      $row | Add-Member -Force -NotePropertyName "secure_quality_artifact" -NotePropertyValue $artifactPath
+      $row | Add-Member -Force -NotePropertyName "secure_quality_evaluation" -NotePropertyValue $evaluationPath
+      $row | Add-Member -Force -NotePropertyName "secure_quality_verdict" -NotePropertyValue $qualityVerdict
+      $row | Add-Member -Force -NotePropertyName "secure_quality_exit_code" -NotePropertyValue $qualityExitCode
+    }
     $row
   } finally {
     Restore-EnvVars $savedEnv
@@ -387,6 +429,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
 $repo = Resolve-RepoPath $RepoRoot
 $outputRoot = Join-Path $repo $OutputDir
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+$script:SecureLanPositivePolicyPath = Join-Path $repo "tests/quality-gates/policies/windows-secure-lan.v1.json"
 $gitCommit = (git -C $repo rev-parse --short=12 HEAD).Trim()
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs $DurationSecs -BitrateMbps $BitrateMbps
 if ($ProfileId -and $ProfileId.Count -gt 0) {
@@ -404,6 +447,7 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
 
 $allowedScenarios = @(
   "cross.e2e.remote_display_smoke",
+  "cross.e2e.secure_remote_display",
   "cross.e2e.media_profile",
   "cross.e2e.input_control",
   "cross.fault.recovery"
@@ -420,6 +464,12 @@ if ($requestedScenarios.Count -eq 0) {
 $unknownScenarios = @($requestedScenarios | Where-Object { $allowedScenarios -notcontains $_ })
 if ($unknownScenarios.Count -gt 0) {
   throw "Unsupported paired LAN canary scenario(s): $($unknownScenarios -join ', ')"
+}
+if (
+  $requestedScenarios -contains "cross.e2e.secure_remote_display" -and
+  -not (Test-Path -LiteralPath $script:SecureLanPositivePolicyPath -PathType Leaf)
+) {
+  throw "Secure LAN positive policy not found: $script:SecureLanPositivePolicyPath"
 }
 
 if (-not $NoBuild) {

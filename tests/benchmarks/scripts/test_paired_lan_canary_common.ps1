@@ -845,13 +845,126 @@ $tauriBuildEnv = New-LocalDualProcessTauriEnvPlan `
   -NoBuild:$false
 Assert-Equal $tauriBuildEnv.CARGO_TARGET_DIR ([System.IO.Path]::Combine("tmp", "repo", "target")) "Build local dual canary also pins Tauri to the workspace cargo target"
 
+$secureRequestedProfile = [pscustomobject]@{
+  width = 1920
+  height = 1080
+  fps = 60
+  bitrate_mbps = 20
+  codec = "h264"
+}
+$secureSelectedProfile = [pscustomobject]@{
+  width = 1920
+  height = 1080
+  fps = 60
+  bitrate_mbps = 20
+  codec = "h264"
+}
+$secureQualityReport = [pscustomobject]@{
+  status = "completed"
+  scenarioId = "cross.e2e.secure_remote_display"
+  sessionId = "secure-quality-session"
+  controllerDeviceId = "secure-controller"
+  peer = [pscustomobject]@{ device_id = "secure-peer" }
+  requestedProfile = $secureRequestedProfile
+  mediaAdaptationSnapshot = [pscustomobject]@{ current_profile = $secureSelectedProfile }
+  profileProbeResult = [pscustomobject]@{ status = "passed" }
+  secureSessionEvidence = [pscustomobject]@{
+    trustedIdentityVerified = $true
+    authorizationGranted = $true
+    authorizationBasis = "consent"
+    scopeAuthorized = $true
+    selectedRoute = "lan_quic"
+    quicPeerAuthenticated = $true
+    realFramesVerified = $true
+    authorizedInputVerified = $true
+    cleanupCompleted = $true
+  }
+  auditEventIds = @("secure-audit-1")
+  controlInputAck = [pscustomobject]@{ session_id = "secure-quality-session"; lane = "reliable"; event_count = 1 }
+  firstFrameTimeMs = 100.0
+  maxZeroFrameWindowAfterFirstFrameMs = 0.0
+  sampleFramesDecoded = 60
+  sampleObservedFps = 60.0
+  sampleRenderFramesPresented = 60
+  probeSnapshot = [pscustomobject]@{
+    frames_decoded = 60
+    media_probe_width = 1920
+    media_probe_height = 1080
+    media_probe_target_fps = 60
+    media_probe_target_bitrate_mbps = 20
+  }
+  sessionSnapshot = [pscustomobject]@{ state = "streaming"; sender_active = $true; receiver_active = $true }
+  mediaPipelineSnapshot = [pscustomobject]@{
+    render_presented_frames = 60
+    active_codec = "h264"
+    sender_transport = [pscustomobject]@{
+      datagram_fragments_sent = 7
+      reliable_fragments_sent = 3
+    }
+  }
+  stages = @([pscustomobject]@{ stage = "cleanup"; status = "completed" })
+}
+
+Assert-Equal (Get-SecureLanPositiveGateFailureReason -Report $secureQualityReport) $null "Exact lan_quic route passes the secure gate"
+$plainQuicReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$plainQuicReport.secureSessionEvidence.selectedRoute = "quic"
+Assert-Equal (Get-SecureLanPositiveGateFailureReason -Report $plainQuicReport) $null "Exact quic route passes the secure gate"
+foreach ($invalidRoute in @("not-quic", "quic_quinn", "proxy/quic")) {
+  $ambiguousRouteReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+  $ambiguousRouteReport.secureSessionEvidence.selectedRoute = $invalidRoute
+  Assert-True ($null -ne (Get-SecureLanPositiveGateFailureReason -Report $ambiguousRouteReport)) "Non-exact route $invalidRoute must fail secure QUIC verification"
+}
+
+$secureQualityArtifact = Convert-SecureLanReportToQualityArtifact -Report $secureQualityReport -RunId "secure-quality-test"
+Assert-Equal $secureQualityArtifact.side_effects.sender_tasks_started 1 "Positive artifact uses authoritative sender_active"
+Assert-Equal $secureQualityArtifact.side_effects.receiver_tasks_started 1 "Positive artifact uses authoritative receiver_active"
+Assert-Equal $secureQualityArtifact.side_effects.media_packets_sent 10 "Positive artifact uses sender transport packet counters"
+Assert-Equal $secureQualityArtifact.media.requested_profile "1920x1080@60-h264-20mbps" "Positive artifact derives requested profile from report"
+Assert-Equal $secureQualityArtifact.media.selected_profile "1920x1080@60-h264-20mbps" "Positive artifact derives selected profile from report"
+Assert-True (-not $secureQualityArtifact.media.profile_downgraded) "Matching authoritative profiles are not downgraded"
+Assert-Equal $secureQualityArtifact.present.freeze_count 0 "Healthy post-first-frame window reports no freeze"
+$freezeBoundaryReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$freezeBoundaryReport.maxZeroFrameWindowAfterFirstFrameMs = $script:CanaryMaxZeroFrameWindowAfterFirstFrameMs
+$freezeBoundaryArtifact = Convert-SecureLanReportToQualityArtifact -Report $freezeBoundaryReport -RunId "secure-freeze-boundary-test"
+Assert-Equal $freezeBoundaryArtifact.present.freeze_count 0 "At-threshold zero-frame window reports no freeze"
+$frozenQualityReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$frozenQualityReport.maxZeroFrameWindowAfterFirstFrameMs = $script:CanaryMaxZeroFrameWindowAfterFirstFrameMs + 1
+$frozenQualityArtifact = Convert-SecureLanReportToQualityArtifact -Report $frozenQualityReport -RunId "secure-freeze-test"
+Assert-True ($frozenQualityArtifact.present.freeze_count -ge 1) "Over-threshold zero-frame window reports at least one freeze"
+$probeSelectedReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$probeSelectedReport.mediaAdaptationSnapshot = $null
+$probeSelectedArtifact = Convert-SecureLanReportToQualityArtifact -Report $probeSelectedReport -RunId "secure-probe-profile-test"
+Assert-Equal $probeSelectedArtifact.media.selected_profile "1920x1080@60-h264-20mbps" "Probe and active codec provide authoritative selected-profile fallback"
+
+$inactiveTaskReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$inactiveTaskReport.sessionSnapshot.sender_active = $false
+$inactiveTaskReport.sessionSnapshot.receiver_active = $false
+$inactiveTaskArtifact = Convert-SecureLanReportToQualityArtifact -Report $inactiveTaskReport -RunId "secure-inactive-test"
+Assert-Equal $inactiveTaskArtifact.side_effects.sender_tasks_started 0 "Frames do not fabricate sender task activity"
+Assert-Equal $inactiveTaskArtifact.side_effects.receiver_tasks_started 0 "Frames do not fabricate receiver task activity"
+
+$downgradedProfileReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$downgradedProfileReport.mediaAdaptationSnapshot.current_profile = [pscustomobject]@{
+  width = 1280
+  height = 720
+  fps = 60
+  bitrate_mbps = 8
+  codec = "h264"
+}
+$downgradedProfileReport.profileProbeResult.status = "degraded"
+$downgradedProfileArtifact = Convert-SecureLanReportToQualityArtifact -Report $downgradedProfileReport -RunId "secure-downgrade-test"
+Assert-Equal $downgradedProfileArtifact.media.selected_profile "1280x720@60-h264-8mbps" "Positive artifact reports authoritative selected profile"
+Assert-True $downgradedProfileArtifact.media.profile_downgraded "Degraded probe is preserved in the quality artifact"
+
 $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
 $pairedLanScript = Get-Content -Path (Join-Path $scriptDir "run_paired_lan_canary.ps1") -Raw
+$secureNegativeScript = Get-Content -Path (Join-Path $scriptDir "run_secure_lan_negative.ps1") -Raw
 Assert-True ($pairedLanScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Paired LAN canary accepts AV1 codec selection"
 Assert-True ($pairedLanScript -match '\[string\[\]\]\$ScenarioId = @\("cross\.e2e\.remote_display_smoke"\)') "Paired LAN canary defaults to the L4 remote-display scenario"
 Assert-True ($pairedLanScript -match '"cross\.fault\.recovery"') "Paired LAN canary accepts the L5 fault recovery scenario"
 Assert-True ($pairedLanScript -match 'MRD_LAN_E2E_SCENARIO') "Paired LAN canary forwards the scenario id to Tauri autorun"
 Assert-True ($pairedLanScript -match 'requested_scenario_id') "Paired LAN rows record the requested scenario id"
+Assert-True ($pairedLanScript -match 'Write-CanaryUtf8Json -InputObject \$artifact') "Paired LAN writes Rust-bound artifacts as UTF-8 without BOM"
 Assert-True ($localDualScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Local dual canary accepts AV1 codec selection"
 Assert-True ($pairedLanScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Paired LAN canary accepts AV1 mode selection"
 Assert-True ($localDualScript -match 'ValidateSet\("low_latency", "ultra_low_latency", "high_refresh"\)') "Local dual canary accepts AV1 mode selection"
@@ -869,5 +982,83 @@ Assert-True ($localDualScript -match "RenderPresentMode") "Local dual canary exp
 Assert-True ($localDualScript -match "MRD_D3D11_RENDER_WAITABLE_OBJECT") "Local dual canary can enable waitable D3D11 present"
 Assert-True ($pairedLanScript -match 'exit 2') "Paired LAN canary must fail the process when the gate fails"
 Assert-True ($localDualScript -match 'exit 2') "Local dual canary must fail the process when the gate fails"
+Assert-True ($secureNegativeScript -match 'security_negative_untrusted_emits_authoritative_evidence') "Secure LAN negative gate runs the untrusted product attempt"
+Assert-True ($secureNegativeScript -match 'security_negative_replay_emits_authoritative_evidence') "Secure LAN negative gate runs the replay product attempt"
+Assert-True ($secureNegativeScript -match 'security_negative_revoked_emits_authoritative_evidence') "Secure LAN negative gate runs the revoked-grant product attempt"
+Assert-True ($secureNegativeScript -match 'security_negative_wrong_scope_emits_authoritative_evidence') "Secure LAN negative gate runs the wrong-scope product attempt"
+Assert-True ($secureNegativeScript -match 'security_negative_certificate_substitution_emits_authoritative_evidence') "Secure LAN negative gate runs the certificate-substitution product attempt"
+Assert-True ($secureNegativeScript -match 'product_test_suites') "Secure LAN negative summary records product suite outcomes"
+Assert-True ($secureNegativeScript -match 'exit_code = \$exitCode') "Secure LAN negative summary records each product suite exit code"
+Assert-True ($secureNegativeScript -match 'preflight_failures') "Secure LAN negative summary aggregates policy preflight failures"
+Assert-True ($secureNegativeScript -match 'security_negative_evidence') "Secure LAN negative gate runs the dedicated product evidence harness"
+Assert-True ($secureNegativeScript -match 'MRD_SECURITY_NEGATIVE_INVOCATION_ID') "Every negative evidence run is bound to a unique invocation id"
+Assert-True ($secureNegativeScript -match 'invocation_id_mismatch') "Negative gate rejects evidence from a different invocation"
+Assert-True ($secureNegativeScript -match 'artifact_not_fresh') "Negative gate rejects stale artifacts"
+foreach ($staticFixture in @(
+  "security-untrusted.json",
+  "security-replay.json",
+  "security-revoked.json",
+  "security-wrong-scope.json",
+  "security-certificate-substitution.json"
+)) {
+  Assert-True (-not $secureNegativeScript.Contains($staticFixture)) "Product negative gate must not consume static fixture $staticFixture"
+}
+
+$repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
+$utf8Fixture = $secureQualityArtifact
+$utf8TempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-canary-utf8-" + [Guid]::NewGuid().ToString("N"))
+$utf8ArtifactPath = Join-Path $utf8TempRoot "artifact.json"
+$utf8EvaluationPath = Join-Path $utf8TempRoot "evaluation.json"
+try {
+  New-Item -ItemType Directory -Force -Path $utf8TempRoot | Out-Null
+  Write-CanaryUtf8Json -InputObject $utf8Fixture -Path $utf8ArtifactPath
+  $utf8Bytes = [System.IO.File]::ReadAllBytes($utf8ArtifactPath)
+  $hasUtf8Bom = $utf8Bytes.Length -ge 3 -and $utf8Bytes[0] -eq 0xEF -and $utf8Bytes[1] -eq 0xBB -and $utf8Bytes[2] -eq 0xBF
+  Assert-True (-not $hasUtf8Bom) "Canary JSON written for Rust must be UTF-8 without BOM"
+
+  Push-Location $repoRoot
+  try {
+    & cargo run -q -p mrd-quality-gate --bin mrd-quality-gate -- `
+      --artifact $utf8ArtifactPath `
+      --policy (Join-Path $repoRoot "tests\quality-gates\policies\windows-secure-lan.v1.json") `
+      --output $utf8EvaluationPath
+    $utf8CliExitCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  $utf8Evaluation = Get-Content -LiteralPath $utf8EvaluationPath -Raw | ConvertFrom-Json
+  Assert-Equal $utf8CliExitCode 0 "Rust quality-gate CLI reads no-BOM secure artifact ($(@($utf8Evaluation.failures) -join '; '))"
+  Assert-Equal $utf8Evaluation.verdict "PASS" "No-BOM canary JSON preserves the quality verdict"
+} finally {
+  if (Test-Path -LiteralPath $utf8TempRoot) {
+    Remove-Item -LiteralPath $utf8TempRoot -Recurse -Force
+  }
+}
+
+$negativeFailureTempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-secure-negative-failure-" + [Guid]::NewGuid().ToString("N"))
+$currentPowerShell = (Get-Process -Id $PID).Path
+try {
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    & $currentPowerShell -NoProfile -ExecutionPolicy Bypass `
+      -File (Join-Path $scriptDir "run_secure_lan_negative.ps1") `
+      -RepoRoot $repoRoot `
+      -OutputDir $negativeFailureTempRoot `
+      -CargoCommand "__missing_mrd_cargo_for_test__" *> $null
+    $negativeFailureExitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  Assert-Equal $negativeFailureExitCode 2 "Secure LAN negative gate aggregates command failures with product exit code"
+  $negativeFailureSummary = Get-Content -LiteralPath (Join-Path $negativeFailureTempRoot "secure-lan-negative-summary.json") -Raw | ConvertFrom-Json
+  Assert-Equal $negativeFailureSummary.verdict "PRODUCT_FAIL" "Secure LAN negative failure summary has a product verdict"
+  Assert-Equal @($negativeFailureSummary.product_test_suites).Count 5 "Secure LAN negative failure summary retains all five product attempts"
+  Assert-True (@($negativeFailureSummary.product_test_suites | Where-Object { $_.exit_code -ne 127 }).Count -eq 0) "Missing cargo is recorded for every product suite"
+} finally {
+  if (Test-Path -LiteralPath $negativeFailureTempRoot) {
+    Remove-Item -LiteralPath $negativeFailureTempRoot -Recurse -Force
+  }
+}
 
 Write-Host "paired LAN canary common tests passed"

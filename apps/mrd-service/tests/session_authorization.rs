@@ -701,7 +701,18 @@ async fn rejected_consent_attempt_is_not_audited_as_an_applied_decision() {
             limit: None,
         })
         .expect("audit query");
-    assert!(before.is_empty());
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].outcome, "rejected");
+    assert_eq!(before[0].reason.as_deref(), Some("policy_changed"));
+    assert_eq!(
+        state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("pending consent survives a rejected stale response")
+            .authorization_state,
+        RemoteAuthorizationState::AwaitingLocalConsent
+    );
 
     let applied = server
         .handle_request(IpcRequest::RespondToConsent {
@@ -722,8 +733,9 @@ async fn rejected_consent_attempt_is_not_audited_as_an_applied_decision() {
             limit: None,
         })
         .expect("audit query");
-    assert_eq!(after.len(), 1);
-    assert_eq!(after[0].outcome, "approve");
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0].outcome, "rejected");
+    assert_eq!(after[1].outcome, "approve");
 }
 
 #[tokio::test]

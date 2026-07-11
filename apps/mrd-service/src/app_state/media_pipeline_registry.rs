@@ -13,6 +13,8 @@ const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
     pipelines: HashMap<SessionId, MediaPipelineState>,
+    cumulative_sender_packets_sent: u64,
+    cumulative_render_presented_frames: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,6 +163,9 @@ impl MediaPipelineRegistry {
     pub fn increment_render_presented_frames(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_presented_frames = state.render_presented_frames.saturating_add(count);
+        self.cumulative_render_presented_frames = self
+            .cumulative_render_presented_frames
+            .saturating_add(count);
     }
 
     pub fn increment_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
@@ -275,10 +280,28 @@ impl MediaPipelineRegistry {
         session_id: SessionId,
         transport: MediaSenderTransportSnapshot,
     ) {
-        self.pipelines
-            .entry(session_id)
-            .or_default()
-            .sender_transport = transport;
+        let next_packets = sender_packets_sent(&transport);
+        let packet_delta = {
+            let state = self.pipelines.entry(session_id).or_default();
+            let previous_packets = sender_packets_sent(&state.sender_transport);
+            state.sender_transport = transport;
+            if next_packets >= previous_packets {
+                next_packets - previous_packets
+            } else {
+                next_packets
+            }
+        };
+        self.cumulative_sender_packets_sent = self
+            .cumulative_sender_packets_sent
+            .saturating_add(packet_delta);
+    }
+
+    pub fn cumulative_sender_packets_sent(&self) -> u64 {
+        self.cumulative_sender_packets_sent
+    }
+
+    pub fn cumulative_render_presented_frames(&self) -> u64 {
+        self.cumulative_render_presented_frames
     }
 
     pub fn set_adaptation(
@@ -351,6 +374,12 @@ impl MediaPipelineRegistry {
     }
 }
 
+fn sender_packets_sent(snapshot: &MediaSenderTransportSnapshot) -> u64 {
+    snapshot
+        .datagram_fragments_sent
+        .saturating_add(snapshot.reliable_fragments_sent)
+}
+
 fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMetrics> {
     let mut metrics = state.stage_summaries.clone();
     for (stage, samples) in &state.stage_samples {
@@ -410,5 +439,37 @@ mod tests {
             .expect("sender capture metrics");
         assert_eq!(capture.p50_ms, Some(140.0));
         assert_eq!(capture.p95_ms, Some(247.0));
+    }
+
+    #[test]
+    fn cumulative_activity_survives_pipeline_removal() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("pipeline-cumulative-session".to_string());
+
+        registry.set_sender_transport(
+            session_id.clone(),
+            MediaSenderTransportSnapshot {
+                datagram_fragments_sent: 3,
+                reliable_fragments_sent: 2,
+                ..Default::default()
+            },
+        );
+        registry.set_sender_transport(
+            session_id.clone(),
+            MediaSenderTransportSnapshot {
+                datagram_fragments_sent: 4,
+                reliable_fragments_sent: 3,
+                ..Default::default()
+            },
+        );
+        registry.increment_render_presented_frames(session_id.clone(), 4);
+
+        assert_eq!(registry.cumulative_sender_packets_sent(), 7);
+        assert_eq!(registry.cumulative_render_presented_frames(), 4);
+
+        registry.remove(&session_id);
+
+        assert_eq!(registry.cumulative_sender_packets_sent(), 7);
+        assert_eq!(registry.cumulative_render_presented_frames(), 4);
     }
 }

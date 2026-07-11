@@ -1423,6 +1423,10 @@ fn secure_remote_permission_and_reason_codes_have_stable_wire_values() {
 
     let reason_codes = [
         (RemoteReasonCode::IdentityMismatch, "identity_mismatch"),
+        (
+            RemoteReasonCode::CertificateBindingMismatch,
+            "certificate_binding_mismatch",
+        ),
         (RemoteReasonCode::TrustRequired, "trust_required"),
         (RemoteReasonCode::ConsentDenied, "consent_denied"),
         (RemoteReasonCode::CredentialInvalid, "credential_invalid"),

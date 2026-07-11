@@ -45,12 +45,64 @@ pub async fn get_remote_session(app_state: &Arc<AppState>, session_id: SessionId
     }
 }
 
+/// Return route evidence only when it is bound to the active verified session grant.
+pub async fn get_route_evidence(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let result = app_state
+        .session_authorizations
+        .verified_route_evidence_at(&session_id, current_time_ms())
+        .await;
+    let terminal = if result.is_err() {
+        app_state
+            .session_authorizations
+            .snapshot_at(&session_id, current_time_ms())
+            .await
+            .is_some_and(|snapshot| {
+                matches!(
+                    snapshot.authorization_state,
+                    RemoteAuthorizationState::Denied
+                        | RemoteAuthorizationState::Expired
+                        | RemoteAuthorizationState::Revoked
+                        | RemoteAuthorizationState::LockedOut
+                        | RemoteAuthorizationState::PolicyChanged
+                )
+            })
+    } else {
+        false
+    };
+    if terminal {
+        crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    }
+    match result {
+        Ok(Some(evidence)) => IpcResponse::RouteEvidence { evidence },
+        Ok(None) => IpcResponse::Error {
+            code: "E_REMOTE_SESSION_NOT_FOUND".to_string(),
+            message: format!("remote session not found: {}", session_id.0),
+        },
+        Err(failure) => IpcResponse::RemoteAccessError {
+            session_id: Some(session_id),
+            peer_key_id: None,
+            failure,
+        },
+    }
+}
+
 /// Resolve a single exact attended-consent request.
 pub async fn respond_to_consent(
     app_state: &Arc<AppState>,
     response: mrd_ipc::ConsentResponse,
 ) -> IpcResponse {
     let session_id = response.session_id.clone();
+    let approved_scope_count = response.approved_scopes.len();
+    let peer_device_id = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .map(|snapshot| snapshot.peer_device_id);
     let result = app_state
         .session_authorizations
         .respond_to_consent_with_audit(response, current_time_ms(), |snapshot, response| {
@@ -87,6 +139,30 @@ pub async fn respond_to_consent(
             }
         }
         Err(crate::session_authorization::ConsentResolutionError::Rejected(failure)) => {
+            let failure_reason = crate::lan_discovery::remote_reason_code_wire_name(failure.code);
+            if app_state
+                .audit_log
+                .record(
+                    "session.consent_decision",
+                    "rejected",
+                    Some(session_id.clone()),
+                    None,
+                    peer_device_id,
+                    Some("lan_quic".to_string()),
+                    Some(failure_reason),
+                    vec![(
+                        "approved_scope_count".to_string(),
+                        approved_scope_count.to_string(),
+                    )],
+                )
+                .is_err()
+            {
+                app_state.mark_security_unhealthy();
+                return IpcResponse::Error {
+                    code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+                    message: "rejected consent decision could not be durably audited".to_string(),
+                };
+            }
             IpcResponse::RemoteAccessError {
                 session_id: Some(session_id),
                 peer_key_id: None,
@@ -232,7 +308,7 @@ fn map_lan_remote_session_error(error: &anyhow::Error, peer_device_id: &DeviceId
         RemoteReasonCode::LanUnreachable
     };
     let suggested_action = match code {
-        RemoteReasonCode::IdentityMismatch => {
+        RemoteReasonCode::IdentityMismatch | RemoteReasonCode::CertificateBindingMismatch => {
             Some("verify the peer identity and pair the device again".to_string())
         }
         RemoteReasonCode::TrustRequired => Some(format!(
@@ -269,10 +345,13 @@ async fn finish_start_lan_remote_session_error(
     peer_device_id: &DeviceId,
     error: anyhow::Error,
 ) -> IpcResponse {
-    let message = error.to_string();
-    let failure = map_lan_remote_session_error(&error, peer_device_id);
+    let mut failure = map_lan_remote_session_error(&error, peer_device_id);
+    let mut peer_key_id = None;
     if let Some(session) = app_state.session_authorizations.snapshot(&session_id).await {
-        if session.failure.is_none() {
+        peer_key_id = Some(session.peer_key_id.clone());
+        if let Some(existing_failure) = session.failure {
+            failure = existing_failure;
+        } else {
             let terminal_state =
                 if session.authorization_state == mrd_ipc::RemoteAuthorizationState::Granted {
                     mrd_ipc::RemoteAuthorizationState::Revoked
@@ -281,13 +360,19 @@ async fn finish_start_lan_remote_session_error(
                 };
             app_state
                 .session_authorizations
-                .record_failure(&session_id, terminal_state, failure, current_time_ms())
+                .record_failure(
+                    &session_id,
+                    terminal_state,
+                    failure.clone(),
+                    current_time_ms(),
+                )
                 .await;
         }
     }
-    IpcResponse::Error {
-        code: "E_LAN_REMOTE".to_string(),
-        message,
+    IpcResponse::RemoteAccessError {
+        session_id: Some(session_id),
+        peer_key_id,
+        failure,
     }
 }
 
@@ -1711,13 +1796,18 @@ mod tests {
         )
         .await;
 
-        match response {
-            IpcResponse::Error { code, message } => {
-                assert_eq!(code, "E_LAN_REMOTE");
-                assert!(message.contains("missing-peer"));
-            }
-            _ => panic!("Expected LAN remote error response"),
-        }
+        let IpcResponse::RemoteAccessError {
+            session_id: failed_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("expected typed LAN remote error response");
+        };
+        assert_eq!(failed_session_id, Some(session_id.clone()));
+        assert_eq!(peer_key_id, None);
+        assert_eq!(failure.code, RemoteReasonCode::TrustRequired);
+        assert!(failure.message.contains("missing-peer"));
 
         let sessions = app_state.sessions.lock().await;
         assert!(sessions.get(&session_id).is_none());
@@ -1738,11 +1828,18 @@ mod tests {
         )
         .await;
 
-        let IpcResponse::Error { code, message } = response else {
-            panic!("expected LAN start error response");
+        let IpcResponse::RemoteAccessError {
+            session_id: failed_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("expected typed LAN start error response");
         };
-        assert_eq!(code, "E_LAN_REMOTE");
-        assert!(message.contains("timed out"));
+        assert_eq!(failed_session_id, Some(session_id.clone()));
+        assert_eq!(peer_key_id.as_deref(), Some("secure-peer-key"));
+        assert_eq!(failure.code, RemoteReasonCode::LanUnreachable);
+        assert!(failure.message.contains("timed out"));
         let authorization = app_state
             .session_authorizations
             .snapshot(&session_id)
@@ -2330,7 +2427,6 @@ mod tests {
             crate::lan_discovery::LanProtocolError::InvalidKeyEpoch,
             crate::lan_discovery::LanProtocolError::InvalidSignature,
             crate::lan_discovery::LanProtocolError::PeerBindingMismatch,
-            crate::lan_discovery::LanProtocolError::CertificateFingerprintMismatch,
         ] {
             let failure = map_lan_remote_session_error(
                 &anyhow::Error::new(error),
@@ -2343,6 +2439,44 @@ mod tests {
                 error
             );
         }
+
+        let certificate_failure = map_lan_remote_session_error(
+            &anyhow::Error::new(
+                crate::lan_discovery::LanProtocolError::CertificateFingerprintMismatch,
+            ),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(
+            certificate_failure.code,
+            RemoteReasonCode::CertificateBindingMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_start_lan_error_preserves_typed_certificate_failure() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("certificate-session".to_string());
+
+        let response = finish_start_lan_remote_session_error(
+            &app_state,
+            session_id.clone(),
+            &DeviceId("peer".to_string()),
+            anyhow::Error::new(
+                crate::lan_discovery::LanProtocolError::CertificateFingerprintMismatch,
+            ),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: actual_session_id,
+            failure,
+            ..
+        } = response
+        else {
+            panic!("expected typed remote-access failure");
+        };
+        assert_eq!(actual_session_id, Some(session_id));
+        assert_eq!(failure.code, RemoteReasonCode::CertificateBindingMismatch);
     }
 
     #[test]

@@ -172,6 +172,7 @@ jobs:
           pwsh -NoProfile -ExecutionPolicy Bypass -File tests/component-matrix/scripts/test_component_matrix_common.ps1 2>&1 | tee component-matrix.log
           pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_transport_matrix_common.ps1 2>&1 | tee transport-matrix.log
           pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_paired_lan_canary_common.ps1 2>&1 | tee paired-canary.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_secure_lan_negative.ps1 2>&1 | tee secure-lan-negative.log
           pnpm --dir apps/Rdesk test -- --run src/app/services/lanE2eAutomationService.test.ts src/app/services/lanE2eTelemetryService.test.ts
           pnpm --dir apps/Rdesk type-check
 
@@ -185,6 +186,8 @@ jobs:
             component-matrix.log
             transport-matrix.log
             paired-canary.log
+            secure-lan-negative.log
+            artifacts/e2e/security-negative/
           if-no-files-found: warn
 
       - name: Enforce quality gate
@@ -325,3 +328,57 @@ jobs:
           name: device-lab-mainline-e2e
           path: artifacts/e2e/device-lab/
           if-no-files-found: ignore
+
+  secure-lan-device-lab:
+    name: Secure LAN device-lab positive gate
+    needs: [l0-l1-generic, quality-gate]
+    if: >-
+      ${{
+        always() &&
+        needs.l0-l1-generic.result == 'success' &&
+        needs.quality-gate.result == 'success' &&
+        vars.MRD_DEVICE_LAB_SECURE_LAN_ENABLED == 'true' &&
+        (inputs.target_device_id != '' || vars.MRD_DEVICE_LAB_TARGET_DEVICE_ID != '') &&
+        (
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && inputs.run_device_lab)
+        )
+      }}
+    runs-on: [self-hosted, Windows, X64, device-lab]
+    timeout-minutes: 180
+    env:
+      TARGET_DEVICE_ID: ${{ inputs.target_device_id || vars.MRD_DEVICE_LAB_TARGET_DEVICE_ID }}
+      TARGET_ADDRESS: ${{ inputs.target_address || vars.MRD_DEVICE_LAB_TARGET_ADDRESS || '' }}
+      DURATION_SECS: ${{ inputs.duration_secs || vars.MRD_DEVICE_LAB_DURATION_SECS || '30' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run secure LAN paired positive scenario
+        shell: powershell
+        run: |
+          $args = @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", "tests/benchmarks/scripts/run_paired_lan_canary.ps1",
+            "-SkipLocal",
+            "-OutputDir", "artifacts/e2e/device-lab/secure-lan",
+            "-ScenarioId", "cross.e2e.secure_remote_display",
+            "-ProfileId", "1080p60",
+            "-DurationSecs", $env:DURATION_SECS,
+            "-TargetDeviceId", $env:TARGET_DEVICE_ID
+          )
+          if ($env:TARGET_ADDRESS) {
+            $args += @("-TargetAddress", $env:TARGET_ADDRESS)
+          }
+          & powershell @args
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload secure LAN device-lab artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secure-lan-device-lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e/device-lab/secure-lan/
+          if-no-files-found: warn

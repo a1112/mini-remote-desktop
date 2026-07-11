@@ -4,9 +4,15 @@ mod artifact;
 mod evaluator;
 mod policy;
 
-pub use artifact::{validate_artifact, ArtifactError, RemoteExperienceRun};
+pub use artifact::{
+    validate_artifact, validate_artifact_for_policy, ArtifactError, RemoteExperienceRun,
+    SecurityEvidence, SideEffectEvidence,
+};
 pub use evaluator::{evaluate, evaluate_allowed_skip, Evaluation};
-pub use policy::{AllowedSkip, GatePolicy, ThresholdRule};
+pub use policy::{
+    validate_policy, AllowedSkip, GatePolicy, PolicyError, SecureLanRequirements,
+    SecurityNegativeAttemptRule, SecurityNegativeRequirements, ThresholdRule,
+};
 
 /// Stable product-gate outcomes shared by scripts, CI, and release artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -1419,12 +1419,36 @@ pub async fn request_lan_remote_session_authorized(
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
     match ack {
         LanDiscoveryPacket::SignedRemoteSessionBootstrap(bootstrap) => {
-            bootstrap.verify_for_request(
+            if let Err(error) = bootstrap.verify_for_request(
                 now_ms(),
                 &signed_request,
                 &peer_public_key,
                 peer_key_epoch,
-            )?;
+            ) {
+                if error == LanProtocolError::CertificateFingerprintMismatch {
+                    let reason = remote_reason_code_wire_name(error.remote_reason_code());
+                    if app_state
+                        .audit_log
+                        .record(
+                            "session.authorization_decision",
+                            "denied",
+                            Some(session_id.clone()),
+                            None,
+                            Some(target_device_id.clone()),
+                            Some(transport_kind.to_string()),
+                            Some(reason),
+                            Vec::new(),
+                        )
+                        .is_err()
+                    {
+                        app_state.mark_security_unhealthy();
+                        anyhow::bail!(
+                            "authoritative security audit is unavailable after certificate binding rejection"
+                        );
+                    }
+                }
+                return Err(error.into());
+            }
             // Keep trust stable until the verified grant and connected receiver
             // are both committed. A concurrent revoke waits, then terminates
             // the now-visible authorization and media state before returning.
@@ -3174,6 +3198,11 @@ fn post_admission_failure_for_error(
                 "authenticated LAN identity binding failed during grant issuance",
                 "verify the paired device identity and retry",
             ),
+            RemoteReasonCode::CertificateBindingMismatch => (
+                code,
+                "the LAN transport certificate no longer matches the signed grant",
+                "verify the paired device identity and retry",
+            ),
             RemoteReasonCode::ReplayDetected => (
                 code,
                 "the secure LAN request nonce was rejected during grant issuance",
@@ -3310,7 +3339,7 @@ fn post_consent_failure_state(code: RemoteReasonCode) -> RemoteAuthorizationStat
     }
 }
 
-fn remote_reason_code_wire_name(code: RemoteReasonCode) -> String {
+pub(crate) fn remote_reason_code_wire_name(code: RemoteReasonCode) -> String {
     serde_json::to_string(&code)
         .unwrap_or_else(|_| "\"policy_changed\"".to_string())
         .trim_matches('"')
@@ -6844,5 +6873,7 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
     true
 }
 
+#[cfg(test)]
+mod security_negative_evidence_tests;
 #[cfg(test)]
 mod tests;

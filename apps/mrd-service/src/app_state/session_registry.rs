@@ -6,19 +6,32 @@ use std::collections::HashMap;
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     sessions: HashMap<SessionId, SessionSnapshot>,
+    sender_activation_count: u64,
+    receiver_activation_count: u64,
 }
 
 impl SessionRegistry {
     pub fn insert(&mut self, session_id: SessionId, snapshot: SessionSnapshot) {
+        let previous = self.sessions.get(&session_id);
+        if snapshot.sender_active && previous.is_none_or(|snapshot| !snapshot.sender_active) {
+            self.sender_activation_count = self.sender_activation_count.saturating_add(1);
+        }
+        if snapshot.receiver_active && previous.is_none_or(|snapshot| !snapshot.receiver_active) {
+            self.receiver_activation_count = self.receiver_activation_count.saturating_add(1);
+        }
         self.sessions.insert(session_id, snapshot);
+    }
+
+    pub fn sender_activation_count(&self) -> u64 {
+        self.sender_activation_count
+    }
+
+    pub fn receiver_activation_count(&self) -> u64 {
+        self.receiver_activation_count
     }
 
     pub fn get(&self, session_id: &SessionId) -> Option<&SessionSnapshot> {
         self.sessions.get(session_id)
-    }
-
-    pub fn get_mut(&mut self, session_id: &SessionId) -> Option<&mut SessionSnapshot> {
-        self.sessions.get_mut(session_id)
     }
 
     pub fn remove(&mut self, session_id: &SessionId) -> Option<SessionSnapshot> {
@@ -79,5 +92,39 @@ mod tests {
             Some("second-target".to_string())
         );
         assert!(registry.list_all().is_empty());
+    }
+
+    #[test]
+    fn activation_counts_are_monotonic_across_replacement_and_removal() {
+        let first_session = SessionId("activation-first".to_string());
+        let second_session = SessionId("activation-second".to_string());
+        let mut registry = SessionRegistry::default();
+
+        let mut inactive = snapshot(&first_session, "first-target");
+        inactive.sender_active = false;
+        registry.insert(first_session.clone(), inactive.clone());
+        assert_eq!(registry.sender_activation_count(), 0);
+        assert_eq!(registry.receiver_activation_count(), 0);
+
+        let mut sender_active = inactive.clone();
+        sender_active.sender_active = true;
+        registry.insert(first_session.clone(), sender_active.clone());
+        registry.insert(first_session.clone(), sender_active);
+        assert_eq!(registry.sender_activation_count(), 1);
+
+        registry.insert(first_session.clone(), inactive);
+        let mut reactivated = snapshot(&first_session, "first-target");
+        reactivated.receiver_active = true;
+        registry.insert(first_session.clone(), reactivated);
+        assert_eq!(registry.sender_activation_count(), 2);
+        assert_eq!(registry.receiver_activation_count(), 1);
+
+        registry.remove(&first_session);
+        let mut initially_active = snapshot(&second_session, "second-target");
+        initially_active.receiver_active = true;
+        registry.insert(second_session, initially_active);
+
+        assert_eq!(registry.sender_activation_count(), 3);
+        assert_eq!(registry.receiver_activation_count(), 2);
     }
 }
