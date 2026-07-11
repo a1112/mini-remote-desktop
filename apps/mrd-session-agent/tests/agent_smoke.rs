@@ -1,10 +1,10 @@
 use mrd_agent_ipc::{
     encode_frame, read_frame, write_frame, AgentCapability, AgentChallenge, AgentCommand,
-    AgentProtocolState, AgentStopping, AgentToService, AuthorizedCommand, CommandOutcome,
-    CommandResult, ConsentDecision, ConsentRequest, DesktopKind, ExecuteCommand, ExecuteGrant,
-    ExecuteGrantClaims, ExecuteGrantVerifier, GrantAudience, PeerBinding,
-    RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
-    AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AgentProtocolState, AgentStopping, AgentToService, AuthorizedCommand, CancelConsent,
+    CommandOutcome, CommandResult, ConsentCancelReason, ConsentDecision, ConsentRequest,
+    DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, ExecuteGrantVerifier,
+    GrantAudience, PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason,
+    StoppingReason, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::PermissionScope;
@@ -324,6 +324,7 @@ async fn agent_registers_reports_capabilities_heartbeats_and_stops_cleanly() {
             windows_session_id: 7,
             issued_at_ms: 1_000,
             expires_at_ms: 2_000,
+            authorization_expires_at_ms: 2_500,
         }),
     )
     .await;
@@ -343,6 +344,22 @@ async fn agent_registers_reports_capabilities_heartbeats_and_stops_cleanly() {
             other => panic!("expected consent result or heartbeat, got {other:?}"),
         }
     }
+
+    send_service_message(
+        &mut service_stream,
+        &ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: 1,
+            request_id: [12; 16],
+            session_id: SessionId("consent-session".to_owned()),
+            reason: ConsentCancelReason::CallerAborted,
+        }),
+    )
+    .await;
+    let heartbeat_after_cancel = match read_agent_message(&mut service_stream).await {
+        AgentToService::AgentHeartbeat(heartbeat) => heartbeat.context.sequence,
+        other => panic!("expected heartbeat after safe cancel consume, got {other:?}"),
+    };
+    assert!(heartbeat_after_cancel > 0);
 
     let heartbeat_sequence = match heartbeat_sequence {
         Some(sequence) => sequence,

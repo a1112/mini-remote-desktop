@@ -1,9 +1,10 @@
 use mrd_agent_ipc::{
-    read_frame, write_frame, AgentCapability, AgentCapabilitySnapshot, AgentCommand, AgentRegister,
-    AgentRegistered, AgentToService, CommandOutcome, CommandResult, ConsentDecision,
-    ConsentRequest, ConsentResult, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
-    GrantAudience, InputAck, InputAckOutcome, InputEventEnvelope, InputEventPayload, PeerBinding,
-    RegistrationProofVerifier, ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
+    decode_frame, read_frame, write_frame, AgentCapability, AgentCapabilitySnapshot, AgentCommand,
+    AgentRegister, AgentRegistered, AgentToService, CancelConsent, CommandOutcome, CommandResult,
+    ConsentCancelReason, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
+    ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, GrantAudience, InputAck, InputAckOutcome,
+    InputEventEnvelope, InputEventPayload, PeerBinding, RegistrationProofVerifier, ServiceToAgent,
+    AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
@@ -21,7 +22,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::io::DuplexStream;
+use tokio::io::{AsyncReadExt, DuplexStream};
 
 const NOW_MS: u64 = 1_000;
 const WINDOWS_SESSION_ID: u32 = 7;
@@ -121,6 +122,32 @@ impl ConnectedAgent {
         capabilities: BTreeSet<AgentCapability>,
         replacement_policy: ReplacementPolicy,
     ) -> Self {
+        Self::connect_to_with_minor(
+            registry,
+            server,
+            windows_session_id,
+            process_id,
+            connection_value,
+            stream_capacity,
+            capabilities,
+            replacement_policy,
+            AGENT_IPC_PROTOCOL_MINOR,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn connect_to_with_minor(
+        registry: Arc<AgentRegistry>,
+        server: Arc<AgentServer>,
+        windows_session_id: u32,
+        process_id: u32,
+        connection_value: u8,
+        stream_capacity: usize,
+        capabilities: BTreeSet<AgentCapability>,
+        replacement_policy: ReplacementPolicy,
+        protocol_minor: u16,
+    ) -> Self {
         let logon_sid_hash = [windows_session_id as u8; 32];
         let agent_key_id = [process_id as u8; 32];
         registry
@@ -176,7 +203,7 @@ impl ConnectedAgent {
                 challenge_id: challenge.challenge_id,
                 agent_instance_id: register.agent_instance_id,
                 accepted_protocol_major: 1,
-                accepted_protocol_minor: AGENT_IPC_PROTOCOL_MINOR,
+                accepted_protocol_minor: protocol_minor,
                 signed_at_ms: NOW_MS,
                 signature: [11; 64],
             }),
@@ -193,7 +220,7 @@ impl ConnectedAgent {
             registration_id: challenge.registration_id,
             registration_epoch: challenge.registration_epoch,
             protocol_major: 1,
-            protocol_minor: AGENT_IPC_PROTOCOL_MINOR,
+            protocol_minor,
         };
         write_frame(
             &mut stream,
@@ -311,6 +338,7 @@ fn consent_request(request_id: [u8; 16], windows_session_id: u32) -> ConsentRequ
         windows_session_id,
         issued_at_ms: NOW_MS - 1,
         expires_at_ms: NOW_MS + 5_000,
+        authorization_expires_at_ms: NOW_MS + 10_000,
     }
 }
 
@@ -583,6 +611,16 @@ async fn mismatched_and_late_consent_results_cannot_complete_a_retried_request()
     )
     .await
     .expect("send late consent");
+    let cancel = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read timed-out consent cancellation")
+        .message
+    {
+        ServiceToAgent::CancelConsent(cancel) => cancel,
+        other => panic!("expected consent cancellation, got {other:?}"),
+    };
+    assert_eq!(cancel.request_token, delivered.request_token);
+    assert_eq!(cancel.reason, ConsentCancelReason::TimedOut);
     let retrying = tokio::spawn({
         let server = Arc::clone(&agent.server);
         let request = request.clone();
@@ -650,6 +688,35 @@ async fn expired_consent_and_missing_consent_capability_fail_before_delivery() {
 }
 
 #[tokio::test]
+async fn consent_cancel_contract_rejects_an_agent_negotiated_at_minor_one() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let legacy = ConnectedAgent::connect_to_with_minor(
+        registry,
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Consent, AgentCapability::Input]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+        1,
+    )
+    .await;
+
+    assert_eq!(
+        server
+            .request_consent(consent_request([26; 16], WINDOWS_SESSION_ID))
+            .await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::ProtocolVersionUnavailable,
+        ))
+    );
+    assert_eq!(legacy.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
 async fn aborting_consent_futures_frees_pending_capacity() {
     let mut agent = ConnectedAgent::start(Duration::from_secs(5)).await;
     for value in 40..80_u8 {
@@ -672,8 +739,239 @@ async fn aborting_consent_futures_frees_pending_capacity() {
         ));
         requesting.abort();
         let _ = requesting.await;
+        let cancel = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_frame::<_, ServiceToAgent>(&mut agent.stream),
+        )
+        .await
+        .expect("aborted delivered consent must be cancelled")
+        .expect("read consent cancel");
+        assert!(matches!(
+            cancel.message,
+            ServiceToAgent::CancelConsent(CancelConsent {
+                reason: ConsentCancelReason::CallerAborted,
+                ..
+            })
+        ));
     }
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn aborting_a_delivered_consent_queues_exact_cancel_cleanup() {
+    let mut agent = ConnectedAgent::start(Duration::from_secs(5)).await;
+    let request = consent_request([79; 16], WINDOWS_SESSION_ID);
+    let requesting = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let request = request.clone();
+        async move { server.request_consent(request).await }
+    });
+    let delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read delivered consent")
+        .message
+    {
+        ServiceToAgent::ConsentRequest(request) => request,
+        other => panic!("expected consent request, got {other:?}"),
+    };
+
+    requesting.abort();
+    let _ = requesting.await;
+    let cancel = match tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, ServiceToAgent>(&mut agent.stream),
+    )
+    .await
+    .expect("delivered consent abort must queue cancellation")
+    .expect("read consent cancellation")
+    .message
+    {
+        ServiceToAgent::CancelConsent(cancel) => cancel,
+        other => panic!("expected consent cancellation, got {other:?}"),
+    };
+    assert_eq!(
+        cancel,
+        CancelConsent {
+            request_token: delivered.request_token,
+            request_id: delivered.request_id,
+            session_id: delivered.session_id,
+            reason: ConsentCancelReason::CallerAborted,
+        }
+    );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn aborting_a_partially_written_consent_hard_closes_without_appending_cancel() {
+    let mut agent = ConnectedAgent::start_with_capacity(Duration::from_secs(5), 64).await;
+    let requesting = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        async move {
+            server
+                .request_consent(consent_request([78; 16], WINDOWS_SESSION_ID))
+                .await
+        }
+    });
+
+    let mut partial = vec![0_u8; 16];
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        agent.stream.read_exact(&mut partial),
+    )
+    .await
+    .expect("consent frame must begin writing")
+    .expect("read partial consent frame");
+    requesting.abort();
+    let _ = requesting.await;
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        agent.stream.read_to_end(&mut partial),
+    )
+    .await
+    .expect("partial cancellation must hard-close the stream")
+    .expect("drain partial stream");
+    assert!(
+        decode_frame::<ServiceToAgent>(&partial).is_err(),
+        "a CancelConsent frame must not be appended to a partial request frame"
+    );
+    assert_eq!(
+        agent
+            .serving
+            .await
+            .expect("server task")
+            .expect("server connection"),
+        AgentConnectionExit::Disconnected
+    );
+}
+
+#[tokio::test]
+async fn aborting_a_queued_consent_sends_neither_prompt_nor_cancel() {
+    let mut agent = ConnectedAgent::start_with_capacity(Duration::from_secs(5), 512).await;
+    let mut blockers = Vec::new();
+    for value in 80..111_u8 {
+        blockers.push(tokio::spawn({
+            let server = Arc::clone(&agent.server);
+            let binding = agent.binding.clone();
+            async move {
+                server
+                    .request_execute(&binding, execute_command([value; 16]))
+                    .await
+            }
+        }));
+    }
+    let target_id = [111; 16];
+    let target = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        async move {
+            server
+                .request_consent(consent_request(target_id, WINDOWS_SESSION_ID))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    target.abort();
+    let _ = target.await;
+
+    let mut execute_count = 0;
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(100),
+            read_frame::<_, ServiceToAgent>(&mut agent.stream),
+        )
+        .await
+        {
+            Ok(Ok(frame)) => match frame.message {
+                ServiceToAgent::Execute(_) => execute_count += 1,
+                ServiceToAgent::ConsentRequest(request) if request.request_id == target_id => {
+                    panic!("queued aborted consent prompt was delivered")
+                }
+                ServiceToAgent::CancelConsent(cancel) if cancel.request_id == target_id => {
+                    panic!("never-delivered consent was cancelled")
+                }
+                other => panic!("unexpected queued frame: {other:?}"),
+            },
+            Ok(Err(error)) => panic!("failed reading queued requests: {error}"),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(execute_count, 31);
+
+    for blocker in blockers {
+        blocker.abort();
+        let _ = blocker.await;
+    }
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn consent_cancel_is_never_retargeted_to_a_replacement_generation() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(5));
+    let capabilities = || {
+        [AgentCapability::Consent, AgentCapability::Input]
+            .into_iter()
+            .collect()
+    };
+    let mut first = ConnectedAgent::connect_to(
+        Arc::clone(&registry),
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        capabilities(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let requesting = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            server
+                .request_consent(consent_request([112; 16], WINDOWS_SESSION_ID))
+                .await
+        }
+    });
+    assert!(matches!(
+        read_frame::<_, ServiceToAgent>(&mut first.stream)
+            .await
+            .expect("first generation receives prompt")
+            .message,
+        ServiceToAgent::ConsentRequest(_)
+    ));
+
+    let mut replacement = ConnectedAgent::connect_to(
+        registry,
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID + 1,
+        2,
+        32 * 1024,
+        capabilities(),
+        ReplacementPolicy::ReplaceExisting {
+            expected_registration_id: first.identity.registration_id,
+            expected_registration_epoch: first.identity.registration_epoch,
+        },
+    )
+    .await;
+    assert_eq!(
+        requesting.await.expect("request task"),
+        Err(AgentRequestError::Revoked)
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            read_frame::<_, ServiceToAgent>(&mut replacement.stream),
+        )
+        .await
+        .is_err(),
+        "replacement must not receive an earlier generation's consent cancel"
+    );
+
+    drop(first.stream);
+    let _ = first.serving.await;
+    assert_eq!(
+        replacement.finish().await,
+        AgentConnectionExit::Disconnected
+    );
 }
 
 #[tokio::test]

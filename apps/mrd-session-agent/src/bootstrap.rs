@@ -208,6 +208,8 @@ struct AuthenticatedLaunch {
     service_process_creation_time: u64,
     config: AgentRuntimeConfig,
     signer: OneShotEd25519Signer,
+    _execute_grant_issuer_key_id: [u8; 32],
+    _execute_grant_public_key: [u8; 32],
     _parent_process: windows_platform::ServiceProcessGuard,
 }
 
@@ -224,6 +226,8 @@ fn build_launch(
         handshake_timeout_ms,
         expected_agent_key_id,
         seed,
+        execute_grant_issuer_key_id,
+        execute_grant_public_key,
     ) = bootstrap.into_parts();
     let heartbeat_interval = Duration::from_millis(u64::from(heartbeat_interval_ms));
     let handshake_timeout = Duration::from_millis(u64::from(handshake_timeout_ms));
@@ -244,6 +248,8 @@ fn build_launch(
             handshake_timeout,
         },
         signer: OneShotEd25519Signer::new(seed, expected_agent_key_id)?,
+        _execute_grant_issuer_key_id: execute_grant_issuer_key_id,
+        _execute_grant_public_key: execute_grant_public_key,
         _parent_process: descriptor.parent_process,
     })
 }

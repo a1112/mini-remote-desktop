@@ -538,6 +538,10 @@ impl AgentRuntime {
                         Some(InboundEvent::Message(ServiceToAgent::ConsentRequest(request))) => {
                             self.handle_consent(writer, request).await?;
                         }
+                        Some(InboundEvent::Message(ServiceToAgent::CancelConsent(_))) => {
+                            // Consent manager installation is a later task. Cancellation is
+                            // cleanup, so an agent without a manager consumes it safely.
+                        }
                         Some(InboundEvent::Message(ServiceToAgent::InputEvent(envelope))) => {
                             self.handle_input(writer, &identity, envelope).await?;
                         }

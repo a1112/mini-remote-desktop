@@ -3,13 +3,16 @@ use mrd_agent_ipc::{
     validate_execute_command, validate_input_event, write_frame, AgentCapability,
     AgentCapabilitySnapshot, AgentChallenge, AgentCommand, AgentCrashed, AgentEventContext,
     AgentHeartbeat, AgentProtocolState, AgentRegister, AgentRegistered, AgentStopping,
-    AgentToService, AudioDirection, CommandOutcome, CommandResult, ConsentDecision, ConsentRequest,
-    ConsentResult, ConsentValidationError, DesktopChanged, DesktopKind, ExecuteCommand,
-    ExecuteGrant, ExecuteGrantClaims, ExecuteGrantVerifier, ExecutionContext, FileDirection,
-    FrameError, GrantAudience, GrantValidationError, InputAck, InputAckOutcome, InputButton,
-    InputEventEnvelope, InputEventPayload, InputFailure, InputKey, InputRejection, Locked,
-    PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
-    Unlocked, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AgentToService, AudioDirection, CancelConsent, CommandOutcome, CommandResult,
+    ConsentCancelReason, ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError,
+    DesktopChanged, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
+    ExecuteGrantVerifier, ExecutionContext, FileDirection, FrameError, GrantAudience,
+    GrantValidationError, InputAck, InputAckOutcome, InputButton, InputEventEnvelope,
+    InputEventPayload, InputFailure, InputKey, InputRejection, Locked, PeerBinding,
+    RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason, Unlocked,
+    AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
+    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES,
+    AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -58,6 +61,7 @@ fn consent_request() -> ConsentRequest {
         windows_session_id: 7,
         issued_at_ms: 1_600,
         expires_at_ms: 2_000,
+        authorization_expires_at_ms: 2_500,
     }
 }
 
@@ -504,6 +508,7 @@ fn consent_result_is_correlated_and_cannot_expand_approved_scopes() {
         validated.approved_scopes(),
         &scopes([PermissionScope::ScreenView])
     );
+    assert_eq!(validated.authorization_expires_at_ms(), 2_500);
 
     let mut escalated = consent_result();
     escalated
@@ -532,6 +537,57 @@ fn consent_result_is_correlated_and_cannot_expand_approved_scopes() {
         validate_consent_result(&consent_request(), &consent_result(), 2_000),
         Err(ConsentValidationError::Expired)
     );
+}
+
+#[test]
+fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
+    let request = consent_request();
+    let validated = validate_consent_result(&request, &consent_result(), 1_700)
+        .expect("valid consent with a longer authorization window");
+    assert_eq!(request.expires_at_ms, 2_000);
+    assert_eq!(validated.authorization_expires_at_ms(), 2_500);
+
+    let mut authorization_before_prompt = request.clone();
+    authorization_before_prompt.authorization_expires_at_ms = request.expires_at_ms - 1;
+    assert_eq!(
+        validate_consent_result(&authorization_before_prompt, &consent_result(), 1_700),
+        Err(ConsentValidationError::InvalidRequest)
+    );
+
+    let mut excessive_authorization = request.clone();
+    excessive_authorization.authorization_expires_at_ms =
+        request.issued_at_ms + AGENT_CONSENT_MAX_LIFETIME_MS + 1;
+    assert_eq!(
+        validate_consent_result(&excessive_authorization, &consent_result(), 1_700),
+        Err(ConsentValidationError::InvalidRequest)
+    );
+
+    assert_eq!(
+        validate_consent_result(&request, &consent_result(), request.expires_at_ms),
+        Err(ConsentValidationError::Expired),
+        "the prompt deadline still controls when a decision may be returned"
+    );
+}
+
+#[test]
+fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
+    assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
+    assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 2);
+
+    for reason in [
+        ConsentCancelReason::CallerAborted,
+        ConsentCancelReason::TimedOut,
+        ConsentCancelReason::SessionClosed,
+        ConsentCancelReason::PolicyChanged,
+    ] {
+        round_trip(&ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: 91,
+            request_id: REQUEST_ID,
+            session_id: session_id(),
+            reason,
+        }));
+    }
 }
 
 #[test]
@@ -801,7 +857,8 @@ fn execute_grant_digest_covers_the_command_id() {
 
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 1);
+    assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 2);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
@@ -837,7 +894,14 @@ fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     );
 
     for value in [
-        serde_json::to_value(ServiceToAgent::ConsentRequest(request)).unwrap(),
+        serde_json::to_value(ServiceToAgent::ConsentRequest(request.clone())).unwrap(),
+        serde_json::to_value(ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: 0,
+            request_id: request.request_id,
+            session_id: request.session_id,
+            reason: ConsentCancelReason::CallerAborted,
+        }))
+        .unwrap(),
         serde_json::to_value(ServiceToAgent::InputEvent(event)).unwrap(),
         serde_json::to_value(ServiceToAgent::Execute(Box::new(execute))).unwrap(),
     ] {

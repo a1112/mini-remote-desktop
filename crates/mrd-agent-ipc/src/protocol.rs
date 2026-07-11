@@ -29,7 +29,9 @@ pub fn hash_windows_logon_sid(sid_bytes: &[u8]) -> Option<[u8; 32]> {
     digest.copy_from_slice(context.finish().as_ref());
     Some(digest)
 }
-/// Maximum lifetime of an interactive consent request.
+/// Maximum lifetime of consent-derived authorization from request issuance.
+///
+/// The prompt deadline is bounded by this same outer authorization deadline.
 pub const AGENT_CONSENT_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 /// Maximum UTF-8 bytes in protocol identifiers inherited from domain types.
 pub const AGENT_IPC_MAX_IDENTIFIER_BYTES: usize = 256;
@@ -243,8 +245,42 @@ pub struct ConsentRequest {
     pub windows_session_id: u32,
     /// Inclusive request activation time.
     pub issued_at_ms: u64,
-    /// Exclusive request expiry time.
+    /// Exclusive prompt/decision expiry time.
     pub expires_at_ms: u64,
+    /// Exclusive expiry of authorization derived from an approval.
+    ///
+    /// This is independent of the prompt deadline and must never be replaced
+    /// with `expires_at_ms` when binding a product session.
+    pub authorization_expires_at_ms: u64,
+}
+
+/// Why the service is withdrawing an already-delivered consent prompt.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentCancelReason {
+    /// The caller that requested consent abandoned its future.
+    CallerAborted,
+    /// The service-side response deadline elapsed.
+    TimedOut,
+    /// The logical product session ended.
+    SessionClosed,
+    /// Local policy invalidated the request.
+    PolicyChanged,
+}
+
+/// Cleanup for one exact consent request already delivered to an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CancelConsent {
+    /// Exact nonzero transport token from the delivered request.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
+    /// Exact one-shot consent request identifier.
+    pub request_id: [u8; 16],
+    /// Exact logical session from the delivered request.
+    pub session_id: SessionId,
+    /// Reason the prompt is being withdrawn.
+    pub reason: ConsentCancelReason,
 }
 
 /// Local user's decision for a consent request.
@@ -326,6 +362,7 @@ pub struct ValidatedConsent {
     decision: ConsentDecision,
     approved_scopes: PermissionScopes,
     decided_at_ms: u64,
+    authorization_expires_at_ms: u64,
 }
 
 impl ValidatedConsent {
@@ -368,6 +405,11 @@ impl ValidatedConsent {
     pub fn decided_at_ms(&self) -> u64 {
         self.decided_at_ms
     }
+
+    /// Return the authorization deadline independently of the prompt deadline.
+    pub fn authorization_expires_at_ms(&self) -> u64 {
+        self.authorization_expires_at_ms
+    }
 }
 
 /// Correlate an untrusted agent result with the exact service-created request.
@@ -388,7 +430,10 @@ pub fn validate_consent_result(
         || request.windows_session_id == 0
         || request.issued_at_ms == 0
         || request.expires_at_ms <= request.issued_at_ms
-        || request.expires_at_ms.saturating_sub(request.issued_at_ms)
+        || request.authorization_expires_at_ms < request.expires_at_ms
+        || request
+            .authorization_expires_at_ms
+            .saturating_sub(request.issued_at_ms)
             > AGENT_CONSENT_MAX_LIFETIME_MS
     {
         return Err(ConsentValidationError::InvalidRequest);
@@ -444,6 +489,7 @@ pub fn validate_consent_result(
         decision: result.decision,
         approved_scopes: result.approved_scopes.clone(),
         decided_at_ms: result.decided_at_ms,
+        authorization_expires_at_ms: request.authorization_expires_at_ms,
     })
 }
 
@@ -1231,6 +1277,8 @@ pub enum ServiceToAgent {
     AgentChallenge(AgentChallenge),
     /// Ask the interactive user for consent.
     ConsentRequest(ConsentRequest),
+    /// Withdraw one consent prompt already delivered on this exact connection.
+    CancelConsent(CancelConsent),
     /// Execute one grant-bearing product command.
     Execute(Box<ExecuteCommand>),
     /// Deliver one event to a previously authorized input resource.

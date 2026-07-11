@@ -11,8 +11,9 @@ pub use bootstrap::*;
 
 pub use framing::{
     decode_frame, encode_frame, read_frame, write_frame, DecodedFrame, FrameError,
-    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AGENT_IPC_PROTOCOL_MINOR,
 };
 pub use grant::{
     authorize_input_resource, validate_execute_command, validate_input_event, AuthorizedCommand,

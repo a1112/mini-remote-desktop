@@ -1,13 +1,15 @@
 #[cfg(windows)]
 mod windows_process_bootstrap {
     use mrd_agent_ipc::{
-        derive_registration_public_key, windows_agent_bootstrap_pipe_name, write_agent_bootstrap,
-        AgentBootstrap, BoundEd25519RegistrationVerifier, ServiceToAgent, StopAgent, StopReason,
+        derive_execute_grant_issuer_key_id, derive_registration_public_key,
+        windows_agent_bootstrap_pipe_name, write_agent_bootstrap, AgentBootstrap,
+        BoundEd25519RegistrationVerifier, ServiceToAgent, StopAgent, StopReason,
     };
     use mrd_service::agent_runtime::{
         inspect_windows_process, AgentConnectionExit, AgentConnectionId, AgentRegistry,
         AgentServer, ExpectedAgentSession, ReplacementPolicy, WindowsAgentPipe,
     };
+    use ring::signature::KeyPair;
     use std::{
         process::Stdio,
         sync::Arc,
@@ -56,6 +58,15 @@ mod windows_process_bootstrap {
         let seed = [73_u8; 32];
         let registration_key =
             derive_registration_public_key(&seed).expect("derive real Ed25519 key");
+        let execute_grant_signer =
+            ring::signature::Ed25519KeyPair::from_seed_unchecked(&[74; 32]).unwrap();
+        let execute_grant_public_key: [u8; 32] = execute_grant_signer
+            .public_key()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let execute_grant_issuer_key_id =
+            derive_execute_grant_issuer_key_id(&execute_grant_public_key);
         let verifier = Arc::new(
             BoundEd25519RegistrationVerifier::new(
                 registration_key.key_id,
@@ -100,6 +111,8 @@ mod windows_process_bootstrap {
                 handshake_timeout_ms: 5_000,
                 registration_seed: Zeroizing::new(seed),
                 expected_agent_key_id: registration_key.key_id,
+                execute_grant_issuer_key_id,
+                execute_grant_public_key,
             },
         )
         .await

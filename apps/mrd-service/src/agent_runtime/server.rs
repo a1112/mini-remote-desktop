@@ -6,11 +6,12 @@ use super::{
 };
 use mrd_agent_ipc::{
     decode_frame, validate_consent_result, write_frame, AgentCapability, AgentHeartbeat,
-    AgentStopping, AgentToService, CommandResult, ConsentDecision, ConsentRequest, ConsentResult,
-    ConsentValidationError, ExecuteCommand, FrameError, InputAck, InputEventEnvelope,
-    InputRejection, RegisteredAgentIdentity, ServiceToAgent, StopAgent, StopReason,
-    ValidatedConsent, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AgentStopping, AgentToService, CancelConsent, CommandResult, ConsentCancelReason,
+    ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, ExecuteCommand,
+    FrameError, InputAck, InputEventEnvelope, InputRejection, RegisteredAgentIdentity,
+    ServiceToAgent, StopAgent, StopReason, ValidatedConsent,
+    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -246,8 +247,27 @@ impl PendingReply {
 struct PendingRequest {
     semantic: RequestSemanticKey,
     sent: bool,
-    cancellation: watch::Sender<bool>,
+    cancellation: watch::Sender<Option<RequestCancellation>>,
     reply: PendingReply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCancellation {
+    CallerAborted,
+    TimedOut,
+    SessionClosed,
+    PolicyChanged,
+}
+
+impl RequestCancellation {
+    fn consent_reason(self) -> ConsentCancelReason {
+        match self {
+            Self::CallerAborted => ConsentCancelReason::CallerAborted,
+            Self::TimedOut => ConsentCancelReason::TimedOut,
+            Self::SessionClosed => ConsentCancelReason::SessionClosed,
+            Self::PolicyChanged => ConsentCancelReason::PolicyChanged,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -294,20 +314,61 @@ impl ConnectionControl {
         Ok(())
     }
 
-    fn mark_request_sent(&self, key: &RequestCorrelationKey) {
-        if let Ok(mut requests) = self.requests.lock() {
-            if let Some(pending) = requests.pending.get_mut(key) {
-                pending.sent = true;
+    fn mark_request_sent(&self, key: &RequestCorrelationKey) -> bool {
+        let Ok(mut requests) = self.requests.lock() else {
+            return false;
+        };
+        let Some(pending) = requests.pending.get_mut(key) else {
+            return false;
+        };
+        pending.sent = true;
+        true
+    }
+
+    fn cancel_request(&self, key: &RequestCorrelationKey, reason: RequestCancellation) {
+        let pending = self
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| remove_pending_request(&mut requests, key));
+        if let Some(pending) = pending {
+            let _ = pending.cancellation.send(Some(reason));
+            if pending.sent {
+                self.queue_consent_cancel(&pending.reply, reason);
             }
         }
     }
 
-    fn cancel_request(&self, key: &RequestCorrelationKey) {
-        if let Ok(mut requests) = self.requests.lock() {
-            if let Some(pending) = remove_pending_request(&mut requests, key) {
-                let _ = pending.cancellation.send(true);
-            }
-        }
+    fn queue_consent_cancel(&self, reply: &PendingReply, reason: RequestCancellation) {
+        let PendingReply::Consent { request, .. } = reply else {
+            return;
+        };
+        let _ = self
+            .outbound
+            .try_send(OutboundMessage::ConsentCancel(CancelConsent {
+                request_token: request.request_token,
+                request_id: request.request_id,
+                session_id: request.session_id.clone(),
+                reason: reason.consent_reason(),
+            }));
+    }
+
+    fn queue_cancel_for_written_message(
+        &self,
+        message: &ServiceToAgent,
+        reason: RequestCancellation,
+    ) {
+        let ServiceToAgent::ConsentRequest(request) = message else {
+            return;
+        };
+        let _ = self
+            .outbound
+            .try_send(OutboundMessage::ConsentCancel(CancelConsent {
+                request_token: request.request_token,
+                request_id: request.request_id,
+                session_id: request.session_id.clone(),
+                reason: reason.consent_reason(),
+            }));
     }
 
     fn is_request_pending(&self, key: &RequestCorrelationKey) -> bool {
@@ -323,7 +384,9 @@ impl ConnectionControl {
             .ok()
             .and_then(|mut requests| remove_pending_request(&mut requests, key));
         if let Some(pending) = pending {
-            let _ = pending.cancellation.send(true);
+            let _ = pending
+                .cancellation
+                .send(Some(RequestCancellation::SessionClosed));
             pending.reply.fail(error);
         }
     }
@@ -432,7 +495,12 @@ impl ConnectionControl {
             })
             .unwrap_or_default();
         for pending in pending {
-            let _ = pending.cancellation.send(true);
+            let reason = if error == AgentRequestError::Revoked {
+                RequestCancellation::PolicyChanged
+            } else {
+                RequestCancellation::SessionClosed
+            };
+            let _ = pending.cancellation.send(Some(reason));
             pending.reply.fail(error.clone());
         }
     }
@@ -450,22 +518,34 @@ fn remove_pending_request(
 struct PendingRequestGuard {
     control: ConnectionControl,
     key: RequestCorrelationKey,
+    armed: bool,
+}
+
+impl PendingRequestGuard {
+    fn cancel(&mut self, reason: RequestCancellation) {
+        if self.armed {
+            self.armed = false;
+            self.control.cancel_request(&self.key, reason);
+        }
+    }
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        self.control.cancel_request(&self.key);
+        self.cancel(RequestCancellation::CallerAborted);
     }
 }
 
 enum OutboundMessage {
     OneWay(ServiceToAgent),
+    ConsentCancel(CancelConsent),
     Request {
         message: ServiceToAgent,
         key: RequestCorrelationKey,
         binding: AgentBinding,
         required_capability: AgentCapability,
-        cancellation: watch::Receiver<bool>,
+        minimum_protocol_minor: u16,
+        cancellation: watch::Receiver<Option<RequestCancellation>>,
     },
 }
 
@@ -485,7 +565,7 @@ enum RevocableWriteOutcome {
 enum RequestWriteOutcome {
     Written,
     Revoked,
-    Cancelled,
+    Cancelled(RequestCancellation),
 }
 
 /// Shared server for authenticated agent connections.
@@ -569,7 +649,7 @@ impl AgentServer {
         let route = self.registry.resolve_exact_with_minimum_minor(
             &binding,
             AgentCapability::Consent,
-            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
             now_ms,
         )?;
         let control = self
@@ -582,7 +662,7 @@ impl AgentServer {
         let key = RequestCorrelationKey::Consent(token);
         let semantic = RequestSemanticKey::Consent(request.request_id);
         let (reply, response) = oneshot::channel();
-        let (cancellation, cancelled) = watch::channel(false);
+        let (cancellation, cancelled) = watch::channel(None);
         control.register_request(
             key.clone(),
             PendingRequest {
@@ -595,9 +675,10 @@ impl AgentServer {
                 },
             },
         )?;
-        let _pending_guard = PendingRequestGuard {
+        let mut pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
+            armed: true,
         };
 
         let mut lease = route.into_lease();
@@ -612,6 +693,7 @@ impl AgentServer {
                 key,
                 binding,
                 required_capability: AgentCapability::Consent,
+                minimum_protocol_minor: AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
                 cancellation: cancelled,
             })
             .map_err(|_| AgentRequestError::OutboundUnavailable)?;
@@ -629,7 +711,20 @@ impl AgentServer {
             _ = tokio::time::sleep(self.request_timeout.min(request_lifetime)) => {
                 Err(AgentRequestError::Timeout)
             },
-        }?;
+        };
+        match &consent {
+            Err(AgentRequestError::Timeout) => {
+                pending_guard.cancel(RequestCancellation::TimedOut);
+            }
+            Err(AgentRequestError::Revoked) => {
+                pending_guard.cancel(RequestCancellation::PolicyChanged);
+            }
+            Err(AgentRequestError::Disconnected) => {
+                pending_guard.cancel(RequestCancellation::SessionClosed);
+            }
+            _ => {}
+        }
+        let consent = consent?;
         Ok(CorrelatedConsent {
             binding: result_binding,
             consent,
@@ -666,7 +761,7 @@ impl AgentServer {
         let key = RequestCorrelationKey::Input(token);
         let semantic = RequestSemanticKey::Input(InputCorrelationKey::from_event(&event));
         let (reply, response) = oneshot::channel();
-        let (cancellation, cancelled) = watch::channel(false);
+        let (cancellation, cancelled) = watch::channel(None);
         control.register_request(
             key.clone(),
             PendingRequest {
@@ -684,6 +779,7 @@ impl AgentServer {
         let _pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
+            armed: true,
         };
 
         let mut lease = route.into_lease();
@@ -697,6 +793,7 @@ impl AgentServer {
                 key,
                 binding: binding.clone(),
                 required_capability: AgentCapability::Input,
+                minimum_protocol_minor: AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
                 cancellation: cancelled,
             })
             .is_err()
@@ -747,7 +844,7 @@ impl AgentServer {
         let key = RequestCorrelationKey::Execute(token);
         let semantic = RequestSemanticKey::Execute(execute.command_id);
         let (reply, response) = oneshot::channel();
-        let (cancellation, cancelled) = watch::channel(false);
+        let (cancellation, cancelled) = watch::channel(None);
         control.register_request(
             key.clone(),
             PendingRequest {
@@ -764,6 +861,7 @@ impl AgentServer {
         let _pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
+            armed: true,
         };
 
         let mut lease = route.into_lease();
@@ -777,6 +875,7 @@ impl AgentServer {
                 key,
                 binding: binding.clone(),
                 required_capability,
+                minimum_protocol_minor: AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
                 cancellation: cancelled,
             })
             .map_err(|_| AgentRequestError::OutboundUnavailable)?;
@@ -973,21 +1072,41 @@ impl AgentServer {
                                 return Ok(AgentConnectionExit::Disconnected);
                             }
                         }
+                        Some(OutboundMessage::ConsentCancel(cancel)) => {
+                            if lease.is_revoked() {
+                                control.fail_all(AgentRequestError::Revoked);
+                                return self
+                                    .stop_revoked_connection(writer, inbound, &identity)
+                                    .await;
+                            }
+                            let message = ServiceToAgent::CancelConsent(cancel);
+                            let revoked = lease.wait_revoked();
+                            if write_service_frame_until_revoked(writer, &message, revoked).await?
+                                == RevocableWriteOutcome::Revoked
+                            {
+                                // Cleanup is already bound to this connection. If replacement
+                                // interrupts a partial frame, hard-close the old stream.
+                                control.fail_all(AgentRequestError::Revoked);
+                                return Ok(AgentConnectionExit::Disconnected);
+                            }
+                        }
                         Some(OutboundMessage::Request {
                             message,
                             key,
                             binding,
                             required_capability,
+                            minimum_protocol_minor,
                             cancellation,
                         }) => {
-                            if !control.is_request_pending(&key) || request_cancelled(&cancellation)
+                            if !control.is_request_pending(&key)
+                                || request_cancellation(&cancellation).is_some()
                             {
                                 continue;
                             }
                             let exact_route = match self.registry.resolve_exact_with_minimum_minor(
                                 &binding,
                                 required_capability,
-                                AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+                                minimum_protocol_minor,
                                 self.clock.now_ms(),
                             ) {
                                 Ok(route) => route,
@@ -996,11 +1115,13 @@ impl AgentServer {
                                     continue;
                                 }
                             };
-                            if !control.is_request_pending(&key) || request_cancelled(&cancellation)
+                            if !control.is_request_pending(&key)
+                                || request_cancellation(&cancellation).is_some()
                             {
                                 continue;
                             }
                             let mut exact_lease = exact_route.into_lease();
+                            let cancellation_after_write = cancellation.clone();
                             match write_request_frame_until_interrupted(
                                 writer,
                                 &message,
@@ -1010,13 +1131,20 @@ impl AgentServer {
                             .await?
                             {
                                 RequestWriteOutcome::Written => {
-                                    control.mark_request_sent(&key);
+                                    if !control.mark_request_sent(&key) {
+                                        // A concurrent caller cancellation can remove the
+                                        // request immediately after the complete frame write.
+                                        // Queue cleanup on this same connection without routing.
+                                        let reason = request_cancellation(&cancellation_after_write)
+                                            .unwrap_or(RequestCancellation::CallerAborted);
+                                        control.queue_cancel_for_written_message(&message, reason);
+                                    }
                                 }
                                 RequestWriteOutcome::Revoked => {
                                     control.fail_all(AgentRequestError::Revoked);
                                     return Ok(AgentConnectionExit::Disconnected);
                                 }
-                                RequestWriteOutcome::Cancelled => {
+                                RequestWriteOutcome::Cancelled(_) => {
                                     // Cancellation may have interrupted a partial frame.
                                     // Hard-close so no later frame can be parsed across it.
                                     return Ok(AgentConnectionExit::Disconnected);
@@ -1142,14 +1270,26 @@ where
     }
 }
 
-fn request_cancelled(cancellation: &watch::Receiver<bool>) -> bool {
-    *cancellation.borrow() || cancellation.has_changed().is_err()
+fn request_cancellation(
+    cancellation: &watch::Receiver<Option<RequestCancellation>>,
+) -> Option<RequestCancellation> {
+    (*cancellation.borrow()).or_else(|| {
+        cancellation
+            .has_changed()
+            .is_err()
+            .then_some(RequestCancellation::SessionClosed)
+    })
 }
 
-async fn wait_for_request_cancellation(mut cancellation: watch::Receiver<bool>) {
-    while !request_cancelled(&cancellation) {
+async fn wait_for_request_cancellation(
+    mut cancellation: watch::Receiver<Option<RequestCancellation>>,
+) -> RequestCancellation {
+    loop {
+        if let Some(reason) = request_cancellation(&cancellation) {
+            return reason;
+        }
         if cancellation.changed().await.is_err() {
-            return;
+            return RequestCancellation::SessionClosed;
         }
     }
 }
@@ -1163,18 +1303,18 @@ async fn write_request_frame_until_interrupted<W, F, G>(
 where
     W: AsyncWrite + Unpin,
     F: Future<Output = ()>,
-    G: Future<Output = ()>,
+    G: Future<Output = RequestCancellation>,
 {
     tokio::pin!(revocation);
     tokio::pin!(cancellation);
     tokio::select! {
         biased;
         _ = &mut revocation => Ok(RequestWriteOutcome::Revoked),
-        _ = &mut cancellation => Ok(RequestWriteOutcome::Cancelled),
         result = write_service_frame(writer, message) => {
             result?;
             Ok(RequestWriteOutcome::Written)
-        }
+        },
+        reason = &mut cancellation => Ok(RequestWriteOutcome::Cancelled(reason)),
     }
 }
 
