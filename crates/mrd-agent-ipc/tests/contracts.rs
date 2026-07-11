@@ -235,6 +235,7 @@ fn capability_and_consent_messages_round_trip() {
         desktop_epoch: 4,
         observed_at_ms: 1_600,
         capabilities: BTreeSet::from([
+            AgentCapability::Consent,
             AgentCapability::Capture,
             AgentCapability::Input,
             AgentCapability::Audio,

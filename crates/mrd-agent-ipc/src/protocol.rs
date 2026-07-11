@@ -171,6 +171,8 @@ pub struct AgentRegistered {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentCapability {
+    /// Interactive user-consent surface.
+    Consent,
     /// Screen capture.
     Capture,
     /// Pointer and keyboard injection.
