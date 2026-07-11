@@ -4,7 +4,7 @@
 
 use crate::app_state::AppState;
 use mrd_application::ports::SessionLifecycleState;
-use mrd_ipc::{AttachedRenderSurface, IpcResponse};
+use mrd_ipc::{AttachedRenderSurface, IpcResponse, RemotePermissionScope, RemoteReasonCode};
 use mrd_proto::SessionId;
 use std::sync::Arc;
 
@@ -12,8 +12,20 @@ use std::sync::Arc;
 pub async fn start_sender(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Starting sender for session: {}", session_id.0);
 
+    if let Some(response) = secure_media_denial(app_state, &session_id).await {
+        return response;
+    }
     let mut sessions = app_state.sessions.lock().await;
     if let Some(snapshot) = sessions.get(&session_id).cloned() {
+        if snapshot.lifecycle_state.is_terminal() {
+            return IpcResponse::Error {
+                code: "E_SESSION_TERMINAL".to_string(),
+                message: format!(
+                    "cannot start sender for {} session",
+                    snapshot.lifecycle_state
+                ),
+            };
+        }
         sessions.insert(
             session_id.clone(),
             mrd_application::ports::SessionSnapshot {
@@ -36,8 +48,20 @@ pub async fn start_sender(app_state: &Arc<AppState>, session_id: SessionId) -> I
 pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Starting receiver for session: {}", session_id.0);
 
+    if let Some(response) = secure_media_denial(app_state, &session_id).await {
+        return response;
+    }
     let mut sessions = app_state.sessions.lock().await;
     if let Some(snapshot) = sessions.get(&session_id).cloned() {
+        if snapshot.lifecycle_state.is_terminal() {
+            return IpcResponse::Error {
+                code: "E_SESSION_TERMINAL".to_string(),
+                message: format!(
+                    "cannot start receiver for {} session",
+                    snapshot.lifecycle_state
+                ),
+            };
+        }
         sessions.insert(
             session_id.clone(),
             mrd_application::ports::SessionSnapshot {
@@ -54,6 +78,43 @@ pub async fn start_receiver(app_state: &Arc<AppState>, session_id: SessionId) ->
             message: format!("Session not found: {}", session_id.0),
         }
     }
+}
+
+async fn secure_media_denial(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Option<IpcResponse> {
+    let secure = app_state
+        .session_authorizations
+        .snapshot(session_id)
+        .await?;
+    if app_state
+        .session_authorizations
+        .allows_scope(
+            session_id,
+            RemotePermissionScope::ScreenView,
+            current_time_ms(),
+        )
+        .await
+    {
+        return None;
+    }
+    Some(IpcResponse::RemoteAccessError {
+        session_id: Some(session_id.clone()),
+        peer_key_id: Some(secure.peer_key_id),
+        failure: secure.failure.unwrap_or(mrd_ipc::RemoteFailure {
+            code: RemoteReasonCode::ScopeDenied,
+            message: "screen media requires a current screen.view grant".to_string(),
+            suggested_action: None,
+        }),
+    })
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// Handle probe snapshot request

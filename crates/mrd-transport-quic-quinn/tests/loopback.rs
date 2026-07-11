@@ -5,7 +5,7 @@ use mrd_transport_quic_quinn::{
     certificate_fingerprint_sha256, fragment_access_unit, fragment_media_payload_v3,
     is_quic_media_v3_datagram, QuicAuReassembler, QuicAuReassemblerConfig, QuicMediaCodec,
     QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnDatagramPair,
-    QuinnServerListener,
+    QuinnPreparedServer, QuinnServerListener,
 };
 
 #[tokio::test]
@@ -278,6 +278,33 @@ async fn quinn_bootstrap_exposes_a_unique_sha256_certificate_fingerprint() {
     assert_eq!(first_fingerprint, first.certificate_fingerprint_sha256());
     assert_eq!(second_fingerprint, second.certificate_fingerprint_sha256());
     assert_ne!(first_fingerprint, second_fingerprint);
+}
+
+#[tokio::test]
+async fn prepared_quinn_server_preserves_its_certificate_when_bound() {
+    let prepared = QuinnPreparedServer::generate().expect("prepare QUIC server material");
+    let prepared_cert = prepared.certificate_der().to_vec();
+    let prepared_fingerprint = prepared.certificate_fingerprint_sha256();
+
+    let (listener, bootstrap) = prepared
+        .bind("127.0.0.1:0")
+        .await
+        .expect("bind prepared QUIC server");
+
+    assert_eq!(bootstrap.cert_der, prepared_cert);
+    assert_eq!(
+        bootstrap.certificate_fingerprint_sha256(),
+        prepared_fingerprint
+    );
+
+    let server_task = tokio::spawn(async move { listener.accept().await });
+    let _client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("connect using prepared certificate");
+    server_task
+        .await
+        .expect("join prepared server")
+        .expect("prepared server accepts pinned client");
 }
 
 #[tokio::test]

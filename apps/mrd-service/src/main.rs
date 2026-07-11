@@ -22,6 +22,7 @@ mod ipc_server;
 mod lan_discovery;
 mod media_adaptation;
 mod resource_monitor;
+mod session_authorization;
 mod shell;
 mod wake_on_lan;
 mod web_bridge;

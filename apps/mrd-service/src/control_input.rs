@@ -15,6 +15,7 @@ pub struct ControlInputResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ControlInputTargetGeometry {
     pub frame_width: u32,
     pub frame_height: u32,
@@ -240,6 +241,7 @@ fn lane_snapshot(
     }
 }
 
+#[cfg(test)]
 pub fn map_control_input_event_for_target_geometry(
     event: &ControlInputEvent,
     geometry: Option<ControlInputTargetGeometry>,
@@ -267,6 +269,7 @@ pub fn map_control_input_event_for_target_geometry(
     }
 }
 
+#[cfg(test)]
 fn scale_target_coordinate(
     coordinate: i32,
     frame_extent: u32,

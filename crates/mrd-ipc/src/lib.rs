@@ -1351,6 +1351,7 @@ mod wire {
         ConsentDenied,
         CredentialInvalid,
         CredentialLocked,
+        AuthorizationTimeout,
         GrantExpired,
         GrantRevoked,
         PolicyChanged,
@@ -1539,6 +1540,8 @@ mod wire {
         pub failure: Option<RemoteFailure>,
         pub created_at_ms: u64,
         pub updated_at_ms: u64,
+        /// Exact service-owned pending-authorization or active-grant deadline.
+        pub authorization_expires_at_ms: Option<u64>,
     }
 
     /// Local user's response to an exact incoming session request.
@@ -1712,6 +1715,11 @@ mod wire {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct SessionEventSubscription {
         pub events: Vec<RemoteSessionEventEnvelope>,
+        /// Bounded authoritative pending consent projections included on an
+        /// initial subscription or stale-cursor reset so a restarted UI cannot
+        /// lose an approval request after event-history truncation.
+        #[serde(default)]
+        pub pending_sessions: Vec<RemoteSessionSnapshot>,
         pub next_after_sequence: Option<DecimalU64>,
         pub cursor_state: RemoteCursorState,
         pub has_more: bool,

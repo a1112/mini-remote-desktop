@@ -1,7 +1,7 @@
 use super::protocol::LanDiscoveryPacket;
 use crate::app_state::AppState;
 use anyhow::{Context, Result};
-use mrd_ipc::{CaptureSource, ControlInputEvent, ControlInputLane, DisplayMode};
+use mrd_ipc::{ControlInputEvent, ControlInputLane};
 use mrd_proto::SessionId;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -177,99 +177,13 @@ pub(super) async fn accept_or_replay_lan_control_input(
 }
 
 async fn accept_lan_control_input(
-    app_state: &Arc<AppState>,
-    session_id: &SessionId,
-    event: &ControlInputEvent,
+    _app_state: &Arc<AppState>,
+    _session_id: &SessionId,
+    _event: &ControlInputEvent,
 ) -> Result<crate::control_input::ControlInputResult> {
-    {
-        let sessions = app_state.sessions.lock().await;
-        let snapshot = sessions
-            .get(session_id)
-            .with_context(|| format!("session not found: {}", session_id.0))?;
-        if snapshot.lifecycle_state.is_terminal() {
-            anyhow::bail!(
-                "control input rejected for {} session",
-                snapshot.lifecycle_state
-            );
-        }
-        if !snapshot.sender_active {
-            anyhow::bail!(
-                "control input rejected until target session has an active sender: {}",
-                session_id.0
-            );
-        }
-    }
-
-    let event = crate::control_input::map_control_input_event_for_target_geometry(
-        event,
-        control_input_target_geometry(app_state, session_id).await,
-    );
-
-    app_state
-        .control_input()
-        .lock()
-        .await
-        .handle_session_event(session_id, &event)
-        .map_err(Into::into)
-}
-
-async fn control_input_target_geometry(
-    app_state: &Arc<AppState>,
-    session_id: &SessionId,
-) -> Option<crate::control_input::ControlInputTargetGeometry> {
-    let selection = app_state.capture_sources.lock().await.get(session_id)?;
-    let active_display_mode = app_state.display_modes.lock().await.active_mode(session_id);
-    let (source_width, source_height) =
-        control_input_source_size(&selection.source, active_display_mode.as_ref());
-    let negotiation = app_state.media_profiles.lock().await.get(session_id);
-    let frame_width = negotiation
-        .as_ref()
-        .map(|profile| profile.selected.width)
-        .filter(|width| *width > 0)
-        .unwrap_or(source_width);
-    let frame_height = negotiation
-        .as_ref()
-        .map(|profile| profile.selected.height)
-        .filter(|height| *height > 0)
-        .unwrap_or(source_height);
-    let (origin_x, origin_y) = control_input_source_origin(&selection.source);
-
-    Some(crate::control_input::ControlInputTargetGeometry {
-        frame_width,
-        frame_height,
-        source_width,
-        source_height,
-        origin_x,
-        origin_y,
-    })
-}
-
-fn control_input_source_size(
-    source: &CaptureSource,
-    active_display_mode: Option<&DisplayMode>,
-) -> (u32, u32) {
-    if is_display_capture_source(source) {
-        if let Some(mode) = active_display_mode.filter(|mode| mode.width > 0 && mode.height > 0) {
-            return (mode.width, mode.height);
-        }
-    }
-    (source.width, source.height)
-}
-
-fn control_input_source_origin(source: &CaptureSource) -> (i32, i32) {
-    if is_windows_display_capture_source(source) {
-        crate::display_mode::display_origin_for_source_id(&source.id).unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    }
-}
-
-fn is_display_capture_source(source: &CaptureSource) -> bool {
-    matches!(source.source_kind.as_str(), "display" | "display_shared")
-}
-
-fn is_windows_display_capture_source(source: &CaptureSource) -> bool {
-    source.platform.eq_ignore_ascii_case("windows") && is_display_capture_source(source)
+    anyhow::bail!(
+        "legacy unsigned LAN control input is disabled until ControlEnvelopeV2 is authenticated"
+    )
 }
 
 fn prune_recent_control_inputs(

@@ -896,6 +896,7 @@ export type RemoteReasonCode =
   | "consent_denied"
   | "credential_invalid"
   | "credential_locked"
+  | "authorization_timeout"
   | "grant_expired"
   | "grant_revoked"
   | "policy_changed"
@@ -989,6 +990,7 @@ export interface RemoteSessionSnapshot {
   failure?: RemoteFailure | null;
   created_at_ms: number;
   updated_at_ms: number;
+  authorization_expires_at_ms?: number | null;
 }
 
 export type ConsentDecision = "approve" | "deny";
@@ -1106,6 +1108,8 @@ export interface SessionEventSubscriptionQuery {
 
 export interface SessionEventSubscription {
   events: RemoteSessionEventEnvelope[];
+  /** Authoritative pending consent snapshots supplied on initial/reset pages. */
+  pending_sessions: RemoteSessionSnapshot[];
   /** Greatest delivered sequence; pass back as after_sequence without incrementing. */
   next_after_sequence?: DecimalU64 | null;
   cursor_state: RemoteCursorState;

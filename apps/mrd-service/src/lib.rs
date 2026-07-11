@@ -17,6 +17,7 @@ pub mod lan_discovery;
 pub mod media_adaptation;
 pub mod resource_monitor;
 pub mod security;
+pub mod session_authorization;
 pub mod shell;
 pub mod wake_on_lan;
 pub mod web_bridge;

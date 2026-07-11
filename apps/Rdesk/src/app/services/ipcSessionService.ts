@@ -166,7 +166,7 @@ export const startSession = async (
 };
 
 /**
- * Start a LAN P2P session as controller; the discovered peer auto-accepts.
+ * Start a LAN P2P session as controller through attended authorization.
  */
 export const startLanRemoteSession = async (
   sessionId: string,
@@ -174,13 +174,20 @@ export const startLanRemoteSession = async (
   transportKind: TransportKind = "webrtc",
   requestedProfile?: MediaProfile
 ): Promise<string> => {
-  const result = await tauriAdapter.ipcStartLanRemoteSession(
-    sessionId,
-    targetDeviceId,
-    transportKind,
-    requestedProfile
-  );
-  return unwrapAdapterResult(result);
+  if (transportKind !== "quic") {
+    throw new ServiceCommandError(
+      "Secure LAN remote sessions currently require QUIC",
+      "E_SECURE_LAN_TRANSPORT"
+    );
+  }
+  const result = await tauriAdapter.ipcRequestRemoteSession({
+    session_id: sessionId,
+    target_device_id: targetDeviceId,
+    access_mode: "attended",
+    requested_scopes: ["screen.view"],
+    requested_profile: requestedProfile ?? null,
+  });
+  return unwrapAdapterResult(result).session_id;
 };
 
 /**

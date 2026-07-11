@@ -1,13 +1,14 @@
 use mrd_identity::DeviceIdentity;
-use mrd_ipc::MediaProfile;
+use mrd_ipc::{AuditLogQuery, MediaProfile, MediaProfileNegotiation};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::{
     handlers::session::start_lan_remote_session,
     lan_discovery::{
         ingest_legacy_lan_announcement, ingest_signed_lan_announcement,
-        process_lan_discovery_packet, LanAnnouncement, LanDiscoveryConfig, LanDiscoveryPacket,
-        LanMediaBootstrap, LanQuicBootstrap, LanSessionBootstrap, LanSessionRequest,
-        SignedLanAnnouncement, SignedLanSessionBootstrap, SignedLanSessionRequest,
+        media_profile_constraint_hash, process_lan_discovery_packet, LanAnnouncement,
+        LanDiscoveryConfig, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap,
+        LanSessionBootstrap, LanSessionGrantPayload, LanSessionRequest, SignedLanAnnouncement,
+        SignedLanSessionBootstrap, SignedLanSessionGrant, SignedLanSessionRequest,
         DISCOVERY_APP_ID, DISCOVERY_MAGIC, SIGNED_LAN_PROTOCOL_VERSION,
     },
     AppState, NoOpTray,
@@ -101,6 +102,9 @@ fn session_request(
                 "quic_stream_media_v2".to_string(),
             ],
             requested_media_profile: Some(MediaProfile::default()),
+            access_mode: mrd_ipc::RemoteAccessMode::Attended,
+            requested_scopes: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+            unattended_proof: None,
             timestamp_ms: NOW_MS,
             expires_at_ms: NOW_MS + 5_000,
             nonce: [3; 16],
@@ -384,6 +388,45 @@ async fn signed_bootstrap_rejects_quic_certificate_substitution() {
             cert_der: quic.cert_der,
         }),
     };
+    let media_fingerprint = media
+        .quic
+        .as_ref()
+        .expect("QUIC bootstrap")
+        .certificate_fingerprint_sha256;
+    let negotiation = MediaProfileNegotiation {
+        requested: MediaProfile::default(),
+        selected: MediaProfile::default(),
+        status: "accepted".to_string(),
+        reason: None,
+        selected_source_id: None,
+        selected_width: None,
+        selected_height: None,
+        downgrade_reason: None,
+    };
+    let grant = SignedLanSessionGrant::sign(
+        &target,
+        LanSessionGrantPayload {
+            session_id: request.payload.session_id.clone(),
+            controller_key_id: controller.key_id().to_string(),
+            controller_key_epoch: 1,
+            target_key_id: target.key_id().to_string(),
+            target_key_epoch: 1,
+            access_mode: request.payload.access_mode,
+            granted_scopes: request.payload.requested_scopes.clone(),
+            issued_at_ms: NOW_MS,
+            expires_at_ms: NOW_MS + 300_000,
+            policy_revision: 1,
+            route_constraint: "quic".to_string(),
+            profile_constraint: Some(
+                media_profile_constraint_hash(&negotiation).expect("profile commitment"),
+            ),
+            request_nonce: request.payload.nonce,
+            grant_nonce: [5; 16],
+            windows_session_id: None,
+            transport_fingerprint_sha256: media_fingerprint,
+        },
+    )
+    .expect("target signs grant");
     let payload = LanSessionBootstrap {
         magic: DISCOVERY_MAGIC.to_string(),
         app_id: DISCOVERY_APP_ID.to_string(),
@@ -397,8 +440,10 @@ async fn signed_bootstrap_rejects_quic_certificate_substitution() {
         request_nonce: request.payload.nonce,
         accepted: true,
         message: Some("accepted".to_string()),
+        failure: None,
+        grant: Some(grant),
         media: Some(media),
-        media_profile: None,
+        media_profile: Some(negotiation),
         timestamp_ms: NOW_MS,
         expires_at_ms: NOW_MS + 5_000,
         nonce: [6; 16],
@@ -432,11 +477,7 @@ async fn signed_bootstrap_rejects_quic_certificate_substitution() {
     attacker_quic.certificate_fingerprint_sha256 =
         certificate_fingerprint_sha256(&attacker_quic.cert_der);
     attacker_payload.target_key_id = attacker.key_id().to_string();
-    let attacker_signed = SignedLanSessionBootstrap::sign(&attacker, attacker_payload)
-        .expect("attacker signs replacement");
-    assert!(attacker_signed
-        .verify_for_request(NOW_MS, &request, target.public_key(), 1)
-        .is_err());
+    assert!(SignedLanSessionBootstrap::sign(&attacker, attacker_payload).is_err());
 }
 
 #[tokio::test]
@@ -571,7 +612,7 @@ async fn unsigned_legacy_peer_is_hidden_when_diagnostics_are_not_explicitly_enab
 }
 
 #[tokio::test]
-async fn untrusted_signed_session_request_has_no_session_side_effect_and_sends_no_ack() {
+async fn untrusted_unattended_request_gets_signed_trust_denial_without_side_effects() {
     let app_state = Arc::new(AppState::new());
     app_state.devices.lock().await.register(
         DeviceId("target-device".to_string()),
@@ -612,35 +653,82 @@ async fn untrusted_signed_session_request_has_no_session_side_effect_and_sends_n
                 "quic_stream_media_v2".to_string(),
             ],
             requested_media_profile: Some(MediaProfile::default()),
+            access_mode: mrd_ipc::RemoteAccessMode::Unattended,
+            requested_scopes: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+            unattended_proof: None,
             timestamp_ms: issued_at_ms,
             expires_at_ms: issued_at_ms + 5_000,
             nonce: [7; 16],
         },
     )
     .expect("sign untrusted request");
-    let bytes = serde_json::to_vec(&LanDiscoveryPacket::SignedRemoteSessionRequest(request))
-        .expect("serialize signed request");
+    let bytes = serde_json::to_vec(&LanDiscoveryPacket::SignedRemoteSessionRequest(
+        request.clone(),
+    ))
+    .expect("serialize signed request");
 
-    let error = process_lan_discovery_packet(
+    process_lan_discovery_packet(
         &service_socket,
         &app_state,
         &bytes,
         source_socket.local_addr().unwrap(),
     )
     .await
-    .expect_err("untrusted controller must be rejected before acknowledgement");
+    .expect("untrusted controller receives a signed denial");
 
-    assert!(error
-        .to_string()
-        .contains("signed LAN session requester is not trusted"));
     assert!(app_state.sessions.lock().await.get(&session_id).is_none());
-    let mut buffer = [0_u8; 1024];
-    assert!(timeout(
-        Duration::from_millis(50),
-        source_socket.recv_from(&mut buffer)
-    )
-    .await
-    .is_err());
+    assert!(app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_none());
+    let mut buffer = vec![0_u8; 65_535];
+    let (len, _) = timeout(Duration::from_secs(1), source_socket.recv_from(&mut buffer))
+        .await
+        .expect("signed trust denial")
+        .expect("receive signed trust denial");
+    let LanDiscoveryPacket::SignedRemoteSessionBootstrap(denial) =
+        serde_json::from_slice(&buffer[..len]).expect("decode denial")
+    else {
+        panic!("expected signed remote-session denial");
+    };
+    denial
+        .verify_for_request(
+            current_time_ms(),
+            &request,
+            app_state
+                .device_identities
+                .machine_public_key()
+                .expect("target public key"),
+            app_state
+                .device_identities
+                .machine_key_epoch()
+                .expect("target epoch"),
+        )
+        .expect("denial is target-signed and request-bound");
+    assert!(!denial.payload.accepted);
+    assert_eq!(
+        denial.payload.failure.map(|failure| failure.code),
+        Some(mrd_ipc::RemoteReasonCode::TrustRequired)
+    );
+    let audit = app_state
+        .audit_log
+        .query(&AuditLogQuery {
+            session_id: Some(session_id),
+            action: Some("session.authorization_decision".to_string()),
+            limit: Some(10),
+        })
+        .expect("trust denial audit");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].outcome, "denied");
+    assert_eq!(audit[0].reason.as_deref(), Some("trust_required"));
+    assert_eq!(
+        audit[0].details,
+        vec![("requested_scope_count".to_string(), "1".to_string())]
+    );
+    let rendered_audit = format!("{:?}", audit[0]);
+    assert!(!rendered_audit.contains("Untrusted Controller"));
+    assert!(!rendered_audit.contains(controller.key_id()));
 }
 
 #[tokio::test]
@@ -690,6 +778,9 @@ async fn signed_session_request_rejects_a_relayed_udp_source_address() {
                 "quic_stream_media_v2".to_string(),
             ],
             requested_media_profile: Some(MediaProfile::default()),
+            access_mode: mrd_ipc::RemoteAccessMode::Attended,
+            requested_scopes: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+            unattended_proof: None,
             timestamp_ms: issued_at_ms,
             expires_at_ms: issued_at_ms + 5_000,
             nonce: [11; 16],

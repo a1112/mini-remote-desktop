@@ -175,6 +175,7 @@ async fn transition_trusted_device(
             message: "peer key identifier must be a SHA-256 hex value".to_string(),
         };
     }
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
     let actor_device_id = app_state
         .devices
         .lock()
@@ -193,14 +194,30 @@ async fn transition_trusted_device(
         details: BTreeMap::from([("peer_key_id".to_owned(), peer_key_id.clone())]),
     };
     let registry = app_state.device_identities.clone();
+    let transition_peer_key_id = peer_key_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        registry.transition_authenticated_peer(&peer_key_id, expected_revision, next, audit)
+        registry.transition_authenticated_peer(
+            &transition_peer_key_id,
+            expected_revision,
+            next,
+            audit,
+        )
     })
     .await;
     match result {
-        Ok(Ok(AuditedTrustTransition::Applied(applied))) => IpcResponse::TrustedDeviceUpdated {
-            device: project_trust_record(applied.record),
-        },
+        Ok(Ok(AuditedTrustTransition::Applied(applied))) => {
+            let device = project_trust_record(applied.record);
+            let revoked_session_ids = app_state
+                .session_authorizations
+                .revoke_peer_authorizations(&peer_key_id, now_unix_ms())
+                .await;
+            crate::lan_discovery::terminate_authorized_remote_sessions(
+                app_state,
+                &revoked_session_ids,
+            )
+            .await;
+            IpcResponse::TrustedDeviceUpdated { device }
+        }
         Ok(Ok(AuditedTrustTransition::Rejected { rejection, .. })) => {
             trust_rejection_response(rejection)
         }

@@ -1,9 +1,16 @@
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_identity::DeviceIdentity;
-use mrd_ipc::{AuditLogQuery, DecimalU64, IpcRequest, IpcResponse, TrustedDeviceState};
+use mrd_ipc::{
+    AuditLogQuery, ConsentDecision, ConsentResponse, DecimalU64, IpcRequest, IpcResponse,
+    RemoteAccessMode, RemoteAuthorizationState, RemotePermissionScope, RemoteReasonCode,
+    TrustedDeviceState,
+};
 use mrd_proto::{DeviceId, SessionId};
-use mrd_service::app_state::AppState;
 use mrd_service::ipc_server::IpcServer;
+use mrd_service::{
+    app_state::AppState,
+    session_authorization::{VerifiedIncomingAuthorizationRequest, VerifiedSessionGrant},
+};
 use mrd_store_sqlite::{AuditDraft, SecretBytes, SecretProtector, TrustState};
 use ring::{
     aead,
@@ -118,6 +125,75 @@ fn remove_sqlite_files(path: &Path) {
         }
     }
     assert!(!path.exists(), "temporary SQLite database was not removed");
+}
+
+fn peer_authorization_request(
+    session_id: &str,
+    peer_key_id: &str,
+) -> VerifiedIncomingAuthorizationRequest {
+    let created_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as u64;
+    VerifiedIncomingAuthorizationRequest {
+        session_id: SessionId(session_id.to_owned()),
+        peer_device_id: DeviceId("trusted-controller".to_owned()),
+        peer_key_id: peer_key_id.to_owned(),
+        peer_key_epoch: 1,
+        access_mode: RemoteAccessMode::Attended,
+        requested_scopes: vec![RemotePermissionScope::ScreenView],
+        peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+        transport_kind: "quic".to_owned(),
+        request_nonce: [23; 16],
+        created_at_ms,
+        expires_at_ms: created_at_ms + 30_000,
+    }
+}
+
+async fn install_peer_grant(
+    state: &AppState,
+    request: VerifiedIncomingAuthorizationRequest,
+) -> SessionId {
+    let session_id = request.session_id.clone();
+    let created_at_ms = request.created_at_ms;
+    state
+        .session_authorizations
+        .begin_verified_incoming(request)
+        .await
+        .expect("pending trusted peer authorization");
+    let approved = state
+        .session_authorizations
+        .respond_to_consent(
+            ConsentResponse {
+                session_id: session_id.clone(),
+                decision: ConsentDecision::Approve,
+                approved_scopes: vec![RemotePermissionScope::ScreenView],
+                expected_policy_revision: DecimalU64::new(1),
+            },
+            created_at_ms + 1,
+        )
+        .await
+        .expect("approved peer authorization");
+    state
+        .session_authorizations
+        .install_verified_grant(
+            VerifiedSessionGrant {
+                grant_id: format!("grant-{}", session_id.0),
+                session_id: session_id.clone(),
+                granted_scopes: approved.granted_scopes,
+                issued_at_ms: created_at_ms + 2,
+                expires_at_ms: created_at_ms + 20_000,
+                policy_revision: 1,
+                route_constraint: "quic".to_owned(),
+                transport_fingerprint_sha256: [31; 32],
+            },
+            created_at_ms + 2,
+        )
+        .await
+        .expect("installed peer grant");
+    session_id
 }
 
 #[test]
@@ -529,6 +605,188 @@ async fn runtime_store_corruption_blocks_mutation_and_latches_unhealthy() {
     ));
 
     drop(server);
+    drop(state);
+    remove_sqlite_files(&path);
+}
+
+async fn assert_applied_trust_transition_revokes_authorizations(suspend: bool) {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x81; 32] });
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).expect("peer identity");
+    let peer_key_id = peer.key_id().to_owned();
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("persistent service security state"),
+    );
+    state
+        .device_identities
+        .approve_authenticated_peer(
+            &peer_key_id,
+            peer.public_key(),
+            1,
+            audit(1, "trust.approved", &peer_key_id),
+        )
+        .expect("trusted peer approval");
+
+    let pending_id = state
+        .session_authorizations
+        .begin_verified_incoming(peer_authorization_request(
+            "trust-transition-pending",
+            &peer_key_id,
+        ))
+        .await
+        .expect("pending peer authorization")
+        .session_id;
+    let active_id = install_peer_grant(
+        state.as_ref(),
+        peer_authorization_request("trust-transition-active", &peer_key_id),
+    )
+    .await;
+    state.sessions.lock().await.insert(
+        active_id.clone(),
+        SessionSnapshot {
+            session_id: active_id.clone(),
+            transport: "quic".to_owned(),
+            source_device_id: Some(DeviceId("trusted-controller".to_owned())),
+            target_device_id: None,
+            local_listen_addr: None,
+            local_server_name: None,
+            local_cert_der_b64: None,
+            remote_listen_addr: None,
+            remote_server_name: None,
+            remote_cert_der_b64: None,
+            lifecycle_state: SessionLifecycleState::Streaming,
+            last_error: None,
+            sender_active: true,
+            receiver_active: false,
+        },
+    );
+    let media_task = tokio::spawn(std::future::pending::<()>());
+    state
+        .media_tasks
+        .lock()
+        .await
+        .register(active_id.clone(), media_task.abort_handle());
+
+    let request = if suspend {
+        IpcRequest::SuspendTrustedDevice {
+            peer_key_id: peer_key_id.clone(),
+            expected_trust_revision: DecimalU64::new(1),
+        }
+    } else {
+        IpcRequest::RevokeTrustedDevice {
+            peer_key_id: peer_key_id.clone(),
+            expected_trust_revision: DecimalU64::new(1),
+        }
+    };
+    let response = IpcServer::new(state.clone()).handle_request(request).await;
+    let IpcResponse::TrustedDeviceUpdated { device } = response else {
+        panic!("expected applied trust transition, got {response:?}");
+    };
+    assert_eq!(
+        device.state,
+        if suspend {
+            TrustedDeviceState::Suspended
+        } else {
+            TrustedDeviceState::Revoked
+        }
+    );
+
+    for session_id in [&pending_id, &active_id] {
+        let snapshot = state
+            .session_authorizations
+            .snapshot(session_id)
+            .await
+            .expect("revoked authorization retained");
+        assert_eq!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Revoked
+        );
+        assert_eq!(
+            snapshot.failure.as_ref().map(|failure| failure.code),
+            Some(RemoteReasonCode::GrantRevoked)
+        );
+        assert!(state
+            .session_authorizations
+            .active_grant(session_id)
+            .await
+            .is_none());
+    }
+    tokio::task::yield_now().await;
+    assert!(
+        media_task.is_finished(),
+        "revoked media task must be aborted"
+    );
+    let sessions = state.sessions.lock().await;
+    let closed = sessions
+        .get(&active_id)
+        .expect("terminated session projection retained");
+    assert_eq!(closed.lifecycle_state, SessionLifecycleState::Closed);
+    assert!(!closed.sender_active);
+    drop(sessions);
+
+    drop(state);
+    remove_sqlite_files(&path);
+}
+
+#[tokio::test]
+async fn suspending_trusted_peer_via_ipc_revokes_active_and_pending_authorizations() {
+    assert_applied_trust_transition_revokes_authorizations(true).await;
+}
+
+#[tokio::test]
+async fn revoking_trusted_peer_via_ipc_revokes_active_and_pending_authorizations() {
+    assert_applied_trust_transition_revokes_authorizations(false).await;
+}
+
+#[tokio::test]
+async fn rejected_trust_transition_leaves_existing_authorization_active() {
+    let path = temp_db();
+    let protector: Arc<dyn SecretProtector> = Arc::new(TestSecretProtector { key: [0x82; 32] });
+    let peer = DeviceIdentity::generate(&SystemRandom::new()).expect("peer identity");
+    let peer_key_id = peer.key_id().to_owned();
+    let state = Arc::new(
+        AppState::open_persistent(&path, protector).expect("persistent service security state"),
+    );
+    state
+        .device_identities
+        .approve_authenticated_peer(
+            &peer_key_id,
+            peer.public_key(),
+            1,
+            audit(1, "trust.approved", &peer_key_id),
+        )
+        .expect("trusted peer approval");
+    let active_id = install_peer_grant(
+        state.as_ref(),
+        peer_authorization_request("rejected-trust-transition", &peer_key_id),
+    )
+    .await;
+
+    let response = IpcServer::new(state.clone())
+        .handle_request(IpcRequest::RevokeTrustedDevice {
+            peer_key_id,
+            expected_trust_revision: DecimalU64::new(99),
+        })
+        .await;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref code, .. } if code == "E_TRUST_REVISION_MISMATCH"
+    ));
+    let still_granted = state
+        .session_authorizations
+        .snapshot(&active_id)
+        .await
+        .expect("authorization retained");
+    assert_eq!(
+        still_granted.authorization_state,
+        RemoteAuthorizationState::Granted
+    );
+    assert!(state
+        .session_authorizations
+        .active_grant(&active_id)
+        .await
+        .is_some());
+
     drop(state);
     remove_sqlite_files(&path);
 }

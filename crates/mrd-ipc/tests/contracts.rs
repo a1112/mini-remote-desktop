@@ -1347,6 +1347,7 @@ fn secure_remote_session_fixture() -> RemoteSessionSnapshot {
         failure: None,
         created_at_ms: 1_700_000_000_000,
         updated_at_ms: 1_700_000_000_100,
+        authorization_expires_at_ms: Some(1_700_000_030_000),
     }
 }
 
@@ -1426,6 +1427,10 @@ fn secure_remote_permission_and_reason_codes_have_stable_wire_values() {
         (RemoteReasonCode::ConsentDenied, "consent_denied"),
         (RemoteReasonCode::CredentialInvalid, "credential_invalid"),
         (RemoteReasonCode::CredentialLocked, "credential_locked"),
+        (
+            RemoteReasonCode::AuthorizationTimeout,
+            "authorization_timeout",
+        ),
         (RemoteReasonCode::GrantExpired, "grant_expired"),
         (RemoteReasonCode::GrantRevoked, "grant_revoked"),
         (RemoteReasonCode::PolicyChanged, "policy_changed"),
@@ -1655,6 +1660,7 @@ fn secure_remote_responses_and_events_round_trip_without_secret_material() {
     };
     let subscription = SessionEventSubscription {
         events: vec![event.clone()],
+        pending_sessions: Vec::new(),
         next_after_sequence: Some(du64(42)),
         cursor_state: RemoteCursorState::Current,
         has_more: false,

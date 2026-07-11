@@ -36,6 +36,7 @@ import {
   configureRemoteDisplayNativeSurface,
   currentRemoteDisplayWindowContext,
   getSystemResourceSnapshot,
+  ipcGetRemoteSession,
   ipcLanDiscoverySnapshot,
   ipcMediaPipelineSnapshot,
   ipcSendControlInput,
@@ -57,6 +58,7 @@ import {
   type MediaPipelineSnapshot,
   type NativeRenderSurfaceSnapshot,
   type RemoteDisplayWindowContext,
+  type RemoteSessionSnapshot,
   type SystemResourceSnapshot,
   type TestConfig,
   type TestMatrixConfig,
@@ -1524,17 +1526,60 @@ function resolutionDimensions(resolution: ResolutionKey): { width: number; heigh
 }
 
 function keyboardMouseControlAvailable(
-  _capabilities: EnvironmentSnapshot | null,
+  capabilities: EnvironmentSnapshot | null,
   sessionSnapshot: SessionRuntimeSnapshot | null,
   isLocalPipelinePreview: boolean,
   peerInputControlAvailable: boolean
 ): boolean {
-  if (isLocalPipelinePreview) return false;
+  if (isLocalPipelinePreview) {
+    return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
+  }
   if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
   if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
     return false;
   }
   return peerInputControlAvailable;
+}
+
+function remoteAuthorizationFailureMessage(
+  snapshot: RemoteSessionSnapshot
+): string | null {
+  if (snapshot.failure) {
+    return `远程会话授权失败（${snapshot.failure.code}）：${snapshot.failure.message}`;
+  }
+
+  if (snapshot.authorization_state !== "granted") {
+    const terminalStateDefaults = {
+      denied: { code: "consent_denied", message: "访问请求已被拒绝" },
+      expired: { code: "grant_expired", message: "会话授权已过期" },
+      revoked: { code: "grant_revoked", message: "会话授权已撤销" },
+      policy_changed: { code: "policy_changed", message: "本地安全策略已变更" },
+    } as const;
+    const fallback = terminalStateDefaults[
+      snapshot.authorization_state as keyof typeof terminalStateDefaults
+    ];
+    if (!fallback) {
+      return `远程会话尚未获得授权（${snapshot.authorization_state}）`;
+    }
+
+    return `远程会话授权失败（${fallback.code}）：${fallback.message}`;
+  }
+
+  if (snapshot.presentation_state === "closed" || snapshot.route_state === "closed") {
+    return "远程会话已关闭";
+  }
+
+  if (
+    snapshot.presentation_state === "failed" ||
+    snapshot.route_state === "failed" ||
+    snapshot.media_state === "failed"
+  ) {
+    return "远程会话失败";
+  }
+
+  return snapshot.granted_scopes.includes("screen.view")
+    ? null
+    : "远程会话授权失败（scope_denied）：未授予 screen.view";
 }
 
 function peerKeyboardMouseControlAvailable(
@@ -1550,7 +1595,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function mapClientPointToRemoteFrame(
+export function mapClientPointToRemoteFrame(
   clientX: number,
   clientY: number,
   rect: DOMRect,
@@ -1596,7 +1641,7 @@ function mapClientPointToRemoteFrame(
   };
 }
 
-function mapPointerButton(button: number): ControlInputButton | null {
+export function mapPointerButton(button: number): ControlInputButton | null {
   if (button === 0) return "left";
   if (button === 1) return "middle";
   if (button === 2) return "right";
@@ -1605,7 +1650,7 @@ function mapPointerButton(button: number): ControlInputButton | null {
   return null;
 }
 
-function virtualKeyFromKeyboardEvent(
+export function virtualKeyFromKeyboardEvent(
   event: Pick<KeyboardEvent, "key" | "code">
 ): number | null {
   if (/^Key[A-Z]$/.test(event.code)) return event.code.charCodeAt(3);
@@ -2251,6 +2296,7 @@ export function RemoteDisplayWindowPage() {
   const webRtcStatsCountersRef = useRef<WebRtcInboundVideoCounters | null>(null);
   const autoStartRequestedRef = useRef<string | null>(null);
   const autoCaptureSourceRequestedRef = useRef<string | null>(null);
+  const secureAuthorizationSessionRef = useRef<string | null>(null);
   const linuxNativeProfileAppliedRef = useRef(false);
   const diagnosticsCurrentRef = useRef<DiagnosticsSample | null>(null);
   const diagnosticsSamplesRef = useRef<DiagnosticsSample[]>([]);
@@ -2320,6 +2366,8 @@ export function RemoteDisplayWindowPage() {
   const [testMessage, setTestMessage] = useState<string | null>(null);
   const [sessionSnapshot, setSessionSnapshot] =
     useState<SessionRuntimeSnapshot | null>(null);
+  const [remoteAuthorizationError, setRemoteAuthorizationError] =
+    useState<string | null>(null);
   const [peerInputControlAvailable, setPeerInputControlAvailable] = useState(false);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [mediaPipelineSnapshot, setMediaPipelineSnapshot] =
@@ -2838,12 +2886,16 @@ export function RemoteDisplayWindowPage() {
     sessionSnapshot?.state,
   ]);
 
-  const controlInputEnabled = keyboardMouseControlAvailable(
-    capabilities,
-    sessionSnapshot,
-    isLocalPipelinePreview,
-    peerInputControlAvailable
-  );
+  // Task 18 authorizes screen viewing only. Network input remains unavailable
+  // until Task 19 introduces authenticated control envelopes end to end.
+  const controlInputEnabled =
+    isLocalPipelinePreview &&
+    keyboardMouseControlAvailable(
+      capabilities,
+      sessionSnapshot,
+      isLocalPipelinePreview,
+      peerInputControlAvailable
+    );
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
     probeSnapshot?.media_probe_width &&
@@ -4967,10 +5019,15 @@ export function RemoteDisplayWindowPage() {
     let cancelled = false;
     const poll = async () => {
       try {
-        const [snapshot, probe, pipeline] = await Promise.all([
+        const authorizationPromise =
+          secureAuthorizationSessionRef.current === sessionId
+            ? ipcGetRemoteSession(sessionId)
+            : Promise.resolve(null);
+        const [snapshot, probe, pipeline, authorizationResult] = await Promise.all([
           getSessionSnapshot(sessionId),
           getProbeSnapshot(sessionId),
           ipcMediaPipelineSnapshot(sessionId),
+          authorizationPromise,
         ]);
         if (cancelled) return;
 
@@ -4997,6 +5054,25 @@ export function RemoteDisplayWindowPage() {
         } else if (testStatus === "running" || testStatus === "starting") {
           setTestStatus("idle");
           setTestMessage("远程会话已连接，等待启动接收侧");
+        }
+
+        if (authorizationResult) {
+          if (!authorizationResult.ok) {
+            const code = authorizationResult.error.code ?? "unknown";
+            const message = `远程会话授权状态刷新失败（${code}）：${authorizationResult.error.message}`;
+            setRemoteAuthorizationError(message);
+            setTestStatus("failed");
+            setTestMessage(message);
+          } else {
+            const authorizationFailure = remoteAuthorizationFailureMessage(
+              authorizationResult.value
+            );
+            setRemoteAuthorizationError(authorizationFailure);
+            if (authorizationFailure) {
+              setTestStatus("failed");
+              setTestMessage(authorizationFailure);
+            }
+          }
         }
       } catch (error) {
         if (cancelled) return;
@@ -5139,6 +5215,42 @@ export function RemoteDisplayWindowPage() {
     );
   }, [browserWebCodecsUltraBlockReason]);
 
+  const requireRemoteScreenAuthorization = useCallback(
+    async (): Promise<"local" | "legacy" | "secure" | null> => {
+      if (isLocalPipelinePreview) return "local";
+
+      const result = await ipcGetRemoteSession(sessionId);
+      if (!result.ok) {
+        if (result.error.code === "E_REMOTE_SESSION_NOT_FOUND") {
+          // Explicit compatibility for sessions created before the secure LAN contract.
+          // Legacy sessions may display media, but never gain control-input readiness.
+          setRemoteAuthorizationError(null);
+          return "legacy";
+        }
+
+        const code = result.error.code ?? "unknown";
+        const message = `远程会话授权检查失败（${code}）：${result.error.message}`;
+        setRemoteAuthorizationError(message);
+        setTestStatus("failed");
+        setTestMessage(message);
+        return null;
+      }
+
+      secureAuthorizationSessionRef.current = sessionId;
+      const failure = remoteAuthorizationFailureMessage(result.value);
+      if (!failure) {
+        setRemoteAuthorizationError(null);
+        return "secure";
+      }
+
+      setRemoteAuthorizationError(failure);
+      setTestStatus("failed");
+      setTestMessage(failure);
+      return null;
+    },
+    [isLocalPipelinePreview, sessionId],
+  );
+
   const ensureRemoteCaptureSourceSelected = useCallback(async () => {
     if (isLocalPipelinePreview) return null;
     if (captureSourceSelection) return captureSourceSelection;
@@ -5172,6 +5284,9 @@ export function RemoteDisplayWindowPage() {
     setMetrics(null);
 
     try {
+      const authorizationMode = await requireRemoteScreenAuthorization();
+      if (!authorizationMode) return;
+
       const snapshot = await getSessionSnapshot(sessionId);
       setSessionSnapshot(snapshot);
 
@@ -5191,7 +5306,9 @@ export function RemoteDisplayWindowPage() {
         return;
       }
 
-      await ensureRemoteCaptureSourceSelected();
+      if (authorizationMode !== "secure") {
+        await ensureRemoteCaptureSourceSelected();
+      }
 
       if (!snapshot.receiver_active) {
         await startReceiver(sessionId);
@@ -5215,7 +5332,7 @@ export function RemoteDisplayWindowPage() {
       setTestMessage(message);
       setLastError(message);
     }
-  }, [ensureRemoteCaptureSourceSelected, sessionId]);
+  }, [ensureRemoteCaptureSourceSelected, requireRemoteScreenAuthorization, sessionId]);
 
   const handleApplyRemoteMediaProfile = useCallback(async () => {
     if (isLocalPipelinePreview) return;
@@ -5229,6 +5346,14 @@ export function RemoteDisplayWindowPage() {
     setLastError(null);
     setTestMessage("正在协商远端媒体参数");
     try {
+      const authorizationMode = await requireRemoteScreenAuthorization();
+      if (!authorizationMode) return;
+      if (authorizationMode === "secure") {
+        const message = "安全会话的远端媒体参数切换需等待已认证控制信封";
+        setLastError(message);
+        setTestMessage(message);
+        return;
+      }
       const negotiation = await updateMediaProfile(sessionId, buildRemoteMediaProfile());
       setMediaProfileNegotiation(negotiation);
       const adaptationEnabled =
@@ -5266,6 +5391,7 @@ export function RemoteDisplayWindowPage() {
     isLocalPipelinePreview,
     remoteAdaptiveMediaEnabled,
     remoteDynamicResolutionEnabled,
+    requireRemoteScreenAuthorization,
     sessionId,
     transport,
   ]);
@@ -5277,6 +5403,16 @@ export function RemoteDisplayWindowPage() {
       isLocalPipelinePreview ? "正在枚举捕获源（本机）" : "正在枚举捕获源（远端设备）"
     );
     try {
+      if (!isLocalPipelinePreview) {
+        const authorizationMode = await requireRemoteScreenAuthorization();
+        if (!authorizationMode) return;
+        if (authorizationMode === "secure") {
+          setCaptureSources([]);
+          setTestMessage("安全会话使用目标端默认捕获源；远端枚举需等待已认证控制信封");
+          return;
+        }
+      }
+
       const sources = isLocalPipelinePreview
         ? await listLocalCaptureSources(false, 24)
         : await listRemoteCaptureSources(sessionId, false, 24);
@@ -5299,7 +5435,7 @@ export function RemoteDisplayWindowPage() {
     } finally {
       setCaptureSourcesLoading(false);
     }
-  }, [isLocalPipelinePreview, sessionId]);
+  }, [isLocalPipelinePreview, requireRemoteScreenAuthorization, sessionId]);
 
   const handleSelectCaptureSource = useCallback(
     async (source: CaptureSource) => {
@@ -5310,6 +5446,15 @@ export function RemoteDisplayWindowPage() {
         setTestMessage(
           `捕获源已切换（本机）: ${captureSourceKindLabel(source.source_kind)} / ${source.title}`
         );
+        return;
+      }
+
+      const authorizationMode = await requireRemoteScreenAuthorization();
+      if (!authorizationMode) return;
+      if (authorizationMode === "secure") {
+        const message = "安全会话的远端捕获源切换需等待已认证控制信封";
+        setLastError(message);
+        setTestMessage(message);
         return;
       }
 
@@ -5328,7 +5473,7 @@ export function RemoteDisplayWindowPage() {
         setTestMessage(message);
       }
     },
-    [isLocalPipelinePreview, sessionId]
+    [isLocalPipelinePreview, requireRemoteScreenAuthorization, sessionId]
   );
 
   useEffect(() => {
@@ -5354,6 +5499,10 @@ export function RemoteDisplayWindowPage() {
 
     void (async () => {
       try {
+        const authorizationMode = await requireRemoteScreenAuthorization();
+        if (!authorizationMode || cancelled) return;
+        if (authorizationMode === "secure") return;
+
         const sources = await listRemoteCaptureSources(sessionId, false, 24);
         if (cancelled) return;
 
@@ -5382,7 +5531,7 @@ export function RemoteDisplayWindowPage() {
     return () => {
       cancelled = true;
     };
-  }, [isLocalPipelinePreview, sessionId]);
+  }, [isLocalPipelinePreview, requireRemoteScreenAuthorization, sessionId]);
 
   const waitForLocalRunFinished = useCallback(
     async (runId: string, timeoutMs: number): Promise<TestRun | null> => {
@@ -7259,9 +7408,9 @@ export function RemoteDisplayWindowPage() {
             {matrixRunProgress.label}
           </div>
         )}
-        {lastError && (
+        {(remoteAuthorizationError ?? lastError) && (
           <div className="absolute bottom-3 left-3 max-w-xl rounded-md border border-red-500/30 bg-red-950/70 px-3 py-2 text-xs text-red-100">
-            {lastError}
+            {remoteAuthorizationError ?? lastError}
           </div>
         )}
       </div>
@@ -7342,7 +7491,7 @@ export function RemoteDisplayWindowPage() {
           </button>
           <span className="hidden items-center gap-1.5 xl:inline-flex">
             <MousePointer2 className="h-3.5 w-3.5" />
-            input ready
+            {controlInputEnabled ? "input ready" : "input blocked"}
           </span>
         </div>
       </div>

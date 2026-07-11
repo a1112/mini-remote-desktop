@@ -14,6 +14,12 @@ impl fmt::Debug for UnattendedCredential {
 }
 
 impl UnattendedCredential {
+    /// Construct access material obtained through an authenticated out-of-band enrollment.
+    /// The secret is never exposed again by this type.
+    pub fn from_secret(secret: [u8; 16]) -> Self {
+        Self { secret }
+    }
+
     pub fn generate(rng: &impl SecureRandom) -> Result<Self, ring::error::Unspecified> {
         let mut secret = [0; 16];
         rng.fill(&mut secret)?;

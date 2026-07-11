@@ -18,8 +18,11 @@ import {
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
   localThreeFrameLatencyStatus,
+  mapClientPointToRemoteFrame,
+  mapPointerButton,
   shouldAutoSwitchWebRtcVideoToWebCodecs,
   summarizeWebRtcInboundVideoStats,
+  virtualKeyFromKeyboardEvent,
 } from "./RemoteDisplayWindowPage";
 
 const runtimeMock = vi.hoisted(() => ({ isTauri: true }));
@@ -222,7 +225,41 @@ function lanDiscoverySnapshotWithPeerInput() {
   };
 }
 
-function defaultRemoteDisplayInvoke(command: string): Promise<unknown> {
+function secureRemoteSessionSnapshot(
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    session_id: "p2p-quic-123",
+    role: "controller",
+    peer_device_id: "target-device",
+    peer_key_id: "sha256:target-device",
+    access_mode: "attended",
+    authorization_state: "granted",
+    route_state: "connected",
+    route_kind: "lan_quic",
+    media_state: "streaming",
+    presentation_state: "streaming",
+    requested_scopes: ["screen.view"],
+    granted_scopes: ["screen.view"],
+    policy_revision: "1",
+    failure: null,
+    created_at_ms: 1,
+    updated_at_ms: 2,
+    ...overrides,
+  };
+}
+
+function defaultRemoteDisplayInvoke(
+  command: string,
+  _args?: Record<string, unknown>
+): Promise<unknown> {
+  if (command === "ipc_secure_remote") {
+    return Promise.resolve({
+      type: "Error",
+      code: "E_REMOTE_SESSION_NOT_FOUND",
+      message: "legacy test session",
+    });
+  }
   if (command === "ipc_lan_discovery_snapshot") {
     return Promise.resolve(lanDiscoverySnapshotWithPeerInput());
   }
@@ -752,36 +789,133 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("captures pointer input on the focused remote render area", async () => {
+  it("keeps network input blocked even when Task 19 scopes are advertised", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+          }),
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+          peer_device_id: "target-device",
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 30,
+          bitrate_mbps: 4,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_send_control_input") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          lane: "realtime",
+          event_count: 1,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([command]) => command === "ipc_lan_discovery_snapshot")
+      ).toBe(true);
+      expect(renderArea).toHaveAttribute("tabindex", "-1");
+    });
+
+    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
+    fireEvent.keyDown(renderArea, { code: "KeyA", key: "a" });
+
+    expect(screen.getByText("input blocked")).toBeInTheDocument();
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")).toBe(
+      false
+    );
+  });
+
+  it("keeps future pointer mappings stable while network input is disabled", () => {
+    const rect = {
+      x: 0,
+      y: 56,
+      left: 0,
+      top: 56,
+      right: 1280,
+      bottom: 776,
+      width: 1280,
+      height: 720,
+      toJSON: () => ({}),
+    } as DOMRect;
+
+    expect(
+      mapClientPointToRemoteFrame(640, 416, rect, { width: 2560, height: 1440 })
+    ).toEqual({ x: 1280, y: 720 });
+    expect(
+      mapClientPointToRemoteFrame(Number.NaN, 416, rect, {
+        width: 2560,
+        height: 1440,
+      })
+    ).toBeNull();
+
+    const letterboxedFrame = { width: 1920, height: 1200 };
+    expect(mapClientPointToRemoteFrame(32, 416, rect, letterboxedFrame)).toBeNull();
+    expect(mapClientPointToRemoteFrame(64, 56, rect, letterboxedFrame)).toEqual({
+      x: 0,
+      y: 0,
+    });
+    expect(mapClientPointToRemoteFrame(1216, 776, rect, letterboxedFrame)).toEqual({
+      x: 1919,
+      y: 1199,
+    });
+    expect([0, 1, 2, 3, 4, 5].map(mapPointerButton)).toEqual([
+      "left",
+      "middle",
+      "right",
+      "x1",
+      "x2",
+      null,
+    ]);
+  });
+
+  it.each([
+    ["KeyA", "a", 0x41],
+    ["F13", "F13", 0x7c],
+    ["Semicolon", ";", 0xba],
+    ["NumpadAdd", "+", 0x6b],
+    ["PrintScreen", "PrintScreen", 0x2c],
+    ["Unidentified", "Unidentified", null],
+  ])(
+    "keeps future keyboard mapping stable for %s while network input is disabled",
+    (code, key, expectedVirtualKey) => {
+      expect(virtualKeyFromKeyboardEvent({ code, key })).toBe(expectedVirtualKey);
+    }
+  );
+
+  it("drops unsigned input events for an explicitly legacy network session", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve({
           ...windowsCapabilities(),
           available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
         });
       }
       if (command === "ipc_session_snapshot") {
@@ -802,516 +936,64 @@ describe("RemoteDisplayWindowPage", () => {
           frames_received: 4,
           frames_decoded: 4,
           frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
-    fireEvent.pointerUp(renderArea, { button: 0, clientX: 640, clientY: 416 });
-    fireEvent.wheel(renderArea, { deltaY: 120 });
-    fireEvent.wheel(renderArea, { deltaX: 120 });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_wheel", delta: -120 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_horizontal_wheel", delta: -120 },
-        },
-      ]);
-    });
-  });
-
-  it("enables remote control from service-owned keyboard mouse capability snapshots", async () => {
-    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
-    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body ?? "{}")) as {
-        request?: { type?: string; session_id?: string };
-      };
-      const request = body.request;
-      if (request?.type === "CapabilitySnapshot") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "CapabilitySnapshot",
-              snapshot: {
-                schema_version: 1,
-                platform: "windows",
-                service_version: "0.1.0",
-                capabilities: [
-                  {
-                    id: "control.keyboard_mouse",
-                    domain: "control",
-                    label: "Keyboard and mouse control",
-                    status: "available",
-                    platform: "windows",
-                  },
-                ],
-                constraints: [],
-                profiles: [],
-                updated_at_ms: 1,
-              },
-            },
-          }),
-        };
-      }
-      if (request?.type === "SessionRuntimeSnapshot") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "SessionRuntimeSnapshot",
-              snapshot: {
-                session_id: request.session_id,
-                role: "controller",
-                state: "streaming",
-                transport_kind: "quic",
-                last_error: null,
-                sender_active: false,
-                receiver_active: true,
-                peer_device_id: "target-device",
-              },
-            },
-          }),
-        };
-      }
-      if (request?.type === "LanDiscoverySnapshot") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "LanDiscoverySnapshot",
-              snapshot: lanDiscoverySnapshotWithPeerInput(),
-            },
-          }),
-        };
-      }
-      if (request?.type === "ProbeSnapshot") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "ProbeSnapshot",
-              snapshot: {
-                session_id: request.session_id,
-                frames_received: 2,
-                frames_decoded: 2,
-                frames_dropped: 0,
-                current_fps: 60,
-                bitrate_mbps: 20,
-                media_probe_valid: true,
-                media_probe_width: 1920,
-                media_probe_height: 1080,
-                media_probe_target_fps: 60,
-                media_probe_target_bitrate_mbps: 20,
-                latest_frame_width: 1920,
-                latest_frame_height: 1080,
-                last_error: null,
-              },
-            },
-          }),
-        };
-      }
-      if (request?.type === "MediaPipelineSnapshot") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "MediaPipelineSnapshot",
-              snapshot: {
-                session_id: request.session_id,
-                active_width: 1920,
-                active_height: 1080,
-                active_fps: 60,
-                active_bitrate_mbps: 20,
-                queue_depth: 0,
-                dropped_frames: 0,
-                stage_metrics: [],
-              },
-            },
-          }),
-        };
-      }
-      if (request?.type === "SendControlInput") {
-        return {
-          ok: true,
-          json: async () => ({
-            response: {
-              type: "ControlInputAccepted",
-              session_id: request.session_id,
-              lane: "realtime",
-              event_count: 1,
-            },
-          }),
-        };
-      }
-      return {
-        ok: true,
-        json: async () => ({ response: { type: "Ack" } }),
-      };
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
-
-    await waitFor(() => {
-      const sentRequests = fetchMock.mock.calls
-        .map(([, init]) => JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}")))
-        .map((body) => body.request)
-        .filter((request) => request?.type === "SendControlInput");
-      expect(sentRequests).toEqual([
-        {
-          type: "SendControlInput",
-          session_id: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 960, y: 540 },
-        },
-      ]);
-    });
-    expect(getMockInvoke()).not.toHaveBeenCalledWith("test_get_capabilities", expect.anything());
-  });
-
-  it("captures extended pointer buttons on the focused remote render area", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
+          current_fps: 60,
+          bitrate_mbps: 20,
           media_probe_valid: true,
           media_probe_width: 2560,
           media_probe_height: 1440,
           latest_frame_width: 2560,
           latest_frame_height: 1440,
-          latest_frame_data_url: null,
           last_error: null,
         });
       }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
+      return defaultRemoteDisplayInvoke(command, args);
     });
 
     renderRemoteDisplay();
     const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerDown(renderArea, { button: 3, clientX: 640, clientY: 416 });
-    fireEvent.pointerUp(renderArea, { button: 3, clientX: 640, clientY: 416 });
-    fireEvent.pointerDown(renderArea, { button: 4, clientX: 640, clientY: 416 });
-    fireEvent.pointerUp(renderArea, { button: 4, clientX: 640, clientY: 416 });
-
     await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "x1", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "x1", pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "x2", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "x2", pressed: false },
-        },
-      ]);
-    });
-  });
-
-  it("keeps remote input disabled until the receiver session is streaming", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "connected",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: false,
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 0,
-          frames_decoded: 0,
-          frames_dropped: 0,
-          current_fps: null,
-          bitrate_mbps: null,
-          latest_frame_width: null,
-          latest_frame_height: null,
-          latest_frame_pixel_format: null,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
+      expect(renderArea).toHaveAttribute("tabindex", "-1");
+      expect(screen.getByText("input blocked")).toBeInTheDocument();
     });
 
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "-1"));
-    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
-    fireEvent.keyDown(renderArea, { key: "a", code: "KeyA" });
+    fireEvent.pointerMove(renderArea, { pointerId: 7, clientX: 640, clientY: 416 });
+    fireEvent.pointerDown(renderArea, {
+      pointerId: 7,
+      button: 0,
+      clientX: 640,
+      clientY: 416,
+    });
+    fireEvent.pointerUp(renderArea, {
+      pointerId: 7,
+      button: 0,
+      clientX: 640,
+      clientY: 416,
+    });
+    fireEvent.pointerCancel(renderArea, { pointerId: 7 });
+    fireEvent.wheel(renderArea, {
+      clientX: 640,
+      clientY: 416,
+      deltaX: 120,
+      deltaY: 120,
+    });
+    fireEvent.keyDown(renderArea, { code: "KeyA", key: "a" });
+    fireEvent.keyUp(renderArea, { code: "KeyA", key: "a" });
+    fireEvent.blur(renderArea);
+    fireEvent(window, new Event("blur"));
+    fireEvent(window, new Event("pagehide"));
 
     expect(
       mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")
     ).toBe(false);
   });
 
-  it("moves the remote cursor before sending a direct pointer button press", async () => {
+  it("keeps local preview input and cleanup available from the local capability", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
         return Promise.resolve({
           ...windowsCapabilities(),
           available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
         });
       }
       if (command === "ipc_send_control_input") {
@@ -1321,1869 +1003,122 @@ describe("RemoteDisplayWindowPage", () => {
           event_count: 1,
         });
       }
-      return defaultRemoteDisplayInvoke(command);
+      return defaultRemoteDisplayInvoke(command, args);
     });
 
-    renderRemoteDisplay();
+    renderRemoteDisplay("local-preview");
     const renderArea = await screen.findByTestId("remote-render-area");
     await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
 
-    act(() => {
-      renderArea.focus();
-    });
+    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
     fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
+    fireEvent.pointerUp(renderArea, { button: 0, clientX: 640, clientY: 416 });
+    fireEvent.wheel(renderArea, { clientX: 640, clientY: 416, deltaY: 120 });
+    fireEvent.keyDown(renderArea, { code: "KeyA", key: "a" });
+    fireEvent.keyUp(renderArea, { code: "KeyA", key: "a" });
+    fireEvent(window, new Event("blur"));
 
     await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
+      const inputCalls = mockInvoke.mock.calls.filter(
+        ([command]) => command === "ipc_send_control_input"
+      );
       expect(inputCalls.map(([, args]) => args)).toEqual([
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
+          sessionId: "local-preview",
+          event: { kind: "mouse_move", x: 960, y: 540 },
         },
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: true },
-        },
-      ]);
-    });
-  });
-
-  it("moves the remote cursor before sending a wheel event", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    const wheelEvent = new WheelEvent("wheel", {
-      bubbles: true,
-      cancelable: true,
-      deltaY: 120,
-    });
-    Object.defineProperty(wheelEvent, "clientX", { value: 640 });
-    Object.defineProperty(wheelEvent, "clientY", { value: 416 });
-    fireEvent(renderArea, wheelEvent);
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_wheel", delta: -120 },
-        },
-      ]);
-    });
-  });
-
-  it("releases active remote pointer input when pointer capture is cancelled", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
-    fireEvent.pointerCancel(renderArea, { pointerId: 1 });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
+          sessionId: "local-preview",
           event: { kind: "mouse_button", button: "left", pressed: true },
         },
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-  });
-
-  it("releases active remote pointer input when pointer capture is lost", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
-    fireEvent(renderArea, new Event("lostpointercapture", { bubbles: true }));
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-  });
-
-  it("releases active remote pointer input when the browser context menu opens", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 2560,
-          active_height: 1440,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerDown(renderArea, { button: 2, clientX: 640, clientY: 416 });
-
-    const contextMenu = new MouseEvent("contextmenu", {
-      bubbles: true,
-      cancelable: true,
-    });
-    fireEvent(renderArea, contextMenu);
-
-    expect(contextMenu.defaultPrevented).toBe(true);
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 1280, y: 720 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "right", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-  });
-
-  it("ignores pointer input in a letterboxed remote render area", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 0, width: 1000, height: 600 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 1600,
-          media_probe_height: 900,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 1600,
-          latest_frame_height: 900,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 1600,
-          active_height: 900,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    vi.spyOn(renderArea, "getBoundingClientRect").mockReturnValue({
-      x: 0,
-      y: 0,
-      left: 0,
-      top: 0,
-      right: 1000,
-      bottom: 600,
-      width: 1000,
-      height: 600,
-      toJSON: () => ({}),
-    } as DOMRect);
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerMove(renderArea, { clientX: 500, clientY: 10 });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 500, clientY: 10 });
-    fireEvent.pointerMove(renderArea, { clientX: 500, clientY: 300 });
-    fireEvent.pointerDown(renderArea, { button: 0, clientX: 500, clientY: 300 });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 800, y: 450 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: true },
-        },
-      ]);
-    });
-  });
-
-  it("releases remote pointer input when pointer up lands in a letterbox gutter", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 0, width: 1000, height: 600 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          frames_received: 4,
-          frames_decoded: 4,
-          frames_dropped: 0,
-          current_fps: 144,
-          bitrate_mbps: 80,
-          media_probe_valid: true,
-          media_probe_width: 1600,
-          media_probe_height: 900,
-          media_probe_target_fps: 144,
-          media_probe_target_bitrate_mbps: 80,
-          latest_frame_width: 1600,
-          latest_frame_height: 900,
-          latest_frame_pixel_format: "d3d11_shared_nv12",
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_media_pipeline_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          active_width: 1600,
-          active_height: 900,
-          active_fps: 144,
-          active_bitrate_mbps: 80,
-          stage_metrics: [],
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    vi.spyOn(renderArea, "getBoundingClientRect").mockReturnValue({
-      x: 0,
-      y: 0,
-      left: 0,
-      top: 0,
-      right: 1000,
-      bottom: 600,
-      width: 1000,
-      height: 600,
-      toJSON: () => ({}),
-    } as DOMRect);
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.pointerDown(renderArea, { pointerId: 7, button: 0, clientX: 500, clientY: 300 });
-    fireEvent.pointerUp(renderArea, { pointerId: 7, button: 0, clientX: 500, clientY: 10 });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_move", x: 800, y: 450 },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "mouse_button", button: "left", pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
+          sessionId: "local-preview",
           event: { kind: "mouse_button", button: "left", pressed: false },
         },
-      ]);
-    });
-  });
-
-  it("captures keyboard input and releases tracked input on blur", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "a", code: "KeyA" });
-    fireEvent.keyUp(renderArea, { key: "a", code: "KeyA" });
-    fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-    fireEvent.blur(renderArea);
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x41 }, pressed: true },
+          sessionId: "local-preview",
+          event: { kind: "mouse_wheel", delta: -120 },
         },
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x41 }, pressed: false },
+          sessionId: "local-preview",
+          event: {
+            kind: "key",
+            key: { kind: "virtual_key", code: 0x41 },
+            pressed: true,
+          },
         },
         {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x10 }, pressed: true },
+          sessionId: "local-preview",
+          event: {
+            kind: "key",
+            key: { kind: "virtual_key", code: 0x41 },
+            pressed: false,
+          },
         },
         {
-          sessionId: "p2p-quic-123",
+          sessionId: "local-preview",
           event: { kind: "release_all" },
         },
       ]);
     });
   });
 
-  it("clears stale control input errors after a later input succeeds", async () => {
-    const mockInvoke = getMockInvoke();
-    let controlInputAttempts = 0;
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        controlInputAttempts += 1;
-        if (controlInputAttempts === 1) {
-          return Promise.reject(new Error("input injection failed"));
-        }
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "a", code: "KeyA" });
-    expect(await screen.findByText("input injection failed")).toBeInTheDocument();
-
-    fireEvent.keyUp(renderArea, { key: "a", code: "KeyA" });
-
-    await waitFor(() => {
-      expect(screen.queryByText("input injection failed")).not.toBeInTheDocument();
-    });
-  });
-
-  it("captures function key input for remote control shortcuts", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "F5", code: "F5" });
-    fireEvent.keyUp(renderArea, { key: "F5", code: "F5" });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x74 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x74 }, pressed: false },
-        },
-      ]);
-    });
-  });
-
-  it("captures punctuation key input for remote typing", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "-", code: "Minus" });
-    fireEvent.keyUp(renderArea, { key: "-", code: "Minus" });
-    fireEvent.keyDown(renderArea, { key: "/", code: "Slash" });
-    fireEvent.keyUp(renderArea, { key: "/", code: "Slash" });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbd }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbd }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbf }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbf }, pressed: false },
-        },
-      ]);
-    });
-  });
-
-  it("captures numpad operator key input for remote typing", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "*", code: "NumpadMultiply" });
-    fireEvent.keyUp(renderArea, { key: "*", code: "NumpadMultiply" });
-    fireEvent.keyDown(renderArea, { key: "+", code: "NumpadAdd" });
-    fireEvent.keyUp(renderArea, { key: "+", code: "NumpadAdd" });
-    fireEvent.keyDown(renderArea, { key: "=", code: "NumpadEqual" });
-    fireEvent.keyUp(renderArea, { key: "=", code: "NumpadEqual" });
-    fireEvent.keyDown(renderArea, { key: "-", code: "NumpadSubtract" });
-    fireEvent.keyUp(renderArea, { key: "-", code: "NumpadSubtract" });
-    fireEvent.keyDown(renderArea, { key: ".", code: "NumpadDecimal" });
-    fireEvent.keyUp(renderArea, { key: ".", code: "NumpadDecimal" });
-    fireEvent.keyDown(renderArea, { key: "/", code: "NumpadDivide" });
-    fireEvent.keyUp(renderArea, { key: "/", code: "NumpadDivide" });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6a }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6a }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6b }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6b }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbb }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0xbb }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6d }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6d }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6e }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6e }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6f }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x6f }, pressed: false },
-        },
-      ]);
-    });
-  });
-
-  it("captures system key input for remote control", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "PrintScreen", code: "PrintScreen" });
-    fireEvent.keyUp(renderArea, { key: "PrintScreen", code: "PrintScreen" });
-    fireEvent.keyDown(renderArea, { key: "NumLock", code: "NumLock" });
-    fireEvent.keyUp(renderArea, { key: "NumLock", code: "NumLock" });
-    fireEvent.keyDown(renderArea, { key: "ScrollLock", code: "ScrollLock" });
-    fireEvent.keyUp(renderArea, { key: "ScrollLock", code: "ScrollLock" });
-    fireEvent.keyDown(renderArea, { key: "ContextMenu", code: "ContextMenu" });
-    fireEvent.keyUp(renderArea, { key: "ContextMenu", code: "ContextMenu" });
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x2c }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x2c }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x90 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x90 }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x91 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x91 }, pressed: false },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x5d }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x5d }, pressed: false },
-        },
-      ]);
-    });
-  });
-
-  it("enables remote control from the peer input capability when local injection is unavailable", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: [],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_lan_discovery_snapshot") {
-        return Promise.resolve({
-          enabled: true,
-          running: true,
-          discovery_port: 49700,
-          instance_id: "local-instance",
-          peers: [
-            {
-              device_id: "target-device",
-              device_name: "Target",
-              device_type: "desktop",
-              ip: "127.0.0.1",
-              discovery_port: 49700,
-              p2p_control_addr: "127.0.0.1:49701",
-              transports: ["quic"],
-              protocol_version: 1,
-              media_protocol_version: 1,
-              media_capabilities: ["control.keyboard_mouse"],
-              age_ms: 10,
-              p2p_available: true,
-            },
-          ],
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
-
-    await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("ipc_send_control_input", {
-        sessionId: "p2p-quic-123",
-        event: { kind: "mouse_move", x: 1280, y: 720 },
+  it("does not send browser-bridge input when future scopes are advertised", async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        request?: { type?: string };
+      };
+      const response = (value: Record<string, unknown>) => ({
+        ok: true,
+        json: async () => ({ response: value }),
       });
+      if (body.request?.type === "CapabilitySnapshot") {
+        return response({
+          type: "CapabilitySnapshot",
+          snapshot: {
+            schema_version: 1,
+            platform: "windows",
+            service_version: "0.1.0",
+            capabilities: [{
+              id: "control.keyboard_mouse",
+              domain: "control",
+              label: "Keyboard and mouse control",
+              status: "available",
+              platform: "windows",
+            }],
+            constraints: [],
+            profiles: [],
+            updated_at_ms: 1,
+          },
+        });
+      }
+      if (body.request?.type === "GetRemoteSession") {
+        return response({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+          }),
+        });
+      }
+      return response({ type: "Ack" });
     });
-    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_list_sessions")).toBe(false);
-  });
-
-  it("keeps remote control disabled until the peer advertises keyboard mouse capability", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_lan_discovery_snapshot") {
-        return Promise.resolve({
-          enabled: true,
-          running: true,
-          discovery_port: 49700,
-          instance_id: "local-instance",
-          peers: [
-            {
-              device_id: "target-device",
-              device_name: "Target",
-              device_type: "desktop",
-              ip: "127.0.0.1",
-              discovery_port: 49700,
-              p2p_control_addr: "127.0.0.1:49701",
-              transports: ["quic"],
-              protocol_version: 1,
-              media_protocol_version: 1,
-              media_capabilities: ["codec.h264"],
-              age_ms: 10,
-              p2p_available: true,
-            },
-          ],
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
+    vi.stubGlobal("fetch", fetchMock);
 
     renderRemoteDisplay();
     const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() =>
-      expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_lan_discovery_snapshot"))
-        .toBe(true)
-    );
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "-1"));
+    fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
+    fireEvent.keyDown(renderArea, { code: "KeyA", key: "a" });
 
-    expect(renderArea).toHaveAttribute("tabindex", "-1");
-    fireEvent.pointerMove(renderArea, { clientX: 640, clientY: 416 });
-    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")).toBe(
-      false
-    );
-  });
-
-  it("releases active remote keyboard input when the window loses focus", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-    window.dispatchEvent(new Event("blur"));
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x10 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-  });
-
-  it("releases active remote keyboard input when the page is hidden", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-    window.dispatchEvent(new Event("pagehide"));
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x10 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-  });
-
-  it("releases active remote keyboard input when document visibility becomes hidden", async () => {
-    const mockInvoke = getMockInvoke();
-    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
-      if (command === "test_get_capabilities") {
-        return Promise.resolve({
-          ...windowsCapabilities(),
-          available_controls: ["keyboard_mouse"],
-        });
-      }
-      if (command === "current_remote_display_window_context") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          session_id: "p2p-quic-123",
-          surface_id: "surface-1",
-          role: "controller",
-          renderer_attached: true,
-          render_mode: "d3d11_native",
-          native_surface_attached: true,
-          session_window_count: 1,
-        });
-      }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
-      if (command === "ipc_session_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          role: "controller",
-          state: "streaming",
-          transport_kind: "quic",
-          last_error: null,
-          sender_active: false,
-          receiver_active: true,
-          peer_device_id: "target-device",
-        });
-      }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "reliable",
-          event_count: 1,
-        });
-      }
-      return defaultRemoteDisplayInvoke(command);
-    });
-
-    renderRemoteDisplay();
-    const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
-    fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-
-    Object.defineProperty(document, "visibilityState", {
-      configurable: true,
-      value: "hidden",
-    });
-    document.dispatchEvent(new Event("visibilitychange"));
-
-    await waitFor(() => {
-      const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
-      expect(inputCalls.map(([, args]) => args)).toEqual([
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "key", key: { kind: "virtual_key", code: 0x10 }, pressed: true },
-        },
-        {
-          sessionId: "p2p-quic-123",
-          event: { kind: "release_all" },
-        },
-      ]);
-    });
-
-    Object.defineProperty(document, "visibilityState", {
-      configurable: true,
-      value: "visible",
-    });
+    const sentRequests = fetchMock.mock.calls
+      .map(([, init]) =>
+        JSON.parse(String((init as RequestInit | undefined)?.body ?? "{}"))
+      )
+      .map((body) => body.request)
+      .filter((request) => request?.type === "SendControlInput");
+    expect(sentRequests).toEqual([]);
   });
 
   it("exposes 4K and high-refresh profile options", async () => {
@@ -5701,6 +3636,13 @@ describe("RemoteDisplayWindowPage", () => {
   it("auto-selects the best fullscreen shared capture source for LAN remote sessions", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "Error",
+          code: "E_REMOTE_SESSION_NOT_FOUND",
+          message: "legacy session",
+        });
+      }
       if (command === "test_get_capabilities") {
         return Promise.resolve(windowsCapabilities());
       }
@@ -5792,6 +3734,488 @@ describe("RemoteDisplayWindowPage", () => {
         sourceId: "windows:display-shared:0",
       });
     });
+  });
+
+  it("uses the target default source without unsigned controls for a secure screen-view session", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            requested_scopes: ["screen.view"],
+            granted_scopes: ["screen.view"],
+          }),
+        });
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_secure_remote", {
+        request: {
+          type: "GetRemoteSession",
+          session_id: "p2p-quic-123",
+        },
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_list_remote_capture_sources",
+      expect.anything(),
+    );
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_select_remote_capture_source",
+      expect.anything(),
+    );
+  });
+
+  it.each([
+    [
+      "expired",
+      secureRemoteSessionSnapshot({
+        authorization_state: "expired",
+        route_state: "closed",
+        media_state: "stopped",
+        presentation_state: "failed",
+        granted_scopes: [],
+        failure: {
+          code: "grant_expired",
+          message: "会话授权已过期",
+          suggested_action: null,
+        },
+      }),
+      "远程会话授权失败（grant_expired）：会话授权已过期",
+    ],
+    [
+      "revoked",
+      secureRemoteSessionSnapshot({
+        authorization_state: "revoked",
+        route_state: "closed",
+        media_state: "stopped",
+        presentation_state: "failed",
+        granted_scopes: [],
+        failure: {
+          code: "grant_revoked",
+          message: "会话授权已撤销",
+          suggested_action: null,
+        },
+      }),
+      "远程会话授权失败（grant_revoked）：会话授权已撤销",
+    ],
+    [
+      "closed",
+      secureRemoteSessionSnapshot({
+        route_state: "closed",
+        media_state: "stopped",
+        presentation_state: "closed",
+      }),
+      "远程会话已关闭",
+    ],
+  ])(
+    "refreshes a known secure session when it becomes %s",
+    async (_terminalState, terminalSnapshot, expectedMessage) => {
+      const mockInvoke = getMockInvoke();
+      let authorizationReads = 0;
+      mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        if (command === "ipc_secure_remote") {
+          authorizationReads += 1;
+          return Promise.resolve({
+            type: "RemoteSession",
+            session:
+              authorizationReads === 1
+                ? secureRemoteSessionSnapshot()
+                : terminalSnapshot,
+          });
+        }
+        if (command === "ipc_session_snapshot") {
+          return Promise.resolve({
+            session_id: "p2p-quic-123",
+            role: "controller",
+            state: "streaming",
+            transport_kind: "quic",
+            sender_active: false,
+            receiver_active: true,
+            peer_device_id: "target-device",
+            last_error: null,
+          });
+        }
+        if (command === "ipc_probe_snapshot") {
+          return Promise.resolve({
+            session_id: "p2p-quic-123",
+            frames_received: 1,
+            frames_decoded: 1,
+            frames_dropped: 0,
+            current_fps: 60,
+            bitrate_mbps: 20,
+            last_error: null,
+          });
+        }
+        return defaultRemoteDisplayInvoke(command, args);
+      });
+
+      renderRemoteDisplay();
+
+      await waitFor(() => {
+        expect(authorizationReads).toBeGreaterThanOrEqual(2);
+      }, { timeout: 2_000 });
+      expect((await screen.findAllByText(expectedMessage)).length).toBeGreaterThan(0);
+    },
+  );
+
+  it("fails closed before remote capture selection or receiver start when authorization is denied", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "current_remote_display_window_context") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          session_id: "p2p-quic-123",
+          surface_id: "surface-1",
+          role: "controller",
+          renderer_attached: false,
+          render_mode: "d3d11_native",
+          native_surface_attached: false,
+          session_window_count: 1,
+        });
+      }
+      if (command === "configure_remote_display_native_surface") {
+        return Promise.resolve({
+          label: "render-p2p-quic-123-1",
+          backend: "d3d11",
+          attached: true,
+          visible: true,
+          parent_hwnd: "0xA",
+          hwnd: "0x14",
+          rect: { x: 0, y: 0, width: 1280, height: 720 },
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "connected",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: false,
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 0,
+          frames_decoded: 0,
+          frames_dropped: 0,
+          current_fps: null,
+          bitrate_mbps: null,
+          last_error: null,
+        });
+      }
+      if (command === "ipc_secure_remote") {
+        expect((args?.request as { type?: string }).type).toBe("GetRemoteSession");
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            authorization_state: "denied",
+            route_state: "idle",
+            media_state: "idle",
+            presentation_state: "denied",
+            granted_scopes: [],
+            failure: {
+              code: "consent_denied",
+              message: "访问请求已被拒绝",
+              suggested_action: null,
+            },
+          }),
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+
+    expect(
+      (
+        await screen.findAllByText(
+          "远程会话授权失败（consent_denied）：访问请求已被拒绝"
+        )
+      ).length
+    ).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "Start remote receiver" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_list_remote_capture_sources",
+        expect.anything()
+      );
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_select_remote_capture_source",
+        expect.anything()
+      );
+      expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
+    });
+  });
+
+  it("requires the exact screen.view grant before remote capture selection", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["input.pointer", "input.keyboard"],
+          }),
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          sender_active: false,
+          receiver_active: true,
+          peer_device_id: "target-device",
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+
+    expect(
+      await screen.findByText("远程会话授权失败（scope_denied）：未授予 screen.view")
+    ).toBeInTheDocument();
+    const renderArea = screen.getByTestId("remote-render-area");
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some(([command]) => command === "ipc_lan_discovery_snapshot")
+      ).toBe(true);
+      expect(renderArea).toHaveAttribute("tabindex", "-1");
+    });
+    expect(screen.getByText("input blocked")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start remote receiver" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_list_remote_capture_sources",
+        expect.anything()
+      );
+      expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
+    });
+  });
+
+  it.each([
+    ["expired", "grant_expired", "会话授权已过期"],
+    ["policy_changed", "policy_changed", "本地安全策略已变更"],
+  ])(
+    "shows a stable failure and starts no receiver when authorization is %s",
+    async (authorizationState, reasonCode, reasonMessage) => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        if (command === "ipc_secure_remote") {
+          return Promise.resolve({
+            type: "RemoteSession",
+            session: secureRemoteSessionSnapshot({
+              authorization_state: authorizationState,
+              route_state: "idle",
+              media_state: "idle",
+              presentation_state: "failed",
+              granted_scopes: [],
+              failure: null,
+            }),
+          });
+        }
+        if (command === "ipc_session_snapshot") {
+          return Promise.resolve({
+            session_id: "p2p-quic-123",
+            role: "controller",
+            state: "connected",
+            transport_kind: "quic",
+            sender_active: false,
+            receiver_active: false,
+          });
+        }
+        if (command === "ipc_list_remote_capture_sources") {
+          return Promise.resolve([remoteDisplaySource]);
+        }
+        return defaultRemoteDisplayInvoke(command, args);
+      });
+
+      renderRemoteDisplay();
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("ipc_secure_remote", {
+          request: { type: "GetRemoteSession", session_id: "p2p-quic-123" },
+        });
+      });
+      expect(
+        await screen.findByText(`远程会话授权失败（${reasonCode}）：${reasonMessage}`)
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Start remote receiver" }));
+
+      await waitFor(() => {
+        expect(mockInvoke).not.toHaveBeenCalledWith(
+          "ipc_list_remote_capture_sources",
+          expect.anything()
+        );
+        expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
+      });
+    }
+  );
+
+  it.each([
+    ["discovered", "trust_required", "authoritative discovered failure"],
+    ["authenticating", "identity_mismatch", "authoritative authentication failure"],
+    ["authorizing", "policy_changed", "authoritative authorizing failure"],
+    [
+      "awaiting_local_consent",
+      "authorization_timeout",
+      "authoritative consent failure",
+    ],
+    [
+      "verifying_unattended_credential",
+      "credential_invalid",
+      "authoritative credential failure",
+    ],
+    ["denied", "scope_denied", "authoritative denial failure"],
+    ["expired", "authorization_timeout", "authoritative expiry failure"],
+    ["revoked", "grant_revoked", "authoritative revocation failure"],
+    ["locked_out", "credential_locked", "authoritative lockout failure"],
+    ["policy_changed", "scope_denied", "authoritative policy failure"],
+  ])(
+    "prefers the authoritative failure when authorization is %s",
+    async (authorizationState, reasonCode, reasonMessage) => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        if (command === "ipc_secure_remote") {
+          return Promise.resolve({
+            type: "RemoteSession",
+            session: secureRemoteSessionSnapshot({
+              authorization_state: authorizationState,
+              route_state: "idle",
+              media_state: "idle",
+              presentation_state: "failed",
+              granted_scopes: [],
+              failure: {
+                code: reasonCode,
+                message: reasonMessage,
+                suggested_action: "authoritative action",
+              },
+            }),
+          });
+        }
+        if (command === "ipc_session_snapshot") {
+          return Promise.resolve({
+            session_id: "p2p-quic-123",
+            role: "controller",
+            state: "connected",
+            transport_kind: "quic",
+            sender_active: false,
+            receiver_active: false,
+          });
+        }
+        if (command === "ipc_list_remote_capture_sources") {
+          return Promise.resolve([remoteDisplaySource]);
+        }
+        return defaultRemoteDisplayInvoke(command, args);
+      });
+
+      renderRemoteDisplay();
+
+      expect(
+        (
+          await screen.findAllByText(
+            `远程会话授权失败（${reasonCode}）：${reasonMessage}`
+          )
+        ).length
+      ).toBeGreaterThan(0);
+    }
+  );
+
+  it("fails closed when the secure remote authorization contract is unavailable", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "Error",
+          code: "E_SECURE_REMOTE_UNAVAILABLE",
+          message: "secure remote session operations are unavailable",
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+
+    expect(
+      await screen.findByText(
+        "远程会话授权检查失败（E_SECURE_REMOTE_UNAVAILABLE）：secure remote session operations are unavailable"
+      )
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start remote receiver" }));
+
+    await waitFor(() => {
+      expect(mockInvoke).not.toHaveBeenCalledWith(
+        "ipc_list_remote_capture_sources",
+        expect.anything()
+      );
+      expect(mockInvoke).not.toHaveBeenCalledWith("ipc_start_receiver", expect.anything());
+    });
+  });
+
+  it("keeps display-only compatibility for an explicitly unknown legacy session", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "Error",
+          code: "E_REMOTE_SESSION_NOT_FOUND",
+          message: "remote session was not found",
+        });
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_list_remote_capture_sources", {
+        sessionId: "p2p-quic-123",
+        includePreviews: false,
+        limit: 24,
+      });
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
+        sessionId: "p2p-quic-123",
+        sourceId: "windows:display-shared:0",
+      });
+    });
+    expect(screen.queryByText(/远程会话授权检查失败/)).not.toBeInTheDocument();
+    expect(screen.getByText("input blocked")).toBeInTheDocument();
   });
 
   it("does not render decoded remote desktop data URLs as preview frames", async () => {
@@ -6246,7 +4670,7 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("releases remote input before closing the remote display window", async () => {
+  it("closes a remote network window without sending an unsigned release", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
@@ -6267,17 +4691,6 @@ describe("RemoteDisplayWindowPage", () => {
           session_window_count: 1,
         });
       }
-      if (command === "configure_remote_display_native_surface") {
-        return Promise.resolve({
-          label: "render-p2p-quic-123-1",
-          backend: "d3d11",
-          attached: true,
-          visible: true,
-          parent_hwnd: "0xA",
-          hwnd: "0x14",
-          rect: { x: 0, y: 56, width: 1280, height: 720 },
-        });
-      }
       if (command === "ipc_session_snapshot") {
         return Promise.resolve({
           session_id: "p2p-quic-123",
@@ -6290,53 +4703,22 @@ describe("RemoteDisplayWindowPage", () => {
           peer_device_id: "target-device",
         });
       }
-      if (command === "ipc_probe_snapshot") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
-          latest_frame_data_url: null,
-          last_error: null,
-        });
-      }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: args?.sessionId,
-          lane: "cleanup",
-          event_count: 1,
-        });
-      }
-      if (command === "close_remote_display_window") {
-        return defaultRemoteDisplayInvoke(command);
-      }
-      return defaultRemoteDisplayInvoke(command);
+      return defaultRemoteDisplayInvoke(command, args);
     });
 
     renderRemoteDisplay();
     const renderArea = await screen.findByTestId("remote-render-area");
-    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "0"));
-
-    act(() => {
-      renderArea.focus();
-    });
+    await waitFor(() => expect(renderArea).toHaveAttribute("tabindex", "-1"));
     fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
     fireEvent.click(await screen.findByTitle("Close"));
 
     await waitFor(() => {
-      const inputCallIndex = mockInvoke.mock.calls.findIndex(
-        ([command, args]) =>
-          command === "ipc_send_control_input" &&
-          (args as { event?: { kind?: string } })?.event?.kind === "release_all"
-      );
-      const closeCallIndex = mockInvoke.mock.calls.findIndex(
-        ([command]) => command === "close_remote_display_window"
-      );
-
-      expect(inputCallIndex).toBeGreaterThanOrEqual(0);
-      expect(closeCallIndex).toBeGreaterThan(inputCallIndex);
+      expect(mockInvoke).toHaveBeenCalledWith("close_remote_display_window", {
+        label: "render-p2p-quic-123-1",
+      });
     });
+    expect(
+      mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")
+    ).toBe(false);
   });
 });

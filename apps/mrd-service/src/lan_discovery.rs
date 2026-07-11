@@ -3,9 +3,11 @@ use crate::app_state::{AppState, AuthenticatedPeerTrust, DeviceIdentityRegistryE
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue};
 use anyhow::{Context, Result};
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
+use mrd_identity::UnattendedCredential;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
-    MediaProfile, MediaProfileNegotiation,
+    MediaProfile, MediaProfileNegotiation, RemoteAccessMode, RemoteAuthorizationState,
+    RemoteFailure, RemotePermissionScope, RemoteReasonCode,
 };
 #[cfg(test)]
 use mrd_ipc::{MediaSenderTransportSnapshot, MediaStageMetrics};
@@ -19,15 +21,15 @@ use mrd_proto::{DeviceId, SessionId};
 #[cfg(test)]
 use mrd_render::RenderFrame;
 #[cfg(test)]
-use mrd_transport_quic_quinn::QuicAuFrame;
-#[cfg(test)]
 use mrd_transport_quic_quinn::QuicAuReassemblerConfig;
 use mrd_transport_quic_quinn::{
     certificate_fingerprint_sha256, fragment_access_unit, fragment_media_payload_v3,
     is_quic_media_v3_datagram, QuicAuReassembler, QuicMediaPayloadType, QuicMediaReassembler,
-    QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
-    QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
+    QuinnDatagramEndpoint, QuinnPreparedServer, QuinnServerBootstrap, QuinnServerListener,
+    QUIC_AU_FRAGMENT_HEADER_LEN, QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
+#[cfg(test)]
+use mrd_transport_quic_quinn::{QuicAuFrame, QuinnDatagramPair};
 #[cfg(any(test, target_os = "macos"))]
 use mrd_transport_quic_quinn::{QuicAuReassemblerStats, QuicMediaCodec, QuicMediaFrame};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -45,7 +47,7 @@ use std::time::Duration;
 #[cfg(all(test, target_os = "macos"))]
 use std::time::Instant as StdInstant;
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{interval, timeout, Instant};
 
 mod capture_activity;
@@ -273,20 +275,24 @@ use peer_registry::{LanPeerAuthentication, LanPeerRecord, LanPeerRegistry};
 #[allow(unused_imports)]
 pub use protocol::LanProtocolError;
 pub use protocol::{
-    LanAnnouncement, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap, LanSessionBootstrap,
-    LanSessionRequest, SignedLanAnnouncement, SignedLanSessionBootstrap, SignedLanSessionRequest,
-    SIGNED_LAN_PROTOCOL_VERSION,
+    media_profile_constraint_hash, unattended_transcript_bytes, LanAnnouncement,
+    LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap, LanQuicControllerChallenge,
+    LanSessionBootstrap, LanSessionGrantPayload, LanSessionRequest, LanUnattendedProof,
+    SignedLanAnnouncement, SignedLanQuicControllerProof, SignedLanSessionBootstrap,
+    SignedLanSessionGrant, SignedLanSessionRequest, SIGNED_LAN_PROTOCOL_VERSION,
 };
 use protocol::{
     DISCOVERY_PACKET_BUFFER_BYTES, LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
-    LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
-    LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
-    LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
-    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT,
+    LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT,
+    LAN_MEDIA_PROTOCOL_VERSION, LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT,
+    LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
 };
 #[cfg(test)]
-use protocol::{DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY, PROTOCOL_VERSION};
+use protocol::{
+    DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY, LAN_INPUT_CONTROL_TRANSPORT,
+    LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
+};
 use remote_power::accept_lan_remote_device_power_action;
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
@@ -331,7 +337,9 @@ const LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
+const LAN_RELIABLE_KEYFRAME_SEND_TASK_LIMIT: usize = 1;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
@@ -350,6 +358,9 @@ const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
 const LAN_QUIC_BOOTSTRAP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
 const LAN_QUIC_BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_QUIC_CONTROLLER_PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_QUIC_CONTROLLER_PROOF_MAX_BYTES: usize = 16 * 1024;
+const LAN_QUIC_CONTROLLER_PROOF_ACCEPTED: &[u8] = b"MRD_LAN_QUIC_CONTROLLER_PROOF_OK_V3";
 #[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -365,6 +376,14 @@ const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
 const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
 const LAN_SIGNED_REPLAY_CACHE_LIMIT: usize = 4_096;
 const LAN_SIGNED_REPLAY_RETENTION_SKEW_MS: u64 = 2_000;
+const LAN_INCOMING_AUTHORIZATION_TASK_LIMIT: usize = 32;
+const LAN_INCOMING_AUTHORIZATION_RATE_LIMIT: u32 = 16;
+const LAN_INCOMING_AUTHORIZATION_GLOBAL_RATE_LIMIT: u32 = 64;
+const LAN_INCOMING_AUTHORIZATION_RATE_WINDOW_MS: u64 = 10_000;
+const LAN_INCOMING_AUTHORIZATION_RATE_PEER_LIMIT: usize = 256;
+const LAN_PRE_AUTHORIZATION_AUDIT_WRITE_LIMIT: u32 = 17;
+const LAN_PRE_AUTHORIZATION_AUDIT_DETAIL_LIMIT: u32 = LAN_PRE_AUTHORIZATION_AUDIT_WRITE_LIMIT - 1;
+const LAN_PRE_AUTHORIZATION_AUDIT_WINDOW_MS: u64 = 10_000;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
@@ -379,8 +398,34 @@ pub struct LanDiscoveryState {
     signed_replays: Mutex<LanSignedReplayCache>,
     pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
+    incoming_authorization_tasks: Arc<Semaphore>,
+    incoming_authorization_rates: Mutex<HashMap<IpAddr, LanIncomingAuthorizationRate>>,
+    incoming_authorization_global_rate: Mutex<Option<LanIncomingAuthorizationRate>>,
+    pre_authorization_audit_window: Mutex<LanPreAuthorizationAuditWindow>,
     probe_requested: Notify,
     peer_changed: Notify,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LanIncomingAuthorizationRate {
+    window_started_ms: u64,
+    request_count: u32,
+    last_seen_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct LanPreAuthorizationAuditWindow {
+    window_started_ms: Option<u64>,
+    detailed_writes: u32,
+    suppressed_denials: u64,
+    overflow_marker_written: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LanPreAuthorizationAuditAdmission {
+    Detailed { previous_window_suppressed: u64 },
+    OverflowMarker,
+    Suppressed,
 }
 
 struct LanSessionReservation {
@@ -408,8 +453,121 @@ impl LanDiscoveryState {
             signed_replays: Mutex::new(LanSignedReplayCache::default()),
             pending_sessions: Arc::new(StdMutex::new(HashSet::new())),
             recent_control_inputs: Mutex::new(HashMap::new()),
+            incoming_authorization_tasks: Arc::new(Semaphore::new(
+                LAN_INCOMING_AUTHORIZATION_TASK_LIMIT,
+            )),
+            incoming_authorization_rates: Mutex::new(HashMap::new()),
+            incoming_authorization_global_rate: Mutex::new(None),
+            pre_authorization_audit_window: Mutex::new(LanPreAuthorizationAuditWindow::default()),
             probe_requested: Notify::new(),
             peer_changed: Notify::new(),
+        }
+    }
+
+    async fn try_admit_incoming_authorization(
+        &self,
+        source_ip: IpAddr,
+        received_at_ms: u64,
+    ) -> Option<OwnedSemaphorePermit> {
+        let permit = self
+            .incoming_authorization_tasks
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        let mut rates = self.incoming_authorization_rates.lock().await;
+        rates.retain(|_, rate| {
+            received_at_ms.saturating_sub(rate.last_seen_ms)
+                <= LAN_INCOMING_AUTHORIZATION_RATE_WINDOW_MS
+        });
+        if !rates.contains_key(&source_ip)
+            && rates.len() >= LAN_INCOMING_AUTHORIZATION_RATE_PEER_LIMIT
+        {
+            if let Some(oldest) = rates
+                .iter()
+                .min_by_key(|(_, rate)| rate.last_seen_ms)
+                .map(|(ip, _)| *ip)
+            {
+                rates.remove(&oldest);
+            }
+        }
+        let rate = rates
+            .entry(source_ip)
+            .or_insert(LanIncomingAuthorizationRate {
+                window_started_ms: received_at_ms,
+                request_count: 0,
+                last_seen_ms: received_at_ms,
+            });
+        if received_at_ms.saturating_sub(rate.window_started_ms)
+            >= LAN_INCOMING_AUTHORIZATION_RATE_WINDOW_MS
+        {
+            rate.window_started_ms = received_at_ms;
+            rate.request_count = 0;
+        }
+        rate.last_seen_ms = received_at_ms;
+        if rate.request_count >= LAN_INCOMING_AUTHORIZATION_RATE_LIMIT {
+            return None;
+        }
+        rate.request_count = rate.request_count.saturating_add(1);
+        drop(rates);
+
+        let mut global_rate = self.incoming_authorization_global_rate.lock().await;
+        let global_rate = global_rate.get_or_insert(LanIncomingAuthorizationRate {
+            window_started_ms: received_at_ms,
+            request_count: 0,
+            last_seen_ms: received_at_ms,
+        });
+        if received_at_ms.saturating_sub(global_rate.window_started_ms)
+            >= LAN_INCOMING_AUTHORIZATION_RATE_WINDOW_MS
+        {
+            global_rate.window_started_ms = received_at_ms;
+            global_rate.request_count = 0;
+        }
+        global_rate.last_seen_ms = received_at_ms;
+        if global_rate.request_count >= LAN_INCOMING_AUTHORIZATION_GLOBAL_RATE_LIMIT {
+            return None;
+        }
+        global_rate.request_count = global_rate.request_count.saturating_add(1);
+        Some(permit)
+    }
+
+    async fn admit_pre_authorization_denial_audit(
+        &self,
+        _source_ip: IpAddr,
+        received_at_ms: u64,
+    ) -> LanPreAuthorizationAuditAdmission {
+        // Deliberately global: keying this quota by source would let address
+        // rotation amplify durable audit writes without bound.
+        let mut window = self.pre_authorization_audit_window.lock().await;
+        let window_expired = window.window_started_ms.is_none_or(|window_started_ms| {
+            received_at_ms.saturating_sub(window_started_ms)
+                >= LAN_PRE_AUTHORIZATION_AUDIT_WINDOW_MS
+        });
+        if window_expired {
+            let previous_window_suppressed = window.suppressed_denials;
+            *window = LanPreAuthorizationAuditWindow {
+                window_started_ms: Some(received_at_ms),
+                detailed_writes: 1,
+                suppressed_denials: 0,
+                overflow_marker_written: false,
+            };
+            return LanPreAuthorizationAuditAdmission::Detailed {
+                previous_window_suppressed,
+            };
+        }
+
+        if window.detailed_writes < LAN_PRE_AUTHORIZATION_AUDIT_DETAIL_LIMIT {
+            window.detailed_writes = window.detailed_writes.saturating_add(1);
+            return LanPreAuthorizationAuditAdmission::Detailed {
+                previous_window_suppressed: 0,
+            };
+        }
+
+        window.suppressed_denials = window.suppressed_denials.saturating_add(1);
+        if !window.overflow_marker_written {
+            window.overflow_marker_written = true;
+            LanPreAuthorizationAuditAdmission::OverflowMarker
+        } else {
+            LanPreAuthorizationAuditAdmission::Suppressed
         }
     }
 
@@ -765,6 +923,32 @@ struct LanRemoteAcceptResult {
     prepared: Option<PreparedLanRemoteSession>,
 }
 
+#[derive(Clone)]
+pub struct LanUnattendedAccessMaterial {
+    pub access_epoch: u64,
+    pub credential: Arc<UnattendedCredential>,
+}
+
+impl std::fmt::Debug for LanUnattendedAccessMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LanUnattendedAccessMaterial")
+            .field("access_epoch", &self.access_epoch)
+            .field("credential", &"REDACTED")
+            .finish()
+    }
+}
+
+struct LanRemoteSessionPreparation {
+    session_id: SessionId,
+    source_device_id: DeviceId,
+    transport: String,
+    source_media_capabilities: Vec<String>,
+    negotiation: MediaProfileNegotiation,
+    prepared_server: QuinnPreparedServer,
+    expected_peer_ip: IpAddr,
+}
+
 struct PreparedLanRemoteSession {
     session_id: SessionId,
     source_device_id: DeviceId,
@@ -774,6 +958,23 @@ struct PreparedLanRemoteSession {
     listener: QuinnServerListener,
     bootstrap: QuinnServerBootstrap,
     expected_peer_ip: IpAddr,
+    controller_binding: Option<LanQuicControllerBinding>,
+}
+
+#[derive(Clone)]
+struct LanQuicControllerBinding {
+    controller_public_key: Vec<u8>,
+    controller_key_epoch: u64,
+    grant_id: [u8; 32],
+    transport_fingerprint_sha256: [u8; 32],
+}
+
+#[derive(Clone)]
+struct LanQuicControllerProofMaterial {
+    controller_identity: Arc<mrd_identity::DeviceIdentity>,
+    controller_key_epoch: u64,
+    grant_id: [u8; 32],
+    transport_fingerprint_sha256: [u8; 32],
 }
 
 type LanEncoderConfigKey = (
@@ -875,6 +1076,64 @@ pub async fn request_lan_remote_session(
     transport_kind: &str,
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
+    request_lan_remote_session_authorized(
+        app_state,
+        target_device_id,
+        session_id,
+        transport_kind,
+        requested_profile,
+        RemoteAccessMode::Attended,
+        vec![RemotePermissionScope::ScreenView],
+        None,
+    )
+    .await
+}
+
+async fn begin_outgoing_authorization_under_security_gate(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    peer_key_id: &str,
+    peer_public_key: &[u8],
+    peer_key_epoch: u64,
+    request: crate::session_authorization::VerifiedIncomingAuthorizationRequest,
+) -> Result<()> {
+    let _admission_guard = app_state.authorization_security_gate.lock().await;
+    let admission_trust =
+        resolve_authenticated_peer_trust(app_state, peer_key_id, peer_public_key, peer_key_epoch)
+            .await?;
+    if !admission_trust.is_controllable() {
+        anyhow::bail!("LAN peer trust changed before session admission");
+    }
+    if app_state.sessions.lock().await.get(session_id).is_some() {
+        anyhow::bail!(
+            "session id became occupied before secure LAN admission: {}",
+            session_id.0
+        );
+    }
+    app_state
+        .session_authorizations
+        .begin_outgoing(request)
+        .await
+        .map_err(|failure| anyhow::anyhow!(failure.message))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn request_lan_remote_session_authorized(
+    app_state: &Arc<AppState>,
+    target_device_id: &DeviceId,
+    session_id: &SessionId,
+    transport_kind: &str,
+    requested_profile: Option<MediaProfile>,
+    access_mode: RemoteAccessMode,
+    mut requested_scopes: Vec<RemotePermissionScope>,
+    unattended_material: Option<LanUnattendedAccessMaterial>,
+) -> Result<MediaProfileNegotiation> {
+    requested_scopes.sort_unstable();
+    requested_scopes.dedup();
+    if requested_scopes.is_empty() {
+        anyhow::bail!("secure LAN session requires at least one permission scope");
+    }
     if app_state.sessions.lock().await.get(session_id).is_some() {
         anyhow::bail!("session id is already in use: {}", session_id.0);
     }
@@ -945,39 +1204,83 @@ pub async fn request_lan_remote_session(
         .machine_key_epoch()
         .context("local machine key epoch is unavailable")?;
     let request_issued_at_ms = now_ms();
+    let request_expires_at_ms = request_issued_at_ms.saturating_add(30_000);
+    let request_nonce = new_signed_nonce()?;
     let source_media_capabilities = lan_media_capabilities();
-    let signed_request = SignedLanSessionRequest::sign(
-        local_identity.as_ref(),
-        LanSessionRequest {
-            magic: DISCOVERY_MAGIC.to_string(),
-            app_id: DISCOVERY_APP_ID.to_string(),
-            protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
-            instance_id: app_state.lan_discovery.instance_id.clone(),
-            session_id: session_id.0.clone(),
-            source_device_id,
-            source_device_name,
-            source_key_id: local_identity.key_id().to_string(),
-            source_key_epoch: local_key_epoch,
-            target_device_id: target_device_id.0.clone(),
-            target_key_id: peer_key_id.clone(),
-            target_key_epoch: peer_key_epoch,
+    let mut request_payload = LanSessionRequest {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: session_id.0.clone(),
+        source_device_id,
+        source_device_name,
+        source_key_id: local_identity.key_id().to_string(),
+        source_key_epoch: local_key_epoch,
+        target_device_id: target_device_id.0.clone(),
+        target_key_id: peer_key_id.clone(),
+        target_key_epoch: peer_key_epoch,
+        transport_kind: transport_kind.to_string(),
+        source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
+        source_endpoint,
+        source_media_capabilities,
+        requested_media_profile: requested_profile,
+        access_mode,
+        requested_scopes: requested_scopes.clone(),
+        unattended_proof: None,
+        timestamp_ms: request_issued_at_ms,
+        expires_at_ms: request_expires_at_ms,
+        nonce: request_nonce,
+    };
+    if access_mode == RemoteAccessMode::Unattended {
+        if let Some(material) = unattended_material {
+            request_payload.unattended_proof = Some(LanUnattendedProof {
+                access_epoch: material.access_epoch,
+                proof: Vec::new(),
+            });
+            let transcript = unattended_transcript_bytes(&request_payload)?;
+            request_payload
+                .unattended_proof
+                .as_mut()
+                .expect("unattended proof metadata was just installed")
+                .proof = material.credential.prove(&transcript, request_nonce);
+        }
+    }
+    let signed_request = SignedLanSessionRequest::sign(local_identity.as_ref(), request_payload)?;
+
+    // Serialize the final trust and legacy-session checks with authorization
+    // insertion. Whichever admission wins the gate prevents a second aggregate
+    // with the same session id from appearing.
+    begin_outgoing_authorization_under_security_gate(
+        app_state,
+        session_id,
+        &peer_key_id,
+        &peer_public_key,
+        peer_key_epoch,
+        crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+            session_id: session_id.clone(),
+            peer_device_id: target_device_id.clone(),
+            peer_key_id: peer_key_id.clone(),
+            peer_key_epoch,
+            access_mode,
+            requested_scopes: requested_scopes.clone(),
+            peer_permission_ceiling: requested_scopes.clone(),
+            machine_permission_ceiling: requested_scopes.clone(),
+            runtime_capabilities: requested_scopes,
             transport_kind: transport_kind.to_string(),
-            source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
-            source_endpoint,
-            source_media_capabilities,
-            requested_media_profile: requested_profile,
-            timestamp_ms: request_issued_at_ms,
-            expires_at_ms: request_issued_at_ms.saturating_add(5_000),
-            nonce: new_signed_nonce()?,
+            request_nonce,
+            created_at_ms: request_issued_at_ms,
+            expires_at_ms: request_expires_at_ms,
         },
-    )?;
+    )
+    .await?;
 
     let packet = LanDiscoveryPacket::SignedRemoteSessionRequest(signed_request.clone());
     let bytes = serde_json::to_vec(&packet)?;
     socket.send(&bytes).await?;
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let len = timeout(Duration::from_secs(2), socket.recv(&mut buffer))
+    let len = timeout(Duration::from_secs(35), socket.recv(&mut buffer))
         .await
         .context("LAN remote request timed out")??;
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
@@ -989,6 +1292,10 @@ pub async fn request_lan_remote_session(
                 &peer_public_key,
                 peer_key_epoch,
             )?;
+            // Keep trust stable until the verified grant and connected receiver
+            // are both committed. A concurrent revoke waits, then terminates
+            // the now-visible authorization and media state before returning.
+            let _issuance_guard = app_state.authorization_security_gate.lock().await;
             let final_trust = resolve_authenticated_peer_trust(
                 app_state,
                 &peer_key_id,
@@ -1000,12 +1307,41 @@ pub async fn request_lan_remote_session(
                 anyhow::bail!("LAN peer trust changed during session bootstrap");
             }
             if bootstrap.payload.accepted {
+                let current_authorization = app_state
+                    .session_authorizations
+                    .snapshot(session_id)
+                    .await
+                    .context("outgoing LAN authorization disappeared before grant install")?;
+                if current_authorization.authorization_state
+                    != RemoteAuthorizationState::Authorizing
+                {
+                    anyhow::bail!(
+                        "outgoing LAN authorization changed before grant install: {:?}",
+                        current_authorization.authorization_state
+                    );
+                }
+                let signed_grant = bootstrap
+                    .payload
+                    .grant
+                    .as_ref()
+                    .context("authorized LAN bootstrap omitted its signed grant")?;
+                let controller_proof = LanQuicControllerProofMaterial {
+                    controller_identity: local_identity.clone(),
+                    controller_key_epoch: local_key_epoch,
+                    grant_id: signed_grant.grant_id()?,
+                    transport_fingerprint_sha256: signed_grant.payload.transport_fingerprint_sha256,
+                };
+                app_state
+                    .session_authorizations
+                    .install_verified_grant(verified_grant_projection(signed_grant)?, now_ms())
+                    .await
+                    .map_err(|failure| anyhow::anyhow!(failure.message))?;
                 let negotiation = bootstrap
                     .payload
                     .media_profile
                     .clone()
                     .unwrap_or_else(default_media_profile_negotiation);
-                start_lan_media_receiver(
+                if let Err(error) = start_lan_media_receiver(
                     app_state.clone(),
                     session_id.clone(),
                     transport_kind,
@@ -1014,16 +1350,49 @@ pub async fn request_lan_remote_session(
                     target_device_id.clone(),
                     negotiation.clone(),
                     peer_media_capabilities,
+                    controller_proof,
                 )
-                .await?;
+                .await
+                {
+                    let _ = app_state
+                        .session_authorizations
+                        .record_failure(
+                            session_id,
+                            RemoteAuthorizationState::Revoked,
+                            RemoteFailure {
+                                code: RemoteReasonCode::RouteLost,
+                                message: "authorized LAN receiver failed to start".to_string(),
+                                suggested_action: Some("retry the LAN connection".to_string()),
+                            },
+                            now_ms(),
+                        )
+                        .await;
+                    return Err(error);
+                }
                 Ok(negotiation)
             } else {
-                anyhow::bail!(
-                    "LAN peer rejected remote session: {}",
-                    bootstrap
+                let failure = bootstrap.payload.failure.clone().unwrap_or(RemoteFailure {
+                    code: RemoteReasonCode::PolicyChanged,
+                    message: bootstrap
                         .payload
                         .message
-                        .unwrap_or_else(|| "unknown reason".to_string())
+                        .clone()
+                        .unwrap_or_else(|| "remote authorization was denied".to_string()),
+                    suggested_action: None,
+                });
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        session_id,
+                        authorization_failure_state(failure.code),
+                        failure.clone(),
+                        now_ms(),
+                    )
+                    .await;
+                anyhow::bail!(
+                    "LAN peer rejected remote session [{}]: {}",
+                    remote_reason_code_wire_name(failure.code),
+                    failure.message
                 );
             }
         }
@@ -1506,6 +1875,34 @@ async fn receive_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
+                if let Ok(LanDiscoveryPacket::SignedRemoteSessionRequest(request)) =
+                    serde_json::from_slice::<LanDiscoveryPacket>(&buffer[..len])
+                {
+                    let Some(admission_permit) = app_state
+                        .lan_discovery
+                        .try_admit_incoming_authorization(addr.ip(), now_ms())
+                        .await
+                    else {
+                        tracing::warn!(%addr, "dropped rate-limited LAN authorization request");
+                        continue;
+                    };
+                    let request_socket = socket.clone();
+                    let request_state = app_state.clone();
+                    tokio::spawn(async move {
+                        let _admission_permit = admission_permit;
+                        if let Err(error) = handle_signed_remote_session_request(
+                            request_socket.as_ref(),
+                            &request_state,
+                            request,
+                            addr,
+                        )
+                        .await
+                        {
+                            tracing::debug!(%error, %addr, "ignored signed LAN session request");
+                        }
+                    });
+                    continue;
+                }
                 if let Err(error) =
                     process_lan_discovery_packet(&socket, &app_state, &buffer[..len], addr).await
                 {
@@ -1892,11 +2289,12 @@ async fn handle_packet(
                 Ok(()) => (true, Some("accepted".to_string())),
                 Err(error) => (false, Some(error.to_string())),
             };
-            tracing::info!(
+            tracing::warn!(
                 source_device_id = %source_device_id,
                 local_device_id = %local_device_id,
+                action = ?action,
                 accepted,
-                "handled LAN remote device power action"
+                "rejected legacy unsigned LAN remote device power action"
             );
             let ack = LanDiscoveryPacket::RemoteDevicePowerActionAck {
                 magic: DISCOVERY_MAGIC.to_string(),
@@ -1952,48 +2350,804 @@ async fn handle_signed_remote_session_request(
     if request.payload.target_device_id != local_device_id {
         anyhow::bail!("signed LAN session request targets another device");
     }
-    let trust = resolve_authenticated_peer_trust(
+    // Reject plainly untrusted keys before entering the authorization security
+    // gate. A second lookup under the gate below closes the trust-transition
+    // race for peers that passed this inexpensive initial admission check.
+    let initial_trust = resolve_authenticated_peer_trust(
         app_state,
         &request.payload.source_key_id,
         &request.public_key,
         request.payload.source_key_epoch,
     )
     .await?;
-    if !trust.is_controllable() {
-        anyhow::bail!("signed LAN session requester is not trusted");
+    if !initial_trust.is_controllable() {
+        return audit_and_send_signed_lan_pre_authorization_denial(
+            socket,
+            app_state,
+            &request,
+            addr,
+            RemoteFailure {
+                code: RemoteReasonCode::TrustRequired,
+                message: "the authenticated controller key is not trusted".to_string(),
+                suggested_action: Some("approve the controller device locally".to_string()),
+            },
+        )
+        .await;
     }
-    app_state.lan_discovery.signed_replays.lock().await.accept(
-        LanSignedReplayDomain::SessionRequest,
+    if app_state
+        .lan_discovery
+        .signed_replays
+        .lock()
+        .await
+        .accept(
+            LanSignedReplayDomain::SessionRequest,
+            &request.payload.source_key_id,
+            request.payload.nonce,
+            request.payload.expires_at_ms,
+            received_at_ms,
+        )
+        .is_err()
+    {
+        return audit_and_send_signed_lan_pre_authorization_denial(
+            socket,
+            app_state,
+            &request,
+            addr,
+            RemoteFailure {
+                code: RemoteReasonCode::ReplayDetected,
+                message: "the signed LAN session request was already used".to_string(),
+                suggested_action: Some("start a new session request".to_string()),
+            },
+        )
+        .await;
+    }
+
+    // Pair the final trust check with record insertion. If a trust transition
+    // wins first this request is denied; if admission wins first the transition
+    // sees and revokes the newly inserted record.
+    let admission_guard = app_state.authorization_security_gate.lock().await;
+    let admission_trust = resolve_authenticated_peer_trust(
+        app_state,
         &request.payload.source_key_id,
-        request.payload.nonce,
-        request.payload.expires_at_ms,
-        received_at_ms,
-    )?;
+        &request.public_key,
+        request.payload.source_key_epoch,
+    )
+    .await?;
+    if !admission_trust.is_controllable() {
+        drop(admission_guard);
+        return audit_and_send_signed_lan_pre_authorization_denial(
+            socket,
+            app_state,
+            &request,
+            addr,
+            RemoteFailure {
+                code: RemoteReasonCode::TrustRequired,
+                message: "the authenticated controller trust changed before admission".to_string(),
+                suggested_action: Some("approve the controller device locally".to_string()),
+            },
+        )
+        .await;
+    }
 
     let session_id = SessionId(request.payload.session_id.clone());
     let _session_reservation = app_state.lan_discovery.reserve_session(&session_id)?;
     if app_state.sessions.lock().await.get(&session_id).is_some() {
         anyhow::bail!("signed LAN session id is already in use");
     }
-    let accept_result = accept_lan_remote_session(
-        app_state,
-        session_id,
-        DeviceId(request.payload.source_device_id.clone()),
-        addr.ip(),
-        request.payload.transport_kind.clone(),
-        request.payload.source_media_capabilities.clone(),
-        request.payload.requested_media_profile.clone(),
-    )
-    .await;
-    let LanRemoteAcceptResult {
-        accepted,
-        message,
-        media,
-        media_profile,
-        prepared,
-    } = accept_result;
 
-    let bootstrap_issued_at_ms = now_ms();
+    let _pending_authorization = match app_state
+        .session_authorizations
+        .begin_verified_incoming(
+            crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: DeviceId(request.payload.source_device_id.clone()),
+                peer_key_id: request.payload.source_key_id.clone(),
+                peer_key_epoch: request.payload.source_key_epoch,
+                access_mode: request.payload.access_mode,
+                requested_scopes: request.payload.requested_scopes.clone(),
+                peer_permission_ceiling: lan_authorization_capabilities(),
+                machine_permission_ceiling: lan_authorization_capabilities(),
+                runtime_capabilities: lan_authorization_capabilities(),
+                transport_kind: request.payload.transport_kind.clone(),
+                request_nonce: request.payload.nonce,
+                created_at_ms: received_at_ms,
+                expires_at_ms: request.payload.expires_at_ms,
+            },
+        )
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(failure) => {
+            drop(admission_guard);
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+    };
+    drop(admission_guard);
+    let post_admission_result: Result<()> = async {
+        ensure_admitted_request_is_live(&request, now_ms())?;
+        if app_state
+            .audit_log
+            .record(
+                "session.authorization_requested",
+                "pending",
+                Some(session_id.clone()),
+                None,
+                Some(DeviceId(request.payload.source_device_id.clone())),
+                Some(request.payload.transport_kind.clone()),
+                None,
+                vec![(
+                    "requested_scope_count".to_string(),
+                    request.payload.requested_scopes.len().to_string(),
+                )],
+            )
+            .is_err()
+        {
+            app_state.mark_security_unhealthy();
+            let failure = RemoteFailure {
+                code: RemoteReasonCode::PolicyChanged,
+                message: "authorization request could not be durably audited".to_string(),
+                suggested_action: Some("repair the local security store".to_string()),
+            };
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::PolicyChanged,
+                    failure.clone(),
+                    now_ms(),
+                )
+                .await;
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+
+        let authorization = match request.payload.access_mode {
+            RemoteAccessMode::Attended => {
+                app_state
+                    .session_authorizations
+                    .wait_for_authorization_decision(&session_id)
+                    .await
+            }
+            RemoteAccessMode::Unattended => match request.payload.unattended_proof.as_ref() {
+                None => Err(RemoteFailure {
+                    code: RemoteReasonCode::CredentialInvalid,
+                    message: "unattended access requires a transcript-bound proof".to_string(),
+                    suggested_action: Some(
+                        "use attended access or enroll a credential".to_string(),
+                    ),
+                }),
+                Some(proof) => {
+                    let transcript = unattended_transcript_bytes(&request.payload)?;
+                    app_state
+                        .session_authorizations
+                        .verify_unattended(
+                            &session_id,
+                            &transcript,
+                            request.payload.nonce,
+                            proof.access_epoch,
+                            &proof.proof,
+                            now_ms(),
+                        )
+                        .await
+                }
+            },
+        };
+        let _authorization = match authorization {
+            Ok(snapshot) => snapshot,
+            Err(failure) => {
+                let terminal_state = authorization_failure_state(failure.code);
+                if app_state
+                    .audit_log
+                    .record(
+                        "session.authorization_decision",
+                        "denied",
+                        Some(session_id.clone()),
+                        None,
+                        Some(DeviceId(request.payload.source_device_id.clone())),
+                        Some(request.payload.transport_kind.clone()),
+                        Some(remote_reason_code_wire_name(failure.code)),
+                        Vec::new(),
+                    )
+                    .is_err()
+                {
+                    app_state.mark_security_unhealthy();
+                }
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(&session_id, terminal_state, failure.clone(), now_ms())
+                    .await;
+                return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                    .await;
+            }
+        };
+        ensure_admitted_request_is_live(&request, now_ms())?;
+
+        // Freeze trust and unattended-policy transitions until the grant, signed
+        // bootstrap, and sender session are all committed. Any transition that
+        // follows will revoke and tear down the fully visible session.
+        let issuance_guard = app_state.authorization_security_gate.lock().await;
+        let final_trust = resolve_authenticated_peer_trust(
+            app_state,
+            &request.payload.source_key_id,
+            &request.public_key,
+            request.payload.source_key_epoch,
+        )
+        .await?;
+        if !final_trust.is_controllable() {
+            let failure = RemoteFailure {
+                code: RemoteReasonCode::TrustRequired,
+                message: "controller trust changed while awaiting authorization".to_string(),
+                suggested_action: None,
+            };
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::Revoked,
+                    failure.clone(),
+                    now_ms(),
+                )
+                .await;
+            drop(issuance_guard);
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+
+        let authorization = match app_state.session_authorizations.snapshot(&session_id).await {
+            Some(snapshot)
+                if snapshot.authorization_state == RemoteAuthorizationState::Authorizing =>
+            {
+                snapshot
+            }
+            Some(snapshot) => {
+                let failure = snapshot.failure.unwrap_or(RemoteFailure {
+                    code: RemoteReasonCode::PolicyChanged,
+                    message: "authorization changed before grant issuance".to_string(),
+                    suggested_action: Some("start a new attended session".to_string()),
+                });
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        post_consent_failure_state(failure.code),
+                        failure.clone(),
+                        now_ms(),
+                    )
+                    .await;
+                drop(issuance_guard);
+                return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                    .await;
+            }
+            None => {
+                drop(issuance_guard);
+                return send_signed_lan_session_denial(
+                    socket,
+                    app_state,
+                    &request,
+                    addr,
+                    RemoteFailure {
+                        code: RemoteReasonCode::PolicyChanged,
+                        message: "authorization record disappeared before grant issuance"
+                            .to_string(),
+                        suggested_action: Some("start a new attended session".to_string()),
+                    },
+                )
+                .await;
+            }
+        };
+
+        let preparation = match prepare_lan_remote_session(
+            app_state,
+            session_id.clone(),
+            DeviceId(request.payload.source_device_id.clone()),
+            addr.ip(),
+            request.payload.transport_kind.clone(),
+            request.payload.source_media_capabilities.clone(),
+            request.payload.requested_media_profile.clone(),
+        )
+        .await
+        {
+            Ok(preparation) => preparation,
+            Err(message) => {
+                let failure = RemoteFailure {
+                    code: RemoteReasonCode::EncoderUnavailable,
+                    message,
+                    suggested_action: Some("choose a supported LAN media profile".to_string()),
+                };
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        RemoteAuthorizationState::Revoked,
+                        failure.clone(),
+                        now_ms(),
+                    )
+                    .await;
+                return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                    .await;
+            }
+        };
+        ensure_admitted_request_is_live(&request, now_ms())?;
+
+        let transport_fingerprint_sha256 =
+            preparation.prepared_server.certificate_fingerprint_sha256();
+        let grant_issued_at_ms = now_ms();
+        let identity = app_state.device_identities.machine_identity();
+        let signed_grant = SignedLanSessionGrant::sign(
+            identity.as_ref(),
+            LanSessionGrantPayload {
+                session_id: session_id.0.clone(),
+                controller_key_id: request.payload.source_key_id.clone(),
+                controller_key_epoch: request.payload.source_key_epoch,
+                target_key_id: local_key_id.clone(),
+                target_key_epoch: local_key_epoch,
+                access_mode: request.payload.access_mode,
+                granted_scopes: authorization.granted_scopes.clone(),
+                issued_at_ms: grant_issued_at_ms,
+                expires_at_ms: grant_issued_at_ms.saturating_add(300_000),
+                policy_revision: authorization.policy_revision.get(),
+                route_constraint: request.payload.transport_kind.clone(),
+                profile_constraint: Some(media_profile_constraint_hash(&preparation.negotiation)?),
+                request_nonce: request.payload.nonce,
+                grant_nonce: new_signed_nonce()?,
+                windows_session_id: None,
+                transport_fingerprint_sha256,
+            },
+        )?;
+        signed_grant.verify_for_request(
+            grant_issued_at_ms,
+            &request,
+            identity.public_key(),
+            local_key_epoch,
+        )?;
+        let controller_binding = LanQuicControllerBinding {
+            controller_public_key: request.public_key.clone(),
+            controller_key_epoch: request.payload.source_key_epoch,
+            grant_id: signed_grant.grant_id()?,
+            transport_fingerprint_sha256: signed_grant.payload.transport_fingerprint_sha256,
+        };
+        let verified_grant = verified_grant_projection(&signed_grant)?;
+        if app_state
+            .audit_log
+            .record(
+                "session.authorization_grant",
+                "allowed",
+                Some(session_id.clone()),
+                None,
+                Some(DeviceId(request.payload.source_device_id.clone())),
+                Some(request.payload.transport_kind.clone()),
+                None,
+                vec![
+                    ("grant_id".to_string(), verified_grant.grant_id.clone()),
+                    (
+                        "granted_scope_count".to_string(),
+                        verified_grant.granted_scopes.len().to_string(),
+                    ),
+                ],
+            )
+            .is_err()
+        {
+            app_state.mark_security_unhealthy();
+            let failure = RemoteFailure {
+                code: RemoteReasonCode::PolicyChanged,
+                message: "authorization grant could not be durably audited".to_string(),
+                suggested_action: Some("repair the local security store".to_string()),
+            };
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::Revoked,
+                    failure.clone(),
+                    now_ms(),
+                )
+                .await;
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+        if let Err(failure) = app_state
+            .session_authorizations
+            .install_verified_grant(verified_grant, grant_issued_at_ms)
+            .await
+        {
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    post_consent_failure_state(failure.code),
+                    failure.clone(),
+                    now_ms(),
+                )
+                .await;
+            drop(issuance_guard);
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+
+        let accept_result = bind_prepared_lan_remote_session(preparation).await;
+        let LanRemoteAcceptResult {
+            accepted,
+            message,
+            media,
+            media_profile,
+            prepared,
+        } = accept_result;
+
+        if !accepted {
+            let failure = RemoteFailure {
+                code: RemoteReasonCode::LanUnreachable,
+                message: message
+                    .unwrap_or_else(|| "failed to bind authorized LAN route".to_string()),
+                suggested_action: Some("retry the LAN connection".to_string()),
+            };
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::Revoked,
+                    failure.clone(),
+                    now_ms(),
+                )
+                .await;
+            return send_signed_lan_session_denial(socket, app_state, &request, addr, failure)
+                .await;
+        }
+        ensure_admitted_request_is_live(&request, now_ms())?;
+
+        let bootstrap_issued_at_ms = now_ms();
+        let bootstrap = LanSessionBootstrap {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+            instance_id: app_state.lan_discovery.instance_id.clone(),
+            session_id: request.payload.session_id.clone(),
+            controller_key_id: request.payload.source_key_id.clone(),
+            controller_key_epoch: request.payload.source_key_epoch,
+            target_key_id: local_key_id,
+            target_key_epoch: local_key_epoch,
+            request_nonce: request.payload.nonce,
+            accepted: true,
+            message: Some("accepted".to_string()),
+            failure: None,
+            grant: Some(signed_grant),
+            media,
+            media_profile,
+            timestamp_ms: bootstrap_issued_at_ms,
+            expires_at_ms: bootstrap_issued_at_ms.saturating_add(5_000),
+            nonce: new_signed_nonce()?,
+        };
+        let signed = SignedLanSessionBootstrap::sign(identity.as_ref(), bootstrap)?;
+        ensure_admitted_request_is_live(&request, now_ms())?;
+        if let Err(error) = send_packet(
+            socket,
+            &LanDiscoveryPacket::SignedRemoteSessionBootstrap(signed),
+            addr,
+        )
+        .await
+        {
+            let _ = app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    RemoteAuthorizationState::Revoked,
+                    RemoteFailure {
+                        code: RemoteReasonCode::RouteLost,
+                        message: "failed to send authorized LAN bootstrap".to_string(),
+                        suggested_action: Some("retry the LAN connection".to_string()),
+                    },
+                    now_ms(),
+                )
+                .await;
+            return Err(error);
+        }
+        if let Some(mut prepared) = prepared {
+            prepared.controller_binding = Some(controller_binding);
+            if let Err(error) = commit_prepared_lan_remote_session(app_state, prepared).await {
+                let _ = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        RemoteAuthorizationState::Revoked,
+                        RemoteFailure {
+                            code: RemoteReasonCode::RouteLost,
+                            message: "authorized LAN sender failed to commit".to_string(),
+                            suggested_action: Some("retry the LAN connection".to_string()),
+                        },
+                        now_ms(),
+                    )
+                    .await;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match post_admission_result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id.0,
+                %error,
+                "finalizing failed signed LAN session after authorization admission"
+            );
+            match finalize_post_admission_error(
+                socket,
+                app_state,
+                &request,
+                addr,
+                &session_id,
+                &error,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(denial_error) => Err(error.context(format!(
+                    "failed to finalize signed LAN session denial: {denial_error}"
+                ))),
+            }
+        }
+    }
+}
+
+fn ensure_admitted_request_is_live(
+    request: &SignedLanSessionRequest,
+    checked_at_ms: u64,
+) -> Result<()> {
+    if checked_at_ms > request.payload.expires_at_ms {
+        anyhow::bail!("signed LAN authorization request expired after admission");
+    }
+    Ok(())
+}
+
+async fn finalize_post_admission_error(
+    socket: &UdpSocket,
+    app_state: &Arc<AppState>,
+    request: &SignedLanSessionRequest,
+    addr: SocketAddr,
+    session_id: &SessionId,
+    error: &anyhow::Error,
+) -> Result<()> {
+    let failed_at_ms = now_ms();
+    let current = app_state.session_authorizations.snapshot(session_id).await;
+    let existing_terminal_failure = current.as_ref().and_then(|snapshot| {
+        matches!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Denied
+                | RemoteAuthorizationState::Expired
+                | RemoteAuthorizationState::Revoked
+                | RemoteAuthorizationState::LockedOut
+                | RemoteAuthorizationState::PolicyChanged
+        )
+        .then(|| snapshot.failure.clone())
+        .flatten()
+    });
+    let (terminal_state, fallback_failure) = post_admission_failure_for_error(
+        error,
+        failed_at_ms > request.payload.expires_at_ms,
+        current.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.authorization_state,
+                RemoteAuthorizationState::Authorizing | RemoteAuthorizationState::Granted
+            )
+        }),
+    );
+
+    let denial_failure = if let Some(existing) = existing_terminal_failure {
+        existing
+    } else {
+        let recorded = app_state
+            .session_authorizations
+            .record_failure(
+                session_id,
+                terminal_state,
+                fallback_failure.clone(),
+                failed_at_ms,
+            )
+            .await;
+        match recorded.and_then(|snapshot| snapshot.failure) {
+            Some(failure) => failure,
+            None => app_state
+                .session_authorizations
+                .snapshot(session_id)
+                .await
+                .and_then(|snapshot| snapshot.failure)
+                .unwrap_or(fallback_failure),
+        }
+    };
+
+    send_signed_lan_session_denial(socket, app_state, request, addr, denial_failure).await
+}
+
+fn post_admission_failure_for_error(
+    error: &anyhow::Error,
+    request_deadline_elapsed: bool,
+    authorization_was_active: bool,
+) -> (RemoteAuthorizationState, RemoteFailure) {
+    let diagnostic = format!("{error:#}").to_ascii_lowercase();
+    if request_deadline_elapsed || diagnostic.contains("expired after admission") {
+        return (
+            RemoteAuthorizationState::Expired,
+            RemoteFailure {
+                code: RemoteReasonCode::AuthorizationTimeout,
+                message: "the LAN authorization request expired before bootstrap completed"
+                    .to_string(),
+                suggested_action: Some("start a new remote session request".to_string()),
+            },
+        );
+    }
+
+    let protocol_failure =
+        LanProtocolError::remote_reason_code_from_diagnostic(&diagnostic).map(|code| match code {
+            RemoteReasonCode::IdentityMismatch => (
+                code,
+                "authenticated LAN identity binding failed during grant issuance",
+                "verify the paired device identity and retry",
+            ),
+            RemoteReasonCode::ReplayDetected => (
+                code,
+                "the secure LAN request nonce was rejected during grant issuance",
+                "start a new secure remote session request",
+            ),
+            _ => (
+                RemoteReasonCode::ProtocolDowngradeBlocked,
+                "the secure LAN grant or bootstrap could not be verified",
+                "update both devices and retry the secure connection",
+            ),
+        });
+
+    let (code, message, suggested_action) = if let Some(failure) = protocol_failure {
+        failure
+    } else if diagnostic.contains("trust") {
+        (
+            RemoteReasonCode::TrustRequired,
+            "controller trust could not be confirmed before grant issuance",
+            "approve the controller device locally and retry",
+        )
+    } else if diagnostic.contains("identity")
+        || diagnostic.contains("public key")
+        || diagnostic.contains("key epoch")
+        || diagnostic.contains("fingerprint")
+        || diagnostic.contains("certificate")
+        || diagnostic.contains("invalid signature")
+    {
+        (
+            RemoteReasonCode::IdentityMismatch,
+            "authenticated LAN identity binding failed during grant issuance",
+            "verify the paired device identity and retry",
+        )
+    } else if diagnostic.contains("media profile")
+        || diagnostic.contains("profile constraint")
+        || diagnostic.contains("codec")
+    {
+        (
+            RemoteReasonCode::ProfileDowngraded,
+            "the selected LAN media profile could not be bound to the grant",
+            "choose a media profile supported by both devices",
+        )
+    } else if diagnostic.contains("encoder") {
+        (
+            RemoteReasonCode::EncoderUnavailable,
+            "the authorized LAN media encoder is unavailable",
+            "choose a supported LAN media profile",
+        )
+    } else if diagnostic.contains("decoder") {
+        (
+            RemoteReasonCode::DecoderUnavailable,
+            "the authorized LAN media decoder is unavailable",
+            "choose a supported LAN media profile",
+        )
+    } else if diagnostic.contains("route")
+        || diagnostic.contains("listener")
+        || diagnostic.contains("socket")
+        || diagnostic.contains("send authorized lan bootstrap")
+    {
+        (
+            RemoteReasonCode::RouteLost,
+            "the authorized LAN route could not be committed",
+            "retry the LAN connection",
+        )
+    } else if diagnostic.contains("protocol")
+        || diagnostic.contains("signed")
+        || diagnostic.contains("signing")
+        || diagnostic.contains("signature")
+        || diagnostic.contains("grant")
+        || diagnostic.contains("bootstrap")
+        || diagnostic.contains("nonce")
+        || diagnostic.contains("payload")
+    {
+        (
+            RemoteReasonCode::ProtocolDowngradeBlocked,
+            "the secure LAN grant or bootstrap could not be verified",
+            "update both devices and retry the secure connection",
+        )
+    } else {
+        (
+            RemoteReasonCode::PolicyChanged,
+            "the authenticated LAN authorization could not be completed",
+            "retry after checking local security state",
+        )
+    };
+    (
+        if authorization_was_active {
+            RemoteAuthorizationState::Revoked
+        } else {
+            RemoteAuthorizationState::PolicyChanged
+        },
+        RemoteFailure {
+            code,
+            message: message.to_string(),
+            suggested_action: Some(suggested_action.to_string()),
+        },
+    )
+}
+
+fn lan_authorization_capabilities() -> Vec<RemotePermissionScope> {
+    // Until Task 19 authenticates control envelopes, LAN authorization exposes
+    // screen viewing only. New capabilities are added here only after their
+    // service-side enforcement exists.
+    vec![RemotePermissionScope::ScreenView]
+}
+
+fn authorization_failure_state(code: RemoteReasonCode) -> RemoteAuthorizationState {
+    match code {
+        RemoteReasonCode::AuthorizationTimeout => RemoteAuthorizationState::Expired,
+        RemoteReasonCode::CredentialLocked => RemoteAuthorizationState::LockedOut,
+        RemoteReasonCode::PolicyChanged => RemoteAuthorizationState::PolicyChanged,
+        RemoteReasonCode::GrantRevoked | RemoteReasonCode::TrustRequired => {
+            RemoteAuthorizationState::Revoked
+        }
+        _ => RemoteAuthorizationState::Denied,
+    }
+}
+
+fn post_consent_failure_state(code: RemoteReasonCode) -> RemoteAuthorizationState {
+    if code == RemoteReasonCode::AuthorizationTimeout {
+        RemoteAuthorizationState::Expired
+    } else {
+        RemoteAuthorizationState::Revoked
+    }
+}
+
+fn remote_reason_code_wire_name(code: RemoteReasonCode) -> String {
+    serde_json::to_string(&code)
+        .unwrap_or_else(|_| "\"policy_changed\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
+fn verified_grant_projection(
+    grant: &SignedLanSessionGrant,
+) -> Result<crate::session_authorization::VerifiedSessionGrant> {
+    Ok(crate::session_authorization::VerifiedSessionGrant {
+        grant_id: format!("sha256:{}", hex_bytes(&grant.grant_id()?)),
+        session_id: SessionId(grant.payload.session_id.clone()),
+        granted_scopes: grant.payload.granted_scopes.clone(),
+        issued_at_ms: grant.payload.issued_at_ms,
+        expires_at_ms: grant.payload.expires_at_ms,
+        policy_revision: grant.payload.policy_revision,
+        route_constraint: grant.payload.route_constraint.clone(),
+        transport_fingerprint_sha256: grant.payload.transport_fingerprint_sha256,
+    })
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn send_signed_lan_session_denial(
+    socket: &UdpSocket,
+    app_state: &Arc<AppState>,
+    request: &SignedLanSessionRequest,
+    addr: SocketAddr,
+    failure: RemoteFailure,
+) -> Result<()> {
+    let identity = app_state.device_identities.machine_identity();
+    let target_key_epoch = app_state
+        .device_identities
+        .machine_key_epoch()
+        .context("local machine key epoch is unavailable")?;
+    let issued_at_ms = now_ms();
     let bootstrap = LanSessionBootstrap {
         magic: DISCOVERY_MAGIC.to_string(),
         app_id: DISCOVERY_APP_ID.to_string(),
@@ -2002,31 +3156,107 @@ async fn handle_signed_remote_session_request(
         session_id: request.payload.session_id.clone(),
         controller_key_id: request.payload.source_key_id.clone(),
         controller_key_epoch: request.payload.source_key_epoch,
-        target_key_id: local_key_id,
-        target_key_epoch: local_key_epoch,
+        target_key_id: identity.key_id().to_string(),
+        target_key_epoch,
         request_nonce: request.payload.nonce,
-        accepted,
-        message,
-        media,
-        media_profile,
-        timestamp_ms: bootstrap_issued_at_ms,
-        expires_at_ms: bootstrap_issued_at_ms.saturating_add(5_000),
+        accepted: false,
+        message: None,
+        failure: Some(failure),
+        grant: None,
+        media: None,
+        media_profile: None,
+        timestamp_ms: issued_at_ms,
+        expires_at_ms: issued_at_ms.saturating_add(5_000),
         nonce: new_signed_nonce()?,
     };
-    let identity = app_state.device_identities.machine_identity();
     let signed = SignedLanSessionBootstrap::sign(identity.as_ref(), bootstrap)?;
     send_packet(
         socket,
         &LanDiscoveryPacket::SignedRemoteSessionBootstrap(signed),
         addr,
     )
-    .await?;
-    if let Some(prepared) = prepared {
-        commit_prepared_lan_remote_session(app_state, prepared).await?;
-    }
-    Ok(())
+    .await
 }
 
+async fn audit_and_send_signed_lan_pre_authorization_denial(
+    socket: &UdpSocket,
+    app_state: &Arc<AppState>,
+    request: &SignedLanSessionRequest,
+    addr: SocketAddr,
+    failure: RemoteFailure,
+) -> Result<()> {
+    if !app_state.security_is_healthy() {
+        anyhow::bail!("security audit is unhealthy; refusing unaudited LAN authorization denial");
+    }
+
+    let reason_code = remote_reason_code_wire_name(failure.code);
+    let audit_admission = app_state
+        .lan_discovery
+        .admit_pre_authorization_denial_audit(addr.ip(), now_ms())
+        .await;
+    let audit_result = match audit_admission {
+        LanPreAuthorizationAuditAdmission::Detailed {
+            previous_window_suppressed,
+        } => {
+            let mut details = vec![(
+                "requested_scope_count".to_string(),
+                request.payload.requested_scopes.len().to_string(),
+            )];
+            if previous_window_suppressed > 0 {
+                details.push((
+                    "previous_window_suppressed_denials".to_string(),
+                    previous_window_suppressed.to_string(),
+                ));
+            }
+            Some(app_state.audit_log.record(
+                "session.authorization_decision",
+                "denied",
+                Some(SessionId(request.payload.session_id.clone())),
+                None,
+                Some(DeviceId(request.payload.source_device_id.clone())),
+                Some(request.payload.transport_kind.clone()),
+                Some(reason_code.clone()),
+                details,
+            ))
+        }
+        LanPreAuthorizationAuditAdmission::OverflowMarker => Some(app_state.audit_log.record(
+            "session.authorization_decision",
+            "denied_aggregate",
+            None,
+            None,
+            None,
+            None,
+            Some(reason_code.clone()),
+            vec![
+                (
+                    "aggregate".to_string(),
+                    "pre_authorization_denials".to_string(),
+                ),
+                (
+                    "window_ms".to_string(),
+                    LAN_PRE_AUTHORIZATION_AUDIT_WINDOW_MS.to_string(),
+                ),
+                (
+                    "suppressed_denial_count_at_least".to_string(),
+                    "1".to_string(),
+                ),
+            ],
+        )),
+        LanPreAuthorizationAuditAdmission::Suppressed => None,
+    };
+    if audit_result.is_some_and(|result| result.is_err()) {
+        app_state.mark_security_unhealthy();
+        tracing::error!(
+            reason_code = %reason_code,
+            "failed to persist signed LAN pre-authorization denial"
+        );
+        anyhow::bail!("signed LAN pre-authorization denial could not be durably audited");
+    }
+
+    send_signed_lan_session_denial(socket, app_state, request, addr, failure).await
+}
+
+#[cfg(test)]
 async fn accept_lan_remote_session(
     app_state: &Arc<AppState>,
     session_id: SessionId,
@@ -2036,41 +3266,87 @@ async fn accept_lan_remote_session(
     source_media_capabilities: Vec<String>,
     requested_profile: Option<MediaProfile>,
 ) -> LanRemoteAcceptResult {
+    let preparation = match prepare_lan_remote_session(
+        app_state,
+        session_id,
+        source_device_id,
+        expected_peer_ip,
+        transport_kind,
+        source_media_capabilities,
+        requested_profile,
+    )
+    .await
+    {
+        Ok(preparation) => preparation,
+        Err(message) => return LanRemoteAcceptResult::rejected(message),
+    };
+    bind_prepared_lan_remote_session(preparation).await
+}
+
+async fn prepare_lan_remote_session(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    source_device_id: DeviceId,
+    expected_peer_ip: IpAddr,
+    transport_kind: String,
+    source_media_capabilities: Vec<String>,
+    requested_profile: Option<MediaProfile>,
+) -> std::result::Result<LanRemoteSessionPreparation, String> {
     let is_registered = {
         let devices = app_state.devices.lock().await;
         devices.is_registered()
     };
     if !is_registered {
-        return LanRemoteAcceptResult::rejected("local device is not registered");
+        return Err("local device is not registered".to_string());
     }
 
     let transport = normalize_transport_kind(&transport_kind);
     if transport == "webrtc" {
-        return LanRemoteAcceptResult::rejected(
-            "LAN WebRTC media path is not implemented in mrd-service yet",
-        );
+        return Err("LAN WebRTC media path is not implemented in mrd-service yet".to_string());
     }
     if transport != "quic" {
-        return LanRemoteAcceptResult::rejected(format!(
-            "unsupported LAN media transport: {transport}"
-        ));
+        return Err(format!("unsupported LAN media transport: {transport}"));
     }
-    let negotiation = match negotiate_media_profile(requested_profile) {
-        Ok(value) => value,
-        Err(error) => return LanRemoteAcceptResult::rejected(error.to_string()),
-    };
+    let negotiation =
+        negotiate_media_profile(requested_profile).map_err(|error| error.to_string())?;
     if let Err(error) = ensure_peer_can_receive_selected_media(
         source_device_id.0.as_str(),
         &negotiation.selected,
         &source_media_capabilities,
     ) {
-        return LanRemoteAcceptResult::rejected(error.to_string());
+        return Err(error.to_string());
     }
-    let (listener, bootstrap) = match QuinnServerListener::bind("0.0.0.0:0").await {
+    let prepared_server = QuinnPreparedServer::generate()
+        .map_err(|error| format!("failed to prepare LAN QUIC identity: {error}"))?;
+
+    Ok(LanRemoteSessionPreparation {
+        session_id,
+        source_device_id,
+        transport,
+        source_media_capabilities,
+        negotiation,
+        prepared_server,
+        expected_peer_ip,
+    })
+}
+
+async fn bind_prepared_lan_remote_session(
+    preparation: LanRemoteSessionPreparation,
+) -> LanRemoteAcceptResult {
+    let LanRemoteSessionPreparation {
+        session_id,
+        source_device_id,
+        transport,
+        source_media_capabilities,
+        negotiation,
+        prepared_server,
+        expected_peer_ip,
+    } = preparation;
+    let (listener, bootstrap) = match prepared_server.bind("0.0.0.0:0").await {
         Ok(value) => value,
         Err(error) => {
             return LanRemoteAcceptResult::rejected(format!(
-                "failed to start LAN QUIC media listener: {error}"
+                "failed to bind authorized LAN QUIC listener: {error}"
             ));
         }
     };
@@ -2099,6 +3375,7 @@ async fn accept_lan_remote_session(
             listener,
             bootstrap,
             expected_peer_ip,
+            controller_binding: None,
         }),
     }
 }
@@ -2129,7 +3406,22 @@ async fn commit_prepared_lan_remote_session_with_timeout(
         listener,
         bootstrap,
         expected_peer_ip,
+        controller_binding,
     } = prepared;
+    if controller_binding.is_some() {
+        let authorization = app_state
+            .session_authorizations
+            .snapshot_at(&session_id, now_ms())
+            .await
+            .context("remote authorization disappeared before LAN sender commit")?;
+        if authorization.authorization_state != RemoteAuthorizationState::Granted
+            || !authorization
+                .granted_scopes
+                .contains(&RemotePermissionScope::ScreenView)
+        {
+            anyhow::bail!("remote authorization changed before LAN sender commit");
+        }
+    }
     #[cfg(test)]
     let capture_selection = Some(CaptureSourceSelection {
         session_id: session_id.clone(),
@@ -2193,6 +3485,7 @@ async fn commit_prepared_lan_remote_session_with_timeout(
         session_id.clone(),
         listener,
         expected_peer_ip,
+        controller_binding,
         accept_timeout,
         start_rx,
     );
@@ -2211,6 +3504,11 @@ async fn commit_prepared_lan_remote_session_with_timeout(
         media_profiles.remove(&session_id);
         anyhow::bail!("LAN media sender task ended before session commit");
     }
+    drop(media_tasks);
+    drop(peer_media_capabilities);
+    drop(capture_sources);
+    drop(media_profiles);
+    drop(sessions);
     Ok(())
 }
 
@@ -2219,6 +3517,7 @@ async fn accept_lan_media_profile_update(
     session_id: &SessionId,
     requested_profile: MediaProfile,
 ) -> Result<MediaProfileNegotiation> {
+    ensure_legacy_session_control_allowed(app_state, session_id, "media profile update").await?;
     validate_media_profile(&requested_profile)?;
     {
         let sessions = app_state.sessions.lock().await;
@@ -2550,6 +3849,7 @@ async fn ensure_active_sender_session(
     session_id: &SessionId,
     operation: &str,
 ) -> Result<()> {
+    ensure_legacy_session_control_allowed(app_state, session_id, operation).await?;
     let sessions = app_state.sessions.lock().await;
     let snapshot = sessions
         .get(session_id)
@@ -2564,6 +3864,24 @@ async fn ensure_active_sender_session(
         anyhow::bail!(
             "{operation} rejected for {} session",
             snapshot.lifecycle_state
+        );
+    }
+    Ok(())
+}
+
+async fn ensure_legacy_session_control_allowed(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    operation: &str,
+) -> Result<()> {
+    if app_state
+        .session_authorizations
+        .snapshot(session_id)
+        .await
+        .is_some()
+    {
+        anyhow::bail!(
+            "legacy unsigned LAN session control is disabled for authorized remote sessions: {operation}"
         );
     }
     Ok(())
@@ -2606,7 +3924,7 @@ async fn build_announcement(
             .map(|(id, name)| (id.0.clone(), name.clone()))
     }?;
 
-    let mut transports = vec![
+    let transports = vec![
         "quic".to_string(),
         LAN_QUIC_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
@@ -2617,12 +3935,10 @@ async fn build_announcement(
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
-        LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string(),
     ];
-    let input_control_available = app_state.control_input().lock().await.is_available();
-    if input_control_available {
-        transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
-    }
+    // Task 19 will advertise input only after ControlEnvelopeV2 is authenticated.
+    // Legacy unsigned power actions remain disabled until Task 40 policy work.
+    let input_control_available = false;
 
     let issued_at_ms = now_ms();
     let announcement = LanAnnouncement {
@@ -2675,6 +3991,7 @@ async fn start_lan_media_receiver(
     target_device_id: DeviceId,
     negotiation: MediaProfileNegotiation,
     peer_media_capabilities: Vec<String>,
+    controller_proof: LanQuicControllerProofMaterial,
 ) -> Result<()> {
     start_lan_media_receiver_with_timeout(
         app_state,
@@ -2685,6 +4002,7 @@ async fn start_lan_media_receiver(
         target_device_id,
         negotiation,
         peer_media_capabilities,
+        Some(controller_proof),
         LAN_QUIC_BOOTSTRAP_CONNECT_TIMEOUT,
     )
     .await
@@ -2700,6 +4018,7 @@ async fn start_lan_media_receiver_with_timeout(
     target_device_id: DeviceId,
     negotiation: MediaProfileNegotiation,
     peer_media_capabilities: Vec<String>,
+    controller_proof: Option<LanQuicControllerProofMaterial>,
     connect_timeout: Duration,
 ) -> Result<()> {
     let requested_transport = normalize_transport_kind(requested_transport);
@@ -2728,6 +4047,25 @@ async fn start_lan_media_receiver_with_timeout(
     .await
     .context("timed out connecting LAN QUIC media receiver")?
     .context("failed to connect LAN QUIC media receiver")?;
+    if let Some(controller_proof) = controller_proof.as_ref() {
+        prove_lan_quic_controller(&endpoint, &session_id, controller_proof).await?;
+    } else if !cfg!(test) {
+        anyhow::bail!("authorized LAN receiver is missing its controller proof material");
+    }
+    if controller_proof.is_some() {
+        let authorization = app_state
+            .session_authorizations
+            .snapshot_at(&session_id, now_ms())
+            .await
+            .context("remote authorization disappeared before LAN receiver commit")?;
+        if authorization.authorization_state != RemoteAuthorizationState::Granted
+            || !authorization
+                .granted_scopes
+                .contains(&RemotePermissionScope::ScreenView)
+        {
+            anyhow::bail!("remote authorization changed before LAN receiver commit");
+        }
+    }
     let snapshot = SessionSnapshot {
         session_id: session_id.clone(),
         transport: requested_transport,
@@ -2781,6 +4119,15 @@ async fn start_lan_media_receiver_with_timeout(
         media_profiles.remove(&session_id);
         anyhow::bail!("LAN media receiver task ended before session commit");
     }
+    drop(media_tasks);
+    drop(stored_peer_capabilities);
+    drop(capture_sources);
+    drop(media_profiles);
+    drop(sessions);
+    let _ = app_state
+        .session_authorizations
+        .mark_streaming(&session_id, now_ms())
+        .await;
     Ok(())
 }
 
@@ -2905,11 +4252,66 @@ async fn close_lan_media_sessions(
     session_ids: Vec<SessionId>,
     reason: &'static str,
 ) {
+    terminate_lan_media_sessions(app_state, &session_ids, reason).await;
+}
+
+pub(crate) async fn terminate_authorized_remote_sessions(
+    app_state: &Arc<AppState>,
+    session_ids: &[SessionId],
+) {
+    terminate_lan_media_sessions(
+        app_state,
+        session_ids,
+        "remote authorization no longer permits LAN media",
+    )
+    .await;
+}
+
+async fn terminate_lan_media_sessions(
+    app_state: &Arc<AppState>,
+    session_ids: &[SessionId],
+    reason: &str,
+) {
+    let mut seen_session_ids = HashSet::new();
     for session_id in session_ids {
+        if !seen_session_ids.insert(session_id.clone()) {
+            continue;
+        }
+        if let Some(authorization) = app_state
+            .session_authorizations
+            .snapshot(session_id)
+            .await
+            .filter(|snapshot| {
+                snapshot.authorization_state == RemoteAuthorizationState::Expired
+                    && snapshot.failure.as_ref().map(|failure| failure.code)
+                        == Some(RemoteReasonCode::GrantExpired)
+            })
+        {
+            if app_state
+                .audit_log
+                .record(
+                    "session.authorization_expired",
+                    "expired",
+                    Some(session_id.clone()),
+                    None,
+                    Some(authorization.peer_device_id),
+                    Some("quic".to_string()),
+                    Some("grant_expired".to_string()),
+                    Vec::new(),
+                )
+                .is_err()
+            {
+                app_state.mark_security_unhealthy();
+                tracing::error!(
+                    session_id = %session_id.0,
+                    "failed to persist LAN authorization expiry audit"
+                );
+            }
+        }
         tracing::info!(session_id = %session_id.0, reason, "closing stale LAN media session");
         {
             let mut sessions = app_state.sessions.lock().await;
-            if let Some(snapshot) = sessions.get(&session_id).cloned() {
+            if let Some(snapshot) = sessions.get(session_id).cloned() {
                 sessions.insert(
                     session_id.clone(),
                     SessionSnapshot {
@@ -2922,12 +4324,8 @@ async fn close_lan_media_sessions(
                 );
             }
         }
-        app_state
-            .media_tasks
-            .lock()
-            .await
-            .abort_session(&session_id);
-        cleanup_lan_media_resources(app_state, &session_id).await;
+        app_state.media_tasks.lock().await.abort_session(session_id);
+        cleanup_lan_media_resources(app_state, session_id).await;
     }
 }
 
@@ -2954,11 +4352,115 @@ async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &Ses
     app_state.media_pipelines.lock().await.remove(session_id);
 }
 
+async fn authenticate_lan_quic_controller(
+    endpoint: &QuinnDatagramEndpoint,
+    session_id: &SessionId,
+    binding: &LanQuicControllerBinding,
+) -> Result<()> {
+    let issued_at_ms = now_ms();
+    let challenge = LanQuicControllerChallenge {
+        protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+        session_id: session_id.0.clone(),
+        grant_id: binding.grant_id,
+        transport_fingerprint_sha256: binding.transport_fingerprint_sha256,
+        issued_at_ms,
+        expires_at_ms: issued_at_ms
+            .saturating_add(LAN_QUIC_CONTROLLER_PROOF_TIMEOUT.as_millis() as u64),
+        nonce: new_signed_nonce()?,
+    };
+    let challenge_bytes =
+        serde_json::to_vec(&challenge).context("failed to encode LAN QUIC controller challenge")?;
+    timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.send_reliable_message(bytes::Bytes::from(challenge_bytes)),
+    )
+    .await
+    .context("timed out sending LAN QUIC controller challenge")?
+    .context("failed to send LAN QUIC controller challenge")?;
+    let proof_bytes = timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.read_reliable_message(LAN_QUIC_CONTROLLER_PROOF_MAX_BYTES),
+    )
+    .await
+    .context("timed out waiting for LAN QUIC controller proof")?
+    .context("failed to read LAN QUIC controller proof")?;
+    let proof = serde_json::from_slice::<SignedLanQuicControllerProof>(&proof_bytes)
+        .context("invalid LAN QUIC controller proof payload")?;
+    proof
+        .verify(
+            now_ms(),
+            &binding.controller_public_key,
+            binding.controller_key_epoch,
+            &challenge,
+        )
+        .context("LAN QUIC controller proof verification failed")?;
+    timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.send_reliable_message(bytes::Bytes::from_static(
+            LAN_QUIC_CONTROLLER_PROOF_ACCEPTED,
+        )),
+    )
+    .await
+    .context("timed out acknowledging LAN QUIC controller proof")?
+    .context("failed to acknowledge LAN QUIC controller proof")
+}
+
+async fn prove_lan_quic_controller(
+    endpoint: &QuinnDatagramEndpoint,
+    session_id: &SessionId,
+    material: &LanQuicControllerProofMaterial,
+) -> Result<()> {
+    let challenge_bytes = timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.read_reliable_message(LAN_QUIC_CONTROLLER_PROOF_MAX_BYTES),
+    )
+    .await
+    .context("timed out waiting for LAN QUIC controller challenge")?
+    .context("failed to read LAN QUIC controller challenge")?;
+    let challenge = serde_json::from_slice::<LanQuicControllerChallenge>(&challenge_bytes)
+        .context("invalid LAN QUIC controller challenge payload")?;
+    challenge
+        .verify_binding(
+            now_ms(),
+            &session_id.0,
+            &material.grant_id,
+            &material.transport_fingerprint_sha256,
+        )
+        .context("LAN QUIC controller challenge binding failed")?;
+    let proof = SignedLanQuicControllerProof::sign(
+        material.controller_identity.as_ref(),
+        material.controller_key_epoch,
+        challenge,
+    )
+    .context("failed to sign LAN QUIC controller proof")?;
+    let proof_bytes =
+        serde_json::to_vec(&proof).context("failed to encode LAN QUIC controller proof")?;
+    timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.send_reliable_message(bytes::Bytes::from(proof_bytes)),
+    )
+    .await
+    .context("timed out sending LAN QUIC controller proof")?
+    .context("failed to send LAN QUIC controller proof")?;
+    let acknowledgement = timeout(
+        LAN_QUIC_CONTROLLER_PROOF_TIMEOUT,
+        endpoint.read_reliable_message(LAN_QUIC_CONTROLLER_PROOF_ACCEPTED.len()),
+    )
+    .await
+    .context("timed out waiting for LAN QUIC controller proof acknowledgement")?
+    .context("failed to read LAN QUIC controller proof acknowledgement")?;
+    if acknowledgement.as_ref() != LAN_QUIC_CONTROLLER_PROOF_ACCEPTED {
+        anyhow::bail!("invalid LAN QUIC controller proof acknowledgement");
+    }
+    Ok(())
+}
+
 fn spawn_quic_media_sender(
     app_state: Arc<AppState>,
     session_id: SessionId,
     listener: QuinnServerListener,
     expected_peer_ip: IpAddr,
+    controller_binding: Option<LanQuicControllerBinding>,
     accept_timeout: Duration,
     start_rx: oneshot::Receiver<()>,
 ) -> tokio::task::AbortHandle {
@@ -2978,27 +4480,67 @@ fn spawn_quic_media_sender(
         }
         let local_addr = listener.local_addr();
         let result = async move {
-            let endpoint = timeout(accept_timeout, listener.accept_from(expected_peer_ip))
-                .await
-                .context("timed out waiting for LAN QUIC media receiver")?
-                .context("LAN QUIC media listener failed to accept receiver")?;
+            let accept = timeout(accept_timeout, listener.accept_from(expected_peer_ip));
+            tokio::pin!(accept);
+            let endpoint = loop {
+                tokio::select! {
+                    result = &mut accept => {
+                        break result
+                            .context("timed out waiting for LAN QUIC media receiver")?
+                            .context("LAN QUIC media listener failed to accept receiver")?;
+                    }
+                    _ = tokio::time::sleep(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL) => {
+                        if !session_allows_media(&task_app_state, &task_session_id).await {
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            let controller_binding = controller_binding
+                .context("authorized LAN sender is missing its controller proof binding")?;
+            authenticate_lan_quic_controller(&endpoint, &task_session_id, &controller_binding)
+                .await?;
+            if !session_allows_media(&task_app_state, &task_session_id).await {
+                return Ok(());
+            }
+            let _ = task_app_state
+                .session_authorizations
+                .mark_streaming(&task_session_id, now_ms())
+                .await;
             send_quic_media_loop(task_app_state, endpoint, task_session_id).await
         }
         .await;
-        if let Err(error) = result {
-            tracing::warn!(%error, %local_addr, "LAN QUIC media sender stopped");
-            mark_session_failed(
-                &failure_app_state,
-                &failure_session_id,
-                format!("LAN QUIC media sender failed: {error}"),
-            )
-            .await;
-            cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
-        }
         completion_registry
             .lock()
             .await
             .forget_task(&failure_session_id, tokio::task::id());
+        match result {
+            Ok(()) => {
+                terminate_authorized_remote_sessions(
+                    &failure_app_state,
+                    std::slice::from_ref(&failure_session_id),
+                )
+                .await;
+            }
+            Err(error) => {
+                if session_allows_media(&failure_app_state, &failure_session_id).await {
+                    tracing::warn!(%error, %local_addr, "LAN QUIC media sender stopped");
+                    mark_session_failed(
+                        &failure_app_state,
+                        &failure_session_id,
+                        format!("LAN QUIC media sender failed: {error}"),
+                    )
+                    .await;
+                    cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
+                } else {
+                    terminate_authorized_remote_sessions(
+                        &failure_app_state,
+                        std::slice::from_ref(&failure_session_id),
+                    )
+                    .await;
+                }
+            }
+        }
     });
     let abort_handle = handle.abort_handle();
     drop(handle);
@@ -3033,6 +4575,12 @@ async fn send_quic_media_loop(
     let mut media_timer_resolution = MediaTimerResolution::default();
     let mut sender_stats = LanSenderStatsTracker::new(Instant::now());
     let mut test_impairment = LanMediaTestImpairment::from_env()?;
+    // Child sends are structured under the media loop. Dropping either JoinSet
+    // on revoke/expiry aborts the sends before their endpoint clones can outlive
+    // the authorized session. Reliable keyframe redundancy has its own strict
+    // bound so a peer that stops reading streams cannot retain unbounded frames.
+    let mut delayed_media_children = tokio::task::JoinSet::new();
+    let mut reliable_keyframe_children = tokio::task::JoinSet::new();
     let mut dynamic_window_fps_config: Option<DynamicWindowFpsConfigKey> = None;
     let mut dynamic_window_fps_policy: Option<DynamicWindowFpsPolicy> = None;
     let mut dynamic_window_fps_decision: Option<DynamicWindowFpsDecision> = None;
@@ -3057,6 +4605,8 @@ async fn send_quic_media_loop(
         .await
         .supports(&session_id, LAN_QUIC_MEDIA_PROFILE_TRANSPORT);
     loop {
+        while delayed_media_children.try_join_next().is_some() {}
+        while reliable_keyframe_children.try_join_next().is_some() {}
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
@@ -3125,6 +4675,9 @@ async fn send_quic_media_loop(
             let pacing_started = Instant::now();
             sleep_until_media_frame(delay_until, &profile).await;
             sender_stats.record_elapsed("sender.pacing_wait", pacing_started);
+        }
+        if !session_allows_media(&app_state, &session_id).await {
+            return Ok(());
         }
         let loop_started = Instant::now();
 
@@ -3553,6 +5106,13 @@ async fn send_quic_media_loop(
                 None
             };
 
+            // Capture and encoding can outlast the grant boundary. Recheck at
+            // the last frame-level boundary before any payload becomes visible
+            // to the peer.
+            if !session_allows_media(&app_state, &session_id).await {
+                return Ok(());
+            }
+
             let mut send_result = Ok(());
             if send_as_reliable_frame {
                 let reliable_send_started = Instant::now();
@@ -3560,14 +5120,35 @@ async fn send_quic_media_loop(
                 for reliable_fragment in reliable_fragments.unwrap_or_default() {
                     let delay = test_impairment.next_delay();
                     if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+                        if run_lan_media_operation_while_authorized(
+                            &app_state,
+                            &session_id,
+                            &endpoint,
+                            tokio::time::sleep(delay),
+                        )
+                        .await
+                        .is_none()
+                        {
+                            return Ok(());
+                        }
                     }
-                    let send = send_lan_reliable_media_fragment(
+                    if !session_allows_media(&app_state, &session_id).await {
+                        return Ok(());
+                    }
+                    let Some(send) = run_lan_media_operation_while_authorized(
+                        &app_state,
+                        &session_id,
                         &endpoint,
-                        reliable_media_send_mode,
-                        reliable_fragment,
+                        send_lan_reliable_media_fragment(
+                            &endpoint,
+                            reliable_media_send_mode,
+                            reliable_fragment,
+                        ),
                     )
-                    .await;
+                    .await
+                    else {
+                        return Ok(());
+                    };
                     if let Err(error) = send {
                         send_result = Err(error).with_context(|| {
                             format!("failed to send LAN QUIC reliable media frame {}", frame_id)
@@ -3593,6 +5174,9 @@ async fn send_quic_media_loop(
                 };
                 let mut skip_unsent_datagram_frame = false;
                 for (fragment_index, fragment) in fragments.iter().enumerate() {
+                    if !session_allows_media(&app_state, &session_id).await {
+                        return Ok(());
+                    }
                     let frame_send_started =
                         datagram_report.fragments_sent > 0 || datagram_report.fragments_delayed > 0;
                     let remaining_send_budget = if frame_send_started {
@@ -3622,18 +5206,30 @@ async fn send_quic_media_loop(
                         datagram_report.fragments_delayed =
                             datagram_report.fragments_delayed.saturating_add(1);
                         let delayed_endpoint = endpoint.clone();
+                        let delayed_app_state = app_state.clone();
                         let delayed_session_id = session_id.clone();
                         let delayed_frame_id = frame_id;
                         let delayed_fragment = fragment.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(decision.delay).await;
-                            let send_result = send_lan_media_datagram(
+                        delayed_media_children.spawn(async move {
+                            let Some(send_result) = run_lan_media_operation_while_authorized(
+                                &delayed_app_state,
+                                &delayed_session_id,
                                 &delayed_endpoint,
-                                delayed_fragment,
-                                !best_effort_datagrams,
-                                None,
+                                async {
+                                    tokio::time::sleep(decision.delay).await;
+                                    send_lan_media_datagram(
+                                        &delayed_endpoint,
+                                        delayed_fragment,
+                                        !best_effort_datagrams,
+                                        None,
+                                    )
+                                    .await
+                                },
                             )
-                            .await;
+                            .await
+                            else {
+                                return;
+                            };
                             if let Err(error) = send_result {
                                 tracing::debug!(
                                     %error,
@@ -3645,13 +5241,24 @@ async fn send_quic_media_loop(
                         });
                         continue;
                     }
-                    let send_fragment_result = send_lan_media_datagram(
+                    if !session_allows_media(&app_state, &session_id).await {
+                        return Ok(());
+                    }
+                    let Some(send_fragment_result) = run_lan_media_operation_while_authorized(
+                        &app_state,
+                        &session_id,
                         &endpoint,
-                        fragment.clone(),
-                        !best_effort_datagrams,
-                        remaining_send_budget,
+                        send_lan_media_datagram(
+                            &endpoint,
+                            fragment.clone(),
+                            !best_effort_datagrams,
+                            remaining_send_budget,
+                        ),
                     )
-                    .await;
+                    .await
+                    else {
+                        return Ok(());
+                    };
                     match send_fragment_result {
                         Ok(LanDatagramSendOutcome::Sent) => {
                             datagram_report.fragments_sent =
@@ -3684,29 +5291,55 @@ async fn send_quic_media_loop(
 
                 if send_result.is_ok() {
                     if let Some(reliable_fragments) = reliable_fragments {
-                        let reliable_endpoint = endpoint.clone();
-                        let reliable_session_id = session_id.clone();
-                        let reliable_frame_id = frame_id;
-                        let reliable_send_mode = reliable_media_send_mode;
-                        tokio::spawn(async move {
-                            for reliable_fragment in reliable_fragments {
-                                if let Err(error) = send_lan_reliable_media_fragment(
-                                    &reliable_endpoint,
-                                    reliable_send_mode,
-                                    reliable_fragment,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(
-                                        %error,
-                                        session_id = %reliable_session_id.0,
-                                        frame_id = reliable_frame_id,
-                                        "LAN QUIC reliable keyframe fragment send failed"
-                                    );
-                                    break;
+                        if can_spawn_reliable_keyframe_child(reliable_keyframe_children.len()) {
+                            let reliable_endpoint = endpoint.clone();
+                            let reliable_app_state = app_state.clone();
+                            let reliable_session_id = session_id.clone();
+                            let reliable_frame_id = frame_id;
+                            let reliable_send_mode = reliable_media_send_mode;
+                            reliable_keyframe_children.spawn(async move {
+                                for reliable_fragment in reliable_fragments {
+                                    if !session_allows_media(
+                                        &reliable_app_state,
+                                        &reliable_session_id,
+                                    )
+                                    .await
+                                    {
+                                        break;
+                                    }
+                                    let Some(send_result) =
+                                        run_lan_media_operation_while_authorized(
+                                            &reliable_app_state,
+                                            &reliable_session_id,
+                                            &reliable_endpoint,
+                                            send_lan_reliable_media_fragment(
+                                                &reliable_endpoint,
+                                                reliable_send_mode,
+                                                reliable_fragment,
+                                            ),
+                                        )
+                                        .await
+                                    else {
+                                        break;
+                                    };
+                                    if let Err(error) = send_result {
+                                        tracing::warn!(
+                                            %error,
+                                            session_id = %reliable_session_id.0,
+                                            frame_id = reliable_frame_id,
+                                            "LAN QUIC reliable keyframe fragment send failed"
+                                        );
+                                        break;
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        } else {
+                            tracing::debug!(
+                                session_id = %session_id.0,
+                                frame_id,
+                                "skipping reliable keyframe redundancy while the bounded sender is busy"
+                            );
+                        }
                     }
                 }
             }
@@ -3728,6 +5361,9 @@ async fn send_quic_media_loop(
                 continue;
             }
             sender_stats.frame_completed();
+            if !session_allows_media(&app_state, &session_id).await {
+                return Ok(());
+            }
             if let Some(stats_payload) = sender_stats.take_payload(
                 Instant::now(),
                 frame_id,
@@ -3776,6 +5412,53 @@ async fn send_quic_media_loop(
             set_session_last_error(&app_state, &session_id, None).await;
         }
     }
+}
+
+fn can_spawn_reliable_keyframe_child(in_flight: usize) -> bool {
+    in_flight < LAN_RELIABLE_KEYFRAME_SEND_TASK_LIMIT
+}
+
+async fn run_lan_media_operation_while_authorized<F, T>(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    endpoint: &QuinnDatagramEndpoint,
+    operation: F,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(lease) = app_state
+        .session_authorizations
+        .acquire_scope_lease(session_id, RemotePermissionScope::ScreenView)
+        .await
+    else {
+        endpoint.close_immediately(b"remote authorization invalid");
+        return None;
+    };
+    let outcome = {
+        let invalid = lease.wait_until_invalid();
+        tokio::pin!(invalid);
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = &mut invalid => {
+                // Quinn implicitly finishes a SendStream when its future is
+                // dropped. Close the connection first so a partially written
+                // reliable media message is reset instead of surfacing as a
+                // successful truncated message at the peer.
+                endpoint.close_immediately(b"remote authorization invalid");
+                None
+            },
+            output = &mut operation => Some(output),
+        }
+    };
+    if outcome.is_none() {
+        let _ = app_state
+            .session_authorizations
+            .snapshot_at(session_id, now_ms())
+            .await;
+    }
+    outcome
 }
 
 async fn handle_media_sender_frame_error(
@@ -4038,22 +5721,38 @@ fn spawn_quic_media_receiver(
                 .forget_task(&failure_session_id, tokio::task::id());
             return;
         }
-        if let Err(error) =
-            receive_quic_media_loop(app_state, task_session_id.clone(), endpoint).await
-        {
-            tracing::warn!(%error, session_id = %task_session_id.0, "LAN QUIC media receiver stopped");
-            mark_session_failed(
-                &failure_app_state,
-                &failure_session_id,
-                format!("LAN QUIC media receiver failed: {error}"),
-            )
-            .await;
-            cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
-        }
+        let result = receive_quic_media_loop(app_state, task_session_id.clone(), endpoint).await;
         completion_registry
             .lock()
             .await
             .forget_task(&failure_session_id, tokio::task::id());
+        match result {
+            Ok(()) => {
+                terminate_authorized_remote_sessions(
+                    &failure_app_state,
+                    std::slice::from_ref(&failure_session_id),
+                )
+                .await;
+            }
+            Err(error) => {
+                if session_allows_media(&failure_app_state, &failure_session_id).await {
+                    tracing::warn!(%error, session_id = %task_session_id.0, "LAN QUIC media receiver stopped");
+                    mark_session_failed(
+                        &failure_app_state,
+                        &failure_session_id,
+                        format!("LAN QUIC media receiver failed: {error}"),
+                    )
+                    .await;
+                    cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
+                } else {
+                    terminate_authorized_remote_sessions(
+                        &failure_app_state,
+                        std::slice::from_ref(&failure_session_id),
+                    )
+                    .await;
+                }
+            }
+        }
     });
     let abort_handle = handle.abort_handle();
     drop(handle);
@@ -4093,41 +5792,42 @@ async fn receive_quic_media_loop(
         persistent_reliable_media_supported,
         &initial_media_profile,
     );
-    let mut reliable_media_rx = if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let reliable_endpoint = endpoint.clone();
-        tokio::spawn(async move {
-            loop {
-                let result = match reliable_media_read_mode {
-                    LanReliableMediaSendMode::Disabled => break,
-                    LanReliableMediaSendMode::PerMessage => {
-                        reliable_endpoint
-                            .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                            .await
+    let (mut reliable_media_rx, _reliable_media_reader) =
+        if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            let reliable_endpoint = endpoint.clone();
+            let reader = AbortOnDrop(tokio::spawn(async move {
+                loop {
+                    let result = match reliable_media_read_mode {
+                        LanReliableMediaSendMode::Disabled => break,
+                        LanReliableMediaSendMode::PerMessage => {
+                            reliable_endpoint
+                                .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                                .await
+                        }
+                        LanReliableMediaSendMode::Persistent => {
+                            reliable_endpoint
+                                .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                                .await
+                        }
+                    };
+                    let should_retry = result.is_err();
+                    if tx
+                        .send(result.map_err(|error| error.to_string()))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
-                    LanReliableMediaSendMode::Persistent => {
-                        reliable_endpoint
-                            .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                            .await
+                    if should_retry {
+                        tokio::time::sleep(LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY).await;
                     }
-                };
-                let should_retry = result.is_err();
-                if tx
-                    .send(result.map_err(|error| error.to_string()))
-                    .await
-                    .is_err()
-                {
-                    break;
                 }
-                if should_retry {
-                    tokio::time::sleep(LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY).await;
-                }
-            }
-        });
-        Some(rx)
-    } else {
-        None
-    };
+            }));
+            (Some(rx), Some(reader))
+        } else {
+            (None, None)
+        };
     let mut datagram_media_enabled = true;
     let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
     let mut keyframe_request_sequence = 0_u32;
@@ -4185,11 +5885,14 @@ async fn receive_quic_media_loop(
                             }
                         }
                     }
+                    _ = tokio::time::sleep(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL) => {
+                        continue;
+                    }
                 }
             } else {
-                match rx.recv().await {
-                    Some(Ok(message)) => message,
-                    Some(Err(error)) => {
+                match timeout(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL, rx.recv()).await {
+                    Ok(Some(Ok(message))) => message,
+                    Ok(Some(Err(error))) => {
                         tracing::warn!(
                             %error,
                             session_id = %session_id.0,
@@ -4197,7 +5900,7 @@ async fn receive_quic_media_loop(
                         );
                         continue;
                     }
-                    None => {
+                    Ok(None) => {
                         reliable_media_rx = None;
                         tracing::warn!(
                             session_id = %session_id.0,
@@ -4205,13 +5908,21 @@ async fn receive_quic_media_loop(
                         );
                         continue;
                     }
+                    Err(_) => {
+                        continue;
+                    }
                 }
             }
         } else {
-            endpoint
-                .read_datagram()
-                .await
-                .context("failed to read LAN QUIC media datagram")?
+            match timeout(
+                LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL,
+                endpoint.read_datagram(),
+            )
+            .await
+            {
+                Ok(result) => result.context("failed to read LAN QUIC media datagram")?,
+                Err(_) => continue,
+            }
         };
         receiver_stats.record_elapsed("receiver.read", read_started);
         receiver_stats.record_elapsed("receiver.message_wait", read_started);

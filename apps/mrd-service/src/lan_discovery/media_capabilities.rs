@@ -48,7 +48,8 @@ pub(super) const LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "decode.videoto
 pub(super) const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 
 pub(super) fn lan_media_capabilities() -> Vec<String> {
-    lan_media_capabilities_with_input_control(cfg!(windows))
+    // Task 19 re-enables this only with authenticated ControlEnvelopeV2.
+    lan_media_capabilities_with_input_control(false)
 }
 
 pub(super) fn lan_media_capabilities_with_input_control(

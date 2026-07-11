@@ -129,15 +129,42 @@ impl IpcServer {
                 .await
             }
 
-            IpcRequest::GetRemoteSession { .. }
-            | IpcRequest::RequestRemoteSession { .. }
-            | IpcRequest::RespondToConsent { .. }
-            | IpcRequest::EnableUnattendedAccess { .. }
-            | IpcRequest::DisableUnattendedAccess { .. }
-            | IpcRequest::RotateUnattendedAccess { .. }
-            | IpcRequest::RotateTrustedDevice { .. }
+            IpcRequest::GetRemoteSession { session_id } => {
+                session::get_remote_session(&self.app_state, session_id).await
+            }
+
+            IpcRequest::RespondToConsent { response } => {
+                session::respond_to_consent(&self.app_state, response).await
+            }
+
+            IpcRequest::SubscribeSessionEvents { query } => {
+                session::subscribe_session_events(&self.app_state, query).await
+            }
+
+            IpcRequest::RequestRemoteSession { request } => {
+                session::request_remote_session(&self.app_state, request).await
+            }
+
+            IpcRequest::EnableUnattendedAccess { policy } => {
+                session::enable_unattended_access(&self.app_state, policy).await
+            }
+
+            IpcRequest::DisableUnattendedAccess {
+                expected_policy_revision,
+            } => {
+                session::disable_unattended_access(&self.app_state, expected_policy_revision.get())
+                    .await
+            }
+
+            IpcRequest::RotateUnattendedAccess {
+                expected_policy_revision,
+            } => {
+                session::rotate_unattended_access(&self.app_state, expected_policy_revision.get())
+                    .await
+            }
+
+            IpcRequest::RotateTrustedDevice { .. }
             | IpcRequest::ChangeSessionPermissions { .. }
-            | IpcRequest::SubscribeSessionEvents { .. }
             | IpcRequest::GetRouteEvidence { .. }
             | IpcRequest::GetAuditEventsV2 { .. } => IpcResponse::Error {
                 code: "E_SECURE_REMOTE_UNAVAILABLE".to_string(),
@@ -667,6 +694,11 @@ fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::RegisterDevice { .. }
+            | IpcRequest::RequestRemoteSession { .. }
+            | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::EnableUnattendedAccess { .. }
+            | IpcRequest::DisableUnattendedAccess { .. }
+            | IpcRequest::RotateUnattendedAccess { .. }
             | IpcRequest::StartSession { .. }
             | IpcRequest::StartLanRemoteSession { .. }
             | IpcRequest::AcceptSession { .. }
@@ -691,7 +723,12 @@ mod tests {
     use super::dispatch_request;
     use crate::app_state::AppState;
     use crate::ipc_server::IpcServer;
-    use mrd_ipc::{IpcRequest, IpcResponse};
+    use crate::session_authorization::VerifiedIncomingAuthorizationRequest;
+    use mrd_ipc::{
+        DecimalU64, IpcRequest, IpcResponse, RemoteAccessMode, RemotePermissionScope,
+        RemoteReasonCode,
+    };
+    use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -705,23 +742,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secure_remote_contract_fails_closed_until_handlers_are_available() {
+    async fn unavailable_secure_remote_operations_remain_fail_closed() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state);
         let requests = [
-            serde_json::json!({"type":"GetRemoteSession","session_id":"session-1"}),
-            serde_json::json!({"type":"RequestRemoteSession","request":{"session_id":"session-1","target_device_id":"device-1","access_mode":"attended","requested_scopes":["screen.view"],"requested_profile":null}}),
-            serde_json::json!({"type":"RespondToConsent","response":{"session_id":"session-1","decision":"approve","approved_scopes":["screen.view"],"expected_policy_revision":"7"}}),
-            serde_json::json!({"type":"EnableUnattendedAccess","policy":{"trusted_devices_only":true,"allowed_peer_key_ids":["sha256:peer"],"permission_ceiling":["screen.view"],"expires_at_ms":null}}),
-            serde_json::json!({"type":"DisableUnattendedAccess","expected_policy_revision":"7"}),
-            serde_json::json!({"type":"RotateUnattendedAccess","expected_policy_revision":"7"}),
-            serde_json::json!({"type":"ListTrustedDevices","include_revoked":false}),
             serde_json::json!({"type":"ApproveTrustedDevice","approval":{"peer_key_id":"sha256:peer","key_epoch":"2","permission_ceiling":["screen.view"]}}),
-            serde_json::json!({"type":"SuspendTrustedDevice","peer_key_id":"sha256:peer","expected_trust_revision":"9"}),
-            serde_json::json!({"type":"RevokeTrustedDevice","peer_key_id":"sha256:peer","expected_trust_revision":"9"}),
             serde_json::json!({"type":"RotateTrustedDevice","rotation":{"peer_key_id":"sha256:peer","new_peer_key_id":"sha256:new-peer","new_key_epoch":"3","expected_trust_revision":"9"}}),
             serde_json::json!({"type":"ChangeSessionPermissions","change":{"session_id":"session-1","requested_scopes":["screen.view"],"expected_policy_revision":"7"}}),
-            serde_json::json!({"type":"SubscribeSessionEvents","query":{"session_id":"session-1","after_sequence":"41","limit":32,"wait_timeout_ms":15000}}),
             serde_json::json!({"type":"GetRouteEvidence","session_id":"session-1"}),
             serde_json::json!({"type":"GetAuditEventsV2","query":{"after_sequence":"8","limit":50,"session_id":"session-1","action":"session.authorized","outcome":"allowed","peer_device_id":"device-1"}}),
         ]
@@ -733,5 +760,177 @@ mod tests {
             let response = dispatch_request(&server, request).await;
             assert!(matches!(response, IpcResponse::Error { .. }));
         }
+    }
+
+    #[tokio::test]
+    async fn task18_secure_remote_handlers_are_reachable() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        assert!(matches!(
+            dispatch_request(
+                &server,
+                IpcRequest::GetRemoteSession {
+                    session_id: mrd_proto::SessionId("missing".to_string()),
+                },
+            )
+            .await,
+            IpcResponse::Error { .. }
+        ));
+        assert!(matches!(
+            dispatch_request(
+                &server,
+                IpcRequest::SubscribeSessionEvents {
+                    query: mrd_ipc::SessionEventSubscriptionQuery {
+                        session_id: None,
+                        after_sequence: None,
+                        limit: 16,
+                        wait_timeout_ms: 0,
+                    },
+                },
+            )
+            .await,
+            IpcResponse::SessionEventsSubscribed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unattended_enrollment_and_rotation_fail_closed_until_task40() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state);
+
+        let enabled = dispatch_request(
+            &server,
+            IpcRequest::EnableUnattendedAccess {
+                policy: mrd_ipc::UnattendedAccessPolicy {
+                    trusted_devices_only: true,
+                    allowed_peer_key_ids: vec!["sha256:peer".to_string()],
+                    permission_ceiling: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    expires_at_ms: None,
+                },
+            },
+        )
+        .await;
+        let IpcResponse::RemoteAccessError { failure, .. } = enabled else {
+            panic!("unattended enrollment must fail closed, got {enabled:?}");
+        };
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(failure.message.contains("enrollment"));
+
+        let rotated = dispatch_request(
+            &server,
+            IpcRequest::RotateUnattendedAccess {
+                expected_policy_revision: DecimalU64::new(1),
+            },
+        )
+        .await;
+        let IpcResponse::RemoteAccessError { failure, .. } = rotated else {
+            panic!("unattended rotation must fail closed, got {rotated:?}");
+        };
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(failure.message.contains("enrollment"));
+
+        let disabled = dispatch_request(
+            &server,
+            IpcRequest::DisableUnattendedAccess {
+                expected_policy_revision: DecimalU64::new(1),
+            },
+        )
+        .await;
+        let IpcResponse::UnattendedAccessUpdated { access } = disabled else {
+            panic!("failed enable must leave the default policy disable-able, got {disabled:?}");
+        };
+        assert!(!access.enabled);
+    }
+
+    #[tokio::test]
+    async fn unattended_session_request_fails_before_lan_request_without_enrollment() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("unattended-without-enrollment".to_string());
+
+        let response = dispatch_request(
+            &server,
+            IpcRequest::RequestRemoteSession {
+                request: mrd_ipc::RemoteSessionRequest {
+                    session_id: session_id.clone(),
+                    target_device_id: DeviceId("missing-target".to_string()),
+                    access_mode: RemoteAccessMode::Unattended,
+                    requested_scopes: vec![RemotePermissionScope::ScreenView],
+                    requested_profile: None,
+                },
+            },
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: response_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("unattended request must fail closed, got {response:?}");
+        };
+        assert_eq!(response_session_id, Some(session_id.clone()));
+        assert_eq!(peer_key_id, None);
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(failure.message.contains("enrollment"));
+        assert!(app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .is_none());
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn secure_session_control_input_requires_control_envelope_v2() {
+        let app_state = Arc::new(AppState::new());
+        let server = IpcServer::new(app_state.clone());
+        let session_id = SessionId("secure-control-input".to_string());
+        app_state
+            .session_authorizations
+            .begin_verified_incoming(VerifiedIncomingAuthorizationRequest {
+                session_id: session_id.clone(),
+                peer_device_id: DeviceId("controller-device".to_string()),
+                peer_key_id: "sha256:controller-key".to_string(),
+                peer_key_epoch: 1,
+                access_mode: RemoteAccessMode::Attended,
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                peer_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                machine_permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                runtime_capabilities: vec![RemotePermissionScope::ScreenView],
+                transport_kind: "quic".to_string(),
+                request_nonce: [7; 16],
+                created_at_ms: 1,
+                expires_at_ms: u64::MAX,
+            })
+            .await
+            .expect("create secure session projection");
+
+        let response = dispatch_request(
+            &server,
+            IpcRequest::SendControlInput {
+                session_id: session_id.clone(),
+                event: mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            },
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: response_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("secure control input must fail closed, got {response:?}");
+        };
+        assert_eq!(response_session_id, Some(session_id));
+        assert_eq!(peer_key_id.as_deref(), Some("sha256:controller-key"));
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(failure.message.contains("ControlEnvelopeV2"));
     }
 }

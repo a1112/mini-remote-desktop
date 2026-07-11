@@ -1,12 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 const REMOTE_POWER_ACTIONS_ENABLED_ENV: &str = "MRD_ENABLE_REMOTE_POWER_ACTIONS";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemotePowerCommand {
-    program: String,
-    args: Vec<String>,
-}
 
 pub(super) fn accept_lan_remote_device_power_action(
     action: &mrd_ipc::RemoteDevicePowerAction,
@@ -14,10 +8,12 @@ pub(super) fn accept_lan_remote_device_power_action(
     accept_lan_remote_device_power_action_with_runner(
         action,
         |key| std::env::var(key).ok(),
-        run_remote_power_command,
+        || anyhow::bail!("legacy unsigned remote power execution is disabled"),
     )
 }
 
+// Keep the historic environment and runner inputs at this seam so tests prove
+// that neither can authorize or execute an unauthenticated v1 packet.
 fn accept_lan_remote_device_power_action_with_runner<E, R>(
     action: &mrd_ipc::RemoteDevicePowerAction,
     env_lookup: E,
@@ -25,27 +21,19 @@ fn accept_lan_remote_device_power_action_with_runner<E, R>(
 ) -> Result<()>
 where
     E: Fn(&str) -> Option<String>,
-    R: FnMut(&RemotePowerCommand) -> Result<()>,
+    R: FnMut() -> Result<()>,
 {
-    if !remote_power_actions_enabled(env_lookup) {
-        let action_label = remote_power_action_label(action);
-        anyhow::bail!("remote power executor is not enabled on this peer for {action_label}");
-    }
-    let command = platform_remote_power_command(action);
-    runner(&command)
+    let _legacy_opt_in = env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV);
+    let _ = &mut runner;
+    reject_legacy_unsigned_remote_power_action(action)
 }
 
-fn remote_power_actions_enabled<E>(env_lookup: E) -> bool
-where
-    E: Fn(&str) -> Option<String>,
-{
-    matches!(
-        env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV)
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
+fn reject_legacy_unsigned_remote_power_action(
+    action: &mrd_ipc::RemoteDevicePowerAction,
+) -> Result<()> {
+    let action_label = remote_power_action_label(action);
+    anyhow::bail!(
+        "legacy unsigned remote power action '{action_label}' is disabled; signed authorization is required"
     )
 }
 
@@ -54,44 +42,6 @@ fn remote_power_action_label(action: &mrd_ipc::RemoteDevicePowerAction) -> &'sta
         mrd_ipc::RemoteDevicePowerAction::Restart => "restart",
         mrd_ipc::RemoteDevicePowerAction::Shutdown => "shutdown",
     }
-}
-
-#[cfg(windows)]
-fn platform_remote_power_command(action: &mrd_ipc::RemoteDevicePowerAction) -> RemotePowerCommand {
-    let mode = match action {
-        mrd_ipc::RemoteDevicePowerAction::Restart => "/r",
-        mrd_ipc::RemoteDevicePowerAction::Shutdown => "/s",
-    };
-    RemotePowerCommand {
-        program: "shutdown.exe".to_string(),
-        args: vec![mode.to_string(), "/t".to_string(), "0".to_string()],
-    }
-}
-
-#[cfg(not(windows))]
-fn platform_remote_power_command(action: &mrd_ipc::RemoteDevicePowerAction) -> RemotePowerCommand {
-    let mode = match action {
-        mrd_ipc::RemoteDevicePowerAction::Restart => "-r",
-        mrd_ipc::RemoteDevicePowerAction::Shutdown => "-h",
-    };
-    RemotePowerCommand {
-        program: "shutdown".to_string(),
-        args: vec![mode.to_string(), "now".to_string()],
-    }
-}
-
-fn run_remote_power_command(command: &RemotePowerCommand) -> Result<()> {
-    std::process::Command::new(&command.program)
-        .args(&command.args)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn remote power command {} {}",
-                command.program,
-                command.args.join(" ")
-            )
-        })?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -104,21 +54,22 @@ mod tests {
         let error = accept_lan_remote_device_power_action_with_runner(
             &mrd_ipc::RemoteDevicePowerAction::Restart,
             |_| None,
-            |_| {
+            || {
                 invoked = true;
                 Ok(())
             },
         )
-        .expect_err("remote power must be opt-in");
+        .expect_err("unsigned remote power must be rejected");
 
         assert!(!invoked);
-        assert!(error.to_string().contains("not enabled"));
+        assert!(error.to_string().contains("legacy unsigned"));
+        assert!(error.to_string().contains("signed authorization"));
     }
 
     #[test]
-    fn remote_power_executor_invokes_platform_command_when_enabled() {
-        let mut commands = Vec::new();
-        accept_lan_remote_device_power_action_with_runner(
+    fn remote_power_executor_rejects_even_when_legacy_env_is_enabled() {
+        let mut invoked = false;
+        let error = accept_lan_remote_device_power_action_with_runner(
             &mrd_ipc::RemoteDevicePowerAction::Shutdown,
             |key| {
                 if key == REMOTE_POWER_ACTIONS_ENABLED_ENV {
@@ -127,18 +78,15 @@ mod tests {
                     None
                 }
             },
-            |command| {
-                commands.push(command.clone());
+            || {
+                invoked = true;
                 Ok(())
             },
         )
-        .expect("enabled remote power executor");
+        .expect_err("an environment switch must not authorize an unsigned LAN power action");
 
-        assert_eq!(
-            commands,
-            vec![platform_remote_power_command(
-                &mrd_ipc::RemoteDevicePowerAction::Shutdown
-            )]
-        );
+        assert!(!invoked);
+        assert!(error.to_string().contains("legacy unsigned"));
+        assert!(error.to_string().contains("signed authorization"));
     }
 }

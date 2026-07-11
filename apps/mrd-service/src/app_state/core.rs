@@ -40,6 +40,10 @@ pub struct AppState {
     pub audit_log: Arc<AuditLogRegistry>,
     /// Service-owned device pairing and identity state.
     pub device_identities: Arc<DeviceIdentityRegistry>,
+    /// Authoritative authorization, consent, grant, and event state.
+    pub session_authorizations: Arc<crate::session_authorization::SessionAuthorizationRegistry>,
+    /// Serializes trust/policy transitions with authorization grant issuance.
+    pub authorization_security_gate: Arc<Mutex<()>>,
     /// Latched health of the authoritative security store.
     security_healthy: Arc<AtomicBool>,
     /// Service-owned device preference flags.
@@ -151,6 +155,10 @@ impl AppState {
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             audit_log: Arc::new(audit_log),
             device_identities: Arc::new(device_identities),
+            session_authorizations: Arc::new(
+                crate::session_authorization::SessionAuthorizationRegistry::default(),
+            ),
+            authorization_security_gate: Arc::new(Mutex::new(())),
             security_healthy: Arc::new(AtomicBool::new(true)),
             device_preferences: Arc::new(Mutex::new(DevicePreferenceRegistry::default())),
             shell: Arc::new(Mutex::new(ShellState::default())),
