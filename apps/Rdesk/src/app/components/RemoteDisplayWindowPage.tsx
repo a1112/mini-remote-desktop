@@ -1525,17 +1525,38 @@ function resolutionDimensions(resolution: ResolutionKey): { width: number; heigh
   return { width, height };
 }
 
-function keyboardMouseControlAvailable(
+export function keyboardMouseControlAvailable(
   capabilities: EnvironmentSnapshot | null,
   sessionSnapshot: SessionRuntimeSnapshot | null,
   isLocalPipelinePreview: boolean,
-  peerInputControlAvailable: boolean
+  peerInputControlAvailable: boolean,
+  authorizationSnapshot: RemoteSessionSnapshot | null,
+  requiredScope: "input.pointer" | "input.keyboard"
 ): boolean {
   if (isLocalPipelinePreview) {
-    return capabilities?.available_controls?.includes("keyboard_mouse") ?? false;
+    return (
+      isTauriRuntime() &&
+      (capabilities?.available_controls?.includes("keyboard_mouse") ?? false)
+    );
   }
+  if (!isTauriRuntime()) return false;
   if (sessionSnapshot?.role && sessionSnapshot.role !== "controller") return false;
   if (sessionSnapshot?.state !== "streaming" || sessionSnapshot.receiver_active !== true) {
+    return false;
+  }
+  if (
+    authorizationSnapshot?.role !== "controller" ||
+    authorizationSnapshot.authorization_state !== "granted" ||
+    authorizationSnapshot.route_state !== "connected" ||
+    authorizationSnapshot.media_state !== "streaming" ||
+    authorizationSnapshot.presentation_state !== "streaming" ||
+    !authorizationSnapshot.granted_scopes.includes("screen.view") ||
+    !authorizationSnapshot.granted_scopes.includes(requiredScope)
+  ) {
+    return false;
+  }
+  const expiresAt = authorizationSnapshot.authorization_expires_at_ms;
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || Date.now() > expiresAt) {
     return false;
   }
   return peerInputControlAvailable;
@@ -1588,7 +1609,11 @@ function peerKeyboardMouseControlAvailable(
 ): boolean {
   if (!peerDeviceId) return false;
   const peer = lanDiscovery?.peers.find((peer) => peer.device_id === peerDeviceId);
-  return peer?.media_capabilities?.includes("control.keyboard_mouse") ?? false;
+  return Boolean(
+    peer?.p2p_available &&
+      peer.transports.includes("input_control_v2") &&
+      peer.media_capabilities?.includes("control.keyboard_mouse")
+  );
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -2368,6 +2393,8 @@ export function RemoteDisplayWindowPage() {
     useState<SessionRuntimeSnapshot | null>(null);
   const [remoteAuthorizationError, setRemoteAuthorizationError] =
     useState<string | null>(null);
+  const [remoteAuthorizationSnapshot, setRemoteAuthorizationSnapshot] =
+    useState<RemoteSessionSnapshot | null>(null);
   const [peerInputControlAvailable, setPeerInputControlAvailable] = useState(false);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
   const [mediaPipelineSnapshot, setMediaPipelineSnapshot] =
@@ -2886,16 +2913,23 @@ export function RemoteDisplayWindowPage() {
     sessionSnapshot?.state,
   ]);
 
-  // Task 18 authorizes screen viewing only. Network input remains unavailable
-  // until Task 19 introduces authenticated control envelopes end to end.
-  const controlInputEnabled =
-    isLocalPipelinePreview &&
-    keyboardMouseControlAvailable(
-      capabilities,
-      sessionSnapshot,
-      isLocalPipelinePreview,
-      peerInputControlAvailable
-    );
+  const pointerControlEnabled = keyboardMouseControlAvailable(
+    capabilities,
+    sessionSnapshot,
+    isLocalPipelinePreview,
+    peerInputControlAvailable,
+    remoteAuthorizationSnapshot,
+    "input.pointer"
+  );
+  const keyboardControlEnabled = keyboardMouseControlAvailable(
+    capabilities,
+    sessionSnapshot,
+    isLocalPipelinePreview,
+    peerInputControlAvailable,
+    remoteAuthorizationSnapshot,
+    "input.keyboard"
+  );
+  const controlInputEnabled = pointerControlEnabled || keyboardControlEnabled;
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
   const remoteProbeTarget =
     probeSnapshot?.media_probe_width &&
@@ -3303,7 +3337,13 @@ export function RemoteDisplayWindowPage() {
 
   const sendControlInputEvent = useCallback(
     (event: ControlInputEvent) => {
-      if (!controlInputEnabled) return;
+      const allowed =
+        event.kind === "key"
+          ? keyboardControlEnabled
+          : event.kind === "release_all"
+            ? controlInputEnabled
+            : pointerControlEnabled;
+      if (!allowed) return;
       void ipcSendControlInput(sessionId, event).then((result) => {
         if (result.ok) {
           setLastError(null);
@@ -3312,7 +3352,7 @@ export function RemoteDisplayWindowPage() {
         }
       });
     },
-    [controlInputEnabled, sessionId]
+    [controlInputEnabled, keyboardControlEnabled, pointerControlEnabled, sessionId]
   );
 
   const releaseRemoteControlInput = useCallback(() => {
@@ -3352,18 +3392,18 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemotePointerMove = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       const point = controlPointFromPointerEvent(event);
       if (!point) return;
       event.preventDefault();
       sendRemotePointerMoveIfNeeded(point);
     },
-    [controlInputEnabled, controlPointFromPointerEvent, sendRemotePointerMoveIfNeeded]
+    [pointerControlEnabled, controlPointFromPointerEvent, sendRemotePointerMoveIfNeeded]
   );
 
   const handleRemotePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
       const point = controlPointFromPointerEvent(event);
@@ -3380,7 +3420,7 @@ export function RemoteDisplayWindowPage() {
       });
     },
     [
-      controlInputEnabled,
+      pointerControlEnabled,
       controlPointFromPointerEvent,
       sendControlInputEvent,
       sendRemotePointerMoveIfNeeded,
@@ -3389,7 +3429,7 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemotePointerUp = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       const button = mapPointerButton(event.button);
       if (!button) return;
       const hadActivePointer = activeRemotePointerIdsRef.current.has(event.pointerId);
@@ -3406,7 +3446,7 @@ export function RemoteDisplayWindowPage() {
       });
     },
     [
-      controlInputEnabled,
+      pointerControlEnabled,
       controlPointFromPointerEvent,
       sendControlInputEvent,
       sendRemotePointerMoveIfNeeded,
@@ -3415,33 +3455,33 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemotePointerCancel = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       event.preventDefault();
       releaseRemoteControlInput();
     },
-    [controlInputEnabled, releaseRemoteControlInput]
+    [pointerControlEnabled, releaseRemoteControlInput]
   );
 
   const handleRemoteLostPointerCapture = useCallback(
     (_event: ReactPointerEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled || activeRemotePointerIdsRef.current.size === 0) return;
+      if (!pointerControlEnabled || activeRemotePointerIdsRef.current.size === 0) return;
       releaseRemoteControlInput();
     },
-    [controlInputEnabled, releaseRemoteControlInput]
+    [pointerControlEnabled, releaseRemoteControlInput]
   );
 
   const handleRemoteContextMenu = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       event.preventDefault();
       releaseRemoteControlInput();
     },
-    [controlInputEnabled, releaseRemoteControlInput]
+    [pointerControlEnabled, releaseRemoteControlInput]
   );
 
   const handleRemoteWheel = useCallback(
     (event: ReactWheelEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!pointerControlEnabled) return;
       const verticalDelta = Math.trunc(-event.deltaY);
       const horizontalDelta = Math.trunc(-event.deltaX);
       if (verticalDelta === 0 && horizontalDelta === 0) return;
@@ -3459,7 +3499,7 @@ export function RemoteDisplayWindowPage() {
       }
     },
     [
-      controlInputEnabled,
+      pointerControlEnabled,
       controlPointFromClientPoint,
       sendControlInputEvent,
       sendRemotePointerMoveIfNeeded,
@@ -3468,7 +3508,7 @@ export function RemoteDisplayWindowPage() {
 
   const handleRemoteKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled || event.repeat) return;
+      if (!keyboardControlEnabled || event.repeat) return;
       const code = virtualKeyFromKeyboardEvent(event);
       if (code === null) return;
       event.preventDefault();
@@ -3478,12 +3518,12 @@ export function RemoteDisplayWindowPage() {
         pressed: true,
       });
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [keyboardControlEnabled, sendControlInputEvent]
   );
 
   const handleRemoteKeyUp = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (!controlInputEnabled) return;
+      if (!keyboardControlEnabled) return;
       const code = virtualKeyFromKeyboardEvent(event);
       if (code === null) return;
       event.preventDefault();
@@ -3493,7 +3533,7 @@ export function RemoteDisplayWindowPage() {
         pressed: false,
       });
     },
-    [controlInputEnabled, sendControlInputEvent]
+    [keyboardControlEnabled, sendControlInputEvent]
   );
 
   const handleRemoteBlur = useCallback(
@@ -3981,6 +4021,8 @@ export function RemoteDisplayWindowPage() {
     const payload = {
       enabled,
       visible,
+      pointerControlEnabled,
+      keyboardControlEnabled,
       rect: {
         x: Math.round(rect.left * scale),
         y: Math.round(rect.top * scale),
@@ -4024,6 +4066,8 @@ export function RemoteDisplayWindowPage() {
     isNative,
     nativeRenderAvailable,
     nativeRendererType,
+    pointerControlEnabled,
+    keyboardControlEnabled,
     remoteInputFrameSize,
     testSettingsOpen,
   ]);
@@ -5058,12 +5102,14 @@ export function RemoteDisplayWindowPage() {
 
         if (authorizationResult) {
           if (!authorizationResult.ok) {
+            setRemoteAuthorizationSnapshot(null);
             const code = authorizationResult.error.code ?? "unknown";
             const message = `远程会话授权状态刷新失败（${code}）：${authorizationResult.error.message}`;
             setRemoteAuthorizationError(message);
             setTestStatus("failed");
             setTestMessage(message);
           } else {
+            setRemoteAuthorizationSnapshot(authorizationResult.value);
             const authorizationFailure = remoteAuthorizationFailureMessage(
               authorizationResult.value
             );
@@ -5076,6 +5122,8 @@ export function RemoteDisplayWindowPage() {
         }
       } catch (error) {
         if (cancelled) return;
+        setRemoteAuthorizationSnapshot(null);
+        setPeerInputControlAvailable(false);
         const message = error instanceof Error ? error.message : String(error);
         setLastError(message);
         setTestMessage(message);
@@ -5224,11 +5272,14 @@ export function RemoteDisplayWindowPage() {
         if (result.error.code === "E_REMOTE_SESSION_NOT_FOUND") {
           // Explicit compatibility for sessions created before the secure LAN contract.
           // Legacy sessions may display media, but never gain control-input readiness.
+          secureAuthorizationSessionRef.current = null;
+          setRemoteAuthorizationSnapshot(null);
           setRemoteAuthorizationError(null);
           return "legacy";
         }
 
         const code = result.error.code ?? "unknown";
+        setRemoteAuthorizationSnapshot(null);
         const message = `远程会话授权检查失败（${code}）：${result.error.message}`;
         setRemoteAuthorizationError(message);
         setTestStatus("failed");
@@ -5237,6 +5288,7 @@ export function RemoteDisplayWindowPage() {
       }
 
       secureAuthorizationSessionRef.current = sessionId;
+      setRemoteAuthorizationSnapshot(result.value);
       const failure = remoteAuthorizationFailureMessage(result.value);
       if (!failure) {
         setRemoteAuthorizationError(null);

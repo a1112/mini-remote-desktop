@@ -1,12 +1,10 @@
-use mrd_input::{
-    InputButton, InputError, InputEvent, InputInjector, InputKey, TrackedInputInjector,
-};
+use mrd_input::{InputButton, InputError, InputEvent, InputInjector, InputKey};
 use mrd_ipc::{
     ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
     ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
 };
 use mrd_proto::SessionId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlInputResult {
@@ -35,11 +33,26 @@ struct ControlLaneCounters {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlInputScope {
+    Pointer,
+    Keyboard,
+}
+
+#[derive(Debug, Default)]
+struct SessionPressedInput {
+    buttons: HashSet<InputButton>,
+    keys: HashSet<InputKey>,
+}
+
 pub struct ControlInputRegistry {
-    injector: TrackedInputInjector<Box<dyn InputInjector>>,
+    injector: Box<dyn InputInjector>,
     reliable: ControlLaneCounters,
     realtime: ControlLaneCounters,
     last_realtime_mouse_move_by_session: HashMap<SessionId, (i32, i32)>,
+    pressed_by_session: HashMap<SessionId, SessionPressedInput>,
+    button_holder_counts: HashMap<InputButton, usize>,
+    key_holder_counts: HashMap<InputKey, usize>,
 }
 
 impl ControlInputRegistry {
@@ -61,10 +74,13 @@ impl ControlInputRegistry {
         I: InputInjector + 'static,
     {
         Self {
-            injector: TrackedInputInjector::new(Box::new(injector)),
+            injector: Box::new(injector),
             reliable: ControlLaneCounters::default(),
             realtime: ControlLaneCounters::default(),
             last_realtime_mouse_move_by_session: HashMap::new(),
+            pressed_by_session: HashMap::new(),
+            button_holder_counts: HashMap::new(),
+            key_holder_counts: HashMap::new(),
         }
     }
 
@@ -77,7 +93,7 @@ impl ControlInputRegistry {
         &mut self,
         event: &ControlInputEvent,
     ) -> Result<ControlInputResult, InputError> {
-        self.handle_event_inner(None, event)
+        self.handle_event_inner(None, event, None)
     }
 
     pub fn handle_session_event(
@@ -85,13 +101,23 @@ impl ControlInputRegistry {
         session_id: &SessionId,
         event: &ControlInputEvent,
     ) -> Result<ControlInputResult, InputError> {
-        self.handle_event_inner(Some(session_id), event)
+        self.handle_event_inner(Some(session_id), event, None)
+    }
+
+    pub(crate) fn handle_authenticated_session_event(
+        &mut self,
+        session_id: &SessionId,
+        scope: ControlInputScope,
+        event: &ControlInputEvent,
+    ) -> Result<ControlInputResult, InputError> {
+        self.handle_event_inner(Some(session_id), event, Some(scope))
     }
 
     fn handle_event_inner(
         &mut self,
         session_id: Option<&SessionId>,
         event: &ControlInputEvent,
+        release_scope: Option<ControlInputScope>,
     ) -> Result<ControlInputResult, InputError> {
         let lane = input_lane(event);
         counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).accepted_messages += 1;
@@ -105,19 +131,22 @@ impl ControlInputRegistry {
             });
         }
 
-        let result: Result<u32, InputError> = match event {
-            ControlInputEvent::ReleaseAll => self
-                .injector
-                .release_all()
-                .map(|released| released.len() as u32),
-            event => input_event_from_ipc(event)
+        let result: Result<u32, InputError> = match (session_id, event) {
+            (Some(session_id), ControlInputEvent::ReleaseAll) => match release_scope {
+                Some(scope) => self.release_session_scope(session_id, scope),
+                None => self.release_session_all(session_id),
+            },
+            (None, ControlInputEvent::ReleaseAll) => Ok(0),
+            (Some(session_id), event) => input_event_from_ipc(event)
+                .and_then(|input| self.inject_session_input(session_id, input)),
+            (None, event) => input_event_from_ipc(event)
                 .and_then(|input| self.injector.inject(&input))
                 .map(|()| 1),
         };
 
         match result {
             Ok(event_count) => {
-                self.record_successful_realtime_event(session_id, event);
+                self.record_successful_realtime_event(session_id, event, release_scope);
                 let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
                 counter.injected_messages += u64::from(event_count);
                 counter.last_error = None;
@@ -153,6 +182,7 @@ impl ControlInputRegistry {
         &mut self,
         session_id: Option<&SessionId>,
         event: &ControlInputEvent,
+        release_scope: Option<ControlInputScope>,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -162,10 +192,189 @@ impl ControlInputRegistry {
                 self.last_realtime_mouse_move_by_session
                     .insert(session_id.clone(), (x, y));
             }
-            ControlInputEvent::ReleaseAll => {
+            ControlInputEvent::ReleaseAll
+                if release_scope.is_none() || release_scope == Some(ControlInputScope::Pointer) =>
+            {
                 self.last_realtime_mouse_move_by_session.remove(session_id);
             }
             _ => {}
+        }
+    }
+
+    fn inject_session_input(
+        &mut self,
+        session_id: &SessionId,
+        event: InputEvent,
+    ) -> Result<u32, InputError> {
+        match event {
+            InputEvent::MouseButton { button, pressed } => {
+                self.transition_session_button(session_id, button, pressed)
+            }
+            InputEvent::Key { key, pressed } => {
+                self.transition_session_key(session_id, key, pressed)
+            }
+            event => self.injector.inject(&event).map(|()| 1),
+        }
+    }
+
+    fn transition_session_button(
+        &mut self,
+        session_id: &SessionId,
+        button: InputButton,
+        pressed: bool,
+    ) -> Result<u32, InputError> {
+        let held_by_session = self
+            .pressed_by_session
+            .get(session_id)
+            .is_some_and(|state| state.buttons.contains(&button));
+        if pressed == held_by_session {
+            return Ok(0);
+        }
+        let holders = self.button_holder_counts.get(&button).copied().unwrap_or(0);
+        let physical_transition = (pressed && holders == 0) || (!pressed && holders == 1);
+        if physical_transition {
+            self.injector
+                .inject(&InputEvent::MouseButton { button, pressed })?;
+        }
+        if pressed {
+            self.pressed_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .buttons
+                .insert(button);
+            self.button_holder_counts.insert(button, holders + 1);
+        } else {
+            if let Some(state) = self.pressed_by_session.get_mut(session_id) {
+                state.buttons.remove(&button);
+            }
+            if holders <= 1 {
+                self.button_holder_counts.remove(&button);
+            } else {
+                self.button_holder_counts.insert(button, holders - 1);
+            }
+            self.remove_empty_session_state(session_id);
+        }
+        Ok(u32::from(physical_transition))
+    }
+
+    fn transition_session_key(
+        &mut self,
+        session_id: &SessionId,
+        key: InputKey,
+        pressed: bool,
+    ) -> Result<u32, InputError> {
+        let held_by_session = self
+            .pressed_by_session
+            .get(session_id)
+            .is_some_and(|state| state.keys.contains(&key));
+        if pressed == held_by_session {
+            return Ok(0);
+        }
+        let holders = self.key_holder_counts.get(&key).copied().unwrap_or(0);
+        let physical_transition = (pressed && holders == 0) || (!pressed && holders == 1);
+        if physical_transition {
+            self.injector.inject(&InputEvent::Key { key, pressed })?;
+        }
+        if pressed {
+            self.pressed_by_session
+                .entry(session_id.clone())
+                .or_default()
+                .keys
+                .insert(key);
+            self.key_holder_counts.insert(key, holders + 1);
+        } else {
+            if let Some(state) = self.pressed_by_session.get_mut(session_id) {
+                state.keys.remove(&key);
+            }
+            if holders <= 1 {
+                self.key_holder_counts.remove(&key);
+            } else {
+                self.key_holder_counts.insert(key, holders - 1);
+            }
+            self.remove_empty_session_state(session_id);
+        }
+        Ok(u32::from(physical_transition))
+    }
+
+    pub(crate) fn release_session_scope(
+        &mut self,
+        session_id: &SessionId,
+        scope: ControlInputScope,
+    ) -> Result<u32, InputError> {
+        if scope == ControlInputScope::Pointer {
+            self.last_realtime_mouse_move_by_session.remove(session_id);
+        }
+        let Some(state) = self.pressed_by_session.get(session_id) else {
+            return Ok(0);
+        };
+        let buttons = (scope == ControlInputScope::Pointer)
+            .then(|| state.buttons.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let keys = (scope == ControlInputScope::Keyboard)
+            .then(|| state.keys.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut released = 0_u32;
+        for button in buttons {
+            released =
+                released.saturating_add(self.transition_session_button(session_id, button, false)?);
+        }
+        for key in keys {
+            released =
+                released.saturating_add(self.transition_session_key(session_id, key, false)?);
+        }
+        Ok(released)
+    }
+
+    pub(crate) fn release_session_all(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<u32, InputError> {
+        let pointer = self.release_session_scope(session_id, ControlInputScope::Pointer)?;
+        let keyboard = self.release_session_scope(session_id, ControlInputScope::Keyboard)?;
+        Ok(pointer.saturating_add(keyboard))
+    }
+
+    pub(crate) fn release_all_sessions(&mut self) -> Result<u32, InputError> {
+        let mut pending = self
+            .pressed_by_session
+            .keys()
+            .chain(self.last_realtime_mouse_move_by_session.keys())
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut released = 0_u32;
+        let mut last_error = None;
+        for _ in 0..3 {
+            let mut retry = Vec::new();
+            for session_id in pending {
+                match self.release_session_all(&session_id) {
+                    Ok(count) => released = released.saturating_add(count),
+                    Err(error) => {
+                        last_error = Some(error);
+                        retry.push(session_id);
+                    }
+                }
+            }
+            if retry.is_empty() {
+                return Ok(released);
+            }
+            pending = retry;
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(released),
+        }
+    }
+
+    fn remove_empty_session_state(&mut self, session_id: &SessionId) {
+        if self
+            .pressed_by_session
+            .get(session_id)
+            .is_some_and(|state| state.buttons.is_empty() && state.keys.is_empty())
+        {
+            self.pressed_by_session.remove(session_id);
         }
     }
 
@@ -325,6 +534,26 @@ fn input_key_from_ipc(key: ControlInputKey) -> InputKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Clone)]
+    struct SharedRecordingInputInjector {
+        events: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InputInjector for SharedRecordingInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event);
+            Ok(())
+        }
+    }
 
     struct FailsOnceInputInjector {
         error_message: String,
@@ -427,6 +656,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_release_clears_session_mouse_move_coalescing_state() {
+        let mut registry =
+            ControlInputRegistry::with_injector(mrd_input::RecordingInputInjector::available());
+        let session_id = SessionId("reused-control-session".to_string());
+        let move_event = ControlInputEvent::MouseMove { x: 10, y: 20 };
+
+        registry
+            .handle_session_event(&session_id, &move_event)
+            .expect("initial mouse move");
+        registry
+            .release_session_all(&session_id)
+            .expect("terminal session release");
+        let reused = registry
+            .handle_session_event(&session_id, &move_event)
+            .expect("same coordinate after session reuse");
+
+        assert_eq!(reused.event_count, 1);
+    }
+
+    #[test]
     fn key_uses_reliable_lane() {
         assert_eq!(
             input_lane(&ControlInputEvent::Key {
@@ -526,6 +775,121 @@ mod tests {
                 }),
             ),
             event
+        );
+    }
+
+    #[test]
+    fn authenticated_release_is_scoped_to_pointer_or_keyboard() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = ControlInputRegistry::with_injector(SharedRecordingInputInjector {
+            events: events.clone(),
+        });
+        let session_id = SessionId("scoped-release".to_string());
+        registry
+            .handle_session_event(
+                &session_id,
+                &ControlInputEvent::MouseButton {
+                    button: ControlInputButton::Left,
+                    pressed: true,
+                },
+            )
+            .expect("button down");
+        registry
+            .handle_session_event(
+                &session_id,
+                &ControlInputEvent::Key {
+                    key: ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
+            .expect("key down");
+
+        registry
+            .release_session_scope(&session_id, ControlInputScope::Pointer)
+            .expect("release pointer scope");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                InputEvent::MouseButton {
+                    button: InputButton::Left,
+                    pressed: true,
+                },
+                InputEvent::Key {
+                    key: InputKey::VirtualKey(0x41),
+                    pressed: true,
+                },
+                InputEvent::MouseButton {
+                    button: InputButton::Left,
+                    pressed: false,
+                },
+            ]
+        );
+
+        registry
+            .release_session_scope(&session_id, ControlInputScope::Keyboard)
+            .expect("release keyboard scope");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .last(),
+            Some(&InputEvent::Key {
+                key: InputKey::VirtualKey(0x41),
+                pressed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn shared_pressed_key_is_released_only_after_last_session_releases_it() {
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = ControlInputRegistry::with_injector(SharedRecordingInputInjector {
+            events: events.clone(),
+        });
+        let first = SessionId("first-holder".to_string());
+        let second = SessionId("second-holder".to_string());
+        let key_down = ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        };
+        registry
+            .handle_session_event(&first, &key_down)
+            .expect("first key down");
+        registry
+            .handle_session_event(&second, &key_down)
+            .expect("second key down");
+        registry
+            .release_session_scope(&first, ControlInputScope::Keyboard)
+            .expect("release first holder");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+
+        registry
+            .release_session_scope(&second, ControlInputScope::Keyboard)
+            .expect("release final holder");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                InputEvent::Key {
+                    key: InputKey::VirtualKey(0x41),
+                    pressed: true,
+                },
+                InputEvent::Key {
+                    key: InputKey::VirtualKey(0x41),
+                    pressed: false,
+                },
+            ]
         );
     }
 }

@@ -6,27 +6,35 @@
 
 #![warn(missing_docs)]
 
-/// Multi-session scheduling and resource isolation.
-pub mod scheduler;
 /// Authorization state for a session.
 pub mod authorization;
-/// Permission scope algebra and effective capability intersection.
-pub mod permissions;
+/// Authenticated, grant-bound remote-control envelopes and replay tracking.
+pub mod control_envelope;
 /// Session-bound capability grants.
 pub mod grant;
 /// Media state for a session.
 pub mod media;
+/// Permission scope algebra and effective capability intersection.
+pub mod permissions;
 /// Service-owned remote session aggregate.
 pub mod remote_session;
 /// Route state for a session.
 pub mod route;
+/// Multi-session scheduling and resource isolation.
+pub mod scheduler;
 
 pub use authorization::AuthorizationState;
+pub use control_envelope::{
+    ControlEnvelopeError, ControlEnvelopeV2, ControlSequenceDecision, ControlSequenceError,
+    ControlSequenceWindow, SignedControlEnvelopeV2, CONTROL_ENVELOPE_MAX_CLOCK_SKEW_MS,
+    CONTROL_ENVELOPE_MAX_EVENT_BYTES, CONTROL_ENVELOPE_MAX_LIFETIME_MS,
+    CONTROL_ENVELOPE_MAX_WIRE_BYTES, CONTROL_ENVELOPE_SIGNATURE_CONTEXT, CONTROL_ENVELOPE_VERSION,
+};
+pub use grant::{GrantError, SessionGrant};
 pub use media::MediaState;
+pub use permissions::{EffectiveScopes, PermissionScope, PermissionScopes};
 pub use remote_session::{RemoteSessionAggregate, SessionTransitionError};
 pub use route::{RouteKind, RouteState};
-pub use grant::{GrantError, SessionGrant};
-pub use permissions::{EffectiveScopes, PermissionScope, PermissionScopes};
 
 use mrd_proto::{BackendRole, DeviceId, SessionId};
 use serde::{Deserialize, Serialize};

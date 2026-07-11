@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
+common-control-proto = { path = "../../common-control-proto" }
 mrd-application = { path = "../../crates/mrd-application" }
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
@@ -26,6 +27,7 @@ mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-proto = { path = "../../crates/mrd-proto" }
 mrd-render = { path = "../../crates/mrd-render" }
+mrd-session = { path = "../../crates/mrd-session" }
 mrd-store-sqlite = { path = "../../crates/mrd-store-sqlite" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
 mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc", optional = true }

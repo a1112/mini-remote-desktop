@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secure_session_control_input_requires_control_envelope_v2() {
+    async fn secure_session_control_input_requires_an_active_streaming_grant() {
         let app_state = Arc::new(AppState::new());
         let server = IpcServer::new(app_state.clone());
         let session_id = SessionId("secure-control-input".to_string());
@@ -930,7 +930,7 @@ mod tests {
         };
         assert_eq!(response_session_id, Some(session_id));
         assert_eq!(peer_key_id.as_deref(), Some("sha256:controller-key"));
-        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
-        assert!(failure.message.contains("ControlEnvelopeV2"));
+        assert_eq!(failure.code, RemoteReasonCode::PolicyChanged);
+        assert!(failure.message.contains("not granted"));
     }
 }

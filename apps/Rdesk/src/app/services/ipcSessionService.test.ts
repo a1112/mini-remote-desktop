@@ -19,7 +19,7 @@ describe("startLanRemoteSession", () => {
     });
   });
 
-  it("requests only screen.view during the Task18 attended authorization flow", async () => {
+  it("requests screen viewing and scoped authenticated input for attended control", async () => {
     const profile = {
       width: 1920,
       height: 1080,
@@ -41,7 +41,7 @@ describe("startLanRemoteSession", () => {
       session_id: "session-1",
       target_device_id: "target-1",
       access_mode: "attended",
-      requested_scopes: ["screen.view"],
+      requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: profile,
     });
   });

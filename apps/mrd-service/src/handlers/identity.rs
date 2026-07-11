@@ -211,7 +211,7 @@ async fn transition_trusted_device(
                 .session_authorizations
                 .revoke_peer_authorizations(&peer_key_id, now_unix_ms())
                 .await;
-            crate::lan_discovery::terminate_authorized_remote_sessions(
+            crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
                 app_state,
                 &revoked_session_ids,
             )

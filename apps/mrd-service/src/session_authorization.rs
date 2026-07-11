@@ -1,4 +1,4 @@
-use mrd_identity::UnattendedCredential;
+use mrd_identity::{public_key_id, UnattendedCredential};
 use mrd_ipc::{
     ConsentDecision, ConsentResponse, DecimalU64, RemoteAccessMode, RemoteAuthorizationState,
     RemoteCursorState, RemoteFailure, RemoteMediaState, RemotePermissionScope,
@@ -46,6 +46,7 @@ struct AuthorizationRecord {
     request: VerifiedIncomingAuthorizationRequest,
     snapshot: RemoteSessionSnapshot,
     grant: Option<VerifiedSessionGrant>,
+    peer_public_key: Option<[u8; 32]>,
     cancellation: watch::Sender<bool>,
 }
 
@@ -93,6 +94,7 @@ fn new_authorization_record(
         request,
         snapshot,
         grant: None,
+        peer_public_key: None,
         cancellation,
     }
 }
@@ -107,6 +109,19 @@ pub struct VerifiedSessionGrant {
     pub policy_revision: u64,
     pub route_constraint: String,
     pub transport_fingerprint_sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActiveControlAuthorization {
+    pub session_id: SessionId,
+    pub role: RemoteSessionRole,
+    pub peer_device_id: DeviceId,
+    pub peer_key_id: String,
+    pub peer_public_key: [u8; 32],
+    pub grant_id: [u8; 32],
+    pub granted_scopes: Vec<RemotePermissionScope>,
+    pub expires_at_ms: u64,
+    pub policy_revision: u64,
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +429,142 @@ impl SessionAuthorizationRegistry {
             .records
             .get(session_id)
             .and_then(|record| record.grant.clone())
+    }
+
+    pub async fn bind_authenticated_peer_key(
+        &self,
+        session_id: &SessionId,
+        peer_public_key: &[u8],
+        bound_at_ms: u64,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        let peer_public_key: [u8; 32] = peer_public_key.try_into().map_err(|_| {
+            failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated peer key has an invalid length",
+            )
+        })?;
+        let mut inner = self.inner.lock().await;
+        let Some(record) = inner.records.get_mut(session_id) else {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated peer key has no matching authorization request",
+            ));
+        };
+        if is_terminal_authorization_state(record.snapshot.authorization_state) {
+            return Err(record.snapshot.failure.clone().unwrap_or_else(|| {
+                failure(
+                    RemoteReasonCode::PolicyChanged,
+                    "terminal authorization cannot accept a peer key binding",
+                )
+            }));
+        }
+        if public_key_id(&peer_public_key) != record.request.peer_key_id {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authenticated peer key does not match the requested peer identity",
+            ));
+        }
+        if record
+            .peer_public_key
+            .is_some_and(|existing| existing != peer_public_key)
+        {
+            return Err(failure(
+                RemoteReasonCode::IdentityMismatch,
+                "authorization is already bound to a different peer key",
+            ));
+        }
+        record.peer_public_key = Some(peer_public_key);
+        record.snapshot.updated_at_ms = record.snapshot.updated_at_ms.max(bound_at_ms);
+        let snapshot = record.snapshot.clone();
+        drop(inner);
+        self.changed.notify_waiters();
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn active_control_authorization(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Result<ActiveControlAuthorization, RemoteFailure> {
+        let (expired, result) = {
+            let mut inner = self.inner.lock().await;
+            let expired = expire_grant_locked(&mut inner, session_id, now_ms);
+            let result = (|| {
+                let Some(record) = inner.records.get(session_id) else {
+                    return Err(failure(
+                        RemoteReasonCode::IdentityMismatch,
+                        "control input has no matching authorization",
+                    ));
+                };
+                if record.snapshot.authorization_state != RemoteAuthorizationState::Granted {
+                    return Err(record.snapshot.failure.clone().unwrap_or_else(|| {
+                        failure(
+                            RemoteReasonCode::PolicyChanged,
+                            "control input authorization is not granted",
+                        )
+                    }));
+                }
+                if record.snapshot.route_state != RemoteRouteState::Connected
+                    || record.snapshot.media_state != RemoteMediaState::Streaming
+                {
+                    return Err(failure(
+                        RemoteReasonCode::PolicyChanged,
+                        "control input requires a connected streaming session",
+                    ));
+                }
+                let Some(grant) = record.grant.as_ref() else {
+                    return Err(failure(
+                        RemoteReasonCode::PolicyChanged,
+                        "control input authorization has no verified grant",
+                    ));
+                };
+                if grant.session_id != *session_id
+                    || grant.issued_at_ms > now_ms
+                    || now_ms > grant.expires_at_ms
+                    || grant.policy_revision != record.snapshot.policy_revision.get()
+                    || grant.granted_scopes != record.snapshot.granted_scopes
+                {
+                    return Err(failure(
+                        RemoteReasonCode::PolicyChanged,
+                        "control input grant no longer matches the active session",
+                    ));
+                }
+                let Some(peer_public_key) = record.peer_public_key else {
+                    return Err(failure(
+                        RemoteReasonCode::IdentityMismatch,
+                        "control input peer key has not been authenticated",
+                    ));
+                };
+                if public_key_id(&peer_public_key) != record.request.peer_key_id {
+                    return Err(failure(
+                        RemoteReasonCode::IdentityMismatch,
+                        "control input peer key binding is invalid",
+                    ));
+                }
+                let grant_id = parse_sha256_identifier(&grant.grant_id).ok_or_else(|| {
+                    failure(
+                        RemoteReasonCode::PolicyChanged,
+                        "control input grant identifier is invalid",
+                    )
+                })?;
+                Ok(ActiveControlAuthorization {
+                    session_id: session_id.clone(),
+                    role: record.snapshot.role,
+                    peer_device_id: record.request.peer_device_id.clone(),
+                    peer_key_id: record.request.peer_key_id.clone(),
+                    peer_public_key,
+                    grant_id,
+                    granted_scopes: grant.granted_scopes.clone(),
+                    expires_at_ms: grant.expires_at_ms,
+                    policy_revision: grant.policy_revision,
+                })
+            })();
+            (expired, result)
+        };
+        if expired {
+            self.changed.notify_waiters();
+        }
+        result
     }
 
     pub async fn allows_scope(
@@ -1435,6 +1586,27 @@ fn normalize_scopes(scopes: &mut Vec<RemotePermissionScope>) {
     scopes.dedup();
 }
 
+fn parse_sha256_identifier(value: &str) -> Option<[u8; 32]> {
+    let digest = value.strip_prefix("sha256:")?;
+    if digest.len() != 64 || !digest.is_ascii() {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, pair) in digest.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(bytes)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1498,5 +1670,244 @@ fn push_event(
     });
     while inner.events.len() > EVENT_HISTORY_LIMIT {
         inner.events.pop_front();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CREATED_AT_MS: u64 = 1_000;
+    const EXPIRES_AT_MS: u64 = 20_000;
+
+    fn control_request(
+        session_id: &str,
+        peer_public_key: &[u8; 32],
+    ) -> VerifiedIncomingAuthorizationRequest {
+        let peer_key_id = public_key_id(peer_public_key);
+        VerifiedIncomingAuthorizationRequest {
+            session_id: SessionId(session_id.to_string()),
+            peer_device_id: DeviceId("controller-device".to_string()),
+            peer_key_id,
+            peer_key_epoch: 1,
+            access_mode: RemoteAccessMode::Attended,
+            requested_scopes: vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            peer_permission_ceiling: vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            machine_permission_ceiling: vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            runtime_capabilities: vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            transport_kind: "quic".to_string(),
+            request_nonce: [1; 16],
+            created_at_ms: CREATED_AT_MS,
+            expires_at_ms: EXPIRES_AT_MS,
+        }
+    }
+
+    fn control_grant(session_id: &SessionId) -> VerifiedSessionGrant {
+        VerifiedSessionGrant {
+            grant_id: format!("sha256:{}", "ab".repeat(32)),
+            session_id: session_id.clone(),
+            granted_scopes: vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            issued_at_ms: CREATED_AT_MS + 1,
+            expires_at_ms: EXPIRES_AT_MS,
+            policy_revision: 7,
+            route_constraint: "quic".to_string(),
+            transport_fingerprint_sha256: [9; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_key_binding_is_exact_and_idempotent() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("bind-idempotent", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+
+        let first = registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 1)
+            .await
+            .expect("bind requested peer key");
+        let second = registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 2)
+            .await
+            .expect("repeat the same binding");
+
+        assert_eq!(first.peer_key_id, public_key_id(&peer_public_key));
+        assert_eq!(second.peer_key_id, first.peer_key_id);
+        assert_eq!(second.updated_at_ms, CREATED_AT_MS + 2);
+    }
+
+    #[tokio::test]
+    async fn peer_key_binding_rejects_non_ed25519_key_length() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("bind-rejects-shape", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+
+        let wrong_shape = registry
+            .bind_authenticated_peer_key(&session_id, &[7; 31], CREATED_AT_MS + 1)
+            .await
+            .expect_err("non-Ed25519 key length must fail closed");
+        assert_eq!(wrong_shape.code, RemoteReasonCode::IdentityMismatch);
+    }
+
+    #[tokio::test]
+    async fn peer_key_binding_rejects_key_id_mismatch() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("bind-rejects-identity", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+
+        let wrong_key = registry
+            .bind_authenticated_peer_key(&session_id, &[8; 32], CREATED_AT_MS + 1)
+            .await
+            .expect_err("key id mismatch must fail closed");
+        assert_eq!(wrong_key.code, RemoteReasonCode::IdentityMismatch);
+    }
+
+    #[tokio::test]
+    async fn peer_key_binding_rejects_terminal_authorization() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("bind-terminal", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+        registry
+            .record_failure(
+                &session_id,
+                RemoteAuthorizationState::Revoked,
+                failure(RemoteReasonCode::GrantRevoked, "revoked"),
+                CREATED_AT_MS + 1,
+            )
+            .await
+            .expect("record terminal authorization");
+
+        let failure = registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 2)
+            .await
+            .expect_err("terminal authorization cannot gain a peer key binding");
+
+        assert_eq!(failure.code, RemoteReasonCode::GrantRevoked);
+    }
+
+    #[tokio::test]
+    async fn active_control_authorization_requires_streaming_and_projects_exact_bindings() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("active-control", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+        registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 1)
+            .await
+            .expect("bind peer key");
+        registry
+            .install_verified_grant(control_grant(&session_id), CREATED_AT_MS + 2)
+            .await
+            .expect("install verified grant");
+
+        let before_streaming = registry
+            .active_control_authorization(&session_id, CREATED_AT_MS + 3)
+            .await
+            .expect_err("connecting route cannot authorize control input");
+        assert_eq!(before_streaming.code, RemoteReasonCode::PolicyChanged);
+
+        registry
+            .mark_streaming(&session_id, CREATED_AT_MS + 4)
+            .await
+            .expect("mark session streaming");
+        let active = registry
+            .active_control_authorization(&session_id, CREATED_AT_MS + 5)
+            .await
+            .expect("project active control authorization");
+
+        assert_eq!(active.session_id, session_id);
+        assert_eq!(
+            active.peer_device_id,
+            DeviceId("controller-device".to_string())
+        );
+        assert_eq!(active.peer_key_id, public_key_id(&peer_public_key));
+        assert_eq!(active.peer_public_key, peer_public_key);
+        assert_eq!(active.grant_id, [0xab; 32]);
+        assert_eq!(active.policy_revision, 7);
+        assert_eq!(active.expires_at_ms, EXPIRES_AT_MS);
+        assert_eq!(
+            active.granted_scopes,
+            vec![
+                RemotePermissionScope::InputPointer,
+                RemotePermissionScope::InputKeyboard,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_control_authorization_expires_grant_before_projection() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let request = control_request("active-control-expired", &peer_public_key);
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization");
+        registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 1)
+            .await
+            .expect("bind peer key");
+        registry
+            .install_verified_grant(control_grant(&session_id), CREATED_AT_MS + 2)
+            .await
+            .expect("install verified grant");
+        registry
+            .mark_streaming(&session_id, CREATED_AT_MS + 3)
+            .await
+            .expect("mark session streaming");
+
+        let failure = registry
+            .active_control_authorization(&session_id, EXPIRES_AT_MS + 1)
+            .await
+            .expect_err("expired grant cannot authorize control input");
+
+        assert_eq!(failure.code, RemoteReasonCode::GrantExpired);
+        let snapshot = registry
+            .snapshot_at(&session_id, EXPIRES_AT_MS + 1)
+            .await
+            .expect("expired snapshot remains queryable");
+        assert_eq!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Expired
+        );
     }
 }

@@ -6,8 +6,8 @@ use crate::app_state::AppState;
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{
     ControlInputEvent, CrossE2EFaultInjectionResult, DisplayMode, IpcResponse, MediaProfile,
-    MediaTestImpairmentSnapshot, RemoteAccessMode, RemoteFailure, RemoteReasonCode,
-    RemoteSessionRequest,
+    MediaTestImpairmentSnapshot, RemoteAccessMode, RemoteAuthorizationState, RemoteFailure,
+    RemoteReasonCode, RemoteSessionRequest,
 };
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
@@ -15,11 +15,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Return the authoritative secure remote-session projection.
 pub async fn get_remote_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
-    match app_state
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let session = app_state
         .session_authorizations
         .snapshot_at(&session_id, current_time_ms())
-        .await
-    {
+        .await;
+    if session.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Denied
+                | RemoteAuthorizationState::Expired
+                | RemoteAuthorizationState::Revoked
+                | RemoteAuthorizationState::LockedOut
+                | RemoteAuthorizationState::PolicyChanged
+        )
+    }) {
+        crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    }
+    match session {
         Some(session) => IpcResponse::RemoteSession { session },
         None => IpcResponse::Error {
             code: "E_REMOTE_SESSION_NOT_FOUND".to_string(),
@@ -322,7 +339,7 @@ pub async fn disable_unattended_access(
                 .session_authorizations
                 .revoke_unattended_authorizations(current_time_ms())
                 .await;
-            crate::lan_discovery::terminate_authorized_remote_sessions(
+            crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
                 app_state,
                 &revoked_session_ids,
             )
@@ -570,16 +587,23 @@ pub async fn send_control_input(
     event: ControlInputEvent,
 ) -> IpcResponse {
     if let Some(secure_session) = app_state.session_authorizations.snapshot(&session_id).await {
-        return IpcResponse::RemoteAccessError {
-            session_id: Some(session_id),
-            peer_key_id: Some(secure_session.peer_key_id),
-            failure: RemoteFailure {
-                code: RemoteReasonCode::ProtocolDowngradeBlocked,
-                message: "secure-session control input requires ControlEnvelopeV2".to_string(),
-                suggested_action: Some(
-                    "install the authenticated control-input update before enabling input"
-                        .to_string(),
-                ),
+        let peer_key_id = Some(secure_session.peer_key_id);
+        return match crate::lan_discovery::request_authenticated_lan_control_input(
+            app_state,
+            &session_id,
+            event,
+        )
+        .await
+        {
+            Ok(result) => IpcResponse::ControlInputAccepted {
+                session_id,
+                lane: result.lane,
+                event_count: result.event_count,
+            },
+            Err(failure) => IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id,
+                failure,
             },
         };
     }
@@ -983,6 +1007,16 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
             message: format!("Session not found: {}", session_id.0),
         };
     }
+    if let Some(snapshot) = snapshot.as_ref() {
+        release_control_input_for_terminal_session(
+            app_state,
+            &session_id,
+            snapshot,
+            secure_session_exists,
+            "stopping",
+        )
+        .await;
+    }
     if secure_session_exists {
         terminalize_secure_session(
             app_state,
@@ -994,11 +1028,6 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
         .await;
     }
     drop(authorization_security_guard);
-
-    if let Some(snapshot) = snapshot.as_ref() {
-        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "stopping")
-            .await;
-    }
 
     if secure_session_exists {
         crate::lan_discovery::terminate_authorized_remote_sessions(
@@ -1054,6 +1083,16 @@ pub async fn fail_session(
             message: format!("Session not found: {}", session_id.0),
         };
     }
+    if let Some(snapshot) = snapshot.as_ref() {
+        release_control_input_for_terminal_session(
+            app_state,
+            &session_id,
+            snapshot,
+            secure_session_exists,
+            "failing",
+        )
+        .await;
+    }
     if secure_session_exists {
         terminalize_secure_session(
             app_state,
@@ -1065,11 +1104,6 @@ pub async fn fail_session(
         .await;
     }
     drop(authorization_security_guard);
-
-    if let Some(snapshot) = snapshot.as_ref() {
-        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "failing")
-            .await;
-    }
 
     if secure_session_exists {
         crate::lan_discovery::terminate_authorized_remote_sessions(
@@ -1150,12 +1184,22 @@ async fn release_control_input_for_terminal_session(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     snapshot: &SessionSnapshot,
+    secure_session_exists: bool,
     action: &'static str,
 ) {
     let route_release_to_peer = snapshot.target_device_id.is_some()
         && snapshot.lifecycle_state == SessionLifecycleState::Streaming
         && snapshot.receiver_active;
-    let result = if route_release_to_peer {
+    let result = if route_release_to_peer && secure_session_exists {
+        crate::lan_discovery::request_authenticated_lan_control_input_under_security_gate(
+            app_state,
+            session_id,
+            ControlInputEvent::ReleaseAll,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failure| anyhow::anyhow!(failure.message))
+    } else if route_release_to_peer {
         crate::lan_discovery::request_lan_control_input(
             app_state,
             session_id,
@@ -1351,6 +1395,27 @@ fn recovery_state_for(snapshot: &SessionSnapshot) -> SessionLifecycleState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_input::{InputError, InputEvent, InputInjector};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct SharedRecordingInputInjector {
+        events: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InputInjector for SharedRecordingInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event);
+            Ok(())
+        }
+    }
 
     async fn begin_secure_outgoing_authorization(app_state: &Arc<AppState>, session_id: SessionId) {
         let created_at_ms = current_time_ms();
@@ -1522,6 +1587,13 @@ mod tests {
     async fn get_remote_session_expires_a_grant_even_without_a_media_task() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("secure-snapshot-expiry".to_string());
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        *app_state.control_input().lock().await =
+            crate::control_input::ControlInputRegistry::with_injector(
+                SharedRecordingInputInjector {
+                    events: Arc::clone(&injected),
+                },
+            );
         begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
         let issued_at_ms = current_time_ms();
         app_state
@@ -1541,6 +1613,18 @@ mod tests {
             )
             .await
             .expect("short-lived grant");
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_session_event(
+                &session_id,
+                &ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
+            .expect("key down before grant expiry");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
         let IpcResponse::RemoteSession { session } =
@@ -1555,6 +1639,22 @@ mod tests {
         assert_eq!(
             session.failure.as_ref().map(|failure| failure.code),
             Some(RemoteReasonCode::GrantExpired)
+        );
+        assert_eq!(
+            injected
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: true,
+                },
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: false,
+                },
+            ]
         );
     }
 
@@ -1839,10 +1939,13 @@ mod tests {
             .control_input()
             .lock()
             .await
-            .handle_event(&mrd_ipc::ControlInputEvent::Key {
-                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
-                pressed: true,
-            })
+            .handle_session_event(
+                &session_id,
+                &mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
             .expect("key down");
 
         let response = stop_session(&app_state, session_id.clone()).await;
@@ -1887,10 +1990,13 @@ mod tests {
             .control_input()
             .lock()
             .await
-            .handle_event(&mrd_ipc::ControlInputEvent::Key {
-                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
-                pressed: true,
-            })
+            .handle_session_event(
+                &session_id,
+                &mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
             .expect("key down");
 
         let response =

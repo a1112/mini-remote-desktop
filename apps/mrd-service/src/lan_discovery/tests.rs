@@ -281,6 +281,49 @@ async fn rotating_source_ips_share_a_bounded_pre_authorization_audit_quota() {
     );
 }
 
+#[tokio::test]
+async fn authenticated_control_has_independent_bounded_admission_and_audit_quotas() {
+    let state = LanDiscoveryState::new(LanDiscoveryConfig::default());
+    let source_ip = "127.0.0.1".parse().expect("loopback IP");
+    let mut permits = Vec::new();
+    for _ in 0..LAN_INCOMING_CONTROL_TASK_LIMIT {
+        permits.push(
+            state
+                .try_admit_authenticated_control(source_ip, 5_000)
+                .await
+                .expect("control work below concurrency ceiling"),
+        );
+    }
+    assert!(
+        state
+            .try_admit_authenticated_control(source_ip, 5_000)
+            .await
+            .is_none(),
+        "control work above the concurrency ceiling must fail closed"
+    );
+    drop(permits);
+
+    for _ in 0..LAN_CONTROL_DENIAL_AUDIT_DETAIL_LIMIT {
+        assert!(matches!(
+            state.admit_control_input_denial_audit(5_000).await,
+            LanPreAuthorizationAuditAdmission::Detailed { .. }
+        ));
+    }
+    assert_eq!(
+        state.admit_control_input_denial_audit(5_000).await,
+        LanPreAuthorizationAuditAdmission::OverflowMarker
+    );
+    assert_eq!(
+        state
+            .admit_pre_authorization_denial_audit(source_ip, 5_000)
+            .await,
+        LanPreAuthorizationAuditAdmission::Detailed {
+            previous_window_suppressed: 0
+        },
+        "control denial pressure must not consume session-admission audit quota"
+    );
+}
+
 #[test]
 fn periodic_discovery_uses_a_probe_so_signed_endpoints_are_unicast() {
     let state = LanDiscoveryState::default();
@@ -1041,7 +1084,7 @@ fn lan_protocol_module_exposes_stable_wire_versions_and_transports() {
     );
     assert_eq!(
         super::protocol::LAN_INPUT_CONTROL_TRANSPORT,
-        "input_control_v1"
+        "input_control_v2"
     );
     assert_eq!(
         super::protocol::LAN_REMOTE_POWER_CONTROL_TRANSPORT,
@@ -1223,7 +1266,7 @@ async fn snapshot_exposes_lan_media_v3_peer_capabilities_with_v2_rollout_compati
 
 #[cfg(windows)]
 #[tokio::test]
-async fn announcement_omits_unsigned_input_and_power_controls_until_authenticated() {
+async fn signed_announcement_advertises_authenticated_input_but_not_unsigned_power_control() {
     let app_state = Arc::new(AppState::new());
     app_state.devices.lock().await.register(
         DeviceId("local-device".to_string()),
@@ -1234,7 +1277,7 @@ async fn announcement_omits_unsigned_input_and_power_controls_until_authenticate
         .await
         .expect("registered device announcement");
 
-    assert!(!announcement
+    assert!(announcement
         .payload
         .announcement
         .transports
@@ -1244,7 +1287,7 @@ async fn announcement_omits_unsigned_input_and_power_controls_until_authenticate
         .announcement
         .transports
         .contains(&LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string()));
-    assert!(!announcement
+    assert!(announcement
         .payload
         .announcement
         .media_capabilities

@@ -217,7 +217,23 @@ impl AppState {
 
     /// Permanently marks security state unavailable until process restart and re-verification.
     pub fn mark_security_unhealthy(&self) {
-        self.security_healthy.store(false, Ordering::Release);
+        if self
+            .security_healthy
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let authorization_security_gate = Arc::clone(&self.authorization_security_gate);
+        let control_input = Arc::clone(&self.control_input);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _authorization_guard = authorization_security_gate.lock().await;
+                if let Err(error) = control_input.lock().await.release_all_sessions() {
+                    tracing::error!(%error, "failed to release pressed input after security became unhealthy");
+                }
+            });
+        }
     }
 
     /// Get a clone of the shell Arc for injection into handlers
@@ -359,6 +375,29 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_input::{InputError, InputEvent, InputInjector};
+    use mrd_ipc::{ControlInputEvent, ControlInputKey};
+    use mrd_proto::SessionId;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct SharedRecordingInjector {
+        events: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InputInjector for SharedRecordingInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn app_state_core_initializes_empty_runtime_registries() {
@@ -372,6 +411,63 @@ mod tests {
                 .expect("media tasks")
                 .active_count(&mrd_proto::SessionId("missing-session".to_string())),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn security_health_transition_releases_all_pressed_input() {
+        let state = AppState::new();
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        *state.control_input.lock().await =
+            ControlInputRegistry::with_injector(SharedRecordingInjector {
+                events: Arc::clone(&events),
+            });
+        state
+            .control_input
+            .lock()
+            .await
+            .handle_session_event(
+                &SessionId("security-health-session".to_string()),
+                &ControlInputEvent::Key {
+                    key: ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
+            .expect("key down before security failure");
+
+        state.mark_security_unhealthy();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .len()
+                    >= 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("security cleanup completes");
+
+        assert!(!state.security_is_healthy());
+        assert_eq!(
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: true,
+                },
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: false,
+                },
+            ]
         );
     }
 }

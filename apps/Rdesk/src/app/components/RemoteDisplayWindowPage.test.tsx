@@ -18,6 +18,7 @@ import {
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
   localThreeFrameLatencyStatus,
+  keyboardMouseControlAvailable,
   mapClientPointToRemoteFrame,
   mapPointerButton,
   shouldAutoSwitchWebRtcVideoToWebCodecs,
@@ -214,7 +215,7 @@ function lanDiscoverySnapshotWithPeerInput() {
         ip: "127.0.0.1",
         discovery_port: 49700,
         p2p_control_addr: "127.0.0.1:49701",
-        transports: ["quic"],
+        transports: ["quic", "input_control_v2"],
         protocol_version: 1,
         media_protocol_version: 1,
         media_capabilities: ["control.keyboard_mouse"],
@@ -275,6 +276,69 @@ describe("RemoteDisplayWindowPage", () => {
     runtimeMock.isTauri = true;
     mockRenderAreaRect();
     mockResizeObserver();
+  });
+
+  it("gates pointer and keyboard independently on exact active grant scopes", () => {
+    const runtime = {
+      session_id: "p2p-quic-123",
+      role: "controller",
+      state: "streaming",
+      transport_kind: "quic",
+      sender_active: false,
+      receiver_active: true,
+      peer_device_id: "target-device",
+    } as Parameters<typeof keyboardMouseControlAvailable>[1];
+    const pointerOnly = secureRemoteSessionSnapshot({
+      granted_scopes: ["screen.view", "input.pointer"],
+      authorization_expires_at_ms: Date.now() + 60_000,
+    }) as Parameters<typeof keyboardMouseControlAvailable>[4];
+
+    expect(
+      keyboardMouseControlAvailable(
+        null,
+        runtime,
+        false,
+        true,
+        pointerOnly,
+        "input.pointer"
+      )
+    ).toBe(true);
+    expect(
+      keyboardMouseControlAvailable(
+        null,
+        runtime,
+        false,
+        true,
+        pointerOnly,
+        "input.keyboard"
+      )
+    ).toBe(false);
+    expect(
+      keyboardMouseControlAvailable(
+        null,
+        runtime,
+        false,
+        true,
+        {
+          ...pointerOnly!,
+          authorization_expires_at_ms: Date.now() - 1,
+        },
+        "input.pointer"
+      )
+    ).toBe(false);
+    expect(
+      keyboardMouseControlAvailable(
+        null,
+        runtime,
+        false,
+        true,
+        {
+          ...pointerOnly!,
+          authorization_expires_at_ms: null,
+        },
+        "input.pointer"
+      )
+    ).toBe(false);
   });
 
   it("summarizes WebRTC inbound video stats for stutter diagnosis", () => {
@@ -789,15 +853,25 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
-  it("keeps network input blocked even when Task 19 scopes are advertised", async () => {
+  it("enables scoped network input only for a streaming signed V2 peer and grant", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "ipc_secure_remote") {
+        const request = args?.request as { type?: string; event?: { kind?: string } } | undefined;
+        if (request?.type === "SendControlInput") {
+          return Promise.resolve({
+            type: "ControlInputAccepted",
+            session_id: "p2p-quic-123",
+            lane: request.event?.kind === "mouse_move" ? "realtime" : "reliable",
+            event_count: 1,
+          });
+        }
         return Promise.resolve({
           type: "RemoteSession",
           session: secureRemoteSessionSnapshot({
             requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
             granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            authorization_expires_at_ms: Date.now() + 60_000,
           }),
         });
       }
@@ -824,13 +898,6 @@ describe("RemoteDisplayWindowPage", () => {
           last_error: null,
         });
       }
-      if (command === "ipc_send_control_input") {
-        return Promise.resolve({
-          session_id: "p2p-quic-123",
-          lane: "realtime",
-          event_count: 1,
-        });
-      }
       return defaultRemoteDisplayInvoke(command, args);
     });
 
@@ -840,15 +907,101 @@ describe("RemoteDisplayWindowPage", () => {
       expect(
         mockInvoke.mock.calls.some(([command]) => command === "ipc_lan_discovery_snapshot")
       ).toBe(true);
-      expect(renderArea).toHaveAttribute("tabindex", "-1");
+      expect(renderArea).toHaveAttribute("tabindex", "0");
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "configure_remote_display_native_surface",
+        expect.objectContaining({
+          pointerControlEnabled: true,
+          keyboardControlEnabled: true,
+        })
+      );
     });
 
     fireEvent.pointerDown(renderArea, { button: 0, clientX: 640, clientY: 416 });
     fireEvent.keyDown(renderArea, { code: "KeyA", key: "a" });
 
-    expect(screen.getByText("input blocked")).toBeInTheDocument();
-    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")).toBe(
-      false
+    expect(screen.getByText("input ready")).toBeInTheDocument();
+    await waitFor(() => {
+      const inputRequests = mockInvoke.mock.calls
+        .filter(([command]) => command === "ipc_secure_remote")
+        .map(([, args]) => (args as { request?: { type?: string; event?: { kind?: string } } })?.request)
+        .filter((request) => request?.type === "SendControlInput");
+      expect(inputRequests.some((request) => request?.event?.kind === "mouse_button")).toBe(true);
+      expect(inputRequests.some((request) => request?.event?.kind === "key")).toBe(true);
+    });
+  });
+
+  it("disarms native input when secure diagnostics polling throws", async () => {
+    const mockInvoke = getMockInvoke();
+    let failSessionPoll = false;
+    mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+      if (command === "ipc_secure_remote") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: secureRemoteSessionSnapshot({
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            authorization_expires_at_ms: Date.now() + 60_000,
+          }),
+        });
+      }
+      if (command === "ipc_session_snapshot") {
+        if (failSessionPoll) {
+          return Promise.reject(new Error("secure diagnostics unavailable"));
+        }
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          role: "controller",
+          state: "streaming",
+          transport_kind: "quic",
+          last_error: null,
+          sender_active: false,
+          receiver_active: true,
+          peer_device_id: "target-device",
+        });
+      }
+      if (command === "ipc_probe_snapshot") {
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          frames_received: 1,
+          frames_decoded: 1,
+          frames_dropped: 0,
+          current_fps: 30,
+          bitrate_mbps: 4,
+          last_error: null,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command, args);
+    });
+
+    renderRemoteDisplay();
+    const renderArea = await screen.findByTestId("remote-render-area");
+    await waitFor(() => {
+      expect(renderArea).toHaveAttribute("tabindex", "0");
+      expect(screen.getByText("input ready")).toBeInTheDocument();
+    });
+    const configureCallsBeforeFailure = mockInvoke.mock.calls.filter(
+      ([command]) => command === "configure_remote_display_native_surface"
+    ).length;
+
+    failSessionPoll = true;
+
+    await waitFor(
+      () => {
+        expect(renderArea).toHaveAttribute("tabindex", "-1");
+        expect(screen.getByText("input blocked")).toBeInTheDocument();
+        const configureCallsAfterFailure = mockInvoke.mock.calls
+          .filter(([command]) => command === "configure_remote_display_native_surface")
+          .slice(configureCallsBeforeFailure);
+        expect(
+          configureCallsAfterFailure.some(
+            ([, args]) =>
+              args?.pointerControlEnabled === false &&
+              args?.keyboardControlEnabled === false
+          )
+        ).toBe(true);
+      },
+      { timeout: 2_000 }
     );
   });
 
@@ -954,6 +1107,13 @@ describe("RemoteDisplayWindowPage", () => {
     await waitFor(() => {
       expect(renderArea).toHaveAttribute("tabindex", "-1");
       expect(screen.getByText("input blocked")).toBeInTheDocument();
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "configure_remote_display_native_surface",
+        expect.objectContaining({
+          pointerControlEnabled: false,
+          keyboardControlEnabled: false,
+        })
+      );
     });
 
     fireEvent.pointerMove(renderArea, { pointerId: 7, clientX: 640, clientY: 416 });
@@ -983,7 +1143,12 @@ describe("RemoteDisplayWindowPage", () => {
     fireEvent(window, new Event("pagehide"));
 
     expect(
-      mockInvoke.mock.calls.some(([command]) => command === "ipc_send_control_input")
+      mockInvoke.mock.calls.some(
+        ([command, args]) =>
+          command === "ipc_secure_remote" &&
+          (args as { request?: { type?: string } } | undefined)?.request?.type ===
+            "SendControlInput"
+      )
     ).toBe(false);
   });
 
@@ -996,9 +1161,13 @@ describe("RemoteDisplayWindowPage", () => {
           available_controls: ["keyboard_mouse"],
         });
       }
-      if (command === "ipc_send_control_input") {
+      if (
+        command === "ipc_secure_remote" &&
+        (args?.request as { type?: string } | undefined)?.type === "SendControlInput"
+      ) {
         return Promise.resolve({
-          session_id: args?.sessionId,
+          type: "ControlInputAccepted",
+          session_id: "local-preview",
           lane: "reliable",
           event_count: 1,
         });
@@ -1020,27 +1189,57 @@ describe("RemoteDisplayWindowPage", () => {
 
     await waitFor(() => {
       const inputCalls = mockInvoke.mock.calls.filter(
-        ([command]) => command === "ipc_send_control_input"
+        ([command, args]) =>
+          command === "ipc_secure_remote" &&
+          (args as { request?: { type?: string } } | undefined)?.request?.type ===
+            "SendControlInput"
       );
-      expect(inputCalls.map(([, args]) => args)).toEqual([
+      const requests = inputCalls.map(
+        ([, args]) =>
+          (args as {
+            request: {
+              type: string;
+              session_id: string;
+              event: { kind: string } & Record<string, unknown>;
+            };
+          }).request
+      );
+      expect(requests).toHaveLength(7);
+      expect(requests).toEqual(
+        expect.arrayContaining([
+          {
+            type: "SendControlInput",
+            session_id: "local-preview",
+            event: { kind: "mouse_move", x: 960, y: 540 },
+          },
+          {
+            type: "SendControlInput",
+            session_id: "local-preview",
+            event: { kind: "mouse_wheel", delta: -120 },
+          },
+        ])
+      );
+      expect(
+        requests.filter(
+          ({ event }) =>
+            event.kind !== "mouse_move" &&
+            event.kind !== "mouse_wheel" &&
+            event.kind !== "mouse_horizontal_wheel"
+        )
+      ).toEqual([
         {
-          sessionId: "local-preview",
-          event: { kind: "mouse_move", x: 960, y: 540 },
-        },
-        {
-          sessionId: "local-preview",
+          type: "SendControlInput",
+          session_id: "local-preview",
           event: { kind: "mouse_button", button: "left", pressed: true },
         },
         {
-          sessionId: "local-preview",
+          type: "SendControlInput",
+          session_id: "local-preview",
           event: { kind: "mouse_button", button: "left", pressed: false },
         },
         {
-          sessionId: "local-preview",
-          event: { kind: "mouse_wheel", delta: -120 },
-        },
-        {
-          sessionId: "local-preview",
+          type: "SendControlInput",
+          session_id: "local-preview",
           event: {
             kind: "key",
             key: { kind: "virtual_key", code: 0x41 },
@@ -1048,7 +1247,8 @@ describe("RemoteDisplayWindowPage", () => {
           },
         },
         {
-          sessionId: "local-preview",
+          type: "SendControlInput",
+          session_id: "local-preview",
           event: {
             kind: "key",
             key: { kind: "virtual_key", code: 0x41 },
@@ -1056,7 +1256,8 @@ describe("RemoteDisplayWindowPage", () => {
           },
         },
         {
-          sessionId: "local-preview",
+          type: "SendControlInput",
+          session_id: "local-preview",
           event: { kind: "release_all" },
         },
       ]);

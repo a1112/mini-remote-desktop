@@ -140,9 +140,7 @@ async function invokeSecureRemoteContract<T>(
   expectedType: string,
   responseFieldName: string
 ): Promise<AdapterResult<T>> {
-  const raw = shouldUseServiceBridge()
-    ? await invokeServiceBridgeIpc<ServiceBridgeIpcResponse>(request)
-    : await invokeAdapter<ServiceBridgeIpcResponse>('ipc_secure_remote', { request });
+  const raw = await invokeSecureRemoteResponse(request);
   if (!raw.ok) return raw;
 
   const response = raw.value;
@@ -174,6 +172,14 @@ async function invokeSecureRemoteContract<T>(
     };
   }
   return { ok: true, value: response[responseFieldName] as T };
+}
+
+async function invokeSecureRemoteResponse(
+  request: ServiceBridgeIpcRequest
+): Promise<AdapterResult<ServiceBridgeIpcResponse>> {
+  return shouldUseServiceBridge()
+    ? invokeServiceBridgeIpc<ServiceBridgeIpcResponse>(request)
+    : invokeAdapter<ServiceBridgeIpcResponse>('ipc_secure_remote', { request });
 }
 
 function environmentFromCapabilitySnapshot(snapshot: CapabilitySnapshot): EnvironmentSnapshot {
@@ -407,6 +413,8 @@ export async function configureRemoteDisplayNativeSurface(params: {
   enabled: boolean;
   visible?: boolean;
   controlFrameSize?: NativeSurfaceControlFrameSize;
+  pointerControlEnabled?: boolean;
+  keyboardControlEnabled?: boolean;
 }): Promise<AdapterResult<NativeRenderSurfaceSnapshot>> {
   return invokeAdapter<NativeRenderSurfaceSnapshot>(
     'configure_remote_display_native_surface',
@@ -894,23 +902,81 @@ export async function ipcSendControlInput(
   sessionId: string,
   event: ControlInputEvent
 ): Promise<AdapterResult<ControlInputAccepted>> {
-  return invokeBridgeOrTauri<ControlInputAccepted>(
-    'ipc_send_control_input',
-    {
-      sessionId,
-      event,
-    },
-    {
-      type: 'SendControlInput',
-      session_id: sessionId,
-      event,
-    },
-    (response) => ({
+  if (shouldUseServiceBridge()) {
+    return {
+      ok: false,
+      error: {
+        code: 'E_WEB_BRIDGE_FORBIDDEN',
+        message: 'remote control input is available only in the trusted desktop runtime',
+      },
+    };
+  }
+  if (event.kind === 'mouse_move' || event.kind === 'mouse_wheel' || event.kind === 'mouse_horizontal_wheel') {
+    return ipcSendControlInputNow(sessionId, event);
+  }
+  const previous = reliableControlInputTails.get(sessionId) ?? Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(() => ipcSendControlInputNow(sessionId, event));
+  const tail = operation.then(
+    () => undefined,
+    () => undefined
+  );
+  reliableControlInputTails.set(sessionId, tail);
+  void tail.finally(() => {
+    if (reliableControlInputTails.get(sessionId) === tail) {
+      reliableControlInputTails.delete(sessionId);
+    }
+  });
+  return operation;
+}
+
+const reliableControlInputTails = new Map<string, Promise<void>>();
+
+async function ipcSendControlInputNow(
+  sessionId: string,
+  event: ControlInputEvent
+): Promise<AdapterResult<ControlInputAccepted>> {
+  const raw = await invokeSecureRemoteResponse({
+    type: 'SendControlInput',
+    session_id: sessionId,
+    event,
+  });
+  if (!raw.ok) return raw;
+  const response = raw.value;
+  if (response.type === 'RemoteAccessError') {
+    const failure = response.failure as RemoteFailure | undefined;
+    return {
+      ok: false,
+      error: {
+        code: failure?.code,
+        message: failure?.message ?? 'remote control input was rejected',
+      },
+    };
+  }
+  if (response.type === 'Error') {
+    return {
+      ok: false,
+      error: {
+        code: response.code,
+        message: response.message ?? 'mrd-service returned an IPC error',
+      },
+    };
+  }
+  if (response.type !== 'ControlInputAccepted') {
+    return {
+      ok: false,
+      error: { message: `unexpected secure IPC response: ${response.type}` },
+    };
+  }
+  return {
+    ok: true,
+    value: {
       session_id: response.session_id as string,
       lane: response.lane as ControlInputAccepted['lane'],
       event_count: response.event_count as number,
-    })
-  );
+    },
+  };
 }
 
 /**

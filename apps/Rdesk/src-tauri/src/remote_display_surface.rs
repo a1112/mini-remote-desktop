@@ -183,17 +183,26 @@ impl RemoteDisplaySurfaceManager {
     }
 
     #[cfg(windows)]
-    pub fn set_control_session_id(
+    pub fn set_control_binding(
         &mut self,
         label: &str,
         session_id: Option<String>,
-    ) -> Result<(), String> {
+        pointer_enabled: bool,
+        keyboard_enabled: bool,
+    ) -> Result<Option<NativeSurfaceControlBindingSnapshot>, String> {
         let surface = self
             .surfaces
             .get_mut(label)
             .ok_or_else(|| format!("native render surface not found: {label}"))?;
-        surface.set_control_session_id(session_id);
-        Ok(())
+        surface.set_control_binding(session_id, pointer_enabled, keyboard_enabled);
+        Ok(surface.control_binding_snapshot())
+    }
+
+    #[cfg(windows)]
+    pub fn control_binding(&self, label: &str) -> Option<NativeSurfaceControlBindingSnapshot> {
+        self.surfaces
+            .get(label)
+            .and_then(NativeRenderSurface::control_binding_snapshot)
     }
 
     #[cfg(windows)]
@@ -279,23 +288,435 @@ fn handle_hex(handle: isize) -> String {
 pub struct NativeSurfaceControlInput {
     pub session_id: String,
     pub event: mrd_ipc::ControlInputEvent,
+    surface_id: usize,
+    authorization: std::sync::Arc<NativeSurfaceControlAuthorization>,
+    generation: u64,
+    deadline: std::time::Instant,
 }
 
 #[cfg(windows)]
-static NATIVE_SURFACE_INPUT_FORWARDER: std::sync::OnceLock<
-    std::sync::mpsc::Sender<NativeSurfaceControlInput>,
-> = std::sync::OnceLock::new();
+const NATIVE_SURFACE_RELIABLE_INPUT_CAPACITY: usize = 256;
+#[cfg(windows)]
+const NATIVE_SURFACE_REALTIME_INPUT_TTL: std::time::Duration =
+    std::time::Duration::from_millis(250);
+#[cfg(windows)]
+const NATIVE_SURFACE_RELIABLE_INPUT_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(windows)]
-pub fn install_control_input_forwarder(
-    sender: std::sync::mpsc::Sender<NativeSurfaceControlInput>,
-) -> bool {
-    NATIVE_SURFACE_INPUT_FORWARDER.set(sender).is_ok()
+static NATIVE_SURFACE_CONTROL_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct NativeSurfaceControlAuthorization {
+    session_id: String,
+    pointer_enabled: bool,
+    keyboard_enabled: bool,
+    epoch: u64,
+    active: std::sync::atomic::AtomicBool,
+    generation: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(windows)]
+impl NativeSurfaceControlAuthorization {
+    pub(crate) fn new(
+        session_id: String,
+        pointer_enabled: bool,
+        keyboard_enabled: bool,
+    ) -> std::sync::Arc<Self> {
+        let epoch = NATIVE_SURFACE_CONTROL_EPOCH
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+            .max(1);
+        std::sync::Arc::new(Self {
+            session_id,
+            pointer_enabled,
+            keyboard_enabled,
+            epoch,
+            active: std::sync::atomic::AtomicBool::new(true),
+            generation: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    fn allows(&self, event: &mrd_ipc::ControlInputEvent) -> bool {
+        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match event {
+            mrd_ipc::ControlInputEvent::MouseMove { .. }
+            | mrd_ipc::ControlInputEvent::MouseButton { .. }
+            | mrd_ipc::ControlInputEvent::MouseWheel { .. }
+            | mrd_ipc::ControlInputEvent::MouseHorizontalWheel { .. } => self.pointer_enabled,
+            mrd_ipc::ControlInputEvent::Key { .. } => self.keyboard_enabled,
+            mrd_ipc::ControlInputEvent::ReleaseAll => self.pointer_enabled || self.keyboard_enabled,
+        }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn advance_generation(&self) -> u64 {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1)
+            .max(1)
+    }
+
+    pub(crate) fn deactivate(&self) {
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.advance_generation();
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSurfaceControlBindingSnapshot {
+    pub session_id: String,
+    pub pointer_enabled: bool,
+    pub keyboard_enabled: bool,
+    pub epoch: u64,
+}
+
+#[cfg(windows)]
+impl NativeSurfaceControlInput {
+    fn new(
+        surface_id: usize,
+        authorization: std::sync::Arc<NativeSurfaceControlAuthorization>,
+        generation: u64,
+        event: mrd_ipc::ControlInputEvent,
+        ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            session_id: authorization.session_id.clone(),
+            event,
+            surface_id,
+            authorization,
+            generation,
+            deadline: std::time::Instant::now() + ttl,
+        }
+    }
+
+    fn is_cleanup(&self) -> bool {
+        matches!(self.event, mrd_ipc::ControlInputEvent::ReleaseAll)
+    }
+
+    fn is_dispatchable(&self, now: std::time::Instant) -> bool {
+        if self.is_cleanup() {
+            return true;
+        }
+        if now > self.deadline {
+            return false;
+        }
+        self.authorization
+            .active
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.generation == self.authorization.current_generation()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NativeSurfaceRealtimeKind {
+    MouseMove,
+    MouseWheel,
+    MouseHorizontalWheel,
+}
+
+#[cfg(windows)]
+fn native_surface_realtime_kind(
+    event: &mrd_ipc::ControlInputEvent,
+) -> Option<NativeSurfaceRealtimeKind> {
+    match event {
+        mrd_ipc::ControlInputEvent::MouseMove { .. } => Some(NativeSurfaceRealtimeKind::MouseMove),
+        mrd_ipc::ControlInputEvent::MouseWheel { .. } => {
+            Some(NativeSurfaceRealtimeKind::MouseWheel)
+        }
+        mrd_ipc::ControlInputEvent::MouseHorizontalWheel { .. } => {
+            Some(NativeSurfaceRealtimeKind::MouseHorizontalWheel)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+type NativeSurfaceRealtimeInputs =
+    std::collections::HashMap<(usize, NativeSurfaceRealtimeKind), NativeSurfaceControlInput>;
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub struct NativeSurfaceControlInputForwarder {
+    reliable: std::sync::mpsc::SyncSender<NativeSurfaceControlInput>,
+    cleanup: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<usize, NativeSurfaceControlInput>>,
+    >,
+    realtime: std::sync::Arc<std::sync::Mutex<NativeSurfaceRealtimeInputs>>,
+    wake: std::sync::mpsc::SyncSender<()>,
+}
+
+#[cfg(windows)]
+pub struct NativeSurfaceControlInputReceiver {
+    reliable: std::sync::mpsc::Receiver<NativeSurfaceControlInput>,
+    cleanup: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<usize, NativeSurfaceControlInput>>,
+    >,
+    realtime: std::sync::Arc<std::sync::Mutex<NativeSurfaceRealtimeInputs>>,
+    wake: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(windows)]
+fn native_surface_control_input_channel_with_capacity(
+    reliable_capacity: usize,
+) -> (
+    NativeSurfaceControlInputForwarder,
+    NativeSurfaceControlInputReceiver,
+) {
+    let (reliable_sender, reliable_receiver) =
+        std::sync::mpsc::sync_channel(reliable_capacity.max(1));
+    let (wake_sender, wake_receiver) = std::sync::mpsc::sync_channel(1);
+    let cleanup = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let realtime = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    (
+        NativeSurfaceControlInputForwarder {
+            reliable: reliable_sender,
+            cleanup: cleanup.clone(),
+            realtime: realtime.clone(),
+            wake: wake_sender,
+        },
+        NativeSurfaceControlInputReceiver {
+            reliable: reliable_receiver,
+            cleanup,
+            realtime,
+            wake: wake_receiver,
+        },
+    )
+}
+
+#[cfg(windows)]
+pub fn native_surface_control_input_channel() -> (
+    NativeSurfaceControlInputForwarder,
+    NativeSurfaceControlInputReceiver,
+) {
+    native_surface_control_input_channel_with_capacity(NATIVE_SURFACE_RELIABLE_INPUT_CAPACITY)
+}
+
+#[cfg(windows)]
+impl NativeSurfaceControlInputForwarder {
+    fn wake(&self) {
+        let _ = self.wake.try_send(());
+    }
+
+    fn enqueue_cleanup(
+        &self,
+        surface_id: usize,
+        authorization: std::sync::Arc<NativeSurfaceControlAuthorization>,
+    ) {
+        let generation = authorization.advance_generation();
+        let cleanup = NativeSurfaceControlInput::new(
+            surface_id,
+            authorization.clone(),
+            generation,
+            mrd_ipc::ControlInputEvent::ReleaseAll,
+            NATIVE_SURFACE_RELIABLE_INPUT_TTL,
+        );
+        self.cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(surface_id, cleanup);
+        self.realtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(queued_surface_id, _), _| *queued_surface_id != surface_id);
+        self.wake();
+    }
+
+    pub(crate) fn submit(
+        &self,
+        surface_id: usize,
+        authorization: std::sync::Arc<NativeSurfaceControlAuthorization>,
+        event: mrd_ipc::ControlInputEvent,
+    ) {
+        if !authorization.allows(&event) {
+            return;
+        }
+        if matches!(event, mrd_ipc::ControlInputEvent::ReleaseAll) {
+            self.enqueue_cleanup(surface_id, authorization);
+            return;
+        }
+
+        let generation = authorization.current_generation();
+        if let Some(kind) = native_surface_realtime_kind(&event) {
+            let input = NativeSurfaceControlInput::new(
+                surface_id,
+                authorization.clone(),
+                generation,
+                event,
+                NATIVE_SURFACE_REALTIME_INPUT_TTL,
+            );
+            if let Ok(mut realtime) = self.realtime.try_lock() {
+                realtime.insert((surface_id, kind), input);
+                drop(realtime);
+                self.wake();
+            }
+            return;
+        }
+
+        let input = NativeSurfaceControlInput::new(
+            surface_id,
+            authorization.clone(),
+            generation,
+            event,
+            NATIVE_SURFACE_RELIABLE_INPUT_TTL,
+        );
+        match self.reliable.try_send(input) {
+            Ok(()) => self.wake(),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.enqueue_cleanup(surface_id, authorization);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn relay_existing(&self, input: NativeSurfaceControlInput) {
+        if !input.is_dispatchable(std::time::Instant::now()) {
+            return;
+        }
+        if input.is_cleanup() {
+            self.cleanup
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(input.surface_id, input);
+            self.wake();
+            return;
+        }
+        if let Some(kind) = native_surface_realtime_kind(&input.event) {
+            let key = (input.surface_id, kind);
+            self.realtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key, input);
+            self.wake();
+            return;
+        }
+        let surface_id = input.surface_id;
+        let authorization = input.authorization.clone();
+        match self.reliable.try_send(input) {
+            Ok(()) => self.wake(),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.enqueue_cleanup(surface_id, authorization);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+impl NativeSurfaceControlInputReceiver {
+    fn pop_cleanup(&self) -> Option<NativeSurfaceControlInput> {
+        let mut cleanup = self
+            .cleanup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let surface_id = cleanup.keys().next().copied()?;
+        cleanup.remove(&surface_id)
+    }
+
+    fn pop_realtime(&self) -> Option<NativeSurfaceControlInput> {
+        let mut realtime = self
+            .realtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = realtime.keys().next().copied()?;
+        realtime.remove(&key)
+    }
+
+    fn pop_dispatchable(&self) -> Option<NativeSurfaceControlInput> {
+        let now = std::time::Instant::now();
+        loop {
+            if let Some(input) = self.pop_cleanup() {
+                if input.is_dispatchable(now) {
+                    return Some(input);
+                }
+                continue;
+            }
+            match self.reliable.try_recv() {
+                Ok(input) if input.is_dispatchable(now) => return Some(input),
+                Ok(input) => {
+                    if now > input.deadline {
+                        let generation = input.authorization.advance_generation();
+                        let cleanup = NativeSurfaceControlInput::new(
+                            input.surface_id,
+                            input.authorization,
+                            generation,
+                            mrd_ipc::ControlInputEvent::ReleaseAll,
+                            NATIVE_SURFACE_RELIABLE_INPUT_TTL,
+                        );
+                        self.cleanup
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(cleanup.surface_id, cleanup);
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+            while let Some(input) = self.pop_realtime() {
+                if input.is_dispatchable(now) {
+                    return Some(input);
+                }
+            }
+            return None;
+        }
+    }
+
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<NativeSurfaceControlInput> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(input) = self.pop_dispatchable() {
+                return Some(input);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            match self
+                .wake
+                .recv_timeout(deadline.saturating_duration_since(now))
+            {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
+    pub fn recv(&self) -> Option<NativeSurfaceControlInput> {
+        loop {
+            if let Some(input) = self.pop_dispatchable() {
+                return Some(input);
+            }
+            if self.wake.recv().is_err() {
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+static NATIVE_SURFACE_INPUT_FORWARDER: std::sync::OnceLock<NativeSurfaceControlInputForwarder> =
+    std::sync::OnceLock::new();
+
+#[cfg(windows)]
+pub fn install_control_input_forwarder(forwarder: NativeSurfaceControlInputForwarder) -> bool {
+    NATIVE_SURFACE_INPUT_FORWARDER.set(forwarder).is_ok()
 }
 
 #[cfg(windows)]
 struct WindowsSurfaceInputContext {
-    session_id: Option<String>,
+    authorization: Option<std::sync::Arc<NativeSurfaceControlAuthorization>>,
     geometry: Option<WindowsSurfaceInputGeometry>,
 }
 
@@ -534,15 +955,16 @@ fn forward_windows_surface_input(
     hwnd: windows::Win32::Foundation::HWND,
     event: mrd_ipc::ControlInputEvent,
 ) {
-    let Some(session_id) = (unsafe {
-        windows_surface_input_context_mut(hwnd).and_then(|context| context.session_id.clone())
+    let Some(authorization) = (unsafe {
+        windows_surface_input_context_mut(hwnd)
+            .and_then(|context| context.authorization.as_ref().cloned())
     }) else {
         return;
     };
-    let Some(sender) = NATIVE_SURFACE_INPUT_FORWARDER.get() else {
+    let Some(forwarder) = NATIVE_SURFACE_INPUT_FORWARDER.get() else {
         return;
     };
-    let _ = sender.send(NativeSurfaceControlInput { session_id, event });
+    forwarder.submit(hwnd.0 as usize, authorization, event);
 }
 
 #[cfg(windows)]
@@ -662,7 +1084,7 @@ impl NativeRenderSurface {
         }
 
         let context = Box::new(WindowsSurfaceInputContext {
-            session_id: None,
+            authorization: None,
             geometry: WindowsSurfaceInputGeometry::from_rect_and_control_frame(
                 rect,
                 control_frame_size,
@@ -746,11 +1168,59 @@ impl NativeRenderSurface {
         self.hwnd.0
     }
 
-    fn set_control_session_id(&mut self, session_id: Option<String>) {
+    fn set_control_binding(
+        &mut self,
+        session_id: Option<String>,
+        pointer_enabled: bool,
+        keyboard_enabled: bool,
+    ) {
         unsafe {
             if let Some(context) = windows_surface_input_context_mut(self.hwnd) {
-                context.session_id = session_id;
+                let desired_session_id = session_id.filter(|_| pointer_enabled || keyboard_enabled);
+                let unchanged = context.authorization.as_ref().is_some_and(|authorization| {
+                    desired_session_id.as_deref() == Some(authorization.session_id.as_str())
+                        && pointer_enabled == authorization.pointer_enabled
+                        && keyboard_enabled == authorization.keyboard_enabled
+                        && authorization
+                            .active
+                            .load(std::sync::atomic::Ordering::Acquire)
+                });
+                if unchanged {
+                    return;
+                }
+                if let Some(previous) = context.authorization.take() {
+                    if let Some(forwarder) = NATIVE_SURFACE_INPUT_FORWARDER.get() {
+                        forwarder.submit(
+                            self.hwnd.0 as usize,
+                            previous.clone(),
+                            mrd_ipc::ControlInputEvent::ReleaseAll,
+                        );
+                    }
+                    previous.deactivate();
+                }
+                context.authorization = desired_session_id.map(|session_id| {
+                    NativeSurfaceControlAuthorization::new(
+                        session_id,
+                        pointer_enabled,
+                        keyboard_enabled,
+                    )
+                });
             }
+        }
+    }
+
+    fn control_binding_snapshot(&self) -> Option<NativeSurfaceControlBindingSnapshot> {
+        unsafe {
+            windows_surface_input_context_mut(self.hwnd).and_then(|context| {
+                context.authorization.as_ref().map(|authorization| {
+                    NativeSurfaceControlBindingSnapshot {
+                        session_id: authorization.session_id.clone(),
+                        pointer_enabled: authorization.pointer_enabled,
+                        keyboard_enabled: authorization.keyboard_enabled,
+                        epoch: authorization.epoch,
+                    }
+                })
+            })
         }
     }
 
@@ -779,7 +1249,11 @@ impl Drop for NativeRenderSurface {
             let ptr =
                 SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0) as *mut WindowsSurfaceInputContext;
             if !ptr.is_null() {
-                drop(Box::from_raw(ptr));
+                let mut context = Box::from_raw(ptr);
+                if let Some(authorization) = context.authorization.take() {
+                    authorization.deactivate();
+                }
+                drop(context);
             }
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
@@ -975,6 +1449,154 @@ mod remote_display_surface_input_tests {
     fn lparam(x: i16, y: i16) -> isize {
         ((u16::from_ne_bytes(y.to_ne_bytes()) as u32) << 16
             | u16::from_ne_bytes(x.to_ne_bytes()) as u32) as isize
+    }
+
+    #[test]
+    fn native_input_realtime_flood_cannot_consume_reliable_or_cleanup_capacity() {
+        let (forwarder, receiver) = native_surface_control_input_channel_with_capacity(2);
+        let authorization =
+            NativeSurfaceControlAuthorization::new("native-flood-session".to_string(), true, true);
+
+        for x in 0..10_000 {
+            forwarder.submit(
+                17,
+                authorization.clone(),
+                mrd_ipc::ControlInputEvent::MouseMove { x, y: x },
+            );
+        }
+        forwarder.submit(
+            17,
+            authorization.clone(),
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: false,
+            },
+        );
+
+        let key_up = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("realtime flood must leave reliable capacity for key-up");
+        assert_eq!(
+            key_up.event,
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: false,
+            }
+        );
+
+        for x in 0..10_000 {
+            forwarder.submit(
+                17,
+                authorization.clone(),
+                mrd_ipc::ControlInputEvent::MouseMove { x, y: x },
+            );
+        }
+        forwarder.submit(17, authorization, mrd_ipc::ControlInputEvent::ReleaseAll);
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("realtime flood must never discard ReleaseAll");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
+    }
+
+    #[test]
+    fn native_input_rejects_unauthorized_scopes_and_stale_epochs() {
+        let (forwarder, receiver) = native_surface_control_input_channel_with_capacity(2);
+        let pointer_only =
+            NativeSurfaceControlAuthorization::new("native-scope-session".to_string(), true, false);
+        forwarder.submit(
+            19,
+            pointer_only.clone(),
+            mrd_ipc::ControlInputEvent::Key {
+                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_none());
+
+        forwarder.submit(
+            19,
+            pointer_only.clone(),
+            mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: true,
+            },
+        );
+        pointer_only.deactivate();
+        let replacement =
+            NativeSurfaceControlAuthorization::new("native-scope-session".to_string(), true, false);
+        forwarder.submit(
+            19,
+            replacement,
+            mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: false,
+            },
+        );
+
+        let current = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("current authorization epoch must remain deliverable");
+        assert_eq!(
+            current.event,
+            mrd_ipc::ControlInputEvent::MouseButton {
+                button: mrd_ipc::ControlInputButton::Left,
+                pressed: false,
+            }
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_none());
+    }
+
+    #[test]
+    fn native_input_reliable_overflow_fails_closed_with_priority_release() {
+        let (forwarder, receiver) = native_surface_control_input_channel_with_capacity(1);
+        let authorization = NativeSurfaceControlAuthorization::new(
+            "native-overflow-session".to_string(),
+            true,
+            true,
+        );
+        for code in [0x41, 0x42] {
+            forwarder.submit(
+                23,
+                authorization.clone(),
+                mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code },
+                    pressed: true,
+                },
+            );
+        }
+
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("overflow must synthesize a priority cleanup");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_none());
+    }
+
+    #[test]
+    fn native_input_expired_cleanup_is_never_dropped() {
+        let (forwarder, receiver) = native_surface_control_input_channel_with_capacity(1);
+        let authorization = NativeSurfaceControlAuthorization::new(
+            "native-expired-cleanup-session".to_string(),
+            true,
+            true,
+        );
+        let mut cleanup = NativeSurfaceControlInput::new(
+            29,
+            authorization.clone(),
+            authorization.current_generation(),
+            mrd_ipc::ControlInputEvent::ReleaseAll,
+            Duration::ZERO,
+        );
+        cleanup.deadline = std::time::Instant::now() - Duration::from_secs(1);
+        authorization.deactivate();
+
+        forwarder.relay_existing(cleanup);
+
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("expired cleanup must still leave the queue after authorization retires");
+        assert_eq!(release.session_id, "native-expired-cleanup-session");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
     }
 
     fn wide(value: &str) -> Vec<u16> {
@@ -1369,6 +1991,7 @@ mod remote_display_surface_input_tests {
                 probe_endpoints: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), peer_port)],
                 announce_interval: Duration::from_millis(50),
                 peer_ttl: Duration::from_secs(5),
+                allow_unsigned_diagnostics: false,
             },
         ))
     }
@@ -1637,7 +2260,7 @@ mod remote_display_surface_input_tests {
 
     #[test]
     fn remote_display_surface_input_forwards_wndproc_events_with_session_id() {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = native_surface_control_input_channel();
         assert!(
             install_control_input_forwarder(sender),
             "native surface input forwarder should only be installed once in tests"
@@ -1660,7 +2283,7 @@ mod remote_display_surface_input_tests {
             }),
         )
         .expect("create native render surface");
-        surface.set_control_session_id(Some("native-forward-session".to_string()));
+        surface.set_control_binding(Some("native-forward-session".to_string()), true, true);
 
         unsafe {
             SendMessageW(
@@ -1680,6 +2303,27 @@ mod remote_display_surface_input_tests {
             mrd_ipc::ControlInputEvent::MouseMove { x: 84, y: 48 }
         );
 
+        surface.set_control_binding(None, false, false);
+        let release = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("removing a native control binding must release active input first");
+        assert_eq!(release.session_id, "native-forward-session");
+        assert_eq!(release.event, mrd_ipc::ControlInputEvent::ReleaseAll);
+
+        unsafe {
+            SendMessageW(
+                surface.hwnd,
+                WM_MOUSEMOVE,
+                WPARAM(0),
+                LPARAM(lparam(21, 12)),
+            );
+        }
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(20)).is_none(),
+            "an unbound native surface must not forward control input"
+        );
+
+        surface.set_control_binding(Some("native-forward-session".to_string()), true, true);
         drop(surface);
 
         let release = receiver
@@ -1805,8 +2449,8 @@ mod remote_display_surface_input_tests {
             .clear();
         keyboard_window.focus();
 
-        let (forward_sender, forward_receiver) = std::sync::mpsc::channel();
-        let (worker_sender, worker_receiver) = std::sync::mpsc::channel();
+        let (forward_sender, forward_receiver) = native_surface_control_input_channel();
+        let (worker_sender, worker_receiver) = native_surface_control_input_channel();
         let (observed_sender, observed_receiver) = std::sync::mpsc::channel();
         let (response_sender, response_receiver) = std::sync::mpsc::channel();
         let observed_receiver = Arc::new(Mutex::new(observed_receiver));
@@ -1816,9 +2460,9 @@ mod remote_display_surface_input_tests {
             "native surface input forwarder should only be installed once in this smoke"
         );
         let _proxy = std::thread::spawn(move || {
-            for input in forward_receiver {
+            while let Some(input) = forward_receiver.recv() {
                 let _ = observed_sender.send(input.clone());
-                let _ = worker_sender.send(input);
+                worker_sender.relay_existing(input);
             }
         });
         let _forwarder =
@@ -1842,7 +2486,7 @@ mod remote_display_surface_input_tests {
             None,
         )
         .expect("create native render surface");
-        surface.set_control_session_id(Some(session_id.0.clone()));
+        surface.set_control_binding(Some(session_id.0.clone()), true, true);
 
         keyboard_window.focus();
         unsafe {

@@ -433,14 +433,17 @@ describe("E2ETestPage LAN automation", () => {
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
-        "ipc_send_control_input",
+        "ipc_secure_remote",
         expect.objectContaining({
-          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
-          event: {
-            kind: "mouse_move",
-            x: 1,
-            y: 1,
-          },
+          request: expect.objectContaining({
+            type: "SendControlInput",
+            session_id: expect.stringMatching(/^lan-e2e-agent-device-/),
+            event: {
+              kind: "mouse_move",
+              x: 1,
+              y: 1,
+            },
+          }),
         })
       );
     });
@@ -871,9 +874,14 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
       }
       return Promise.resolve("started");
     }
-    if (command === "ipc_send_control_input") {
+    if (command === "ipc_secure_remote") {
+      const request = args?.request as Record<string, unknown> | undefined;
+      if (request?.type !== "SendControlInput") {
+        return Promise.resolve(null);
+      }
       return Promise.resolve({
-        session_id: args?.sessionId,
+        type: "ControlInputAccepted",
+        session_id: request.session_id,
         lane: "realtime",
         event_count: 1,
       });

@@ -98,9 +98,15 @@ use dynamic_window_fps::{
 };
 #[cfg(test)]
 use dynamic_window_fps::{DynamicWindowFpsInput, DynamicWindowFpsTier};
-pub use lan_control_input::request_lan_control_input;
+pub(crate) use lan_control_input::request_authenticated_lan_control_input_under_security_gate;
 use lan_control_input::{
-    accept_or_replay_lan_control_input, LanControlInputAckState, LanControlInputDedupeKey,
+    accept_or_replay_lan_control_input, process_authenticated_control_input_datagram,
+    AuthenticatedControlReplayKey, AuthenticatedControlReplayState, AuthenticatedControlSenderKey,
+    AuthenticatedControlSenderState, LanControlInputAckState, LanControlInputDedupeKey,
+};
+pub use lan_control_input::{
+    request_authenticated_lan_control_input, request_lan_control_input,
+    AUTHENTICATED_CONTROL_INPUT_DATAGRAM_PREFIX,
 };
 use local_network_identity::local_lan_announcement_mac_address;
 use media_access_unit::{h264_access_unit_is_keyframe, LanAccessUnitCodec};
@@ -283,14 +289,15 @@ pub use protocol::{
 };
 use protocol::{
     DISCOVERY_PACKET_BUFFER_BYTES, LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
-    LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_MEDIA_PROFILE_CONTROL_TRANSPORT,
-    LAN_MEDIA_PROTOCOL_VERSION, LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT,
-    LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
+    LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
+    LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
+    LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
+    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
     LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
 };
 #[cfg(test)]
 use protocol::{
-    DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY, LAN_INPUT_CONTROL_TRANSPORT,
+    DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY,
     LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
 use remote_power::accept_lan_remote_device_power_action;
@@ -384,6 +391,14 @@ const LAN_INCOMING_AUTHORIZATION_RATE_PEER_LIMIT: usize = 256;
 const LAN_PRE_AUTHORIZATION_AUDIT_WRITE_LIMIT: u32 = 17;
 const LAN_PRE_AUTHORIZATION_AUDIT_DETAIL_LIMIT: u32 = LAN_PRE_AUTHORIZATION_AUDIT_WRITE_LIMIT - 1;
 const LAN_PRE_AUTHORIZATION_AUDIT_WINDOW_MS: u64 = 10_000;
+const LAN_INCOMING_CONTROL_TASK_LIMIT: usize = 64;
+const LAN_INCOMING_CONTROL_RATE_LIMIT: u32 = 4_096;
+const LAN_INCOMING_CONTROL_GLOBAL_RATE_LIMIT: u32 = 16_384;
+const LAN_INCOMING_CONTROL_RATE_WINDOW_MS: u64 = 10_000;
+const LAN_INCOMING_CONTROL_RATE_PEER_LIMIT: usize = 256;
+const LAN_CONTROL_DENIAL_AUDIT_WRITE_LIMIT: u32 = 17;
+const LAN_CONTROL_DENIAL_AUDIT_DETAIL_LIMIT: u32 = LAN_CONTROL_DENIAL_AUDIT_WRITE_LIMIT - 1;
+const LAN_CONTROL_DENIAL_AUDIT_WINDOW_MS: u64 = 10_000;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
@@ -398,10 +413,18 @@ pub struct LanDiscoveryState {
     signed_replays: Mutex<LanSignedReplayCache>,
     pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
+    authenticated_control_inputs:
+        Mutex<HashMap<AuthenticatedControlReplayKey, AuthenticatedControlReplayState>>,
+    authenticated_control_senders:
+        Mutex<HashMap<AuthenticatedControlSenderKey, Arc<AuthenticatedControlSenderState>>>,
     incoming_authorization_tasks: Arc<Semaphore>,
     incoming_authorization_rates: Mutex<HashMap<IpAddr, LanIncomingAuthorizationRate>>,
     incoming_authorization_global_rate: Mutex<Option<LanIncomingAuthorizationRate>>,
     pre_authorization_audit_window: Mutex<LanPreAuthorizationAuditWindow>,
+    incoming_control_tasks: Arc<Semaphore>,
+    incoming_control_rates: Mutex<HashMap<IpAddr, LanIncomingAuthorizationRate>>,
+    incoming_control_global_rate: Mutex<Option<LanIncomingAuthorizationRate>>,
+    control_denial_audit_window: Mutex<LanPreAuthorizationAuditWindow>,
     probe_requested: Notify,
     peer_changed: Notify,
 }
@@ -453,12 +476,18 @@ impl LanDiscoveryState {
             signed_replays: Mutex::new(LanSignedReplayCache::default()),
             pending_sessions: Arc::new(StdMutex::new(HashSet::new())),
             recent_control_inputs: Mutex::new(HashMap::new()),
+            authenticated_control_inputs: Mutex::new(HashMap::new()),
+            authenticated_control_senders: Mutex::new(HashMap::new()),
             incoming_authorization_tasks: Arc::new(Semaphore::new(
                 LAN_INCOMING_AUTHORIZATION_TASK_LIMIT,
             )),
             incoming_authorization_rates: Mutex::new(HashMap::new()),
             incoming_authorization_global_rate: Mutex::new(None),
             pre_authorization_audit_window: Mutex::new(LanPreAuthorizationAuditWindow::default()),
+            incoming_control_tasks: Arc::new(Semaphore::new(LAN_INCOMING_CONTROL_TASK_LIMIT)),
+            incoming_control_rates: Mutex::new(HashMap::new()),
+            incoming_control_global_rate: Mutex::new(None),
+            control_denial_audit_window: Mutex::new(LanPreAuthorizationAuditWindow::default()),
             probe_requested: Notify::new(),
             peer_changed: Notify::new(),
         }
@@ -562,6 +591,104 @@ impl LanDiscoveryState {
             };
         }
 
+        window.suppressed_denials = window.suppressed_denials.saturating_add(1);
+        if !window.overflow_marker_written {
+            window.overflow_marker_written = true;
+            LanPreAuthorizationAuditAdmission::OverflowMarker
+        } else {
+            LanPreAuthorizationAuditAdmission::Suppressed
+        }
+    }
+
+    async fn try_admit_authenticated_control(
+        &self,
+        source_ip: IpAddr,
+        received_at_ms: u64,
+    ) -> Option<OwnedSemaphorePermit> {
+        let permit = self
+            .incoming_control_tasks
+            .clone()
+            .try_acquire_owned()
+            .ok()?;
+        let mut rates = self.incoming_control_rates.lock().await;
+        rates.retain(|_, rate| {
+            received_at_ms.saturating_sub(rate.last_seen_ms) <= LAN_INCOMING_CONTROL_RATE_WINDOW_MS
+        });
+        if !rates.contains_key(&source_ip) && rates.len() >= LAN_INCOMING_CONTROL_RATE_PEER_LIMIT {
+            if let Some(oldest) = rates
+                .iter()
+                .min_by_key(|(_, rate)| rate.last_seen_ms)
+                .map(|(ip, _)| *ip)
+            {
+                rates.remove(&oldest);
+            }
+        }
+        let rate = rates
+            .entry(source_ip)
+            .or_insert(LanIncomingAuthorizationRate {
+                window_started_ms: received_at_ms,
+                request_count: 0,
+                last_seen_ms: received_at_ms,
+            });
+        if received_at_ms.saturating_sub(rate.window_started_ms)
+            >= LAN_INCOMING_CONTROL_RATE_WINDOW_MS
+        {
+            rate.window_started_ms = received_at_ms;
+            rate.request_count = 0;
+        }
+        rate.last_seen_ms = received_at_ms;
+        if rate.request_count >= LAN_INCOMING_CONTROL_RATE_LIMIT {
+            return None;
+        }
+        rate.request_count = rate.request_count.saturating_add(1);
+        drop(rates);
+
+        let mut global_rate = self.incoming_control_global_rate.lock().await;
+        let global_rate = global_rate.get_or_insert(LanIncomingAuthorizationRate {
+            window_started_ms: received_at_ms,
+            request_count: 0,
+            last_seen_ms: received_at_ms,
+        });
+        if received_at_ms.saturating_sub(global_rate.window_started_ms)
+            >= LAN_INCOMING_CONTROL_RATE_WINDOW_MS
+        {
+            global_rate.window_started_ms = received_at_ms;
+            global_rate.request_count = 0;
+        }
+        global_rate.last_seen_ms = received_at_ms;
+        if global_rate.request_count >= LAN_INCOMING_CONTROL_GLOBAL_RATE_LIMIT {
+            return None;
+        }
+        global_rate.request_count = global_rate.request_count.saturating_add(1);
+        Some(permit)
+    }
+
+    async fn admit_control_input_denial_audit(
+        &self,
+        received_at_ms: u64,
+    ) -> LanPreAuthorizationAuditAdmission {
+        let mut window = self.control_denial_audit_window.lock().await;
+        let window_expired = window.window_started_ms.is_none_or(|window_started_ms| {
+            received_at_ms.saturating_sub(window_started_ms) >= LAN_CONTROL_DENIAL_AUDIT_WINDOW_MS
+        });
+        if window_expired {
+            let previous_window_suppressed = window.suppressed_denials;
+            *window = LanPreAuthorizationAuditWindow {
+                window_started_ms: Some(received_at_ms),
+                detailed_writes: 1,
+                suppressed_denials: 0,
+                overflow_marker_written: false,
+            };
+            return LanPreAuthorizationAuditAdmission::Detailed {
+                previous_window_suppressed,
+            };
+        }
+        if window.detailed_writes < LAN_CONTROL_DENIAL_AUDIT_DETAIL_LIMIT {
+            window.detailed_writes = window.detailed_writes.saturating_add(1);
+            return LanPreAuthorizationAuditAdmission::Detailed {
+                previous_window_suppressed: 0,
+            };
+        }
         window.suppressed_denials = window.suppressed_denials.saturating_add(1);
         if !window.overflow_marker_written {
             window.overflow_marker_written = true;
@@ -1110,9 +1237,15 @@ async fn begin_outgoing_authorization_under_security_gate(
             session_id.0
         );
     }
+    let bound_at_ms = request.created_at_ms;
     app_state
         .session_authorizations
         .begin_outgoing(request)
+        .await
+        .map_err(|failure| anyhow::anyhow!(failure.message))?;
+    app_state
+        .session_authorizations
+        .bind_authenticated_peer_key(session_id, peer_public_key, bound_at_ms)
         .await
         .map_err(|failure| anyhow::anyhow!(failure.message))?;
     Ok(())
@@ -1875,6 +2008,33 @@ async fn receive_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
+                if buffer[..len].starts_with(AUTHENTICATED_CONTROL_INPUT_DATAGRAM_PREFIX) {
+                    let Some(admission_permit) = app_state
+                        .lan_discovery
+                        .try_admit_authenticated_control(addr.ip(), now_ms())
+                        .await
+                    else {
+                        tracing::warn!(%addr, "dropped rate-limited authenticated control input");
+                        continue;
+                    };
+                    let request_socket = socket.clone();
+                    let request_state = app_state.clone();
+                    let packet = buffer[..len].to_vec();
+                    tokio::spawn(async move {
+                        let _admission_permit = admission_permit;
+                        if let Err(error) = process_lan_discovery_packet(
+                            request_socket.as_ref(),
+                            &request_state,
+                            &packet,
+                            addr,
+                        )
+                        .await
+                        {
+                            tracing::debug!(%error, %addr, "ignored authenticated control input");
+                        }
+                    });
+                    continue;
+                }
                 if let Ok(LanDiscoveryPacket::SignedRemoteSessionRequest(request)) =
                     serde_json::from_slice::<LanDiscoveryPacket>(&buffer[..len])
                 {
@@ -1922,6 +2082,15 @@ pub async fn process_lan_discovery_packet(
     bytes: &[u8],
     addr: SocketAddr,
 ) -> Result<()> {
+    if let Some(envelope_bytes) = bytes.strip_prefix(AUTHENTICATED_CONTROL_INPUT_DATAGRAM_PREFIX) {
+        return process_authenticated_control_input_datagram(
+            socket,
+            app_state,
+            envelope_bytes,
+            addr,
+        )
+        .await;
+    }
     handle_packet(socket, app_state, bytes, addr).await
 }
 
@@ -2435,6 +2604,10 @@ async fn handle_signed_remote_session_request(
         anyhow::bail!("signed LAN session id is already in use");
     }
 
+    let input_control_available =
+        app_state.security_is_healthy() && app_state.control_input().lock().await.is_available();
+    let authorization_capabilities =
+        lan_authorization_capabilities_with_input_control(input_control_available);
     let _pending_authorization = match app_state
         .session_authorizations
         .begin_verified_incoming(
@@ -2445,9 +2618,9 @@ async fn handle_signed_remote_session_request(
                 peer_key_epoch: request.payload.source_key_epoch,
                 access_mode: request.payload.access_mode,
                 requested_scopes: request.payload.requested_scopes.clone(),
-                peer_permission_ceiling: lan_authorization_capabilities(),
-                machine_permission_ceiling: lan_authorization_capabilities(),
-                runtime_capabilities: lan_authorization_capabilities(),
+                peer_permission_ceiling: authorization_capabilities.clone(),
+                machine_permission_ceiling: authorization_capabilities.clone(),
+                runtime_capabilities: authorization_capabilities,
                 transport_kind: request.payload.transport_kind.clone(),
                 request_nonce: request.payload.nonce,
                 created_at_ms: received_at_ms,
@@ -2463,6 +2636,23 @@ async fn handle_signed_remote_session_request(
                 .await;
         }
     };
+    if let Err(failure) = app_state
+        .session_authorizations
+        .bind_authenticated_peer_key(&session_id, &request.public_key, received_at_ms)
+        .await
+    {
+        let _ = app_state
+            .session_authorizations
+            .record_failure(
+                &session_id,
+                RemoteAuthorizationState::PolicyChanged,
+                failure.clone(),
+                received_at_ms,
+            )
+            .await;
+        drop(admission_guard);
+        return send_signed_lan_session_denial(socket, app_state, &request, addr, failure).await;
+    }
     drop(admission_guard);
     let post_admission_result: Result<()> = async {
         ensure_admitted_request_is_live(&request, now_ms())?;
@@ -3082,11 +3272,22 @@ fn post_admission_failure_for_error(
     )
 }
 
+#[cfg(test)]
 fn lan_authorization_capabilities() -> Vec<RemotePermissionScope> {
-    // Until Task 19 authenticates control envelopes, LAN authorization exposes
-    // screen viewing only. New capabilities are added here only after their
-    // service-side enforcement exists.
-    vec![RemotePermissionScope::ScreenView]
+    lan_authorization_capabilities_with_input_control(false)
+}
+
+fn lan_authorization_capabilities_with_input_control(
+    input_control_available: bool,
+) -> Vec<RemotePermissionScope> {
+    let mut capabilities = vec![RemotePermissionScope::ScreenView];
+    if input_control_available {
+        capabilities.extend([
+            RemotePermissionScope::InputPointer,
+            RemotePermissionScope::InputKeyboard,
+        ]);
+    }
+    capabilities
 }
 
 fn authorization_failure_state(code: RemoteReasonCode) -> RemoteAuthorizationState {
@@ -3924,7 +4125,9 @@ async fn build_announcement(
             .map(|(id, name)| (id.0.clone(), name.clone()))
     }?;
 
-    let transports = vec![
+    let input_control_available =
+        app_state.security_is_healthy() && app_state.control_input().lock().await.is_available();
+    let mut transports = vec![
         "quic".to_string(),
         LAN_QUIC_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_MEDIA_PROFILE_TRANSPORT.to_string(),
@@ -3936,9 +4139,10 @@ async fn build_announcement(
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
     ];
-    // Task 19 will advertise input only after ControlEnvelopeV2 is authenticated.
+    if input_control_available {
+        transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
+    }
     // Legacy unsigned power actions remain disabled until Task 40 policy work.
-    let input_control_available = false;
 
     let issued_at_ms = now_ms();
     let announcement = LanAnnouncement {
@@ -4252,10 +4456,19 @@ async fn close_lan_media_sessions(
     session_ids: Vec<SessionId>,
     reason: &'static str,
 ) {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
     terminate_lan_media_sessions(app_state, &session_ids, reason).await;
 }
 
 pub(crate) async fn terminate_authorized_remote_sessions(
+    app_state: &Arc<AppState>,
+    session_ids: &[SessionId],
+) {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    terminate_authorized_remote_sessions_under_security_gate(app_state, session_ids).await;
+}
+
+pub(crate) async fn terminate_authorized_remote_sessions_under_security_gate(
     app_state: &Arc<AppState>,
     session_ids: &[SessionId],
 ) {
@@ -4277,16 +4490,36 @@ async fn terminate_lan_media_sessions(
         if !seen_session_ids.insert(session_id.clone()) {
             continue;
         }
-        if let Some(authorization) = app_state
-            .session_authorizations
-            .snapshot(session_id)
-            .await
-            .filter(|snapshot| {
-                snapshot.authorization_state == RemoteAuthorizationState::Expired
-                    && snapshot.failure.as_ref().map(|failure| failure.code)
-                        == Some(RemoteReasonCode::GrantExpired)
-            })
-        {
+        let mut authorization = app_state.session_authorizations.snapshot(session_id).await;
+        if authorization.as_ref().is_some_and(|snapshot| {
+            !matches!(
+                snapshot.authorization_state,
+                RemoteAuthorizationState::Denied
+                    | RemoteAuthorizationState::Expired
+                    | RemoteAuthorizationState::Revoked
+                    | RemoteAuthorizationState::LockedOut
+                    | RemoteAuthorizationState::PolicyChanged
+            )
+        }) {
+            authorization = app_state
+                .session_authorizations
+                .record_failure(
+                    session_id,
+                    RemoteAuthorizationState::Revoked,
+                    RemoteFailure {
+                        code: RemoteReasonCode::RouteLost,
+                        message: reason.to_string(),
+                        suggested_action: Some("start a new authorized LAN session".to_string()),
+                    },
+                    now_ms(),
+                )
+                .await;
+        }
+        if let Some(authorization) = authorization.filter(|snapshot| {
+            snapshot.authorization_state == RemoteAuthorizationState::Expired
+                && snapshot.failure.as_ref().map(|failure| failure.code)
+                    == Some(RemoteReasonCode::GrantExpired)
+        }) {
             if app_state
                 .audit_log
                 .record(
@@ -4309,6 +4542,7 @@ async fn terminate_lan_media_sessions(
             }
         }
         tracing::info!(session_id = %session_id.0, reason, "closing stale LAN media session");
+        release_control_state_for_session(app_state, session_id).await;
         {
             let mut sessions = app_state.sessions.lock().await;
             if let Some(snapshot) = sessions.get(session_id).cloned() {
@@ -4326,6 +4560,40 @@ async fn terminate_lan_media_sessions(
         }
         app_state.media_tasks.lock().await.abort_session(session_id);
         cleanup_lan_media_resources(app_state, session_id).await;
+    }
+}
+
+async fn release_control_state_for_session(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state
+        .lan_discovery
+        .authenticated_control_inputs
+        .lock()
+        .await
+        .retain(|key, _| key.session_id != session_id.0);
+    app_state
+        .lan_discovery
+        .authenticated_control_senders
+        .lock()
+        .await
+        .retain(|key, _| key.session_id != session_id.0);
+    let control_input = app_state.control_input();
+    let mut control_input = control_input.lock().await;
+    let mut last_error = None;
+    for _ in 0..3 {
+        match control_input.release_session_all(session_id) {
+            Ok(_) => {
+                last_error = None;
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        tracing::warn!(
+            session_id = %session_id.0,
+            %error,
+            "failed to release session-scoped input during LAN termination"
+        );
     }
 }
 

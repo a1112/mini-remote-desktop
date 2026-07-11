@@ -44,6 +44,7 @@ pub(super) async fn mark_session_failed(
     session_id: &SessionId,
     reason: String,
 ) {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
     let failed_at_ms = now_ms();
     if app_state
         .session_authorizations
@@ -65,6 +66,7 @@ pub(super) async fn mark_session_failed(
             )
             .await;
     }
+    super::release_control_state_for_session(app_state, session_id).await;
     let mut sessions = app_state.sessions.lock().await;
     let Some(snapshot) = sessions.get(session_id).cloned() else {
         return;

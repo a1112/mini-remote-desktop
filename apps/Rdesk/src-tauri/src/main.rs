@@ -985,11 +985,55 @@ async fn configure_remote_display_native_surface(
     enabled: bool,
     visible: Option<bool>,
     control_frame_size: Option<NativeSurfaceControlFrameSize>,
+    pointer_control_enabled: Option<bool>,
+    keyboard_control_enabled: Option<bool>,
 ) -> Result<NativeRenderSurfaceSnapshot, String> {
     let label = window.label().to_string();
     let app_handle = window.app_handle().clone();
+    let pointer_control_enabled = pointer_control_enabled.unwrap_or(false);
+    let keyboard_control_enabled = keyboard_control_enabled.unwrap_or(false);
+    let initial_context = state
+        .render_window_registry
+        .lock()
+        .unwrap()
+        .context_for_label(&app_handle, &label);
+    let desired_control_session = (enabled
+        && (pointer_control_enabled || keyboard_control_enabled))
+        .then(|| {
+            initial_context
+                .as_ref()
+                .map(|context| context.session_id.clone())
+        })
+        .flatten();
+
+    #[cfg(windows)]
+    {
+        let current_binding = native_surface_control_binding_for_label(
+            &app_handle,
+            state.inner().clone(),
+            label.clone(),
+        )?;
+        let binding_changed = current_binding.as_ref().is_some_and(|binding| {
+            desired_control_session.as_deref() != Some(binding.session_id.as_str())
+                || pointer_control_enabled != binding.pointer_enabled
+                || keyboard_control_enabled != binding.keyboard_enabled
+        });
+        if binding_changed {
+            if let Some(binding) = current_binding.as_ref() {
+                set_native_surface_control_binding_for_label(
+                    &app_handle,
+                    state.inner().clone(),
+                    label.clone(),
+                    None,
+                    false,
+                    false,
+                )?;
+                release_native_surface_control_binding(&binding.session_id).await?;
+            }
+        }
+    }
     eprintln!(
-        "render-surface ui configure request label={label} enabled={enabled} visible={visible:?}"
+        "render-surface ui configure request label={label} enabled={enabled} visible={visible:?} pointer_control={pointer_control_enabled} keyboard_control={keyboard_control_enabled}"
     );
     let snapshot = configure_native_surface_for_window(
         &window,
@@ -1049,19 +1093,21 @@ async fn configure_remote_display_native_surface(
 
     #[cfg(windows)]
     if snapshot.attached {
-        if let Some(context) = context.as_ref() {
-            if let Err(error) = set_native_surface_control_session_for_label(
-                &app_handle,
-                state.inner().clone(),
-                label.clone(),
-                Some(context.session_id.clone()),
-            ) {
-                eprintln!(
-                    "render-surface input session bind failed label={label} session_id={} error={error}",
-                    context.session_id
-                );
-            }
-        }
+        let session_id = desired_control_session.clone();
+        set_native_surface_control_binding_for_label(
+            &app_handle,
+            state.inner().clone(),
+            label.clone(),
+            session_id.clone(),
+            pointer_control_enabled,
+            keyboard_control_enabled,
+        )
+        .map_err(|error| {
+            format!(
+                "render-surface input binding failed label={label} session_id={} error={error}",
+                session_id.as_deref().unwrap_or("-")
+            )
+        })?;
     }
 
     if snapshot.attached && context.is_none() {
@@ -1281,12 +1327,14 @@ fn detach_native_surface_for_label(
 }
 
 #[cfg(windows)]
-fn set_native_surface_control_session_for_label(
+fn set_native_surface_control_binding_for_label(
     app_handle: &AppHandle,
     state: AppState,
     label: String,
     session_id: Option<String>,
-) -> Result<(), String> {
+    pointer_enabled: bool,
+    keyboard_enabled: bool,
+) -> Result<Option<remote_display_surface::NativeSurfaceControlBindingSnapshot>, String> {
     let app_handle = app_handle.clone();
     let (sender, receiver) = std::sync::mpsc::channel();
     app_handle
@@ -1295,7 +1343,7 @@ fn set_native_surface_control_session_for_label(
                 .remote_display_surfaces
                 .lock()
                 .unwrap()
-                .set_control_session_id(&label, session_id);
+                .set_control_binding(&label, session_id, pointer_enabled, keyboard_enabled);
             let _ = sender.send(result);
         })
         .map_err(|error| format!("schedule native surface input session update failed: {error}"))?;
@@ -1303,6 +1351,70 @@ fn set_native_surface_control_session_for_label(
     receiver
         .recv()
         .map_err(|error| format!("native surface input session update failed: {error}"))?
+}
+
+#[cfg(windows)]
+fn native_surface_control_binding_for_label(
+    app_handle: &AppHandle,
+    state: AppState,
+    label: String,
+) -> Result<Option<remote_display_surface::NativeSurfaceControlBindingSnapshot>, String> {
+    let app_handle = app_handle.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app_handle
+        .run_on_main_thread(move || {
+            let binding = state
+                .remote_display_surfaces
+                .lock()
+                .unwrap()
+                .control_binding(&label);
+            let _ = sender.send(binding);
+        })
+        .map_err(|error| format!("schedule native surface input binding read failed: {error}"))?;
+
+    receiver
+        .recv()
+        .map_err(|error| format!("native surface input binding read failed: {error}"))
+}
+
+#[cfg(windows)]
+async fn release_native_surface_control_binding(session_id: &str) -> Result<(), String> {
+    use mrd_ipc::{ControlInputEvent, IpcRequest, IpcResponse, RemoteReasonCode};
+
+    let endpoint = mrd_ipc::transport::IpcEndpoint::service_from_env_or_default();
+    let mut client = mrd_ipc::client::IpcClient::with_endpoint(endpoint);
+    let response = client
+        .send_request(IpcRequest::SendControlInput {
+            session_id: SessionId(session_id.to_string()),
+            event: ControlInputEvent::ReleaseAll,
+        })
+        .await
+        .map_err(|error| format!("native input cleanup IPC failed: {error}"))?;
+    match response {
+        IpcResponse::ControlInputAccepted { .. } => Ok(()),
+        IpcResponse::RemoteAccessError { failure, .. }
+            if matches!(
+                failure.code,
+                RemoteReasonCode::GrantExpired
+                    | RemoteReasonCode::GrantRevoked
+                    | RemoteReasonCode::PolicyChanged
+                    | RemoteReasonCode::RouteLost
+            ) =>
+        {
+            // The authoritative service terminal transition owns pressed-state cleanup.
+            Ok(())
+        }
+        IpcResponse::RemoteAccessError { failure, .. } => Err(format!(
+            "native input cleanup rejected ({:?}): {}",
+            failure.code, failure.message
+        )),
+        IpcResponse::Error { code, message } => {
+            Err(format!("native input cleanup rejected ({code}): {message}"))
+        }
+        other => Err(format!(
+            "unexpected native input cleanup response: {other:?}"
+        )),
+    }
 }
 
 fn render_mode_for_native_surface(snapshot: &NativeRenderSurfaceSnapshot) -> &'static str {
@@ -4213,8 +4325,8 @@ fn prefer_x11_backend_for_linux_native_render() {
 
 #[cfg(windows)]
 fn spawn_native_surface_control_input_forwarder() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    if !remote_display_surface::install_control_input_forwarder(sender) {
+    let (forwarder, receiver) = remote_display_surface::native_surface_control_input_channel();
+    if !remote_display_surface::install_control_input_forwarder(forwarder) {
         return;
     }
 
@@ -4224,7 +4336,7 @@ fn spawn_native_surface_control_input_forwarder() {
 
 #[cfg(windows)]
 fn spawn_native_surface_control_input_forwarder_for_receiver(
-    receiver: std::sync::mpsc::Receiver<remote_display_surface::NativeSurfaceControlInput>,
+    receiver: remote_display_surface::NativeSurfaceControlInputReceiver,
     endpoint: mrd_ipc::transport::IpcEndpoint,
 ) -> std::thread::JoinHandle<()> {
     spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
@@ -4234,7 +4346,7 @@ fn spawn_native_surface_control_input_forwarder_for_receiver(
 
 #[cfg(windows)]
 fn spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
-    receiver: std::sync::mpsc::Receiver<remote_display_surface::NativeSurfaceControlInput>,
+    receiver: remote_display_surface::NativeSurfaceControlInputReceiver,
     endpoint: mrd_ipc::transport::IpcEndpoint,
     reporter: Option<std::sync::mpsc::Sender<(String, Result<mrd_ipc::IpcResponse, String>)>>,
 ) -> std::thread::JoinHandle<()> {
@@ -4247,7 +4359,7 @@ fn spawn_native_surface_control_input_forwarder_for_receiver_with_reporter(
             }
         };
 
-        for input in receiver {
+        while let Some(input) = receiver.recv() {
             let endpoint = endpoint.clone();
             let reporter = reporter.clone();
             runtime.block_on(async move {
@@ -4325,21 +4437,26 @@ mod native_surface_control_forwarder_tests {
             request_sender.send(request).expect("publish request");
         });
 
-        let (input_sender, input_receiver) = std::sync::mpsc::channel();
+        let (input_forwarder, input_receiver) =
+            remote_display_surface::native_surface_control_input_channel();
         let worker =
             spawn_native_surface_control_input_forwarder_for_receiver(input_receiver, endpoint);
-        input_sender
-            .send(remote_display_surface::NativeSurfaceControlInput {
-                session_id: "native-forward-ipc-session".to_string(),
-                event: mrd_ipc::ControlInputEvent::MouseMove { x: 7, y: 9 },
-            })
-            .expect("send native surface input");
+        let authorization = remote_display_surface::NativeSurfaceControlAuthorization::new(
+            "native-forward-ipc-session".to_string(),
+            true,
+            true,
+        );
+        input_forwarder.submit(
+            1,
+            authorization,
+            mrd_ipc::ControlInputEvent::MouseMove { x: 7, y: 9 },
+        );
 
         let request = tokio::time::timeout(Duration::from_secs(2), request_receiver)
             .await
             .expect("forwarded request timeout")
             .expect("forwarded request");
-        drop(input_sender);
+        drop(input_forwarder);
         worker.join().expect("forwarder worker exits");
         server_task.await.expect("ipc capture task exits");
 
