@@ -208,6 +208,7 @@ fn execute_command(
     execution: &ExecutionContext,
 ) -> ExecuteCommand {
     let mut execute = ExecuteCommand {
+        request_token: u64::from(grant_id[0]).max(1),
         command_id: [grant_id[0].wrapping_add(20); 16],
         grant: ExecuteGrant {
             claims: ExecuteGrantClaims {
@@ -243,6 +244,7 @@ fn event(
     payload: InputEventPayload,
 ) -> InputEventEnvelope {
     InputEventEnvelope {
+        request_token: sequence,
         session_id: session_id(),
         resource_id,
         start_grant_id,
@@ -752,6 +754,7 @@ async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
         START_GRANT_ID,
         &context(),
     );
+    let start_token = start.request_token;
     write_frame(
         &mut service_stream,
         &ServiceToAgent::Execute(Box::new(start)),
@@ -764,6 +767,7 @@ async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
         .message
     {
         AgentToService::CommandResult(result) => {
+            assert_eq!(result.request_token, start_token);
             assert_eq!(result.outcome, CommandOutcome::Completed)
         }
         other => panic!("expected StartInput result, got {other:?}"),
@@ -790,6 +794,7 @@ async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
         .message
     {
         AgentToService::InputAck(ack) => {
+            assert_eq!(ack.request_token, key_down.request_token);
             assert_eq!(ack.outcome, InputAckOutcome::Applied);
             assert_eq!(ack.event_commitment, key_down.commitment().unwrap());
         }

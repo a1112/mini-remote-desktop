@@ -723,6 +723,7 @@ impl AgentRuntime {
         write_frame(
             writer,
             &AgentToService::CommandResult(CommandResult {
+                request_token: execute.request_token,
                 registration_id: identity.registration_id,
                 command_id: execute.command_id,
                 outcome,
@@ -780,6 +781,7 @@ impl AgentRuntime {
         write_frame(
             writer,
             &AgentToService::InputAck(InputAck {
+                request_token: envelope.request_token,
                 registration_id: identity.registration_id,
                 registration_epoch: identity.registration_epoch,
                 session_id: envelope.session_id.clone(),
@@ -811,6 +813,7 @@ impl AgentRuntime {
         write_frame(
             writer,
             &AgentToService::ConsentResult(ConsentResult {
+                request_token: request.request_token,
                 request_id: request.request_id,
                 session_id: request.session_id,
                 peer: request.peer,

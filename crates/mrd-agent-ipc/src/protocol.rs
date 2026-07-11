@@ -86,6 +86,21 @@ pub(crate) mod bytes_64 {
     }
 }
 
+mod request_token {
+    use serde::{de::Error as _, Deserialize, Deserializer};
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let token = u64::deserialize(deserializer)?;
+        if token == 0 {
+            return Err(D::Error::custom("request token must be nonzero"));
+        }
+        Ok(token)
+    }
+}
+
 /// A remote peer identity bound to an authorization decision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +226,9 @@ pub struct AgentCapabilitySnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentRequest {
+    /// Service-assigned transport correlation token. This is not authorization data.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// One-shot consent request identifier.
     pub request_id: [u8; 16],
     /// Session requesting consent.
@@ -247,6 +265,9 @@ pub enum ConsentDecision {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConsentResult {
+    /// Exact transport token copied from the request.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// Consent request being answered.
     pub request_id: [u8; 16],
     /// Session from the original request.
@@ -355,7 +376,8 @@ pub fn validate_consent_result(
     result: &ConsentResult,
     now_ms: u64,
 ) -> Result<ValidatedConsent, ConsentValidationError> {
-    if request.request_id.iter().all(|byte| *byte == 0)
+    if request.request_token == 0
+        || request.request_id.iter().all(|byte| *byte == 0)
         || request.session_id.0.is_empty()
         || request.session_id.0.len() > AGENT_IPC_MAX_IDENTIFIER_BYTES
         || request.peer.device_id.0.is_empty()
@@ -371,7 +393,9 @@ pub fn validate_consent_result(
     {
         return Err(ConsentValidationError::InvalidRequest);
     }
-    if result.request_id != request.request_id
+    if result.request_token == 0
+        || result.request_token != request.request_token
+        || result.request_id != request.request_id
         || result.session_id != request.session_id
         || result.peer != request.peer
         || result.policy_revision != request.policy_revision
@@ -541,6 +565,9 @@ impl InputEventPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputEventEnvelope {
+    /// Service-assigned transport correlation token.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// Product session that owns the input resource.
     pub session_id: SessionId,
     /// Input-resource identity created by `StartInput`.
@@ -556,7 +583,8 @@ pub struct InputEventEnvelope {
 impl InputEventEnvelope {
     /// Validate bounded identifiers, non-sentinel bindings, sequence, and payload shape.
     pub fn validate_shape(&self) -> Result<(), InputRejection> {
-        if self.session_id.0.trim().is_empty()
+        if self.request_token == 0
+            || self.session_id.0.trim().is_empty()
             || self.session_id.0.len() > AGENT_IPC_MAX_IDENTIFIER_BYTES
             || self.session_id.0.contains('\0')
             || self.resource_id.iter().all(|byte| *byte == 0)
@@ -570,10 +598,28 @@ impl InputEventEnvelope {
         Ok(())
     }
 
-    /// Return a domain-separated commitment covering every event binding and payload field.
+    /// Return a domain-separated commitment covering every semantic event field.
+    ///
+    /// The service-assigned request token is transport correlation metadata and
+    /// is deliberately excluded so a retry cannot become a different input.
     pub fn commitment(&self) -> Result<[u8; 32], InputRejection> {
         self.validate_shape()?;
-        let encoded = serde_json::to_vec(self).map_err(|_| InputRejection::InvalidEvent)?;
+        #[derive(Serialize)]
+        struct SemanticInputEvent<'a> {
+            session_id: &'a SessionId,
+            resource_id: &'a [u8; 16],
+            start_grant_id: &'a [u8; 32],
+            sequence: u64,
+            event: &'a InputEventPayload,
+        }
+        let encoded = serde_json::to_vec(&SemanticInputEvent {
+            session_id: &self.session_id,
+            resource_id: &self.resource_id,
+            start_grant_id: &self.start_grant_id,
+            sequence: self.sequence,
+            event: &self.event,
+        })
+        .map_err(|_| InputRejection::InvalidEvent)?;
         let mut context = DigestContext::new(&SHA256);
         context.update(AGENT_INPUT_EVENT_COMMITMENT_CONTEXT);
         context.update(&(encoded.len() as u64).to_le_bytes());
@@ -634,6 +680,9 @@ pub enum InputAckOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputAck {
+    /// Exact transport token copied from the input event.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// Registration that processed the event.
     pub registration_id: [u8; 16],
     /// Registration generation that processed the event.
@@ -831,6 +880,18 @@ impl AgentCommand {
         self.digest()
     }
 
+    /// Desktop capability required to execute this command family.
+    pub fn required_capability(&self) -> AgentCapability {
+        match self {
+            Self::StartCapture { .. } | Self::StopCapture { .. } => AgentCapability::Capture,
+            Self::StartInput { .. } | Self::StopInput { .. } => AgentCapability::Input,
+            Self::StartAudio { .. } | Self::StopAudio { .. } => AgentCapability::Audio,
+            Self::StartClipboard { .. } | Self::StopClipboard { .. } => AgentCapability::Clipboard,
+            Self::StartFile { .. } | Self::StopFile { .. } => AgentCapability::File,
+            Self::StartRender { .. } | Self::StopRender { .. } => AgentCapability::Render,
+        }
+    }
+
     /// Permission scopes that must be present before this command can start work.
     pub fn required_scopes(&self) -> PermissionScopes {
         let mut scopes = PermissionScopes::new();
@@ -913,6 +974,12 @@ impl AgentCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExecuteCommand {
+    /// Service-assigned transport correlation token.
+    ///
+    /// This field is deliberately excluded from [`Self::command_digest`], so a
+    /// retry attempt does not change the signed authorization command.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// Per-command idempotency identifier.
     pub command_id: [u8; 16],
     /// Authorization proof bound to this command.
@@ -937,6 +1004,11 @@ impl ExecuteCommand {
     /// Permission scopes required by the command.
     pub fn required_scopes(&self) -> PermissionScopes {
         self.command.required_scopes()
+    }
+
+    /// Desktop capability required by the enclosed command family.
+    pub fn required_capability(&self) -> AgentCapability {
+        self.command.required_capability()
     }
 
     /// Whether this command is teardown-only cleanup.
@@ -1070,6 +1142,9 @@ pub enum CommandOutcome {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommandResult {
+    /// Exact transport token copied from the execute command.
+    #[serde(deserialize_with = "request_token::deserialize")]
+    pub request_token: u64,
     /// Registration that processed the command.
     pub registration_id: [u8; 16],
     /// Command being completed.

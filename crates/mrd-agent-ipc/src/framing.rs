@@ -7,7 +7,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// Current protocol major version.
 pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 /// Current protocol minor version.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 0;
+///
+/// Minor version 1 adds mandatory nonzero request tokens to every correlated
+/// consent, execute, and input request/response pair.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 1;
+/// Minimum negotiated minor version that supports correlated request tokens.
+pub const AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR: u16 = 1;
 /// Maximum JSON payload carried by one control frame.
 pub const AGENT_IPC_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Bytes in the length-and-version frame header.

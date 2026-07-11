@@ -41,25 +41,7 @@ impl AgentCapabilities {
     /// long as resources of that kind can exist; transient device availability
     /// must not remove the capability needed to stop those resources.
     pub fn supports_command(&self, command: &AgentCommand) -> bool {
-        let required = match command {
-            AgentCommand::StartCapture { .. } | AgentCommand::StopCapture { .. } => {
-                AgentCapability::Capture
-            }
-            AgentCommand::StartInput { .. } | AgentCommand::StopInput { .. } => {
-                AgentCapability::Input
-            }
-            AgentCommand::StartAudio { .. } | AgentCommand::StopAudio { .. } => {
-                AgentCapability::Audio
-            }
-            AgentCommand::StartClipboard { .. } | AgentCommand::StopClipboard { .. } => {
-                AgentCapability::Clipboard
-            }
-            AgentCommand::StartFile { .. } | AgentCommand::StopFile { .. } => AgentCapability::File,
-            AgentCommand::StartRender { .. } | AgentCommand::StopRender { .. } => {
-                AgentCapability::Render
-            }
-        };
-        self.implemented.contains(&required)
+        self.implemented.contains(&command.required_capability())
     }
 }
 

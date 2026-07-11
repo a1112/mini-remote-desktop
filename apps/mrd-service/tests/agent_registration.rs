@@ -274,6 +274,29 @@ fn exact_route_binding_preserves_session_generation_desktop_and_capability() {
 }
 
 #[test]
+fn correlated_requests_reject_an_agent_negotiated_below_protocol_minor_one() {
+    let registry = registry();
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+    let binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_002)
+        .expect("bind legacy agent");
+
+    assert_eq!(
+        registry
+            .resolve_exact_with_minimum_minor(&binding, AgentCapability::Capture, 1, 1_002)
+            .expect_err("minor zero cannot receive required-token requests"),
+        AgentRouteError::ProtocolVersionUnavailable
+    );
+}
+
+#[test]
 fn exact_route_selection_requires_a_healthy_capable_agent() {
     let registry = registry();
     assert_eq!(

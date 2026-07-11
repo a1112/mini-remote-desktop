@@ -3,7 +3,7 @@ use mrd_agent_ipc::{
     AgentRegistered, AgentToService, CommandOutcome, CommandResult, ConsentDecision,
     ConsentRequest, ConsentResult, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
     GrantAudience, InputAck, InputAckOutcome, InputEventEnvelope, InputEventPayload, PeerBinding,
-    RegistrationProofVerifier, ServiceToAgent,
+    RegistrationProofVerifier, ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
@@ -176,7 +176,7 @@ impl ConnectedAgent {
                 challenge_id: challenge.challenge_id,
                 agent_instance_id: register.agent_instance_id,
                 accepted_protocol_major: 1,
-                accepted_protocol_minor: 0,
+                accepted_protocol_minor: AGENT_IPC_PROTOCOL_MINOR,
                 signed_at_ms: NOW_MS,
                 signature: [11; 64],
             }),
@@ -193,7 +193,7 @@ impl ConnectedAgent {
             registration_id: challenge.registration_id,
             registration_epoch: challenge.registration_epoch,
             protocol_major: 1,
-            protocol_minor: 0,
+            protocol_minor: AGENT_IPC_PROTOCOL_MINOR,
         };
         write_frame(
             &mut stream,
@@ -267,6 +267,7 @@ fn register_for(windows_session_id: u32, process_id: u32) -> AgentRegister {
 
 fn input_event(sequence: u64) -> InputEventEnvelope {
     InputEventEnvelope {
+        request_token: 0,
         session_id: SessionId("input-session".to_string()),
         resource_id: [4; 16],
         start_grant_id: [5; 32],
@@ -280,6 +281,7 @@ fn input_ack(
     event: &InputEventEnvelope,
 ) -> InputAck {
     InputAck {
+        request_token: event.request_token,
         registration_id: identity.registration_id,
         registration_epoch: identity.registration_epoch,
         session_id: event.session_id.clone(),
@@ -297,6 +299,7 @@ fn permission_scopes(values: impl IntoIterator<Item = PermissionScope>) -> Permi
 
 fn consent_request(request_id: [u8; 16], windows_session_id: u32) -> ConsentRequest {
     ConsentRequest {
+        request_token: 0,
         request_id,
         session_id: SessionId("consent-session".to_string()),
         peer: PeerBinding {
@@ -313,6 +316,7 @@ fn consent_request(request_id: [u8; 16], windows_session_id: u32) -> ConsentRequ
 
 fn consent_result(request: &ConsentRequest) -> ConsentResult {
     ConsentResult {
+        request_token: request.request_token,
         request_id: request.request_id,
         session_id: request.session_id.clone(),
         peer: request.peer.clone(),
@@ -325,10 +329,17 @@ fn consent_result(request: &ConsentRequest) -> ConsentResult {
 }
 
 fn execute_command(command_id: [u8; 16]) -> ExecuteCommand {
-    let command = AgentCommand::StopInput {
-        resource_id: [13; 16],
-    };
+    execute_command_for(
+        command_id,
+        AgentCommand::StopInput {
+            resource_id: [13; 16],
+        },
+    )
+}
+
+fn execute_command_for(command_id: [u8; 16], command: AgentCommand) -> ExecuteCommand {
     let mut execute = ExecuteCommand {
+        request_token: 0,
         command_id,
         grant: ExecuteGrant {
             claims: ExecuteGrantClaims {
@@ -378,7 +389,10 @@ async fn consent_request_returns_only_a_validated_correlated_result() {
         ServiceToAgent::ConsentRequest(request) => request,
         other => panic!("expected consent request, got {other:?}"),
     };
-    assert_eq!(delivered, request);
+    assert_ne!(delivered.request_token, 0);
+    let mut expected = request.clone();
+    expected.request_token = delivered.request_token;
+    assert_eq!(delivered, expected);
     write_frame(
         &mut agent.stream,
         &AgentToService::ConsentResult(consent_result(&delivered)),
@@ -425,8 +439,12 @@ async fn execute_request_completes_only_for_the_exact_registration_and_command()
         ServiceToAgent::Execute(execute) => *execute,
         other => panic!("expected execute request, got {other:?}"),
     };
-    assert_eq!(delivered, execute);
+    assert_ne!(delivered.request_token, 0);
+    let mut expected = execute.clone();
+    expected.request_token = delivered.request_token;
+    assert_eq!(delivered, expected);
     let result = CommandResult {
+        request_token: delivered.request_token,
         registration_id: agent.identity.registration_id,
         command_id: execute.command_id,
         outcome: CommandOutcome::Completed,
@@ -528,7 +546,7 @@ async fn consent_is_delivered_only_to_its_named_windows_session_and_connection()
 }
 
 #[tokio::test]
-async fn mismatched_and_late_consent_results_cannot_complete_or_reuse_a_request() {
+async fn mismatched_and_late_consent_results_cannot_complete_a_retried_request() {
     let mut agent = ConnectedAgent::start(Duration::from_millis(30)).await;
     let request = consent_request([23; 16], WINDOWS_SESSION_ID);
     let requesting = tokio::spawn({
@@ -565,10 +583,27 @@ async fn mismatched_and_late_consent_results_cannot_complete_or_reuse_a_request(
     )
     .await
     .expect("send late consent");
-    assert_eq!(
-        agent.server.request_consent(request).await,
-        Err(AgentRequestError::RetiredRequest)
-    );
+    let retrying = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let request = request.clone();
+        async move { server.request_consent(request).await }
+    });
+    let retry = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read retried consent")
+        .message
+    {
+        ServiceToAgent::ConsentRequest(request) => request,
+        other => panic!("expected consent request, got {other:?}"),
+    };
+    assert_ne!(delivered.request_token, retry.request_token);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::ConsentResult(consent_result(&retry)),
+    )
+    .await
+    .expect("answer retried consent");
+    retrying.await.expect("retry task").expect("retry result");
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
 
@@ -615,7 +650,7 @@ async fn expired_consent_and_missing_consent_capability_fail_before_delivery() {
 }
 
 #[tokio::test]
-async fn aborting_consent_futures_frees_capacity_and_retires_each_request() {
+async fn aborting_consent_futures_frees_pending_capacity() {
     let mut agent = ConnectedAgent::start(Duration::from_secs(5)).await;
     for value in 40..80_u8 {
         let request = consent_request([value; 16], WINDOWS_SESSION_ID);
@@ -637,10 +672,6 @@ async fn aborting_consent_futures_frees_capacity_and_retires_each_request() {
         ));
         requesting.abort();
         let _ = requesting.await;
-        assert_eq!(
-            agent.server.request_consent(request).await,
-            Err(AgentRequestError::RetiredRequest)
-        );
     }
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
@@ -692,7 +723,7 @@ async fn aborting_a_queued_execute_request_prevents_late_delivery() {
 }
 
 #[tokio::test]
-async fn mismatched_and_late_command_results_cannot_complete_or_reuse_a_command() {
+async fn mismatched_and_late_command_results_cannot_complete_another_attempt() {
     let mut agent = ConnectedAgent::start(Duration::from_secs(1)).await;
     let execute = execute_command([112; 16]);
     let requesting = tokio::spawn({
@@ -710,6 +741,7 @@ async fn mismatched_and_late_command_results_cannot_complete_or_reuse_a_command(
         other => panic!("expected execute request, got {other:?}"),
     };
     let mut result = CommandResult {
+        request_token: delivered.request_token,
         registration_id: agent.identity.registration_id,
         command_id: delivered.command_id,
         outcome: CommandOutcome::Completed,
@@ -723,6 +755,7 @@ async fn mismatched_and_late_command_results_cannot_complete_or_reuse_a_command(
     assert!(!requesting.is_finished());
 
     let result = CommandResult {
+        request_token: delivered.request_token,
         registration_id: agent.identity.registration_id,
         command_id: delivered.command_id,
         outcome: CommandOutcome::Completed,
@@ -738,15 +771,40 @@ async fn mismatched_and_late_command_results_cannot_complete_or_reuse_a_command(
     write_frame(&mut agent.stream, &AgentToService::CommandResult(result))
         .await
         .expect("send late duplicate result");
-    assert_eq!(
-        agent.server.request_execute(&agent.binding, execute).await,
-        Err(AgentRequestError::RetiredRequest)
-    );
+    let retrying = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let execute = execute.clone();
+        async move { server.request_execute(&binding, execute).await }
+    });
+    let retry = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read retried command")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected execute request, got {other:?}"),
+    };
+    assert_ne!(delivered.request_token, retry.request_token);
+    let retry_result = CommandResult {
+        request_token: retry.request_token,
+        registration_id: agent.identity.registration_id,
+        command_id: retry.command_id,
+        outcome: CommandOutcome::Completed,
+        completed_at_ms: NOW_MS,
+    };
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(retry_result.clone()),
+    )
+    .await
+    .expect("complete retried command");
+    assert_eq!(retrying.await.expect("retry task"), Ok(retry_result));
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
 
 #[tokio::test]
-async fn timed_out_execute_is_retired_and_a_disconnect_closes_its_waiter() {
+async fn timed_out_execute_can_retry_and_a_disconnect_closes_its_waiter() {
     let mut timed_out = ConnectedAgent::start(Duration::from_millis(20)).await;
     let execute = execute_command([115; 16]);
     let requesting = tokio::spawn({
@@ -762,13 +820,34 @@ async fn timed_out_execute_is_retired_and_a_disconnect_closes_its_waiter() {
         requesting.await.expect("request task"),
         Err(AgentRequestError::Timeout)
     );
-    assert_eq!(
-        timed_out
-            .server
-            .request_execute(&timed_out.binding, execute)
-            .await,
-        Err(AgentRequestError::RetiredRequest)
-    );
+    let retrying = tokio::spawn({
+        let server = Arc::clone(&timed_out.server);
+        let binding = timed_out.binding.clone();
+        let execute = execute.clone();
+        async move { server.request_execute(&binding, execute).await }
+    });
+    let retry = match read_frame::<_, ServiceToAgent>(&mut timed_out.stream)
+        .await
+        .expect("read retried execute")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected execute request, got {other:?}"),
+    };
+    let retry_result = CommandResult {
+        request_token: retry.request_token,
+        registration_id: timed_out.identity.registration_id,
+        command_id: retry.command_id,
+        outcome: CommandOutcome::Completed,
+        completed_at_ms: NOW_MS,
+    };
+    write_frame(
+        &mut timed_out.stream,
+        &AgentToService::CommandResult(retry_result.clone()),
+    )
+    .await
+    .expect("complete retried execute");
+    assert_eq!(retrying.await.expect("retry task"), Ok(retry_result));
     assert_eq!(timed_out.finish().await, AgentConnectionExit::Disconnected);
 
     let mut disconnected = ConnectedAgent::start(Duration::from_secs(1)).await;
@@ -936,6 +1015,290 @@ async fn fast_replacement_never_retargets_a_persisted_execute_binding() {
 }
 
 #[tokio::test]
+async fn more_than_retired_capacity_successes_do_not_exhaust_request_correlation() {
+    let mut agent = ConnectedAgent::start(Duration::from_secs(5)).await;
+    for sequence in 1..=4_100_u64 {
+        let event = input_event(sequence);
+        let requesting = tokio::spawn({
+            let server = Arc::clone(&agent.server);
+            let binding = agent.binding.clone();
+            let event = event.clone();
+            async move { server.request_input(&binding, event).await }
+        });
+        let delivered = match tokio::time::timeout(
+            Duration::from_secs(1),
+            read_frame::<_, ServiceToAgent>(&mut agent.stream),
+        )
+        .await
+        .expect("successful traffic must not saturate correlation state")
+        .expect("read input request")
+        .message
+        {
+            ServiceToAgent::InputEvent(event) => event,
+            other => panic!("expected input event, got {other:?}"),
+        };
+        assert_ne!(delivered.request_token, 0);
+        let ack = input_ack(&agent.identity, &delivered);
+        write_frame(&mut agent.stream, &AgentToService::InputAck(ack.clone()))
+            .await
+            .expect("send input ack");
+        assert_eq!(requesting.await.expect("request task"), Ok(ack));
+    }
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn late_tokens_cannot_complete_reused_input_consent_or_execute_semantics() {
+    let mut agent = ConnectedAgent::start(Duration::from_secs(1)).await;
+
+    let event = input_event(4_200);
+    let first_input = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let event = event.clone();
+        async move { server.request_input(&binding, event).await }
+    });
+    let first_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read first input")
+        .message
+    {
+        ServiceToAgent::InputEvent(event) => event,
+        other => panic!("expected input event, got {other:?}"),
+    };
+    let first_ack = input_ack(&agent.identity, &first_delivered);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::InputAck(first_ack.clone()),
+    )
+    .await
+    .expect("ack first input");
+    assert_eq!(
+        first_input.await.expect("first input task"),
+        Ok(first_ack.clone())
+    );
+
+    let second_input = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let event = event.clone();
+        async move { server.request_input(&binding, event).await }
+    });
+    let second_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read second input")
+        .message
+    {
+        ServiceToAgent::InputEvent(event) => event,
+        other => panic!("expected input event, got {other:?}"),
+    };
+    assert_ne!(
+        first_delivered.request_token,
+        second_delivered.request_token
+    );
+    write_frame(&mut agent.stream, &AgentToService::InputAck(first_ack))
+        .await
+        .expect("send late input ack");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!second_input.is_finished());
+    let second_ack = input_ack(&agent.identity, &second_delivered);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::InputAck(second_ack.clone()),
+    )
+    .await
+    .expect("ack second input");
+    assert_eq!(
+        second_input.await.expect("second input task"),
+        Ok(second_ack)
+    );
+
+    let request = consent_request([117; 16], WINDOWS_SESSION_ID);
+    let first_consent = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let request = request.clone();
+        async move { server.request_consent(request).await }
+    });
+    let first_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read first consent")
+        .message
+    {
+        ServiceToAgent::ConsentRequest(request) => request,
+        other => panic!("expected consent request, got {other:?}"),
+    };
+    let first_result = consent_result(&first_delivered);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::ConsentResult(first_result.clone()),
+    )
+    .await
+    .expect("answer first consent");
+    first_consent
+        .await
+        .expect("first consent task")
+        .expect("first consent result");
+
+    let second_consent = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let request = request.clone();
+        async move { server.request_consent(request).await }
+    });
+    let second_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read second consent")
+        .message
+    {
+        ServiceToAgent::ConsentRequest(request) => request,
+        other => panic!("expected consent request, got {other:?}"),
+    };
+    assert_ne!(
+        first_delivered.request_token,
+        second_delivered.request_token
+    );
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::ConsentResult(first_result),
+    )
+    .await
+    .expect("send late consent result");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!second_consent.is_finished());
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::ConsentResult(consent_result(&second_delivered)),
+    )
+    .await
+    .expect("answer second consent");
+    second_consent
+        .await
+        .expect("second consent task")
+        .expect("second consent result");
+
+    let execute = execute_command([118; 16]);
+    let first_execute = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let execute = execute.clone();
+        async move { server.request_execute(&binding, execute).await }
+    });
+    let first_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read first execute")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected execute request, got {other:?}"),
+    };
+    let first_result = CommandResult {
+        request_token: first_delivered.request_token,
+        registration_id: agent.identity.registration_id,
+        command_id: first_delivered.command_id,
+        outcome: CommandOutcome::Completed,
+        completed_at_ms: NOW_MS,
+    };
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(first_result.clone()),
+    )
+    .await
+    .expect("complete first execute");
+    assert_eq!(
+        first_execute.await.expect("first execute task"),
+        Ok(first_result.clone())
+    );
+
+    let second_execute = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let execute = execute.clone();
+        async move { server.request_execute(&binding, execute).await }
+    });
+    let second_delivered = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read second execute")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected execute request, got {other:?}"),
+    };
+    assert_ne!(
+        first_delivered.request_token,
+        second_delivered.request_token
+    );
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(first_result),
+    )
+    .await
+    .expect("send late command result");
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(!second_execute.is_finished());
+    let second_result = CommandResult {
+        request_token: second_delivered.request_token,
+        registration_id: agent.identity.registration_id,
+        command_id: second_delivered.command_id,
+        outcome: CommandOutcome::Completed,
+        completed_at_ms: NOW_MS,
+    };
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(second_result.clone()),
+    )
+    .await
+    .expect("complete second execute");
+    assert_eq!(
+        second_execute.await.expect("second execute task"),
+        Ok(second_result)
+    );
+
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn execute_command_capability_must_match_the_persisted_binding() {
+    let agent = ConnectedAgent::start(Duration::from_secs(1)).await;
+    let consent_binding = agent
+        .registry
+        .bind_active_session(WINDOWS_SESSION_ID, AgentCapability::Consent, NOW_MS)
+        .expect("bind consent capability");
+    let start_input = execute_command_for(
+        [119; 16],
+        AgentCommand::StartInput {
+            resource_id: [20; 16],
+            input_scopes: permission_scopes([PermissionScope::InputPointer]),
+        },
+    );
+    assert_eq!(
+        agent
+            .server
+            .request_execute(&consent_binding, start_input)
+            .await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::CapabilityBindingMismatch,
+        ))
+    );
+
+    let start_capture = execute_command_for(
+        [120; 16],
+        AgentCommand::StartCapture {
+            resource_id: [21; 16],
+            display_id: 1,
+        },
+    );
+    assert_eq!(
+        agent
+            .server
+            .request_execute(&agent.binding, start_capture)
+            .await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::CapabilityBindingMismatch,
+        ))
+    );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
 async fn input_request_routes_to_exact_binding_and_returns_correlated_ack() {
     let mut agent = ConnectedAgent::start(Duration::from_secs(1)).await;
     let event = input_event(1);
@@ -954,8 +1317,11 @@ async fn input_request_routes_to_exact_binding_and_returns_correlated_ack() {
         ServiceToAgent::InputEvent(event) => event,
         other => panic!("expected input event, got {other:?}"),
     };
-    assert_eq!(delivered, event);
-    let ack = input_ack(&agent.identity, &event);
+    assert_ne!(delivered.request_token, 0);
+    let mut expected = event.clone();
+    expected.request_token = delivered.request_token;
+    assert_eq!(delivered, expected);
+    let ack = input_ack(&agent.identity, &delivered);
     write_frame(&mut agent.stream, &AgentToService::InputAck(ack.clone()))
         .await
         .expect("send input ack");
@@ -1101,7 +1467,7 @@ async fn input_request_waiter_closes_at_the_bounded_timeout() {
 }
 
 #[tokio::test]
-async fn timed_out_input_correlation_is_retired_before_a_late_ack_or_retry() {
+async fn timed_out_input_uses_a_new_token_and_ignores_the_late_ack() {
     let mut agent = ConnectedAgent::start(Duration::from_millis(20)).await;
     let event = input_event(6);
     let requesting = tokio::spawn({
@@ -1129,10 +1495,29 @@ async fn timed_out_input_correlation_is_retired_before_a_late_ack_or_retry() {
     )
     .await
     .expect("send late ack");
-    assert_eq!(
-        agent.server.request_input(&agent.binding, event).await,
-        Err(AgentRequestError::RetiredRequest)
-    );
+    let retrying = tokio::spawn({
+        let server = Arc::clone(&agent.server);
+        let binding = agent.binding.clone();
+        let event = event.clone();
+        async move { server.request_input(&binding, event).await }
+    });
+    let retry = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read retried input")
+        .message
+    {
+        ServiceToAgent::InputEvent(event) => event,
+        other => panic!("expected input event, got {other:?}"),
+    };
+    assert_ne!(delivered.request_token, retry.request_token);
+    let retry_ack = input_ack(&agent.identity, &retry);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::InputAck(retry_ack.clone()),
+    )
+    .await
+    .expect("ack retried input");
+    assert_eq!(retrying.await.expect("retry task"), Ok(retry_ack));
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
 

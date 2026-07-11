@@ -145,6 +145,7 @@ fn signed_start_capture(
     };
     let scopes = command.required_scopes();
     let mut execute = ExecuteCommand {
+        request_token: u64::from(command_id[0]).max(1),
         command_id,
         grant: ExecuteGrant {
             claims: ExecuteGrantClaims {
@@ -206,9 +207,13 @@ async fn send_execute_and_read_result<W>(stream: &mut W, execute: ExecuteCommand
 where
     W: AsyncRead + AsyncWrite + Unpin,
 {
+    let request_token = execute.request_token;
     send_service_message(stream, &ServiceToAgent::Execute(Box::new(execute))).await;
     match read_agent_message(stream).await {
-        AgentToService::CommandResult(result) => result,
+        AgentToService::CommandResult(result) => {
+            assert_eq!(result.request_token, request_token);
+            result
+        }
         other => panic!("expected command result, got {other:?}"),
     }
 }
@@ -307,6 +312,7 @@ async fn agent_registers_reports_capabilities_heartbeats_and_stops_cleanly() {
     send_service_message(
         &mut service_stream,
         &ServiceToAgent::ConsentRequest(ConsentRequest {
+            request_token: 1,
             request_id: [12; 16],
             session_id: SessionId("consent-session".to_owned()),
             peer: PeerBinding {
@@ -325,6 +331,7 @@ async fn agent_registers_reports_capabilities_heartbeats_and_stops_cleanly() {
     loop {
         match read_agent_message(&mut service_stream).await {
             AgentToService::ConsentResult(result) => {
+                assert_eq!(result.request_token, 1);
                 assert_eq!(result.request_id, [12; 16]);
                 assert_eq!(result.decision, ConsentDecision::Dismissed);
                 assert!(result.approved_scopes.is_empty());

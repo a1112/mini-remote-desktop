@@ -353,6 +353,9 @@ pub enum AgentRouteError {
     /// Registry state could not be inspected safely.
     #[error("agent routing state is unavailable")]
     StateUnavailable,
+    /// The selected registration negotiated a protocol too old for the request.
+    #[error("the selected agent protocol version is unavailable")]
+    ProtocolVersionUnavailable,
 }
 
 /// Immediately revocable handle for a successfully revalidated exact route.
@@ -985,6 +988,20 @@ impl AgentRegistry {
         required_capability: AgentCapability,
         now_ms: u64,
     ) -> Result<ExactAgentRoute, AgentRouteError> {
+        self.resolve_exact_with_minimum_minor(binding, required_capability, 0, now_ms)
+    }
+
+    /// Revalidate one exact route and require a negotiated protocol minor.
+    ///
+    /// This gates mandatory-field additions without silently delivering them to
+    /// an older agent that negotiated a compatible major but lacks the fields.
+    pub fn resolve_exact_with_minimum_minor(
+        &self,
+        binding: &AgentBinding,
+        required_capability: AgentCapability,
+        minimum_protocol_minor: u16,
+        now_ms: u64,
+    ) -> Result<ExactAgentRoute, AgentRouteError> {
         if binding.required_capability != required_capability {
             return Err(AgentRouteError::CapabilityBindingMismatch);
         }
@@ -1005,6 +1022,9 @@ impl AgentRegistry {
         }
         if active.capabilities.desktop_epoch != binding.desktop_epoch {
             return Err(AgentRouteError::DesktopChanged);
+        }
+        if active.identity.protocol_minor < minimum_protocol_minor {
+            return Err(AgentRouteError::ProtocolVersionUnavailable);
         }
         validate_route_readiness(active, required_capability, now_ms)?;
         Ok(ExactAgentRoute {

@@ -59,7 +59,8 @@ pub struct ExecuteGrantClaims {
     pub not_before_ms: u64,
     /// Exclusive end of the validity interval.
     pub expires_at_ms: u64,
-    /// Digest of the exact command envelope authorized by the grant.
+    /// Digest of the semantic command envelope authorized by the grant.
+    /// Transport-only request tokens are deliberately excluded.
     pub command_digest: [u8; 32],
     /// Intended verifier of the grant.
     pub audience: GrantAudience,
@@ -199,6 +200,9 @@ pub enum GrantValidationError {
     /// The command id is the all-zero sentinel.
     #[error("execute command id is invalid")]
     InvalidCommandId,
+    /// The service-assigned transport correlation token is zero.
+    #[error("execute request token is invalid")]
+    InvalidRequestToken,
     /// The resource id is the all-zero sentinel.
     #[error("execute command resource id is invalid")]
     InvalidResourceId,
@@ -440,6 +444,9 @@ pub fn validate_execute_command<V>(
 where
     V: ExecuteGrantVerifier + ?Sized,
 {
+    if execute.request_token == 0 {
+        return Err(GrantValidationError::InvalidRequestToken);
+    }
     if execute.command_id.iter().all(|byte| *byte == 0) {
         return Err(GrantValidationError::InvalidCommandId);
     }

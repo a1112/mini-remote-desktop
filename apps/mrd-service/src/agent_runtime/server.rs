@@ -9,8 +9,8 @@ use mrd_agent_ipc::{
     AgentStopping, AgentToService, CommandResult, ConsentDecision, ConsentRequest, ConsentResult,
     ConsentValidationError, ExecuteCommand, FrameError, InputAck, InputEventEnvelope,
     InputRejection, RegisteredAgentIdentity, ServiceToAgent, StopAgent, StopReason,
-    ValidatedConsent, AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES,
-    AGENT_IPC_PROTOCOL_MAJOR,
+    ValidatedConsent, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -38,7 +38,6 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLACED_STOP_GRACE_MS: u64 = 5_000;
 const PENDING_REQUEST_CAPACITY: usize = 32;
-const RETIRED_REQUEST_CAPACITY: usize = 4_096;
 
 /// Service clock boundary used by deterministic protocol tests.
 pub trait AgentServerClock: Send + Sync {
@@ -151,9 +150,6 @@ pub enum AgentRequestError {
     /// The same correlation identity already has an outstanding request.
     #[error("agent request correlation is already pending")]
     DuplicateRequest,
-    /// A cancelled or timed-out correlation identity cannot be reused on this connection.
-    #[error("agent request correlation was retired")]
-    RetiredRequest,
     /// The bounded pending-request directory or token space is exhausted.
     #[error("agent request capacity is exhausted")]
     CapacityExhausted,
@@ -201,6 +197,13 @@ impl InputCorrelationKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RequestCorrelationKey {
+    Input(u64),
+    Consent(u64),
+    Execute(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RequestSemanticKey {
     Input(InputCorrelationKey),
     Consent([u8; 16]),
     Execute([u8; 16]),
@@ -241,7 +244,7 @@ impl PendingReply {
 }
 
 struct PendingRequest {
-    token: u64,
+    semantic: RequestSemanticKey,
     sent: bool,
     cancellation: watch::Sender<bool>,
     reply: PendingReply,
@@ -250,7 +253,7 @@ struct PendingRequest {
 #[derive(Default)]
 struct RequestCorrelationState {
     pending: HashMap<RequestCorrelationKey, PendingRequest>,
-    retired: HashMap<RequestCorrelationKey, ()>,
+    pending_semantics: HashMap<RequestSemanticKey, RequestCorrelationKey>,
 }
 
 #[derive(Clone)]
@@ -276,72 +279,49 @@ impl ConnectionControl {
             .requests
             .lock()
             .map_err(|_| AgentRequestError::StateUnavailable)?;
-        if requests.pending.contains_key(&key) {
+        if requests.pending.contains_key(&key)
+            || requests.pending_semantics.contains_key(&pending.semantic)
+        {
             return Err(AgentRequestError::DuplicateRequest);
         }
-        if requests.retired.contains_key(&key) {
-            return Err(AgentRequestError::RetiredRequest);
-        }
-        if requests.pending.len() >= PENDING_REQUEST_CAPACITY
-            || requests.retired.len() >= RETIRED_REQUEST_CAPACITY
-        {
+        if requests.pending.len() >= PENDING_REQUEST_CAPACITY {
             return Err(AgentRequestError::CapacityExhausted);
         }
+        requests
+            .pending_semantics
+            .insert(pending.semantic.clone(), key.clone());
         requests.pending.insert(key, pending);
         Ok(())
     }
 
-    fn mark_request_sent(&self, key: &RequestCorrelationKey, token: u64) {
+    fn mark_request_sent(&self, key: &RequestCorrelationKey) {
         if let Ok(mut requests) = self.requests.lock() {
-            if let Some(pending) = requests
-                .pending
-                .get_mut(key)
-                .filter(|pending| pending.token == token)
-            {
+            if let Some(pending) = requests.pending.get_mut(key) {
                 pending.sent = true;
             }
         }
     }
 
-    fn cancel_request(&self, key: &RequestCorrelationKey, token: u64) {
+    fn cancel_request(&self, key: &RequestCorrelationKey) {
         if let Ok(mut requests) = self.requests.lock() {
-            if requests
-                .pending
-                .get(key)
-                .is_some_and(|pending| pending.token == token)
-            {
-                if let Some(pending) = requests.pending.remove(key) {
-                    let _ = pending.cancellation.send(true);
-                    if requests.retired.len() < RETIRED_REQUEST_CAPACITY {
-                        requests.retired.insert(key.clone(), ());
-                    }
-                }
+            if let Some(pending) = remove_pending_request(&mut requests, key) {
+                let _ = pending.cancellation.send(true);
             }
         }
     }
 
-    fn is_request_pending(&self, key: &RequestCorrelationKey, token: u64) -> bool {
-        self.requests.lock().is_ok_and(|requests| {
-            requests
-                .pending
-                .get(key)
-                .is_some_and(|pending| pending.token == token)
-        })
+    fn is_request_pending(&self, key: &RequestCorrelationKey) -> bool {
+        self.requests
+            .lock()
+            .is_ok_and(|requests| requests.pending.contains_key(key))
     }
 
-    fn fail_request(&self, key: &RequestCorrelationKey, token: u64, error: AgentRequestError) {
-        let pending = self.requests.lock().ok().and_then(|mut requests| {
-            let pending = requests
-                .pending
-                .get(key)
-                .is_some_and(|pending| pending.token == token)
-                .then(|| requests.pending.remove(key))
-                .flatten();
-            if pending.is_some() && requests.retired.len() < RETIRED_REQUEST_CAPACITY {
-                requests.retired.insert(key.clone(), ());
-            }
-            pending
-        });
+    fn fail_request(&self, key: &RequestCorrelationKey, error: AgentRequestError) {
+        let pending = self
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| remove_pending_request(&mut requests, key));
         if let Some(pending) = pending {
             let _ = pending.cancellation.send(true);
             pending.reply.fail(error);
@@ -349,13 +329,15 @@ impl ConnectionControl {
     }
 
     fn resolve_input_ack(&self, ack: InputAck) {
-        let key = RequestCorrelationKey::Input(InputCorrelationKey::from_ack(&ack));
+        let key = RequestCorrelationKey::Input(ack.request_token);
+        let semantic = RequestSemanticKey::Input(InputCorrelationKey::from_ack(&ack));
         let pending = {
             let Ok(mut requests) = self.requests.lock() else {
                 return;
             };
             let matches = requests.pending.get(&key).is_some_and(|pending| {
                 pending.sent
+                    && pending.semantic == semantic
                     && matches!(
                         &pending.reply,
                         PendingReply::Input {
@@ -368,11 +350,9 @@ impl ConnectionControl {
                             && *event_commitment == ack.event_commitment
                     )
             });
-            let pending = matches.then(|| requests.pending.remove(&key)).flatten();
-            if pending.is_some() && requests.retired.len() < RETIRED_REQUEST_CAPACITY {
-                requests.retired.insert(key, ());
-            }
-            pending
+            matches
+                .then(|| remove_pending_request(&mut requests, &key))
+                .flatten()
         };
         if let Some(pending) = pending {
             if let PendingReply::Input { reply, .. } = pending.reply {
@@ -382,7 +362,7 @@ impl ConnectionControl {
     }
 
     fn resolve_consent_result(&self, result: ConsentResult, now_ms: u64) {
-        let key = RequestCorrelationKey::Consent(result.request_id);
+        let key = RequestCorrelationKey::Consent(result.request_token);
         let resolved = {
             let Ok(mut requests) = self.requests.lock() else {
                 return;
@@ -398,11 +378,8 @@ impl ConnectionControl {
             });
             let pending = validated
                 .is_some()
-                .then(|| requests.pending.remove(&key))
+                .then(|| remove_pending_request(&mut requests, &key))
                 .flatten();
-            if pending.is_some() && requests.retired.len() < RETIRED_REQUEST_CAPACITY {
-                requests.retired.insert(key, ());
-            }
             pending.zip(validated)
         };
         if let Some((pending, validated)) = resolved {
@@ -413,7 +390,7 @@ impl ConnectionControl {
     }
 
     fn resolve_command_result(&self, result: CommandResult) {
-        let key = RequestCorrelationKey::Execute(result.command_id);
+        let key = RequestCorrelationKey::Execute(result.request_token);
         let pending = {
             let Ok(mut requests) = self.requests.lock() else {
                 return;
@@ -430,11 +407,9 @@ impl ConnectionControl {
                             && *command_id == result.command_id
                     )
             });
-            let pending = matches.then(|| requests.pending.remove(&key)).flatten();
-            if pending.is_some() && requests.retired.len() < RETIRED_REQUEST_CAPACITY {
-                requests.retired.insert(key, ());
-            }
-            pending
+            matches
+                .then(|| remove_pending_request(&mut requests, &key))
+                .flatten()
         };
         if let Some(pending) = pending {
             if let PendingReply::Execute { reply, .. } = pending.reply {
@@ -448,6 +423,7 @@ impl ConnectionControl {
             .requests
             .lock()
             .map(|mut requests| {
+                requests.pending_semantics.clear();
                 requests
                     .pending
                     .drain()
@@ -462,15 +438,23 @@ impl ConnectionControl {
     }
 }
 
+fn remove_pending_request(
+    requests: &mut RequestCorrelationState,
+    key: &RequestCorrelationKey,
+) -> Option<PendingRequest> {
+    let pending = requests.pending.remove(key)?;
+    requests.pending_semantics.remove(&pending.semantic);
+    Some(pending)
+}
+
 struct PendingRequestGuard {
     control: ConnectionControl,
     key: RequestCorrelationKey,
-    token: u64,
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        self.control.cancel_request(&self.key, self.token);
+        self.control.cancel_request(&self.key);
     }
 }
 
@@ -479,7 +463,6 @@ enum OutboundMessage {
     Request {
         message: ServiceToAgent,
         key: RequestCorrelationKey,
-        token: u64,
         binding: AgentBinding,
         required_capability: AgentCapability,
         cancellation: watch::Receiver<bool>,
@@ -572,8 +555,10 @@ impl AgentServer {
     /// a result validated against the exact request.
     pub async fn request_consent(
         &self,
-        request: ConsentRequest,
+        mut request: ConsentRequest,
     ) -> Result<CorrelatedConsent, AgentRequestError> {
+        let token = self.next_request_token()?;
+        request.request_token = token;
         let now_ms = self.clock.now_ms();
         validate_consent_request(&request, now_ms).map_err(AgentRequestError::InvalidConsent)?;
         let binding = self.registry.bind_active_session(
@@ -581,9 +566,12 @@ impl AgentServer {
             AgentCapability::Consent,
             now_ms,
         )?;
-        let route = self
-            .registry
-            .resolve_exact(&binding, AgentCapability::Consent, now_ms)?;
+        let route = self.registry.resolve_exact_with_minimum_minor(
+            &binding,
+            AgentCapability::Consent,
+            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            now_ms,
+        )?;
         let control = self
             .controls
             .lock()
@@ -591,14 +579,14 @@ impl AgentServer {
             .get(&route.connection_id())
             .cloned()
             .ok_or(AgentRequestError::ConnectionUnavailable)?;
-        let token = self.next_request_token()?;
-        let key = RequestCorrelationKey::Consent(request.request_id);
+        let key = RequestCorrelationKey::Consent(token);
+        let semantic = RequestSemanticKey::Consent(request.request_id);
         let (reply, response) = oneshot::channel();
         let (cancellation, cancelled) = watch::channel(false);
         control.register_request(
             key.clone(),
             PendingRequest {
-                token,
+                semantic,
                 sent: false,
                 cancellation,
                 reply: PendingReply::Consent {
@@ -610,7 +598,6 @@ impl AgentServer {
         let _pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
-            token,
         };
 
         let mut lease = route.into_lease();
@@ -623,7 +610,6 @@ impl AgentServer {
             .try_send(OutboundMessage::Request {
                 message: ServiceToAgent::ConsentRequest(request.clone()),
                 key,
-                token,
                 binding,
                 required_capability: AgentCapability::Consent,
                 cancellation: cancelled,
@@ -654,17 +640,22 @@ impl AgentServer {
     pub async fn request_input(
         &self,
         binding: &AgentBinding,
-        event: InputEventEnvelope,
+        mut event: InputEventEnvelope,
     ) -> Result<InputAck, AgentRequestError> {
+        let token = self.next_request_token()?;
+        event.request_token = token;
         event
             .validate_shape()
             .map_err(AgentRequestError::InvalidInput)?;
         let event_commitment = event
             .commitment()
             .map_err(AgentRequestError::InvalidInput)?;
-        let route =
-            self.registry
-                .resolve_exact(binding, AgentCapability::Input, self.clock.now_ms())?;
+        let route = self.registry.resolve_exact_with_minimum_minor(
+            binding,
+            AgentCapability::Input,
+            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            self.clock.now_ms(),
+        )?;
         let control = self
             .controls
             .lock()
@@ -672,14 +663,14 @@ impl AgentServer {
             .get(&route.connection_id())
             .cloned()
             .ok_or(AgentRequestError::ConnectionUnavailable)?;
-        let token = self.next_request_token()?;
-        let key = RequestCorrelationKey::Input(InputCorrelationKey::from_event(&event));
+        let key = RequestCorrelationKey::Input(token);
+        let semantic = RequestSemanticKey::Input(InputCorrelationKey::from_event(&event));
         let (reply, response) = oneshot::channel();
         let (cancellation, cancelled) = watch::channel(false);
         control.register_request(
             key.clone(),
             PendingRequest {
-                token,
+                semantic,
                 sent: false,
                 cancellation,
                 reply: PendingReply::Input {
@@ -693,7 +684,6 @@ impl AgentServer {
         let _pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
-            token,
         };
 
         let mut lease = route.into_lease();
@@ -705,7 +695,6 @@ impl AgentServer {
             .try_send(OutboundMessage::Request {
                 message: ServiceToAgent::InputEvent(event),
                 key,
-                token,
                 binding: binding.clone(),
                 required_capability: AgentCapability::Input,
                 cancellation: cancelled,
@@ -734,12 +723,18 @@ impl AgentServer {
     pub async fn request_execute(
         &self,
         binding: &AgentBinding,
-        execute: ExecuteCommand,
+        mut execute: ExecuteCommand,
     ) -> Result<CommandResult, AgentRequestError> {
-        let required_capability = binding.required_capability();
-        let route =
-            self.registry
-                .resolve_exact(binding, required_capability, self.clock.now_ms())?;
+        let required_capability = execute.required_capability();
+        if binding.required_capability() != required_capability {
+            return Err(AgentRouteError::CapabilityBindingMismatch.into());
+        }
+        let route = self.registry.resolve_exact_with_minimum_minor(
+            binding,
+            required_capability,
+            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            self.clock.now_ms(),
+        )?;
         let control = self
             .controls
             .lock()
@@ -748,13 +743,15 @@ impl AgentServer {
             .cloned()
             .ok_or(AgentRequestError::ConnectionUnavailable)?;
         let token = self.next_request_token()?;
-        let key = RequestCorrelationKey::Execute(execute.command_id);
+        execute.request_token = token;
+        let key = RequestCorrelationKey::Execute(token);
+        let semantic = RequestSemanticKey::Execute(execute.command_id);
         let (reply, response) = oneshot::channel();
         let (cancellation, cancelled) = watch::channel(false);
         control.register_request(
             key.clone(),
             PendingRequest {
-                token,
+                semantic,
                 sent: false,
                 cancellation,
                 reply: PendingReply::Execute {
@@ -767,7 +764,6 @@ impl AgentServer {
         let _pending_guard = PendingRequestGuard {
             control: control.clone(),
             key: key.clone(),
-            token,
         };
 
         let mut lease = route.into_lease();
@@ -779,7 +775,6 @@ impl AgentServer {
             .try_send(OutboundMessage::Request {
                 message: ServiceToAgent::Execute(Box::new(execute)),
                 key,
-                token,
                 binding: binding.clone(),
                 required_capability,
                 cancellation: cancelled,
@@ -981,33 +976,27 @@ impl AgentServer {
                         Some(OutboundMessage::Request {
                             message,
                             key,
-                            token,
                             binding,
                             required_capability,
                             cancellation,
                         }) => {
-                            if !control.is_request_pending(&key, token)
-                                || request_cancelled(&cancellation)
+                            if !control.is_request_pending(&key) || request_cancelled(&cancellation)
                             {
                                 continue;
                             }
-                            let exact_route = match self.registry.resolve_exact(
+                            let exact_route = match self.registry.resolve_exact_with_minimum_minor(
                                 &binding,
                                 required_capability,
+                                AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
                                 self.clock.now_ms(),
                             ) {
                                 Ok(route) => route,
                                 Err(error) => {
-                                    control.fail_request(
-                                        &key,
-                                        token,
-                                        AgentRequestError::Route(error),
-                                    );
+                                    control.fail_request(&key, AgentRequestError::Route(error));
                                     continue;
                                 }
                             };
-                            if !control.is_request_pending(&key, token)
-                                || request_cancelled(&cancellation)
+                            if !control.is_request_pending(&key) || request_cancelled(&cancellation)
                             {
                                 continue;
                             }
@@ -1021,7 +1010,7 @@ impl AgentServer {
                             .await?
                             {
                                 RequestWriteOutcome::Written => {
-                                    control.mark_request_sent(&key, token);
+                                    control.mark_request_sent(&key);
                                 }
                                 RequestWriteOutcome::Revoked => {
                                     control.fail_all(AgentRequestError::Revoked);
@@ -1093,6 +1082,7 @@ fn validate_consent_request(
     now_ms: u64,
 ) -> Result<(), ConsentValidationError> {
     let shape_probe = ConsentResult {
+        request_token: request.request_token,
         request_id: request.request_id,
         session_id: request.session_id.clone(),
         peer: request.peer.clone(),

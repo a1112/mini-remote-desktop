@@ -9,7 +9,7 @@ use mrd_agent_ipc::{
     FrameError, GrantAudience, GrantValidationError, InputAck, InputAckOutcome, InputButton,
     InputEventEnvelope, InputEventPayload, InputFailure, InputKey, InputRejection, Locked,
     PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
-    Unlocked, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    Unlocked, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -49,6 +49,7 @@ fn scopes(values: impl IntoIterator<Item = PermissionScope>) -> PermissionScopes
 
 fn consent_request() -> ConsentRequest {
     ConsentRequest {
+        request_token: 1,
         request_id: REQUEST_ID,
         session_id: session_id(),
         peer: peer(),
@@ -62,6 +63,7 @@ fn consent_request() -> ConsentRequest {
 
 fn consent_result() -> ConsentResult {
     ConsentResult {
+        request_token: 1,
         request_id: REQUEST_ID,
         session_id: session_id(),
         peer: peer(),
@@ -165,6 +167,7 @@ fn execution_context(now_ms: u64) -> ExecutionContext {
 
 fn execute_command(command: AgentCommand) -> ExecuteCommand {
     let mut execute = ExecuteCommand {
+        request_token: 1,
         command_id: COMMAND_ID,
         grant: grant(),
         command,
@@ -175,6 +178,7 @@ fn execute_command(command: AgentCommand) -> ExecuteCommand {
 
 fn input_event(sequence: u64, event: InputEventPayload) -> InputEventEnvelope {
     InputEventEnvelope {
+        request_token: 1,
         session_id: session_id(),
         resource_id: RESOURCE_ID,
         start_grant_id: GRANT_ID,
@@ -304,6 +308,7 @@ fn input_event_and_structured_acknowledgments_round_trip_without_payload_echo() 
 
     for (index, outcome) in outcomes.into_iter().enumerate() {
         let message = AgentToService::InputAck(InputAck {
+            request_token: 1,
             registration_id: REGISTRATION_ID,
             registration_epoch: 1,
             session_id: session_id(),
@@ -624,6 +629,7 @@ fn lifecycle_events_and_shutdown_messages_round_trip() {
             context: event_context(6),
         }),
         AgentToService::CommandResult(CommandResult {
+            request_token: 1,
             registration_id: REGISTRATION_ID,
             command_id: COMMAND_ID,
             outcome: CommandOutcome::Completed,
@@ -794,6 +800,78 @@ fn execute_grant_digest_covers_the_command_id() {
 }
 
 #[test]
+fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 1);
+
+    let mut execute = execute_command(AgentCommand::StartCapture {
+        resource_id: RESOURCE_ID,
+        display_id: 1,
+    });
+    let digest = execute.command_digest();
+    execute.request_token += 1;
+    assert_eq!(execute.command_digest(), digest);
+
+    execute.request_token = 0;
+    assert_eq!(
+        validate_execute_command(&execute, &execution_context(1_500), &AcceptAllVerifier),
+        Err(GrantValidationError::InvalidRequestToken)
+    );
+
+    let mut event = input_event(1, InputEventPayload::MouseMove { x: 1, y: 2 });
+    let event_commitment = event.commitment().expect("valid input commitment");
+    event.request_token += 1;
+    assert_eq!(
+        event.commitment().expect("retry input commitment"),
+        event_commitment
+    );
+    event.request_token = 0;
+    assert_eq!(event.validate_shape(), Err(InputRejection::InvalidEvent));
+
+    let mut request = consent_request();
+    request.request_token = 0;
+    let mut result = consent_result();
+    result.request_token = 0;
+    assert_eq!(
+        validate_consent_result(&request, &result, 1_700),
+        Err(ConsentValidationError::InvalidRequest)
+    );
+
+    for value in [
+        serde_json::to_value(ServiceToAgent::ConsentRequest(request)).unwrap(),
+        serde_json::to_value(ServiceToAgent::InputEvent(event)).unwrap(),
+        serde_json::to_value(ServiceToAgent::Execute(Box::new(execute))).unwrap(),
+    ] {
+        assert!(serde_json::from_value::<ServiceToAgent>(value).is_err());
+    }
+
+    for value in [
+        serde_json::to_value(AgentToService::ConsentResult(result)).unwrap(),
+        serde_json::to_value(AgentToService::CommandResult(CommandResult {
+            request_token: 0,
+            registration_id: REGISTRATION_ID,
+            command_id: COMMAND_ID,
+            outcome: CommandOutcome::Completed,
+            completed_at_ms: 1_700,
+        }))
+        .unwrap(),
+        serde_json::to_value(AgentToService::InputAck(InputAck {
+            request_token: 0,
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            session_id: session_id(),
+            resource_id: RESOURCE_ID,
+            start_grant_id: GRANT_ID,
+            sequence: 1,
+            event_commitment: [17; 32],
+            outcome: InputAckOutcome::Applied,
+        }))
+        .unwrap(),
+    ] {
+        assert!(serde_json::from_value::<AgentToService>(value).is_err());
+    }
+}
+
+#[test]
 fn execute_grant_rejects_each_mismatched_authorization_binding() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
@@ -959,6 +1037,7 @@ fn messages_reject_unknown_or_secret_bearing_fields() {
     assert!(serde_json::from_value::<ServiceToAgent>(input).is_err());
 
     let mut ack = serde_json::to_value(AgentToService::InputAck(InputAck {
+        request_token: 1,
         registration_id: REGISTRATION_ID,
         registration_epoch: 1,
         session_id: session_id(),
@@ -983,6 +1062,7 @@ fn serialized_control_messages_contain_no_secret_material_fields() {
         serde_json::to_value(ServiceToAgent::AgentChallenge(challenge())).unwrap(),
         serde_json::to_value(AgentToService::AgentRegistered(registered())).unwrap(),
         serde_json::to_value(ServiceToAgent::Execute(Box::new(ExecuteCommand {
+            request_token: 1,
             command_id: COMMAND_ID,
             grant: grant(),
             command: AgentCommand::StopCapture {
@@ -996,6 +1076,7 @@ fn serialized_control_messages_contain_no_secret_material_fields() {
         )))
         .unwrap(),
         serde_json::to_value(AgentToService::InputAck(InputAck {
+            request_token: 1,
             registration_id: REGISTRATION_ID,
             registration_epoch: 1,
             session_id: session_id(),
