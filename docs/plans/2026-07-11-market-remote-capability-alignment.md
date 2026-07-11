@@ -792,6 +792,7 @@ git commit -m "feat: secure identity replay and rotation"
 - Modify: crates/mrd-session/src/media.rs
 - Modify: crates/mrd-session/src/route.rs
 - Modify: apps/mrd-service/Cargo.toml
+- Modify: apps/mrd-session-agent/Cargo.toml
 - Modify: apps/mrd-service/src/lib.rs
 - Create: apps/mrd-service/src/security/mod.rs
 - Create: apps/mrd-service/src/security/windows_dpapi.rs
@@ -1251,11 +1252,16 @@ Expected: FAIL because the app is absent.
 
 The initial app owns no product behavior beyond:
 
-- connecting only to the configured private endpoint;
+- exposing a runtime that connects only to the configured private endpoint;
 - registering immutable process/session identity;
 - reporting truthful platform capabilities;
 - accepting only verified ExecuteGrant-bearing commands;
 - clean shutdown and heartbeat.
+
+The standalone binary must fail closed until Task 23 supplies the authenticated
+launcher bootstrap, trusted registration signer, and OS-verified descriptor. Do
+not place signer material or self-asserted Windows identity in environment
+variables merely to make the transitional binary start.
 
 **Step 4: Run agent and workspace checks**
 
@@ -1279,6 +1285,8 @@ git commit -m "feat: add interactive session agent"
 
 **Files:**
 - Modify: apps/mrd-service/Cargo.toml
+- Modify: apps/mrd-session-agent/src/main.rs
+- Modify: apps/mrd-session-agent/src/runtime.rs
 - Create: apps/mrd-service/src/agent_runtime/mod.rs
 - Create: apps/mrd-service/src/agent_runtime/registry.rs
 - Create: apps/mrd-service/src/agent_runtime/server.rs
@@ -1286,6 +1294,7 @@ git commit -m "feat: add interactive session agent"
 - Create: apps/mrd-service/src/agent_runtime/unsupported.rs
 - Modify: apps/mrd-service/src/app_state/core.rs
 - Create: apps/mrd-service/tests/agent_registration.rs
+- Create: apps/mrd-session-agent/tests/process_bootstrap.rs
 
 **Step 1: Write failing registration security tests**
 
@@ -1297,18 +1306,26 @@ Test:
 - stale challenge is rejected;
 - duplicate process for the same session follows an explicit replacement policy;
 - disconnected agent invalidates outstanding execution grants.
+- the real mrd-session-agent binary receives only an authenticated launcher
+  bootstrap, connects to the private endpoint, registers, heartbeats, and exits
+  on StopAgent without test-only signers or self-asserted identity.
 
 Use a platform-neutral fake verifier for generic CI and Windows token/ACL integration tests behind cfg(windows).
 
 **Step 2: Run the registration tests**
 
-Run: cargo test -p mrd-service --test agent_registration
+Run:
+
+~~~powershell
+cargo test -p mrd-service --test agent_registration
+cargo test -p mrd-session-agent --test process_bootstrap
+~~~
 
 Expected: FAIL.
 
 **Step 3: Implement the registry and secure pipe**
 
-On Windows create the named pipe with an explicit security descriptor and validate caller PID/token/logon SID/session ID before registration. The agent registry maps Windows session IDs to capability snapshots and health.
+On Windows create the named pipe with an explicit security descriptor and validate caller PID/token/logon SID/session ID before registration. The agent registry maps Windows session IDs to capability snapshots and health. Wire the real agent `main` to a launcher-provisioned bootstrap channel/handle; signer operations and the OS-derived descriptor must not be accepted from ordinary environment variables or command-line arguments.
 
 **Step 4: Run service tests**
 
@@ -1316,6 +1333,7 @@ Run:
 
 ~~~powershell
 cargo test -p mrd-service --test agent_registration
+cargo test -p mrd-session-agent --test process_bootstrap
 cargo test -p mrd-service
 ~~~
 
@@ -1324,13 +1342,16 @@ Expected: PASS.
 **Step 5: Commit**
 
 ~~~powershell
-git add apps/mrd-service
+git add apps/mrd-service apps/mrd-session-agent
 git commit -m "feat: authenticate desktop session agents"
 ~~~
 
 ### Task 24: Route consent and input through the selected session agent
 
 **Files:**
+- Modify: crates/mrd-agent-ipc/src/protocol.rs
+- Modify: crates/mrd-agent-ipc/src/grant.rs
+- Modify: crates/mrd-agent-ipc/tests/contracts.rs
 - Create: apps/mrd-session-agent/src/consent.rs
 - Create: apps/mrd-session-agent/src/input.rs
 - Modify: apps/mrd-session-agent/src/runtime.rs
@@ -1351,6 +1372,11 @@ Prove:
 - fast user switch does not retarget an active session;
 - agent disconnect releases all input and pauses control;
 - stale agent grants are rejected.
+- input events carry session/resource/sequence bindings and cannot be replayed
+  under a StartInput grant for another channel;
+- acknowledgments distinguish policy/grant rejection, unsupported capability,
+  stale desktop, UIPI denial, and platform injection failure without leaking
+  input payloads.
 
 **Step 2: Run the tests**
 
@@ -1359,6 +1385,7 @@ Run:
 ~~~powershell
 cargo test -p mrd-session-agent --test input_grants
 cargo test -p mrd-service --test agent_input_routing
+cargo test -p mrd-agent-ipc
 ~~~
 
 Expected: FAIL.
@@ -1373,6 +1400,7 @@ Run:
 
 ~~~powershell
 cargo test -p mrd-input
+cargo test -p mrd-agent-ipc
 cargo test -p mrd-session-agent
 cargo test -p mrd-service
 ~~~
@@ -1382,7 +1410,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ~~~powershell
-git add crates/mrd-input apps/mrd-session-agent apps/mrd-service
+git add crates/mrd-agent-ipc crates/mrd-input apps/mrd-session-agent apps/mrd-service
 git commit -m "refactor: execute input in desktop session agent"
 ~~~
 

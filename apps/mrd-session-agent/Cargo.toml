@@ -1,0 +1,22 @@
+[package]
+name = "mrd-session-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mrd_session_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mrd-session-agent"
+path = "src/main.rs"
+
+[dependencies]
+mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
+mrd-proto = { path = "../../crates/mrd-proto" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+mrd-session = { path = "../../crates/mrd-session" }

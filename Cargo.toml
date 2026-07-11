@@ -4,6 +4,7 @@ members = [
   "apps/rdesk-legacy-harness",
   "apps/realtime-server",
   "apps/mrd-service",
+  "apps/mrd-session-agent",
   "common-control-proto",
   "crates/mrd-capture-dxgi",
   "crates/mrd-capture-macos",
