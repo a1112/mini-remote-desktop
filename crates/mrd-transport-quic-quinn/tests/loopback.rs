@@ -2,9 +2,10 @@ use bytes::Bytes;
 use std::time::Duration;
 
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuReassembler,
-    QuicAuReassemblerConfig, QuicMediaCodec, QuicMediaPayloadType, QuicMediaReassembler,
-    QuinnDatagramEndpoint, QuinnDatagramPair, QuinnServerListener,
+    certificate_fingerprint_sha256, fragment_access_unit, fragment_media_payload_v3,
+    is_quic_media_v3_datagram, QuicAuReassembler, QuicAuReassemblerConfig, QuicMediaCodec,
+    QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnDatagramPair,
+    QuinnServerListener,
 };
 
 #[tokio::test]
@@ -260,6 +261,102 @@ async fn quinn_bootstrap_supports_explicit_client_server_connection() {
     assert_eq!(bootstrap.transport, "quic_quinn");
     assert_eq!(bootstrap.server_name, "localhost");
     assert!(!bootstrap.cert_der.is_empty());
+}
+
+#[tokio::test]
+async fn quinn_bootstrap_exposes_a_unique_sha256_certificate_fingerprint() {
+    let (_first_listener, first) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("first QUIC listener");
+    let (_second_listener, second) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("second QUIC listener");
+
+    let first_fingerprint = certificate_fingerprint_sha256(&first.cert_der);
+    let second_fingerprint = certificate_fingerprint_sha256(&second.cert_der);
+
+    assert_eq!(first_fingerprint, first.certificate_fingerprint_sha256());
+    assert_eq!(second_fingerprint, second.certificate_fingerprint_sha256());
+    assert_ne!(first_fingerprint, second_fingerprint);
+}
+
+#[tokio::test]
+async fn quinn_listener_can_pin_the_authenticated_client_ip() {
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("QUIC listener");
+    let server_task =
+        tokio::spawn(async move { listener.accept_from("127.0.0.1".parse().unwrap()).await });
+    let client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("authenticated-IP client");
+    let server = server_task
+        .await
+        .expect("join server")
+        .expect("accept expected client IP");
+
+    assert_eq!(client.metadata().peer_addr.ip(), bootstrap.listen_addr.ip());
+    assert_eq!(server.metadata().peer_addr.ip().to_string(), "127.0.0.1");
+}
+
+#[tokio::test]
+async fn quinn_listener_rejects_a_client_from_the_wrong_ip() {
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("QUIC listener");
+    let mut server_task = tokio::spawn(async move {
+        listener
+            .accept_from("192.0.2.1".parse().expect("documentation address"))
+            .await
+    });
+    let client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("wrong-IP client completes the TLS handshake");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), &mut server_task)
+            .await
+            .is_err(),
+        "wrong-IP client must not be returned as the authenticated endpoint"
+    );
+    tokio::time::timeout(Duration::from_secs(1), client.read_datagram())
+        .await
+        .expect("wrong-IP connection is closed promptly")
+        .expect_err("rejected connection cannot receive media");
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn quinn_listener_survives_a_failed_handshake_before_the_valid_client() {
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("QUIC listener");
+    let (_unrelated_listener, unrelated_bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("unrelated QUIC certificate");
+    let mut invalid_bootstrap = bootstrap.clone();
+    invalid_bootstrap.cert_der = unrelated_bootstrap.cert_der;
+    let server_task =
+        tokio::spawn(async move { listener.accept_from("127.0.0.1".parse().unwrap()).await });
+
+    QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &invalid_bootstrap)
+        .await
+        .expect_err("client rejects the unrelated server certificate");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !server_task.is_finished(),
+        "one failed handshake must not terminate the listener"
+    );
+
+    let client = QuinnDatagramEndpoint::connect_client("127.0.0.1:0", &bootstrap)
+        .await
+        .expect("valid client connects after failed handshake");
+    let server = server_task
+        .await
+        .expect("join server")
+        .expect("listener accepts valid client");
+    assert_eq!(client.metadata().peer_addr, bootstrap.listen_addr);
+    assert_eq!(server.metadata().peer_addr.ip().to_string(), "127.0.0.1");
 }
 
 #[tokio::test]

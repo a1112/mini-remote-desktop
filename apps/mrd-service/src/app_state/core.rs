@@ -131,11 +131,12 @@ impl AppState {
         let machine_identity = store.load_or_create_identity(|| {
             DeviceIdentity::generate(&SystemRandom::new()).map_err(|_| StoreError::InvalidIdentity)
         })?;
+        let machine_epoch = store.load_identity_epoch()?;
         Ok(Self::with_security_adapters(
             tray,
             lan_discovery_config,
             AuditLogRegistry::persistent(store.clone()),
-            DeviceIdentityRegistry::persistent(store, machine_identity),
+            DeviceIdentityRegistry::persistent(store, machine_identity, machine_epoch),
         ))
     }
 

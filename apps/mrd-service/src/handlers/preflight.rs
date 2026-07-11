@@ -31,18 +31,16 @@ pub async fn preflight_session_start(
         }
     }
 
-    if require_lan_peer {
-        let discovery = app_state.lan_discovery.snapshot().await;
-        if !discovery
-            .peers
-            .iter()
-            .any(|peer| &peer.device_id == target_device_id)
-        {
-            return Err(format!(
-                "LAN peer {} was not found during session preflight.",
-                target_device_id.0
-            ));
-        }
+    if require_lan_peer
+        && !app_state
+            .lan_discovery
+            .has_controllable_peer(target_device_id)
+            .await
+    {
+        return Err(format!(
+            "LAN peer {} is not authenticated and trusted for product sessions.",
+            target_device_id.0
+        ));
     }
 
     Ok(())

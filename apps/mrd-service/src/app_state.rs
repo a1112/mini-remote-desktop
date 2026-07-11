@@ -35,7 +35,9 @@ pub use audit_log_registry::AuditLogRegistry;
 pub use capability_snapshot_registry::CapabilitySnapshotRegistry;
 pub use capture_source_registry::CaptureSourceRegistry;
 pub use core::AppState;
-pub use device_identity_registry::{DeviceIdentityRegistry, DeviceIdentityRegistryError};
+pub use device_identity_registry::{
+    AuthenticatedPeerTrust, DeviceIdentityRegistry, DeviceIdentityRegistryError,
+};
 pub use device_preference_registry::DevicePreferenceRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;

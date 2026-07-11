@@ -413,6 +413,6 @@ mod tests {
         .await
         .expect_err("missing LAN peer should fail preflight");
 
-        assert!(error.contains("LAN peer missing-lan-peer was not found"));
+        assert!(error.contains("LAN peer missing-lan-peer is not authenticated and trusted"));
     }
 }

@@ -3,17 +3,20 @@ pub mod recovery;
 
 use std::{
     collections::{BTreeMap, HashMap},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use ring::digest;
 use rustls::RootCertStore;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+const QUIC_SERVER_HANDSHAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicTransportMetadata {
@@ -28,6 +31,20 @@ pub struct QuinnServerBootstrap {
     pub listen_addr: SocketAddr,
     pub server_name: String,
     pub cert_der: Vec<u8>,
+}
+
+impl QuinnServerBootstrap {
+    /// SHA-256 commitment to the exact ephemeral leaf certificate used by this listener.
+    pub fn certificate_fingerprint_sha256(&self) -> [u8; 32] {
+        certificate_fingerprint_sha256(&self.cert_der)
+    }
+}
+
+/// Computes a stable SHA-256 commitment for an encoded X.509 certificate.
+pub fn certificate_fingerprint_sha256(cert_der: &[u8]) -> [u8; 32] {
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(digest::digest(&digest::SHA256, cert_der).as_ref());
+    fingerprint
 }
 
 pub struct QuinnServerListener {
@@ -82,28 +99,52 @@ impl QuinnServerListener {
     }
 
     pub async fn accept(self) -> Result<QuinnDatagramEndpoint, QuinnTransportError> {
-        let connecting =
-            self.endpoint.accept().await.ok_or_else(|| {
+        self.accept_matching_ip(None).await
+    }
+
+    /// Accepts only a QUIC client from the IP that sent the authenticated session request.
+    pub async fn accept_from(
+        self,
+        expected_peer_ip: IpAddr,
+    ) -> Result<QuinnDatagramEndpoint, QuinnTransportError> {
+        self.accept_matching_ip(Some(expected_peer_ip)).await
+    }
+
+    async fn accept_matching_ip(
+        self,
+        expected_peer_ip: Option<IpAddr>,
+    ) -> Result<QuinnDatagramEndpoint, QuinnTransportError> {
+        loop {
+            let connecting = self.endpoint.accept().await.ok_or_else(|| {
                 QuinnTransportError::Message("server accept returned None".into())
             })?;
-        let connection = connecting.await.map_err(|error| {
-            QuinnTransportError::Message(format!("server handshake failed: {error}"))
-        })?;
-        let metadata = QuicTransportMetadata {
-            transport: "quic_quinn",
-            local_addr: self.local_addr,
-            peer_addr: connection.remote_address(),
-        };
+            let connection =
+                match tokio::time::timeout(QUIC_SERVER_HANDSHAKE_ATTEMPT_TIMEOUT, connecting).await
+                {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(_)) | Err(_) => continue,
+                };
+            let peer_addr = connection.remote_address();
+            if expected_peer_ip.is_some_and(|expected| peer_addr.ip() != expected) {
+                connection.close(0_u32.into(), b"unexpected authenticated peer address");
+                continue;
+            }
+            let metadata = QuicTransportMetadata {
+                transport: "quic_quinn",
+                local_addr: self.local_addr,
+                peer_addr,
+            };
 
-        Ok(QuinnDatagramEndpoint {
-            inner: Arc::new(QuinnDatagramEndpointInner {
-                endpoint: self.endpoint,
-                connection,
-                metadata,
-                reliable_send_stream: Mutex::new(None),
-                reliable_recv_stream: Mutex::new(None),
-            }),
-        })
+            return Ok(QuinnDatagramEndpoint {
+                inner: Arc::new(QuinnDatagramEndpointInner {
+                    endpoint: self.endpoint,
+                    connection,
+                    metadata,
+                    reliable_send_stream: Mutex::new(None),
+                    reliable_recv_stream: Mutex::new(None),
+                }),
+            });
+        }
     }
 }
 

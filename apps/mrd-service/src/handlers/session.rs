@@ -65,29 +65,6 @@ pub async fn start_lan_remote_session(
         transport_kind
     );
 
-    {
-        let mut sessions = app_state.sessions.lock().await;
-        sessions.insert(
-            session_id.clone(),
-            SessionSnapshot {
-                session_id: session_id.clone(),
-                transport: transport_kind.clone(),
-                source_device_id: None,
-                target_device_id: Some(target_device_id.clone()),
-                local_listen_addr: None,
-                local_server_name: None,
-                local_cert_der_b64: None,
-                remote_listen_addr: None,
-                remote_server_name: None,
-                remote_cert_der_b64: None,
-                lifecycle_state: SessionLifecycleState::Connecting,
-                last_error: None,
-                sender_active: false,
-                receiver_active: false,
-            },
-        );
-    }
-
     match crate::lan_discovery::request_lan_remote_session(
         app_state,
         &target_device_id,
@@ -113,19 +90,6 @@ pub async fn start_lan_remote_session(
         }
         Err(error) => {
             let message = error.to_string();
-            let mut sessions = app_state.sessions.lock().await;
-            if let Some(snapshot) = sessions.get(&session_id).cloned() {
-                sessions.insert(
-                    session_id.clone(),
-                    SessionSnapshot {
-                        lifecycle_state: SessionLifecycleState::Failed {
-                            message: message.clone(),
-                        },
-                        last_error: Some(message.clone()),
-                        ..snapshot
-                    },
-                );
-            }
             IpcResponse::Error {
                 code: "E_LAN_REMOTE".to_string(),
                 message,
@@ -895,7 +859,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_lan_remote_session_marks_missing_peer_failure() {
+    async fn start_lan_remote_session_rejects_missing_peer_without_session_side_effects() {
         let app_state = Arc::new(AppState::new());
         app_state
             .devices
@@ -922,12 +886,7 @@ mod tests {
         }
 
         let sessions = app_state.sessions.lock().await;
-        let stored = sessions.get(&session_id).expect("failed LAN session");
-        assert!(matches!(
-            stored.lifecycle_state,
-            SessionLifecycleState::Failed { .. }
-        ));
-        assert!(stored.last_error.is_some());
+        assert!(sessions.get(&session_id).is_none());
     }
 
     #[tokio::test]

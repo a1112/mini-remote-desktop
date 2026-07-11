@@ -1,5 +1,174 @@
 use super::*;
 
+async fn wait_until_session_commit_reaches_locked_profile(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            match app_state.sessions.try_lock() {
+                Err(_) => break,
+                Ok(sessions) if sessions.get(session_id).is_some() => break,
+                Ok(_) => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await
+    .expect("session commit should reach the locked media-profile barrier");
+}
+
+#[test]
+fn lan_session_reservation_is_exclusive_and_releases_on_drop() {
+    let state = LanDiscoveryState::default();
+    let session_id = SessionId("reserved-session".to_string());
+
+    let reservation = state
+        .reserve_session(&session_id)
+        .expect("first reservation");
+    assert!(state.reserve_session(&session_id).is_err());
+    drop(reservation);
+    state
+        .reserve_session(&session_id)
+        .expect("reservation is released by drop");
+}
+
+#[test]
+fn periodic_discovery_uses_a_probe_so_signed_endpoints_are_unicast() {
+    let state = LanDiscoveryState::default();
+
+    assert!(matches!(
+        periodic_discovery_packet(&state),
+        LanDiscoveryPacket::Probe { .. }
+    ));
+}
+
+#[test]
+fn routed_discovery_endpoint_uses_the_route_source_ip_and_service_port() {
+    let endpoint =
+        routed_discovery_endpoint("127.0.0.1:9".parse().unwrap(), 21_116).expect("loopback route");
+
+    assert_eq!(endpoint, "127.0.0.1:21116".parse().unwrap());
+}
+
+#[test]
+fn signed_lan_replay_cache_rejects_duplicate_nonce_in_same_domain() {
+    let mut cache = LanSignedReplayCache::default();
+    let nonce = [9; 16];
+
+    cache
+        .accept(
+            LanSignedReplayDomain::TrustedAnnouncement,
+            "peer-key",
+            nonce,
+            10_000,
+            1_000,
+        )
+        .unwrap();
+
+    assert!(cache
+        .accept(
+            LanSignedReplayDomain::TrustedAnnouncement,
+            "peer-key",
+            nonce,
+            10_000,
+            1_001,
+        )
+        .is_err());
+    assert!(cache
+        .accept(
+            LanSignedReplayDomain::SessionRequest,
+            "peer-key",
+            nonce,
+            10_000,
+            1_001,
+        )
+        .is_ok());
+}
+
+#[test]
+fn signed_lan_replay_cache_is_domain_isolated_and_fails_closed_at_capacity() {
+    let mut cache = LanSignedReplayCache::default();
+    for index in 0..LAN_SIGNED_REPLAY_CACHE_LIMIT {
+        let mut nonce = [0; 16];
+        nonce[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        cache
+            .accept(
+                LanSignedReplayDomain::DiagnosticAnnouncement,
+                "peer-key",
+                nonce,
+                10_000 + index as u64,
+                1_000,
+            )
+            .unwrap();
+    }
+    assert_eq!(cache.entries.len(), LAN_SIGNED_REPLAY_CACHE_LIMIT);
+
+    let mut overflow_nonce = [0; 16];
+    overflow_nonce[..8].copy_from_slice(&(LAN_SIGNED_REPLAY_CACHE_LIMIT as u64).to_le_bytes());
+    assert!(cache
+        .accept(
+            LanSignedReplayDomain::DiagnosticAnnouncement,
+            "peer-key",
+            overflow_nonce,
+            20_000,
+            1_000,
+        )
+        .is_err());
+
+    assert_eq!(cache.entries.len(), LAN_SIGNED_REPLAY_CACHE_LIMIT);
+    assert!(cache.entries.contains_key(&(
+        LanSignedReplayDomain::DiagnosticAnnouncement,
+        "peer-key".to_string(),
+        [0; 16],
+    )));
+
+    let trusted_announcement_nonce = [0xB6; 16];
+    cache
+        .accept(
+            LanSignedReplayDomain::TrustedAnnouncement,
+            "trusted-announcement-peer",
+            trusted_announcement_nonce,
+            10_000,
+            1_000,
+        )
+        .expect("diagnostic pressure must not consume the trusted announcement domain");
+    assert!(cache.entries.contains_key(&(
+        LanSignedReplayDomain::TrustedAnnouncement,
+        "trusted-announcement-peer".to_string(),
+        trusted_announcement_nonce,
+    )));
+
+    let session_nonce = [0xA5; 16];
+    cache
+        .accept(
+            LanSignedReplayDomain::SessionRequest,
+            "trusted-session-peer",
+            session_nonce,
+            5_000,
+            1_000,
+        )
+        .expect("announcement pressure must not consume the session-request domain");
+    assert!(cache
+        .accept(
+            LanSignedReplayDomain::SessionRequest,
+            "trusted-session-peer",
+            session_nonce,
+            5_000,
+            1_001,
+        )
+        .is_err());
+    assert!(cache.entries.contains_key(&(
+        LanSignedReplayDomain::SessionRequest,
+        "trusted-session-peer".to_string(),
+        session_nonce,
+    )));
+    assert!(!cache.entries.contains_key(&(
+        LanSignedReplayDomain::DiagnosticAnnouncement,
+        "peer-key".to_string(),
+        overflow_nonce,
+    )));
+}
+
 #[derive(Clone)]
 struct SharedRecordingInputInjector {
     events: std::sync::Arc<std::sync::Mutex<Vec<mrd_input::InputEvent>>>,
@@ -812,17 +981,23 @@ async fn announcement_advertises_keyboard_mouse_input_control() {
         "Local Device".to_string(),
     );
 
-    let announcement = build_announcement(&app_state)
+    let announcement = build_announcement(&app_state, "127.0.0.1:21116".parse().unwrap())
         .await
         .expect("registered device announcement");
 
     assert!(announcement
+        .payload
+        .announcement
         .transports
         .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
     assert!(announcement
+        .payload
+        .announcement
         .transports
         .contains(&LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string()));
     assert!(announcement
+        .payload
+        .announcement
         .media_capabilities
         .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
 }
@@ -839,17 +1014,23 @@ async fn announcement_omits_keyboard_mouse_input_control_when_injector_unavailab
         .replace_control_input_for_test(mrd_input::UnsupportedInputInjector::new("blocked by test"))
         .await;
 
-    let announcement = build_announcement(&app_state)
+    let announcement = build_announcement(&app_state, "127.0.0.1:21116".parse().unwrap())
         .await
         .expect("registered device announcement");
 
     assert!(!announcement
+        .payload
+        .announcement
         .transports
         .contains(&LAN_INPUT_CONTROL_TRANSPORT.to_string()));
     assert!(announcement
+        .payload
+        .announcement
         .transports
         .contains(&LAN_REMOTE_POWER_CONTROL_TRANSPORT.to_string()));
     assert!(!announcement
+        .payload
+        .announcement
         .media_capabilities
         .contains(&LAN_INPUT_CONTROL_CAPABILITY.to_string()));
 }
@@ -967,6 +1148,12 @@ fn peer_registry_record_projects_addr_snapshot_and_capabilities() {
         media_protocol_version: Some(3),
         media_capabilities: vec!["media.hevc".to_string()],
         mac_address: Some("AA:BB:CC:DD:EE:FF".to_string()),
+        peer_key_id: Some("test-key-remote".to_string()),
+        public_key: Some(vec![7; 32]),
+        key_epoch: Some(1),
+        authentication: super::peer_registry::LanPeerAuthentication::Signed(
+            crate::app_state::AuthenticatedPeerTrust::Trusted,
+        ),
         last_seen_ms: 1_000,
     };
 
@@ -1002,6 +1189,12 @@ fn peer_registry_prunes_and_queries_records() {
         media_protocol_version: Some(3),
         media_capabilities: vec!["media.hevc".to_string()],
         mac_address: None,
+        peer_key_id: Some("test-key-fresh".to_string()),
+        public_key: Some(vec![8; 32]),
+        key_epoch: Some(1),
+        authentication: super::peer_registry::LanPeerAuthentication::Signed(
+            crate::app_state::AuthenticatedPeerTrust::Trusted,
+        ),
         last_seen_ms: 1_000,
     });
     registry.upsert(super::peer_registry::LanPeerRecord {
@@ -1016,6 +1209,12 @@ fn peer_registry_prunes_and_queries_records() {
         media_protocol_version: None,
         media_capabilities: Vec::new(),
         mac_address: None,
+        peer_key_id: Some("test-key-stale".to_string()),
+        public_key: Some(vec![9; 32]),
+        key_epoch: Some(1),
+        authentication: super::peer_registry::LanPeerAuthentication::Signed(
+            crate::app_state::AuthenticatedPeerTrust::Trusted,
+        ),
         last_seen_ms: 100,
     });
 
@@ -1467,8 +1666,7 @@ async fn lan_control_input_sendinput_smoke_moves_cursor_through_udp_handler() {
 
     eprintln!(
         "lan sendinput smoke start={start:?} target={target:?} moved={moved:?} lane={:?} snapshot={:?}",
-        result.lane,
-        snapshot.realtime
+        result.lane, snapshot.realtime
     );
     assert_eq!(result.lane, mrd_ipc::ControlInputLane::Realtime);
     assert_eq!(result.event_count, 1);
@@ -2191,35 +2389,55 @@ async fn realtime_lan_control_input_does_not_retry_without_ack() {
 }
 
 #[tokio::test]
-async fn remote_session_request_auto_accepts_session() {
+async fn signed_remote_session_request_from_trusted_peer_auto_accepts_until_task18() {
     let app_state = Arc::new(AppState::new());
     app_state.devices.lock().await.register(
         DeviceId("target-device".to_string()),
         "Target Device".to_string(),
     );
+    let controller = mrd_identity::DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    app_state
+        .device_identities
+        .trust_authenticated_peer_for_test(&controller, 1, mrd_store_sqlite::TrustState::Trusted);
+    let target_identity = app_state.device_identities.machine_identity();
+    let target_key_epoch = app_state.device_identities.machine_key_epoch().unwrap();
 
     let service_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let ack_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let request = LanDiscoveryPacket::RemoteSessionRequest {
-        magic: DISCOVERY_MAGIC.to_string(),
-        app_id: DISCOVERY_APP_ID.to_string(),
-        instance_id: "controller-instance".to_string(),
-        session_id: "session-1".to_string(),
-        source_device_id: "controller-device".to_string(),
-        source_device_name: "Controller".to_string(),
-        transport_kind: "quic".to_string(),
-        source_discovery_port: Some(21116),
-        source_media_capabilities: lan_media_capabilities(),
-        requested_media_profile: Some(MediaProfile {
-            width: 3840,
-            height: 2160,
-            fps: 240,
-            bitrate_mbps: 120,
-            codec: "hevc".to_string(),
-            ..MediaProfile::default()
-        }),
-        timestamp_ms: now_ms(),
-    };
+    let signed_request = SignedLanSessionRequest::sign(
+        &controller,
+        LanSessionRequest {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+            instance_id: "controller-instance".to_string(),
+            session_id: "session-1".to_string(),
+            source_device_id: "controller-device".to_string(),
+            source_device_name: "Controller".to_string(),
+            source_key_id: controller.key_id().to_string(),
+            source_key_epoch: 1,
+            target_device_id: "target-device".to_string(),
+            target_key_id: target_identity.key_id().to_string(),
+            target_key_epoch,
+            transport_kind: "quic".to_string(),
+            source_discovery_port: Some(21_116),
+            source_endpoint: ack_socket.local_addr().unwrap(),
+            source_media_capabilities: lan_media_capabilities(),
+            requested_media_profile: Some(MediaProfile {
+                width: 3840,
+                height: 2160,
+                fps: 240,
+                bitrate_mbps: 120,
+                codec: "hevc".to_string(),
+                ..MediaProfile::default()
+            }),
+            timestamp_ms: now_ms(),
+            expires_at_ms: now_ms().saturating_add(5_000),
+            nonce: [7; 16],
+        },
+    )
+    .unwrap();
+    let request = LanDiscoveryPacket::SignedRemoteSessionRequest(signed_request.clone());
     let bytes = serde_json::to_vec(&request).unwrap();
 
     handle_packet(
@@ -2238,22 +2456,26 @@ async fn remote_session_request_auto_accepts_session() {
         .unwrap();
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len]).unwrap();
     match ack {
-        LanDiscoveryPacket::RemoteSessionAck {
-            session_id,
-            accepted,
-            media,
-            media_profile,
-            ..
-        } => {
-            assert_eq!(session_id, "session-1");
-            assert!(accepted);
-            let media = media.expect("QUIC media bootstrap");
+        LanDiscoveryPacket::SignedRemoteSessionBootstrap(ack) => {
+            ack.verify_for_request(
+                now_ms(),
+                &signed_request,
+                target_identity.public_key(),
+                target_key_epoch,
+            )
+            .expect("authenticated bootstrap");
+            assert_eq!(ack.payload.session_id, "session-1");
+            assert!(ack.payload.accepted);
+            let media = ack.payload.media.expect("QUIC media bootstrap");
             assert_eq!(media.transport_kind, "quic");
             let quic = media.quic.expect("QUIC bootstrap details");
             assert!(!quic.listen_addr.ends_with(":0"));
             assert!(!quic.server_name.is_empty());
             assert!(!quic.cert_der.is_empty());
-            let negotiation = media_profile.expect("media profile negotiation");
+            let negotiation = ack
+                .payload
+                .media_profile
+                .expect("media profile negotiation");
             assert_eq!(negotiation.status, "downgraded");
             assert_eq!(negotiation.selected.width, LAN_MEDIA_TARGET_WIDTH);
             assert_eq!(negotiation.selected.height, LAN_MEDIA_TARGET_HEIGHT);
@@ -2291,28 +2513,49 @@ async fn remote_session_request_auto_accepts_session() {
 }
 
 #[tokio::test]
-async fn remote_session_request_rejects_webrtc_until_media_path_exists() {
+async fn signed_remote_session_request_rejects_webrtc_until_media_path_exists() {
     let app_state = Arc::new(AppState::new());
     app_state.devices.lock().await.register(
         DeviceId("target-device".to_string()),
         "Target Device".to_string(),
     );
+    let controller = mrd_identity::DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    app_state
+        .device_identities
+        .trust_authenticated_peer_for_test(&controller, 1, mrd_store_sqlite::TrustState::Trusted);
+    let target_identity = app_state.device_identities.machine_identity();
+    let target_key_epoch = app_state.device_identities.machine_key_epoch().unwrap();
 
     let service_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let ack_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let request = LanDiscoveryPacket::RemoteSessionRequest {
-        magic: DISCOVERY_MAGIC.to_string(),
-        app_id: DISCOVERY_APP_ID.to_string(),
-        instance_id: "controller-instance".to_string(),
-        session_id: "session-1".to_string(),
-        source_device_id: "controller-device".to_string(),
-        source_device_name: "Controller".to_string(),
-        transport_kind: "webrtc".to_string(),
-        source_discovery_port: None,
-        source_media_capabilities: Vec::new(),
-        requested_media_profile: None,
-        timestamp_ms: now_ms(),
-    };
+    let issued_at_ms = now_ms();
+    let signed_request = SignedLanSessionRequest::sign(
+        &controller,
+        LanSessionRequest {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+            instance_id: "controller-instance".to_string(),
+            session_id: "session-1".to_string(),
+            source_device_id: "controller-device".to_string(),
+            source_device_name: "Controller".to_string(),
+            source_key_id: controller.key_id().to_string(),
+            source_key_epoch: 1,
+            target_device_id: "target-device".to_string(),
+            target_key_id: target_identity.key_id().to_string(),
+            target_key_epoch,
+            transport_kind: "webrtc".to_string(),
+            source_discovery_port: None,
+            source_endpoint: ack_socket.local_addr().unwrap(),
+            source_media_capabilities: Vec::new(),
+            requested_media_profile: None,
+            timestamp_ms: issued_at_ms,
+            expires_at_ms: issued_at_ms.saturating_add(5_000),
+            nonce: [8; 16],
+        },
+    )
+    .unwrap();
+    let request = LanDiscoveryPacket::SignedRemoteSessionRequest(signed_request.clone());
     let bytes = serde_json::to_vec(&request).unwrap();
 
     handle_packet(
@@ -2331,11 +2574,18 @@ async fn remote_session_request_rejects_webrtc_until_media_path_exists() {
         .unwrap();
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len]).unwrap();
     match ack {
-        LanDiscoveryPacket::RemoteSessionAck {
-            accepted, message, ..
-        } => {
-            assert!(!accepted);
-            assert!(message
+        LanDiscoveryPacket::SignedRemoteSessionBootstrap(ack) => {
+            ack.verify_for_request(
+                now_ms(),
+                &signed_request,
+                target_identity.public_key(),
+                target_key_epoch,
+            )
+            .expect("authenticated rejection");
+            assert!(!ack.payload.accepted);
+            assert!(ack
+                .payload
+                .message
                 .expect("reject message")
                 .contains("WebRTC media path is not implemented"));
         }
@@ -2483,7 +2733,7 @@ async fn request_lan_remote_session_records_quic_datagram_frames() {
 }
 
 #[tokio::test]
-async fn request_lan_remote_session_rejects_legacy_quic_peer_without_media_capability() {
+async fn request_lan_remote_session_rejects_legacy_unsigned_peer_before_capability_checks() {
     let controller_state = Arc::new(AppState::new());
     controller_state.devices.lock().await.register(
         DeviceId("controller-device".to_string()),
@@ -2524,12 +2774,11 @@ async fn request_lan_remote_session_rejects_legacy_quic_peer_without_media_capab
     .await
     .expect_err("legacy QUIC peer should fail before session request");
 
-    assert!(error.to_string().contains("quic_datagram"));
-    assert!(error.to_string().contains("Rebuild and restart"));
+    assert!(error.to_string().contains("trust is no longer active"));
 }
 
 #[tokio::test]
-async fn request_lan_remote_session_rejects_peer_without_2k144_media_profile() {
+async fn request_lan_remote_session_rejects_unpinned_peer_before_profile_checks() {
     let controller_state = Arc::new(AppState::new());
     controller_state.devices.lock().await.register(
         DeviceId("controller-device".to_string()),
@@ -2570,8 +2819,7 @@ async fn request_lan_remote_session_rejects_peer_without_2k144_media_profile() {
     .await
     .expect_err("stale QUIC datagram peer should fail before session request");
 
-    assert!(error.to_string().contains("quic_datagram_2k144"));
-    assert!(error.to_string().contains("Rebuild and restart"));
+    assert!(error.to_string().contains("trust is no longer active"));
 }
 
 #[tokio::test]
@@ -2932,6 +3180,380 @@ fn requested_hdr_main10_profile_requires_peer_main10_media_capabilities() {
 }
 
 #[tokio::test]
+async fn remote_session_accept_is_prepared_without_starting_before_bootstrap_delivery() {
+    let app_state = Arc::new(AppState::new());
+    app_state.devices.lock().await.register(
+        DeviceId("target-device".to_string()),
+        "Target Device".to_string(),
+    );
+    let session_id = SessionId("prepared-target-session".to_string());
+
+    let result = accept_lan_remote_session(
+        &app_state,
+        session_id.clone(),
+        DeviceId("controller-device".to_string()),
+        "127.0.0.1".parse().unwrap(),
+        "quic".to_string(),
+        lan_media_capabilities(),
+        None,
+    )
+    .await;
+
+    assert!(result.accepted);
+    assert!(result.media.is_some());
+    assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        0
+    );
+}
+
+#[tokio::test]
+async fn committed_target_session_times_out_and_cleans_resources_without_a_client() {
+    let app_state = Arc::new(AppState::new());
+    app_state.devices.lock().await.register(
+        DeviceId("target-device".to_string()),
+        "Target Device".to_string(),
+    );
+    let session_id = SessionId("target-bootstrap-timeout".to_string());
+    let mut result = accept_lan_remote_session(
+        &app_state,
+        session_id.clone(),
+        DeviceId("controller-device".to_string()),
+        "127.0.0.1".parse().unwrap(),
+        "quic".to_string(),
+        lan_media_capabilities(),
+        None,
+    )
+    .await;
+    let prepared = result.prepared.take().expect("prepared target session");
+
+    commit_prepared_lan_remote_session_with_timeout(
+        &app_state,
+        prepared,
+        Duration::from_millis(25),
+    )
+    .await
+    .expect("commit target session");
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let failed = app_state
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .is_some_and(|snapshot| {
+                    matches!(
+                        snapshot.lifecycle_state,
+                        SessionLifecycleState::Failed { .. }
+                    )
+                });
+            let task_count = app_state.media_tasks.lock().await.active_count(&session_id);
+            if failed && task_count == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("target listener cleanup deadline");
+
+    assert!(app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .capture_sources
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+}
+
+#[tokio::test]
+async fn target_commit_and_stop_are_atomic_across_media_registry_awaits() {
+    let app_state = Arc::new(AppState::new());
+    app_state.devices.lock().await.register(
+        DeviceId("target-device".to_string()),
+        "Target Device".to_string(),
+    );
+    let session_id = SessionId("target-commit-stop-race".to_string());
+    let mut result = accept_lan_remote_session(
+        &app_state,
+        session_id.clone(),
+        DeviceId("controller-device".to_string()),
+        "127.0.0.1".parse().unwrap(),
+        "quic".to_string(),
+        lan_media_capabilities(),
+        None,
+    )
+    .await;
+    let prepared = result.prepared.take().expect("prepared target session");
+    let profile_guard = app_state.media_profiles.lock().await;
+    let commit_state = app_state.clone();
+    let commit = tokio::spawn(async move {
+        commit_prepared_lan_remote_session_with_timeout(
+            &commit_state,
+            prepared,
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    wait_until_session_commit_reaches_locked_profile(&app_state, &session_id).await;
+
+    let stop_state = app_state.clone();
+    let stop_session_id = session_id.clone();
+    let mut stop = tokio::spawn(async move {
+        crate::handlers::session::stop_session(&stop_state, stop_session_id).await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut stop).await.is_err(),
+        "stop must wait until the target session commit is fully published"
+    );
+
+    drop(profile_guard);
+    commit.await.unwrap().expect("target commit");
+    assert!(matches!(
+        stop.await.unwrap(),
+        mrd_ipc::IpcResponse::SessionStopped { .. }
+    ));
+    assert!(app_state
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|snapshot| snapshot.lifecycle_state == SessionLifecycleState::Closed));
+    assert!(app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .capture_sources
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        0
+    );
+}
+
+#[tokio::test]
+async fn cancelled_target_commit_leaves_no_partially_published_media_state() {
+    let app_state = Arc::new(AppState::new());
+    app_state.devices.lock().await.register(
+        DeviceId("target-device".to_string()),
+        "Target Device".to_string(),
+    );
+    let session_id = SessionId("cancelled-target-commit".to_string());
+    let mut result = accept_lan_remote_session(
+        &app_state,
+        session_id.clone(),
+        DeviceId("controller-device".to_string()),
+        "127.0.0.1".parse().unwrap(),
+        "quic".to_string(),
+        lan_media_capabilities(),
+        None,
+    )
+    .await;
+    let prepared = result.prepared.take().expect("prepared target session");
+    let task_guard = app_state.media_tasks.lock().await;
+    let commit_state = app_state.clone();
+    let commit = tokio::spawn(async move {
+        commit_prepared_lan_remote_session_with_timeout(
+            &commit_state,
+            prepared,
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    wait_until_session_commit_reaches_locked_profile(&app_state, &session_id).await;
+
+    commit.abort();
+    assert!(commit.await.unwrap_err().is_cancelled());
+    drop(task_guard);
+
+    assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    assert!(app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .capture_sources
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        0
+    );
+}
+
+#[tokio::test]
+async fn receiver_connect_failure_leaves_no_session_or_media_state() {
+    let app_state = Arc::new(AppState::new());
+    let session_id = SessionId("receiver-connect-failure".to_string());
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary QUIC listener");
+    drop(listener);
+    let certificate_fingerprint_sha256 = bootstrap.certificate_fingerprint_sha256();
+    let media = LanMediaBootstrap {
+        transport_kind: "quic".to_string(),
+        quic: Some(LanQuicBootstrap {
+            listen_addr: bootstrap.listen_addr.to_string(),
+            server_name: bootstrap.server_name,
+            certificate_fingerprint_sha256,
+            cert_der: bootstrap.cert_der,
+        }),
+    };
+
+    let result = start_lan_media_receiver_with_timeout(
+        app_state.clone(),
+        session_id.clone(),
+        "quic",
+        Some(media),
+        "127.0.0.1".parse().unwrap(),
+        DeviceId("target-device".to_string()),
+        default_media_profile_negotiation(),
+        lan_media_capabilities(),
+        Duration::from_millis(25),
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    assert!(app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        0
+    );
+}
+
+#[tokio::test]
+async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
+    let app_state = Arc::new(AppState::new());
+    let session_id = SessionId("receiver-commit-stop-race".to_string());
+    let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
+        .await
+        .expect("temporary QUIC listener");
+    let certificate_fingerprint_sha256 = bootstrap.certificate_fingerprint_sha256();
+    let media = LanMediaBootstrap {
+        transport_kind: "quic".to_string(),
+        quic: Some(LanQuicBootstrap {
+            listen_addr: bootstrap.listen_addr.to_string(),
+            server_name: bootstrap.server_name,
+            certificate_fingerprint_sha256,
+            cert_der: bootstrap.cert_der,
+        }),
+    };
+    let server = tokio::spawn(async move {
+        let endpoint = listener
+            .accept()
+            .await
+            .expect("receiver test server accept");
+        let _endpoint = endpoint;
+        std::future::pending::<()>().await;
+    });
+    let profile_guard = app_state.media_profiles.lock().await;
+    let commit_state = app_state.clone();
+    let commit_session_id = session_id.clone();
+    let commit = tokio::spawn(async move {
+        start_lan_media_receiver_with_timeout(
+            commit_state,
+            commit_session_id,
+            "quic",
+            Some(media),
+            "127.0.0.1".parse().unwrap(),
+            DeviceId("target-device".to_string()),
+            default_media_profile_negotiation(),
+            lan_media_capabilities(),
+            Duration::from_secs(1),
+        )
+        .await
+    });
+    wait_until_session_commit_reaches_locked_profile(&app_state, &session_id).await;
+
+    let stop_state = app_state.clone();
+    let stop_session_id = session_id.clone();
+    let mut stop = tokio::spawn(async move {
+        crate::handlers::session::stop_session(&stop_state, stop_session_id).await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut stop).await.is_err(),
+        "stop must wait until the receiver session commit is fully published"
+    );
+
+    drop(profile_guard);
+    commit.await.unwrap().expect("receiver commit");
+    assert!(matches!(
+        stop.await.unwrap(),
+        mrd_ipc::IpcResponse::SessionStopped { .. }
+    ));
+    assert!(app_state
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|snapshot| snapshot.lifecycle_state == SessionLifecycleState::Closed));
+    assert!(app_state
+        .media_profiles
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert!(app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .get(&session_id)
+        .is_none());
+    assert_eq!(
+        app_state.media_tasks.lock().await.active_count(&session_id),
+        0
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn remote_session_accept_rejects_source_without_selected_hevc_decoder() {
     let app_state = Arc::new(AppState::new());
     app_state
@@ -2944,6 +3566,7 @@ async fn remote_session_accept_rejects_source_without_selected_hevc_decoder() {
         &app_state,
         SessionId("session-hevc-receiver-missing".to_string()),
         DeviceId("mac-controller".to_string()),
+        "127.0.0.1".parse().expect("loopback address"),
         "quic".to_string(),
         vec!["videotoolbox_h264".to_string()],
         Some(MediaProfile {

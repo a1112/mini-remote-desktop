@@ -1,5 +1,5 @@
 use crate::{integrity, PersistentStore, SecretProtector, StoreError};
-use mrd_identity::DeviceIdentity;
+use mrd_identity::{public_key_id, DeviceIdentity};
 use ring::digest;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
@@ -56,6 +56,18 @@ impl PersistentStore {
         let identity = load_identity_from_row(self.protector.as_ref(), &meta.store_id, &stored)?;
         transaction.commit()?;
         Ok(identity)
+    }
+
+    /// Returns the sealed monotonic epoch for the current machine signing key.
+    pub fn load_identity_epoch(&self) -> Result<u64, StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        self.verify_store_snapshot_connection(&transaction)?;
+        let stored = query_identity(&transaction)?.ok_or(StoreError::InvalidIdentity)?;
+        validate_identity_metadata(&stored)?;
+        let epoch = stored.epoch;
+        transaction.commit()?;
+        Ok(epoch)
     }
 
     /// Generates an identity only for a genuinely uninitialized sealed store.
@@ -132,7 +144,7 @@ fn validate_identity_metadata(stored: &StoredIdentity) -> Result<(), StoreError>
         || stored.public_key.len() != 32
         || stored.protected_pkcs8.is_empty()
         || stored.created_at_ms == 0
-        || key_id(&stored.public_key) != stored.key_id
+        || public_key_id(&stored.public_key) != stored.key_id
     {
         return Err(StoreError::InvalidIdentity);
     }
@@ -166,12 +178,4 @@ fn identity_commitment(stored: &StoredIdentity) -> Vec<u8> {
     integrity::append_field(&mut bytes, &stored.protected_pkcs8);
     bytes.extend_from_slice(&stored.created_at_ms.to_be_bytes());
     digest::digest(&digest::SHA256, &bytes).as_ref().to_vec()
-}
-
-fn key_id(public_key: &[u8]) -> String {
-    digest::digest(&digest::SHA256, public_key)
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

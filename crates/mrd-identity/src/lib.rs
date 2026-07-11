@@ -32,6 +32,8 @@ pub enum IdentityError {
     PeerBindingMismatch,
 }
 
+const CONTEXT_SIGNATURE_PREFIX: &[u8] = b"MRD_CONTEXT_SIGNATURE_V1";
+
 #[derive(Clone)]
 pub struct DeviceIdentity {
     private_pkcs8: Vec<u8>,
@@ -67,7 +69,7 @@ impl DeviceIdentity {
         let pair = signature::Ed25519KeyPair::from_pkcs8(bytes)
             .map_err(|_| IdentityError::InvalidPrivateKey)?;
         let public_key = pair.public_key().as_ref().to_vec();
-        let key_id = hex_digest(&public_key);
+        let key_id = public_key_id(&public_key);
         Ok(Self {
             private_pkcs8: bytes.to_vec(),
             public_key,
@@ -109,6 +111,51 @@ impl DeviceIdentity {
             signature: pair.sign(&bytes).as_ref().to_vec(),
         })
     }
+
+    /// Signs already-canonical payload bytes under an explicit protocol context.
+    pub fn sign_context_bytes(
+        &self,
+        context: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, IdentityError> {
+        let bytes = contextual_bytes(context, payload)?;
+        self.sign_domain_bytes(&bytes)
+    }
+}
+
+/// Recomputes the stable SHA-256 key identifier for an Ed25519 public key.
+pub fn public_key_id(public_key: &[u8]) -> String {
+    hex_digest(public_key)
+}
+
+/// Verifies canonical payload bytes under the same explicit protocol context.
+pub fn verify_context_bytes(
+    public_key: &[u8],
+    context: &str,
+    payload: &[u8],
+    signature_bytes: &[u8],
+) -> Result<(), IdentityError> {
+    let bytes = contextual_bytes(context, payload)?;
+    signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+        .verify(&bytes, signature_bytes)
+        .map_err(|_| IdentityError::InvalidSignature)
+}
+
+fn contextual_bytes(context: &str, payload: &[u8]) -> Result<Vec<u8>, IdentityError> {
+    let context_len = u16::try_from(context.len()).map_err(|_| IdentityError::PayloadEncoding)?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| IdentityError::PayloadEncoding)?;
+    if context.is_empty() {
+        return Err(IdentityError::PayloadEncoding);
+    }
+
+    let mut bytes =
+        Vec::with_capacity(CONTEXT_SIGNATURE_PREFIX.len() + 2 + context.len() + 8 + payload.len());
+    bytes.extend_from_slice(CONTEXT_SIGNATURE_PREFIX);
+    bytes.extend_from_slice(&context_len.to_be_bytes());
+    bytes.extend_from_slice(context.as_bytes());
+    bytes.extend_from_slice(&payload_len.to_be_bytes());
+    bytes.extend_from_slice(payload);
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

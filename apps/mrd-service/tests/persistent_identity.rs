@@ -133,6 +133,7 @@ fn machine_identity_trust_and_audit_survive_service_restarts() {
         .machine_key_id()
         .expect("persistent machine identity")
         .to_owned();
+    assert_eq!(first.device_identities.machine_key_epoch(), Some(1));
     assert!(matches!(
         first.device_identities.upsert(
             mrd_proto::DeviceId("unauthenticated-device".to_owned()),
@@ -172,6 +173,7 @@ fn machine_identity_trust_and_audit_survive_service_restarts() {
         second.device_identities.machine_key_id(),
         Some(machine_key_id.as_str())
     );
+    assert_eq!(second.device_identities.machine_key_epoch(), Some(1));
     assert_eq!(
         second
             .device_identities

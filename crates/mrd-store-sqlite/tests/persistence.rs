@@ -335,6 +335,7 @@ fn generated_identity_reloads_with_same_public_key_and_no_plaintext_secret() {
         reopened.load_identity().unwrap().public_key(),
         expected_public
     );
+    assert_eq!(reopened.load_identity_epoch().unwrap(), 1);
     let replacement = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
     assert!(matches!(
         reopened.save_identity(&replacement),

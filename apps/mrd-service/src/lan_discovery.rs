@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::app_state::{AppState, AuthenticatedPeerTrust, DeviceIdentityRegistryError};
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue};
 use anyhow::{Context, Result};
@@ -23,29 +23,29 @@ use mrd_transport_quic_quinn::QuicAuFrame;
 #[cfg(test)]
 use mrd_transport_quic_quinn::QuicAuReassemblerConfig;
 use mrd_transport_quic_quinn::{
-    fragment_access_unit, fragment_media_payload_v3, is_quic_media_v3_datagram, QuicAuReassembler,
-    QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnServerBootstrap,
-    QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN, QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
+    certificate_fingerprint_sha256, fragment_access_unit, fragment_media_payload_v3,
+    is_quic_media_v3_datagram, QuicAuReassembler, QuicMediaPayloadType, QuicMediaReassembler,
+    QuinnDatagramEndpoint, QuinnServerBootstrap, QuinnServerListener, QUIC_AU_FRAGMENT_HEADER_LEN,
+    QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN,
 };
 #[cfg(any(test, target_os = "macos"))]
 use mrd_transport_quic_quinn::{QuicAuReassemblerStats, QuicMediaCodec, QuicMediaFrame};
-use std::collections::HashMap;
+use ring::rand::{SecureRandom, SystemRandom};
 #[cfg(all(test, target_os = "macos"))]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 #[cfg(all(test, target_os = "macos"))]
 use std::sync::Condvar as StdCondvar;
-#[cfg(test)]
-use std::sync::Mutex as StdMutex;
 #[cfg(any(windows, target_os = "macos"))]
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 #[cfg(all(test, target_os = "macos"))]
 use std::time::Instant as StdInstant;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{oneshot, Mutex, Notify};
 use tokio::time::{interval, timeout, Instant};
 
 mod capture_activity;
@@ -87,9 +87,8 @@ mod session_runtime;
 mod time_utils;
 use capture_activity::active_window_capture_count;
 pub use discovery_config::LanDiscoveryConfig;
-use discovery_identity::{
-    is_valid_discovery_packet, new_instance_id, now_ms, DISCOVERY_APP_ID, DISCOVERY_MAGIC,
-};
+use discovery_identity::{is_valid_discovery_packet, new_instance_id, now_ms};
+pub use discovery_identity::{DISCOVERY_APP_ID, DISCOVERY_MAGIC};
 use dynamic_window_fps::{
     is_winrt_window_capture_no_frame_timeout, update_dynamic_window_fps_decision,
     window_dynamic_fps_input_for_capture_error, window_dynamic_fps_input_for_captured_frame,
@@ -270,18 +269,24 @@ use peer_lookup::{
     peer_control_addr_with_input_control_capability,
     peer_control_addr_with_remote_power_capability, session_remote_peer,
 };
-use peer_registry::{LanPeerRecord, LanPeerRegistry};
+use peer_registry::{LanPeerAuthentication, LanPeerRecord, LanPeerRegistry};
+#[allow(unused_imports)]
+pub use protocol::LanProtocolError;
+pub use protocol::{
+    LanAnnouncement, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap, LanSessionBootstrap,
+    LanSessionRequest, SignedLanAnnouncement, SignedLanSessionBootstrap, SignedLanSessionRequest,
+    SIGNED_LAN_PROTOCOL_VERSION,
+};
 use protocol::{
-    LanAnnouncement, LanDiscoveryPacket, LanMediaBootstrap, LanQuicBootstrap,
     DISCOVERY_PACKET_BUFFER_BYTES, LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT,
     LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
     LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
     LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT,
 };
 #[cfg(test)]
-use protocol::{DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY};
+use protocol::{DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY, PROTOCOL_VERSION};
 use remote_power::accept_lan_remote_device_power_action;
 use runtime_flags::env_bool_override;
 use service_identity::service_build_id;
@@ -343,6 +348,8 @@ const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
 const LAN_CONTROL_INPUT_DEDUPE_WINDOW_MS: u64 = 10_000;
 const LAN_CONTROL_INPUT_DEDUPE_CACHE_LIMIT: usize = 4096;
+const LAN_QUIC_BOOTSTRAP_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_QUIC_BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(windows, target_os = "macos"))]
 static LOCAL_RENDER_REFRESH_HZ: OnceLock<Option<u32>> = OnceLock::new();
 static LAN_CONTROL_INPUT_EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -356,6 +363,8 @@ const LAN_CAPTURE_PUMP_REPEAT_GRACE_MAX: Duration = Duration::from_millis(4);
 const LAN_CAPTURE_PUMP_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 const LAN_MEDIA_REASSEMBLER_FRAME_TIMEOUT_MS: u64 = 1_500;
 const LAN_MEDIA_REASSEMBLER_MAX_PENDING_FRAMES: usize = 256;
+const LAN_SIGNED_REPLAY_CACHE_LIMIT: usize = 4_096;
+const LAN_SIGNED_REPLAY_RETENTION_SKEW_MS: u64 = 2_000;
 // Small bounded reorder window: absorbs normal QUIC stream/datagram jitter at 144-180 Hz
 // without letting a genuinely missing frame add visible input latency.
 const LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES: usize = 4;
@@ -367,9 +376,25 @@ pub struct LanDiscoveryState {
     running: AtomicBool,
     last_probe_ms: AtomicU64,
     peers: Mutex<LanPeerRegistry>,
+    signed_replays: Mutex<LanSignedReplayCache>,
+    pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
     probe_requested: Notify,
     peer_changed: Notify,
+}
+
+struct LanSessionReservation {
+    pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
+    session_id: SessionId,
+}
+
+impl Drop for LanSessionReservation {
+    fn drop(&mut self) {
+        self.pending_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.session_id);
+    }
 }
 
 impl LanDiscoveryState {
@@ -380,6 +405,8 @@ impl LanDiscoveryState {
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
             peers: Mutex::new(LanPeerRegistry::default()),
+            signed_replays: Mutex::new(LanSignedReplayCache::default()),
+            pending_sessions: Arc::new(StdMutex::new(HashSet::new())),
             recent_control_inputs: Mutex::new(HashMap::new()),
             probe_requested: Notify::new(),
             peer_changed: Notify::new(),
@@ -388,6 +415,21 @@ impl LanDiscoveryState {
 
     pub fn discovery_port(&self) -> u16 {
         self.config.discovery_port
+    }
+
+    fn reserve_session(&self, session_id: &SessionId) -> Result<LanSessionReservation> {
+        let mut pending_sessions = self
+            .pending_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending_sessions.insert(session_id.clone()) {
+            anyhow::bail!("LAN session id is already pending: {}", session_id.0);
+        }
+        drop(pending_sessions);
+        Ok(LanSessionReservation {
+            pending_sessions: Arc::clone(&self.pending_sessions),
+            session_id: session_id.clone(),
+        })
     }
 
     fn probe_targets(&self, discovery_port: u16) -> Vec<SocketAddr> {
@@ -416,11 +458,13 @@ impl LanDiscoveryState {
         self.snapshot().await
     }
 
+    #[cfg(test)]
     async fn upsert_peer(&self, announcement: LanAnnouncement, addr: SocketAddr) {
         if announcement.instance_id == self.instance_id {
             return;
         }
 
+        let test_peer_key_id = format!("test-peer:{}", announcement.device_id);
         let peer = LanPeerRecord {
             device_id: announcement.device_id,
             device_name: announcement.device_name,
@@ -433,9 +477,66 @@ impl LanDiscoveryState {
             media_protocol_version: announcement.media_protocol_version,
             media_capabilities: announcement.media_capabilities,
             mac_address: announcement.mac_address,
+            peer_key_id: Some(test_peer_key_id),
+            public_key: Some(vec![0; 32]),
+            key_epoch: Some(1),
+            authentication: peer_registry::LanPeerAuthentication::Signed(
+                crate::app_state::AuthenticatedPeerTrust::Trusted,
+            ),
             last_seen_ms: now_ms(),
         };
 
+        self.peers.lock().await.upsert(peer);
+        self.peer_changed.notify_one();
+    }
+
+    async fn upsert_signed_peer(
+        &self,
+        signed: &SignedLanAnnouncement,
+        authentication: AuthenticatedPeerTrust,
+    ) {
+        let announcement = &signed.payload.announcement;
+        let peer = LanPeerRecord {
+            device_id: announcement.device_id.clone(),
+            device_name: announcement.device_name.clone(),
+            device_type: announcement.device_type.clone(),
+            ip: signed.payload.discovery_endpoint.ip(),
+            discovery_port: signed.payload.discovery_endpoint.port(),
+            transports: announcement.transports.clone(),
+            protocol_version: announcement.protocol_version,
+            service_build_id: announcement.service_build_id.clone(),
+            media_protocol_version: announcement.media_protocol_version,
+            media_capabilities: announcement.media_capabilities.clone(),
+            mac_address: announcement.mac_address.clone(),
+            peer_key_id: Some(signed.payload.signer_key_id.clone()),
+            public_key: Some(signed.public_key.clone()),
+            key_epoch: Some(signed.payload.signer_key_epoch),
+            authentication: LanPeerAuthentication::Signed(authentication),
+            last_seen_ms: now_ms(),
+        };
+        self.peers.lock().await.upsert(peer);
+        self.peer_changed.notify_one();
+    }
+
+    async fn upsert_legacy_peer(&self, announcement: LanAnnouncement, addr: SocketAddr) {
+        let peer = LanPeerRecord {
+            device_id: announcement.device_id,
+            device_name: announcement.device_name,
+            device_type: announcement.device_type,
+            ip: addr.ip(),
+            discovery_port: announcement.discovery_port,
+            transports: announcement.transports,
+            protocol_version: announcement.protocol_version,
+            service_build_id: announcement.service_build_id,
+            media_protocol_version: announcement.media_protocol_version,
+            media_capabilities: announcement.media_capabilities,
+            mac_address: announcement.mac_address,
+            peer_key_id: None,
+            public_key: None,
+            key_epoch: None,
+            authentication: LanPeerAuthentication::LegacyDiagnostic,
+            last_seen_ms: now_ms(),
+        };
         self.peers.lock().await.upsert(peer);
         self.peer_changed.notify_one();
     }
@@ -471,6 +572,20 @@ impl LanDiscoveryState {
         self.peers.lock().await.control_addr(device_id)
     }
 
+    pub async fn has_controllable_peer(&self, device_id: &DeviceId) -> bool {
+        self.prune_stale_peers().await;
+        self.peers
+            .lock()
+            .await
+            .controllable_peer(device_id)
+            .is_some()
+    }
+
+    async fn controllable_peer(&self, device_id: &DeviceId) -> Option<LanPeerRecord> {
+        self.prune_stale_peers().await;
+        self.peers.lock().await.controllable_peer(device_id)
+    }
+
     pub async fn peer_transports(&self, device_id: &DeviceId) -> Option<Vec<String>> {
         self.prune_stale_peers().await;
         self.peers.lock().await.transports(device_id)
@@ -482,10 +597,164 @@ impl LanDiscoveryState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LanSignedReplayDomain {
+    TrustedAnnouncement,
+    DiagnosticAnnouncement,
+    SessionRequest,
+}
+
+#[derive(Debug, Default)]
+struct LanSignedReplayCache {
+    entries: HashMap<(LanSignedReplayDomain, String, [u8; 16]), u64>,
+}
+
+impl LanSignedReplayCache {
+    fn accept(
+        &mut self,
+        domain: LanSignedReplayDomain,
+        peer_key_id: &str,
+        nonce: [u8; 16],
+        expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<()> {
+        self.entries.retain(|_, expiry| *expiry >= now_ms);
+        let key = (domain, peer_key_id.to_string(), nonce);
+        if self.entries.contains_key(&key) {
+            anyhow::bail!("replayed signed LAN message");
+        }
+        let domain_entry_count = self
+            .entries
+            .keys()
+            .filter(|(entry_domain, _, _)| *entry_domain == domain)
+            .count();
+        if domain_entry_count >= LAN_SIGNED_REPLAY_CACHE_LIMIT {
+            anyhow::bail!("signed LAN replay cache capacity exceeded");
+        }
+        self.entries.insert(
+            key,
+            expires_at_ms.saturating_add(LAN_SIGNED_REPLAY_RETENTION_SKEW_MS),
+        );
+        Ok(())
+    }
+}
+
 impl Default for LanDiscoveryState {
     fn default() -> Self {
         Self::new(LanDiscoveryConfig::default())
     }
+}
+
+pub async fn ingest_signed_lan_announcement(
+    app_state: &Arc<AppState>,
+    signed: SignedLanAnnouncement,
+    addr: SocketAddr,
+    observed_at_ms: u64,
+) -> Result<()> {
+    signed.verify(observed_at_ms)?;
+    if signed.payload.discovery_endpoint != addr {
+        anyhow::bail!(
+            "signed LAN discovery endpoint does not match UDP source: signed={}, observed={addr}",
+            signed.payload.discovery_endpoint
+        );
+    }
+    if signed.payload.announcement.instance_id == app_state.lan_discovery.instance_id()
+        && app_state.device_identities.machine_key_id()
+            == Some(signed.payload.signer_key_id.as_str())
+    {
+        return Ok(());
+    }
+    let trust = resolve_authenticated_peer_trust(
+        app_state,
+        &signed.payload.signer_key_id,
+        &signed.public_key,
+        signed.payload.signer_key_epoch,
+    )
+    .await?;
+    let replay_domain = if trust.is_controllable() {
+        LanSignedReplayDomain::TrustedAnnouncement
+    } else {
+        LanSignedReplayDomain::DiagnosticAnnouncement
+    };
+    app_state.lan_discovery.signed_replays.lock().await.accept(
+        replay_domain,
+        &signed.payload.signer_key_id,
+        signed.payload.nonce,
+        signed.payload.expires_at_ms,
+        observed_at_ms,
+    )?;
+    app_state
+        .lan_discovery
+        .upsert_signed_peer(&signed, trust)
+        .await;
+    Ok(())
+}
+
+pub async fn ingest_legacy_lan_announcement(
+    app_state: &Arc<AppState>,
+    announcement: LanAnnouncement,
+    addr: SocketAddr,
+    observed_at_ms: u64,
+) -> Result<()> {
+    if !app_state.lan_discovery.config.allow_unsigned_diagnostics {
+        anyhow::bail!("unsigned LAN diagnostics are disabled");
+    }
+    if !is_valid_discovery_packet(&announcement.magic, &announcement.app_id) {
+        anyhow::bail!("invalid legacy LAN discovery namespace");
+    }
+    if announcement.instance_id == app_state.lan_discovery.instance_id() {
+        return Ok(());
+    }
+    if announcement.timestamp_ms > observed_at_ms.saturating_add(2_000)
+        || observed_at_ms.saturating_sub(announcement.timestamp_ms) > 15_000
+    {
+        anyhow::bail!("stale legacy LAN diagnostic announcement");
+    }
+    app_state
+        .lan_discovery
+        .upsert_legacy_peer(announcement, addr)
+        .await;
+    Ok(())
+}
+
+async fn resolve_authenticated_peer_trust(
+    app_state: &Arc<AppState>,
+    peer_key_id: &str,
+    public_key: &[u8],
+    epoch: u64,
+) -> Result<AuthenticatedPeerTrust> {
+    if !app_state.security_is_healthy() {
+        anyhow::bail!("authoritative security state is unavailable");
+    }
+    let registry = app_state.device_identities();
+    let peer_key_id = peer_key_id.to_string();
+    let public_key = public_key.to_vec();
+    match tokio::task::spawn_blocking(move || {
+        registry.authenticated_peer_trust(&peer_key_id, &public_key, epoch)
+    })
+    .await
+    {
+        Ok(Ok(trust)) => Ok(trust),
+        Ok(Err(DeviceIdentityRegistryError::Store(error))) => {
+            app_state.mark_security_unhealthy();
+            Err(error.into())
+        }
+        Ok(Err(DeviceIdentityRegistryError::AuthenticatedPeerRequired)) => {
+            anyhow::bail!("authenticated peer trust lookup is unavailable")
+        }
+        Err(error) => {
+            app_state.mark_security_unhealthy();
+            Err(anyhow::Error::new(error).context("LAN trust lookup task failed"))
+        }
+    }
+}
+
+fn new_signed_nonce() -> Result<[u8; 16]> {
+    let mut nonce = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| anyhow::anyhow!("failed to generate LAN protocol nonce"))?;
+    Ok(nonce)
 }
 
 struct LanRemoteAcceptResult {
@@ -493,6 +762,18 @@ struct LanRemoteAcceptResult {
     message: Option<String>,
     media: Option<LanMediaBootstrap>,
     media_profile: Option<MediaProfileNegotiation>,
+    prepared: Option<PreparedLanRemoteSession>,
+}
+
+struct PreparedLanRemoteSession {
+    session_id: SessionId,
+    source_device_id: DeviceId,
+    transport: String,
+    source_media_capabilities: Vec<String>,
+    negotiation: MediaProfileNegotiation,
+    listener: QuinnServerListener,
+    bootstrap: QuinnServerBootstrap,
+    expected_peer_ip: IpAddr,
 }
 
 type LanEncoderConfigKey = (
@@ -523,6 +804,7 @@ impl LanRemoteAcceptResult {
             message: Some(message.into()),
             media: None,
             media_profile: None,
+            prepared: None,
         }
     }
 }
@@ -532,18 +814,22 @@ pub async fn send_probe(
     discovery_port: u16,
     state: &LanDiscoveryState,
 ) -> Result<()> {
-    let packet = LanDiscoveryPacket::Probe {
-        magic: DISCOVERY_MAGIC.to_string(),
-        app_id: DISCOVERY_APP_ID.to_string(),
-        instance_id: state.instance_id.clone(),
-        device_id: None,
-        timestamp_ms: now_ms(),
-    };
+    let packet = periodic_discovery_packet(state);
     for target in state.probe_targets(discovery_port) {
         send_packet(socket, &packet, target).await?;
     }
     state.last_probe_ms.store(now_ms(), Ordering::Relaxed);
     Ok(())
+}
+
+fn periodic_discovery_packet(state: &LanDiscoveryState) -> LanDiscoveryPacket {
+    LanDiscoveryPacket::Probe {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        instance_id: state.instance_id.clone(),
+        device_id: None,
+        timestamp_ms: now_ms(),
+    }
 }
 
 pub async fn start_lan_discovery(app_state: Arc<AppState>) -> Result<()> {
@@ -589,21 +875,43 @@ pub async fn request_lan_remote_session(
     transport_kind: &str,
     requested_profile: Option<MediaProfile>,
 ) -> Result<MediaProfileNegotiation> {
-    let target = app_state
+    if app_state.sessions.lock().await.get(session_id).is_some() {
+        anyhow::bail!("session id is already in use: {}", session_id.0);
+    }
+    let _session_reservation = app_state.lan_discovery.reserve_session(session_id)?;
+    if app_state.sessions.lock().await.get(session_id).is_some() {
+        anyhow::bail!("session id is already in use: {}", session_id.0);
+    }
+    let peer = app_state
         .lan_discovery
-        .peer_control_addr(target_device_id)
+        .controllable_peer(target_device_id)
         .await
-        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
-    let peer_transports = app_state
-        .lan_discovery
-        .peer_transports(target_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
-    let peer_media_capabilities = app_state
-        .lan_discovery
-        .peer_media_capabilities(target_device_id)
-        .await
-        .with_context(|| format!("LAN peer not found: {}", target_device_id.0))?;
+        .with_context(|| {
+            format!(
+                "LAN peer is not authenticated and trusted: {}",
+                target_device_id.0
+            )
+        })?;
+    let peer_key_id = peer
+        .peer_key_id
+        .clone()
+        .context("trusted LAN peer has no key identifier")?;
+    let peer_public_key = peer
+        .public_key
+        .clone()
+        .context("trusted LAN peer has no public key")?;
+    let peer_key_epoch = peer
+        .key_epoch
+        .context("trusted LAN peer has no key epoch")?;
+    let fresh_trust =
+        resolve_authenticated_peer_trust(app_state, &peer_key_id, &peer_public_key, peer_key_epoch)
+            .await?;
+    if !fresh_trust.is_controllable() {
+        anyhow::bail!("LAN peer trust is no longer active: {peer_key_id}");
+    }
+    let target = peer.control_addr();
+    let peer_transports = peer.transports.clone();
+    let peer_media_capabilities = peer.media_capabilities_with_transports();
     ensure_peer_supports_requested_media(
         target_device_id,
         transport_kind,
@@ -611,6 +919,17 @@ pub async fn request_lan_remote_session(
         requested_profile.as_ref(),
         &peer_media_capabilities,
     )?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .context("failed to bind LAN remote request UDP socket")?;
+    socket
+        .connect(target)
+        .await
+        .with_context(|| format!("failed to bind LAN request socket to trusted peer {target}"))?;
+    let source_endpoint = socket
+        .local_addr()
+        .context("failed to read signed LAN request source endpoint")?;
 
     let (source_device_id, source_device_name) = {
         let devices = app_state.devices.lock().await;
@@ -620,89 +939,91 @@ pub async fn request_lan_remote_session(
             .context("local device is not registered")?
     };
 
-    let socket = UdpSocket::bind(("0.0.0.0", 0))
-        .await
-        .context("failed to bind LAN remote request UDP socket")?;
-    let packet = LanDiscoveryPacket::RemoteSessionRequest {
-        magic: DISCOVERY_MAGIC.to_string(),
-        app_id: DISCOVERY_APP_ID.to_string(),
-        instance_id: app_state.lan_discovery.instance_id.clone(),
-        session_id: session_id.0.clone(),
-        source_device_id,
-        source_device_name,
-        transport_kind: transport_kind.to_string(),
-        source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
-        source_media_capabilities: lan_media_capabilities(),
-        requested_media_profile: requested_profile,
-        timestamp_ms: now_ms(),
-    };
-    send_packet(&socket, &packet, target).await?;
+    let local_identity = app_state.device_identities.machine_identity();
+    let local_key_epoch = app_state
+        .device_identities
+        .machine_key_epoch()
+        .context("local machine key epoch is unavailable")?;
+    let request_issued_at_ms = now_ms();
+    let source_media_capabilities = lan_media_capabilities();
+    let signed_request = SignedLanSessionRequest::sign(
+        local_identity.as_ref(),
+        LanSessionRequest {
+            magic: DISCOVERY_MAGIC.to_string(),
+            app_id: DISCOVERY_APP_ID.to_string(),
+            protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+            instance_id: app_state.lan_discovery.instance_id.clone(),
+            session_id: session_id.0.clone(),
+            source_device_id,
+            source_device_name,
+            source_key_id: local_identity.key_id().to_string(),
+            source_key_epoch: local_key_epoch,
+            target_device_id: target_device_id.0.clone(),
+            target_key_id: peer_key_id.clone(),
+            target_key_epoch: peer_key_epoch,
+            transport_kind: transport_kind.to_string(),
+            source_discovery_port: Some(app_state.lan_discovery.discovery_port()),
+            source_endpoint,
+            source_media_capabilities,
+            requested_media_profile: requested_profile,
+            timestamp_ms: request_issued_at_ms,
+            expires_at_ms: request_issued_at_ms.saturating_add(5_000),
+            nonce: new_signed_nonce()?,
+        },
+    )?;
+
+    let packet = LanDiscoveryPacket::SignedRemoteSessionRequest(signed_request.clone());
+    let bytes = serde_json::to_vec(&packet)?;
+    socket.send(&bytes).await?;
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let (len, ack_addr) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+    let len = timeout(Duration::from_secs(2), socket.recv(&mut buffer))
         .await
         .context("LAN remote request timed out")??;
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
     match ack {
-        LanDiscoveryPacket::RemoteSessionAck {
-            magic,
-            app_id,
-            session_id: ack_session_id,
-            accepted,
-            message,
-            media,
-            media_profile,
-            ..
-        } if is_valid_discovery_packet(&magic, &app_id) && ack_session_id == session_id.0 => {
-            if accepted {
-                let negotiation = media_profile.unwrap_or_else(default_media_profile_negotiation);
-                app_state
-                    .media_profiles
-                    .lock()
-                    .await
-                    .set(session_id.clone(), negotiation.clone());
-                app_state
-                    .peer_media_capabilities
-                    .lock()
-                    .await
-                    .set(session_id.clone(), peer_media_capabilities);
-                {
-                    let mut sessions = app_state.sessions.lock().await;
-                    if sessions.get(session_id).is_none() {
-                        sessions.insert(
-                            session_id.clone(),
-                            SessionSnapshot {
-                                session_id: session_id.clone(),
-                                transport: normalize_transport_kind(transport_kind),
-                                source_device_id: None,
-                                target_device_id: Some(target_device_id.clone()),
-                                local_listen_addr: None,
-                                local_server_name: None,
-                                local_cert_der_b64: None,
-                                remote_listen_addr: None,
-                                remote_server_name: None,
-                                remote_cert_der_b64: None,
-                                lifecycle_state: SessionLifecycleState::Connecting,
-                                last_error: None,
-                                sender_active: false,
-                                receiver_active: false,
-                            },
-                        );
-                    }
-                }
+        LanDiscoveryPacket::SignedRemoteSessionBootstrap(bootstrap) => {
+            bootstrap.verify_for_request(
+                now_ms(),
+                &signed_request,
+                &peer_public_key,
+                peer_key_epoch,
+            )?;
+            let final_trust = resolve_authenticated_peer_trust(
+                app_state,
+                &peer_key_id,
+                &peer_public_key,
+                peer_key_epoch,
+            )
+            .await?;
+            if !final_trust.is_controllable() {
+                anyhow::bail!("LAN peer trust changed during session bootstrap");
+            }
+            if bootstrap.payload.accepted {
+                let negotiation = bootstrap
+                    .payload
+                    .media_profile
+                    .clone()
+                    .unwrap_or_else(default_media_profile_negotiation);
                 start_lan_media_receiver(
                     app_state.clone(),
                     session_id.clone(),
                     transport_kind,
-                    media,
-                    ack_addr.ip(),
+                    bootstrap.payload.media,
+                    target.ip(),
+                    target_device_id.clone(),
+                    negotiation.clone(),
+                    peer_media_capabilities,
                 )
                 .await?;
                 Ok(negotiation)
             } else {
                 anyhow::bail!(
                     "LAN peer rejected remote session: {}",
-                    message.unwrap_or_else(|| "unknown reason".to_string())
+                    bootstrap
+                        .payload
+                        .message
+                        .unwrap_or_else(|| "unknown reason".to_string())
                 );
             }
         }
@@ -1165,21 +1486,9 @@ async fn announce_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Some(announcement) = build_announcement(&app_state).await {
-                    let packet = LanDiscoveryPacket::Announce(announcement);
-                    let targets = app_state
-                        .lan_discovery
-                        .probe_targets(app_state.lan_discovery.discovery_port());
-                    for target in targets {
-                        if let Err(error) = send_packet(&socket, &packet, target).await {
-                            tracing::warn!(%error, %target, "failed to send LAN discovery announce");
-                        } else {
-                            app_state
-                                .lan_discovery
-                                .last_probe_ms
-                                .store(now_ms(), Ordering::Relaxed);
-                        }
-                    }
+                let discovery_port = app_state.lan_discovery.discovery_port();
+                if let Err(error) = send_probe(&socket, discovery_port, &app_state.lan_discovery).await {
+                    tracing::warn!(%error, "failed to send periodic LAN discovery probe");
                 }
                 app_state.lan_discovery.prune_stale_peers().await;
             }
@@ -1197,7 +1506,9 @@ async fn receive_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
     loop {
         match socket.recv_from(&mut buffer).await {
             Ok((len, addr)) => {
-                if let Err(error) = handle_packet(&socket, &app_state, &buffer[..len], addr).await {
+                if let Err(error) =
+                    process_lan_discovery_packet(&socket, &app_state, &buffer[..len], addr).await
+                {
                     tracing::debug!(%error, %addr, "ignored LAN discovery packet");
                 }
             }
@@ -1206,6 +1517,15 @@ async fn receive_loop(socket: Arc<UdpSocket>, app_state: Arc<AppState>) {
             }
         }
     }
+}
+
+pub async fn process_lan_discovery_packet(
+    socket: &UdpSocket,
+    app_state: &Arc<AppState>,
+    bytes: &[u8],
+    addr: SocketAddr,
+) -> Result<()> {
+    handle_packet(socket, app_state, bytes, addr).await
 }
 
 async fn handle_packet(
@@ -1227,59 +1547,31 @@ async fn handle_packet(
             {
                 return Ok(());
             }
-            if let Some(announcement) = build_announcement(app_state).await {
-                send_packet(socket, &LanDiscoveryPacket::Announce(announcement), addr).await?;
+            let discovery_endpoint =
+                routed_discovery_endpoint(addr, app_state.lan_discovery.discovery_port())?;
+            if let Some(announcement) = build_announcement(app_state, discovery_endpoint).await {
+                send_packet(
+                    socket,
+                    &LanDiscoveryPacket::SignedAnnounce(announcement),
+                    addr,
+                )
+                .await?;
             }
         }
         LanDiscoveryPacket::Announce(announcement) => {
-            if is_valid_discovery_packet(&announcement.magic, &announcement.app_id) {
-                app_state
-                    .lan_discovery
-                    .upsert_peer(announcement, addr)
-                    .await;
-            }
+            ingest_legacy_lan_announcement(app_state, announcement, addr, now_ms()).await?;
         }
-        LanDiscoveryPacket::RemoteSessionRequest {
-            magic,
-            app_id,
-            instance_id,
-            session_id,
-            source_device_id,
-            transport_kind,
-            source_media_capabilities,
-            requested_media_profile,
-            ..
-        } => {
-            if !is_valid_discovery_packet(&magic, &app_id)
-                || instance_id == app_state.lan_discovery.instance_id()
-            {
-                return Ok(());
-            }
-
-            let accept_result = accept_lan_remote_session(
-                app_state,
-                SessionId(session_id.clone()),
-                DeviceId(source_device_id),
-                transport_kind,
-                source_media_capabilities,
-                requested_media_profile,
-            )
-            .await;
-
-            let ack = LanDiscoveryPacket::RemoteSessionAck {
-                magic: DISCOVERY_MAGIC.to_string(),
-                app_id: DISCOVERY_APP_ID.to_string(),
-                instance_id: app_state.lan_discovery.instance_id.clone(),
-                session_id: session_id.clone(),
-                accepted: accept_result.accepted,
-                message: accept_result.message,
-                media: accept_result.media,
-                media_profile: accept_result.media_profile,
-                timestamp_ms: now_ms(),
-            };
-            send_packet(socket, &ack, addr).await?;
+        LanDiscoveryPacket::SignedAnnounce(announcement) => {
+            ingest_signed_lan_announcement(app_state, announcement, addr, now_ms()).await?;
         }
-        LanDiscoveryPacket::RemoteSessionAck { .. } => {}
+        LanDiscoveryPacket::RemoteSessionRequest { .. } => {
+            tracing::debug!(%addr, "ignored unsigned legacy LAN session request");
+        }
+        LanDiscoveryPacket::SignedRemoteSessionRequest(request) => {
+            handle_signed_remote_session_request(socket, app_state, request, addr).await?;
+        }
+        LanDiscoveryPacket::RemoteSessionAck { .. }
+        | LanDiscoveryPacket::SignedRemoteSessionBootstrap(_) => {}
         LanDiscoveryPacket::MediaProfileUpdate {
             magic,
             app_id,
@@ -1624,10 +1916,122 @@ async fn handle_packet(
     Ok(())
 }
 
+async fn handle_signed_remote_session_request(
+    socket: &UdpSocket,
+    app_state: &Arc<AppState>,
+    request: SignedLanSessionRequest,
+    addr: SocketAddr,
+) -> Result<()> {
+    let received_at_ms = now_ms();
+    let local_key_id = app_state
+        .device_identities
+        .machine_key_id()
+        .context("local machine signing key is unavailable")?
+        .to_string();
+    let local_key_epoch = app_state
+        .device_identities
+        .machine_key_epoch()
+        .context("local machine key epoch is unavailable")?;
+    request.verify_for_target(received_at_ms, &local_key_id, local_key_epoch)?;
+    if request.payload.source_endpoint != addr {
+        anyhow::bail!(
+            "signed LAN session request source endpoint does not match UDP source: signed={}, observed={addr}",
+            request.payload.source_endpoint
+        );
+    }
+    if request.payload.instance_id == app_state.lan_discovery.instance_id() {
+        anyhow::bail!("self-originated signed LAN session request");
+    }
+    let local_device_id = {
+        let devices = app_state.devices.lock().await;
+        devices
+            .get_local_device()
+            .map(|(device_id, _)| device_id.0.clone())
+            .context("local device is not registered")?
+    };
+    if request.payload.target_device_id != local_device_id {
+        anyhow::bail!("signed LAN session request targets another device");
+    }
+    let trust = resolve_authenticated_peer_trust(
+        app_state,
+        &request.payload.source_key_id,
+        &request.public_key,
+        request.payload.source_key_epoch,
+    )
+    .await?;
+    if !trust.is_controllable() {
+        anyhow::bail!("signed LAN session requester is not trusted");
+    }
+    app_state.lan_discovery.signed_replays.lock().await.accept(
+        LanSignedReplayDomain::SessionRequest,
+        &request.payload.source_key_id,
+        request.payload.nonce,
+        request.payload.expires_at_ms,
+        received_at_ms,
+    )?;
+
+    let session_id = SessionId(request.payload.session_id.clone());
+    let _session_reservation = app_state.lan_discovery.reserve_session(&session_id)?;
+    if app_state.sessions.lock().await.get(&session_id).is_some() {
+        anyhow::bail!("signed LAN session id is already in use");
+    }
+    let accept_result = accept_lan_remote_session(
+        app_state,
+        session_id,
+        DeviceId(request.payload.source_device_id.clone()),
+        addr.ip(),
+        request.payload.transport_kind.clone(),
+        request.payload.source_media_capabilities.clone(),
+        request.payload.requested_media_profile.clone(),
+    )
+    .await;
+    let LanRemoteAcceptResult {
+        accepted,
+        message,
+        media,
+        media_profile,
+        prepared,
+    } = accept_result;
+
+    let bootstrap_issued_at_ms = now_ms();
+    let bootstrap = LanSessionBootstrap {
+        magic: DISCOVERY_MAGIC.to_string(),
+        app_id: DISCOVERY_APP_ID.to_string(),
+        protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
+        instance_id: app_state.lan_discovery.instance_id.clone(),
+        session_id: request.payload.session_id.clone(),
+        controller_key_id: request.payload.source_key_id.clone(),
+        controller_key_epoch: request.payload.source_key_epoch,
+        target_key_id: local_key_id,
+        target_key_epoch: local_key_epoch,
+        request_nonce: request.payload.nonce,
+        accepted,
+        message,
+        media,
+        media_profile,
+        timestamp_ms: bootstrap_issued_at_ms,
+        expires_at_ms: bootstrap_issued_at_ms.saturating_add(5_000),
+        nonce: new_signed_nonce()?,
+    };
+    let identity = app_state.device_identities.machine_identity();
+    let signed = SignedLanSessionBootstrap::sign(identity.as_ref(), bootstrap)?;
+    send_packet(
+        socket,
+        &LanDiscoveryPacket::SignedRemoteSessionBootstrap(signed),
+        addr,
+    )
+    .await?;
+    if let Some(prepared) = prepared {
+        commit_prepared_lan_remote_session(app_state, prepared).await?;
+    }
+    Ok(())
+}
+
 async fn accept_lan_remote_session(
     app_state: &Arc<AppState>,
     session_id: SessionId,
     source_device_id: DeviceId,
+    expected_peer_ip: IpAddr,
     transport_kind: String,
     source_media_capabilities: Vec<String>,
     requested_profile: Option<MediaProfile>,
@@ -1676,78 +2080,138 @@ async fn accept_lan_remote_session(
         quic: Some(LanQuicBootstrap {
             listen_addr: bootstrap.listen_addr.to_string(),
             server_name: bootstrap.server_name.clone(),
+            certificate_fingerprint_sha256: bootstrap.certificate_fingerprint_sha256(),
             cert_der: bootstrap.cert_der.clone(),
         }),
     };
-    app_state
-        .media_profiles
-        .lock()
-        .await
-        .set(session_id.clone(), negotiation.clone());
-    app_state
-        .peer_media_capabilities
-        .lock()
-        .await
-        .set(session_id.clone(), source_media_capabilities);
-
-    let local_listen_addr = bootstrap.listen_addr.to_string();
-    let local_server_name = bootstrap.server_name.clone();
-    {
-        let mut sessions = app_state.sessions.lock().await;
-        sessions.insert(
-            session_id.clone(),
-            SessionSnapshot {
-                session_id: session_id.clone(),
-                transport,
-                source_device_id: Some(source_device_id),
-                target_device_id: None,
-                local_listen_addr: Some(local_listen_addr),
-                local_server_name: Some(local_server_name),
-                local_cert_der_b64: None,
-                remote_listen_addr: None,
-                remote_server_name: None,
-                remote_cert_der_b64: None,
-                lifecycle_state: SessionLifecycleState::Listening,
-                last_error: None,
-                sender_active: true,
-                receiver_active: false,
-            },
-        );
-    }
-    #[cfg(test)]
-    {
-        app_state.capture_sources.lock().await.set(
-            session_id.clone(),
-            CaptureSourceSelection {
-                session_id: session_id.clone(),
-                source: synthetic_capture_source(),
-                status: "selected".to_string(),
-                reason: Some("test synthetic capture source".to_string()),
-            },
-        );
-    }
-    #[cfg(not(test))]
-    {
-        if let Ok(source) = crate::capture_source::default_capture_source(false) {
-            app_state.capture_sources.lock().await.set(
-                session_id.clone(),
-                CaptureSourceSelection {
-                    session_id: session_id.clone(),
-                    source,
-                    status: "selected".to_string(),
-                    reason: Some("default fullscreen capture source".to_string()),
-                },
-            );
-        }
-    }
-    spawn_quic_media_sender(app_state.clone(), session_id.clone(), listener).await;
 
     LanRemoteAcceptResult {
         accepted: true,
         message: Some("accepted".to_string()),
         media: Some(local_media),
-        media_profile: Some(negotiation),
+        media_profile: Some(negotiation.clone()),
+        prepared: Some(PreparedLanRemoteSession {
+            session_id,
+            source_device_id,
+            transport,
+            source_media_capabilities,
+            negotiation,
+            listener,
+            bootstrap,
+            expected_peer_ip,
+        }),
     }
+}
+
+async fn commit_prepared_lan_remote_session(
+    app_state: &Arc<AppState>,
+    prepared: PreparedLanRemoteSession,
+) -> Result<()> {
+    commit_prepared_lan_remote_session_with_timeout(
+        app_state,
+        prepared,
+        LAN_QUIC_BOOTSTRAP_ACCEPT_TIMEOUT,
+    )
+    .await
+}
+
+async fn commit_prepared_lan_remote_session_with_timeout(
+    app_state: &Arc<AppState>,
+    prepared: PreparedLanRemoteSession,
+    accept_timeout: Duration,
+) -> Result<()> {
+    let PreparedLanRemoteSession {
+        session_id,
+        source_device_id,
+        transport,
+        source_media_capabilities,
+        negotiation,
+        listener,
+        bootstrap,
+        expected_peer_ip,
+    } = prepared;
+    #[cfg(test)]
+    let capture_selection = Some(CaptureSourceSelection {
+        session_id: session_id.clone(),
+        source: synthetic_capture_source(),
+        status: "selected".to_string(),
+        reason: Some("test synthetic capture source".to_string()),
+    });
+    #[cfg(not(test))]
+    let capture_selection = crate::capture_source::default_capture_source(false)
+        .ok()
+        .map(|source| CaptureSourceSelection {
+            session_id: session_id.clone(),
+            source,
+            status: "selected".to_string(),
+            reason: Some("default fullscreen capture source".to_string()),
+        });
+    let snapshot = SessionSnapshot {
+        session_id: session_id.clone(),
+        transport,
+        source_device_id: Some(source_device_id),
+        target_device_id: None,
+        local_listen_addr: Some(bootstrap.listen_addr.to_string()),
+        local_server_name: Some(bootstrap.server_name.clone()),
+        local_cert_der_b64: None,
+        remote_listen_addr: None,
+        remote_server_name: None,
+        remote_cert_der_b64: None,
+        lifecycle_state: SessionLifecycleState::Listening,
+        last_error: None,
+        sender_active: true,
+        receiver_active: false,
+    };
+    let (start_tx, start_rx) = oneshot::channel();
+
+    // Acquire every registry in one fixed order before mutating any of them. The
+    // session remains invisible to stop/fail until the gated task is registered.
+    let mut sessions = app_state.sessions.lock().await;
+    if sessions.get(&session_id).is_some() {
+        anyhow::bail!(
+            "session id became occupied before LAN bootstrap commit: {}",
+            session_id.0
+        );
+    }
+    let mut media_profiles = app_state.media_profiles.lock().await;
+    let mut capture_sources = app_state.capture_sources.lock().await;
+    let mut peer_media_capabilities = app_state.peer_media_capabilities.lock().await;
+    let mut media_tasks = app_state.media_tasks.lock().await;
+    if media_profiles.get(&session_id).is_some()
+        || capture_sources.get(&session_id).is_some()
+        || peer_media_capabilities.get(&session_id).is_some()
+        || media_tasks.active_count(&session_id) != 0
+    {
+        anyhow::bail!(
+            "media state became occupied before LAN bootstrap commit: {}",
+            session_id.0
+        );
+    }
+
+    let abort_handle = spawn_quic_media_sender(
+        app_state.clone(),
+        session_id.clone(),
+        listener,
+        expected_peer_ip,
+        accept_timeout,
+        start_rx,
+    );
+    media_profiles.set(session_id.clone(), negotiation);
+    if let Some(selection) = capture_selection {
+        capture_sources.set(session_id.clone(), selection);
+    }
+    peer_media_capabilities.set(session_id.clone(), source_media_capabilities);
+    media_tasks.register(session_id.clone(), abort_handle);
+    sessions.insert(session_id.clone(), snapshot);
+    if start_tx.send(()).is_err() {
+        sessions.remove(&session_id);
+        media_tasks.abort_session(&session_id);
+        peer_media_capabilities.remove(&session_id);
+        capture_sources.remove(&session_id);
+        media_profiles.remove(&session_id);
+        anyhow::bail!("LAN media sender task ended before session commit");
+    }
+    Ok(())
 }
 
 async fn accept_lan_media_profile_update(
@@ -2105,7 +2569,36 @@ async fn ensure_active_sender_session(
     Ok(())
 }
 
-async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement> {
+fn routed_discovery_endpoint(target: SocketAddr, discovery_port: u16) -> Result<SocketAddr> {
+    let bind_addr = if target.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket =
+        std::net::UdpSocket::bind(bind_addr).context("failed to bind LAN route probe socket")?;
+    if target.is_ipv4() {
+        socket
+            .set_broadcast(true)
+            .context("failed to enable LAN route probe broadcast")?;
+    }
+    socket
+        .connect(target)
+        .with_context(|| format!("failed to resolve LAN route to {target}"))?;
+    let local_ip = socket
+        .local_addr()
+        .context("failed to read routed LAN source address")?
+        .ip();
+    if local_ip.is_unspecified() || local_ip.is_multicast() {
+        anyhow::bail!("LAN route selected an invalid local address: {local_ip}");
+    }
+    Ok(SocketAddr::new(local_ip, discovery_port))
+}
+
+async fn build_announcement(
+    app_state: &Arc<AppState>,
+    discovery_endpoint: SocketAddr,
+) -> Option<SignedLanAnnouncement> {
     let (device_id, device_name) = {
         let devices = app_state.devices.lock().await;
         devices
@@ -2131,22 +2624,36 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         transports.push(LAN_INPUT_CONTROL_TRANSPORT.to_string());
     }
 
-    Some(LanAnnouncement {
+    let issued_at_ms = now_ms();
+    let announcement = LanAnnouncement {
         magic: DISCOVERY_MAGIC.to_string(),
         app_id: DISCOVERY_APP_ID.to_string(),
         instance_id: app_state.lan_discovery.instance_id.clone(),
         device_id,
         device_name,
         device_type: "rdesk".to_string(),
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: SIGNED_LAN_PROTOCOL_VERSION,
         discovery_port: app_state.lan_discovery.discovery_port(),
         transports,
         service_build_id: Some(service_build_id()),
         media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
         media_capabilities: lan_media_capabilities_with_input_control(input_control_available),
         mac_address: local_lan_announcement_mac_address(),
-        timestamp_ms: now_ms(),
-    })
+        timestamp_ms: issued_at_ms,
+    };
+    let identity = app_state.device_identities.machine_identity();
+    let key_epoch = app_state.device_identities.machine_key_epoch()?;
+    let lifetime_ms = (app_state.lan_discovery.config.peer_ttl.as_millis() as u64).clamp(1, 15_000);
+    let nonce = new_signed_nonce().ok()?;
+    SignedLanAnnouncement::sign(
+        identity.as_ref(),
+        key_epoch,
+        announcement,
+        discovery_endpoint,
+        issued_at_ms.saturating_add(lifetime_ms),
+        nonce,
+    )
+    .ok()
 }
 
 async fn send_packet(
@@ -2165,6 +2672,35 @@ async fn start_lan_media_receiver(
     requested_transport: &str,
     media: Option<LanMediaBootstrap>,
     peer_ip: IpAddr,
+    target_device_id: DeviceId,
+    negotiation: MediaProfileNegotiation,
+    peer_media_capabilities: Vec<String>,
+) -> Result<()> {
+    start_lan_media_receiver_with_timeout(
+        app_state,
+        session_id,
+        requested_transport,
+        media,
+        peer_ip,
+        target_device_id,
+        negotiation,
+        peer_media_capabilities,
+        LAN_QUIC_BOOTSTRAP_CONNECT_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_lan_media_receiver_with_timeout(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    requested_transport: &str,
+    media: Option<LanMediaBootstrap>,
+    peer_ip: IpAddr,
+    target_device_id: DeviceId,
+    negotiation: MediaProfileNegotiation,
+    peer_media_capabilities: Vec<String>,
+    connect_timeout: Duration,
 ) -> Result<()> {
     let requested_transport = normalize_transport_kind(requested_transport);
     if requested_transport == "webrtc" {
@@ -2185,29 +2721,66 @@ async fn start_lan_media_receiver(
         .quic
         .context("LAN peer accepted QUIC session without QUIC bootstrap")?;
     let bootstrap = quic_bootstrap_for_peer(quic.clone(), peer_ip)?;
-    let endpoint = QuinnDatagramEndpoint::connect_client("0.0.0.0:0", &bootstrap)
-        .await
-        .context("failed to connect LAN QUIC media receiver")?;
+    let endpoint = timeout(
+        connect_timeout,
+        QuinnDatagramEndpoint::connect_client("0.0.0.0:0", &bootstrap),
+    )
+    .await
+    .context("timed out connecting LAN QUIC media receiver")?
+    .context("failed to connect LAN QUIC media receiver")?;
+    let snapshot = SessionSnapshot {
+        session_id: session_id.clone(),
+        transport: requested_transport,
+        source_device_id: None,
+        target_device_id: Some(target_device_id),
+        local_listen_addr: None,
+        local_server_name: None,
+        local_cert_der_b64: None,
+        remote_listen_addr: Some(bootstrap.listen_addr.to_string()),
+        remote_server_name: Some(bootstrap.server_name.clone()),
+        remote_cert_der_b64: None,
+        lifecycle_state: SessionLifecycleState::Streaming,
+        last_error: None,
+        sender_active: false,
+        receiver_active: true,
+    };
+    let (start_tx, start_rx) = oneshot::channel();
 
+    let mut sessions = app_state.sessions.lock().await;
+    if sessions.get(&session_id).is_some() {
+        anyhow::bail!(
+            "session id became occupied before LAN receiver commit: {}",
+            session_id.0
+        );
+    }
+    let mut media_profiles = app_state.media_profiles.lock().await;
+    let capture_sources = app_state.capture_sources.lock().await;
+    let mut stored_peer_capabilities = app_state.peer_media_capabilities.lock().await;
+    let mut media_tasks = app_state.media_tasks.lock().await;
+    if media_profiles.get(&session_id).is_some()
+        || capture_sources.get(&session_id).is_some()
+        || stored_peer_capabilities.get(&session_id).is_some()
+        || media_tasks.active_count(&session_id) != 0
     {
-        let mut sessions = app_state.sessions.lock().await;
-        if let Some(snapshot) = sessions.get(&session_id).cloned() {
-            sessions.insert(
-                session_id.clone(),
-                SessionSnapshot {
-                    remote_listen_addr: Some(bootstrap.listen_addr.to_string()),
-                    remote_server_name: Some(bootstrap.server_name.clone()),
-                    remote_cert_der_b64: None,
-                    lifecycle_state: SessionLifecycleState::Streaming,
-                    last_error: None,
-                    receiver_active: true,
-                    ..snapshot
-                },
-            );
-        }
+        anyhow::bail!(
+            "media state became occupied before LAN receiver commit: {}",
+            session_id.0
+        );
     }
 
-    spawn_quic_media_receiver(app_state, session_id, endpoint).await;
+    let abort_handle =
+        spawn_quic_media_receiver(app_state.clone(), session_id.clone(), endpoint, start_rx);
+    media_profiles.set(session_id.clone(), negotiation);
+    stored_peer_capabilities.set(session_id.clone(), peer_media_capabilities);
+    media_tasks.register(session_id.clone(), abort_handle);
+    sessions.insert(session_id.clone(), snapshot);
+    if start_tx.send(()).is_err() {
+        sessions.remove(&session_id);
+        media_tasks.abort_session(&session_id);
+        stored_peer_capabilities.remove(&session_id);
+        media_profiles.remove(&session_id);
+        anyhow::bail!("LAN media receiver task ended before session commit");
+    }
     Ok(())
 }
 
@@ -2215,6 +2788,9 @@ fn quic_bootstrap_for_peer(
     quic: LanQuicBootstrap,
     peer_ip: IpAddr,
 ) -> Result<QuinnServerBootstrap> {
+    if certificate_fingerprint_sha256(&quic.cert_der) != quic.certificate_fingerprint_sha256 {
+        anyhow::bail!("LAN QUIC certificate fingerprint does not match signed bootstrap");
+    }
     let listen_addr = quic
         .listen_addr
         .parse::<SocketAddr>()
@@ -2351,45 +2927,60 @@ async fn close_lan_media_sessions(
             .lock()
             .await
             .abort_session(&session_id);
-        app_state.media_profiles.lock().await.remove(&session_id);
-        app_state.capture_sources.lock().await.remove(&session_id);
-        app_state
-            .peer_media_capabilities
-            .lock()
-            .await
-            .remove(&session_id);
-        #[cfg(any(windows, target_os = "macos"))]
-        app_state
-            .media_surface_renderers
-            .lock()
-            .await
-            .detach_session(&session_id);
-        #[cfg(any(windows, target_os = "macos"))]
-        app_state
-            .media_render_queues
-            .lock()
-            .await
-            .remove(&session_id);
-        app_state.media_pipelines.lock().await.remove(&session_id);
+        cleanup_lan_media_resources(app_state, &session_id).await;
     }
 }
 
-async fn spawn_quic_media_sender(
+async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.media_profiles.lock().await.remove(session_id);
+    app_state.capture_sources.lock().await.remove(session_id);
+    app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .remove(session_id);
+    #[cfg(any(windows, target_os = "macos"))]
+    app_state
+        .media_surface_renderers
+        .lock()
+        .await
+        .detach_session(session_id);
+    #[cfg(any(windows, target_os = "macos"))]
+    app_state
+        .media_render_queues
+        .lock()
+        .await
+        .remove(session_id);
+    app_state.media_pipelines.lock().await.remove(session_id);
+}
+
+fn spawn_quic_media_sender(
     app_state: Arc<AppState>,
     session_id: SessionId,
     listener: QuinnServerListener,
-) {
+    expected_peer_ip: IpAddr,
+    accept_timeout: Duration,
+    start_rx: oneshot::Receiver<()>,
+) -> tokio::task::AbortHandle {
     let registry = app_state.media_tasks.clone();
+    let completion_registry = registry.clone();
     let task_app_state = app_state;
     let failure_app_state = task_app_state.clone();
     let task_session_id = session_id.clone();
     let failure_session_id = task_session_id.clone();
     let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            completion_registry
+                .lock()
+                .await
+                .forget_task(&failure_session_id, tokio::task::id());
+            return;
+        }
         let local_addr = listener.local_addr();
         let result = async move {
-            let endpoint = listener
-                .accept()
+            let endpoint = timeout(accept_timeout, listener.accept_from(expected_peer_ip))
                 .await
+                .context("timed out waiting for LAN QUIC media receiver")?
                 .context("LAN QUIC media listener failed to accept receiver")?;
             send_quic_media_loop(task_app_state, endpoint, task_session_id).await
         }
@@ -2402,11 +2993,16 @@ async fn spawn_quic_media_sender(
                 format!("LAN QUIC media sender failed: {error}"),
             )
             .await;
+            cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
         }
+        completion_registry
+            .lock()
+            .await
+            .forget_task(&failure_session_id, tokio::task::id());
     });
     let abort_handle = handle.abort_handle();
     drop(handle);
-    registry.lock().await.register(session_id, abort_handle);
+    abort_handle
 }
 
 async fn send_quic_media_loop(
@@ -3423,16 +4019,25 @@ async fn set_session_last_error(
     );
 }
 
-async fn spawn_quic_media_receiver(
+fn spawn_quic_media_receiver(
     app_state: Arc<AppState>,
     session_id: SessionId,
     endpoint: QuinnDatagramEndpoint,
-) {
+    start_rx: oneshot::Receiver<()>,
+) -> tokio::task::AbortHandle {
     let registry = app_state.media_tasks.clone();
+    let completion_registry = registry.clone();
     let failure_app_state = app_state.clone();
     let task_session_id = session_id.clone();
     let failure_session_id = task_session_id.clone();
     let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            completion_registry
+                .lock()
+                .await
+                .forget_task(&failure_session_id, tokio::task::id());
+            return;
+        }
         if let Err(error) =
             receive_quic_media_loop(app_state, task_session_id.clone(), endpoint).await
         {
@@ -3443,11 +4048,16 @@ async fn spawn_quic_media_receiver(
                 format!("LAN QUIC media receiver failed: {error}"),
             )
             .await;
+            cleanup_lan_media_resources(&failure_app_state, &failure_session_id).await;
         }
+        completion_registry
+            .lock()
+            .await
+            .forget_task(&failure_session_id, tokio::task::id());
     });
     let abort_handle = handle.abort_handle();
     drop(handle);
-    registry.lock().await.register(session_id, abort_handle);
+    abort_handle
 }
 
 async fn receive_quic_media_loop(
