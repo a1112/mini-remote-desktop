@@ -15,8 +15,10 @@ pub use framing::{
     AGENT_IPC_PROTOCOL_MINOR,
 };
 pub use grant::{
-    validate_execute_command, AuthorizedCommand, AuthorizedGrant, ExecuteGrant, ExecuteGrantClaims,
+    authorize_input_resource, validate_execute_command, validate_input_event, AuthorizedCommand,
+    AuthorizedGrant, AuthorizedInputResource, ExecuteGrant, ExecuteGrantClaims,
     ExecuteGrantVerifier, ExecutionContext, GrantAudience, GrantValidationError,
-    AGENT_EXECUTE_GRANT_MAX_LIFETIME_MS, AGENT_EXECUTE_GRANT_SIGNATURE_CONTEXT,
+    InputResourceAuthorizationError, ValidatedInputEvent, AGENT_EXECUTE_GRANT_MAX_LIFETIME_MS,
+    AGENT_EXECUTE_GRANT_SIGNATURE_CONTEXT,
 };
 pub use protocol::*;

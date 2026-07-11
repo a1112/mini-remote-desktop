@@ -1,9 +1,9 @@
 //! Service-owned registration, replacement, capability, and liveness state.
 
 use mrd_agent_ipc::{
-    AgentCapabilitySnapshot, AgentChallenge, AgentHeartbeat, AgentProtocolState, AgentRegister,
-    AgentRegistered, RegisteredAgentIdentity, RegistrationError, RegistrationProofVerifier,
-    AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
+    AgentCapability, AgentCapabilitySnapshot, AgentChallenge, AgentHeartbeat, AgentProtocolState,
+    AgentRegister, AgentRegistered, RegisteredAgentIdentity, RegistrationError,
+    RegistrationProofVerifier, AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{
@@ -280,6 +280,113 @@ pub struct ActiveAgentSnapshot {
     pub last_received_at_ms: u64,
     /// Health derived exclusively from the service receipt clock.
     pub health: AgentHealth,
+}
+
+/// Immutable selection of one exact agent generation and desktop capability.
+///
+/// A binding can only be created from a healthy active registration. Routing
+/// code must resolve this exact value before every request; it must never use
+/// the Windows session id alone to select a replacement generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBinding {
+    windows_session_id: u32,
+    connection_id: AgentConnectionId,
+    registration_id: [u8; 16],
+    registration_epoch: u64,
+    desktop_epoch: u64,
+    required_capability: AgentCapability,
+}
+
+impl AgentBinding {
+    /// Interactive Windows session selected for this product session.
+    pub fn windows_session_id(&self) -> u32 {
+        self.windows_session_id
+    }
+
+    /// Exact private connection that owned the selected registration.
+    pub fn connection_id(&self) -> AgentConnectionId {
+        self.connection_id
+    }
+
+    /// Registration identity selected for execution.
+    pub fn registration_id(&self) -> &[u8; 16] {
+        &self.registration_id
+    }
+
+    /// Registration generation selected for execution.
+    pub fn registration_epoch(&self) -> u64 {
+        self.registration_epoch
+    }
+
+    /// Desktop generation on which the capability was advertised.
+    pub fn desktop_epoch(&self) -> u64 {
+        self.desktop_epoch
+    }
+
+    /// Capability for which this binding was selected.
+    pub fn required_capability(&self) -> AgentCapability {
+        self.required_capability
+    }
+}
+
+/// Failures selecting or resolving an exact desktop-agent route.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum AgentRouteError {
+    /// No active registration owns the requested Windows session.
+    #[error("no active agent owns the requested Windows session")]
+    SessionUnavailable,
+    /// The selected registration has not recently contacted the service.
+    #[error("the selected agent is unhealthy")]
+    Unhealthy,
+    /// The selected registration does not currently advertise the capability.
+    #[error("the selected agent capability is unavailable")]
+    CapabilityUnavailable,
+    /// A binding created for one capability was reused for another.
+    #[error("the requested capability does not match the agent binding")]
+    CapabilityBindingMismatch,
+    /// Disconnect or replacement revoked the exact selected generation.
+    #[error("the selected agent registration was revoked")]
+    BindingRevoked,
+    /// The interactive desktop changed after selection.
+    #[error("the selected agent desktop changed")]
+    DesktopChanged,
+    /// Registry state could not be inspected safely.
+    #[error("agent routing state is unavailable")]
+    StateUnavailable,
+}
+
+/// Immediately revocable handle for a successfully revalidated exact route.
+#[derive(Debug, Clone)]
+pub struct ExactAgentRoute {
+    binding: AgentBinding,
+    lease: AgentRegistrationLease,
+}
+
+impl ExactAgentRoute {
+    /// Exact immutable binding revalidated by the registry.
+    pub fn binding(&self) -> &AgentBinding {
+        &self.binding
+    }
+
+    /// Private connection to which a request may be queued.
+    pub fn connection_id(&self) -> AgentConnectionId {
+        self.binding.connection_id
+    }
+
+    /// Whether the generation was revoked after this route was resolved.
+    pub fn is_revoked(&self) -> bool {
+        self.lease.is_revoked()
+    }
+
+    /// Borrow the generation lease for cancellation-aware request handling.
+    pub fn lease(&self) -> &AgentRegistrationLease {
+        &self.lease
+    }
+
+    /// Consume the route and return its generation lease.
+    pub fn into_lease(self) -> AgentRegistrationLease {
+        self.lease
+    }
 }
 
 /// Revocation handle bound to one exact active registration generation.
@@ -834,10 +941,75 @@ impl AgentRegistry {
     pub fn lease_for_session(&self, windows_session_id: u32) -> Option<AgentRegistrationLease> {
         let state = self.state.lock().ok()?;
         let active = state.active_by_session.get(&windows_session_id)?;
-        Some(AgentRegistrationLease {
+        Some(registration_lease(active))
+    }
+
+    /// Select one healthy active generation for an exact capability.
+    ///
+    /// This is the sole operation that may select by Windows session id. The
+    /// returned binding must be persisted by the product session and passed to
+    /// [`Self::resolve_exact`] for every later operation.
+    pub fn bind_active_session(
+        &self,
+        windows_session_id: u32,
+        required_capability: AgentCapability,
+        now_ms: u64,
+    ) -> Result<AgentBinding, AgentRouteError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AgentRouteError::StateUnavailable)?;
+        let active = state
+            .active_by_session
+            .get(&windows_session_id)
+            .ok_or(AgentRouteError::SessionUnavailable)?;
+        validate_route_readiness(active, required_capability, now_ms)?;
+        Ok(AgentBinding {
+            windows_session_id,
+            connection_id: active.connection_id,
             registration_id: active.identity.registration_id,
             registration_epoch: active.identity.registration_epoch,
-            revoked: active.revocation.subscribe(),
+            desktop_epoch: active.capabilities.desktop_epoch,
+            required_capability,
+        })
+    }
+
+    /// Revalidate one previously selected generation without automatic fallback.
+    ///
+    /// A replacement process in the same Windows session is deliberately not a
+    /// match. Callers must pause their product session and perform an explicit
+    /// rebind flow before a new generation can receive work.
+    pub fn resolve_exact(
+        &self,
+        binding: &AgentBinding,
+        required_capability: AgentCapability,
+        now_ms: u64,
+    ) -> Result<ExactAgentRoute, AgentRouteError> {
+        if binding.required_capability != required_capability {
+            return Err(AgentRouteError::CapabilityBindingMismatch);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AgentRouteError::StateUnavailable)?;
+        let active = state
+            .active_by_session
+            .get(&binding.windows_session_id)
+            .ok_or(AgentRouteError::BindingRevoked)?;
+        if active.connection_id != binding.connection_id
+            || active.identity.registration_id != binding.registration_id
+            || active.identity.registration_epoch != binding.registration_epoch
+            || active.identity.windows_session_id != binding.windows_session_id
+        {
+            return Err(AgentRouteError::BindingRevoked);
+        }
+        if active.capabilities.desktop_epoch != binding.desktop_epoch {
+            return Err(AgentRouteError::DesktopChanged);
+        }
+        validate_route_readiness(active, required_capability, now_ms)?;
+        Ok(ExactAgentRoute {
+            binding: binding.clone(),
+            lease: registration_lease(active),
         })
     }
 
@@ -859,13 +1031,7 @@ impl AgentRegistry {
                 last_event_sequence: active.last_event_sequence,
                 last_agent_observed_at_ms: active.last_agent_observed_at_ms,
                 last_received_at_ms: active.last_received_at_ms,
-                health: if now_ms >= active.last_received_at_ms
-                    && now_ms - active.last_received_at_ms <= AGENT_HEARTBEAT_STALE_AFTER_MS
-                {
-                    AgentHealth::Healthy
-                } else {
-                    AgentHealth::Unresponsive
-                },
+                health: agent_health(active, now_ms),
             })
     }
 
@@ -874,6 +1040,42 @@ impl AgentRegistry {
             .lock()
             .map_err(|_| AgentRegistryError::StateUnavailable)
     }
+}
+
+fn registration_lease(active: &ActiveAgent) -> AgentRegistrationLease {
+    AgentRegistrationLease {
+        registration_id: active.identity.registration_id,
+        registration_epoch: active.identity.registration_epoch,
+        revoked: active.revocation.subscribe(),
+    }
+}
+
+fn agent_health(active: &ActiveAgent, now_ms: u64) -> AgentHealth {
+    if now_ms >= active.last_received_at_ms
+        && now_ms - active.last_received_at_ms <= AGENT_HEARTBEAT_STALE_AFTER_MS
+    {
+        AgentHealth::Healthy
+    } else {
+        AgentHealth::Unresponsive
+    }
+}
+
+fn validate_route_readiness(
+    active: &ActiveAgent,
+    required_capability: AgentCapability,
+    now_ms: u64,
+) -> Result<(), AgentRouteError> {
+    if agent_health(active, now_ms) != AgentHealth::Healthy {
+        return Err(AgentRouteError::Unhealthy);
+    }
+    if !active
+        .capabilities
+        .capabilities
+        .contains(&required_capability)
+    {
+        return Err(AgentRouteError::CapabilityUnavailable);
+    }
+    Ok(())
 }
 
 fn validate_expected_session(expected: &ExpectedAgentSession) -> Result<(), AgentRegistryError> {

@@ -1,11 +1,13 @@
 use mrd_agent_ipc::{
-    decode_frame, encode_frame, read_frame, validate_consent_result, validate_execute_command,
-    write_frame, AgentCapability, AgentCapabilitySnapshot, AgentChallenge, AgentCommand,
-    AgentCrashed, AgentEventContext, AgentHeartbeat, AgentProtocolState, AgentRegister,
-    AgentRegistered, AgentStopping, AgentToService, AudioDirection, CommandOutcome, CommandResult,
-    ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, DesktopChanged,
-    DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, ExecuteGrantVerifier,
-    ExecutionContext, FileDirection, FrameError, GrantAudience, GrantValidationError, Locked,
+    authorize_input_resource, decode_frame, encode_frame, read_frame, validate_consent_result,
+    validate_execute_command, validate_input_event, write_frame, AgentCapability,
+    AgentCapabilitySnapshot, AgentChallenge, AgentCommand, AgentCrashed, AgentEventContext,
+    AgentHeartbeat, AgentProtocolState, AgentRegister, AgentRegistered, AgentStopping,
+    AgentToService, AudioDirection, CommandOutcome, CommandResult, ConsentDecision, ConsentRequest,
+    ConsentResult, ConsentValidationError, DesktopChanged, DesktopKind, ExecuteCommand,
+    ExecuteGrant, ExecuteGrantClaims, ExecuteGrantVerifier, ExecutionContext, FileDirection,
+    FrameError, GrantAudience, GrantValidationError, InputAck, InputAckOutcome, InputButton,
+    InputEventEnvelope, InputEventPayload, InputFailure, InputKey, InputRejection, Locked,
     PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
     Unlocked, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
@@ -27,6 +29,8 @@ const AGENT_KEY_ID: [u8; 32] = [8; 32];
 const PEER_KEY_ID: [u8; 32] = [9; 32];
 const ISSUER_KEY_ID: [u8; 32] = [10; 32];
 const COMMAND_DIGEST: [u8; 32] = [11; 32];
+const OTHER_RESOURCE_ID: [u8; 16] = [17; 16];
+const OTHER_GRANT_ID: [u8; 32] = [18; 32];
 
 fn session_id() -> SessionId {
     SessionId("session-21".into())
@@ -169,6 +173,16 @@ fn execute_command(command: AgentCommand) -> ExecuteCommand {
     execute
 }
 
+fn input_event(sequence: u64, event: InputEventPayload) -> InputEventEnvelope {
+    InputEventEnvelope {
+        session_id: session_id(),
+        resource_id: RESOURCE_ID,
+        start_grant_id: GRANT_ID,
+        sequence,
+        event,
+    }
+}
+
 struct AcceptAllVerifier;
 
 impl ExecuteGrantVerifier for AcceptAllVerifier {
@@ -236,6 +250,247 @@ fn capability_and_consent_messages_round_trip() {
 }
 
 #[test]
+fn input_event_and_structured_acknowledgments_round_trip_without_payload_echo() {
+    let events = [
+        InputEventPayload::MouseMove { x: 320, y: 240 },
+        InputEventPayload::MouseButton {
+            button: InputButton::X1,
+            pressed: true,
+        },
+        InputEventPayload::MouseWheel { delta: -120 },
+        InputEventPayload::MouseHorizontalWheel { delta: 120 },
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        },
+        InputEventPayload::ReleaseAll,
+    ];
+
+    for (index, event) in events.into_iter().enumerate() {
+        round_trip(&ServiceToAgent::InputEvent(input_event(
+            index as u64 + 1,
+            event,
+        )));
+    }
+
+    let outcomes = [
+        InputAckOutcome::Applied,
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Policy,
+        },
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Grant,
+        },
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Unsupported,
+        },
+        InputAckOutcome::Rejected {
+            reason: InputRejection::StaleDesktop,
+        },
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Replay,
+        },
+        InputAckOutcome::Rejected {
+            reason: InputRejection::InvalidEvent,
+        },
+        InputAckOutcome::Failed {
+            reason: InputFailure::Uipi,
+        },
+        InputAckOutcome::Failed {
+            reason: InputFailure::Platform,
+        },
+    ];
+
+    for (index, outcome) in outcomes.into_iter().enumerate() {
+        let message = AgentToService::InputAck(InputAck {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            session_id: session_id(),
+            resource_id: RESOURCE_ID,
+            start_grant_id: GRANT_ID,
+            sequence: index as u64 + 1,
+            event_commitment: [17; 32],
+            outcome,
+        });
+        round_trip(&message);
+
+        let json = serde_json::to_value(message).expect("serialize input acknowledgment");
+        let serialized = serde_json::to_string(&json).expect("stringify input acknowledgment");
+        for forbidden in [
+            "event",
+            "payload_echo",
+            "message",
+            "native_error",
+            "coordinates",
+            "key",
+            "button",
+        ] {
+            assert!(
+                !serialized.contains(&format!("\"{forbidden}\"")),
+                "acknowledgment leaked forbidden field {forbidden}: {serialized}"
+            );
+        }
+    }
+}
+
+#[test]
+fn start_input_binds_the_exact_nonempty_input_scope_set_into_its_grant_digest() {
+    let pointer = AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputPointer]),
+    };
+    let keyboard = AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputKeyboard]),
+    };
+    assert_ne!(pointer.digest(), keyboard.digest());
+    assert_eq!(
+        pointer.required_scopes(),
+        scopes([PermissionScope::InputPointer])
+    );
+
+    let mut authorized = execute_command(pointer);
+    authorized.grant.claims.scopes = scopes([PermissionScope::InputPointer]);
+    assert!(
+        validate_execute_command(&authorized, &execution_context(1_500), &AcceptAllVerifier)
+            .is_ok()
+    );
+
+    for input_scopes in [
+        PermissionScopes::new(),
+        scopes([PermissionScope::ScreenView]),
+        scopes([PermissionScope::InputPointer, PermissionScope::ScreenView]),
+    ] {
+        let invalid = execute_command(AgentCommand::StartInput {
+            resource_id: RESOURCE_ID,
+            input_scopes,
+        });
+        assert_eq!(
+            validate_execute_command(&invalid, &execution_context(1_500), &AcceptAllVerifier),
+            Err(GrantValidationError::InvalidInputScopes)
+        );
+    }
+}
+
+#[test]
+fn input_event_commitment_and_validation_bind_the_authorized_resource() {
+    let mut start = execute_command(AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputPointer]),
+    });
+    start.grant.claims.scopes = scopes([PermissionScope::InputPointer]);
+    let authorized =
+        validate_execute_command(&start, &execution_context(1_500), &AcceptAllVerifier)
+            .expect("authorized start-input command");
+    let resource = authorize_input_resource(authorized).expect("typed input resource");
+
+    let envelope = input_event(1, InputEventPayload::MouseMove { x: 11, y: 12 });
+    let validated = validate_input_event(&envelope, &resource, &execution_context(1_500))
+        .expect("resource-bound input event");
+    assert_eq!(validated.sequence(), 1);
+    assert_eq!(validated.event(), &envelope.event);
+
+    let baseline = envelope.commitment().expect("input event commitment");
+    let mut variants = Vec::new();
+    let mut changed = envelope.clone();
+    changed.session_id = SessionId("other-session".into());
+    variants.push(changed);
+    let mut changed = envelope.clone();
+    changed.resource_id = OTHER_RESOURCE_ID;
+    variants.push(changed);
+    let mut changed = envelope.clone();
+    changed.start_grant_id = OTHER_GRANT_ID;
+    variants.push(changed);
+    let mut changed = envelope.clone();
+    changed.sequence += 1;
+    variants.push(changed);
+    let mut changed = envelope.clone();
+    changed.event = InputEventPayload::MouseMove { x: 12, y: 11 };
+    variants.push(changed);
+    for changed in variants {
+        assert_ne!(changed.commitment().unwrap(), baseline);
+    }
+
+    for mismatched in [
+        {
+            let mut value = envelope.clone();
+            value.session_id = SessionId("other-session".into());
+            value
+        },
+        {
+            let mut value = envelope.clone();
+            value.resource_id = OTHER_RESOURCE_ID;
+            value
+        },
+        {
+            let mut value = envelope.clone();
+            value.start_grant_id = OTHER_GRANT_ID;
+            value
+        },
+    ] {
+        assert_eq!(
+            validate_input_event(&mismatched, &resource, &execution_context(1_500)),
+            Err(InputRejection::Grant)
+        );
+    }
+
+    let keyboard = input_event(
+        2,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        },
+    );
+    assert_eq!(
+        validate_input_event(&keyboard, &resource, &execution_context(1_500)),
+        Err(InputRejection::Grant)
+    );
+
+    let mut changed_policy = execution_context(1_500);
+    changed_policy.policy_revision += 1;
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &changed_policy),
+        Err(InputRejection::Policy)
+    );
+
+    let mut changed_desktop = execution_context(1_500);
+    changed_desktop.desktop_epoch += 1;
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &changed_desktop),
+        Err(InputRejection::StaleDesktop)
+    );
+}
+
+#[test]
+fn input_event_shape_rejects_sentinels_invalid_sequences_and_invalid_keys() {
+    let mut value = input_event(1, InputEventPayload::MouseMove { x: 1, y: 2 });
+    assert!(value.validate_shape().is_ok());
+
+    value.session_id = SessionId(String::new());
+    assert_eq!(value.validate_shape(), Err(InputRejection::InvalidEvent));
+    value = input_event(1, InputEventPayload::MouseMove { x: 1, y: 2 });
+    value.resource_id = [0; 16];
+    assert_eq!(value.validate_shape(), Err(InputRejection::InvalidEvent));
+    value = input_event(1, InputEventPayload::MouseMove { x: 1, y: 2 });
+    value.start_grant_id = [0; 32];
+    assert_eq!(value.validate_shape(), Err(InputRejection::InvalidEvent));
+
+    for sequence in [0, u64::MAX] {
+        value = input_event(sequence, InputEventPayload::MouseMove { x: 1, y: 2 });
+        assert_eq!(value.validate_shape(), Err(InputRejection::InvalidEvent));
+    }
+
+    value = input_event(
+        1,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0 },
+            pressed: true,
+        },
+    );
+    assert_eq!(value.validate_shape(), Err(InputRejection::InvalidEvent));
+}
+
+#[test]
 fn consent_result_is_correlated_and_cannot_expand_approved_scopes() {
     let validated = validate_consent_result(&consent_request(), &consent_result(), 1_700)
         .expect("bound consent result");
@@ -285,6 +540,10 @@ fn every_product_command_round_trips_with_an_execute_grant() {
         },
         AgentCommand::StartInput {
             resource_id: RESOURCE_ID,
+            input_scopes: scopes([
+                PermissionScope::InputPointer,
+                PermissionScope::InputKeyboard,
+            ]),
         },
         AgentCommand::StopInput {
             resource_id: RESOURCE_ID,
@@ -637,6 +896,10 @@ fn ordinary_session_agent_rejects_all_non_default_desktop_starts() {
 
     let mut input = execute_command(AgentCommand::StartInput {
         resource_id: RESOURCE_ID,
+        input_scopes: scopes([
+            PermissionScope::InputPointer,
+            PermissionScope::InputKeyboard,
+        ]),
     });
     input.grant.claims.desktop_kind = DesktopKind::Winlogon;
     let mut winlogon_context = execution_context(1_500);
@@ -681,6 +944,35 @@ fn messages_reject_unknown_or_secret_bearing_fields() {
         .unwrap()
         .insert("private_key".into(), Value::String("forbidden".into()));
     assert!(serde_json::from_value::<ServiceToAgent>(outer).is_err());
+
+    let mut input = serde_json::to_value(ServiceToAgent::InputEvent(input_event(
+        1,
+        InputEventPayload::MouseMove { x: 1, y: 2 },
+    )))
+    .unwrap();
+    input
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .insert("native_error".into(), Value::String("forbidden".into()));
+    assert!(serde_json::from_value::<ServiceToAgent>(input).is_err());
+
+    let mut ack = serde_json::to_value(AgentToService::InputAck(InputAck {
+        registration_id: REGISTRATION_ID,
+        registration_epoch: 1,
+        session_id: session_id(),
+        resource_id: RESOURCE_ID,
+        start_grant_id: GRANT_ID,
+        sequence: 1,
+        event_commitment: [17; 32],
+        outcome: InputAckOutcome::Applied,
+    }))
+    .unwrap();
+    ack.get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .unwrap()
+        .insert("event".into(), serde_json::json!({ "kind": "key" }));
+    assert!(serde_json::from_value::<AgentToService>(ack).is_err());
 }
 
 #[test]
@@ -696,6 +988,24 @@ fn serialized_control_messages_contain_no_secret_material_fields() {
                 resource_id: RESOURCE_ID,
             },
         })))
+        .unwrap(),
+        serde_json::to_value(ServiceToAgent::InputEvent(input_event(
+            1,
+            InputEventPayload::MouseMove { x: 1, y: 2 },
+        )))
+        .unwrap(),
+        serde_json::to_value(AgentToService::InputAck(InputAck {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            session_id: session_id(),
+            resource_id: RESOURCE_ID,
+            start_grant_id: GRANT_ID,
+            sequence: 1,
+            event_commitment: [17; 32],
+            outcome: InputAckOutcome::Rejected {
+                reason: InputRejection::Policy,
+            },
+        }))
         .unwrap(),
     ];
     let forbidden = [

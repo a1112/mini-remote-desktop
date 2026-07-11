@@ -33,6 +33,8 @@ pub fn hash_windows_logon_sid(sid_bytes: &[u8]) -> Option<[u8; 32]> {
 pub const AGENT_CONSENT_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 /// Maximum UTF-8 bytes in protocol identifiers inherited from domain types.
 pub const AGENT_IPC_MAX_IDENTIFIER_BYTES: usize = 256;
+/// Domain separator for resource-bound input event commitments.
+pub const AGENT_INPUT_EVENT_COMMITMENT_CONTEXT: &[u8] = b"mrd-agent-ipc/input-event/v1\0";
 
 /// Serde adapter for fixed-size Ed25519 signatures. Serde's built-in array
 /// implementations intentionally stop below this wire size on supported MSRVs.
@@ -226,7 +228,7 @@ pub struct ConsentRequest {
 }
 
 /// Local user's decision for a consent request.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentDecision {
     /// The user approved at least the returned scopes.
@@ -420,7 +422,7 @@ pub fn validate_consent_result(
 }
 
 /// Audio flow requested from the interactive agent.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioDirection {
     /// Send local audio to the remote peer.
@@ -441,6 +443,211 @@ pub enum FileDirection {
     Upload,
     /// Permit both directions.
     Bidirectional,
+}
+
+/// Mouse button carried by a service-to-agent input event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum InputButton {
+    /// Primary mouse button.
+    Left,
+    /// Secondary mouse button.
+    Right,
+    /// Middle mouse button.
+    Middle,
+    /// First extended mouse button.
+    X1,
+    /// Second extended mouse button.
+    X2,
+}
+
+/// Keyboard key carried by a service-to-agent input event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputKey {
+    /// Windows virtual-key code.
+    VirtualKey {
+        /// Numeric virtual-key code.
+        code: u16,
+    },
+}
+
+/// Normalized input operation executed inside one authorized input resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputEventPayload {
+    /// Absolute mouse position in target desktop coordinates.
+    MouseMove {
+        /// X coordinate.
+        x: i32,
+        /// Y coordinate.
+        y: i32,
+    },
+    /// Mouse button transition.
+    MouseButton {
+        /// Button identifier.
+        button: InputButton,
+        /// Whether the button is pressed.
+        pressed: bool,
+    },
+    /// Vertical mouse-wheel movement.
+    MouseWheel {
+        /// Wheel delta.
+        delta: i32,
+    },
+    /// Horizontal mouse-wheel movement.
+    MouseHorizontalWheel {
+        /// Wheel delta.
+        delta: i32,
+    },
+    /// Keyboard transition.
+    Key {
+        /// Key identifier.
+        key: InputKey,
+        /// Whether the key is pressed.
+        pressed: bool,
+    },
+    /// Release every pressed key and button owned by this resource.
+    ReleaseAll,
+}
+
+impl InputEventPayload {
+    /// Permission needed to inject this event, or `None` for cleanup-only release-all.
+    pub fn required_scope(&self) -> Option<PermissionScope> {
+        match self {
+            Self::MouseMove { .. }
+            | Self::MouseButton { .. }
+            | Self::MouseWheel { .. }
+            | Self::MouseHorizontalWheel { .. } => Some(PermissionScope::InputPointer),
+            Self::Key { .. } => Some(PermissionScope::InputKeyboard),
+            Self::ReleaseAll => None,
+        }
+    }
+
+    fn has_valid_shape(&self) -> bool {
+        !matches!(
+            self,
+            Self::Key {
+                key: InputKey::VirtualKey { code: 0 },
+                ..
+            }
+        )
+    }
+}
+
+/// One input operation bound to an authorized input resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InputEventEnvelope {
+    /// Product session that owns the input resource.
+    pub session_id: SessionId,
+    /// Input-resource identity created by `StartInput`.
+    pub resource_id: [u8; 16],
+    /// Unique execute grant that authorized `StartInput`.
+    pub start_grant_id: [u8; 32],
+    /// Strictly increasing sequence local to this resource.
+    pub sequence: u64,
+    /// Input operation. This payload is never echoed in an acknowledgment.
+    pub event: InputEventPayload,
+}
+
+impl InputEventEnvelope {
+    /// Validate bounded identifiers, non-sentinel bindings, sequence, and payload shape.
+    pub fn validate_shape(&self) -> Result<(), InputRejection> {
+        if self.session_id.0.trim().is_empty()
+            || self.session_id.0.len() > AGENT_IPC_MAX_IDENTIFIER_BYTES
+            || self.session_id.0.contains('\0')
+            || self.resource_id.iter().all(|byte| *byte == 0)
+            || self.start_grant_id.iter().all(|byte| *byte == 0)
+            || self.sequence == 0
+            || self.sequence == u64::MAX
+            || !self.event.has_valid_shape()
+        {
+            return Err(InputRejection::InvalidEvent);
+        }
+        Ok(())
+    }
+
+    /// Return a domain-separated commitment covering every event binding and payload field.
+    pub fn commitment(&self) -> Result<[u8; 32], InputRejection> {
+        self.validate_shape()?;
+        let encoded = serde_json::to_vec(self).map_err(|_| InputRejection::InvalidEvent)?;
+        let mut context = DigestContext::new(&SHA256);
+        context.update(AGENT_INPUT_EVENT_COMMITMENT_CONTEXT);
+        context.update(&(encoded.len() as u64).to_le_bytes());
+        context.update(&encoded);
+        let mut commitment = [0_u8; 32];
+        commitment.copy_from_slice(context.finish().as_ref());
+        Ok(commitment)
+    }
+}
+
+/// Stable rejection category for an input event that did no platform work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRejection {
+    /// Current machine policy no longer permits the resource.
+    Policy,
+    /// The event did not match a live, authorized input resource.
+    Grant,
+    /// The registered agent does not implement the requested input operation.
+    Unsupported,
+    /// The input desktop changed after the resource was authorized.
+    StaleDesktop,
+    /// The resource-local replay or ordering rules rejected the sequence.
+    Replay,
+    /// The event violated a bounded protocol invariant.
+    InvalidEvent,
+}
+
+/// Stable platform-failure category for an authorized input event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputFailure {
+    /// Windows User Interface Privilege Isolation blocked injection.
+    Uipi,
+    /// Input injection failed for another platform reason.
+    Platform,
+}
+
+/// Result of processing one resource-bound input event.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InputAckOutcome {
+    /// The operation was accepted exactly once.
+    Applied,
+    /// The operation was rejected before platform injection.
+    Rejected {
+        /// Coarse rejection category with no input-payload detail.
+        reason: InputRejection,
+    },
+    /// The operation was authorized but platform injection failed.
+    Failed {
+        /// Coarse platform failure with no native error string.
+        reason: InputFailure,
+    },
+}
+
+/// Payload-free acknowledgment for one input sequence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InputAck {
+    /// Registration that processed the event.
+    pub registration_id: [u8; 16],
+    /// Registration generation that processed the event.
+    pub registration_epoch: u64,
+    /// Product session named by the event.
+    pub session_id: SessionId,
+    /// Input resource named by the event.
+    pub resource_id: [u8; 16],
+    /// Execute grant that established the input resource.
+    pub start_grant_id: [u8; 32],
+    /// Resource-local input sequence being acknowledged.
+    pub sequence: u64,
+    /// Commitment of the exact event envelope being acknowledged.
+    pub event_commitment: [u8; 32],
+    /// Structured result. It deliberately contains no input payload or free text.
+    pub outcome: InputAckOutcome,
 }
 
 /// Product operation executed by an interactive-session agent.
@@ -468,6 +675,8 @@ pub enum AgentCommand {
     StartInput {
         /// Resource identity used for idempotency and cleanup.
         resource_id: [u8; 16],
+        /// Exact pointer and/or keyboard permissions enabled for this resource.
+        input_scopes: PermissionScopes,
     },
     /// Stop input injection and release held input state.
     StopInput {
@@ -541,7 +750,7 @@ impl AgentCommand {
             Self::StopCapture { resource_id } => {
                 (b"stop_capture".as_slice(), resource_id, None, None)
             }
-            Self::StartInput { resource_id } => {
+            Self::StartInput { resource_id, .. } => {
                 (b"start_input".as_slice(), resource_id, None, None)
             }
             Self::StopInput { resource_id } => (b"stop_input".as_slice(), resource_id, None, None),
@@ -602,6 +811,12 @@ impl AgentCommand {
         if let Some(direction) = direction {
             context.update(&[direction]);
         }
+        if let Self::StartInput { input_scopes, .. } = self {
+            let encoded_scopes = serde_json::to_vec(input_scopes)
+                .expect("input permission scopes are infallibly serializable");
+            context.update(&(encoded_scopes.len() as u64).to_le_bytes());
+            context.update(&encoded_scopes);
+        }
 
         let digest = context.finish();
         let mut output = [0_u8; 32];
@@ -621,10 +836,7 @@ impl AgentCommand {
             Self::StartCapture { .. } | Self::StartRender { .. } => {
                 scopes.insert(PermissionScope::ScreenView);
             }
-            Self::StartInput { .. } => {
-                scopes.insert(PermissionScope::InputPointer);
-                scopes.insert(PermissionScope::InputKeyboard);
-            }
+            Self::StartInput { input_scopes, .. } => scopes.extend(input_scopes.iter().copied()),
             Self::StartAudio { direction, .. } => match direction {
                 AudioDirection::Listen => {
                     scopes.insert(PermissionScope::AudioListen);
@@ -681,7 +893,7 @@ impl AgentCommand {
         match self {
             Self::StartCapture { resource_id, .. }
             | Self::StopCapture { resource_id }
-            | Self::StartInput { resource_id }
+            | Self::StartInput { resource_id, .. }
             | Self::StopInput { resource_id }
             | Self::StartAudio { resource_id, .. }
             | Self::StopAudio { resource_id }
@@ -925,6 +1137,8 @@ pub enum AgentToService {
     AgentHeartbeat(AgentHeartbeat),
     /// Report command completion.
     CommandResult(CommandResult),
+    /// Acknowledge one resource-bound input event.
+    InputAck(InputAck),
 }
 
 /// Messages emitted by the machine service.
@@ -942,6 +1156,8 @@ pub enum ServiceToAgent {
     ConsentRequest(ConsentRequest),
     /// Execute one grant-bearing product command.
     Execute(Box<ExecuteCommand>),
+    /// Deliver one event to a previously authorized input resource.
+    InputEvent(InputEventEnvelope),
     /// Request graceful agent shutdown.
     StopAgent(StopAgent),
 }

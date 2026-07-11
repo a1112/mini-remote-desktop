@@ -11,6 +11,8 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 #[cfg(windows)]
+use crate::input::InputResourceManager;
+#[cfg(windows)]
 use crate::runtime::{
     connect_private_endpoint, AgentRuntime, AgentRuntimeConfig, PrivateAgentEndpoint,
     PrivateAgentStream, SessionDescriptor, SystemClock,
@@ -180,7 +182,10 @@ async fn run_windows_launcher() -> Result<AgentExit, AgentLauncherError> {
         launch.config,
         Arc::new(SystemClock),
         Arc::new(launch.signer),
-    )?;
+    )?
+    .with_input_backend(Box::new(InputResourceManager::new(
+        mrd_input::windows::WindowsSendInputInjector::new(),
+    )));
     let result = runtime.run(control_stream).await;
     drop(control_service);
     result.map_err(Into::into)

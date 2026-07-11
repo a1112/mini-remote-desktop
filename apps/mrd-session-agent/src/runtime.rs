@@ -1,14 +1,15 @@
 //! Fail-closed interactive-agent registration and event loop.
 
 use crate::capabilities::AgentCapabilities;
+use crate::input::InputBackend;
 use mrd_agent_ipc::{
     decode_frame, registration_proof_signing_bytes, validate_execute_command, write_frame,
     AgentCapabilitySnapshot, AgentChallenge, AgentEventContext, AgentHeartbeat, AgentRegister,
     AgentRegistered, AgentStopping, AgentToService, AuthorizedCommand, CommandOutcome,
     CommandResult, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
-    ExecuteGrantVerifier, ExecutionContext, FrameError, PeerBinding, RegisteredAgentIdentity,
-    ServiceToAgent, StoppingReason, AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES,
-    AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    ExecuteGrantVerifier, ExecutionContext, FrameError, InputAck, InputAckOutcome, PeerBinding,
+    RegisteredAgentIdentity, ServiceToAgent, StoppingReason, AGENT_IPC_FRAME_HEADER_BYTES,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::SessionId;
@@ -411,6 +412,8 @@ pub struct AgentRuntime {
     signer: Arc<dyn RegistrationSigner>,
     security: Option<ExecutionSecurity>,
     executor: Box<dyn AuthorizedCommandExecutor>,
+    input: Option<Box<dyn InputBackend>>,
+    last_desktop_state: Option<TrustedDesktopState>,
     replay: ReplayLedger,
     event_sequence: u64,
 }
@@ -435,6 +438,8 @@ impl AgentRuntime {
             signer,
             security: None,
             executor: Box::new(ShellBackend),
+            input: None,
+            last_desktop_state: None,
             replay: ReplayLedger::new(REPLAY_LEDGER_CAPACITY),
             event_sequence: 0,
         })
@@ -460,6 +465,12 @@ impl AgentRuntime {
         self
     }
 
+    /// Install the platform input backend used by validated StartInput resources.
+    pub fn with_input_backend(mut self, input: Box<dyn InputBackend>) -> Self {
+        self.input = Some(input);
+        self
+    }
+
     /// Connect to a validated local endpoint and run the agent.
     pub async fn run_at_endpoint(
         self,
@@ -479,6 +490,7 @@ impl AgentRuntime {
         let reader_task = tokio::spawn(read_loop(reader, inbound_tx));
 
         let result = self.run_connected(&mut writer, &mut inbound_rx).await;
+        let _ = self.release_input();
         stop_reader(reader_task).await;
         result
     }
@@ -508,6 +520,7 @@ impl AgentRuntime {
                             if stop.request_id.iter().all(|byte| *byte == 0) {
                                 return Err(AgentRuntimeError::InvalidStopRequest);
                             }
+                            let _ = self.release_input();
                             let context = self.next_event_context(&identity)?;
                             write_frame(
                                 writer,
@@ -525,6 +538,9 @@ impl AgentRuntime {
                         Some(InboundEvent::Message(ServiceToAgent::ConsentRequest(request))) => {
                             self.handle_consent(writer, request).await?;
                         }
+                        Some(InboundEvent::Message(ServiceToAgent::InputEvent(envelope))) => {
+                            self.handle_input(writer, &identity, envelope).await?;
+                        }
                         Some(InboundEvent::Message(ServiceToAgent::AgentChallenge(_))) => {
                             return Err(AgentRuntimeError::UnsupportedMessage);
                         }
@@ -536,6 +552,7 @@ impl AgentRuntime {
                     }
                 }
                 _ = heartbeat.tick() => {
+                    self.refresh_input_desktop()?;
                     let context = self.next_event_context(&identity)?;
                     write_frame(
                         writer,
@@ -612,9 +629,10 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
-        let (desktop_epoch, capabilities) = match &self.security {
+        let (desktop_epoch, mut capabilities) = match &self.security {
             Some(security) => {
                 let state = validated_desktop_state(security.desktop_state.as_ref())?;
+                self.last_desktop_state = Some(state);
                 let capabilities = if state.desktop_kind == DesktopKind::Default {
                     self.executor.capabilities()
                 } else {
@@ -627,6 +645,29 @@ impl AgentRuntime {
                 AgentCapabilities::empty(),
             ),
         };
+        if self.last_desktop_state.is_none() {
+            self.last_desktop_state = Some(TrustedDesktopState {
+                desktop_epoch,
+                desktop_kind: DesktopKind::Default,
+            });
+        }
+        if self.security.is_some()
+            && self
+                .last_desktop_state
+                .is_some_and(|state| state.desktop_kind == DesktopKind::Default)
+            && self
+                .input
+                .as_ref()
+                .is_some_and(|input| input.is_available())
+            && capabilities
+                .as_set()
+                .iter()
+                .all(|capability| *capability != mrd_agent_ipc::AgentCapability::Input)
+        {
+            let mut advertised = capabilities.as_set().clone();
+            advertised.insert(mrd_agent_ipc::AgentCapability::Input);
+            capabilities = AgentCapabilities::from_implemented(advertised);
+        }
         write_frame(
             writer,
             &AgentToService::AgentCapabilitySnapshot(AgentCapabilitySnapshot {
@@ -692,6 +733,67 @@ impl AgentRuntime {
         Ok(())
     }
 
+    async fn handle_input<W>(
+        &mut self,
+        writer: &mut W,
+        identity: &RegisteredAgentIdentity,
+        envelope: mrd_agent_ipc::InputEventEnvelope,
+    ) -> Result<(), AgentRuntimeError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let outcome = if let (Some(input), Some(security)) = (&mut self.input, &self.security) {
+            if let Some(binding) = security.bindings.resolve(&envelope.session_id) {
+                let desktop = validated_desktop_state(security.desktop_state.as_ref())?;
+                let context = ExecutionContext {
+                    registration_id: identity.registration_id,
+                    registration_epoch: identity.registration_epoch,
+                    session_id: binding.session_id,
+                    peer: binding.peer,
+                    policy_revision: binding.policy_revision,
+                    windows_session_id: identity.windows_session_id,
+                    desktop_epoch: desktop.desktop_epoch,
+                    desktop_kind: desktop.desktop_kind,
+                    now_ms: self.clock.now_ms(),
+                    expected_issuer_key_id: binding.expected_issuer_key_id,
+                };
+                let outcome = input.handle(&envelope, &context);
+                if matches!(
+                    outcome,
+                    InputAckOutcome::Rejected {
+                        reason: mrd_agent_ipc::InputRejection::StaleDesktop
+                    }
+                ) {
+                    let _ = input.release_all();
+                }
+                outcome
+            } else {
+                InputAckOutcome::Rejected {
+                    reason: mrd_agent_ipc::InputRejection::Grant,
+                }
+            }
+        } else {
+            InputAckOutcome::Rejected {
+                reason: mrd_agent_ipc::InputRejection::Unsupported,
+            }
+        };
+        write_frame(
+            writer,
+            &AgentToService::InputAck(InputAck {
+                registration_id: identity.registration_id,
+                registration_epoch: identity.registration_epoch,
+                session_id: envelope.session_id.clone(),
+                resource_id: envelope.resource_id,
+                start_grant_id: envelope.start_grant_id,
+                sequence: envelope.sequence,
+                event_commitment: envelope.commitment().unwrap_or([0; 32]),
+                outcome,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn handle_consent<W>(
         &mut self,
         writer: &mut W,
@@ -733,7 +835,21 @@ impl AgentRuntime {
         match self.replay.reserve(grant_id, command_id, fingerprint)? {
             ReplayReservation::First => {
                 let capabilities = self.executor.capabilities();
-                let outcome = if capabilities.supports_command(authorized.command()) {
+                let outcome = if let Some(input) = &mut self.input {
+                    match authorized.command().clone() {
+                        mrd_agent_ipc::AgentCommand::StartInput { .. } => input
+                            .start(authorized)
+                            .map(|()| CommandOutcome::Completed)
+                            .unwrap_or(CommandOutcome::Rejected),
+                        mrd_agent_ipc::AgentCommand::StopInput { resource_id } => {
+                            command_outcome(input.stop(&resource_id))
+                        }
+                        _ if capabilities.supports_command(authorized.command()) => {
+                            self.executor.execute(authorized)
+                        }
+                        _ => CommandOutcome::Rejected,
+                    }
+                } else if capabilities.supports_command(authorized.command()) {
                     self.executor.execute(authorized)
                 } else {
                     CommandOutcome::Rejected
@@ -743,6 +859,27 @@ impl AgentRuntime {
             }
             ReplayReservation::Cached(outcome) => Ok(outcome),
         }
+    }
+
+    fn release_input(&mut self) -> Result<(), mrd_input::InputError> {
+        self.input
+            .as_mut()
+            .map_or(Ok(()), |input| input.release_all())
+    }
+
+    fn refresh_input_desktop(&mut self) -> Result<(), AgentRuntimeError> {
+        let Some(security) = &self.security else {
+            return Ok(());
+        };
+        let current = validated_desktop_state(security.desktop_state.as_ref())?;
+        if self
+            .last_desktop_state
+            .is_some_and(|previous| previous != current)
+        {
+            let _ = self.release_input();
+        }
+        self.last_desktop_state = Some(current);
+        Ok(())
     }
 
     fn next_event_context(
@@ -768,6 +905,14 @@ impl AgentRuntime {
             sequence: self.event_sequence,
             observed_at_ms: self.clock.now_ms(),
         })
+    }
+}
+
+fn command_outcome(outcome: InputAckOutcome) -> CommandOutcome {
+    match outcome {
+        InputAckOutcome::Applied => CommandOutcome::Completed,
+        InputAckOutcome::Rejected { .. } => CommandOutcome::Rejected,
+        InputAckOutcome::Failed { .. } => CommandOutcome::Failed,
     }
 }
 

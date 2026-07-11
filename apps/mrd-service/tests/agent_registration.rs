@@ -6,9 +6,9 @@ use mrd_agent_ipc::{
 };
 use mrd_service::agent_runtime::{
     AgentCallerKind, AgentConnectionExit, AgentConnectionId, AgentHealth, AgentRegistry,
-    AgentRegistryError, AgentServer, AgentServerClock, AgentServerError, ChallengeMaterial,
-    ChallengeMaterialSource, ExpectedAgentSession, ObservedAgentIdentity, RegistrationOutcome,
-    ReplacementPolicy, AGENT_HEARTBEAT_STALE_AFTER_MS,
+    AgentRegistryError, AgentRouteError, AgentServer, AgentServerClock, AgentServerError,
+    ChallengeMaterial, ChallengeMaterialSource, ExpectedAgentSession, ObservedAgentIdentity,
+    RegistrationOutcome, ReplacementPolicy, AGENT_HEARTBEAT_STALE_AFTER_MS,
 };
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
@@ -232,6 +232,204 @@ fn expected_windows_session_registers_once_and_tracks_health() {
         .active_for_session_at(7, 1_199)
         .expect("agent remains addressable after clock rollback");
     assert_eq!(rolled_back_clock.health, AgentHealth::Unresponsive);
+}
+
+#[test]
+fn exact_route_binding_preserves_session_generation_desktop_and_capability() {
+    let registry = registry();
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    let outcome = complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+
+    let binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_002)
+        .expect("bind healthy capture agent");
+    assert_eq!(binding.windows_session_id(), 7);
+    assert_eq!(binding.connection_id(), connection(1));
+    assert_eq!(binding.registration_id(), &outcome.identity.registration_id);
+    assert_eq!(
+        binding.registration_epoch(),
+        outcome.identity.registration_epoch
+    );
+    assert_eq!(binding.desktop_epoch(), 1);
+    assert_eq!(binding.required_capability(), AgentCapability::Capture);
+
+    let route = registry
+        .resolve_exact(&binding, AgentCapability::Capture, 1_002)
+        .expect("resolve exact generation");
+    assert_eq!(route.binding(), &binding);
+    assert_eq!(route.connection_id(), connection(1));
+    assert!(!route.is_revoked());
+    assert_eq!(
+        registry
+            .resolve_exact(&binding, AgentCapability::Render, 1_002)
+            .expect_err("a capture binding cannot be reused for render"),
+        AgentRouteError::CapabilityBindingMismatch
+    );
+}
+
+#[test]
+fn exact_route_selection_requires_a_healthy_capable_agent() {
+    let registry = registry();
+    assert_eq!(
+        registry
+            .bind_active_session(7, AgentCapability::Capture, 1_000)
+            .expect_err("an absent session cannot be selected"),
+        AgentRouteError::SessionUnavailable
+    );
+
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+    assert_eq!(
+        registry
+            .bind_active_session(7, AgentCapability::Input, 1_002)
+            .expect_err("an unadvertised capability cannot be selected"),
+        AgentRouteError::CapabilityUnavailable
+    );
+    assert_eq!(
+        registry
+            .bind_active_session(
+                7,
+                AgentCapability::Capture,
+                1_002 + AGENT_HEARTBEAT_STALE_AFTER_MS + 1,
+            )
+            .expect_err("an unhealthy agent cannot be selected"),
+        AgentRouteError::Unhealthy
+    );
+}
+
+#[test]
+fn exact_route_rejects_unhealthy_or_removed_capability() {
+    let registry = registry();
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    let outcome = complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+    let binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_002)
+        .expect("bind healthy capture agent");
+
+    assert_eq!(
+        registry
+            .resolve_exact(
+                &binding,
+                AgentCapability::Capture,
+                1_002 + AGENT_HEARTBEAT_STALE_AFTER_MS + 1,
+            )
+            .expect_err("an unhealthy generation cannot be routed"),
+        AgentRouteError::Unhealthy
+    );
+
+    let mut without_capture = capability(&outcome.identity, 2);
+    without_capture.capabilities.clear();
+    registry
+        .record_capabilities(connection(1), without_capture, 1_100)
+        .expect("remove capture capability");
+    assert_eq!(
+        registry
+            .resolve_exact(&binding, AgentCapability::Capture, 1_100)
+            .expect_err("removed capability invalidates exact routing"),
+        AgentRouteError::CapabilityUnavailable
+    );
+}
+
+#[test]
+fn exact_route_rejects_desktop_generation_change() {
+    let registry = registry();
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    let outcome = complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+    let binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_002)
+        .expect("bind desktop generation one");
+
+    let mut next_desktop = capability(&outcome.identity, 2);
+    next_desktop.desktop_epoch = 2;
+    registry
+        .record_capabilities(connection(1), next_desktop, 1_100)
+        .expect("advance desktop generation");
+
+    assert_eq!(
+        registry
+            .resolve_exact(&binding, AgentCapability::Capture, 1_100)
+            .expect_err("desktop change invalidates the binding"),
+        AgentRouteError::DesktopChanged
+    );
+}
+
+#[test]
+fn exact_route_never_falls_back_after_disconnect_or_replacement() {
+    let registry = registry();
+    expect_session(&registry, 42, 7, ReplacementPolicy::RejectExisting);
+    let first = complete(
+        &registry,
+        connection(1),
+        register(42, 7),
+        observed(42, 7),
+        1_000,
+    );
+    let first_binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_002)
+        .expect("bind first generation");
+
+    expect_session(
+        &registry,
+        43,
+        7,
+        ReplacementPolicy::ReplaceExisting {
+            expected_registration_id: first.identity.registration_id,
+            expected_registration_epoch: first.identity.registration_epoch,
+        },
+    );
+    let second = complete(
+        &registry,
+        connection(2),
+        register(43, 7),
+        observed(43, 7),
+        1_100,
+    );
+    assert_eq!(second.replaced_connection, Some(connection(1)));
+    assert_eq!(
+        registry
+            .resolve_exact(&first_binding, AgentCapability::Capture, 1_102)
+            .expect_err("replacement cannot transparently inherit an old binding"),
+        AgentRouteError::BindingRevoked
+    );
+
+    let second_binding = registry
+        .bind_active_session(7, AgentCapability::Capture, 1_102)
+        .expect("an explicit new selection can bind the replacement");
+    assert_ne!(
+        second_binding.registration_id(),
+        first_binding.registration_id()
+    );
+    registry.disconnect(connection(2));
+    assert_eq!(
+        registry
+            .resolve_exact(&second_binding, AgentCapability::Capture, 1_103)
+            .expect_err("disconnect cannot fall back to another generation"),
+        AgentRouteError::BindingRevoked
+    );
 }
 
 #[test]

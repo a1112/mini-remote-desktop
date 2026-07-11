@@ -1,22 +1,30 @@
 //! Bounded per-connection registration and lifecycle server.
 
-use super::{AgentConnectionId, AgentRegistry, AgentRegistryError, ObservedAgentIdentity};
-use mrd_agent_ipc::{
-    decode_frame, write_frame, AgentHeartbeat, AgentStopping, AgentToService, FrameError,
-    RegisteredAgentIdentity, ServiceToAgent, StopAgent, StopReason, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+use super::{
+    AgentBinding, AgentConnectionId, AgentRegistry, AgentRegistryError, AgentRouteError,
+    ObservedAgentIdentity,
 };
+use mrd_agent_ipc::{
+    decode_frame, write_frame, AgentCapability, AgentHeartbeat, AgentStopping, AgentToService,
+    FrameError, InputAck, InputEventEnvelope, InputRejection, RegisteredAgentIdentity,
+    ServiceToAgent, StopAgent, StopReason, AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES,
+    AGENT_IPC_PROTOCOL_MAJOR,
+};
+use mrd_proto::SessionId;
 use std::{
     collections::{hash_map::Entry, HashMap},
     future::Future,
     io::ErrorKind,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    sync::mpsc,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -25,7 +33,10 @@ const OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const REPLACED_STOP_GRACE_MS: u64 = 5_000;
+const PENDING_INPUT_CAPACITY: usize = 32;
+const RETIRED_INPUT_CAPACITY: usize = 4_096;
 
 /// Service clock boundary used by deterministic protocol tests.
 pub trait AgentServerClock: Send + Sync {
@@ -87,6 +98,243 @@ pub enum AgentServerError {
     /// Peer stopped reading before a bounded control write completed.
     #[error("agent control write timed out")]
     WriteTimeout,
+    /// A response-bearing message was sent through the one-way compatibility API.
+    #[error("agent request requires correlated request/response routing")]
+    ResponseRequired,
+}
+
+/// Failures for one exact, response-bearing request to a session agent.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AgentRequestError {
+    /// The persisted agent binding is no longer routable.
+    #[error(transparent)]
+    Route(#[from] AgentRouteError),
+    /// Input request fields violate the bounded IPC contract.
+    #[error("agent input request is invalid: {0:?}")]
+    InvalidInput(InputRejection),
+    /// No live server connection owns the exact bound connection.
+    #[error("agent connection is unavailable")]
+    ConnectionUnavailable,
+    /// The exact connection's bounded outbound queue is full or closed.
+    #[error("agent request queue is unavailable")]
+    OutboundUnavailable,
+    /// The same correlation identity already has an outstanding request.
+    #[error("agent input request correlation is already pending")]
+    DuplicateRequest,
+    /// A cancelled or timed-out correlation identity cannot be reused on this connection.
+    #[error("agent input request correlation was retired")]
+    RetiredRequest,
+    /// The bounded pending-request directory or token space is exhausted.
+    #[error("agent request capacity is exhausted")]
+    CapacityExhausted,
+    /// The exact agent generation was revoked while the request was pending.
+    #[error("agent request was revoked")]
+    Revoked,
+    /// The authenticated agent disconnected while the request was pending.
+    #[error("agent disconnected before responding")]
+    Disconnected,
+    /// No correlated response arrived within the configured deadline.
+    #[error("agent request timed out")]
+    Timeout,
+    /// Correlation state could not be inspected safely.
+    #[error("agent response correlation state is unavailable")]
+    StateUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InputCorrelationKey {
+    session_id: SessionId,
+    resource_id: [u8; 16],
+    start_grant_id: [u8; 32],
+    sequence: u64,
+}
+
+impl InputCorrelationKey {
+    fn from_event(event: &InputEventEnvelope) -> Self {
+        Self {
+            session_id: event.session_id.clone(),
+            resource_id: event.resource_id,
+            start_grant_id: event.start_grant_id,
+            sequence: event.sequence,
+        }
+    }
+
+    fn from_ack(ack: &InputAck) -> Self {
+        Self {
+            session_id: ack.session_id.clone(),
+            resource_id: ack.resource_id,
+            start_grant_id: ack.start_grant_id,
+            sequence: ack.sequence,
+        }
+    }
+}
+
+struct PendingInput {
+    token: u64,
+    registration_id: [u8; 16],
+    registration_epoch: u64,
+    event_commitment: [u8; 32],
+    sent: bool,
+    cancellation: watch::Sender<bool>,
+    reply: oneshot::Sender<Result<InputAck, AgentRequestError>>,
+}
+
+#[derive(Default)]
+struct InputCorrelationState {
+    pending: HashMap<InputCorrelationKey, PendingInput>,
+    retired: HashMap<InputCorrelationKey, [u8; 32]>,
+}
+
+#[derive(Clone)]
+struct ConnectionControl {
+    outbound: mpsc::Sender<OutboundMessage>,
+    inputs: Arc<Mutex<InputCorrelationState>>,
+}
+
+impl ConnectionControl {
+    fn new(outbound: mpsc::Sender<OutboundMessage>) -> Self {
+        Self {
+            outbound,
+            inputs: Arc::new(Mutex::new(InputCorrelationState::default())),
+        }
+    }
+
+    fn register_input(
+        &self,
+        key: InputCorrelationKey,
+        pending: PendingInput,
+    ) -> Result<(), AgentRequestError> {
+        let mut inputs = self
+            .inputs
+            .lock()
+            .map_err(|_| AgentRequestError::StateUnavailable)?;
+        if inputs.pending.contains_key(&key) {
+            return Err(AgentRequestError::DuplicateRequest);
+        }
+        if inputs.retired.contains_key(&key) {
+            return Err(AgentRequestError::RetiredRequest);
+        }
+        if inputs.pending.len() >= PENDING_INPUT_CAPACITY
+            || inputs.retired.len() >= RETIRED_INPUT_CAPACITY
+        {
+            return Err(AgentRequestError::CapacityExhausted);
+        }
+        inputs.pending.insert(key, pending);
+        Ok(())
+    }
+
+    fn mark_input_sent(&self, key: &InputCorrelationKey, token: u64) {
+        if let Ok(mut inputs) = self.inputs.lock() {
+            if let Some(pending) = inputs
+                .pending
+                .get_mut(key)
+                .filter(|pending| pending.token == token)
+            {
+                pending.sent = true;
+            }
+        }
+    }
+
+    fn cancel_input(&self, key: &InputCorrelationKey, token: u64) {
+        if let Ok(mut inputs) = self.inputs.lock() {
+            if inputs
+                .pending
+                .get(key)
+                .is_some_and(|pending| pending.token == token)
+            {
+                if let Some(pending) = inputs.pending.remove(key) {
+                    let _ = pending.cancellation.send(true);
+                    if inputs.retired.len() < RETIRED_INPUT_CAPACITY {
+                        inputs.retired.insert(key.clone(), pending.event_commitment);
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_input_pending(&self, key: &InputCorrelationKey, token: u64) -> bool {
+        self.inputs.lock().is_ok_and(|inputs| {
+            inputs
+                .pending
+                .get(key)
+                .is_some_and(|pending| pending.token == token)
+        })
+    }
+
+    fn fail_input(&self, key: &InputCorrelationKey, token: u64, error: AgentRequestError) {
+        let pending = self.inputs.lock().ok().and_then(|mut inputs| {
+            inputs
+                .pending
+                .get(key)
+                .is_some_and(|pending| pending.token == token)
+                .then(|| inputs.pending.remove(key))
+                .flatten()
+        });
+        if let Some(pending) = pending {
+            let _ = pending.cancellation.send(true);
+            let _ = pending.reply.send(Err(error));
+        }
+    }
+
+    fn resolve_input_ack(&self, ack: InputAck) {
+        let key = InputCorrelationKey::from_ack(&ack);
+        let pending = {
+            let Ok(mut inputs) = self.inputs.lock() else {
+                return;
+            };
+            let matches = inputs.pending.get(&key).is_some_and(|pending| {
+                pending.sent
+                    && pending.registration_id == ack.registration_id
+                    && pending.registration_epoch == ack.registration_epoch
+                    && pending.event_commitment == ack.event_commitment
+            });
+            matches.then(|| inputs.pending.remove(&key)).flatten()
+        };
+        if let Some(pending) = pending {
+            let _ = pending.reply.send(Ok(ack));
+        }
+    }
+
+    fn fail_all(&self, error: AgentRequestError) {
+        let pending = self
+            .inputs
+            .lock()
+            .map(|mut inputs| {
+                inputs
+                    .pending
+                    .drain()
+                    .map(|(_, pending)| pending)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for pending in pending {
+            let _ = pending.cancellation.send(true);
+            let _ = pending.reply.send(Err(error.clone()));
+        }
+    }
+}
+
+struct PendingInputGuard {
+    control: ConnectionControl,
+    key: InputCorrelationKey,
+    token: u64,
+}
+
+impl Drop for PendingInputGuard {
+    fn drop(&mut self) {
+        self.control.cancel_input(&self.key, self.token);
+    }
+}
+
+enum OutboundMessage {
+    OneWay(ServiceToAgent),
+    Input {
+        event: InputEventEnvelope,
+        key: InputCorrelationKey,
+        token: u64,
+        binding: AgentBinding,
+        cancellation: watch::Receiver<bool>,
+    },
 }
 
 enum InboundEvent {
@@ -101,11 +349,20 @@ enum RevocableWriteOutcome {
     Revoked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputWriteOutcome {
+    Written,
+    Revoked,
+    Cancelled,
+}
+
 /// Shared server for authenticated agent connections.
 pub struct AgentServer {
     registry: Arc<AgentRegistry>,
     clock: Arc<dyn AgentServerClock>,
-    controls: Arc<Mutex<HashMap<AgentConnectionId, mpsc::Sender<ServiceToAgent>>>>,
+    request_timeout: Duration,
+    next_request_token: AtomicU64,
+    controls: Arc<Mutex<HashMap<AgentConnectionId, ConnectionControl>>>,
 }
 
 impl AgentServer {
@@ -116,9 +373,23 @@ impl AgentServer {
 
     /// Construct a server with an injected trusted clock.
     pub fn with_clock(registry: Arc<AgentRegistry>, clock: Arc<dyn AgentServerClock>) -> Self {
+        Self::with_clock_and_request_timeout(registry, clock, REQUEST_TIMEOUT)
+    }
+
+    /// Construct a server with injected clock and request deadline.
+    ///
+    /// The explicit deadline keeps request/response timeout behavior deterministic
+    /// in integration tests while production constructors use the safe default.
+    pub fn with_clock_and_request_timeout(
+        registry: Arc<AgentRegistry>,
+        clock: Arc<dyn AgentServerClock>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             registry,
             clock,
+            request_timeout,
+            next_request_token: AtomicU64::new(1),
             controls: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -129,19 +400,99 @@ impl AgentServer {
         connection_id: AgentConnectionId,
         message: ServiceToAgent,
     ) -> Result<(), AgentServerError> {
+        if !matches!(message, ServiceToAgent::StopAgent(_)) {
+            return Err(AgentServerError::ResponseRequired);
+        }
         if !self.registry.is_connection_active(connection_id) {
             return Err(AgentServerError::ConnectionUnavailable);
         }
-        let sender = self
+        let control = self
             .controls
             .lock()
             .map_err(|_| AgentServerError::ConnectionUnavailable)?
             .get(&connection_id)
             .cloned()
             .ok_or(AgentServerError::ConnectionUnavailable)?;
-        sender
-            .try_send(message)
+        control
+            .outbound
+            .try_send(OutboundMessage::OneWay(message))
             .map_err(|_| AgentServerError::OutboundUnavailable)
+    }
+
+    /// Route one input event to the exact persisted agent generation and await its bound ack.
+    pub async fn request_input(
+        &self,
+        binding: &AgentBinding,
+        event: InputEventEnvelope,
+    ) -> Result<InputAck, AgentRequestError> {
+        event
+            .validate_shape()
+            .map_err(AgentRequestError::InvalidInput)?;
+        let event_commitment = event
+            .commitment()
+            .map_err(AgentRequestError::InvalidInput)?;
+        let route =
+            self.registry
+                .resolve_exact(binding, AgentCapability::Input, self.clock.now_ms())?;
+        let control = self
+            .controls
+            .lock()
+            .map_err(|_| AgentRequestError::ConnectionUnavailable)?
+            .get(&route.connection_id())
+            .cloned()
+            .ok_or(AgentRequestError::ConnectionUnavailable)?;
+        let token = self
+            .next_request_token
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
+                token.checked_add(1)
+            })
+            .map_err(|_| AgentRequestError::CapacityExhausted)?;
+        let key = InputCorrelationKey::from_event(&event);
+        let (reply, response) = oneshot::channel();
+        let (cancellation, cancelled) = watch::channel(false);
+        control.register_input(
+            key.clone(),
+            PendingInput {
+                token,
+                registration_id: *binding.registration_id(),
+                registration_epoch: binding.registration_epoch(),
+                event_commitment,
+                sent: false,
+                cancellation,
+                reply,
+            },
+        )?;
+        let _pending_guard = PendingInputGuard {
+            control: control.clone(),
+            key: key.clone(),
+            token,
+        };
+
+        let mut lease = route.into_lease();
+        if lease.is_revoked() {
+            return Err(AgentRequestError::Revoked);
+        }
+        if control
+            .outbound
+            .try_send(OutboundMessage::Input {
+                event,
+                key: key.clone(),
+                token,
+                binding: binding.clone(),
+                cancellation: cancelled,
+            })
+            .is_err()
+        {
+            return Err(AgentRequestError::OutboundUnavailable);
+        }
+
+        let result = tokio::select! {
+            biased;
+            response = response => response.unwrap_or(Err(AgentRequestError::Disconnected)),
+            _ = lease.wait_revoked() => Err(AgentRequestError::Revoked),
+            _ = tokio::time::sleep(self.request_timeout) => Err(AgentRequestError::Timeout),
+        };
+        result
     }
 
     /// Serve one stream whose OS identity was independently verified.
@@ -155,6 +506,7 @@ impl AgentServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+        let control = ConnectionControl::new(outbound_tx);
         {
             let mut controls = self
                 .controls
@@ -163,7 +515,7 @@ impl AgentServer {
             match controls.entry(connection_id) {
                 Entry::Occupied(_) => return Err(AgentServerError::DuplicateConnection),
                 Entry::Vacant(entry) => {
-                    entry.insert(outbound_tx);
+                    entry.insert(control.clone());
                 }
             }
         }
@@ -181,6 +533,7 @@ impl AgentServer {
                 &mut writer,
                 &mut inbound_rx,
                 outbound_rx,
+                control,
                 connection_id,
                 observed,
             )
@@ -194,7 +547,8 @@ impl AgentServer {
         &self,
         writer: &mut W,
         inbound: &mut mpsc::Receiver<InboundEvent>,
-        mut outbound: mpsc::Receiver<ServiceToAgent>,
+        mut outbound: mpsc::Receiver<OutboundMessage>,
+        control: ConnectionControl,
         connection_id: AgentConnectionId,
         observed: ObservedAgentIdentity,
     ) -> Result<AgentConnectionExit, AgentServerError>
@@ -240,29 +594,10 @@ impl AgentServer {
             tokio::select! {
                 biased;
                 _ = lease.wait_revoked() => {
+                    control.fail_all(AgentRequestError::Revoked);
                     return self
                         .stop_revoked_connection(writer, inbound, &identity)
                         .await;
-                }
-                outbound_message = outbound.recv() => {
-                    match outbound_message {
-                        Some(message) => {
-                            if lease.is_revoked() {
-                                return self
-                                    .stop_revoked_connection(writer, inbound, &identity)
-                                    .await;
-                            }
-                            let revoked = lease.wait_revoked();
-                            if write_service_frame_until_revoked(writer, &message, revoked).await?
-                                == RevocableWriteOutcome::Revoked
-                            {
-                                // A frame may now be partial, so hard-close instead of
-                                // appending a StopAgent frame to a corrupt stream.
-                                return Ok(AgentConnectionExit::Disconnected);
-                            }
-                        }
-                        None => return Err(AgentServerError::OutboundUnavailable),
-                    }
                 }
                 inbound_event = inbound.recv() => {
                     match inbound_event {
@@ -279,6 +614,9 @@ impl AgentServer {
                                 snapshot,
                                 self.clock.now_ms(),
                             )?;
+                        }
+                        Some(InboundEvent::Message(AgentToService::InputAck(ack))) => {
+                            control.resolve_input_ack(ack);
                         }
                         Some(InboundEvent::Message(AgentToService::AgentStopping(stopping))) => {
                             let heartbeat = AgentHeartbeat { context: stopping.context };
@@ -298,7 +636,89 @@ impl AgentServer {
                         }
                         Some(InboundEvent::Failed(error)) => return Err(error.into()),
                         Some(InboundEvent::Disconnected) | None => {
+                            control.fail_all(AgentRequestError::Disconnected);
                             return Ok(AgentConnectionExit::Disconnected);
+                        }
+                    }
+                }
+                outbound_message = outbound.recv() => {
+                    match outbound_message {
+                        Some(OutboundMessage::OneWay(message)) => {
+                            if lease.is_revoked() {
+                                control.fail_all(AgentRequestError::Revoked);
+                                return self
+                                    .stop_revoked_connection(writer, inbound, &identity)
+                                    .await;
+                            }
+                            let revoked = lease.wait_revoked();
+                            if write_service_frame_until_revoked(writer, &message, revoked).await?
+                                == RevocableWriteOutcome::Revoked
+                            {
+                                // A frame may now be partial, so hard-close instead of
+                                // appending a StopAgent frame to a corrupt stream.
+                                control.fail_all(AgentRequestError::Revoked);
+                                return Ok(AgentConnectionExit::Disconnected);
+                            }
+                        }
+                        Some(OutboundMessage::Input {
+                            event,
+                            key,
+                            token,
+                            binding,
+                            cancellation,
+                        }) => {
+                            if !control.is_input_pending(&key, token)
+                                || input_request_cancelled(&cancellation)
+                            {
+                                continue;
+                            }
+                            let exact_route = match self.registry.resolve_exact(
+                                &binding,
+                                AgentCapability::Input,
+                                self.clock.now_ms(),
+                            ) {
+                                Ok(route) => route,
+                                Err(error) => {
+                                    control.fail_input(
+                                        &key,
+                                        token,
+                                        AgentRequestError::Route(error),
+                                    );
+                                    continue;
+                                }
+                            };
+                            if !control.is_input_pending(&key, token)
+                                || input_request_cancelled(&cancellation)
+                            {
+                                continue;
+                            }
+                            let mut exact_lease = exact_route.into_lease();
+                            let message = ServiceToAgent::InputEvent(event);
+                            match write_input_frame_until_interrupted(
+                                writer,
+                                &message,
+                                exact_lease.wait_revoked(),
+                                wait_for_input_cancellation(cancellation),
+                            )
+                            .await?
+                            {
+                                InputWriteOutcome::Written => {
+                                    control.mark_input_sent(&key, token);
+                                }
+                                InputWriteOutcome::Revoked => {
+                                    control.fail_all(AgentRequestError::Revoked);
+                                    return Ok(AgentConnectionExit::Disconnected);
+                                }
+                                InputWriteOutcome::Cancelled => {
+                                    // Cancellation may have interrupted a partial frame.
+                                    // Hard-close so no later frame can be parsed across it.
+                                    return Ok(AgentConnectionExit::Disconnected);
+                                }
+                            }
+                        }
+                        None => {
+                            control.fail_all(AgentRequestError::Disconnected);
+                            return Err(AgentServerError::OutboundUnavailable);
                         }
                     }
                 }
@@ -335,16 +755,18 @@ impl AgentServer {
 
 struct ConnectionCleanup {
     registry: Arc<AgentRegistry>,
-    controls: Arc<Mutex<HashMap<AgentConnectionId, mpsc::Sender<ServiceToAgent>>>>,
+    controls: Arc<Mutex<HashMap<AgentConnectionId, ConnectionControl>>>,
     connection_id: AgentConnectionId,
 }
 
 impl Drop for ConnectionCleanup {
     fn drop(&mut self) {
-        self.registry.disconnect(self.connection_id);
         if let Ok(mut controls) = self.controls.lock() {
-            controls.remove(&self.connection_id);
+            if let Some(control) = controls.remove(&self.connection_id) {
+                control.fail_all(AgentRequestError::Disconnected);
+            }
         }
+        self.registry.disconnect(self.connection_id);
     }
 }
 
@@ -391,6 +813,42 @@ where
         result = write_service_frame(writer, message) => {
             result?;
             Ok(RevocableWriteOutcome::Written)
+        }
+    }
+}
+
+fn input_request_cancelled(cancellation: &watch::Receiver<bool>) -> bool {
+    *cancellation.borrow() || cancellation.has_changed().is_err()
+}
+
+async fn wait_for_input_cancellation(mut cancellation: watch::Receiver<bool>) {
+    while !input_request_cancelled(&cancellation) {
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn write_input_frame_until_interrupted<W, F, G>(
+    writer: &mut W,
+    message: &ServiceToAgent,
+    revocation: F,
+    cancellation: G,
+) -> Result<InputWriteOutcome, AgentServerError>
+where
+    W: AsyncWrite + Unpin,
+    F: Future<Output = ()>,
+    G: Future<Output = ()>,
+{
+    tokio::pin!(revocation);
+    tokio::pin!(cancellation);
+    tokio::select! {
+        biased;
+        _ = &mut revocation => Ok(InputWriteOutcome::Revoked),
+        _ = &mut cancellation => Ok(InputWriteOutcome::Cancelled),
+        result = write_service_frame(writer, message) => {
+            result?;
+            Ok(InputWriteOutcome::Written)
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Execute-grant wire contracts and authorization checks.
 
 use crate::protocol::{
-    AgentCommand, DesktopKind, ExecuteCommand, PeerBinding, AGENT_IPC_MAX_IDENTIFIER_BYTES,
+    AgentCommand, DesktopKind, ExecuteCommand, InputEventEnvelope, InputEventPayload,
+    InputRejection, PeerBinding, AGENT_IPC_MAX_IDENTIFIER_BYTES,
 };
 use mrd_proto::SessionId;
 use mrd_session::PermissionScopes;
@@ -201,6 +202,9 @@ pub enum GrantValidationError {
     /// The resource id is the all-zero sentinel.
     #[error("execute command resource id is invalid")]
     InvalidResourceId,
+    /// StartInput did not request a non-empty subset of the input scopes.
+    #[error("start-input scopes must contain only pointer and/or keyboard input")]
+    InvalidInputScopes,
     /// The grant belongs to a different registration.
     #[error("execute grant registration does not match")]
     RegistrationMismatch,
@@ -258,6 +262,7 @@ pub enum GrantValidationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedGrant {
     claims: ExecuteGrantClaims,
+    issuer_key_id: [u8; 32],
 }
 
 /// A product command whose signed grant and trusted bindings were validated.
@@ -266,6 +271,31 @@ pub struct AuthorizedCommand {
     command_id: [u8; 16],
     command: AgentCommand,
     grant: AuthorizedGrant,
+}
+
+/// Failure to derive an input-resource capability from an authorized command.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum InputResourceAuthorizationError {
+    /// The authorized command was not StartInput.
+    #[error("authorized command does not create an input resource")]
+    NotStartInput,
+}
+
+/// In-memory capability established by one validated StartInput command.
+///
+/// Fields are private so untrusted wire values cannot fabricate this proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedInputResource {
+    resource_id: [u8; 16],
+    start_grant_id: [u8; 32],
+    input_scopes: PermissionScopes,
+    grant: AuthorizedGrant,
+}
+
+/// Input event whose payload and identity are bound to a live authorized resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedInputEvent {
+    envelope: InputEventEnvelope,
 }
 
 impl AuthorizedCommand {
@@ -290,6 +320,114 @@ impl AuthorizedCommand {
     }
 }
 
+impl AuthorizedInputResource {
+    /// Resource identity signed by StartInput.
+    pub fn resource_id(&self) -> &[u8; 16] {
+        &self.resource_id
+    }
+
+    /// Unique execute-grant identity that established the resource.
+    pub fn start_grant_id(&self) -> &[u8; 32] {
+        &self.start_grant_id
+    }
+
+    /// Product session bound to this resource.
+    pub fn session_id(&self) -> &SessionId {
+        &self.grant.claims.session_id
+    }
+
+    /// Exact pointer and/or keyboard scopes requested by StartInput.
+    pub fn input_scopes(&self) -> &PermissionScopes {
+        &self.input_scopes
+    }
+
+    /// Validated grant claims retained for live-context checks and audit.
+    pub fn claims(&self) -> &ExecuteGrantClaims {
+        &self.grant.claims
+    }
+}
+
+impl ValidatedInputEvent {
+    /// Resource-local input sequence.
+    pub fn sequence(&self) -> u64 {
+        self.envelope.sequence
+    }
+
+    /// Validated input operation.
+    pub fn event(&self) -> &InputEventPayload {
+        &self.envelope.event
+    }
+
+    /// Full validated envelope for commitment and acknowledgment correlation.
+    pub fn envelope(&self) -> &InputEventEnvelope {
+        &self.envelope
+    }
+}
+
+/// Convert a grant-validated StartInput command into a non-forgeable resource capability.
+pub fn authorize_input_resource(
+    authorized: AuthorizedCommand,
+) -> Result<AuthorizedInputResource, InputResourceAuthorizationError> {
+    let AuthorizedCommand { command, grant, .. } = authorized;
+    match command {
+        AgentCommand::StartInput {
+            resource_id,
+            input_scopes,
+        } => Ok(AuthorizedInputResource {
+            resource_id,
+            start_grant_id: grant.claims.grant_id,
+            input_scopes,
+            grant,
+        }),
+        _ => Err(InputResourceAuthorizationError::NotStartInput),
+    }
+}
+
+/// Validate an input envelope against its StartInput capability and current trusted state.
+///
+/// ReleaseAll is cleanup: it remains valid across policy or desktop transitions so held input
+/// can always be released, while all immutable resource and registration bindings still match.
+pub fn validate_input_event(
+    envelope: &InputEventEnvelope,
+    resource: &AuthorizedInputResource,
+    context: &ExecutionContext,
+) -> Result<ValidatedInputEvent, InputRejection> {
+    envelope.validate_shape()?;
+    let claims = &resource.grant.claims;
+    if envelope.session_id != claims.session_id
+        || envelope.resource_id != resource.resource_id
+        || envelope.start_grant_id != resource.start_grant_id
+        || context.registration_id != claims.registration_id
+        || context.registration_epoch != claims.registration_epoch
+        || context.session_id != claims.session_id
+        || context.peer != claims.peer
+        || context.windows_session_id != claims.windows_session_id
+        || context.expected_issuer_key_id != resource.grant.issuer_key_id
+    {
+        return Err(InputRejection::Grant);
+    }
+
+    let required_scope = envelope.event.required_scope();
+    if let Some(required_scope) = required_scope {
+        if !resource.input_scopes.contains(&required_scope) {
+            return Err(InputRejection::Grant);
+        }
+        if context.policy_revision != claims.policy_revision {
+            return Err(InputRejection::Policy);
+        }
+        if context.desktop_epoch != claims.desktop_epoch
+            || context.desktop_kind != claims.desktop_kind
+            || context.desktop_kind != DesktopKind::Default
+        {
+            return Err(InputRejection::StaleDesktop);
+        }
+    }
+
+    Ok(ValidatedInputEvent {
+        envelope: envelope.clone(),
+    })
+}
+
 /// Validate an execute command without trusting command-derived caller input.
 ///
 /// The command digest, required scopes, and start/cleanup purpose are derived
@@ -307,6 +445,19 @@ where
     }
     if execute.command.resource_id().iter().all(|byte| *byte == 0) {
         return Err(GrantValidationError::InvalidResourceId);
+    }
+    if let AgentCommand::StartInput { input_scopes, .. } = &execute.command {
+        if input_scopes.is_empty()
+            || input_scopes.iter().any(|scope| {
+                !matches!(
+                    scope,
+                    mrd_session::PermissionScope::InputPointer
+                        | mrd_session::PermissionScope::InputKeyboard
+                )
+            })
+        {
+            return Err(GrantValidationError::InvalidInputScopes);
+        }
     }
 
     let purpose = if execute.command.is_cleanup() {
@@ -487,6 +638,7 @@ where
 
     Ok(AuthorizedGrant {
         claims: claims.clone(),
+        issuer_key_id: grant.issuer_key_id,
     })
 }
 

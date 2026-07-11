@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 ed25519-dalek.workspace = true
 mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
+mrd-input = { path = "../../crates/mrd-input" }
 mrd-proto = { path = "../../crates/mrd-proto" }
 ring.workspace = true
 thiserror.workspace = true
