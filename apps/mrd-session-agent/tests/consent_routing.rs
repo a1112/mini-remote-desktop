@@ -28,7 +28,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream},
-    sync::{mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch, Notify},
     task::JoinHandle,
 };
 
@@ -212,6 +212,123 @@ impl ConsentBackend for TestBackend {
     }
 }
 
+struct BarrierBackendState {
+    entered: Notify,
+    dropped: AtomicBool,
+}
+
+struct BarrierBackend {
+    state: Arc<BarrierBackendState>,
+}
+
+struct BarrierFutureGuard(Arc<BarrierBackendState>);
+
+impl Drop for BarrierFutureGuard {
+    fn drop(&mut self) {
+        self.0.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ConsentBackend for BarrierBackend {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        _prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let _guard = BarrierFutureGuard(Arc::clone(&state));
+            state.entered.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PanicMode {
+    Constructor,
+    Future,
+}
+
+struct PanicOnceBackend {
+    mode: PanicMode,
+    calls: AtomicUsize,
+    fallback: Arc<TestBackend>,
+}
+
+struct PanicOnAbortBackend {
+    calls: AtomicUsize,
+    entered: Notify,
+    fallback: Arc<TestBackend>,
+}
+
+struct AvailabilityPanicBackend;
+
+impl ConsentBackend for PanicOnceBackend {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        prompt: ConsentPrompt,
+        abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            match self.mode {
+                PanicMode::Constructor => panic!("test consent constructor panic"),
+                PanicMode::Future => {
+                    return Box::pin(async { panic!("test consent future panic") });
+                }
+            }
+        }
+        self.fallback.prompt(prompt, abort)
+    }
+}
+
+impl ConsentBackend for PanicOnAbortBackend {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        prompt: ConsentPrompt,
+        mut abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+            return self.fallback.prompt(prompt, abort);
+        }
+        self.entered.notify_one();
+        Box::pin(async move {
+            while abort.borrow_and_update().is_none() {
+                if abort.changed().await.is_err() {
+                    return ConsentBackendDecision::Cancelled;
+                }
+            }
+            panic!("test panic while closing consent surface")
+        })
+    }
+}
+
+impl ConsentBackend for AvailabilityPanicBackend {
+    fn is_available(&self) -> bool {
+        panic!("test availability panic")
+    }
+
+    fn prompt(
+        &self,
+        _prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        panic!("unavailable backend must not construct a prompt")
+    }
+}
+
 fn backend() -> (
     Arc<TestBackend>,
     Arc<BackendState>,
@@ -249,7 +366,7 @@ fn descriptor() -> SessionDescriptor {
 }
 
 async fn start_agent(
-    backend: Arc<TestBackend>,
+    backend: Arc<dyn ConsentBackend>,
 ) -> (
     JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
     DuplexStream,
@@ -258,7 +375,7 @@ async fn start_agent(
 }
 
 async fn start_agent_with_environment(
-    backend: Arc<TestBackend>,
+    backend: Arc<dyn ConsentBackend>,
     desktop: Arc<dyn TrustedDesktopStateSource>,
     expect_consent_capability: bool,
 ) -> (
@@ -272,7 +389,7 @@ async fn start_agent_with_environment(
 }
 
 async fn start_agent_with_environment_and_snapshot(
-    backend: Arc<TestBackend>,
+    backend: Arc<dyn ConsentBackend>,
     desktop: Arc<dyn TrustedDesktopStateSource>,
     expect_consent_capability: bool,
 ) -> (
@@ -1641,5 +1758,186 @@ async fn first_unavailable_dismissal_is_tombstoned() {
             .is_err(),
         "unavailable dismissal replay must stay cached after recovery"
     );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn aborting_runtime_drops_the_active_backend_future() {
+    let (backend, state, mut started) = backend();
+    let (agent, mut service) = start_agent(backend).await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(consent_request(83)),
+    )
+    .await;
+    let mut prompt = next_started(&mut started).await;
+    assert_eq!(state.visible.load(Ordering::SeqCst), 1);
+
+    agent.abort();
+    let join_error = tokio::time::timeout(TEST_TIMEOUT, agent)
+        .await
+        .expect("aborted runtime join timeout")
+        .expect_err("runtime task must report cancellation");
+    assert!(join_error.is_cancelled());
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while state.visible.load(Ordering::SeqCst) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backend future must be dropped with runtime");
+    let _ = tokio::time::timeout(TEST_TIMEOUT, prompt.abort.changed()).await;
+    assert_eq!(
+        *prompt.abort.borrow(),
+        Some(ConsentAbortReason::RuntimeStopping)
+    );
+    assert!(prompt
+        .respond
+        .send(ConsentBackendDecision::Approved(
+            [PermissionScope::ScreenView].into_iter().collect(),
+        ))
+        .is_err());
+}
+
+#[tokio::test]
+async fn startup_barrier_future_does_not_block_heartbeat_or_stop() {
+    let state = Arc::new(BarrierBackendState {
+        entered: Notify::new(),
+        dropped: AtomicBool::new(false),
+    });
+    let backend = Arc::new(BarrierBackend {
+        state: Arc::clone(&state),
+    });
+    let (agent, mut service) = start_agent(backend).await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(consent_request(84)),
+    )
+    .await;
+    tokio::time::timeout(TEST_TIMEOUT, state.entered.notified())
+        .await
+        .expect("backend future was never polled");
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentHeartbeat(_)
+    ));
+    stop_agent(agent, &mut service).await;
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while !state.dropped.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("stopping runtime must drop the startup-barrier future");
+}
+
+async fn assert_panicking_backend_does_not_wedge(mode: PanicMode, first_seed: u8) {
+    let (fallback, _state, mut started) = backend();
+    let backend = Arc::new(PanicOnceBackend {
+        mode,
+        calls: AtomicUsize::new(0),
+        fallback,
+    });
+    let (agent, mut service) = start_agent(backend).await;
+    let failed = consent_request(first_seed);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(failed.clone()),
+    )
+    .await;
+    let failed_result = next_consent_result(&mut service).await;
+    assert_eq!(failed_result.request_id, failed.request_id);
+    assert_eq!(failed_result.decision, ConsentDecision::Dismissed);
+
+    let following = consent_request(first_seed + 1);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(following.clone()),
+    )
+    .await;
+    next_started(&mut started)
+        .await
+        .respond
+        .send(ConsentBackendDecision::Denied)
+        .expect("complete prompt after backend failure");
+    let following_result = next_consent_result(&mut service).await;
+    assert_eq!(following_result.request_id, following.request_id);
+    assert_eq!(following_result.decision, ConsentDecision::Denied);
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn panicking_prompt_constructor_is_dismissed_and_next_progresses() {
+    assert_panicking_backend_does_not_wedge(PanicMode::Constructor, 85).await;
+}
+
+#[tokio::test]
+async fn panicking_prompt_future_is_dismissed_and_next_progresses() {
+    assert_panicking_backend_does_not_wedge(PanicMode::Future, 87).await;
+}
+
+#[tokio::test]
+async fn backend_failure_while_closing_releases_slot_for_next_prompt() {
+    let (fallback, _state, mut started) = backend();
+    let backend = Arc::new(PanicOnAbortBackend {
+        calls: AtomicUsize::new(0),
+        entered: Notify::new(),
+        fallback,
+    });
+    let (agent, mut service) = start_agent(backend.clone()).await;
+    let first = consent_request(89);
+    let second = consent_request(90);
+    send_service_message(&mut service, &ServiceToAgent::ConsentRequest(first.clone())).await;
+    tokio::time::timeout(TEST_TIMEOUT, backend.entered.notified())
+        .await
+        .expect("first backend constructor did not run");
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(second.clone()),
+    )
+    .await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: first.request_token,
+            request_id: first.request_id,
+            session_id: first.session_id.clone(),
+            reason: ConsentCancelReason::CallerAborted,
+        }),
+    )
+    .await;
+    let cancelled = next_consent_result(&mut service).await;
+    assert_eq!(cancelled.request_id, first.request_id);
+    assert_eq!(cancelled.decision, ConsentDecision::Dismissed);
+
+    let promoted = next_started(&mut started).await;
+    assert_eq!(promoted.prompt.session_id(), &second.session_id);
+    promoted
+        .respond
+        .send(ConsentBackendDecision::Denied)
+        .expect("complete promoted prompt");
+    let second_result = next_consent_result(&mut service).await;
+    assert_eq!(second_result.request_id, second.request_id);
+    assert_eq!(second_result.decision, ConsentDecision::Denied);
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn availability_panic_is_fail_closed_for_snapshot_and_request() {
+    let (agent, mut service) = start_agent_with_environment(
+        Arc::new(AvailabilityPanicBackend),
+        Arc::new(DefaultDesktop),
+        false,
+    )
+    .await;
+    let request = consent_request(91);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let result = next_consent_result(&mut service).await;
+    assert_eq!(result.request_id, request.request_id);
+    assert_eq!(result.decision, ConsentDecision::Dismissed);
     stop_agent(agent, &mut service).await;
 }

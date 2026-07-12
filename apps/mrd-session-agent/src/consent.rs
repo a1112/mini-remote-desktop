@@ -13,6 +13,7 @@ use mrd_session::PermissionScopes;
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
+    panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -186,10 +187,19 @@ pub type ConsentBackendFuture =
 /// The backend receives display-only prompt data and an abort watch. It cannot
 /// provide or override any trusted authorization context.
 pub trait ConsentBackend: Send + Sync {
-    /// Whether this exact backend can currently display an attended prompt.
+    /// Return an O(1), wait-free, panic-free availability snapshot.
+    ///
+    /// Implementations must not perform I/O, acquire contended locks, or wait
+    /// for a UI thread. The runtime still catches a contract-violating panic
+    /// and treats the backend as unavailable when publishing capabilities.
     fn is_available(&self) -> bool;
 
-    /// Display one prompt and resolve only after its surface has closed.
+    /// Immediately construct a cancellation-safe asynchronous prompt handle.
+    ///
+    /// This method must not display UI, perform I/O, or block. All UI work must
+    /// begin when the returned future is polled. Dropping that future must
+    /// cancel any work and close its surface without leaving helper threads.
+    /// The future resolves only after its surface has closed.
     fn prompt(
         &self,
         prompt: ConsentPrompt,
@@ -602,7 +612,14 @@ const CONSENT_COMPLETION_CHANNEL_CAPACITY: usize = 1;
 #[derive(Debug)]
 pub(crate) struct BackendCompletion {
     attempt_id: u64,
-    decision: ConsentBackendDecision,
+    outcome: BackendCompletionOutcome,
+}
+
+#[derive(Debug)]
+enum BackendCompletionOutcome {
+    Decision(ConsentBackendDecision),
+    Unavailable,
+    BackendFailed,
 }
 
 struct ManagedPrompt {
@@ -621,6 +638,7 @@ struct ActivePrompt {
     prompt: ManagedPrompt,
     phase: ActivePromptPhase,
     abort: watch::Sender<Option<ConsentAbortReason>>,
+    backend_abort: Option<tokio::task::AbortHandle>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -648,7 +666,7 @@ impl ConsentManager {
     }
 
     pub(crate) fn is_available(&self) -> bool {
-        self.backend.is_available()
+        catch_unwind(AssertUnwindSafe(|| self.backend.is_available())).unwrap_or(false)
     }
 
     pub(crate) fn registry(&self) -> Arc<ConsentAuthorityRegistry> {
@@ -723,12 +741,18 @@ impl ConsentManager {
             return Err(ConsentRegistryError::Unavailable);
         };
         if active.phase != ActivePromptPhase::Closing {
-            let (decision, scopes) = match completion.decision {
-                ConsentBackendDecision::Approved(scopes) => (ConsentDecision::Approved, scopes),
-                ConsentBackendDecision::Denied => {
+            let (decision, scopes) = match completion.outcome {
+                BackendCompletionOutcome::Decision(ConsentBackendDecision::Approved(scopes)) => {
+                    (ConsentDecision::Approved, scopes)
+                }
+                BackendCompletionOutcome::Decision(ConsentBackendDecision::Denied) => {
                     (ConsentDecision::Denied, PermissionScopes::new())
                 }
-                ConsentBackendDecision::Dismissed | ConsentBackendDecision::Cancelled => {
+                BackendCompletionOutcome::Decision(
+                    ConsentBackendDecision::Dismissed | ConsentBackendDecision::Cancelled,
+                )
+                | BackendCompletionOutcome::Unavailable
+                | BackendCompletionOutcome::BackendFailed => {
                     (ConsentDecision::Dismissed, PermissionScopes::new())
                 }
             };
@@ -830,6 +854,9 @@ impl ConsentManager {
 
         if let Some(mut active) = active {
             active.abort.send_replace(Some(reason));
+            if let Some(backend_abort) = active.backend_abort.take() {
+                backend_abort.abort();
+            }
             if let Some(task) = active.task.take() {
                 task.abort();
                 let _ = task.await;
@@ -858,11 +885,6 @@ impl ConsentManager {
                 now = Instant::now();
                 continue;
             }
-            if !self.backend.is_available() {
-                complete_unavailable_prompt(&self.registry, &prompt, current_context, results)?;
-                now = Instant::now();
-                continue;
-            }
             break prompt;
         };
         let display_prompt = ConsentPrompt {
@@ -876,17 +898,35 @@ impl ConsentManager {
             prompt,
             phase: ActivePromptPhase::Prompting,
             abort,
+            backend_abort: None,
             task: None,
         });
 
-        let future = self.backend.prompt(display_prompt, abort_receiver);
+        let backend = Arc::clone(&self.backend);
+        let backend_task = tokio::spawn(async move {
+            if !backend.is_available() {
+                return BackendCompletionOutcome::Unavailable;
+            }
+            let future = backend.prompt(display_prompt, abort_receiver);
+            BackendCompletionOutcome::Decision(future.await)
+        });
+        let backend_abort = backend_task.abort_handle();
+        let Some(active) = self.active.as_mut() else {
+            backend_abort.abort();
+            return Err(ConsentRegistryError::Unavailable);
+        };
+        active.backend_abort = Some(backend_abort);
         let completion = self.completion_tx.clone();
         let task = tokio::spawn(async move {
-            let decision = future.await;
+            let outcome = match backend_task.await {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_cancelled() => return,
+                Err(_) => BackendCompletionOutcome::BackendFailed,
+            };
             let _ = completion
                 .send(BackendCompletion {
                     attempt_id,
-                    decision,
+                    outcome,
                 })
                 .await;
         });
@@ -938,6 +978,23 @@ impl ConsentManager {
     }
 }
 
+impl Drop for ConsentManager {
+    fn drop(&mut self) {
+        let Some(mut active) = self.active.take() else {
+            return;
+        };
+        active
+            .abort
+            .send_replace(Some(ConsentAbortReason::RuntimeStopping));
+        if let Some(backend_abort) = active.backend_abort.take() {
+            backend_abort.abort();
+        }
+        if let Some(task) = active.task.take() {
+            task.abort();
+        }
+    }
+}
+
 fn cancel_managed_prompt(
     registry: &ConsentAuthorityRegistry,
     prompt: &ManagedPrompt,
@@ -973,24 +1030,6 @@ fn complete_expired_prompt(
         ConsentDecision::Expired,
         PermissionScopes::new(),
         context,
-    )? {
-        ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
-        ConsentCompletionOutcome::Ignored => {}
-    }
-    Ok(())
-}
-
-fn complete_unavailable_prompt(
-    registry: &ConsentAuthorityRegistry,
-    prompt: &ManagedPrompt,
-    current_context: &TrustedConsentContext,
-    results: &mut Vec<ConsentResult>,
-) -> Result<(), ConsentRegistryError> {
-    match registry.complete(
-        prompt.pending.attempt_id,
-        ConsentDecision::Dismissed,
-        PermissionScopes::new(),
-        current_context.clone(),
     )? {
         ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
         ConsentCompletionOutcome::Ignored => {}
