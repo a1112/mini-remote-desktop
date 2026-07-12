@@ -4,6 +4,8 @@ use mrd_agent_ipc::{
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::{PermissionScope, PermissionScopes};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 const REGISTRATION_ID: [u8; 16] = [7; 16];
 const ISSUER_KEY_ID: [u8; 32] = [9; 32];
@@ -191,6 +193,32 @@ fn nonapproved_decisions_never_install_authority() {
             Ok(ConsentBeginOutcome::Cached(_))
         ));
     }
+}
+
+#[test]
+fn nonapproved_decision_with_scopes_is_tombstoned_without_authority() {
+    let registry = ConsentAuthorityRegistry::new();
+    let request = request([19; 16], 79, "nonapproved-with-scopes");
+    let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+    let completion = completed(
+        registry
+            .complete(
+                attempt,
+                ConsentDecision::Denied,
+                scopes(&[PermissionScope::ScreenView]),
+                context(120),
+            )
+            .unwrap(),
+    );
+    assert_eq!(completion.result.decision, ConsentDecision::Dismissed);
+    assert!(completion.result.approved_scopes.is_empty());
+    assert_eq!(
+        completion.disposition,
+        ConsentCompletionDisposition::Rejected(
+            ConsentCompletionRejection::UnexpectedApprovedScopes
+        )
+    );
+    assert_eq!(registry.resolve(&request.session_id, 120), None);
 }
 
 #[test]
@@ -817,4 +845,192 @@ fn poisoned_registry_never_returns_or_installs_authority() {
         registry.begin(request([110; 16], 110, "poisoned"), context(110)),
         Err(ConsentRegistryError::Unavailable)
     );
+}
+
+struct PendingBackend {
+    started: Arc<Notify>,
+    dropped: Arc<AtomicBool>,
+}
+
+struct ImmediateApprovalBackend;
+
+impl ConsentBackend for ImmediateApprovalBackend {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        let scopes = prompt.requested_scopes().clone();
+        Box::pin(async move { ConsentBackendDecision::Approved(scopes) })
+    }
+}
+
+struct FutureDropGuard(Arc<AtomicBool>);
+
+impl Drop for FutureDropGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl ConsentBackend for PendingBackend {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        _prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        let started = Arc::clone(&self.started);
+        let dropped = Arc::clone(&self.dropped);
+        Box::pin(async move {
+            let _guard = FutureDropGuard(dropped);
+            started.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+fn pending_manager() -> (ConsentManager, Arc<Notify>, Arc<AtomicBool>) {
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let manager = ConsentManager::new(Arc::new(PendingBackend {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+    }));
+    (manager, started, dropped)
+}
+
+#[tokio::test]
+async fn monotonic_deadline_wins_when_exact_cancel_is_already_ready() {
+    let (mut manager, started, _dropped) = pending_manager();
+    let request = request([111; 16], 111, "deadline-cancel-race");
+    manager.begin(request.clone(), context(110)).unwrap();
+    started.notified().await;
+    manager
+        .active
+        .as_mut()
+        .expect("active prompt")
+        .prompt
+        .deadline = Instant::now() - std::time::Duration::from_millis(1);
+    let mut abort = manager
+        .active
+        .as_ref()
+        .expect("active prompt")
+        .abort
+        .subscribe();
+
+    let results = manager
+        .cancel(
+            &CancelConsent {
+                request_token: request.request_token,
+                request_id: request.request_id,
+                session_id: request.session_id.clone(),
+                reason: ConsentCancelReason::CallerAborted,
+            },
+            Instant::now(),
+            110,
+        )
+        .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].decision, ConsentDecision::Expired);
+    abort.changed().await.unwrap();
+    assert_eq!(
+        *abort.borrow_and_update(),
+        Some(ConsentAbortReason::PromptExpired)
+    );
+    assert_eq!(
+        manager.active.as_ref().map(|active| active.phase),
+        Some(ActivePromptPhase::Closing)
+    );
+    manager
+        .shutdown(ConsentAbortReason::RuntimeStopping, 110)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn poisoned_registry_cannot_skip_backend_abort_and_join() {
+    let (mut manager, started, dropped) = pending_manager();
+    manager
+        .begin(request([112; 16], 112, "poison-shutdown"), context(110))
+        .unwrap();
+    started.notified().await;
+    let registry = manager.registry();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = registry.state.lock().unwrap();
+        panic!("poison manager registry");
+    });
+
+    assert_eq!(
+        manager
+            .shutdown(ConsentAbortReason::RuntimeStopping, 110)
+            .await,
+        Err(ConsentRegistryError::Unavailable)
+    );
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(manager.active.is_none());
+    assert!(manager.queued.is_empty());
+}
+
+#[tokio::test]
+async fn manager_owned_registry_installs_only_timely_approval() {
+    let mut manager = ConsentManager::new(Arc::new(ImmediateApprovalBackend));
+    let request = request([113; 16], 113, "manager-approval");
+    manager.begin(request.clone(), context(110)).unwrap();
+    let completion = manager.next_completion().await.unwrap();
+    let results = manager.complete(completion, context(120)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].decision, ConsentDecision::Approved);
+    assert!(manager.registry.resolve(&request.session_id, 120).is_some());
+}
+
+#[tokio::test]
+async fn approved_completion_that_loses_cancel_race_cannot_install_binding() {
+    let mut manager = ConsentManager::new(Arc::new(ImmediateApprovalBackend));
+    let request = request([114; 16], 114, "manager-cancel-late");
+    manager.begin(request.clone(), context(110)).unwrap();
+    let cancelled = manager
+        .cancel(
+            &CancelConsent {
+                request_token: request.request_token,
+                request_id: request.request_id,
+                session_id: request.session_id.clone(),
+                reason: ConsentCancelReason::CallerAborted,
+            },
+            Instant::now(),
+            110,
+        )
+        .unwrap();
+    assert_eq!(cancelled[0].decision, ConsentDecision::Dismissed);
+    let completion = manager.next_completion().await.unwrap();
+    assert!(manager
+        .complete(completion, context(120))
+        .unwrap()
+        .is_empty());
+    assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
+}
+
+#[tokio::test]
+async fn approved_completion_that_loses_deadline_race_cannot_install_binding() {
+    let mut manager = ConsentManager::new(Arc::new(ImmediateApprovalBackend));
+    let request = request([115; 16], 115, "manager-deadline-late");
+    manager.begin(request.clone(), context(110)).unwrap();
+    manager
+        .active
+        .as_mut()
+        .expect("active prompt")
+        .prompt
+        .deadline = Instant::now() - std::time::Duration::from_millis(1);
+    let completion = manager.next_completion().await.unwrap();
+    let results = manager.complete(completion, context(110)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].decision, ConsentDecision::Expired);
+    assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
 }

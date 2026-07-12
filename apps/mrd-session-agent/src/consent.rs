@@ -10,8 +10,18 @@ use mrd_agent_ipc::{
 };
 use mrd_proto::SessionId;
 use mrd_session::PermissionScopes;
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::Instant,
+};
 
 /// Maximum simultaneously live consent-derived session bindings.
 pub const MAX_ACTIVE_BINDINGS: usize = 64;
@@ -113,15 +123,89 @@ impl From<&ConsentRequest> for ConsentFingerprint {
     }
 }
 
+/// Read-only display data passed to the local consent surface.
+///
+/// Registration, desktop, issuer, policy, and timestamp authority deliberately
+/// remain inside the runtime and are not representable through this boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConsentPrompt {
+pub struct ConsentPrompt {
+    session_id: SessionId,
+    peer: PeerBinding,
+    requested_scopes: PermissionScopes,
+}
+
+impl ConsentPrompt {
+    /// Product session requesting attended consent.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Authenticated remote peer rendered by the consent surface.
+    pub fn peer(&self) -> &PeerBinding {
+        &self.peer
+    }
+
+    /// Requested scopes from which an approval may select a subset.
+    pub fn requested_scopes(&self) -> &PermissionScopes {
+        &self.requested_scopes
+    }
+}
+
+/// Terminal decision returned only after the local consent surface has closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsentBackendDecision {
+    /// The user approved the returned non-empty subset of requested scopes.
+    Approved(PermissionScopes),
+    /// The user explicitly denied the request.
+    Denied,
+    /// The surface closed without an explicit approval or denial.
+    Dismissed,
+    /// The surface observed a runtime abort and has finished closing.
+    Cancelled,
+}
+
+/// Trusted runtime reason delivered to an already-visible consent surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentAbortReason {
+    /// The service withdrew this exact delivered request.
+    Service(mrd_agent_ipc::ConsentCancelReason),
+    /// The monotonic prompt deadline elapsed.
+    PromptExpired,
+    /// The agent is stopping and will not wait for the surface to close.
+    RuntimeStopping,
+    /// The authenticated service connection disappeared.
+    ServiceDisconnected,
+}
+
+/// Heap-owned asynchronous consent operation returned by a backend.
+pub type ConsentBackendFuture =
+    Pin<Box<dyn Future<Output = ConsentBackendDecision> + Send + 'static>>;
+
+/// Native attended-consent boundary.
+///
+/// The backend receives display-only prompt data and an abort watch. It cannot
+/// provide or override any trusted authorization context.
+pub trait ConsentBackend: Send + Sync {
+    /// Whether this exact backend can currently display an attended prompt.
+    fn is_available(&self) -> bool;
+
+    /// Display one prompt and resolve only after its surface has closed.
+    fn prompt(
+        &self,
+        prompt: ConsentPrompt,
+        abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingConsentPrompt {
     pub(crate) attempt_id: u64,
     pub(crate) request: ConsentRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConsentBeginOutcome {
-    Prompt(ConsentPrompt),
+    Prompt(PendingConsentPrompt),
     Cached(ConsentResult),
 }
 
@@ -367,7 +451,7 @@ impl ConsentAuthorityRegistry {
         state
             .pending_attempts
             .insert(attempt_id, request.request_id);
-        Ok(ConsentBeginOutcome::Prompt(ConsentPrompt {
+        Ok(ConsentBeginOutcome::Prompt(PendingConsentPrompt {
             attempt_id,
             request,
         }))
@@ -511,6 +595,386 @@ impl TrustedSessionBindingSource for ConsentAuthorityRegistry {
         }
         state.bindings.get(session_id).cloned()
     }
+}
+
+const CONSENT_COMPLETION_CHANNEL_CAPACITY: usize = 1;
+
+#[derive(Debug)]
+pub(crate) struct BackendCompletion {
+    attempt_id: u64,
+    decision: ConsentBackendDecision,
+}
+
+struct ManagedPrompt {
+    pending: PendingConsentPrompt,
+    context: TrustedConsentContext,
+    deadline: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePromptPhase {
+    Prompting,
+    Closing,
+}
+
+struct ActivePrompt {
+    prompt: ManagedPrompt,
+    phase: ActivePromptPhase,
+    abort: watch::Sender<Option<ConsentAbortReason>>,
+    task: Option<JoinHandle<()>>,
+}
+
+/// Single-owner, bounded coordinator for local consent prompt futures.
+pub(crate) struct ConsentManager {
+    registry: Arc<ConsentAuthorityRegistry>,
+    backend: Arc<dyn ConsentBackend>,
+    queued: VecDeque<ManagedPrompt>,
+    active: Option<ActivePrompt>,
+    completion_tx: mpsc::Sender<BackendCompletion>,
+    completion_rx: mpsc::Receiver<BackendCompletion>,
+}
+
+impl ConsentManager {
+    pub(crate) fn new(backend: Arc<dyn ConsentBackend>) -> Self {
+        let (completion_tx, completion_rx) = mpsc::channel(CONSENT_COMPLETION_CHANNEL_CAPACITY);
+        Self {
+            registry: Arc::new(ConsentAuthorityRegistry::new()),
+            backend,
+            queued: VecDeque::with_capacity(MAX_PENDING_CONSENTS),
+            active: None,
+            completion_tx,
+            completion_rx,
+        }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.backend.is_available()
+    }
+
+    pub(crate) fn registry(&self) -> Arc<ConsentAuthorityRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub(crate) fn begin(
+        &mut self,
+        request: ConsentRequest,
+        context: TrustedConsentContext,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let now = Instant::now();
+        let mut results = Vec::new();
+        match self.registry.begin(request, context.clone())? {
+            ConsentBeginOutcome::Cached(result) => results.push(result),
+            ConsentBeginOutcome::Prompt(pending) => {
+                let prompt_lifetime_ms =
+                    pending.request.expires_at_ms.saturating_sub(context.now_ms);
+                self.queued.push_back(ManagedPrompt {
+                    pending,
+                    context,
+                    deadline: now + std::time::Duration::from_millis(prompt_lifetime_ms),
+                });
+            }
+        }
+        self.start_next(Instant::now(), &mut results)?;
+        Ok(results)
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.active
+            .as_ref()
+            .filter(|active| active.phase == ActivePromptPhase::Prompting)
+            .map(|active| active.prompt.deadline)
+            .into_iter()
+            .chain(self.queued.iter().map(|prompt| prompt.deadline))
+            .min()
+    }
+
+    pub(crate) async fn next_completion(&mut self) -> Option<BackendCompletion> {
+        self.completion_rx.recv().await
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        completion: BackendCompletion,
+        context: TrustedConsentContext,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if active.prompt.pending.attempt_id != completion.attempt_id {
+            return Ok(Vec::new());
+        }
+        let now = Instant::now();
+        let now_ms = context.now_ms;
+        let deadline_won = active.phase == ActivePromptPhase::Prompting
+            && (now >= active.prompt.deadline
+                || context.now_ms >= active.prompt.pending.request.expires_at_ms);
+        let mut results = Vec::new();
+        if deadline_won {
+            self.expire_active(now_ms, &mut results)?;
+            // This completion is proof that the backend surface has closed. The
+            // just-consumed attempt may now transition Closing -> Idle, but its
+            // decision (including Approved) is deliberately ignored.
+            self.active.take();
+            self.expire_queued_due(now, now_ms, &mut results)?;
+            self.start_next(Instant::now(), &mut results)?;
+            return Ok(results);
+        }
+        let Some(active) = self.active.take() else {
+            return Err(ConsentRegistryError::Unavailable);
+        };
+        if active.phase != ActivePromptPhase::Closing {
+            let (decision, scopes) = match completion.decision {
+                ConsentBackendDecision::Approved(scopes) => (ConsentDecision::Approved, scopes),
+                ConsentBackendDecision::Denied => {
+                    (ConsentDecision::Denied, PermissionScopes::new())
+                }
+                ConsentBackendDecision::Dismissed | ConsentBackendDecision::Cancelled => {
+                    (ConsentDecision::Dismissed, PermissionScopes::new())
+                }
+            };
+            match self.registry.complete(
+                active.prompt.pending.attempt_id,
+                decision,
+                scopes,
+                context,
+            )? {
+                ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
+                ConsentCompletionOutcome::Ignored => {}
+            }
+        }
+        self.expire_queued_due(now, now_ms, &mut results)?;
+        self.start_next(Instant::now(), &mut results)?;
+        Ok(results)
+    }
+
+    pub(crate) fn expire_due(
+        &mut self,
+        now: Instant,
+        now_ms: u64,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let mut results = Vec::new();
+        let active_due = self.active.as_ref().is_some_and(|active| {
+            active.phase == ActivePromptPhase::Prompting
+                && (now >= active.prompt.deadline
+                    || now_ms >= active.prompt.pending.request.expires_at_ms)
+        });
+        if active_due {
+            self.expire_active(now_ms, &mut results)?;
+        }
+        self.expire_queued_due(now, now_ms, &mut results)?;
+        self.start_next(Instant::now(), &mut results)?;
+        Ok(results)
+    }
+
+    pub(crate) fn cancel(
+        &mut self,
+        cancel: &CancelConsent,
+        now: Instant,
+        now_ms: u64,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let mut results = self.expire_due(now, now_ms)?;
+        let active_matches = self
+            .active
+            .as_ref()
+            .is_some_and(|active| exact_cancel_matches(&active.prompt.pending.request, cancel));
+        if active_matches {
+            let outcome = self.registry.cancel(cancel, now_ms)?;
+            let ConsentCancelOutcome::Cancelled(result) = outcome else {
+                return Ok(results);
+            };
+            let Some(active) = self.active.as_mut() else {
+                return Err(ConsentRegistryError::Unavailable);
+            };
+            active.phase = ActivePromptPhase::Closing;
+            active
+                .abort
+                .send_replace(Some(ConsentAbortReason::Service(cancel.reason)));
+            results.push(result);
+            return Ok(results);
+        }
+
+        let queued_index = self
+            .queued
+            .iter()
+            .position(|prompt| exact_cancel_matches(&prompt.pending.request, cancel));
+        let Some(queued_index) = queued_index else {
+            return Ok(results);
+        };
+        let outcome = self.registry.cancel(cancel, now_ms)?;
+        let ConsentCancelOutcome::Cancelled(result) = outcome else {
+            return Ok(results);
+        };
+        self.queued.remove(queued_index);
+        results.push(result);
+        Ok(results)
+    }
+
+    pub(crate) async fn shutdown(
+        &mut self,
+        reason: ConsentAbortReason,
+        now_ms: u64,
+    ) -> Result<(), ConsentRegistryError> {
+        let active = self.active.take();
+        let queued = self.queued.drain(..).collect::<Vec<_>>();
+        let mut first_error = None;
+
+        if let Some(active) = active.as_ref() {
+            if let Err(error) = cancel_managed_prompt(&self.registry, &active.prompt, now_ms) {
+                first_error = Some(error);
+            }
+        }
+        for prompt in &queued {
+            if let Err(error) = cancel_managed_prompt(&self.registry, prompt, now_ms) {
+                first_error.get_or_insert(error);
+            }
+        }
+
+        if let Some(mut active) = active {
+            active.abort.send_replace(Some(reason));
+            if let Some(task) = active.task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn start_next(
+        &mut self,
+        mut now: Instant,
+        results: &mut Vec<ConsentResult>,
+    ) -> Result<(), ConsentRegistryError> {
+        if self.active.is_some() {
+            return Ok(());
+        }
+        let prompt = loop {
+            let Some(prompt) = self.queued.pop_front() else {
+                return Ok(());
+            };
+            if now < prompt.deadline {
+                break prompt;
+            }
+            complete_expired_prompt(
+                &self.registry,
+                &prompt,
+                prompt.pending.request.expires_at_ms,
+                results,
+            )?;
+            now = Instant::now();
+        };
+        let display_prompt = ConsentPrompt {
+            session_id: prompt.pending.request.session_id.clone(),
+            peer: prompt.pending.request.peer.clone(),
+            requested_scopes: prompt.pending.request.requested_scopes.clone(),
+        };
+        let (abort, abort_receiver) = watch::channel(None);
+        let attempt_id = prompt.pending.attempt_id;
+        self.active = Some(ActivePrompt {
+            prompt,
+            phase: ActivePromptPhase::Prompting,
+            abort,
+            task: None,
+        });
+
+        let future = self.backend.prompt(display_prompt, abort_receiver);
+        let completion = self.completion_tx.clone();
+        let task = tokio::spawn(async move {
+            let decision = future.await;
+            let _ = completion
+                .send(BackendCompletion {
+                    attempt_id,
+                    decision,
+                })
+                .await;
+        });
+        let Some(active) = self.active.as_mut() else {
+            task.abort();
+            return Err(ConsentRegistryError::Unavailable);
+        };
+        active.task = Some(task);
+        Ok(())
+    }
+
+    fn expire_active(
+        &mut self,
+        now_ms: u64,
+        results: &mut Vec<ConsentResult>,
+    ) -> Result<(), ConsentRegistryError> {
+        let Some(active) = self.active.as_mut() else {
+            return Err(ConsentRegistryError::Unavailable);
+        };
+        complete_expired_prompt(&self.registry, &active.prompt, now_ms, results)?;
+        active.phase = ActivePromptPhase::Closing;
+        active
+            .abort
+            .send_replace(Some(ConsentAbortReason::PromptExpired));
+        Ok(())
+    }
+
+    fn expire_queued_due(
+        &mut self,
+        now: Instant,
+        now_ms: u64,
+        results: &mut Vec<ConsentResult>,
+    ) -> Result<(), ConsentRegistryError> {
+        let mut index = 0;
+        while index < self.queued.len() {
+            let due = self.queued.get(index).is_some_and(|prompt| {
+                now >= prompt.deadline || now_ms >= prompt.pending.request.expires_at_ms
+            });
+            if !due {
+                index += 1;
+                continue;
+            }
+            let Some(prompt) = self.queued.remove(index) else {
+                return Err(ConsentRegistryError::Unavailable);
+            };
+            complete_expired_prompt(&self.registry, &prompt, now_ms, results)?;
+        }
+        Ok(())
+    }
+}
+
+fn cancel_managed_prompt(
+    registry: &ConsentAuthorityRegistry,
+    prompt: &ManagedPrompt,
+    now_ms: u64,
+) -> Result<ConsentCancelOutcome, ConsentRegistryError> {
+    registry.cancel(
+        &CancelConsent {
+            request_token: prompt.pending.request.request_token,
+            request_id: prompt.pending.request.request_id,
+            session_id: prompt.pending.request.session_id.clone(),
+            reason: mrd_agent_ipc::ConsentCancelReason::SessionClosed,
+        },
+        now_ms,
+    )
+}
+
+fn exact_cancel_matches(request: &ConsentRequest, cancel: &CancelConsent) -> bool {
+    request.request_token == cancel.request_token
+        && request.request_id == cancel.request_id
+        && request.session_id == cancel.session_id
+}
+
+fn complete_expired_prompt(
+    registry: &ConsentAuthorityRegistry,
+    prompt: &ManagedPrompt,
+    now_ms: u64,
+    results: &mut Vec<ConsentResult>,
+) -> Result<(), ConsentRegistryError> {
+    let mut context = prompt.context.clone();
+    context.now_ms = now_ms.max(prompt.pending.request.expires_at_ms);
+    match registry.complete(
+        prompt.pending.attempt_id,
+        ConsentDecision::Expired,
+        PermissionScopes::new(),
+        context,
+    )? {
+        ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
+        ConsentCompletionOutcome::Ignored => {}
+    }
+    Ok(())
 }
 
 fn normalize_decision(
