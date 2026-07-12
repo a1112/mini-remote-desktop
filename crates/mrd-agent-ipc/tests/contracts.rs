@@ -8,11 +8,11 @@ use mrd_agent_ipc::{
     DesktopChanged, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
     ExecuteGrantVerifier, ExecutionContext, FileDirection, FrameError, GrantAudience,
     GrantValidationError, InputAck, InputAckOutcome, InputButton, InputEventEnvelope,
-    InputEventPayload, InputFailure, InputKey, InputRejection, Locked, PeerBinding,
-    RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason, Unlocked,
-    AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
+    InputEventPayload, InputFailure, InputKey, InputRejection, Locked, MediaAccessUnit, MediaCodec,
+    PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
+    Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
     AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES,
-    AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -33,6 +33,35 @@ const PEER_KEY_ID: [u8; 32] = [9; 32];
 const ISSUER_KEY_ID: [u8; 32] = [10; 32];
 const COMMAND_DIGEST: [u8; 32] = [11; 32];
 const OTHER_RESOURCE_ID: [u8; 16] = [17; 16];
+
+#[test]
+fn media_access_unit_round_trips_and_enforces_payload_bound() {
+    let unit = MediaAccessUnit {
+        context: AgentEventContext {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            windows_session_id: 7,
+            desktop_epoch: 2,
+            sequence: 3,
+            observed_at_ms: 4,
+        },
+        resource_id: RESOURCE_ID,
+        sequence: 9,
+        timestamp_us: 10,
+        codec: MediaCodec::H264,
+        is_keyframe: true,
+        payload: vec![1, 2, 3],
+    };
+    assert!(unit.is_valid());
+    let message = AgentToService::MediaAccessUnit(unit.clone());
+    let decoded: AgentToService =
+        serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
+    assert_eq!(decoded, message);
+
+    let mut oversized = unit;
+    oversized.payload = vec![0; AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES + 1];
+    assert!(!oversized.is_valid());
+}
 const OTHER_GRANT_ID: [u8; 32] = [18; 32];
 
 fn session_id() -> SessionId {

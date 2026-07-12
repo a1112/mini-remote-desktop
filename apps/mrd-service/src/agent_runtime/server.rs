@@ -1046,6 +1046,13 @@ impl AgentServer {
                         Some(InboundEvent::Message(AgentToService::InputAck(ack))) => {
                             control.resolve_input_ack(ack);
                         }
+                        Some(InboundEvent::Message(AgentToService::MediaAccessUnit(unit))) => {
+                            // Media delivery is consumed by the LAN transport layer. Keep the
+                            // authenticated agent connection alive while that hand-off is wired.
+                            if !unit.is_valid() {
+                                return Err(AgentServerError::UnsupportedRegisteredMessage);
+                            }
+                        }
                         Some(InboundEvent::Message(AgentToService::ConsentResult(result))) => {
                             control.resolve_consent_result(result, self.clock.now_ms());
                         }

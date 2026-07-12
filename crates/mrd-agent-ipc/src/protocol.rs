@@ -35,6 +35,8 @@ pub fn hash_windows_logon_sid(sid_bytes: &[u8]) -> Option<[u8; 32]> {
 pub const AGENT_CONSENT_MAX_LIFETIME_MS: u64 = 5 * 60 * 1_000;
 /// Maximum UTF-8 bytes in protocol identifiers inherited from domain types.
 pub const AGENT_IPC_MAX_IDENTIFIER_BYTES: usize = 256;
+/// Maximum encoded media payload carried by one agent IPC message.
+pub const AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES: usize = 768 * 1024;
 /// Domain separator for resource-bound input event commitments.
 pub const AGENT_INPUT_EVENT_COMMITMENT_CONTEXT: &[u8] = b"mrd-agent-ipc/input-event/v1\0";
 
@@ -1170,6 +1172,49 @@ pub struct AgentHeartbeat {
     pub context: AgentEventContext,
 }
 
+/// Codec carried by an encoded media access unit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaCodec {
+    /// H.264/AVC video.
+    H264,
+    /// H.265/HEVC video.
+    Hevc,
+    /// AV1 video.
+    Av1,
+}
+
+/// One grant-bound encoded media access unit emitted by an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MediaAccessUnit {
+    /// Lifecycle context binding this unit to the registered agent.
+    pub context: AgentEventContext,
+    /// Authorized capture/render resource.
+    pub resource_id: [u8; 16],
+    /// Monotonic sequence within the resource.
+    pub sequence: u64,
+    /// Presentation timestamp in microseconds.
+    pub timestamp_us: u64,
+    /// Encoded video codec.
+    pub codec: MediaCodec,
+    /// Whether this unit is an intra-coded keyframe.
+    pub is_keyframe: bool,
+    /// Encoded payload bytes.
+    pub payload: Vec<u8>,
+}
+
+impl MediaAccessUnit {
+    /// Return whether identifiers, sequences, and payload bounds are valid.
+    pub fn is_valid(&self) -> bool {
+        self.resource_id != [0; 16]
+            && self.sequence > 0
+            && self.context.sequence > 0
+            && !self.payload.is_empty()
+            && self.payload.len() <= AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES
+    }
+}
+
 /// Outcome of an agent command.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1262,6 +1307,8 @@ pub enum AgentToService {
     CommandResult(CommandResult),
     /// Acknowledge one resource-bound input event.
     InputAck(InputAck),
+    /// Deliver one grant-bound encoded media access unit.
+    MediaAccessUnit(MediaAccessUnit),
 }
 
 /// Messages emitted by the machine service.
