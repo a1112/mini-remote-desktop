@@ -87,6 +87,11 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Binds an authenticated agent server to this service's media ingress.
+    pub fn bind_agent_media_server(&self, server: &crate::agent_runtime::AgentServer) {
+        server.set_media_ingress(self.agent_media_ingress.clone());
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
