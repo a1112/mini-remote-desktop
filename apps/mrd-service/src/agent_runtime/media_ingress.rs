@@ -1,5 +1,5 @@
 use mrd_agent_ipc::MediaAccessUnit;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// Bounded hand-off from authenticated agent IPC to the service media loop.
 #[derive(Debug)]
@@ -7,7 +7,7 @@ pub struct AgentMediaIngress {
     capacity: usize,
     queue: VecDeque<MediaAccessUnit>,
     dropped: u64,
-    last_sequence: u64,
+    last_sequences: HashMap<String, u64>,
 }
 
 impl AgentMediaIngress {
@@ -17,20 +17,26 @@ impl AgentMediaIngress {
             capacity,
             queue: VecDeque::with_capacity(capacity),
             dropped: 0,
-            last_sequence: 0,
+            last_sequences: HashMap::new(),
         })
     }
 
     /// Enqueues a validated unit, rejecting invalid or over-capacity input.
     pub fn push(&mut self, unit: MediaAccessUnit) -> bool {
         if !unit.is_valid()
-            || unit.sequence <= self.last_sequence
+            || unit.sequence
+                <= self
+                    .last_sequences
+                    .get(&unit.session_id)
+                    .copied()
+                    .unwrap_or(0)
             || self.queue.len() >= self.capacity
         {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
-        self.last_sequence = unit.sequence;
+        self.last_sequences
+            .insert(unit.session_id.clone(), unit.sequence);
         self.queue.push_back(unit);
         true
     }
@@ -74,7 +80,7 @@ impl AgentMediaIngress {
     /// Clears queued units when the owning agent/session is invalidated.
     pub fn clear(&mut self) {
         self.queue.clear();
-        self.last_sequence = 0;
+        self.last_sequences.clear();
     }
 }
 
@@ -128,6 +134,7 @@ mod tests {
         let mut ingress = AgentMediaIngress::new(4).unwrap();
         let mut second = unit(2);
         second.session_id = "session-2".to_string();
+        second.sequence = 1;
         assert!(ingress.push(unit(1)));
         assert!(ingress.push(second));
         let first = ingress.drain_session("session-1", 8);
