@@ -1,6 +1,7 @@
 //! Agent-local consent authority state.
 // The write-side state machine is intentionally wired by the next consent-
-// manager slice; keep it crate-private so no product adapter can mint authority.
+// manager slice. Registry writes stay crate-private; the public source trait is
+// a transitional test-injection seam until B2.4 production wiring removes it.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use mrd_agent_ipc::{
@@ -227,6 +228,33 @@ impl ConsentAuthorityState {
         self.prune_bindings(now_ms);
         self.tombstones
             .retain(|_, tombstone| now_ms < tombstone.retain_until_ms);
+        let expired_request_ids = self
+            .pending
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                (now_ms >= pending.request.expires_at_ms).then_some(*request_id)
+            })
+            .collect::<Vec<_>>();
+        for request_id in expired_request_ids {
+            let Some(pending) = self.pending.remove(&request_id) else {
+                continue;
+            };
+            self.pending_attempts.remove(&pending.attempt_id);
+            if now_ms < pending.request.authorization_expires_at_ms {
+                self.tombstones.insert(
+                    request_id,
+                    ConsentTombstone {
+                        fingerprint: pending.fingerprint,
+                        result: terminal_result(
+                            &pending.request,
+                            ConsentDecision::Expired,
+                            pending.request.expires_at_ms.saturating_sub(1),
+                        ),
+                        retain_until_ms: pending.request.authorization_expires_at_ms,
+                    },
+                );
+            }
+        }
     }
 
     fn prune_bindings(&mut self, now_ms: u64) {
@@ -246,8 +274,9 @@ impl ConsentAuthorityState {
 
 /// Bounded in-memory source of consent-derived authority.
 ///
-/// Mutation is crate-private so product adapters cannot directly install a
-/// binding. They can only supply a local decision to the consent manager.
+/// Registry mutation is crate-private. The public binding/source types remain
+/// a transitional test-injection seam until B2.4 seals production wiring; an
+/// arbitrary source must not be treated as product consent authority.
 pub struct ConsentAuthorityRegistry {
     state: Mutex<ConsentAuthorityState>,
     limits: RegistryLimits,
@@ -385,7 +414,7 @@ impl ConsentAuthorityRegistry {
             windows_session_id: pending.request.windows_session_id,
             decision: final_decision,
             approved_scopes: final_scopes.clone(),
-            decided_at_ms: context.now_ms,
+            decided_at_ms: clamped_decided_at(&pending.request, context.now_ms),
         };
         let binding_changed = if final_decision == ConsentDecision::Approved {
             state.bindings.insert(
@@ -450,17 +479,11 @@ impl ConsentAuthorityRegistry {
         } else {
             ConsentDecision::Dismissed
         };
-        let result = ConsentResult {
-            request_token: pending.request.request_token,
-            request_id: pending.request.request_id,
-            session_id: pending.request.session_id,
-            peer: pending.request.peer,
-            policy_revision: pending.request.policy_revision,
-            windows_session_id: pending.request.windows_session_id,
+        let result = terminal_result(
+            &pending.request,
             decision,
-            approved_scopes: PermissionScopes::new(),
-            decided_at_ms: now_ms,
-        };
+            clamped_decided_at(&pending.request, now_ms),
+        );
         if now_ms < pending.request.authorization_expires_at_ms {
             state.tombstones.insert(
                 cancel.request_id,
@@ -500,6 +523,13 @@ fn normalize_decision(
     PermissionScopes,
     ConsentCompletionDisposition,
 ) {
+    if context.now_ms < pending.context.now_ms {
+        return (
+            ConsentDecision::Dismissed,
+            PermissionScopes::new(),
+            ConsentCompletionDisposition::Rejected(ConsentCompletionRejection::InvalidLocalContext),
+        );
+    }
     if context.now_ms < pending.request.issued_at_ms
         || context.now_ms >= pending.request.expires_at_ms
     {
@@ -551,6 +581,30 @@ fn normalize_decision(
             PermissionScopes::new(),
             ConsentCompletionDisposition::NonApproved,
         ),
+    }
+}
+
+fn clamped_decided_at(request: &ConsentRequest, now_ms: u64) -> u64 {
+    now_ms
+        .max(request.issued_at_ms)
+        .min(request.expires_at_ms.saturating_sub(1))
+}
+
+fn terminal_result(
+    request: &ConsentRequest,
+    decision: ConsentDecision,
+    decided_at_ms: u64,
+) -> ConsentResult {
+    ConsentResult {
+        request_token: request.request_token,
+        request_id: request.request_id,
+        session_id: request.session_id.clone(),
+        peer: request.peer.clone(),
+        policy_revision: request.policy_revision,
+        windows_session_id: request.windows_session_id,
+        decision,
+        approved_scopes: PermissionScopes::new(),
+        decided_at_ms,
     }
 }
 

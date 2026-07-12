@@ -346,34 +346,144 @@ fn live_binding_capacity_never_evicts_existing_authority_or_leaks_approval() {
 #[test]
 fn tombstone_capacity_is_bounded_but_exact_replay_still_hits() {
     assert_eq!(MAX_CONSENT_TOMBSTONES, 4_096);
-    assert_eq!(MAX_PENDING_CONSENTS, 32);
-    assert_eq!(MAX_ACTIVE_BINDINGS, 64);
-    let registry = ConsentAuthorityRegistry::with_limits(2, 2, 2);
-    let mut completed_requests = Vec::new();
-    for id in [40, 41] {
-        let request = request([id; 16], u64::from(id), "bounded-session");
+    let registry = ConsentAuthorityRegistry::new();
+    let mut boundary_requests = Vec::new();
+    for index in 1..=MAX_CONSENT_TOMBSTONES {
+        let request = request(
+            (index as u128).to_le_bytes(),
+            index as u64,
+            "bounded-session",
+        );
         let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+        let completion = completed(
+            registry
+                .complete(
+                    attempt,
+                    ConsentDecision::Denied,
+                    PermissionScopes::new(),
+                    context(120),
+                )
+                .unwrap(),
+        );
+        if index == 1 || index == MAX_CONSENT_TOMBSTONES {
+            boundary_requests.push((request, completion.result));
+        }
+    }
+
+    let overflow = request(
+        ((MAX_CONSENT_TOMBSTONES + 1) as u128).to_le_bytes(),
+        5_000,
+        "capacity-overflow",
+    );
+    assert_eq!(
+        registry.begin(overflow, context(130)),
+        Err(ConsentRegistryError::TombstoneCapacityExceeded)
+    );
+    for (offset, (mut exact, original_result)) in boundary_requests.into_iter().enumerate() {
+        exact.request_token = 6_000 + offset as u64;
+        let ConsentBeginOutcome::Cached(cached) =
+            registry.begin(exact.clone(), context(130)).unwrap()
+        else {
+            panic!("boundary replay missed its completed tombstone");
+        };
+        assert_eq!(cached.request_token, exact.request_token);
+        assert_eq!(cached.decided_at_ms, original_result.decided_at_ms);
+        assert_eq!(cached.decision, original_result.decision);
+    }
+}
+
+#[test]
+fn expired_pending_attempts_become_tombstones_before_new_capacity_is_reserved() {
+    assert_eq!(MAX_PENDING_CONSENTS, 32);
+    let registry = ConsentAuthorityRegistry::new();
+    let mut pending = Vec::new();
+    for index in 1..=MAX_PENDING_CONSENTS {
+        let request = request(
+            (10_000_u128 + index as u128).to_le_bytes(),
+            index as u64,
+            &format!("expiring-pending-{index}"),
+        );
+        let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+        pending.push((request, attempt));
+    }
+
+    let mut replacement = request([250; 16], 250, "post-expiry-prompt");
+    replacement.issued_at_ms = 200;
+    replacement.expires_at_ms = 300;
+    replacement.authorization_expires_at_ms = 600;
+    let replacement_attempt = prompt_attempt(registry.begin(replacement, context(210)).unwrap());
+    assert!(pending
+        .iter()
+        .all(|(_, expired_attempt)| *expired_attempt != replacement_attempt));
+    {
+        let state = registry.state.lock().unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.pending_attempts.len(), 1);
+        assert_eq!(state.tombstones.len(), MAX_PENDING_CONSENTS);
+    }
+
+    for (_, expired_attempt) in &pending {
+        assert_eq!(
+            registry
+                .complete(
+                    *expired_attempt,
+                    ConsentDecision::Approved,
+                    scopes(&[PermissionScope::ScreenView]),
+                    context(220),
+                )
+                .unwrap(),
+            ConsentCompletionOutcome::Ignored
+        );
+    }
+
+    let (mut exact, _) = pending.remove(0);
+    exact.request_token = 8_000;
+    let ConsentBeginOutcome::Cached(first_cached) =
+        registry.begin(exact.clone(), context(230)).unwrap()
+    else {
+        panic!("expired pending request prompted again");
+    };
+    assert_eq!(first_cached.decision, ConsentDecision::Expired);
+    assert!(first_cached.approved_scopes.is_empty());
+    exact.request_token = 8_001;
+    let ConsentBeginOutcome::Cached(second_cached) = registry.begin(exact, context(240)).unwrap()
+    else {
+        panic!("second expired replay prompted again");
+    };
+    assert_eq!(second_cached.request_token, 8_001);
+    assert_eq!(second_cached.decided_at_ms, first_cached.decided_at_ms);
+}
+
+#[test]
+fn expired_pending_attempt_past_authorization_expiry_releases_its_reservation() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut expired = request([249; 16], 249, "fully-expired-pending");
+    expired.authorization_expires_at_ms = expired.expires_at_ms;
+    let attempt = prompt_attempt(registry.begin(expired.clone(), context(110)).unwrap());
+
+    let mut replacement = request([248; 16], 248, "after-full-expiry");
+    replacement.issued_at_ms = 200;
+    replacement.expires_at_ms = 300;
+    replacement.authorization_expires_at_ms = 600;
+    assert!(matches!(
+        registry.begin(replacement, context(210)),
+        Ok(ConsentBeginOutcome::Prompt(_))
+    ));
+    assert_eq!(
         registry
             .complete(
                 attempt,
-                ConsentDecision::Denied,
-                PermissionScopes::new(),
-                context(120),
+                ConsentDecision::Approved,
+                scopes(&[PermissionScope::ScreenView]),
+                context(220),
             )
-            .unwrap();
-        completed_requests.push(request);
-    }
-
-    assert_eq!(
-        registry.begin(request([42; 16], 42, "new-session"), context(130)),
-        Err(ConsentRegistryError::TombstoneCapacityExceeded)
+            .unwrap(),
+        ConsentCompletionOutcome::Ignored
     );
-    let mut exact = completed_requests.remove(0);
-    exact.request_token = 140;
-    assert!(matches!(
-        registry.begin(exact, context(130)),
-        Ok(ConsentBeginOutcome::Cached(_))
-    ));
+    assert_eq!(
+        registry.begin(expired, context(220)),
+        Err(ConsentRegistryError::InactiveRequest)
+    );
 }
 
 #[test]
@@ -483,6 +593,43 @@ fn inexact_cancel_does_not_consume_the_pending_attempt() {
 }
 
 #[test]
+fn cancel_after_clock_rollback_is_stable_and_consumes_the_attempt() {
+    let registry = ConsentAuthorityRegistry::new();
+    let original = request([63; 16], 73, "rollback-cancel");
+    let attempt = prompt_attempt(registry.begin(original.clone(), context(190)).unwrap());
+    let cancel = CancelConsent {
+        request_token: original.request_token,
+        request_id: original.request_id,
+        session_id: original.session_id.clone(),
+        reason: ConsentCancelReason::CallerAborted,
+    };
+    let ConsentCancelOutcome::Cancelled(cancelled) = registry.cancel(&cancel, 50).unwrap() else {
+        panic!("exact rollback cancel was ignored");
+    };
+    assert!(cancelled.decided_at_ms >= original.issued_at_ms);
+    assert!(cancelled.decided_at_ms < original.expires_at_ms);
+    assert_eq!(
+        registry
+            .complete(
+                attempt,
+                ConsentDecision::Approved,
+                scopes(&[PermissionScope::ScreenView]),
+                context(195),
+            )
+            .unwrap(),
+        ConsentCompletionOutcome::Ignored
+    );
+
+    let mut retry = original;
+    retry.request_token = 74;
+    let ConsentBeginOutcome::Cached(cached) = registry.begin(retry, context(195)).unwrap() else {
+        panic!("rollback cancellation prompted again");
+    };
+    assert_eq!(cached.request_token, 74);
+    assert_eq!(cached.decided_at_ms, cancelled.decided_at_ms);
+}
+
+#[test]
 fn changed_local_generation_and_prompt_expiry_cannot_install_authority() {
     let registry = ConsentAuthorityRegistry::new();
     let local_change = request([70; 16], 70, "local-change");
@@ -524,6 +671,40 @@ fn changed_local_generation_and_prompt_expiry_cannot_install_authority() {
         registry.begin(secure, secure_context),
         Err(ConsentRegistryError::InvalidLocalContext)
     );
+}
+
+#[test]
+fn completion_clock_rollback_cannot_approve_or_install_authority() {
+    let registry = ConsentAuthorityRegistry::new();
+    let original = request([73; 16], 75, "rollback-completion");
+    let attempt = prompt_attempt(registry.begin(original.clone(), context(190)).unwrap());
+    let completion = completed(
+        registry
+            .complete(
+                attempt,
+                ConsentDecision::Approved,
+                scopes(&[PermissionScope::ScreenView]),
+                context(110),
+            )
+            .unwrap(),
+    );
+    assert_eq!(completion.result.decision, ConsentDecision::Dismissed);
+    assert_eq!(
+        completion.disposition,
+        ConsentCompletionDisposition::Rejected(ConsentCompletionRejection::InvalidLocalContext)
+    );
+    assert!(!completion.binding_changed);
+    assert_eq!(registry.resolve(&original.session_id, 190), None);
+
+    let mut retry = original;
+    retry.request_token = 76;
+    assert!(matches!(
+        registry.begin(retry, context(195)),
+        Ok(ConsentBeginOutcome::Cached(ConsentResult {
+            decision: ConsentDecision::Dismissed,
+            ..
+        }))
+    ));
 }
 
 #[test]
