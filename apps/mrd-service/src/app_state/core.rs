@@ -114,6 +114,18 @@ impl AppState {
         crate::lan_discovery::media_sender::drain_agent_access_units(&mut ingress, limit)
     }
 
+    /// Drains sender-ready units for one exact logical session.
+    pub(crate) async fn drain_agent_media_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Vec<mrd_agent_ipc::MediaAccessUnit> {
+        self.agent_media_ingress
+            .lock()
+            .await
+            .drain_session(session_id, limit)
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(

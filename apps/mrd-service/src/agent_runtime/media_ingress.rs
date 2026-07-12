@@ -46,6 +46,21 @@ impl AgentMediaIngress {
         self.queue.drain(..count).collect()
     }
 
+    /// Drains only units belonging to one logical session.
+    pub fn drain_session(&mut self, session_id: &str, limit: usize) -> Vec<MediaAccessUnit> {
+        let mut selected = Vec::new();
+        let mut retained = VecDeque::with_capacity(self.queue.len());
+        while let Some(unit) = self.queue.pop_front() {
+            if unit.session_id == session_id && selected.len() < limit {
+                selected.push(unit);
+            } else {
+                retained.push_back(unit);
+            }
+        }
+        self.queue = retained;
+        selected
+    }
+
     /// Current queue depth.
     pub fn len(&self) -> usize {
         self.queue.len()
