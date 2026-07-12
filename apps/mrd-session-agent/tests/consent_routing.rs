@@ -872,6 +872,14 @@ async fn continuous_inbound_cannot_starve_heartbeat() {
             .await
             .expect("prefill inbound while control loop is gated");
     }
+    let mut marker = consent_request(81);
+    marker.expires_at_ms = 1_400;
+    write_frame(
+        &mut service_writer,
+        &ServiceToAgent::ConsentRequest(marker.clone()),
+    )
+    .await
+    .expect("enqueue inactive consent marker before continuous flood");
     let flood = tokio::spawn(async move {
         let mut sent = 0_usize;
         while flood_flag.load(Ordering::SeqCst) {
@@ -892,22 +900,33 @@ async fn continuous_inbound_cannot_starve_heartbeat() {
     );
     clock.release();
 
-    let heartbeat = tokio::time::timeout(Duration::from_millis(250), async {
-        let mut observed = 0_u8;
+    let marker_result = tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             match read_frame::<_, AgentToService>(&mut service_reader)
                 .await
                 .expect("agent output while flooded")
                 .message
             {
-                AgentToService::AgentHeartbeat(heartbeat) => {
-                    observed += 1;
-                    if observed == 2 {
-                        return heartbeat;
-                    }
+                AgentToService::AgentHeartbeat(_) => {}
+                AgentToService::ConsentResult(result) if result.request_id == marker.request_id => {
+                    return result;
                 }
-                other => panic!("unexpected output while flooding inbound: {other:?}"),
+                other => panic!("unexpected output before inbound marker: {other:?}"),
             }
+        }
+    })
+    .await
+    .expect("continuous inbound must reach the FIFO marker");
+    assert_eq!(marker_result.decision, ConsentDecision::Expired);
+
+    let heartbeat = tokio::time::timeout(Duration::from_millis(150), async {
+        match read_frame::<_, AgentToService>(&mut service_reader)
+            .await
+            .expect("agent output after inbound marker")
+            .message
+        {
+            AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
+            other => panic!("unexpected output after inbound marker: {other:?}"),
         }
     })
     .await;
