@@ -13,6 +13,8 @@ pub mod consent;
 pub(crate) mod desktop;
 /// Authorized input-resource execution and pressed-state cleanup.
 pub mod input;
+/// Grant-bound desktop capture/render resource ownership.
+pub mod media;
 /// Native attended-consent adapter and sanitized surface model.
 #[allow(dead_code)] // Production bootstrap consumes this adapter in Task 24.B3.5.
 pub(crate) mod native_consent;
