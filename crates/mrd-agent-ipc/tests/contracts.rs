@@ -959,6 +959,16 @@ fn release_all_remains_valid_after_authorization_expiry() {
 
     assert!(validate_input_event(&release, &resource, &expired).is_ok());
 
+    let mut scope_narrowed = expired.clone();
+    scope_narrowed
+        .authorization_scopes
+        .remove(&PermissionScope::InputPointer);
+    assert_eq!(
+        validate_input_event(&release, &resource, &scope_narrowed),
+        Err(InputRejection::Grant),
+        "cleanup must still reject grant scopes outside local consent authority"
+    );
+
     expired.authorization_expires_at_ms -= 1;
     assert_eq!(
         validate_input_event(&release, &resource, &expired),
