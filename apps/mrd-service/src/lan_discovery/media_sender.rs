@@ -50,6 +50,7 @@ pub(crate) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentE
 }
 
 /// Takes one bounded batch from the agent ingress and maps it for transport.
+#[allow(dead_code)]
 pub(crate) fn drain_agent_access_units(
     ingress: &mut AgentMediaIngress,
     limit: usize,
