@@ -1,8 +1,8 @@
 //! Bounded per-connection registration and lifecycle server.
 
 use super::{
-    AgentBinding, AgentConnectionId, AgentRegistry, AgentRegistryError, AgentRouteError,
-    ObservedAgentIdentity,
+    AgentBinding, AgentConnectionId, AgentMediaIngress, AgentRegistry, AgentRegistryError,
+    AgentRouteError, ObservedAgentIdentity,
 };
 use mrd_agent_ipc::{
     decode_frame, validate_consent_result, write_frame, AgentCapability, AgentHeartbeat,
@@ -635,6 +635,15 @@ impl AgentServer {
         if let Ok(mut slot) = self.media_sink.lock() {
             *slot = Some(sink);
         }
+    }
+
+    /// Binds the authenticated agent stream to a bounded service ingress queue.
+    pub fn set_media_ingress(&self, ingress: Arc<Mutex<AgentMediaIngress>>) {
+        self.set_media_sink(Arc::new(move |unit| {
+            if let Ok(mut queue) = ingress.lock() {
+                let _ = queue.push(unit);
+            }
+        }));
     }
 
     /// Queue a bounded service command for one exact private connection.
