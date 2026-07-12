@@ -2,8 +2,8 @@
 
 use crate::capabilities::AgentCapabilities;
 use crate::consent::{
-    BackendCompletion, ConsentAbortReason, ConsentBackend, ConsentManager, ConsentRegistryError,
-    TrustedConsentContext, TrustedSessionBinding,
+    AuthorityInvalidation, BackendCompletion, ConsentAbortReason, ConsentBackend, ConsentManager,
+    ConsentRegistryError, TrustedConsentContext, TrustedSessionBinding,
 };
 use crate::input::InputBackend;
 use mrd_agent_ipc::{
@@ -28,14 +28,126 @@ use std::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite},
-    sync::mpsc,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, MissedTickBehavior},
 };
 
 const INBOUND_QUEUE_CAPACITY: usize = 32;
+const OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const REPLAY_LEDGER_CAPACITY: usize = 4_096;
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct OutboundFrame {
+    message: AgentToService,
+    flushed: Option<oneshot::Sender<Result<(), ()>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterTerminal {
+    Failed,
+}
+
+struct OutboundWriter {
+    sender: Option<mpsc::Sender<OutboundFrame>>,
+    terminal: watch::Receiver<Option<WriterTerminal>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl OutboundWriter {
+    fn spawn<W>(mut writer: W) -> Self
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (sender, mut receiver) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
+        let (terminal_sender, terminal) = watch::channel(None);
+        let task = tokio::spawn(async move {
+            while let Some(frame) = receiver.recv().await {
+                let result = write_frame(&mut writer, &frame.message).await;
+                if result.is_err() {
+                    if let Some(flushed) = frame.flushed {
+                        let _ = flushed.send(Err(()));
+                    }
+                    terminal_sender.send_replace(Some(WriterTerminal::Failed));
+                    return;
+                }
+                if let Some(flushed) = frame.flushed {
+                    let _ = flushed.send(Ok(()));
+                }
+            }
+        });
+        Self {
+            sender: Some(sender),
+            terminal,
+            task: Some(task),
+        }
+    }
+
+    fn enqueue(&self, message: AgentToService) -> Result<(), AgentRuntimeError> {
+        self.sender
+            .as_ref()
+            .ok_or(AgentRuntimeError::OutboundUnavailable)?
+            .try_send(OutboundFrame {
+                message,
+                flushed: None,
+            })
+            .map_err(|_| AgentRuntimeError::OutboundUnavailable)
+    }
+
+    fn sender(&self) -> Result<mpsc::Sender<OutboundFrame>, AgentRuntimeError> {
+        self.sender
+            .as_ref()
+            .cloned()
+            .ok_or(AgentRuntimeError::OutboundUnavailable)
+    }
+
+    fn terminal_subscription(&self) -> watch::Receiver<Option<WriterTerminal>> {
+        self.terminal.clone()
+    }
+
+    async fn terminal_changed(&mut self) -> WriterTerminal {
+        match self.terminal.changed().await {
+            Ok(()) => self
+                .terminal
+                .borrow_and_update()
+                .unwrap_or(WriterTerminal::Failed),
+            Err(_) => WriterTerminal::Failed,
+        }
+    }
+
+    async fn close_and_join(&mut self) -> Result<(), AgentRuntimeError> {
+        self.sender.take();
+        match self.task.take() {
+            Some(task) => task
+                .await
+                .map_err(|_| AgentRuntimeError::OutboundUnavailable),
+            None => Ok(()),
+        }
+    }
+
+    async fn abort_and_join(&mut self) {
+        self.sender.take();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for OutboundWriter {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn wait_for_writer_terminal(terminal: &mut watch::Receiver<Option<WriterTerminal>>) {
+    if terminal.borrow_and_update().is_some() {
+        return;
+    }
+    let _ = terminal.changed().await;
+}
 
 /// Platform-local endpoint; network transports are deliberately unrepresentable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,8 +407,24 @@ pub struct TrustedDesktopState {
 
 /// Independent source of current desktop state.
 pub trait TrustedDesktopStateSource: Send + Sync {
-    /// Return current trusted state, or `None` when it cannot be established.
+    /// Return the current trusted state from a fast in-memory snapshot, or
+    /// `None` when it cannot be established.
+    ///
+    /// This method must not perform platform I/O or wait for a native desktop
+    /// probe. Native watchers update the snapshot in the background.
     fn current_state(&self) -> Option<TrustedDesktopState>;
+
+    /// Subscribe to trusted-state changes.
+    ///
+    /// The source must keep the corresponding sender alive for its own trusted
+    /// lifetime and publish a new watch revision after updating trusted state
+    /// for every possible identity change. The payload is only a wake-up hint;
+    /// callers re-read [`Self::current_state`] after every notification. A
+    /// closed receiver means desktop authority is unavailable and causes the
+    /// runtime to revoke local authority and fail-stop. Subscription must also
+    /// be an immediate in-memory operation and must not perform platform I/O or
+    /// wait for native state.
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<()>;
 }
 
 /// Product backend boundary that can receive only validated commands.
@@ -364,6 +492,9 @@ pub enum AgentRuntimeError {
     /// A fresh local authority could not synchronously retire old input state.
     #[error("session input cleanup failed")]
     InputCleanupFailed,
+    /// The bounded post-registration writer stopped or could not accept output.
+    #[error("agent outbound channel is unavailable")]
+    OutboundUnavailable,
 }
 
 /// Startup failures spanning local endpoint connection and the agent runtime.
@@ -484,19 +615,18 @@ impl AgentRuntime {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (reader, mut writer) = tokio::io::split(stream);
+        let (reader, writer) = tokio::io::split(stream);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
         let reader_task = tokio::spawn(read_loop(reader, inbound_tx));
 
-        let result = self.run_connected(&mut writer, &mut inbound_rx).await;
+        let result = self.run_connected(writer, &mut inbound_rx).await;
         let shutdown_reason = match &result {
             Ok(AgentExit::StoppedByService) => ConsentAbortReason::RuntimeStopping,
             Ok(AgentExit::ServiceDisconnected) | Err(_) => ConsentAbortReason::ServiceDisconnected,
         };
-        let _ = self.release_input();
-        let consent_shutdown = self.shutdown_consent(shutdown_reason).await;
+        let final_cleanup = self.terminal_cleanup(shutdown_reason).await;
         stop_reader(reader_task).await;
-        match (result, consent_shutdown) {
+        match (result, final_cleanup) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Ok(exit), Ok(())) => Ok(exit),
@@ -505,26 +635,43 @@ impl AgentRuntime {
 
     async fn run_connected<W>(
         &mut self,
-        writer: &mut W,
+        mut writer: W,
         inbound: &mut mpsc::Receiver<InboundEvent>,
     ) -> Result<AgentExit, AgentRuntimeError>
     where
-        W: AsyncWrite + Unpin,
+        W: AsyncWrite + Unpin + Send + 'static,
     {
-        let identity = self.register(writer, inbound).await?;
-        self.send_capabilities(writer, &identity).await?;
+        let mut desktop_changes = self
+            .authority
+            .as_ref()
+            .map(|authority| authority.desktop_state.subscribe());
+        let identity = self.register(&mut writer, inbound).await?;
+        let mut outbound = OutboundWriter::spawn(writer);
+        let mut capability_revision = 1_u64;
+        let result = async {
+            let baseline_desktop = self.resolve_desktop_state()?;
+            self.last_desktop_state = Some(baseline_desktop);
+            self.send_capabilities(
+                &outbound,
+                &identity,
+                capability_revision,
+                baseline_desktop,
+            )?;
 
-        let mut heartbeat = tokio::time::interval_at(
-            Instant::now() + self.config.heartbeat_interval,
-            self.config.heartbeat_interval,
-        );
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut heartbeat = tokio::time::interval_at(
+                Instant::now() + self.config.heartbeat_interval,
+                self.config.heartbeat_interval,
+            );
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        loop {
+            loop {
             let consent_deadline = self
                 .authority
                 .as_ref()
-                .and_then(|authority| authority.manager.next_deadline());
+                .map(|authority| authority.manager.next_deadline())
+                .transpose()
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
+                .flatten();
             let event = {
                 let consent_completion = async {
                     match self.authority.as_mut() {
@@ -538,86 +685,198 @@ impl AgentRuntime {
                         None => std::future::pending().await,
                     }
                 };
+                let desktop_change = async {
+                    match desktop_changes.as_mut() {
+                        Some(changes) => Some(changes.changed().await),
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
-                    inbound_event = inbound.recv() => RegisteredLoopEvent::Inbound(inbound_event),
-                    completion = consent_completion => RegisteredLoopEvent::Consent(completion),
+                    biased;
+                    _ = outbound.terminal_changed() => RegisteredLoopEvent::WriterTerminal,
+                    change = desktop_change => RegisteredLoopEvent::DesktopChanged(change),
                     _ = consent_deadline_wait => RegisteredLoopEvent::ConsentDeadline,
+                    completion = consent_completion => RegisteredLoopEvent::Consent(completion),
+                    inbound_event = inbound.recv() => RegisteredLoopEvent::Inbound(inbound_event),
                     _ = heartbeat.tick() => RegisteredLoopEvent::Heartbeat,
                 }
             };
-            match event {
+            let due_sessions = if !matches!(&event, RegisteredLoopEvent::WriterTerminal) {
+                self.reconcile_due_authority()?
+            } else {
+                Vec::new()
+            };
+            if matches!(
+                &event,
+                RegisteredLoopEvent::Inbound(_) | RegisteredLoopEvent::Heartbeat
+            ) {
+                let desktop = self.current_desktop_state()?;
+                self.reconcile_desktop_authority(desktop)?;
+                if self.last_desktop_state != Some(desktop) {
+                    self.last_desktop_state = Some(desktop);
+                    capability_revision = capability_revision
+                        .checked_add(1)
+                        .ok_or(AgentRuntimeError::EventSequenceExhausted)?;
+                    self.send_capabilities(
+                        &outbound,
+                        &identity,
+                        capability_revision,
+                        desktop,
+                    )?;
+                }
+            }
+                match event {
                 RegisteredLoopEvent::Inbound(inbound_event) => match inbound_event {
                     Some(InboundEvent::Message(ServiceToAgent::StopAgent(stop))) => {
-                        if stop.request_id.iter().all(|byte| *byte == 0) {
+                        let now_ms = self.clock.now_ms();
+                        if stop.request_id.iter().all(|byte| *byte == 0)
+                            || stop.deadline_ms <= now_ms
+                        {
                             return Err(AgentRuntimeError::InvalidStopRequest);
                         }
-                        let _ = self.release_input();
-                        self.shutdown_consent(ConsentAbortReason::RuntimeStopping)
+                        let stop_deadline = Instant::now()
+                            .checked_add(Duration::from_millis(
+                                stop.deadline_ms.saturating_sub(now_ms),
+                            ))
+                            .ok_or(AgentRuntimeError::InvalidStopRequest)?;
+                        self.terminal_cleanup(ConsentAbortReason::RuntimeStopping)
                             .await?;
+                        if Instant::now() >= stop_deadline {
+                            return Err(AgentRuntimeError::OutboundUnavailable);
+                        }
                         let desktop = self.current_desktop_state()?;
                         let context = self.next_event_context(&identity, desktop)?;
-                        write_frame(
-                            writer,
-                            &AgentToService::AgentStopping(AgentStopping {
+                        let stopping = AgentToService::AgentStopping(AgentStopping {
                                 context,
                                 reason: StoppingReason::ServiceRequest,
-                            }),
-                        )
-                        .await?;
-                        return Ok(AgentExit::StoppedByService);
+                            });
+                        let sender = outbound.sender()?;
+                        let mut writer_terminal = outbound.terminal_subscription();
+                        let permit = tokio::select! {
+                            biased;
+                            _ = wait_for_writer_terminal(&mut writer_terminal) => {
+                                return Err(AgentRuntimeError::OutboundUnavailable);
+                            }
+                            inbound_event = inbound.recv() => {
+                                return match inbound_event {
+                                    Some(InboundEvent::Disconnected) | None => Ok(AgentExit::ServiceDisconnected),
+                                    Some(InboundEvent::Failed(error)) => Err(error.into()),
+                                    Some(InboundEvent::Message(_)) => Err(AgentRuntimeError::UnsupportedMessage),
+                                };
+                            }
+                            _ = tokio::time::sleep_until(stop_deadline) => {
+                                return Err(AgentRuntimeError::OutboundUnavailable);
+                            }
+                            permit = sender.reserve_owned() => {
+                                permit.map_err(|_| AgentRuntimeError::OutboundUnavailable)?
+                            }
+                        };
+                        let (flushed_sender, mut flushed) = oneshot::channel();
+                        permit.send(OutboundFrame {
+                            message: stopping,
+                            flushed: Some(flushed_sender),
+                        });
+                        let flush_result = tokio::select! {
+                            biased;
+                            _ = wait_for_writer_terminal(&mut writer_terminal) => Err(AgentRuntimeError::OutboundUnavailable),
+                            inbound_event = inbound.recv() => match inbound_event {
+                                Some(InboundEvent::Disconnected) | None => Ok(AgentExit::ServiceDisconnected),
+                                Some(InboundEvent::Failed(error)) => Err(error.into()),
+                                Some(InboundEvent::Message(_)) => Err(AgentRuntimeError::UnsupportedMessage),
+                            },
+                            _ = tokio::time::sleep_until(stop_deadline) => Err(AgentRuntimeError::OutboundUnavailable),
+                            result = &mut flushed => match result {
+                                Ok(Ok(())) => Ok(AgentExit::StoppedByService),
+                                Ok(Err(())) | Err(_) => Err(AgentRuntimeError::OutboundUnavailable),
+                            },
+                        };
+                        return flush_result;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::Execute(execute))) => {
-                        self.handle_execute(writer, &identity, &execute).await?;
+                        self.handle_execute(&outbound, &identity, &execute).await?;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::ConsentRequest(request))) => {
-                        self.handle_managed_consent(writer, &identity, request)
+                        self.handle_managed_consent(&outbound, &identity, request)
                             .await?;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::CancelConsent(cancel))) => {
-                        self.handle_managed_cancel(writer, cancel).await?;
+                        self.handle_managed_cancel(&outbound, cancel).await?;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::InputEvent(envelope))) => {
-                        self.handle_input(writer, &identity, envelope).await?;
+                        self.handle_input(&outbound, &identity, envelope).await?;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::AgentChallenge(_))) => {
                         return Err(AgentRuntimeError::UnsupportedMessage);
                     }
                     Some(InboundEvent::Failed(error)) => return Err(error.into()),
                     Some(InboundEvent::Disconnected) => {
-                        let _ = self.release_input();
-                        self.shutdown_consent(ConsentAbortReason::ServiceDisconnected)
+                        self.terminal_cleanup(ConsentAbortReason::ServiceDisconnected)
                             .await?;
                         return Ok(AgentExit::ServiceDisconnected);
                     }
                     None => {
-                        let _ = self.release_input();
-                        self.shutdown_consent(ConsentAbortReason::ServiceDisconnected)
+                        self.terminal_cleanup(ConsentAbortReason::ServiceDisconnected)
                             .await?;
                         return Ok(AgentExit::ServiceDisconnected);
                     }
                 },
                 RegisteredLoopEvent::Consent(Some(completion)) => {
-                    self.handle_consent_completion(writer, &identity, completion)
+                    self.handle_consent_completion(
+                        &outbound,
+                        &identity,
+                        completion,
+                        &due_sessions,
+                    )
                         .await?;
                 }
                 RegisteredLoopEvent::Consent(None) => {
                     return Err(AgentRuntimeError::ConsentStateUnavailable);
                 }
                 RegisteredLoopEvent::ConsentDeadline => {
-                    self.handle_consent_deadline(writer).await?;
+                    self.handle_consent_deadline(&outbound).await?;
+                }
+                RegisteredLoopEvent::DesktopChanged(Some(Ok(()))) => {
+                    let desktop = self.current_desktop_state()?;
+                    self.reconcile_desktop_authority(desktop)?;
+                    self.last_desktop_state = Some(desktop);
+                    capability_revision = capability_revision
+                        .checked_add(1)
+                        .ok_or(AgentRuntimeError::EventSequenceExhausted)?;
+                    self.send_capabilities(
+                        &outbound,
+                        &identity,
+                        capability_revision,
+                        desktop,
+                    )?;
+                }
+                RegisteredLoopEvent::DesktopChanged(Some(Err(_)) | None) => {
+                    return match self
+                        .terminal_cleanup(ConsentAbortReason::ServiceDisconnected)
+                        .await
+                    {
+                        Ok(()) => Err(AgentRuntimeError::DesktopStateUnavailable),
+                        Err(error) => Err(error),
+                    };
                 }
                 RegisteredLoopEvent::Heartbeat => {
                     let desktop = self.current_desktop_state()?;
-                    self.refresh_input_desktop(desktop);
                     let context = self.next_event_context(&identity, desktop)?;
-                    write_frame(
-                        writer,
-                        &AgentToService::AgentHeartbeat(AgentHeartbeat { context }),
-                    )
-                    .await?;
+                    outbound.enqueue(AgentToService::AgentHeartbeat(AgentHeartbeat { context }))?;
+                }
+                RegisteredLoopEvent::WriterTerminal => {
+                    return Err(AgentRuntimeError::OutboundUnavailable);
+                }
                 }
             }
         }
+        .await;
+        match &result {
+            Ok(AgentExit::StoppedByService) => {
+                outbound.close_and_join().await?;
+            }
+            _ => outbound.abort_and_join().await,
+        }
+        result
     }
 
     async fn register<W>(
@@ -677,16 +936,13 @@ impl AgentRuntime {
         })
     }
 
-    async fn send_capabilities<W>(
+    fn send_capabilities(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         identity: &RegisteredAgentIdentity,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let state = self.resolve_desktop_state()?;
-        self.last_desktop_state = Some(state);
+        revision: u64,
+        state: TrustedDesktopState,
+    ) -> Result<(), AgentRuntimeError> {
         let desktop_epoch = state.desktop_epoch;
         let mut capabilities = if state.desktop_kind == DesktopKind::Default {
             self.generic_executor_capabilities()
@@ -694,9 +950,7 @@ impl AgentRuntime {
             AgentCapabilities::empty()
         };
         if self.authority.is_some()
-            && self
-                .last_desktop_state
-                .is_some_and(|state| state.desktop_kind == DesktopKind::Default)
+            && state.desktop_kind == DesktopKind::Default
             && self
                 .input
                 .as_ref()
@@ -717,38 +971,39 @@ impl AgentRuntime {
             advertised.insert(mrd_agent_ipc::AgentCapability::Consent);
             capabilities = AgentCapabilities::from_implemented(advertised);
         }
-        write_frame(
-            writer,
-            &AgentToService::AgentCapabilitySnapshot(AgentCapabilitySnapshot {
+        writer.enqueue(AgentToService::AgentCapabilitySnapshot(
+            AgentCapabilitySnapshot {
                 agent_instance_id: identity.agent_instance_id,
                 registration_id: identity.registration_id,
                 windows_session_id: identity.windows_session_id,
-                revision: 1,
+                revision,
                 desktop_epoch,
                 observed_at_ms: self.clock.now_ms(),
                 capabilities: capabilities.as_set().clone(),
-            }),
-        )
-        .await?;
+            },
+        ))?;
         Ok(())
     }
 
-    async fn handle_execute<W>(
+    async fn handle_execute(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         identity: &RegisteredAgentIdentity,
         execute: &mrd_agent_ipc::ExecuteCommand,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
-        let authorized = if let Some(authority) = &self.authority {
-            if let Some(binding) = authority
+        let authorized = if self.authority.is_some() {
+            let desktop = self.current_desktop_state()?;
+            self.reconcile_desktop_authority(desktop)?;
+            let authority = self
+                .authority
+                .as_ref()
+                .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
+            let binding = authority
                 .manager
                 .resolve_binding(&execute.grant.claims.session_id, now_ms)
-            {
-                let desktop = validated_desktop_state(authority.desktop_state.as_ref())?;
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            if let Some(binding) = binding {
                 if binding_matches_runtime(&binding, identity, desktop) {
                     let context = ExecutionContext {
                         registration_id: binding.registration_id,
@@ -779,39 +1034,35 @@ impl AgentRuntime {
             None => CommandOutcome::Rejected,
         };
 
-        write_frame(
-            writer,
-            &AgentToService::CommandResult(CommandResult {
-                request_token: execute.request_token,
-                registration_id: identity.registration_id,
-                command_id: execute.command_id,
-                outcome,
-                completed_at_ms: self.clock.now_ms(),
-            }),
-        )
-        .await?;
+        writer.enqueue(AgentToService::CommandResult(CommandResult {
+            request_token: execute.request_token,
+            registration_id: identity.registration_id,
+            command_id: execute.command_id,
+            outcome,
+            completed_at_ms: self.clock.now_ms(),
+        }))?;
         Ok(())
     }
 
-    async fn handle_input<W>(
+    async fn handle_input(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         identity: &RegisteredAgentIdentity,
         envelope: mrd_agent_ipc::InputEventEnvelope,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
-        let outcome = if let (Some(input), Some(authority)) = (&mut self.input, &self.authority) {
-            if let Some(binding) = authority
+        let outcome = if self.input.is_some() && self.authority.is_some() {
+            let desktop = self.current_desktop_state()?;
+            self.reconcile_desktop_authority(desktop)?;
+            let binding = self
+                .authority
+                .as_ref()
+                .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
                 .manager
                 .resolve_binding(&envelope.session_id, now_ms)
-            {
-                let desktop = validated_desktop_state(authority.desktop_state.as_ref())?;
-                if binding_matches_registration(&binding, identity)
-                    && binding.desktop_kind == DesktopKind::Default
-                {
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            if let Some(binding) = binding {
+                if binding_matches_runtime(&binding, identity, desktop) {
                     let context = ExecutionContext {
                         registration_id: binding.registration_id,
                         registration_epoch: binding.registration_epoch,
@@ -826,6 +1077,10 @@ impl AgentRuntime {
                         authorization_scopes: binding.approved_scopes,
                         authorization_expires_at_ms: binding.authorization_expires_at_ms,
                     };
+                    let input = self
+                        .input
+                        .as_mut()
+                        .ok_or(AgentRuntimeError::InputCleanupFailed)?;
                     let outcome = input.handle(&envelope, &context);
                     if matches!(
                         outcome,
@@ -833,7 +1088,9 @@ impl AgentRuntime {
                             reason: mrd_agent_ipc::InputRejection::StaleDesktop
                         }
                     ) {
-                        let _ = input.release_all();
+                        input
+                            .release_all()
+                            .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
                     }
                     outcome
                 } else {
@@ -851,33 +1108,26 @@ impl AgentRuntime {
                 reason: mrd_agent_ipc::InputRejection::Unsupported,
             }
         };
-        write_frame(
-            writer,
-            &AgentToService::InputAck(InputAck {
-                request_token: envelope.request_token,
-                registration_id: identity.registration_id,
-                registration_epoch: identity.registration_epoch,
-                session_id: envelope.session_id.clone(),
-                resource_id: envelope.resource_id,
-                start_grant_id: envelope.start_grant_id,
-                sequence: envelope.sequence,
-                event_commitment: envelope.commitment().unwrap_or([0; 32]),
-                outcome,
-            }),
-        )
-        .await?;
+        writer.enqueue(AgentToService::InputAck(InputAck {
+            request_token: envelope.request_token,
+            registration_id: identity.registration_id,
+            registration_epoch: identity.registration_epoch,
+            session_id: envelope.session_id.clone(),
+            resource_id: envelope.resource_id,
+            start_grant_id: envelope.start_grant_id,
+            sequence: envelope.sequence,
+            event_commitment: envelope.commitment().unwrap_or([0; 32]),
+            outcome,
+        }))?;
         Ok(())
     }
 
-    async fn handle_managed_consent<W>(
+    async fn handle_managed_consent(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         identity: &RegisteredAgentIdentity,
         request: ConsentRequest,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<(), AgentRuntimeError> {
         if self.authority.is_none() {
             return self.handle_consent_without_manager(writer, request).await;
         }
@@ -891,7 +1141,7 @@ impl AgentRuntime {
             .expire_due(Instant::now(), context.now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
         for result in due {
-            write_frame(writer, &AgentToService::ConsentResult(result)).await?;
+            writer.enqueue(AgentToService::ConsentResult(result))?;
         }
         let immediate = match authority.manager.begin(request.clone(), context) {
             Ok(results) => results,
@@ -911,20 +1161,18 @@ impl AgentRuntime {
             Err(_) => return Err(AgentRuntimeError::ConsentStateUnavailable),
         };
         for result in immediate {
-            write_frame(writer, &AgentToService::ConsentResult(result)).await?;
+            writer.enqueue(AgentToService::ConsentResult(result))?;
         }
         Ok(())
     }
 
-    async fn handle_consent_completion<W>(
+    async fn handle_consent_completion(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         identity: &RegisteredAgentIdentity,
         completion: BackendCompletion,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+        already_released_sessions: &[SessionId],
+    ) -> Result<(), AgentRuntimeError> {
         let context = self.trusted_consent_context(identity)?;
         let mut completion = {
             let authority = self
@@ -937,10 +1185,11 @@ impl AgentRuntime {
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
         };
         if let Some(change) = completion.fresh_authority_change.as_ref() {
-            let cleanup_failed = self
-                .input
-                .as_mut()
-                .is_some_and(|input| input.release_session(&change.session_id).is_err());
+            let cleanup_failed = !already_released_sessions.contains(&change.session_id)
+                && self
+                    .input
+                    .as_mut()
+                    .is_some_and(|input| input.release_session(&change.session_id).is_err());
             if cleanup_failed {
                 let invalidated = self
                     .authority
@@ -967,15 +1216,15 @@ impl AgentRuntime {
             completion.results.append(&mut resumed);
         }
         for result in completion.results {
-            write_frame(writer, &AgentToService::ConsentResult(result)).await?;
+            writer.enqueue(AgentToService::ConsentResult(result))?;
         }
         Ok(())
     }
 
-    async fn handle_consent_deadline<W>(&mut self, writer: &mut W) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    async fn handle_consent_deadline(
+        &mut self,
+        writer: &OutboundWriter,
+    ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
         let results = self
             .authority
@@ -985,19 +1234,16 @@ impl AgentRuntime {
             .expire_due(Instant::now(), now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
         for result in results {
-            write_frame(writer, &AgentToService::ConsentResult(result)).await?;
+            writer.enqueue(AgentToService::ConsentResult(result))?;
         }
         Ok(())
     }
 
-    async fn handle_managed_cancel<W>(
+    async fn handle_managed_cancel(
         &mut self,
-        writer: &mut W,
+        writer: &OutboundWriter,
         cancel: CancelConsent,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
         let Some(authority) = &mut self.authority else {
             // Cleanup is deliberately safe to consume when no manager exists.
@@ -1008,7 +1254,7 @@ impl AgentRuntime {
             .cancel(&cancel, Instant::now(), now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
         for result in results {
-            write_frame(writer, &AgentToService::ConsentResult(result)).await?;
+            writer.enqueue(AgentToService::ConsentResult(result))?;
         }
         Ok(())
     }
@@ -1049,25 +1295,39 @@ impl AgentRuntime {
         Ok(())
     }
 
-    async fn handle_consent_without_manager<W>(
+    async fn terminal_cleanup(
         &mut self,
-        writer: &mut W,
+        reason: ConsentAbortReason,
+    ) -> Result<(), AgentRuntimeError> {
+        let mut first_error = None;
+        if let Some(authority) = self.authority.as_ref() {
+            if authority.manager.drain_authority().is_err() {
+                first_error = Some(AgentRuntimeError::ConsentStateUnavailable);
+            }
+        }
+        if self.release_input().is_err() {
+            first_error.get_or_insert(AgentRuntimeError::InputCleanupFailed);
+        }
+        if let Err(error) = self.shutdown_consent(reason).await {
+            first_error.get_or_insert(error);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn handle_consent_without_manager(
+        &mut self,
+        writer: &OutboundWriter,
         request: ConsentRequest,
-    ) -> Result<(), AgentRuntimeError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
         let decision = if now_ms >= request.issued_at_ms && now_ms < request.expires_at_ms {
             ConsentDecision::Dismissed
         } else {
             ConsentDecision::Expired
         };
-        write_frame(
-            writer,
-            &AgentToService::ConsentResult(coarse_consent_result(&request, decision, now_ms)),
-        )
-        .await?;
+        writer.enqueue(AgentToService::ConsentResult(coarse_consent_result(
+            &request, decision, now_ms,
+        )))?;
         Ok(())
     }
 
@@ -1126,6 +1386,53 @@ impl AgentRuntime {
             .map_or(Ok(()), |input| input.release_all())
     }
 
+    fn release_authority_invalidations(
+        &mut self,
+        invalidations: Vec<AuthorityInvalidation>,
+    ) -> Result<(), AgentRuntimeError> {
+        let Some(input) = self.input.as_mut() else {
+            return Ok(());
+        };
+        let mut first_error = None;
+        for invalidation in invalidations {
+            if let Err(error) = input.release_session(&invalidation.session_id) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), |_| Err(AgentRuntimeError::InputCleanupFailed))
+    }
+
+    fn reconcile_desktop_authority(
+        &mut self,
+        desktop: TrustedDesktopState,
+    ) -> Result<(), AgentRuntimeError> {
+        let invalidations = match self.authority.as_ref() {
+            Some(authority) => authority
+                .manager
+                .take_desktop_mismatch(desktop.desktop_epoch, desktop.desktop_kind)
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
+            None => Vec::new(),
+        };
+        self.release_authority_invalidations(invalidations)
+    }
+
+    fn reconcile_due_authority(&mut self) -> Result<Vec<SessionId>, AgentRuntimeError> {
+        let now_ms = self.clock.now_ms();
+        let invalidations = match self.authority.as_ref() {
+            Some(authority) => authority
+                .manager
+                .take_due_authority(Instant::now(), now_ms)
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
+            None => Vec::new(),
+        };
+        let sessions = invalidations
+            .iter()
+            .map(|invalidation| invalidation.session_id.clone())
+            .collect();
+        self.release_authority_invalidations(invalidations)?;
+        Ok(sessions)
+    }
+
     fn generic_executor_capabilities(&self) -> AgentCapabilities {
         let Some(authority) = self.authority.as_ref() else {
             return AgentCapabilities::empty();
@@ -1145,16 +1452,6 @@ impl AgentRuntime {
                     )
                 }),
         )
-    }
-
-    fn refresh_input_desktop(&mut self, current: TrustedDesktopState) {
-        if self
-            .last_desktop_state
-            .is_some_and(|previous| previous != current)
-        {
-            let _ = self.release_input();
-        }
-        self.last_desktop_state = Some(current);
     }
 
     fn next_event_context(
@@ -1287,6 +1584,8 @@ enum RegisteredLoopEvent {
     Inbound(Option<InboundEvent>),
     Consent(Option<BackendCompletion>),
     ConsentDeadline,
+    DesktopChanged(Option<Result<(), tokio::sync::watch::error::RecvError>>),
+    WriterTerminal,
     Heartbeat,
 }
 
@@ -1585,6 +1884,61 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_queue_full_fails_without_waiting_for_the_blocked_stream() {
+        let (writer, _reader) = tokio::io::duplex(1);
+        let mut outbound = OutboundWriter::spawn(writer);
+        let mut failed = false;
+        for sequence in 1..=(OUTBOUND_QUEUE_CAPACITY as u64 + 2) {
+            let message = AgentToService::AgentHeartbeat(AgentHeartbeat {
+                context: AgentEventContext {
+                    registration_id: [1; 16],
+                    registration_epoch: 1,
+                    windows_session_id: 7,
+                    desktop_epoch: 1,
+                    sequence,
+                    observed_at_ms: 1,
+                },
+            });
+            if outbound.enqueue(message).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(
+            failed,
+            "bounded output must fail instead of awaiting capacity"
+        );
+        outbound.abort_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn outbound_writer_failure_wakes_the_registered_control_loop() {
+        let (writer, reader) = tokio::io::duplex(64);
+        drop(reader);
+        let mut outbound = OutboundWriter::spawn(writer);
+        outbound
+            .enqueue(AgentToService::AgentHeartbeat(AgentHeartbeat {
+                context: AgentEventContext {
+                    registration_id: [1; 16],
+                    registration_epoch: 1,
+                    windows_session_id: 7,
+                    desktop_epoch: 1,
+                    sequence: 1,
+                    observed_at_ms: 1,
+                },
+            }))
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), outbound.terminal_changed())
+                .await
+                .expect("writer terminal wake"),
+            WriterTerminal::Failed,
+        );
+        outbound.abort_and_join().await;
     }
 
     #[test]

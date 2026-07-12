@@ -84,8 +84,13 @@ fn approved_completion_installs_the_exact_local_binding() {
         completed.disposition,
         ConsentCompletionDisposition::Approved
     );
+    let authorization_deadline = registry
+        .resolve(&request.session_id, 120)
+        .unwrap()
+        .expect("installed binding")
+        .authorization_deadline;
     assert_eq!(
-        registry.resolve(&request.session_id, 120),
+        registry.resolve(&request.session_id, 120).unwrap(),
         Some(TrustedSessionBinding {
             authority_generation: attempt,
             consent_request_id: request.request_id,
@@ -99,10 +104,350 @@ fn approved_completion_installs_the_exact_local_binding() {
             desktop_epoch: 13,
             desktop_kind: DesktopKind::Default,
             authorization_expires_at_ms: 500,
+            authorization_deadline,
             expected_issuer_key_id: ISSUER_KEY_ID,
         })
     );
-    assert_eq!(registry.resolve(&request.session_id, 500), None);
+    assert_eq!(registry.resolve(&request.session_id, 500).unwrap(), None);
+}
+
+#[tokio::test]
+async fn monotonic_binding_deadline_wins_wall_clock_rollback() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut request = request([122; 16], 122, "monotonic-deadline");
+    request.expires_at_ms = 125;
+    request.authorization_expires_at_ms = 140;
+    let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    assert_eq!(
+        registry.resolve(&request.session_id, 121).unwrap(),
+        None,
+        "elapsed monotonic time must revoke authority even when wall time rolls back",
+    );
+    assert_eq!(
+        registry.take_due(Instant::now(), 121).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: request.session_id,
+            consent_request_id: request.request_id,
+            authority_generation: attempt,
+        }],
+    );
+    assert!(registry.take_due(Instant::now(), 121).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn prompt_time_and_wall_rollback_do_not_restart_authority_lifetime() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut request = request([133; 16], 134, "anchored-deadline");
+    request.expires_at_ms = 150;
+    request.authorization_expires_at_ms = 310;
+    let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+
+    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    registry
+        .complete(
+            attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(111),
+        )
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    assert_eq!(
+        registry.take_due(Instant::now(), 111).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: request.session_id,
+            consent_request_id: request.request_id,
+            authority_generation: attempt,
+        }],
+        "local prompt latency must consume, rather than restart, authority lifetime",
+    );
+}
+
+#[test]
+fn due_bindings_return_exact_cleanup_identity_once() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut early = request([123; 16], 123, "early-session");
+    early.authorization_expires_at_ms = 300;
+    let early_attempt = prompt_attempt(registry.begin(early.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            early_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+    let mut later = request([124; 16], 124, "later-session");
+    later.authorization_expires_at_ms = 400;
+    let later_attempt = prompt_attempt(registry.begin(later.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            later_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry.take_due(Instant::now(), 300).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: early.session_id.clone(),
+            consent_request_id: early.request_id,
+            authority_generation: early_attempt,
+        }],
+    );
+    assert!(registry.take_due(Instant::now(), 300).unwrap().is_empty());
+    assert!(registry.resolve(&early.session_id, 120).unwrap().is_none());
+    assert_eq!(
+        registry
+            .resolve(&later.session_id, 300)
+            .unwrap()
+            .expect("later authority remains")
+            .authority_generation,
+        later_attempt,
+    );
+}
+
+#[test]
+fn resolving_due_authority_does_not_discard_cleanup_identity() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut request = request([125; 16], 125, "resolve-due-session");
+    request.authorization_expires_at_ms = 300;
+    let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+
+    assert!(registry
+        .resolve(&request.session_id, 300)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        registry.take_due(Instant::now(), 300).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: request.session_id,
+            consent_request_id: request.request_id,
+            authority_generation: attempt,
+        }],
+        "authorization lookup must not silently lose the release_session identity",
+    );
+}
+
+#[test]
+fn beginning_another_consent_does_not_prune_cleanup_identity() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut expired = request([126; 16], 126, "expired-before-begin");
+    expired.authorization_expires_at_ms = 300;
+    let attempt = prompt_attempt(registry.begin(expired.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+
+    let mut unrelated = request([127; 16], 127, "unrelated-pending");
+    unrelated.issued_at_ms = 250;
+    unrelated.expires_at_ms = 350;
+    unrelated.authorization_expires_at_ms = 400;
+    registry.begin(unrelated, context(300)).unwrap();
+
+    assert_eq!(
+        registry.take_due(Instant::now(), 300).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: expired.session_id,
+            consent_request_id: expired.request_id,
+            authority_generation: attempt,
+        }],
+    );
+}
+
+#[test]
+fn stale_deadline_cannot_remove_same_session_replacement() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut first = request([128; 16], 128, "deadline-replacement");
+    first.authorization_expires_at_ms = 300;
+    let first_attempt = prompt_attempt(registry.begin(first.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            first_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+    let stale_deadline = registry
+        .next_authority_deadline()
+        .unwrap()
+        .expect("first deadline");
+
+    let replacement = request([129; 16], 129, "deadline-replacement");
+    let replacement_attempt =
+        prompt_attempt(registry.begin(replacement.clone(), context(130)).unwrap());
+    registry
+        .complete(
+            replacement_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(140),
+        )
+        .unwrap();
+
+    assert!(registry.take_due(stale_deadline, 150).unwrap().is_empty());
+    assert_eq!(
+        registry
+            .resolve(&replacement.session_id, 150)
+            .unwrap()
+            .expect("replacement remains")
+            .authority_generation,
+        replacement_attempt,
+    );
+}
+
+#[test]
+fn desktop_mismatch_withdraws_only_nonmatching_bindings() {
+    let registry = ConsentAuthorityRegistry::new();
+    let matching = request([130; 16], 130, "desktop-matching");
+    let matching_attempt = prompt_attempt(registry.begin(matching.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            matching_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+
+    let mismatching = request([131; 16], 131, "desktop-mismatching");
+    let mut changed_context = context(110);
+    changed_context.desktop_epoch = 14;
+    let mismatching_attempt = prompt_attempt(
+        registry
+            .begin(mismatching.clone(), changed_context.clone())
+            .unwrap(),
+    );
+    changed_context.now_ms = 120;
+    registry
+        .complete(
+            mismatching_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            changed_context,
+        )
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .take_desktop_mismatch(13, DesktopKind::Default)
+            .unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: mismatching.session_id.clone(),
+            consent_request_id: mismatching.request_id,
+            authority_generation: mismatching_attempt,
+        }],
+    );
+    assert!(registry
+        .resolve(&matching.session_id, 120)
+        .unwrap()
+        .is_some());
+    assert!(registry
+        .resolve(&mismatching.session_id, 120)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn draining_live_bindings_retains_completed_replay_tombstones() {
+    let registry = ConsentAuthorityRegistry::new();
+    let original = request([132; 16], 132, "drained-session");
+    let attempt = prompt_attempt(registry.begin(original.clone(), context(110)).unwrap());
+    let completion = completed(
+        registry
+            .complete(
+                attempt,
+                ConsentDecision::Approved,
+                scopes(&[PermissionScope::InputPointer]),
+                context(120),
+            )
+            .unwrap(),
+    );
+
+    assert_eq!(
+        registry.drain().unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: original.session_id.clone(),
+            consent_request_id: original.request_id,
+            authority_generation: attempt,
+        }],
+    );
+    assert!(registry
+        .resolve(&original.session_id, 130)
+        .unwrap()
+        .is_none());
+
+    let mut replay = original;
+    replay.request_token = 133;
+    let ConsentBeginOutcome::Cached(cached) = registry.begin(replay, context(130)).unwrap() else {
+        panic!("drain removed the replay tombstone");
+    };
+    assert_eq!(cached.decision, completion.result.decision);
+    assert_eq!(cached.request_token, 133);
+}
+
+#[test]
+fn poisoned_registry_lookup_is_not_indistinguishable_from_missing_authority() {
+    let registry = ConsentAuthorityRegistry::new();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = registry.state.lock().expect("lock registry");
+        panic!("poison registry for fail-closed lookup test");
+    }));
+
+    assert_eq!(
+        registry.resolve(&SessionId("unknown".to_owned()), 120),
+        Err(ConsentRegistryError::Unavailable),
+    );
+}
+
+#[test]
+fn monotonic_deadline_overflow_fails_closed_before_pending_insert() {
+    assert_eq!(
+        checked_authority_deadline(Instant::now(), u64::MAX),
+        Err(ConsentRegistryError::DeadlineOverflow),
+    );
+}
+
+#[test]
+fn far_future_request_is_inactive_before_deadline_construction() {
+    let registry = ConsentAuthorityRegistry::new();
+    let mut future = request([134; 16], 135, "far-future");
+    future.issued_at_ms = 1_000_000;
+    future.expires_at_ms = 1_000_100;
+    future.authorization_expires_at_ms = 1_000_500;
+
+    assert_eq!(
+        registry.begin(future, context(110)),
+        Err(ConsentRegistryError::InactiveRequest),
+    );
 }
 
 #[test]
@@ -139,6 +484,7 @@ fn stale_authority_generation_cannot_invalidate_a_newer_binding() {
     assert!(!registry.invalidate_fresh_authority(&stale).unwrap());
     let current = registry
         .resolve(&replacement.session_id, 140)
+        .unwrap()
         .expect("replacement authority remains installed");
     assert_eq!(current.consent_request_id, replacement.request_id);
     assert_eq!(current.authority_generation, replacement_attempt);
@@ -149,7 +495,10 @@ fn stale_authority_generation_cannot_invalidate_a_newer_binding() {
             authority_generation: replacement_attempt,
         })
         .unwrap());
-    assert_eq!(registry.resolve(&replacement.session_id, 140), None);
+    assert_eq!(
+        registry.resolve(&replacement.session_id, 140).unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -171,6 +520,7 @@ fn completed_replay_is_cached_without_a_second_prompt() {
 
     let installed = registry
         .resolve(&original.session_id, 121)
+        .unwrap()
         .expect("approval installs one binding");
     let session_id = original.session_id.clone();
     let mut retry = original;
@@ -182,7 +532,7 @@ fn completed_replay_is_cached_without_a_second_prompt() {
     expected.request_token = 52;
     assert_eq!(cached, expected);
     assert_eq!(cached.decided_at_ms, 121);
-    assert_eq!(registry.resolve(&session_id, 150), Some(installed));
+    assert_eq!(registry.resolve(&session_id, 150).unwrap(), Some(installed));
 }
 
 #[test]
@@ -232,7 +582,7 @@ fn nonapproved_decisions_never_install_authority() {
             completion.disposition,
             ConsentCompletionDisposition::NonApproved
         );
-        assert_eq!(registry.resolve(&request.session_id, 120), None);
+        assert_eq!(registry.resolve(&request.session_id, 120).unwrap(), None);
 
         let mut retry = request;
         retry.request_token += 100;
@@ -266,7 +616,7 @@ fn nonapproved_decision_with_scopes_is_tombstoned_without_authority() {
             ConsentCompletionRejection::UnexpectedApprovedScopes
         )
     );
-    assert_eq!(registry.resolve(&request.session_id, 120), None);
+    assert_eq!(registry.resolve(&request.session_id, 120).unwrap(), None);
 }
 
 #[test]
@@ -290,7 +640,7 @@ fn scope_escalation_is_tombstoned_as_nonapproved() {
         completion.disposition,
         ConsentCompletionDisposition::Rejected(ConsentCompletionRejection::ScopeEscalation)
     );
-    assert_eq!(registry.resolve(&original.session_id, 120), None);
+    assert_eq!(registry.resolve(&original.session_id, 120).unwrap(), None);
 
     let mut retry = original;
     retry.request_token = 81;
@@ -388,12 +738,14 @@ fn live_binding_capacity_never_evicts_existing_authority_or_leaks_approval() {
         completion.disposition,
         ConsentCompletionDisposition::Rejected(ConsentCompletionRejection::BindingCapacityExceeded)
     );
-    assert_eq!(registry.resolve(&overflow.session_id, 140), None);
+    assert_eq!(registry.resolve(&overflow.session_id, 140).unwrap(), None);
     assert!(registry
         .resolve(&SessionId("active-session-0".to_owned()), 140)
+        .unwrap()
         .is_some());
     assert!(registry
         .resolve(&SessionId("active-session-63".to_owned()), 140)
+        .unwrap()
         .is_some());
 
     let replacement = request([101; 16], 101, "active-session-0");
@@ -413,6 +765,7 @@ fn live_binding_capacity_never_evicts_existing_authority_or_leaks_approval() {
     assert_eq!(
         registry
             .resolve(&replacement.session_id, 160)
+            .unwrap()
             .unwrap()
             .consent_request_id,
         replacement.request_id
@@ -563,7 +916,7 @@ fn expired_pending_attempt_past_authorization_expiry_releases_its_reservation() 
 }
 
 #[test]
-fn expired_authority_and_tombstones_are_pruned_before_capacity_checks() {
+fn explicit_expiry_cleanup_frees_capacity_without_discarding_owner_identity() {
     let registry = ConsentAuthorityRegistry::with_limits(1, 1, 1);
     let first = request([50; 16], 50, "expired-session");
     let attempt = prompt_attempt(registry.begin(first.clone(), context(110)).unwrap());
@@ -575,12 +928,20 @@ fn expired_authority_and_tombstones_are_pruned_before_capacity_checks() {
             context(120),
         )
         .unwrap();
-    assert!(registry.resolve(&first.session_id, 499).is_some());
+    assert!(registry.resolve(&first.session_id, 499).unwrap().is_some());
 
     let mut next = request([51; 16], 51, "replacement-session");
     next.issued_at_ms = 500;
     next.expires_at_ms = 600;
     next.authorization_expires_at_ms = 800;
+    assert_eq!(
+        registry.take_due(Instant::now(), 510).unwrap(),
+        vec![AuthorityInvalidation {
+            session_id: first.session_id.clone(),
+            consent_request_id: first.request_id,
+            authority_generation: attempt,
+        }],
+    );
     let attempt = prompt_attempt(registry.begin(next.clone(), context(510)).unwrap());
     let completion = completed(
         registry
@@ -593,8 +954,8 @@ fn expired_authority_and_tombstones_are_pruned_before_capacity_checks() {
             .unwrap(),
     );
     assert_eq!(completion.result.decision, ConsentDecision::Approved);
-    assert_eq!(registry.resolve(&first.session_id, 520), None);
-    assert!(registry.resolve(&next.session_id, 520).is_some());
+    assert_eq!(registry.resolve(&first.session_id, 520).unwrap(), None);
+    assert!(registry.resolve(&next.session_id, 520).unwrap().is_some());
 }
 
 #[test]
@@ -624,7 +985,7 @@ fn exact_cancel_is_tombstoned_and_the_late_attempt_is_ignored() {
             .unwrap(),
         ConsentCompletionOutcome::Ignored
     );
-    assert_eq!(registry.resolve(&original.session_id, 121), None);
+    assert_eq!(registry.resolve(&original.session_id, 121).unwrap(), None);
 
     let mut retry = original;
     retry.request_token = 61;
@@ -723,7 +1084,10 @@ fn changed_local_generation_and_prompt_expiry_cannot_install_authority() {
             .unwrap(),
     );
     assert_eq!(completion.result.decision, ConsentDecision::Dismissed);
-    assert_eq!(registry.resolve(&local_change.session_id, 120), None);
+    assert_eq!(
+        registry.resolve(&local_change.session_id, 120).unwrap(),
+        None
+    );
 
     let expired = request([71; 16], 71, "prompt-expired");
     let attempt = prompt_attempt(registry.begin(expired.clone(), context(110)).unwrap());
@@ -738,7 +1102,7 @@ fn changed_local_generation_and_prompt_expiry_cannot_install_authority() {
             .unwrap(),
     );
     assert_eq!(completion.result.decision, ConsentDecision::Expired);
-    assert_eq!(registry.resolve(&expired.session_id, 200), None);
+    assert_eq!(registry.resolve(&expired.session_id, 200).unwrap(), None);
 
     let secure = request([72; 16], 72, "secure-desktop");
     let mut secure_context = context(110);
@@ -770,7 +1134,7 @@ fn completion_clock_rollback_cannot_approve_or_install_authority() {
         ConsentCompletionDisposition::Rejected(ConsentCompletionRejection::InvalidLocalContext)
     );
     assert!(!completion.binding_changed);
-    assert_eq!(registry.resolve(&original.session_id, 190), None);
+    assert_eq!(registry.resolve(&original.session_id, 190).unwrap(), None);
 
     let mut retry = original;
     retry.request_token = 76;
@@ -840,7 +1204,7 @@ fn empty_approval_and_each_changed_local_identity_fail_closed() {
             .unwrap(),
     );
     assert_eq!(completion.result.decision, ConsentDecision::Dismissed);
-    assert_eq!(registry.resolve(&empty.session_id, 120), None);
+    assert_eq!(registry.resolve(&empty.session_id, 120).unwrap(), None);
 
     for (index, mutate) in [
         |context: &mut TrustedConsentContext| context.registration_id[0] ^= 1,
@@ -873,7 +1237,7 @@ fn empty_approval_and_each_changed_local_identity_fail_closed() {
         );
         assert_eq!(completion.result.decision, ConsentDecision::Dismissed);
         assert!(!completion.binding_changed);
-        assert_eq!(registry.resolve(&request.session_id, 120), None);
+        assert_eq!(registry.resolve(&request.session_id, 120).unwrap(), None);
     }
 }
 
@@ -887,7 +1251,7 @@ fn poisoned_registry_never_returns_or_installs_authority() {
 
     assert_eq!(
         registry.resolve(&SessionId("any-session".to_owned()), 110),
-        None
+        Err(ConsentRegistryError::Unavailable)
     );
     assert_eq!(
         registry.begin(request([110; 16], 110, "poisoned"), context(110)),
@@ -1041,7 +1405,12 @@ async fn manager_owned_registry_installs_only_timely_approval() {
         .expect("fresh approval reports its authority generation");
     assert_eq!(change.session_id, request.session_id);
     assert_eq!(change.consent_request_id, request.request_id);
-    assert!(manager.registry.resolve(&request.session_id, 120).is_some());
+    assert!(manager
+        .registry
+        .resolve(&request.session_id, 120)
+        .unwrap()
+        .is_some());
+    assert!(matches!(manager.next_deadline(), Ok(Some(_))));
 }
 
 #[tokio::test]
@@ -1097,7 +1466,10 @@ async fn approved_completion_that_loses_cancel_race_cannot_install_binding() {
         .unwrap()
         .results
         .is_empty());
-    assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
+    assert_eq!(
+        manager.registry.resolve(&request.session_id, 120).unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -1116,5 +1488,8 @@ async fn approved_completion_that_loses_deadline_race_cannot_install_binding() {
     assert_eq!(completion.results.len(), 1);
     assert_eq!(completion.results[0].decision, ConsentDecision::Expired);
     assert!(completion.fresh_authority_change.is_none());
-    assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
+    assert_eq!(
+        manager.registry.resolve(&request.session_id, 120).unwrap(),
+        None
+    );
 }

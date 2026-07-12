@@ -34,6 +34,11 @@ pub struct InputResourceManager<I> {
 }
 
 /// Runtime-facing input backend boundary.
+///
+/// Every method is synchronous control-loop work and must return promptly. An
+/// implementation must not perform blocking I/O, wait on another thread or
+/// process, or otherwise park the runtime while starting, handling, stopping,
+/// or releasing input resources.
 pub trait InputBackend: Send {
     /// Whether this exact platform backend is currently available.
     fn is_available(&self) -> bool;

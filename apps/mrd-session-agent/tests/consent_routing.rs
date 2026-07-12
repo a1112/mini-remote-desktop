@@ -22,7 +22,7 @@ use mrd_session_agent::{
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -103,12 +103,21 @@ impl AuthorizedCommandExecutor for EmptyExecutor {
 
 struct DefaultDesktop;
 
+fn stable_desktop_subscription() -> watch::Receiver<()> {
+    static CHANGES: OnceLock<watch::Sender<()>> = OnceLock::new();
+    CHANGES.get_or_init(|| watch::channel(()).0).subscribe()
+}
+
 impl TrustedDesktopStateSource for DefaultDesktop {
     fn current_state(&self) -> Option<TrustedDesktopState> {
         Some(TrustedDesktopState {
             desktop_epoch: 9,
             desktop_kind: mrd_agent_ipc::DesktopKind::Default,
         })
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        stable_desktop_subscription()
     }
 }
 
@@ -121,6 +130,10 @@ impl TrustedDesktopStateSource for SecureDesktop {
             desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
         })
     }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        stable_desktop_subscription()
+    }
 }
 
 struct UnavailableDesktop;
@@ -128,6 +141,77 @@ struct UnavailableDesktop;
 impl TrustedDesktopStateSource for UnavailableDesktop {
     fn current_state(&self) -> Option<TrustedDesktopState> {
         None
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        stable_desktop_subscription()
+    }
+}
+
+struct WatchDesktop {
+    state: Mutex<Option<TrustedDesktopState>>,
+    changes: watch::Sender<()>,
+}
+
+impl WatchDesktop {
+    fn new(state: TrustedDesktopState) -> Self {
+        let (changes, _) = watch::channel(());
+        Self {
+            state: Mutex::new(Some(state)),
+            changes,
+        }
+    }
+
+    fn set(&self, state: Option<TrustedDesktopState>) {
+        *self.state.lock().expect("desktop state") = state;
+        self.changes.send_replace(());
+    }
+}
+
+impl TrustedDesktopStateSource for WatchDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        *self.state.lock().expect("desktop state")
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+}
+
+struct SubscribeBaselineRaceDesktop {
+    state: Mutex<TrustedDesktopState>,
+    changes: watch::Sender<()>,
+    raced: AtomicBool,
+}
+
+impl SubscribeBaselineRaceDesktop {
+    fn new() -> Self {
+        let (changes, _) = watch::channel(());
+        Self {
+            state: Mutex::new(TrustedDesktopState {
+                desktop_epoch: 9,
+                desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+            }),
+            changes,
+            raced: AtomicBool::new(false),
+        }
+    }
+}
+
+impl TrustedDesktopStateSource for SubscribeBaselineRaceDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        if !self.raced.swap(true, Ordering::SeqCst) {
+            *self.state.lock().expect("desktop state") = TrustedDesktopState {
+                desktop_epoch: 10,
+                desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
+            };
+            self.changes.send_replace(());
+        }
+        Some(*self.state.lock().expect("desktop state"))
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 }
 
@@ -1325,6 +1409,88 @@ async fn nondefault_desktop_does_not_publish_consent_or_receive_prompt() {
             .is_err(),
         "secure desktop must not invoke the consent backend"
     );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn desktop_watch_immediately_publishes_revision_two_without_secure_capabilities() {
+    let (backend, _state, _started) = backend();
+    let desktop = Arc::new(WatchDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid runtime")
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        desktop.clone(),
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("attended authority");
+    let (agent, mut service, first) = start_configured_agent(runtime, true).await;
+    assert_eq!(first.revision, 1);
+
+    desktop.set(Some(TrustedDesktopState {
+        desktop_epoch: 10,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
+    }));
+
+    let changed = match read_agent_message(&mut service).await {
+        AgentToService::AgentCapabilitySnapshot(snapshot) => snapshot,
+        other => panic!("expected immediate capability revision, got {other:?}"),
+    };
+    assert_eq!(changed.revision, 2);
+    assert_eq!(changed.desktop_epoch, 10);
+    assert!(!changed.capabilities.contains(&AgentCapability::Input));
+    assert!(!changed.capabilities.contains(&AgentCapability::Consent));
+
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn subscribe_before_baseline_does_not_lose_a_racing_desktop_change() {
+    let (backend, _state, _started) = backend();
+    let desktop = Arc::new(SubscribeBaselineRaceDesktop::new());
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid runtime")
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        desktop,
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("attended authority");
+    let (agent, mut service, baseline) = start_configured_agent(runtime, false).await;
+    assert_eq!(baseline.desktop_epoch, 10);
+    assert!(!baseline.capabilities.contains(&AgentCapability::Consent));
+
+    let observed = match read_agent_message(&mut service).await {
+        AgentToService::AgentCapabilitySnapshot(snapshot) => snapshot,
+        other => panic!("expected retained desktop notification, got {other:?}"),
+    };
+    assert_eq!(observed.revision, 2);
+    assert_eq!(observed.desktop_epoch, 10);
+    assert!(!observed.capabilities.contains(&AgentCapability::Input));
+    assert!(!observed.capabilities.contains(&AgentCapability::Consent));
     stop_agent(agent, &mut service).await;
 }
 

@@ -20,10 +20,15 @@ use mrd_session_agent::{
     },
 };
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
 const REGISTRATION_ID: [u8; 16] = [1; 16];
@@ -34,10 +39,54 @@ const OTHER_START_GRANT_ID: [u8; 32] = [5; 32];
 const ISSUER_KEY_ID: [u8; 32] = [6; 32];
 const PEER_KEY_ID: [u8; 32] = [7; 32];
 
+struct WriteGateStream {
+    inner: tokio::io::DuplexStream,
+    blocked: Arc<AtomicBool>,
+}
+
+impl AsyncRead for WriteGateStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for WriteGateStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.blocked.load(Ordering::SeqCst) {
+            Poll::Pending
+        } else {
+            Pin::new(&mut self.inner).poll_write(context, buffer)
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
 #[derive(Clone)]
 struct SharedInjector {
     events: Arc<Mutex<Vec<InputEvent>>>,
     next_error: Arc<Mutex<Option<InputError>>>,
+    persistent_failure: Arc<AtomicBool>,
     available: bool,
 }
 
@@ -46,6 +95,7 @@ impl SharedInjector {
         Self {
             events,
             next_error: Arc::new(Mutex::new(None)),
+            persistent_failure: Arc::new(AtomicBool::new(false)),
             available: true,
         }
     }
@@ -54,6 +104,7 @@ impl SharedInjector {
         Self {
             events,
             next_error: Arc::new(Mutex::new(Some(error))),
+            persistent_failure: Arc::new(AtomicBool::new(false)),
             available: true,
         }
     }
@@ -65,11 +116,52 @@ impl InputInjector for SharedInjector {
     }
 
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        if self.persistent_failure.load(Ordering::SeqCst) {
+            return Err(InputError::UipiDenied);
+        }
         if let Some(error) = self.next_error.lock().expect("input error lock").take() {
             return Err(error);
         }
         self.events.lock().expect("input event lock").push(*event);
         Ok(())
+    }
+}
+
+struct SlowCleanupInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    delay: Duration,
+}
+
+impl InputBackend for SlowCleanupInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        // Deliberately violates InputBackend's prompt-return contract so the
+        // test can prove an over-deadline cleanup never reports normal stop.
+        std::thread::sleep(self.delay);
+        self.inner.release_all()
     }
 }
 
@@ -120,11 +212,42 @@ fn test_signature(message: &[u8]) -> [u8; 64] {
 
 struct MutableDesktop {
     state: Arc<Mutex<TrustedDesktopState>>,
+    changes: Mutex<Option<watch::Sender<()>>>,
+}
+
+impl MutableDesktop {
+    fn new(state: TrustedDesktopState) -> Arc<Self> {
+        let (changes, _) = watch::channel(());
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(state)),
+            changes: Mutex::new(Some(changes)),
+        })
+    }
+
+    fn set(&self, state: TrustedDesktopState) {
+        *self.state.lock().expect("desktop state") = state;
+        if let Some(changes) = self.changes.lock().expect("desktop changes").as_ref() {
+            changes.send_replace(());
+        }
+    }
+
+    fn close(&self) {
+        self.changes.lock().expect("desktop changes").take();
+    }
 }
 
 impl TrustedDesktopStateSource for MutableDesktop {
     fn current_state(&self) -> Option<TrustedDesktopState> {
         self.state.lock().ok().map(|state| *state)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes
+            .lock()
+            .expect("desktop changes")
+            .as_ref()
+            .expect("desktop source is open at subscription")
+            .subscribe()
     }
 }
 
@@ -359,6 +482,114 @@ async fn start_attended_input_runtime(
     .await
 }
 
+async fn start_gated_attended_input_runtime(
+    injector: SharedInjector,
+) -> (
+    tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    tokio::io::DuplexStream,
+    Arc<AtomicBool>,
+) {
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    start_gated_attended_input_runtime_with_desktop(injector, desktop).await
+}
+
+async fn start_gated_attended_input_runtime_with_desktop(
+    injector: SharedInjector,
+    desktop: Arc<MutableDesktop>,
+) -> (
+    tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    tokio::io::DuplexStream,
+    Arc<AtomicBool>,
+) {
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: SessionDescriptor::new([10; 16], 4_242, 55, [11; 32], 7, [12; 32], 11)
+                .unwrap(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(1),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .unwrap()
+    .with_attended_authority(
+        Arc::new(ApproveRequestedScopes),
+        Arc::new(AcceptVerifier),
+        desktop,
+        ISSUER_KEY_ID,
+        Box::new(NoopExecutor),
+    )
+    .expect("attended authority")
+    .with_input_backend(Box::new(InputResourceManager::new(injector)));
+    let (agent_inner, mut service) = tokio::io::duplex(32 * 1024);
+    let blocked = Arc::new(AtomicBool::new(false));
+    let agent = tokio::spawn(runtime.run(WriteGateStream {
+        inner: agent_inner,
+        blocked: Arc::clone(&blocked),
+    }));
+
+    let register = match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::AgentRegister(register) => register,
+        other => panic!("expected register, got {other:?}"),
+    };
+    let challenge = AgentChallenge {
+        registration_id: REGISTRATION_ID,
+        registration_epoch: 1,
+        challenge_id: [13; 16],
+        challenge_nonce: [14; 32],
+        expected_agent_instance_id: register.agent_instance_id,
+        expected_process_id: register.process_id,
+        expected_process_creation_time: register.process_creation_time,
+        expected_logon_sid_hash: register.logon_sid_hash,
+        expected_windows_session_id: register.windows_session_id,
+        issued_at_ms: 1_000,
+        expires_at_ms: 2_000,
+    };
+    write_frame(
+        &mut service,
+        &ServiceToAgent::AgentChallenge(challenge.clone()),
+    )
+    .await
+    .unwrap();
+    let registered = match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::AgentRegistered(registered) => registered,
+        other => panic!("expected registered proof, got {other:?}"),
+    };
+    let mut protocol = AgentProtocolState::new();
+    protocol.accept_register(register).unwrap();
+    protocol.issue_challenge(challenge).unwrap();
+    protocol
+        .complete_registration(registered, 1_500, &FixedRegistrationVerifier)
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::AgentCapabilitySnapshot(snapshot) => {
+            assert!(snapshot
+                .capabilities
+                .contains(&mrd_agent_ipc::AgentCapability::Consent));
+            assert!(snapshot
+                .capabilities
+                .contains(&mrd_agent_ipc::AgentCapability::Input));
+        }
+        other => panic!("expected capabilities, got {other:?}"),
+    }
+    (agent, service, blocked)
+}
+
 async fn start_attended_runtime(
     backend: Arc<dyn ConsentBackend>,
     executor: Box<dyn AuthorizedCommandExecutor>,
@@ -369,10 +600,10 @@ async fn start_attended_runtime(
     tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
     tokio::io::DuplexStream,
 ) {
-    let desktop = Arc::new(Mutex::new(TrustedDesktopState {
+    let desktop = MutableDesktop::new(TrustedDesktopState {
         desktop_epoch: 11,
         desktop_kind: DesktopKind::Default,
-    }));
+    });
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: SessionDescriptor::new([10; 16], 4_242, 55, [11; 32], 7, [12; 32], 11)
@@ -387,7 +618,7 @@ async fn start_attended_runtime(
     .with_attended_authority(
         backend,
         Arc::new(AcceptVerifier),
-        Arc::new(MutableDesktop { state: desktop }),
+        desktop,
         ISSUER_KEY_ID,
         executor,
     )
@@ -465,6 +696,40 @@ async fn start_attended_runtime(
 
 async fn establish_pressed_input(service: &mut tokio::io::DuplexStream) {
     let first_consent = consent_request(20, [12; 16]);
+    establish_pressed_input_with_request(service, first_consent, None).await;
+}
+
+async fn establish_pressed_input_with_request<S>(
+    service: &mut S,
+    first_consent: ConsentRequest,
+    grant_expires_at_ms: Option<u64>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    establish_pressed_input_for(
+        service,
+        first_consent,
+        context(),
+        RESOURCE_ID,
+        START_GRANT_ID,
+        0x41,
+        grant_expires_at_ms,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn establish_pressed_input_for<S>(
+    service: &mut S,
+    first_consent: ConsentRequest,
+    execution: ExecutionContext,
+    resource_id: [u8; 16],
+    start_grant_id: [u8; 32],
+    key_code: u16,
+    grant_expires_at_ms: Option<u64>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     write_frame(
         &mut *service,
         &ServiceToAgent::ConsentRequest(first_consent.clone()),
@@ -483,14 +748,17 @@ async fn establish_pressed_input(service: &mut tokio::io::DuplexStream) {
         other => panic!("expected first consent result, got {other:?}"),
     }
 
-    let start = execute_command(
+    let mut start = execute_command(
         AgentCommand::StartInput {
-            resource_id: RESOURCE_ID,
+            resource_id,
             input_scopes: scopes(&[PermissionScope::InputKeyboard]),
         },
-        START_GRANT_ID,
-        &context(),
+        start_grant_id,
+        &execution,
     );
+    if let Some(expires_at_ms) = grant_expires_at_ms {
+        start.grant.claims.expires_at_ms = expires_at_ms;
+    }
     let start_token = start.request_token;
     write_frame(&mut *service, &ServiceToAgent::Execute(Box::new(start)))
         .await
@@ -507,12 +775,13 @@ async fn establish_pressed_input(service: &mut tokio::io::DuplexStream) {
         other => panic!("expected StartInput result, got {other:?}"),
     }
 
-    let key_down = event(
-        RESOURCE_ID,
-        START_GRANT_ID,
+    let key_down = event_for_session(
+        execution.session_id,
+        resource_id,
+        start_grant_id,
         1,
         InputEventPayload::Key {
-            key: InputKey::VirtualKey { code: 0x41 },
+            key: InputKey::VirtualKey { code: key_code },
             pressed: true,
         },
     );
@@ -1028,6 +1297,235 @@ fn release_session_keeps_a_shared_key_down_until_the_last_session_releases_it() 
 }
 
 #[test]
+fn release_session_removes_every_resource_owned_by_the_same_session() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = InputResourceManager::new(SharedInjector::available(Arc::clone(&events)));
+    let execution = context();
+    manager
+        .start(authorized_command(
+            AgentCommand::StartInput {
+                resource_id: RESOURCE_ID,
+                input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+            },
+            START_GRANT_ID,
+            &execution,
+        ))
+        .unwrap();
+    manager
+        .start(authorized_command(
+            AgentCommand::StartInput {
+                resource_id: OTHER_RESOURCE_ID,
+                input_scopes: scopes(&[PermissionScope::InputPointer]),
+            },
+            OTHER_START_GRANT_ID,
+            &execution,
+        ))
+        .unwrap();
+    assert_eq!(
+        manager.handle(
+            &event(
+                RESOURCE_ID,
+                START_GRANT_ID,
+                1,
+                InputEventPayload::Key {
+                    key: InputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            ),
+            &execution,
+        ),
+        InputAckOutcome::Applied
+    );
+    assert_eq!(
+        manager.handle(
+            &event(
+                OTHER_RESOURCE_ID,
+                OTHER_START_GRANT_ID,
+                1,
+                InputEventPayload::MouseButton {
+                    button: InputButton::Left,
+                    pressed: true,
+                },
+            ),
+            &execution,
+        ),
+        InputAckOutcome::Applied
+    );
+
+    manager.release_session(&session_id()).unwrap();
+
+    assert_eq!(events.lock().expect("events").len(), 4);
+    for (resource_id, grant_id) in [
+        (RESOURCE_ID, START_GRANT_ID),
+        (OTHER_RESOURCE_ID, OTHER_START_GRANT_ID),
+    ] {
+        assert_eq!(
+            manager.handle(
+                &event(
+                    resource_id,
+                    grant_id,
+                    2,
+                    InputEventPayload::MouseMove { x: 1, y: 1 },
+                ),
+                &execution,
+            ),
+            InputAckOutcome::Rejected {
+                reason: InputRejection::Grant,
+            }
+        );
+    }
+}
+
+#[test]
+fn release_session_keeps_a_shared_mouse_button_until_last_holder_releases() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut manager = InputResourceManager::new(SharedInjector::available(Arc::clone(&events)));
+    let first_context = context();
+    let second_context = context_for(other_session_id());
+    for (resource_id, grant_id, execution) in [
+        (RESOURCE_ID, START_GRANT_ID, &first_context),
+        (OTHER_RESOURCE_ID, OTHER_START_GRANT_ID, &second_context),
+    ] {
+        manager
+            .start(authorized_command(
+                AgentCommand::StartInput {
+                    resource_id,
+                    input_scopes: scopes(&[PermissionScope::InputPointer]),
+                },
+                grant_id,
+                execution,
+            ))
+            .unwrap();
+        assert_eq!(
+            manager.handle(
+                &event_for_session(
+                    execution.session_id.clone(),
+                    resource_id,
+                    grant_id,
+                    1,
+                    InputEventPayload::MouseButton {
+                        button: InputButton::Left,
+                        pressed: true,
+                    },
+                ),
+                execution,
+            ),
+            InputAckOutcome::Applied
+        );
+    }
+    assert_eq!(events.lock().expect("events").len(), 1);
+
+    manager.release_session(&session_id()).unwrap();
+    assert_eq!(events.lock().expect("events").len(), 1);
+    manager.release_session(&other_session_id()).unwrap();
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::MouseButton {
+                button: mrd_input::InputButton::Left,
+                pressed: true,
+            },
+            InputEvent::MouseButton {
+                button: mrd_input::InputButton::Left,
+                pressed: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn release_session_mixed_partial_failure_is_retryable_without_replaying_successes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let next_error = Arc::clone(&injector.next_error);
+    let mut manager = InputResourceManager::new(injector);
+    manager
+        .start(authorized_start(
+            RESOURCE_ID,
+            START_GRANT_ID,
+            scopes(&[
+                PermissionScope::InputPointer,
+                PermissionScope::InputKeyboard,
+            ]),
+        ))
+        .unwrap();
+    assert_eq!(
+        manager.handle(
+            &event(
+                RESOURCE_ID,
+                START_GRANT_ID,
+                1,
+                InputEventPayload::MouseButton {
+                    button: InputButton::Left,
+                    pressed: true,
+                },
+            ),
+            &context(),
+        ),
+        InputAckOutcome::Applied
+    );
+    assert_eq!(
+        manager.handle(
+            &event(
+                RESOURCE_ID,
+                START_GRANT_ID,
+                2,
+                InputEventPayload::Key {
+                    key: InputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            ),
+            &context(),
+        ),
+        InputAckOutcome::Applied
+    );
+    *next_error.lock().expect("input error") = Some(InputError::UipiDenied);
+
+    assert_eq!(
+        manager.release_session(&session_id()),
+        Err(InputError::UipiDenied)
+    );
+    assert_eq!(events.lock().expect("events").len(), 3);
+    manager
+        .release_session(&session_id())
+        .expect("retry failed transition only");
+    let recorded = events.lock().expect("events");
+    assert_eq!(recorded.len(), 4);
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|event| {
+                **event
+                    == InputEvent::Key {
+                        key: mrd_input::InputKey::VirtualKey(0x41),
+                        pressed: false,
+                    }
+            })
+            .count(),
+        1,
+    );
+    assert!(recorded.contains(&InputEvent::MouseButton {
+        button: mrd_input::InputButton::Left,
+        pressed: false,
+    }));
+    drop(recorded);
+    assert_eq!(
+        manager.handle(
+            &event(
+                RESOURCE_ID,
+                START_GRANT_ID,
+                3,
+                InputEventPayload::MouseMove { x: 9, y: 9 },
+            ),
+            &context(),
+        ),
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Grant,
+        }
+    );
+}
+
+#[test]
 fn cleanup_attempts_every_pressed_transition_and_retains_failed_state_for_retry() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let injector = SharedInjector::available(Arc::clone(&events));
@@ -1415,6 +1913,676 @@ async fn runtime_cleanup_failure_withholds_approval_and_fails_closed() {
             },
         ],
         "outer shutdown must retry the failed targeted release"
+    );
+}
+
+#[tokio::test]
+async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service) =
+        start_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    let mut consent = consent_request(40, [40; 16]);
+    consent.expires_at_ms = 1_800;
+    consent.authorization_expires_at_ms = 2_000;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(consent.clone()),
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::ConsentResult(result) => {
+            assert_eq!(result.decision, ConsentDecision::Approved)
+        }
+        other => panic!("expected approval, got {other:?}"),
+    }
+
+    let mut start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        START_GRANT_ID,
+        &context(),
+    );
+    start.grant.claims.expires_at_ms = 1_900;
+    write_frame(&mut service, &ServiceToAgent::Execute(Box::new(start)))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::CommandResult(result) => {
+            assert_eq!(result.outcome, CommandOutcome::Completed)
+        }
+        other => panic!("expected StartInput result, got {other:?}"),
+    }
+    let down = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        1,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        },
+    );
+    write_frame(&mut service, &ServiceToAgent::InputEvent(down))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => assert_eq!(ack.outcome, InputAckOutcome::Applied),
+        other => panic!("expected input ack, got {other:?}"),
+    }
+
+    let mut other_consent = consent_request(41, [41; 16]);
+    other_consent.session_id = other_session_id();
+    other_consent.authorization_expires_at_ms = 4_000;
+    write_frame(&mut service, &ServiceToAgent::ConsentRequest(other_consent))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::ConsentResult(result) => {
+            assert_eq!(result.decision, ConsentDecision::Approved)
+        }
+        other => panic!("expected other approval, got {other:?}"),
+    }
+    let other_context = context_for(other_session_id());
+    let other_start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        OTHER_START_GRANT_ID,
+        &other_context,
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(other_start)),
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::CommandResult(result) => {
+            assert_eq!(result.outcome, CommandOutcome::Completed)
+        }
+        other => panic!("expected other StartInput result, got {other:?}"),
+    }
+    let other_down = event_for_session(
+        other_session_id(),
+        OTHER_RESOURCE_ID,
+        OTHER_START_GRANT_ID,
+        1,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x42 },
+            pressed: true,
+        },
+    );
+    write_frame(&mut service, &ServiceToAgent::InputEvent(other_down))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => assert_eq!(ack.outcome, InputAckOutcome::Applied),
+        other => panic!("expected other input ack, got {other:?}"),
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if events.lock().expect("events").len() == 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("authority expiry must release input before the idle heartbeat");
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x42),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ]
+    );
+
+    let other_after_expiry = event_for_session(
+        other_session_id(),
+        OTHER_RESOURCE_ID,
+        OTHER_START_GRANT_ID,
+        2,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x43 },
+            pressed: true,
+        },
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(other_after_expiry),
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => assert_eq!(ack.outcome, InputAckOutcome::Applied),
+        other => panic!("expected surviving session input ack, got {other:?}"),
+    }
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn expiry_cleanup_failure_revokes_authority_and_global_retry_still_fail_stops() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let next_error = Arc::clone(&injector.next_error);
+    let (agent, mut service) = start_attended_input_runtime(injector).await;
+    let mut consent = consent_request(42, [42; 16]);
+    consent.expires_at_ms = 1_800;
+    consent.authorization_expires_at_ms = 2_000;
+    establish_pressed_input_with_request(&mut service, consent, Some(1_900)).await;
+    *next_error.lock().expect("input error") = Some(InputError::Platform(
+        "sensitive expiry cleanup detail".to_owned(),
+    ));
+
+    let error = tokio::time::timeout(Duration::from_secs(2), agent)
+        .await
+        .expect("expiry fail-stop timeout")
+        .expect("agent join")
+        .expect_err("targeted expiry cleanup failure must fail-stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::InputCleanupFailed
+    ));
+    assert_eq!(error.to_string(), "session input cleanup failed");
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ],
+        "outer release_all must retry the failed targeted release",
+    );
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "expiry failure must never look like a normal stop",
+    );
+}
+
+#[tokio::test]
+async fn expiry_releases_input_while_outbound_writer_is_backpressured() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, blocked) =
+        start_gated_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    let mut consent = consent_request(43, [43; 16]);
+    consent.expires_at_ms = 1_800;
+    consent.authorization_expires_at_ms = 2_000;
+    establish_pressed_input_with_request(&mut service, consent, Some(1_900)).await;
+
+    blocked.store(true, Ordering::SeqCst);
+    let queued = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        2,
+        InputEventPayload::MouseMove { x: 7, y: 8 },
+    );
+    write_frame(&mut service, &ServiceToAgent::InputEvent(queued))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if events.lock().expect("events").iter().any(|event| {
+                *event
+                    == InputEvent::Key {
+                        key: mrd_input::InputKey::VirtualKey(0x41),
+                        pressed: false,
+                    }
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked output must not delay monotonic authority cleanup");
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn stop_under_writer_backpressure_releases_input_before_deadline_failure() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, blocked) =
+        start_gated_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    establish_pressed_input_with_request(&mut service, consent_request(44, [44; 16]), None).await;
+    blocked.store(true, Ordering::SeqCst);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [44; 16],
+            deadline_ms: 1_600,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if events.lock().expect("events").len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("StopAgent must release input before waiting for writer flush");
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("stop deadline timeout")
+        .expect("agent join")
+        .expect_err("blocked writer cannot report a normal stopped exit");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "flush timeout must not masquerade as a successful stop",
+    );
+}
+
+#[tokio::test]
+async fn stop_cleanup_crossing_deadline_never_reports_stopped() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let slow = SlowCleanupInputBackend {
+        inner: InputResourceManager::new(SharedInjector::available(Arc::clone(&events))),
+        delay: Duration::from_millis(100),
+    };
+    let (agent, mut service) = start_attended_runtime(
+        Arc::new(ApproveRequestedScopes),
+        Box::new(NoopExecutor),
+        Some(Box::new(slow)),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [47; 16],
+            deadline_ms: 1_550,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("stop cleanup deadline timeout")
+        .expect("agent join")
+        .expect_err("cleanup crossing the anchored deadline cannot be stopped");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "late cleanup must not enqueue AgentStopping",
+    );
+}
+
+#[tokio::test]
+async fn persistent_stop_cleanup_failure_never_sends_agent_stopping() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let persistent_failure = Arc::clone(&injector.persistent_failure);
+    let (agent, mut service) = start_attended_input_runtime(injector).await;
+    establish_pressed_input(&mut service).await;
+    persistent_failure.store(true, Ordering::SeqCst);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [45; 16],
+            deadline_ms: 2_500,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("cleanup fail-stop timeout")
+        .expect("agent join")
+        .expect_err("persistent input cleanup failure must not stop cleanly");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::InputCleanupFailed
+    ));
+    assert_eq!(events.lock().expect("events").len(), 1);
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "cleanup failure must withhold AgentStopping",
+    );
+}
+
+#[tokio::test]
+async fn disconnect_cleanup_failure_is_not_reported_as_clean_disconnect() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let next_error = Arc::clone(&injector.next_error);
+    let (agent, mut service) = start_attended_input_runtime(injector).await;
+    establish_pressed_input(&mut service).await;
+    *next_error.lock().expect("input error") = Some(InputError::UipiDenied);
+
+    drop(service);
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("disconnect cleanup timeout")
+        .expect("agent join")
+        .expect_err("failed disconnect cleanup cannot be a clean exit");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::InputCleanupFailed
+    ));
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ],
+        "outer cleanup must retry while preserving the first disconnect failure",
+    );
+}
+
+#[tokio::test]
+async fn desktop_watch_revokes_and_releases_immediately_without_restoring_on_switch_back() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _blocked) = start_gated_attended_input_runtime_with_desktop(
+        SharedInjector::available(Arc::clone(&events)),
+        Arc::clone(&desktop),
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 12,
+        desktop_kind: DesktopKind::Secure,
+    });
+    let secure = match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::AgentCapabilitySnapshot(snapshot) => snapshot,
+        other => panic!("expected secure desktop capability snapshot, got {other:?}"),
+    };
+    assert_eq!(secure.revision, 2);
+    assert!(!secure
+        .capabilities
+        .contains(&mrd_agent_ipc::AgentCapability::Input));
+    assert!(!secure
+        .capabilities
+        .contains(&mrd_agent_ipc::AgentCapability::Consent));
+    assert_eq!(
+        events.lock().expect("events").last(),
+        Some(&InputEvent::Key {
+            key: mrd_input::InputKey::VirtualKey(0x41),
+            pressed: false,
+        })
+    );
+
+    let revoked = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        2,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x42 },
+            pressed: true,
+        },
+    );
+    write_frame(&mut service, &ServiceToAgent::InputEvent(revoked))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => assert_eq!(
+            ack.outcome,
+            InputAckOutcome::Rejected {
+                reason: InputRejection::Grant,
+            }
+        ),
+        other => panic!("expected revoked input ack, got {other:?}"),
+    }
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 13,
+        desktop_kind: DesktopKind::Default,
+    });
+    let restored = match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::AgentCapabilitySnapshot(snapshot) => snapshot,
+        other => panic!("expected restored desktop capability snapshot, got {other:?}"),
+    };
+    assert_eq!(restored.revision, 3);
+    let still_revoked = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        3,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x43 },
+            pressed: true,
+        },
+    );
+    write_frame(&mut service, &ServiceToAgent::InputEvent(still_revoked))
+        .await
+        .unwrap();
+    match read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => assert_eq!(
+            ack.outcome,
+            InputAckOutcome::Rejected {
+                reason: InputRejection::Grant,
+            }
+        ),
+        other => panic!("expected still-revoked input ack, got {other:?}"),
+    }
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn desktop_cleanup_attempts_all_sessions_before_fail_stop() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let next_error = Arc::clone(&injector.next_error);
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _blocked) =
+        start_gated_attended_input_runtime_with_desktop(injector, Arc::clone(&desktop)).await;
+    establish_pressed_input(&mut service).await;
+    let mut other_consent = consent_request(46, [46; 16]);
+    other_consent.session_id = other_session_id();
+    establish_pressed_input_for(
+        &mut service,
+        other_consent,
+        context_for(other_session_id()),
+        OTHER_RESOURCE_ID,
+        OTHER_START_GRANT_ID,
+        0x42,
+        None,
+    )
+    .await;
+    *next_error.lock().expect("input error") = Some(InputError::Platform(
+        "sensitive desktop cleanup detail".to_owned(),
+    ));
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 12,
+        desktop_kind: DesktopKind::Secure,
+    });
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("desktop fail-stop timeout")
+        .expect("agent join")
+        .expect_err("any desktop cleanup failure must fail-stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::InputCleanupFailed
+    ));
+    let recorded = events.lock().expect("events");
+    for code in [0x41, 0x42] {
+        assert!(recorded.contains(&InputEvent::Key {
+            key: mrd_input::InputKey::VirtualKey(code),
+            pressed: false,
+        }));
+    }
+    assert_eq!(
+        recorded.len(),
+        4,
+        "both sessions must be attempted and retried"
+    );
+}
+
+#[tokio::test]
+async fn closed_desktop_watcher_drains_authority_releases_input_and_fail_stops() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _blocked) = start_gated_attended_input_runtime_with_desktop(
+        SharedInjector::available(Arc::clone(&events)),
+        Arc::clone(&desktop),
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+
+    desktop.close();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("desktop watcher close timeout")
+        .expect("agent join")
+        .expect_err("closed desktop authority source must fail-stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::DesktopStateUnavailable
+    ));
+    assert_eq!(
+        events.lock().expect("events").last(),
+        Some(&InputEvent::Key {
+            key: mrd_input::InputKey::VirtualKey(0x41),
+            pressed: false,
+        })
     );
 }
 

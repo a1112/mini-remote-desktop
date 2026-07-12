@@ -55,7 +55,25 @@ pub(crate) struct TrustedSessionBinding {
     pub(crate) desktop_epoch: u64,
     pub(crate) desktop_kind: DesktopKind,
     pub(crate) authorization_expires_at_ms: u64,
+    pub(crate) authorization_deadline: Instant,
     pub(crate) expected_issuer_key_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AuthorityInvalidation {
+    pub(crate) session_id: SessionId,
+    pub(crate) authority_generation: u64,
+    pub(crate) consent_request_id: [u8; 16],
+}
+
+impl From<&TrustedSessionBinding> for AuthorityInvalidation {
+    fn from(binding: &TrustedSessionBinding) -> Self {
+        Self {
+            session_id: binding.session_id.clone(),
+            authority_generation: binding.authority_generation,
+            consent_request_id: binding.consent_request_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +295,8 @@ pub(crate) enum ConsentRegistryError {
     TombstoneCapacityExceeded,
     #[error("consent attempt identities are exhausted")]
     AttemptIdExhausted,
+    #[error("consent authority deadline is outside the monotonic clock range")]
+    DeadlineOverflow,
     #[error("the consent authority registry lock is unavailable")]
     Unavailable,
 }
@@ -287,6 +307,7 @@ struct PendingConsent {
     request: ConsentRequest,
     fingerprint: ConsentFingerprint,
     context: TrustedConsentContext,
+    authorization_deadline: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -324,7 +345,6 @@ struct ConsentAuthorityState {
 
 impl ConsentAuthorityState {
     fn prune_for_capacity(&mut self, now_ms: u64) {
-        self.prune_bindings(now_ms);
         self.tombstones
             .retain(|_, tombstone| now_ms < tombstone.retain_until_ms);
         let expired_request_ids = self
@@ -354,11 +374,6 @@ impl ConsentAuthorityState {
                 );
             }
         }
-    }
-
-    fn prune_bindings(&mut self, now_ms: u64) {
-        self.bindings
-            .retain(|_, binding| now_ms < binding.authorization_expires_at_ms);
     }
 
     fn allocate_attempt_id(&mut self) -> Result<u64, ConsentRegistryError> {
@@ -448,6 +463,12 @@ impl ConsentAuthorityRegistry {
             return Err(ConsentRegistryError::TombstoneCapacityExceeded);
         }
 
+        let authorization_deadline = checked_authority_deadline(
+            Instant::now(),
+            request
+                .authorization_expires_at_ms
+                .saturating_sub(context.now_ms),
+        )?;
         let attempt_id = state.allocate_attempt_id()?;
         state.pending.insert(
             request.request_id,
@@ -456,6 +477,7 @@ impl ConsentAuthorityRegistry {
                 request: request.clone(),
                 fingerprint,
                 context,
+                authorization_deadline,
             },
         );
         state
@@ -471,17 +493,93 @@ impl ConsentAuthorityRegistry {
         &self,
         session_id: &SessionId,
         now_ms: u64,
-    ) -> Option<TrustedSessionBinding> {
-        let mut state = self.state.lock().ok()?;
-        if state
+    ) -> Result<Option<TrustedSessionBinding>, ConsentRegistryError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        Ok(state.bindings.get(session_id).and_then(|binding| {
+            (now_ms < binding.authorization_expires_at_ms
+                && Instant::now() < binding.authorization_deadline)
+                .then(|| binding.clone())
+        }))
+    }
+
+    pub(crate) fn take_due(
+        &self,
+        now: Instant,
+        now_ms: u64,
+    ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        let due = state
             .bindings
-            .get(session_id)
-            .is_some_and(|binding| now_ms >= binding.authorization_expires_at_ms)
-        {
-            state.bindings.remove(session_id);
-            return None;
+            .iter()
+            .filter_map(|(session_id, binding)| {
+                (now >= binding.authorization_deadline
+                    || now_ms >= binding.authorization_expires_at_ms)
+                    .then_some(session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut invalidations = Vec::with_capacity(due.len());
+        for session_id in due {
+            if let Some(binding) = state.bindings.remove(&session_id) {
+                invalidations.push(AuthorityInvalidation::from(&binding));
+            }
         }
-        state.bindings.get(session_id).cloned()
+        Ok(invalidations)
+    }
+
+    pub(crate) fn next_authority_deadline(&self) -> Result<Option<Instant>, ConsentRegistryError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        Ok(state
+            .bindings
+            .values()
+            .map(|binding| binding.authorization_deadline)
+            .min())
+    }
+
+    pub(crate) fn take_desktop_mismatch(
+        &self,
+        desktop_epoch: u64,
+        desktop_kind: DesktopKind,
+    ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        let mismatching = state
+            .bindings
+            .iter()
+            .filter_map(|(session_id, binding)| {
+                (binding.desktop_epoch != desktop_epoch || binding.desktop_kind != desktop_kind)
+                    .then_some(session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut invalidations = Vec::with_capacity(mismatching.len());
+        for session_id in mismatching {
+            if let Some(binding) = state.bindings.remove(&session_id) {
+                invalidations.push(AuthorityInvalidation::from(&binding));
+            }
+        }
+        Ok(invalidations)
+    }
+
+    pub(crate) fn drain(&self) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        Ok(state
+            .bindings
+            .drain()
+            .map(|(_, binding)| AuthorityInvalidation::from(&binding))
+            .collect())
     }
 
     pub(crate) fn complete(
@@ -495,7 +593,6 @@ impl ConsentAuthorityRegistry {
             .state
             .lock()
             .map_err(|_| ConsentRegistryError::Unavailable)?;
-        state.prune_bindings(context.now_ms);
         let Some(request_id) = state.pending_attempts.remove(&attempt_id) else {
             return Ok(ConsentCompletionOutcome::Ignored);
         };
@@ -543,6 +640,7 @@ impl ConsentAuthorityRegistry {
                     desktop_epoch: pending.context.desktop_epoch,
                     desktop_kind: pending.context.desktop_kind,
                     authorization_expires_at_ms: pending.request.authorization_expires_at_ms,
+                    authorization_deadline: pending.authorization_deadline,
                     expected_issuer_key_id: pending.context.expected_issuer_key_id,
                 },
             );
@@ -702,7 +800,7 @@ impl ConsentManager {
         &self,
         session_id: &SessionId,
         now_ms: u64,
-    ) -> Option<TrustedSessionBinding> {
+    ) -> Result<Option<TrustedSessionBinding>, ConsentRegistryError> {
         self.registry.resolve(session_id, now_ms)
     }
 
@@ -729,14 +827,19 @@ impl ConsentManager {
         Ok(results)
     }
 
-    pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        self.active
+    pub(crate) fn next_deadline(&self) -> Result<Option<Instant>, ConsentRegistryError> {
+        let prompt_deadline = self
+            .active
             .as_ref()
             .filter(|active| active.phase == ActivePromptPhase::Prompting)
             .map(|active| active.prompt.deadline)
             .into_iter()
             .chain(self.queued.iter().map(|prompt| prompt.deadline))
-            .min()
+            .min();
+        Ok(prompt_deadline
+            .into_iter()
+            .chain(self.registry.next_authority_deadline()?)
+            .min())
     }
 
     pub(crate) async fn next_completion(&mut self) -> Option<BackendCompletion> {
@@ -844,6 +947,29 @@ impl ConsentManager {
         change: &FreshAuthorityChange,
     ) -> Result<bool, ConsentRegistryError> {
         self.registry.invalidate_fresh_authority(change)
+    }
+
+    pub(crate) fn take_due_authority(
+        &self,
+        now: Instant,
+        now_ms: u64,
+    ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        self.registry.take_due(now, now_ms)
+    }
+
+    pub(crate) fn take_desktop_mismatch(
+        &self,
+        desktop_epoch: u64,
+        desktop_kind: DesktopKind,
+    ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        self.registry
+            .take_desktop_mismatch(desktop_epoch, desktop_kind)
+    }
+
+    pub(crate) fn drain_authority(
+        &self,
+    ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
+        self.registry.drain()
     }
 
     pub(crate) fn expire_due(
@@ -1225,6 +1351,17 @@ fn valid_request_shape(request: &ConsentRequest) -> bool {
             .authorization_expires_at_ms
             .saturating_sub(request.issued_at_ms)
             <= AGENT_CONSENT_MAX_LIFETIME_MS
+}
+
+fn checked_authority_deadline(
+    now: Instant,
+    lifetime_ms: u64,
+) -> Result<Instant, ConsentRegistryError> {
+    if lifetime_ms > AGENT_CONSENT_MAX_LIFETIME_MS {
+        return Err(ConsentRegistryError::DeadlineOverflow);
+    }
+    now.checked_add(std::time::Duration::from_millis(lifetime_ms))
+        .ok_or(ConsentRegistryError::DeadlineOverflow)
 }
 
 #[cfg(test)]

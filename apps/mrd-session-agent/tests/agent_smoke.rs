@@ -81,11 +81,16 @@ impl ExecuteGrantVerifier for FixedExecuteGrantVerifier {
 
 struct MutableDesktopSource {
     state: Arc<RwLock<Option<TrustedDesktopState>>>,
+    changes: watch::Sender<()>,
 }
 
 impl TrustedDesktopStateSource for MutableDesktopSource {
     fn current_state(&self) -> Option<TrustedDesktopState> {
         self.state.read().ok().and_then(|state| *state)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
     }
 }
 
@@ -222,12 +227,15 @@ where
 {
     let request_token = execute.request_token;
     send_service_message(stream, &ServiceToAgent::Execute(Box::new(execute))).await;
-    match read_agent_message(stream).await {
-        AgentToService::CommandResult(result) => {
-            assert_eq!(result.request_token, request_token);
-            result
+    loop {
+        match read_agent_message(stream).await {
+            AgentToService::CommandResult(result) => {
+                assert_eq!(result.request_token, request_token);
+                return result;
+            }
+            AgentToService::AgentCapabilitySnapshot(_) | AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected command result, got {other:?}"),
         }
-        other => panic!("expected command result, got {other:?}"),
     }
 }
 
@@ -460,6 +468,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         desktop_epoch: 3,
         desktop_kind: DesktopKind::Default,
     })));
+    let (desktop_changes, _) = watch::channel(());
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: descriptor(),
@@ -475,6 +484,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         Arc::new(FixedExecuteGrantVerifier),
         Arc::new(MutableDesktopSource {
             state: Arc::clone(&desktop_state),
+            changes: desktop_changes,
         }),
         GRANT_ISSUER_KEY_ID,
         Box::new(CountingCaptureExecutor {
@@ -608,7 +618,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 
     *desktop_state.write().expect("desktop state lock") = Some(TrustedDesktopState {
-        desktop_epoch: 2,
+        desktop_epoch: 4,
         desktop_kind: DesktopKind::Secure,
     });
     let stale_after_switch = signed_start_capture([38; 32], [39; 16], 3);
@@ -620,11 +630,31 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
     );
     assert_eq!(executions.load(Ordering::SeqCst), 0);
     *desktop_state.write().expect("desktop state lock") = Some(TrustedDesktopState {
-        desktop_epoch: 3,
+        desktop_epoch: 5,
         desktop_kind: DesktopKind::Default,
     });
 
-    let first = signed_start_capture([20; 32], [21; 16], 3);
+    let first = signed_start_capture([20; 32], [21; 16], 5);
+    let revoked = send_execute_and_read_result(&mut service_stream, first.clone()).await;
+    assert_eq!(revoked.outcome, CommandOutcome::Rejected);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let mut replacement_consent = consent;
+    replacement_consent.request_token = 13;
+    replacement_consent.request_id = [13; 16];
+    send_service_message(
+        &mut service_stream,
+        &ServiceToAgent::ConsentRequest(replacement_consent.clone()),
+    )
+    .await;
+    match read_agent_message(&mut service_stream).await {
+        AgentToService::ConsentResult(result) => {
+            assert_eq!(result.request_id, replacement_consent.request_id);
+            assert_eq!(result.decision, ConsentDecision::Approved);
+        }
+        other => panic!("expected replacement consent result, got {other:?}"),
+    }
+
     let first_result = send_execute_and_read_result(&mut service_stream, first.clone()).await;
     assert_eq!(first_result.command_id, [21; 16]);
     assert_eq!(first_result.outcome, CommandOutcome::Completed);
@@ -634,13 +664,13 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
     assert_eq!(exact_replay, first_result);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
 
-    let new_grant_same_command = signed_start_capture([22; 32], [21; 16], 3);
+    let new_grant_same_command = signed_start_capture([22; 32], [21; 16], 5);
     let command_id_replay =
         send_execute_and_read_result(&mut service_stream, new_grant_same_command).await;
     assert_eq!(command_id_replay, first_result);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
 
-    let conflicting_command = signed_start_capture([20; 32], [23; 16], 3);
+    let conflicting_command = signed_start_capture([20; 32], [23; 16], 5);
     send_service_message(
         &mut service_stream,
         &ServiceToAgent::Execute(Box::new(conflicting_command)),
