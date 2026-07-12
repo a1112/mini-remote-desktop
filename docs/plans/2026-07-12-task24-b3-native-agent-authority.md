@@ -69,6 +69,11 @@
 3. Implement the Windows driver on a second dedicated message-loop thread. Build a modeless top-level window with standard static text, one checkbox per requested scope, and explicit Deny/Allow buttons. Deny receives initial/default focus; Escape, `WM_CLOSE`, empty selection, unknown commands, and native failures fail closed.
 4. Render only sanitized display data: replace NUL/control/bidi formatting characters, bound UTF-16 lengths, show the full peer key fingerprint, and use fixed local labels for scopes. No registration, policy, desktop, issuer, timestamps, token, or raw native errors cross into the UI.
 5. Make all button/close commands prompt-generation-bound so HWND reuse and late messages cannot decide another request. On backend drop, close any surface, stop the UI thread, and join it.
+   The native input gate accepts only the current Windows input message with a
+   matching keyboard/mouse-class device and hardware origin; ordinary posted,
+   sent, and non-UIAccess `SendInput` traffic is rejected. Windows defines
+   `IMO_HARDWARE` to include injection by `UIAccess=true` processes, which are
+   treated as an OS-trusted boundary and are outside the agent threat model.
 6. Run targeted tests, the package suite, strict Clippy, and formatting.
 7. Commit as `feat: add native Windows attended consent`.
 

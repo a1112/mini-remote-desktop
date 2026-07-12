@@ -146,6 +146,23 @@ pub struct ConsentPrompt {
 }
 
 impl ConsentPrompt {
+    #[cfg(test)]
+    pub(crate) fn for_native_test(
+        session_id: SessionId,
+        peer: PeerBinding,
+        requested_scopes: PermissionScopes,
+    ) -> Self {
+        Self {
+            session_id,
+            peer,
+            requested_scopes,
+        }
+    }
+
+    pub(crate) fn into_display_parts(self) -> (SessionId, PeerBinding, PermissionScopes) {
+        (self.session_id, self.peer, self.requested_scopes)
+    }
+
     /// Product session requesting attended consent.
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
