@@ -326,13 +326,24 @@ impl ConnectionControl {
     }
 
     fn cancel_request(&self, key: &RequestCorrelationKey, reason: RequestCancellation) {
-        let pending = self
-            .requests
-            .lock()
-            .ok()
-            .and_then(|mut requests| remove_pending_request(&mut requests, key));
-        if let Some(pending) = pending {
+        self.cancel_request_with_publication_hook(key, reason, || {});
+    }
+
+    fn cancel_request_with_publication_hook<F>(
+        &self,
+        key: &RequestCorrelationKey,
+        reason: RequestCancellation,
+        after_publication: F,
+    ) where
+        F: FnOnce(),
+    {
+        let pending = self.requests.lock().ok().and_then(|mut requests| {
+            let pending = requests.pending.get(key)?;
             let _ = pending.cancellation.send(Some(reason));
+            after_publication();
+            remove_pending_request(&mut requests, key)
+        });
+        if let Some(pending) = pending {
             if pending.sent {
                 self.queue_consent_cancel(&pending.reply, reason);
             }
@@ -378,15 +389,14 @@ impl ConnectionControl {
     }
 
     fn fail_request(&self, key: &RequestCorrelationKey, error: AgentRequestError) {
-        let pending = self
-            .requests
-            .lock()
-            .ok()
-            .and_then(|mut requests| remove_pending_request(&mut requests, key));
+        let pending = self.requests.lock().ok().and_then(|mut requests| {
+            remove_pending_request_with_cancellation(
+                &mut requests,
+                key,
+                RequestCancellation::SessionClosed,
+            )
+        });
         if let Some(pending) = pending {
-            let _ = pending
-                .cancellation
-                .send(Some(RequestCancellation::SessionClosed));
             pending.reply.fail(error);
         }
     }
@@ -482,10 +492,18 @@ impl ConnectionControl {
     }
 
     fn fail_all(&self, error: AgentRequestError) {
+        let reason = if error == AgentRequestError::Revoked {
+            RequestCancellation::PolicyChanged
+        } else {
+            RequestCancellation::SessionClosed
+        };
         let pending = self
             .requests
             .lock()
             .map(|mut requests| {
+                for pending in requests.pending.values() {
+                    let _ = pending.cancellation.send(Some(reason));
+                }
                 requests.pending_semantics.clear();
                 requests
                     .pending
@@ -495,12 +513,6 @@ impl ConnectionControl {
             })
             .unwrap_or_default();
         for pending in pending {
-            let reason = if error == AgentRequestError::Revoked {
-                RequestCancellation::PolicyChanged
-            } else {
-                RequestCancellation::SessionClosed
-            };
-            let _ = pending.cancellation.send(Some(reason));
             pending.reply.fail(error.clone());
         }
     }
@@ -513,6 +525,16 @@ fn remove_pending_request(
     let pending = requests.pending.remove(key)?;
     requests.pending_semantics.remove(&pending.semantic);
     Some(pending)
+}
+
+fn remove_pending_request_with_cancellation(
+    requests: &mut RequestCorrelationState,
+    key: &RequestCorrelationKey,
+    reason: RequestCancellation,
+) -> Option<PendingRequest> {
+    let pending = requests.pending.get(key)?;
+    let _ = pending.cancellation.send(Some(reason));
+    remove_pending_request(requests, key)
 }
 
 struct PendingRequestGuard {
@@ -1135,9 +1157,13 @@ impl AgentServer {
                                         // A concurrent caller cancellation can remove the
                                         // request immediately after the complete frame write.
                                         // Queue cleanup on this same connection without routing.
-                                        let reason = request_cancellation(&cancellation_after_write)
-                                            .unwrap_or(RequestCancellation::CallerAborted);
-                                        control.queue_cancel_for_written_message(&message, reason);
+                                        if let Some(reason) =
+                                            request_cancellation(&cancellation_after_write)
+                                        {
+                                            control.queue_cancel_for_written_message(
+                                                &message, reason,
+                                            );
+                                        }
                                     }
                                 }
                                 RequestWriteOutcome::Revoked => {
@@ -1273,12 +1299,7 @@ where
 fn request_cancellation(
     cancellation: &watch::Receiver<Option<RequestCancellation>>,
 ) -> Option<RequestCancellation> {
-    (*cancellation.borrow()).or_else(|| {
-        cancellation
-            .has_changed()
-            .is_err()
-            .then_some(RequestCancellation::SessionClosed)
-    })
+    *cancellation.borrow()
 }
 
 async fn wait_for_request_cancellation(
@@ -1289,7 +1310,7 @@ async fn wait_for_request_cancellation(
             return reason;
         }
         if cancellation.changed().await.is_err() {
-            return RequestCancellation::SessionClosed;
+            return std::future::pending().await;
         }
     }
 }
@@ -1509,6 +1530,89 @@ mod tests {
         assert!(
             delivered.is_empty(),
             "a cancellation already visible at the write boundary must win over a ready sink"
+        );
+    }
+
+    #[test]
+    fn a_completed_request_channel_is_not_reclassified_as_session_cancellation() {
+        let (completed, receiver) = watch::channel(None);
+        drop(completed);
+
+        assert_eq!(request_cancellation(&receiver), None);
+    }
+
+    #[test]
+    fn cancellation_is_published_before_pending_removal_becomes_visible() {
+        use std::sync::{atomic::AtomicBool, Barrier};
+
+        let (outbound, _outbound_rx) = mpsc::channel(1);
+        let control = ConnectionControl::new(outbound);
+        let key = RequestCorrelationKey::Execute(9);
+        let command_id = [9; 16];
+        let (reply, _response) = oneshot::channel();
+        let (cancellation, receiver) = watch::channel(None);
+        control
+            .register_request(
+                key.clone(),
+                PendingRequest {
+                    semantic: RequestSemanticKey::Execute(command_id),
+                    sent: false,
+                    cancellation,
+                    reply: PendingReply::Execute {
+                        registration_id: [8; 16],
+                        command_id,
+                        reply,
+                    },
+                },
+            )
+            .unwrap();
+
+        let published = Arc::new(Barrier::new(2));
+        let observer_started = Arc::new(AtomicBool::new(false));
+        let cancelling = {
+            let control = control.clone();
+            let key = key.clone();
+            let receiver = receiver.clone();
+            let published = Arc::clone(&published);
+            let observer_started = Arc::clone(&observer_started);
+            std::thread::spawn(move || {
+                control.cancel_request_with_publication_hook(
+                    &key,
+                    RequestCancellation::TimedOut,
+                    || {
+                        assert_eq!(
+                            request_cancellation(&receiver),
+                            Some(RequestCancellation::TimedOut)
+                        );
+                        published.wait();
+                        while !observer_started.load(Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                    },
+                );
+            })
+        };
+        let observing = {
+            let control = control.clone();
+            let key = key.clone();
+            let receiver = receiver.clone();
+            let published = Arc::clone(&published);
+            let observer_started = Arc::clone(&observer_started);
+            std::thread::spawn(move || {
+                published.wait();
+                observer_started.store(true, Ordering::Release);
+                (
+                    control.is_request_pending(&key),
+                    control.mark_request_sent(&key),
+                    request_cancellation(&receiver),
+                )
+            })
+        };
+
+        cancelling.join().unwrap();
+        assert_eq!(
+            observing.join().unwrap(),
+            (false, false, Some(RequestCancellation::TimedOut))
         );
     }
 }
