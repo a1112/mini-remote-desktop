@@ -21,6 +21,32 @@ use mrd_transport_quic_quinn::{
 };
 use std::sync::Arc;
 
+/// Migration rule: an installed Agent route is authoritative even on failure.
+pub(super) fn receiver_should_use_local_render_fallback(
+    dispatch: crate::agent_runtime::AgentRenderDispatch,
+) -> bool {
+    dispatch == crate::agent_runtime::AgentRenderDispatch::Unavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::receiver_should_use_local_render_fallback;
+    use crate::agent_runtime::AgentRenderDispatch;
+
+    #[test]
+    fn only_an_unavailable_agent_route_allows_service_local_render_fallback() {
+        assert!(receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Unavailable
+        ));
+        assert!(!receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Delivered
+        ));
+        assert!(!receiver_should_use_local_render_fallback(
+            AgentRenderDispatch::Rejected
+        ));
+    }
+}
+
 pub(super) async fn quic_media_v3_frame_to_legacy_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,

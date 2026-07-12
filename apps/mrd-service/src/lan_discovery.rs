@@ -208,7 +208,10 @@ use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates
 use media_receiver_decoder_candidates::{
     default_lan_receiver_decoder_candidates, prioritize_lan_receiver_decoder_candidates,
 };
-use media_receiver_runtime::{quic_media_v3_frame_to_legacy_frame, record_lan_decoded_frames};
+use media_receiver_runtime::{
+    quic_media_v3_frame_to_legacy_frame, receiver_should_use_local_render_fallback,
+    record_lan_decoded_frames,
+};
 #[cfg(test)]
 use media_render_policy::{
     lan_media_payload_hash_for_mode, lan_media_payload_hash_mode_for_profile_with_override,
@@ -4630,6 +4633,7 @@ async fn release_control_state_for_session(app_state: &Arc<AppState>, session_id
 }
 
 async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.remove_agent_render_route(session_id).await;
     app_state.media_profiles.lock().await.remove(session_id);
     app_state.capture_sources.lock().await.remove(session_id);
     app_state
@@ -6469,6 +6473,48 @@ async fn receive_quic_media_loop(
                                 &mut receiver_stats,
                             )
                             .await;
+                            continue;
+                        }
+
+                        let agent_codec = match frame_codec {
+                            LanAccessUnitCodec::H264 => mrd_agent_ipc::MediaCodec::H264,
+                            LanAccessUnitCodec::Hevc => mrd_agent_ipc::MediaCodec::Hevc,
+                            LanAccessUnitCodec::Av1 => mrd_agent_ipc::MediaCodec::Av1,
+                        };
+                        let agent_forward_started = Instant::now();
+                        let agent_dispatch = app_state
+                            .dispatch_agent_render_access_unit(
+                                &session_id,
+                                envelope.sequence,
+                                envelope.timestamp_us,
+                                agent_codec,
+                                frame.is_keyframe,
+                                envelope.payload.clone(),
+                            )
+                            .await;
+                        if !receiver_should_use_local_render_fallback(agent_dispatch) {
+                            receiver_stats.record_elapsed(
+                                "receiver.agent_render_forward",
+                                agent_forward_started,
+                            );
+                            match agent_dispatch {
+                                crate::agent_runtime::AgentRenderDispatch::Delivered => {
+                                    consecutive_decode_errors = 0;
+                                    decoder_waits_for_keyframe = false;
+                                }
+                                crate::agent_runtime::AgentRenderDispatch::Rejected => {
+                                    decoder_waits_for_keyframe = true;
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        frame.payload.len() as u64,
+                                        now_ms(),
+                                        "session-agent render route rejected encoded access unit",
+                                    );
+                                }
+                                crate::agent_runtime::AgentRenderDispatch::Unavailable => {
+                                    unreachable!("unavailable route must use local fallback")
+                                }
+                            }
                             continue;
                         }
 

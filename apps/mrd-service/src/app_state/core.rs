@@ -15,7 +15,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 use tokio::sync::Mutex;
@@ -84,12 +84,86 @@ pub struct AppState {
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
     /// Bounded encoded media ingress from authenticated session agents.
     pub agent_media_ingress: Arc<Mutex<crate::agent_runtime::AgentMediaIngress>>,
+    /// Exact service-to-agent render routes keyed by logical session.
+    agent_render_routes: Arc<
+        Mutex<crate::agent_runtime::AgentRenderRouteRegistry<crate::agent_runtime::AgentBinding>>,
+    >,
+    /// Authenticated server used to deliver prepared render access units.
+    agent_media_server: Arc<RwLock<Option<Arc<crate::agent_runtime::AgentServer>>>>,
 }
 
 impl AppState {
     /// Binds an authenticated agent server to this service's media ingress.
-    pub fn bind_agent_media_server(&self, server: &crate::agent_runtime::AgentServer) {
+    pub fn bind_agent_media_server(&self, server: Arc<crate::agent_runtime::AgentServer>) {
         server.set_media_ingress(self.agent_media_ingress.clone());
+        if let Ok(mut slot) = self.agent_media_server.write() {
+            *slot = Some(server);
+        }
+    }
+
+    /// Install one exact render binding after `StartRender` succeeds.
+    pub async fn install_agent_render_route(
+        &self,
+        session_id: mrd_proto::SessionId,
+        binding: crate::agent_runtime::AgentBinding,
+        resource_id: [u8; 16],
+    ) -> Result<(), crate::agent_runtime::AgentRenderRouteError> {
+        if binding.required_capability() != mrd_agent_ipc::AgentCapability::Render {
+            return Err(crate::agent_runtime::AgentRenderRouteError::InvalidBinding);
+        }
+        self.agent_render_routes
+            .lock()
+            .await
+            .install(session_id, binding, resource_id)
+    }
+
+    /// Revoke one logical session's render route without implicit retargeting.
+    pub async fn remove_agent_render_route(&self, session_id: &mrd_proto::SessionId) -> bool {
+        self.agent_render_routes
+            .lock()
+            .await
+            .remove(session_id)
+            .is_some()
+    }
+
+    /// Validate and deliver one encoded receiver unit to its exact session agent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_agent_render_access_unit(
+        &self,
+        session_id: &mrd_proto::SessionId,
+        sequence: u64,
+        timestamp_us: u64,
+        codec: mrd_agent_ipc::MediaCodec,
+        is_keyframe: bool,
+        payload: Vec<u8>,
+    ) -> crate::agent_runtime::AgentRenderDispatch {
+        let prepared = match self.agent_render_routes.lock().await.prepare(
+            session_id,
+            sequence,
+            timestamp_us,
+            codec,
+            is_keyframe,
+            payload,
+        ) {
+            Ok(prepared) => prepared,
+            Err(crate::agent_runtime::AgentRenderRouteError::MissingSession) => {
+                return crate::agent_runtime::AgentRenderDispatch::Unavailable;
+            }
+            Err(_) => return crate::agent_runtime::AgentRenderDispatch::Rejected,
+        };
+        let server = self
+            .agent_media_server
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let Some(server) = server else {
+            return crate::agent_runtime::AgentRenderDispatch::Rejected;
+        };
+        let (binding, unit) = prepared.into_parts();
+        match server.send_render_access_unit(&binding, unit) {
+            Ok(()) => crate::agent_runtime::AgentRenderDispatch::Delivered,
+            Err(_) => crate::agent_runtime::AgentRenderDispatch::Rejected,
+        }
     }
 
     /// Clears queued agent media after the owning session is revoked.
@@ -276,6 +350,11 @@ impl AppState {
                 crate::agent_runtime::AgentMediaIngress::new(32)
                     .expect("non-zero agent media ingress capacity"),
             )),
+            agent_render_routes: Arc::new(Mutex::new(
+                crate::agent_runtime::AgentRenderRouteRegistry::new(32)
+                    .expect("non-zero agent render route capacity"),
+            )),
+            agent_media_server: Arc::new(RwLock::new(None)),
         }
     }
 

@@ -3,6 +3,7 @@
 #![allow(dead_code, unused_imports)]
 
 mod media_ingress;
+mod media_render;
 mod registry;
 mod server;
 #[cfg(not(windows))]
@@ -11,6 +12,7 @@ mod unsupported;
 mod windows_pipe;
 
 pub use media_ingress::*;
+pub use media_render::*;
 pub use registry::*;
 pub use server::*;
 #[cfg(not(windows))]

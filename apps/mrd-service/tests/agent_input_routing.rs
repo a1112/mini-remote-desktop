@@ -9,10 +9,11 @@ use mrd_agent_ipc::{
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
     AgentBinding, AgentCallerKind, AgentConnectionExit, AgentConnectionId, AgentRegistry,
-    AgentRegistryError, AgentRequestError, AgentServer, AgentServerClock, AgentServerError,
-    ChallengeMaterial, ChallengeMaterialSource, ExpectedAgentSession, ObservedAgentIdentity,
-    ReplacementPolicy,
+    AgentRegistryError, AgentRenderDispatch, AgentRequestError, AgentServer, AgentServerClock,
+    AgentServerError, ChallengeMaterial, ChallengeMaterialSource, ExpectedAgentSession,
+    ObservedAgentIdentity, ReplacementPolicy,
 };
+use mrd_service::app_state::AppState;
 use mrd_session::{PermissionScope, PermissionScopes};
 use std::{
     collections::BTreeSet,
@@ -1735,6 +1736,64 @@ async fn render_access_unit_routes_only_to_the_exact_render_binding() {
             .expect("read render frame")
             .message,
         ServiceToAgent::RenderAccessUnit(unit)
+    );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn app_state_render_route_delivers_then_revokes_without_retargeting() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let mut agent = ConnectedAgent::connect_to(
+        Arc::clone(&registry),
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input, AgentCapability::Render]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let render_binding = registry
+        .bind_active_session(WINDOWS_SESSION_ID, AgentCapability::Render, NOW_MS)
+        .expect("bind render capability");
+    let app_state = AppState::new();
+    app_state.bind_agent_media_server(Arc::clone(&server));
+    let session_id = SessionId("render-session".to_string());
+    app_state
+        .install_agent_render_route(session_id.clone(), render_binding, [31; 16])
+        .await
+        .expect("install exact render route");
+
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(
+                &session_id,
+                1,
+                2,
+                MediaCodec::H264,
+                true,
+                vec![1, 2, 3],
+            )
+            .await,
+        AgentRenderDispatch::Delivered
+    );
+    assert!(matches!(
+        read_frame::<_, ServiceToAgent>(&mut agent.stream)
+            .await
+            .expect("read routed render frame")
+            .message,
+        ServiceToAgent::RenderAccessUnit(unit) if unit.session_id == session_id.0
+    ));
+
+    assert!(app_state.remove_agent_render_route(&session_id).await);
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(&session_id, 2, 3, MediaCodec::H264, false, vec![4],)
+            .await,
+        AgentRenderDispatch::Unavailable
     );
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
