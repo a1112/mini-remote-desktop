@@ -150,4 +150,15 @@ mod tests {
         assert_eq!(first[0].session_id, "session-1");
         assert_eq!(ingress.pop().unwrap().session_id, "session-2");
     }
+
+    #[test]
+    fn session_len_counts_only_target_session() {
+        let mut ingress = AgentMediaIngress::new(4).unwrap();
+        let mut second = unit(2);
+        second.session_id = "session-2".to_string();
+        assert!(ingress.push(unit(1)));
+        assert!(ingress.push(second));
+        assert_eq!(ingress.session_len("session-1"), 1);
+        assert_eq!(ingress.session_len("session-2"), 1);
+    }
 }
