@@ -5,6 +5,29 @@ use mrd_proto::SessionId;
 use std::collections::HashMap;
 use thiserror::Error;
 
+/// Failures in the signed StartRender transaction.
+#[derive(Debug, Error)]
+pub enum AgentRenderControlError {
+    /// No authenticated Agent server was bound to application state.
+    #[error("agent media server is unavailable")]
+    ServerUnavailable,
+    /// Trusted authority facts could not produce a command-bound grant.
+    #[error(transparent)]
+    Grant(#[from] super::ExecuteGrantIssueError),
+    /// The bounded route registry rejected reservation or activation.
+    #[error(transparent)]
+    Route(#[from] AgentRenderRouteError),
+    /// Exact request delivery or correlation failed.
+    #[error(transparent)]
+    Request(#[from] super::AgentRequestError),
+    /// Agent explicitly rejected or failed StartRender.
+    #[error("session agent did not complete StartRender")]
+    CommandRejected,
+    /// Route was revoked while StartRender was in flight.
+    #[error("reserved render route was revoked before activation")]
+    ActivationLost,
+}
+
 /// Fail-closed render-route registry errors.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum AgentRenderRouteError {
@@ -23,6 +46,9 @@ pub enum AgentRenderRouteError {
     /// No installed route owns the logical session.
     #[error("agent render route is unavailable for the session")]
     MissingSession,
+    /// StartRender has not completed, so the reserved route cannot receive frames.
+    #[error("agent render route is pending activation")]
+    PendingSession,
     /// Access-unit sequence must strictly increase within the route.
     #[error("agent render access-unit sequence is not monotonic")]
     NonMonotonicSequence,
@@ -47,6 +73,7 @@ struct AgentRenderRoute<B> {
     binding: B,
     resource_id: [u8; 16],
     last_sequence: u64,
+    active: bool,
 }
 
 /// Exact binding and validated unit prepared under one registry mutation.
@@ -99,6 +126,21 @@ where
         binding: B,
         resource_id: [u8; 16],
     ) -> Result<(), AgentRenderRouteError> {
+        self.reserve(session_id.clone(), binding, resource_id)?;
+        if self.activate(&session_id) {
+            Ok(())
+        } else {
+            Err(AgentRenderRouteError::MissingSession)
+        }
+    }
+
+    /// Reserve one route while its signed StartRender command is in flight.
+    pub fn reserve(
+        &mut self,
+        session_id: SessionId,
+        binding: B,
+        resource_id: [u8; 16],
+    ) -> Result<(), AgentRenderRouteError> {
         if resource_id == [0; 16] {
             return Err(AgentRenderRouteError::InvalidResource);
         }
@@ -114,9 +156,31 @@ where
                 binding,
                 resource_id,
                 last_sequence: 0,
+                active: false,
             },
         );
         Ok(())
+    }
+
+    /// Activate a previously reserved route after StartRender completes.
+    pub fn activate(&mut self, session_id: &SessionId) -> bool {
+        self.routes.get_mut(session_id).is_some_and(|route| {
+            route.active = true;
+            true
+        })
+    }
+
+    /// Deactivate an active route and return exact cleanup material.
+    pub fn begin_stop(&mut self, session_id: &SessionId) -> Option<(B, [u8; 16])> {
+        self.routes.get_mut(session_id).map(|route| {
+            route.active = false;
+            (route.binding.clone(), route.resource_id)
+        })
+    }
+
+    /// Cancel a pending route; active removal uses the same explicit identity path.
+    pub fn cancel(&mut self, session_id: &SessionId) -> Option<B> {
+        self.remove(session_id)
     }
 
     /// Prepare one validated IPC unit and advance the route sequence atomically.
@@ -134,6 +198,9 @@ where
             .routes
             .get_mut(session_id)
             .ok_or(AgentRenderRouteError::MissingSession)?;
+        if !route.active {
+            return Err(AgentRenderRouteError::PendingSession);
+        }
         if sequence <= route.last_sequence {
             return Err(AgentRenderRouteError::NonMonotonicSequence);
         }

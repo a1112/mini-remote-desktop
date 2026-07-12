@@ -2,6 +2,7 @@
 
 #![allow(dead_code, unused_imports)]
 
+mod execute_issuer;
 mod media_ingress;
 mod media_render;
 mod registry;
@@ -11,6 +12,7 @@ mod unsupported;
 #[cfg(windows)]
 mod windows_pipe;
 
+pub use execute_issuer::*;
 pub use media_ingress::*;
 pub use media_render::*;
 pub use registry::*;

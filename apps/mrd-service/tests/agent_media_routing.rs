@@ -50,3 +50,30 @@ fn render_route_capacity_and_invalid_resources_fail_closed() {
         Err(AgentRenderRouteError::CapacityExceeded)
     );
 }
+
+#[test]
+fn pending_render_route_requires_explicit_activation_or_cancellation() {
+    let mut routes = AgentRenderRouteRegistry::new(1).unwrap();
+    let session = SessionId("pending".into());
+    routes
+        .reserve(session.clone(), "binding", [3; 16])
+        .expect("reserve route before StartRender");
+    assert_eq!(
+        routes.prepare(&session, 1, 1, MediaCodec::H264, true, vec![1]),
+        Err(AgentRenderRouteError::PendingSession)
+    );
+    assert!(routes.activate(&session));
+    assert!(routes
+        .prepare(&session, 1, 1, MediaCodec::H264, true, vec![1])
+        .is_ok());
+
+    assert_eq!(routes.remove(&session), Some("binding"));
+    routes
+        .reserve(session.clone(), "replacement", [4; 16])
+        .unwrap();
+    assert_eq!(routes.cancel(&session), Some("replacement"));
+    assert_eq!(
+        routes.prepare(&session, 2, 2, MediaCodec::H264, false, vec![2]),
+        Err(AgentRenderRouteError::MissingSession)
+    );
+}

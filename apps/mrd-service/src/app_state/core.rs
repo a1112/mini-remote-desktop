@@ -117,6 +117,115 @@ impl AppState {
             .install(session_id, binding, resource_id)
     }
 
+    /// Reserve, sign, execute, and activate one exact Agent render resource.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_agent_render_route(
+        &self,
+        issuer: &crate::agent_runtime::ExecuteGrantIssuer,
+        binding: crate::agent_runtime::AgentBinding,
+        template: crate::agent_runtime::ExecuteGrantTemplate,
+        resource_id: [u8; 16],
+        display_id: u32,
+        command_id: [u8; 16],
+        grant_id: [u8; 32],
+    ) -> Result<(), crate::agent_runtime::AgentRenderControlError> {
+        if binding.required_capability() != mrd_agent_ipc::AgentCapability::Render
+            || !template.matches_binding(&binding)
+        {
+            return Err(crate::agent_runtime::ExecuteGrantIssueError::CapabilityMismatch.into());
+        }
+        let server = self
+            .agent_media_server
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or(crate::agent_runtime::AgentRenderControlError::ServerUnavailable)?;
+        let session_id = template.session_id().clone();
+        let execute = issuer.issue(
+            command_id,
+            grant_id,
+            mrd_agent_ipc::AgentCommand::StartRender {
+                resource_id,
+                display_id,
+            },
+            template,
+        )?;
+        self.agent_render_routes.lock().await.reserve(
+            session_id.clone(),
+            binding.clone(),
+            resource_id,
+        )?;
+        let result = server.request_execute(&binding, execute).await;
+        let completed = matches!(
+            &result,
+            Ok(mrd_agent_ipc::CommandResult {
+                outcome: mrd_agent_ipc::CommandOutcome::Completed,
+                ..
+            })
+        );
+        if !completed {
+            self.agent_render_routes.lock().await.cancel(&session_id);
+            return match result {
+                Ok(_) => Err(crate::agent_runtime::AgentRenderControlError::CommandRejected),
+                Err(error) => Err(error.into()),
+            };
+        }
+        if !self.agent_render_routes.lock().await.activate(&session_id) {
+            return Err(crate::agent_runtime::AgentRenderControlError::ActivationLost);
+        }
+        Ok(())
+    }
+
+    /// Deactivate, sign, execute, and remove one exact Agent render resource.
+    pub async fn stop_agent_render_route(
+        &self,
+        issuer: &crate::agent_runtime::ExecuteGrantIssuer,
+        session_id: &mrd_proto::SessionId,
+        template: crate::agent_runtime::ExecuteGrantTemplate,
+        command_id: [u8; 16],
+        grant_id: [u8; 32],
+    ) -> Result<(), crate::agent_runtime::AgentRenderControlError> {
+        let server = self
+            .agent_media_server
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or(crate::agent_runtime::AgentRenderControlError::ServerUnavailable)?;
+        let Some((binding, resource_id)) =
+            self.agent_render_routes.lock().await.begin_stop(session_id)
+        else {
+            return Err(crate::agent_runtime::AgentRenderRouteError::MissingSession.into());
+        };
+        if template.session_id() != session_id || !template.matches_binding(&binding) {
+            self.agent_render_routes.lock().await.activate(session_id);
+            return Err(crate::agent_runtime::ExecuteGrantIssueError::CapabilityMismatch.into());
+        }
+        let execute = match issuer.issue(
+            command_id,
+            grant_id,
+            mrd_agent_ipc::AgentCommand::StopRender { resource_id },
+            template,
+        ) {
+            Ok(execute) => execute,
+            Err(error) => {
+                self.agent_render_routes.lock().await.activate(session_id);
+                return Err(error.into());
+            }
+        };
+        let result = server.request_execute(&binding, execute).await;
+        self.agent_render_routes.lock().await.remove(session_id);
+        match result {
+            Ok(mrd_agent_ipc::CommandResult {
+                outcome:
+                    mrd_agent_ipc::CommandOutcome::Completed
+                    | mrd_agent_ipc::CommandOutcome::AlreadyStopped,
+                ..
+            }) => Ok(()),
+            Ok(_) => Err(crate::agent_runtime::AgentRenderControlError::CommandRejected),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Revoke one logical session's render route without implicit retargeting.
     pub async fn remove_agent_render_route(&self, session_id: &mrd_proto::SessionId) -> bool {
         self.agent_render_routes

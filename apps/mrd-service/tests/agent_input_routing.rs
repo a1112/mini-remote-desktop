@@ -1,17 +1,19 @@
 use mrd_agent_ipc::{
     decode_frame, read_frame, write_frame, AgentCapability, AgentCapabilitySnapshot, AgentCommand,
-    AgentRegister, AgentRegistered, AgentToService, CancelConsent, CommandOutcome, CommandResult,
-    ConsentCancelReason, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
-    ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, GrantAudience, InputAck, InputAckOutcome,
-    InputEventEnvelope, InputEventPayload, MediaCodec, PeerBinding, RegistrationProofVerifier,
-    RenderAccessUnit, ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
+    AgentRegister, AgentRegistered, AgentToService, BoundEd25519ExecuteGrantVerifier,
+    CancelConsent, CommandOutcome, CommandResult, ConsentCancelReason, ConsentDecision,
+    ConsentRequest, ConsentResult, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
+    ExecuteGrantVerifier, GrantAudience, InputAck, InputAckOutcome, InputEventEnvelope,
+    InputEventPayload, MediaCodec, PeerBinding, RegistrationProofVerifier, RenderAccessUnit,
+    ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
     AgentBinding, AgentCallerKind, AgentConnectionExit, AgentConnectionId, AgentRegistry,
     AgentRegistryError, AgentRenderDispatch, AgentRequestError, AgentServer, AgentServerClock,
-    AgentServerError, ChallengeMaterial, ChallengeMaterialSource, ExpectedAgentSession,
-    ObservedAgentIdentity, ReplacementPolicy,
+    AgentServerError, ChallengeMaterial, ChallengeMaterialSource, ExecuteGrantIssueError,
+    ExecuteGrantIssuer, ExecuteGrantTemplate, ExpectedAgentSession, ObservedAgentIdentity,
+    ReplacementPolicy,
 };
 use mrd_service::app_state::AppState;
 use mrd_session::{PermissionScope, PermissionScopes};
@@ -1605,6 +1607,78 @@ async fn execute_command_capability_must_match_the_persisted_binding() {
 }
 
 #[tokio::test]
+async fn execute_issuer_binds_render_command_to_exact_agent_and_authority() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let agent = ConnectedAgent::connect_to(
+        Arc::clone(&registry),
+        server,
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input, AgentCapability::Render]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let render_binding = registry
+        .bind_active_session(WINDOWS_SESSION_ID, AgentCapability::Render, NOW_MS)
+        .expect("bind render capability");
+    let issuer = ExecuteGrantIssuer::from_seed([77; 32]).expect("valid issuer seed");
+    let command = AgentCommand::StartRender {
+        resource_id: [78; 16],
+        display_id: 1,
+    };
+    let template = ExecuteGrantTemplate::for_binding(
+        &render_binding,
+        SessionId("render-authority".into()),
+        PeerBinding {
+            device_id: DeviceId("peer-render".into()),
+            key_id: [79; 32],
+        },
+        permission_scopes([PermissionScope::ScreenView]),
+        4,
+        DesktopKind::Default,
+        NOW_MS,
+        NOW_MS,
+        NOW_MS + 1_000,
+    )
+    .expect("template from exact binding");
+
+    let missing_scope = template.clone().with_scopes(PermissionScopes::new());
+    let execute = issuer
+        .issue([80; 16], [81; 32], command.clone(), template)
+        .expect("issue exact render grant");
+    let verifier = BoundEd25519ExecuteGrantVerifier::new(issuer.key_id(), issuer.public_key())
+        .expect("bind verifier");
+    assert!(verifier.verify(
+        &execute.grant.issuer_key_id,
+        &execute.grant.signing_bytes(),
+        &execute.grant.signature,
+    ));
+    assert_eq!(execute.grant.claims.command_digest, command.digest());
+    assert_eq!(
+        execute.grant.claims.registration_id,
+        *render_binding.registration_id()
+    );
+    assert_eq!(
+        execute.grant.claims.registration_epoch,
+        render_binding.registration_epoch()
+    );
+    assert_eq!(
+        execute.grant.claims.scopes,
+        permission_scopes([PermissionScope::ScreenView])
+    );
+
+    assert_eq!(
+        issuer.issue([82; 16], [83; 32], command, missing_scope),
+        Err(ExecuteGrantIssueError::MissingScope)
+    );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
 async fn input_request_routes_to_exact_binding_and_returns_correlated_ack() {
     let mut agent = ConnectedAgent::start(Duration::from_secs(1)).await;
     let event = input_event(1);
@@ -1792,6 +1866,198 @@ async fn app_state_render_route_delivers_then_revokes_without_retargeting() {
     assert_eq!(
         app_state
             .dispatch_agent_render_access_unit(&session_id, 2, 3, MediaCodec::H264, false, vec![4],)
+            .await,
+        AgentRenderDispatch::Unavailable
+    );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn signed_start_render_activates_route_only_after_agent_completion() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let mut agent = ConnectedAgent::connect_to(
+        Arc::clone(&registry),
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input, AgentCapability::Render]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let render_binding = registry
+        .bind_active_session(WINDOWS_SESSION_ID, AgentCapability::Render, NOW_MS)
+        .expect("bind render capability");
+    let session_id = SessionId("signed-render-session".into());
+    let template = ExecuteGrantTemplate::for_binding(
+        &render_binding,
+        session_id.clone(),
+        PeerBinding {
+            device_id: DeviceId("peer-render".into()),
+            key_id: [90; 32],
+        },
+        permission_scopes([PermissionScope::ScreenView]),
+        5,
+        DesktopKind::Default,
+        NOW_MS,
+        NOW_MS,
+        NOW_MS + 1_000,
+    )
+    .unwrap();
+    let app_state = Arc::new(AppState::new());
+    app_state.bind_agent_media_server(Arc::clone(&server));
+    let issuer = Arc::new(ExecuteGrantIssuer::from_seed([91; 32]).unwrap());
+    let starting = tokio::spawn({
+        let app_state = Arc::clone(&app_state);
+        let issuer = Arc::clone(&issuer);
+        let render_binding = render_binding.clone();
+        async move {
+            app_state
+                .start_agent_render_route(
+                    issuer.as_ref(),
+                    render_binding,
+                    template,
+                    [92; 16],
+                    1,
+                    [93; 16],
+                    [94; 32],
+                )
+                .await
+        }
+    });
+
+    let execute = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read StartRender")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected StartRender, got {other:?}"),
+    };
+    assert_eq!(
+        execute.command,
+        AgentCommand::StartRender {
+            resource_id: [92; 16],
+            display_id: 1,
+        }
+    );
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(&session_id, 1, 1, MediaCodec::H264, true, vec![1],)
+            .await,
+        AgentRenderDispatch::Rejected
+    );
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(CommandResult {
+            request_token: execute.request_token,
+            registration_id: agent.identity.registration_id,
+            command_id: execute.command_id,
+            outcome: CommandOutcome::Completed,
+            completed_at_ms: NOW_MS,
+        }),
+    )
+    .await
+    .unwrap();
+    starting.await.unwrap().expect("activate render route");
+
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(&session_id, 1, 1, MediaCodec::H264, true, vec![1],)
+            .await,
+        AgentRenderDispatch::Delivered
+    );
+    assert!(matches!(
+        read_frame::<_, ServiceToAgent>(&mut agent.stream)
+            .await
+            .unwrap()
+            .message,
+        ServiceToAgent::RenderAccessUnit(_)
+    ));
+
+    let stop_template = ExecuteGrantTemplate::for_binding(
+        &render_binding,
+        session_id.clone(),
+        PeerBinding {
+            device_id: DeviceId("peer-render".into()),
+            key_id: [90; 32],
+        },
+        permission_scopes([PermissionScope::ScreenView]),
+        5,
+        DesktopKind::Default,
+        NOW_MS,
+        NOW_MS,
+        NOW_MS + 1_000,
+    )
+    .unwrap();
+    let stopping = tokio::spawn({
+        let app_state = Arc::clone(&app_state);
+        let issuer = Arc::clone(&issuer);
+        async move {
+            app_state
+                .stop_agent_render_route(
+                    issuer.as_ref(),
+                    &session_id,
+                    stop_template,
+                    [95; 16],
+                    [96; 32],
+                )
+                .await
+        }
+    });
+    let stop_execute = match read_frame::<_, ServiceToAgent>(&mut agent.stream)
+        .await
+        .expect("read StopRender")
+        .message
+    {
+        ServiceToAgent::Execute(execute) => *execute,
+        other => panic!("expected StopRender, got {other:?}"),
+    };
+    assert_eq!(
+        stop_execute.command,
+        AgentCommand::StopRender {
+            resource_id: [92; 16],
+        }
+    );
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(
+                &SessionId("signed-render-session".into()),
+                2,
+                2,
+                MediaCodec::H264,
+                false,
+                vec![2],
+            )
+            .await,
+        AgentRenderDispatch::Rejected
+    );
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(CommandResult {
+            request_token: stop_execute.request_token,
+            registration_id: agent.identity.registration_id,
+            command_id: stop_execute.command_id,
+            outcome: CommandOutcome::Completed,
+            completed_at_ms: NOW_MS,
+        }),
+    )
+    .await
+    .unwrap();
+    stopping.await.unwrap().expect("stop render route");
+    assert_eq!(
+        app_state
+            .dispatch_agent_render_access_unit(
+                &SessionId("signed-render-session".into()),
+                2,
+                2,
+                MediaCodec::H264,
+                false,
+                vec![2],
+            )
             .await,
         AgentRenderDispatch::Unavailable
     );

@@ -13,6 +13,7 @@ name = "mrd-service"
 path = "src/main.rs"
 
 [dependencies]
+ed25519-dalek.workspace = true
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
 common-control-proto = { path = "../../common-control-proto" }
