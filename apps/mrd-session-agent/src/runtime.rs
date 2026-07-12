@@ -3,9 +3,8 @@
 use crate::capabilities::AgentCapabilities;
 use crate::consent::{
     BackendCompletion, ConsentAbortReason, ConsentBackend, ConsentManager, ConsentRegistryError,
-    TrustedConsentContext,
+    TrustedConsentContext, TrustedSessionBinding,
 };
-pub use crate::consent::{TrustedSessionBinding, TrustedSessionBindingSource};
 use crate::input::InputBackend;
 use mrd_agent_ipc::{
     decode_frame, registration_proof_signing_bytes, validate_execute_command, write_frame,
@@ -308,19 +307,6 @@ pub trait AuthorizedCommandExecutor: Send {
     fn execute(&mut self, command: AuthorizedCommand) -> CommandOutcome;
 }
 
-#[derive(Default)]
-struct ShellBackend;
-
-impl AuthorizedCommandExecutor for ShellBackend {
-    fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities::empty()
-    }
-
-    fn execute(&mut self, _command: AuthorizedCommand) -> CommandOutcome {
-        CommandOutcome::Rejected
-    }
-}
-
 /// Normal termination reason for the agent event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentExit {
@@ -375,6 +361,9 @@ pub enum AgentRuntimeError {
     /// The bounded agent-local consent authority could not safely progress.
     #[error("agent-local consent authority is unavailable")]
     ConsentStateUnavailable,
+    /// A fresh local authority could not synchronously retire old input state.
+    #[error("session input cleanup failed")]
+    InputCleanupFailed,
 }
 
 /// Startup failures spanning local endpoint connection and the agent runtime.
@@ -388,32 +377,36 @@ pub enum AgentStartError {
     Runtime(#[from] AgentRuntimeError),
 }
 
-struct ExecutionSecurity {
-    bindings: Arc<dyn TrustedSessionBindingSource>,
+struct AttendedAuthority {
+    manager: ConsentManager,
     verifier: Arc<dyn ExecuteGrantVerifier + Send + Sync>,
     desktop_state: Arc<dyn TrustedDesktopStateSource>,
-}
-
-struct ConsentRuntime {
-    manager: ConsentManager,
-    desktop_state: Arc<dyn TrustedDesktopStateSource>,
     expected_issuer_key_id: [u8; 32],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ResolvedDesktopState {
-    runtime: TrustedDesktopState,
-    consent: Option<TrustedDesktopState>,
+    executor: Box<dyn AuthorizedCommandExecutor>,
 }
 
 /// One connected session-agent runtime.
+///
+/// Legacy split authority builders are intentionally absent:
+///
+/// ```compile_fail
+/// use mrd_session_agent::runtime::AgentRuntime;
+/// fn bypass(runtime: AgentRuntime) {
+///     let _ = runtime.with_execution_security(todo!(), todo!(), todo!(), todo!());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use mrd_session_agent::runtime::AgentRuntime;
+/// fn replace_manager(runtime: AgentRuntime) {
+///     let _ = runtime.with_consent_backend(todo!(), todo!(), [1; 32]);
+/// }
+/// ```
 pub struct AgentRuntime {
     config: AgentRuntimeConfig,
     clock: Arc<dyn AgentClock>,
     signer: Arc<dyn RegistrationSigner>,
-    security: Option<ExecutionSecurity>,
-    consent: Option<ConsentRuntime>,
-    executor: Box<dyn AuthorizedCommandExecutor>,
+    authority: Option<AttendedAuthority>,
     input: Option<Box<dyn InputBackend>>,
     last_desktop_state: Option<TrustedDesktopState>,
     replay: ReplayLedger,
@@ -438,9 +431,7 @@ impl AgentRuntime {
             config,
             clock,
             signer,
-            security: None,
-            consent: None,
-            executor: Box::new(ShellBackend),
+            authority: None,
             input: None,
             last_desktop_state: None,
             replay: ReplayLedger::new(REPLAY_LEDGER_CAPACITY),
@@ -448,43 +439,27 @@ impl AgentRuntime {
         })
     }
 
-    /// Replace the empty security/backend ports with trusted product adapters.
+    /// Atomically install the attended-consent and command authority product path.
     ///
-    /// The binding source must resolve service-owned state independently from
-    /// the grant. The executor receives only an [`AuthorizedCommand`].
-    pub fn with_execution_security(
-        mut self,
-        bindings: Arc<dyn TrustedSessionBindingSource>,
-        verifier: Arc<dyn ExecuteGrantVerifier + Send + Sync>,
-        desktop_state: Arc<dyn TrustedDesktopStateSource>,
-        executor: Box<dyn AuthorizedCommandExecutor>,
-    ) -> Self {
-        self.security = Some(ExecutionSecurity {
-            bindings,
-            verifier,
-            desktop_state,
-        });
-        self.executor = executor;
-        self
-    }
-
-    /// Install an asynchronous attended-consent backend and trusted context sources.
-    ///
-    /// The runtime constructs and exclusively owns the corresponding authority
-    /// registry; the backend receives only display-safe prompt data.
-    pub fn with_consent_backend(
+    /// Consent, execution, input, capabilities, and heartbeat observations all
+    /// share this exact desktop source and the manager-owned binding registry.
+    pub fn with_attended_authority(
         mut self,
         backend: Arc<dyn ConsentBackend>,
+        verifier: Arc<dyn ExecuteGrantVerifier + Send + Sync>,
         desktop_state: Arc<dyn TrustedDesktopStateSource>,
         expected_issuer_key_id: [u8; 32],
+        executor: Box<dyn AuthorizedCommandExecutor>,
     ) -> Result<Self, AgentRuntimeError> {
-        if expected_issuer_key_id.iter().all(|byte| *byte == 0) {
+        if self.authority.is_some() || expected_issuer_key_id.iter().all(|byte| *byte == 0) {
             return Err(AgentRuntimeError::InvalidConfiguration);
         }
-        self.consent = Some(ConsentRuntime {
+        self.authority = Some(AttendedAuthority {
             manager: ConsentManager::new(backend),
+            verifier,
             desktop_state,
             expected_issuer_key_id,
+            executor,
         });
         Ok(self)
     }
@@ -547,13 +522,13 @@ impl AgentRuntime {
 
         loop {
             let consent_deadline = self
-                .consent
+                .authority
                 .as_ref()
-                .and_then(|consent| consent.manager.next_deadline());
+                .and_then(|authority| authority.manager.next_deadline());
             let event = {
                 let consent_completion = async {
-                    match self.consent.as_mut() {
-                        Some(consent) => consent.manager.next_completion().await,
+                    match self.authority.as_mut() {
+                        Some(authority) => authority.manager.next_completion().await,
                         None => std::future::pending().await,
                     }
                 };
@@ -710,17 +685,15 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
-        let resolved_desktop = self.resolve_desktop_state()?;
-        let state = resolved_desktop.runtime;
+        let state = self.resolve_desktop_state()?;
         self.last_desktop_state = Some(state);
         let desktop_epoch = state.desktop_epoch;
-        let mut capabilities =
-            if self.security.is_some() && state.desktop_kind == DesktopKind::Default {
-                self.executor.capabilities()
-            } else {
-                AgentCapabilities::empty()
-            };
-        if self.security.is_some()
+        let mut capabilities = if state.desktop_kind == DesktopKind::Default {
+            self.generic_executor_capabilities()
+        } else {
+            AgentCapabilities::empty()
+        };
+        if self.authority.is_some()
             && self
                 .last_desktop_state
                 .is_some_and(|state| state.desktop_kind == DesktopKind::Default)
@@ -737,11 +710,8 @@ impl AgentRuntime {
             advertised.insert(mrd_agent_ipc::AgentCapability::Input);
             capabilities = AgentCapabilities::from_implemented(advertised);
         }
-        if self.consent.as_ref().is_some_and(|consent| {
-            consent.manager.is_available()
-                && resolved_desktop
-                    .consent
-                    .is_some_and(|desktop| desktop.desktop_kind == DesktopKind::Default)
+        if self.authority.as_ref().is_some_and(|authority| {
+            authority.manager.is_available() && state.desktop_kind == DesktopKind::Default
         }) {
             let mut advertised = capabilities.as_set().clone();
             advertised.insert(mrd_agent_ipc::AgentCapability::Consent);
@@ -773,12 +743,12 @@ impl AgentRuntime {
         W: AsyncWrite + Unpin,
     {
         let now_ms = self.clock.now_ms();
-        let authorized = if let Some(security) = &self.security {
-            if let Some(binding) = security
-                .bindings
-                .resolve(&execute.grant.claims.session_id, now_ms)
+        let authorized = if let Some(authority) = &self.authority {
+            if let Some(binding) = authority
+                .manager
+                .resolve_binding(&execute.grant.claims.session_id, now_ms)
             {
-                let desktop = validated_desktop_state(security.desktop_state.as_ref())?;
+                let desktop = validated_desktop_state(authority.desktop_state.as_ref())?;
                 if binding_matches_runtime(&binding, identity, desktop) {
                     let context = ExecutionContext {
                         registration_id: binding.registration_id,
@@ -794,7 +764,7 @@ impl AgentRuntime {
                         authorization_scopes: binding.approved_scopes,
                         authorization_expires_at_ms: binding.authorization_expires_at_ms,
                     };
-                    validate_execute_command(execute, &context, security.verifier.as_ref()).ok()
+                    validate_execute_command(execute, &context, authority.verifier.as_ref()).ok()
                 } else {
                     None
                 }
@@ -833,9 +803,12 @@ impl AgentRuntime {
         W: AsyncWrite + Unpin,
     {
         let now_ms = self.clock.now_ms();
-        let outcome = if let (Some(input), Some(security)) = (&mut self.input, &self.security) {
-            if let Some(binding) = security.bindings.resolve(&envelope.session_id, now_ms) {
-                let desktop = validated_desktop_state(security.desktop_state.as_ref())?;
+        let outcome = if let (Some(input), Some(authority)) = (&mut self.input, &self.authority) {
+            if let Some(binding) = authority
+                .manager
+                .resolve_binding(&envelope.session_id, now_ms)
+            {
+                let desktop = validated_desktop_state(authority.desktop_state.as_ref())?;
                 if binding_matches_registration(&binding, identity)
                     && binding.desktop_kind == DesktopKind::Default
                 {
@@ -905,22 +878,22 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
-        if self.consent.is_none() {
+        if self.authority.is_none() {
             return self.handle_consent_without_manager(writer, request).await;
         }
         let context = self.trusted_consent_context(identity)?;
-        let consent = self
-            .consent
+        let authority = self
+            .authority
             .as_mut()
             .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
-        let due = consent
+        let due = authority
             .manager
             .expire_due(Instant::now(), context.now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
         for result in due {
             write_frame(writer, &AgentToService::ConsentResult(result)).await?;
         }
-        let immediate = match consent.manager.begin(request.clone(), context) {
+        let immediate = match authority.manager.begin(request.clone(), context) {
             Ok(results) => results,
             Err(ConsentRegistryError::InactiveRequest) => vec![coarse_consent_result(
                 &request,
@@ -953,14 +926,47 @@ impl AgentRuntime {
         W: AsyncWrite + Unpin,
     {
         let context = self.trusted_consent_context(identity)?;
-        let results = self
-            .consent
-            .as_mut()
-            .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
-            .manager
-            .complete(completion, context)
-            .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
-        for result in results {
+        let mut completion = {
+            let authority = self
+                .authority
+                .as_mut()
+                .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
+            authority
+                .manager
+                .complete(completion, context.clone())
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
+        };
+        if let Some(change) = completion.fresh_authority_change.as_ref() {
+            let cleanup_failed = self
+                .input
+                .as_mut()
+                .is_some_and(|input| input.release_session(&change.session_id).is_err());
+            if cleanup_failed {
+                let invalidated = self
+                    .authority
+                    .as_ref()
+                    .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+                    .manager
+                    .invalidate_fresh_authority(change)
+                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                return if invalidated {
+                    Err(AgentRuntimeError::InputCleanupFailed)
+                } else {
+                    Err(AgentRuntimeError::ConsentStateUnavailable)
+                };
+            }
+        }
+        if completion.fresh_authority_change.is_some() {
+            let mut resumed = self
+                .authority
+                .as_mut()
+                .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+                .manager
+                .resume_after_fresh_authority(context)
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            completion.results.append(&mut resumed);
+        }
+        for result in completion.results {
             write_frame(writer, &AgentToService::ConsentResult(result)).await?;
         }
         Ok(())
@@ -972,7 +978,7 @@ impl AgentRuntime {
     {
         let now_ms = self.clock.now_ms();
         let results = self
-            .consent
+            .authority
             .as_mut()
             .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
             .manager
@@ -993,11 +999,11 @@ impl AgentRuntime {
         W: AsyncWrite + Unpin,
     {
         let now_ms = self.clock.now_ms();
-        let Some(consent) = &mut self.consent else {
+        let Some(authority) = &mut self.authority else {
             // Cleanup is deliberately safe to consume when no manager exists.
             return Ok(());
         };
-        let results = consent
+        let results = authority
             .manager
             .cancel(&cancel, Instant::now(), now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
@@ -1012,17 +1018,11 @@ impl AgentRuntime {
         identity: &RegisteredAgentIdentity,
     ) -> Result<TrustedConsentContext, AgentRuntimeError> {
         let expected_issuer_key_id = self
-            .consent
+            .authority
             .as_ref()
-            .map(|consent| consent.expected_issuer_key_id)
+            .map(|authority| authority.expected_issuer_key_id)
             .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
-        let desktop = self
-            .resolve_desktop_state()?
-            .consent
-            .unwrap_or(TrustedDesktopState {
-                desktop_epoch: 0,
-                desktop_kind: DesktopKind::Unknown,
-            });
+        let desktop = self.resolve_desktop_state()?;
         Ok(TrustedConsentContext {
             registration_id: identity.registration_id,
             registration_epoch: identity.registration_epoch,
@@ -1039,8 +1039,8 @@ impl AgentRuntime {
         reason: ConsentAbortReason,
     ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
-        if let Some(consent) = &mut self.consent {
-            consent
+        if let Some(authority) = &mut self.authority {
+            authority
                 .manager
                 .shutdown(reason, now_ms)
                 .await
@@ -1080,7 +1080,7 @@ impl AgentRuntime {
         let fingerprint = SemanticFingerprint::from_authorized(&authorized);
         match self.replay.reserve(grant_id, command_id, fingerprint)? {
             ReplayReservation::First => {
-                let capabilities = self.executor.capabilities();
+                let capabilities = self.generic_executor_capabilities();
                 let outcome = if let Some(input) = &mut self.input {
                     match authorized.command().clone() {
                         mrd_agent_ipc::AgentCommand::StartInput { .. } => input
@@ -1090,13 +1090,26 @@ impl AgentRuntime {
                         mrd_agent_ipc::AgentCommand::StopInput { resource_id } => {
                             command_outcome(input.stop(&resource_id))
                         }
-                        _ if capabilities.supports_command(authorized.command()) => {
-                            self.executor.execute(authorized)
-                        }
+                        _ if capabilities.supports_command(authorized.command()) => self
+                            .authority
+                            .as_mut()
+                            .map_or(CommandOutcome::Rejected, |authority| {
+                                authority.executor.execute(authorized)
+                            }),
                         _ => CommandOutcome::Rejected,
                     }
+                } else if matches!(
+                    authorized.command(),
+                    mrd_agent_ipc::AgentCommand::StartInput { .. }
+                        | mrd_agent_ipc::AgentCommand::StopInput { .. }
+                ) {
+                    CommandOutcome::Rejected
                 } else if capabilities.supports_command(authorized.command()) {
-                    self.executor.execute(authorized)
+                    self.authority
+                        .as_mut()
+                        .map_or(CommandOutcome::Rejected, |authority| {
+                            authority.executor.execute(authorized)
+                        })
                 } else {
                     CommandOutcome::Rejected
                 };
@@ -1111,6 +1124,27 @@ impl AgentRuntime {
         self.input
             .as_mut()
             .map_or(Ok(()), |input| input.release_all())
+    }
+
+    fn generic_executor_capabilities(&self) -> AgentCapabilities {
+        let Some(authority) = self.authority.as_ref() else {
+            return AgentCapabilities::empty();
+        };
+        AgentCapabilities::from_implemented(
+            authority
+                .executor
+                .capabilities()
+                .as_set()
+                .iter()
+                .copied()
+                .filter(|capability| {
+                    !matches!(
+                        capability,
+                        mrd_agent_ipc::AgentCapability::Input
+                            | mrd_agent_ipc::AgentCapability::Consent
+                    )
+                }),
+        )
     }
 
     fn refresh_input_desktop(&mut self, current: TrustedDesktopState) {
@@ -1145,30 +1179,16 @@ impl AgentRuntime {
 
     fn current_desktop_state(&self) -> Result<TrustedDesktopState, AgentRuntimeError> {
         self.resolve_desktop_state()
-            .map(|resolved| resolved.runtime)
     }
 
-    fn resolve_desktop_state(&self) -> Result<ResolvedDesktopState, AgentRuntimeError> {
-        let consent = match self.consent.as_ref() {
-            Some(consent) => optional_desktop_state(consent.desktop_state.as_ref())?,
-            None => None,
-        };
-        let execution = self
-            .security
-            .as_ref()
-            .map(|security| validated_desktop_state(security.desktop_state.as_ref()))
-            .transpose()?;
-        let runtime = match (consent, execution) {
-            (Some(consent), Some(execution)) if consent == execution => Ok(consent),
-            (Some(_), Some(_)) => Err(AgentRuntimeError::DesktopStateUnavailable),
-            (Some(consent), None) => Ok(consent),
-            (None, Some(execution)) => Ok(execution),
-            (None, None) => Ok(TrustedDesktopState {
+    fn resolve_desktop_state(&self) -> Result<TrustedDesktopState, AgentRuntimeError> {
+        match self.authority.as_ref() {
+            Some(authority) => validated_desktop_state(authority.desktop_state.as_ref()),
+            None => Ok(TrustedDesktopState {
                 desktop_epoch: self.config.session.desktop_epoch,
                 desktop_kind: DesktopKind::Default,
             }),
-        }?;
-        Ok(ResolvedDesktopState { runtime, consent })
+        }
     }
 }
 
@@ -1227,16 +1247,6 @@ fn validated_desktop_state(
         .current_state()
         .filter(|state| state.desktop_epoch != 0)
         .ok_or(AgentRuntimeError::DesktopStateUnavailable)
-}
-
-fn optional_desktop_state(
-    source: &dyn TrustedDesktopStateSource,
-) -> Result<Option<TrustedDesktopState>, AgentRuntimeError> {
-    match source.current_state() {
-        Some(state) if state.desktop_epoch != 0 => Ok(Some(state)),
-        Some(_) => Err(AgentRuntimeError::DesktopStateUnavailable),
-        None => Ok(None),
-    }
 }
 
 fn validate_challenge(

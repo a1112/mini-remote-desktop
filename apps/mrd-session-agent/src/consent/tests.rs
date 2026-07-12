@@ -87,6 +87,7 @@ fn approved_completion_installs_the_exact_local_binding() {
     assert_eq!(
         registry.resolve(&request.session_id, 120),
         Some(TrustedSessionBinding {
+            authority_generation: attempt,
             consent_request_id: request.request_id,
             registration_id: REGISTRATION_ID,
             registration_epoch: 11,
@@ -102,6 +103,53 @@ fn approved_completion_installs_the_exact_local_binding() {
         })
     );
     assert_eq!(registry.resolve(&request.session_id, 500), None);
+}
+
+#[test]
+fn stale_authority_generation_cannot_invalidate_a_newer_binding() {
+    let registry = ConsentAuthorityRegistry::new();
+    let first = request([120; 16], 120, "generation-session");
+    let first_attempt = prompt_attempt(registry.begin(first.clone(), context(110)).unwrap());
+    registry
+        .complete(
+            first_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(120),
+        )
+        .unwrap();
+    let stale = FreshAuthorityChange {
+        session_id: first.session_id.clone(),
+        consent_request_id: first.request_id,
+        authority_generation: first_attempt,
+    };
+
+    let replacement = request([121; 16], 121, "generation-session");
+    let replacement_attempt =
+        prompt_attempt(registry.begin(replacement.clone(), context(130)).unwrap());
+    registry
+        .complete(
+            replacement_attempt,
+            ConsentDecision::Approved,
+            scopes(&[PermissionScope::InputPointer]),
+            context(140),
+        )
+        .unwrap();
+
+    assert!(!registry.invalidate_fresh_authority(&stale).unwrap());
+    let current = registry
+        .resolve(&replacement.session_id, 140)
+        .expect("replacement authority remains installed");
+    assert_eq!(current.consent_request_id, replacement.request_id);
+    assert_eq!(current.authority_generation, replacement_attempt);
+    assert!(registry
+        .invalidate_fresh_authority(&FreshAuthorityChange {
+            session_id: replacement.session_id.clone(),
+            consent_request_id: replacement.request_id,
+            authority_generation: replacement_attempt,
+        })
+        .unwrap());
+    assert_eq!(registry.resolve(&replacement.session_id, 140), None);
 }
 
 #[test]
@@ -985,10 +1033,44 @@ async fn manager_owned_registry_installs_only_timely_approval() {
     let request = request([113; 16], 113, "manager-approval");
     manager.begin(request.clone(), context(110)).unwrap();
     let completion = manager.next_completion().await.unwrap();
-    let results = manager.complete(completion, context(120)).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].decision, ConsentDecision::Approved);
+    let completion = manager.complete(completion, context(120)).unwrap();
+    assert_eq!(completion.results.len(), 1);
+    assert_eq!(completion.results[0].decision, ConsentDecision::Approved);
+    let change = completion
+        .fresh_authority_change
+        .expect("fresh approval reports its authority generation");
+    assert_eq!(change.session_id, request.session_id);
+    assert_eq!(change.consent_request_id, request.request_id);
     assert!(manager.registry.resolve(&request.session_id, 120).is_some());
+}
+
+#[tokio::test]
+async fn fresh_authority_waits_for_runtime_cleanup_before_promoting_next_prompt() {
+    let mut manager = ConsentManager::new(Arc::new(ImmediateApprovalBackend));
+    manager
+        .begin(
+            request([122; 16], 122, "cleanup-before-next-a"),
+            context(110),
+        )
+        .unwrap();
+    manager
+        .begin(
+            request([123; 16], 123, "cleanup-before-next-b"),
+            context(110),
+        )
+        .unwrap();
+    let backend_completion = manager.next_completion().await.unwrap();
+
+    let completion = manager.complete(backend_completion, context(120)).unwrap();
+
+    assert!(completion.fresh_authority_change.is_some());
+    assert!(
+        manager.active.is_none(),
+        "next prompt must not start before runtime acknowledges targeted cleanup"
+    );
+    let resumed = manager.resume_after_fresh_authority(context(120)).unwrap();
+    assert!(resumed.is_empty());
+    assert!(manager.active.is_some());
 }
 
 #[tokio::test]
@@ -1013,6 +1095,7 @@ async fn approved_completion_that_loses_cancel_race_cannot_install_binding() {
     assert!(manager
         .complete(completion, context(120))
         .unwrap()
+        .results
         .is_empty());
     assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
 }
@@ -1029,8 +1112,9 @@ async fn approved_completion_that_loses_deadline_race_cannot_install_binding() {
         .prompt
         .deadline = Instant::now() - std::time::Duration::from_millis(1);
     let completion = manager.next_completion().await.unwrap();
-    let results = manager.complete(completion, context(110)).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].decision, ConsentDecision::Expired);
+    let completion = manager.complete(completion, context(110)).unwrap();
+    assert_eq!(completion.results.len(), 1);
+    assert_eq!(completion.results[0].decision, ConsentDecision::Expired);
+    assert!(completion.fresh_authority_change.is_none());
     assert_eq!(manager.registry.resolve(&request.session_id, 120), None);
 }

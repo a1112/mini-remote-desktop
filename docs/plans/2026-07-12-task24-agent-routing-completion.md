@@ -34,7 +34,7 @@
 
 1. Add failing tests for exact Windows-session validation, request expiry, approved-scope subset enforcement, duplicate request replay, desktop changes, and binding creation only from an authenticated service request.
 2. Add a bounded consent backend that returns structured decisions and never supplies scopes not present in the request. The Windows adapter runs outside the async control loop; unsupported platforms and unavailable desktops dismiss or expire fail-closed.
-3. Persist the service-authenticated session/peer/policy binding in an agent-local registry and use it as the independent `TrustedSessionBindingSource` for subsequent execute/input validation.
+3. Persist the service-authenticated session/peer/policy binding in the consent manager's crate-private registry and make that registry the sole source for subsequent execute/input validation.
 4. Release input and invalidate live bindings on disconnect, StopAgent, desktop generation change, and binding expiry.
 5. Run `cargo test -p mrd-session-agent` and strict Clippy.
 

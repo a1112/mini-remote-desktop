@@ -9,11 +9,13 @@ use mrd_agent_ipc::{
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::PermissionScope;
 use mrd_session_agent::capabilities::AgentCapabilities;
+use mrd_session_agent::consent::{
+    ConsentBackend, ConsentBackendDecision, ConsentBackendFuture, ConsentPrompt,
+};
 use mrd_session_agent::runtime::{
     AgentClock, AgentExit, AgentRuntime, AgentRuntimeConfig, AgentRuntimeError,
     AuthorizedCommandExecutor, RegistrationSigner, RegistrationSigningError, SessionDescriptor,
-    TrustedDesktopState, TrustedDesktopStateSource, TrustedSessionBinding,
-    TrustedSessionBindingSource,
+    TrustedDesktopState, TrustedDesktopStateSource,
 };
 use std::{
     sync::{
@@ -23,6 +25,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 
 const AGENT_INSTANCE_ID: [u8; 16] = [1; 16];
 const REGISTRATION_ID: [u8; 16] = [2; 16];
@@ -76,10 +79,6 @@ impl ExecuteGrantVerifier for FixedExecuteGrantVerifier {
     }
 }
 
-struct FixedBindingSource {
-    binding: TrustedSessionBinding,
-}
-
 struct MutableDesktopSource {
     state: Arc<RwLock<Option<TrustedDesktopState>>>,
 }
@@ -87,14 +86,6 @@ struct MutableDesktopSource {
 impl TrustedDesktopStateSource for MutableDesktopSource {
     fn current_state(&self) -> Option<TrustedDesktopState> {
         self.state.read().ok().and_then(|state| *state)
-    }
-}
-
-impl TrustedSessionBindingSource for FixedBindingSource {
-    fn resolve(&self, session_id: &SessionId, now_ms: u64) -> Option<TrustedSessionBinding> {
-        (session_id == &self.binding.session_id
-            && now_ms < self.binding.authorization_expires_at_ms)
-            .then(|| self.binding.clone())
     }
 }
 
@@ -123,32 +114,42 @@ impl AuthorizedCommandExecutor for CountingCaptureExecutor {
     }
 }
 
-fn trusted_binding() -> TrustedSessionBinding {
-    TrustedSessionBinding {
-        consent_request_id: [12; 16],
-        registration_id: REGISTRATION_ID,
-        registration_epoch: 1,
-        session_id: SessionId("session-replay-test".to_owned()),
-        peer: PeerBinding {
-            device_id: DeviceId("peer-replay-test".to_owned()),
-            key_id: [11; 32],
-        },
-        policy_revision: 1,
-        expected_issuer_key_id: GRANT_ISSUER_KEY_ID,
-        approved_scopes: [mrd_session::PermissionScope::ScreenView]
-            .into_iter()
-            .collect(),
-        windows_session_id: 7,
-        desktop_epoch: 3,
-        desktop_kind: DesktopKind::Default,
-        authorization_expires_at_ms: 2_500,
+struct ApproveScreenView;
+
+impl ConsentBackend for ApproveScreenView {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        _prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<mrd_session_agent::consent::ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        Box::pin(async {
+            ConsentBackendDecision::Approved(
+                [mrd_session::PermissionScope::ScreenView]
+                    .into_iter()
+                    .collect(),
+            )
+        })
+    }
+}
+
+fn execution_session_id() -> SessionId {
+    SessionId("session-replay-test".to_owned())
+}
+
+fn execution_peer() -> PeerBinding {
+    PeerBinding {
+        device_id: DeviceId("peer-replay-test".to_owned()),
+        key_id: [11; 32],
     }
 }
 
 fn signed_start_capture(
     grant_id: [u8; 32],
     command_id: [u8; 16],
-    binding: &TrustedSessionBinding,
     desktop_epoch: u64,
 ) -> ExecuteCommand {
     let command = AgentCommand::StartCapture {
@@ -164,10 +165,10 @@ fn signed_start_capture(
                 grant_id,
                 registration_id: REGISTRATION_ID,
                 registration_epoch: 1,
-                session_id: binding.session_id.clone(),
-                peer: binding.peer.clone(),
+                session_id: execution_session_id(),
+                peer: execution_peer(),
                 scopes,
-                policy_revision: binding.policy_revision,
+                policy_revision: 1,
                 windows_session_id: 7,
                 desktop_epoch,
                 desktop_kind: DesktopKind::Default,
@@ -357,6 +358,25 @@ async fn agent_registers_reports_capabilities_heartbeats_and_stops_cleanly() {
         }
     }
 
+    let unauthorized = signed_start_capture([60; 32], [61; 16], 1);
+    send_service_message(
+        &mut service_stream,
+        &ServiceToAgent::Execute(Box::new(unauthorized)),
+    )
+    .await;
+    loop {
+        match read_agent_message(&mut service_stream).await {
+            AgentToService::CommandResult(result) => {
+                assert_eq!(result.outcome, CommandOutcome::Rejected);
+                break;
+            }
+            AgentToService::AgentHeartbeat(heartbeat) => {
+                heartbeat_sequence = Some(heartbeat.context.sequence);
+            }
+            other => panic!("expected rejected command or heartbeat, got {other:?}"),
+        }
+    }
+
     send_service_message(
         &mut service_stream,
         &ServiceToAgent::CancelConsent(CancelConsent {
@@ -437,10 +457,9 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
     let (agent_stream, mut service_stream) = tokio::io::duplex(32 * 1024);
     let executions = Arc::new(AtomicUsize::new(0));
     let desktop_state = Arc::new(RwLock::new(Some(TrustedDesktopState {
-        desktop_epoch: 1,
+        desktop_epoch: 3,
         desktop_kind: DesktopKind::Default,
     })));
-    let binding = trusted_binding();
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: descriptor(),
@@ -451,18 +470,18 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         Arc::new(FixedSigner),
     )
     .expect("valid fixed runtime")
-    .with_execution_security(
-        Arc::new(FixedBindingSource {
-            binding: binding.clone(),
-        }),
+    .with_attended_authority(
+        Arc::new(ApproveScreenView),
         Arc::new(FixedExecuteGrantVerifier),
         Arc::new(MutableDesktopSource {
             state: Arc::clone(&desktop_state),
         }),
+        GRANT_ISSUER_KEY_ID,
         Box::new(CountingCaptureExecutor {
             executions: Arc::clone(&executions),
         }),
-    );
+    )
+    .expect("valid attended authority configuration");
     let agent = tokio::spawn(runtime.run(agent_stream));
 
     let register = match read_agent_message(&mut service_stream).await {
@@ -508,10 +527,46 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         other => panic!("expected capabilities, got {other:?}"),
     };
     assert_eq!(snapshot.registration_id, REGISTRATION_ID);
-    assert_eq!(snapshot.capabilities.len(), 1);
     assert!(snapshot.capabilities.contains(&AgentCapability::Capture));
+    assert!(snapshot.capabilities.contains(&AgentCapability::Consent));
 
-    let mut wrong_session = signed_start_capture([30; 32], [31; 16], &binding, 1);
+    let before_consent = signed_start_capture([44; 32], [45; 16], 3);
+    assert_eq!(
+        send_execute_and_read_result(&mut service_stream, before_consent)
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let consent = ConsentRequest {
+        request_token: 12,
+        request_id: [12; 16],
+        session_id: execution_session_id(),
+        peer: execution_peer(),
+        requested_scopes: [mrd_session::PermissionScope::ScreenView]
+            .into_iter()
+            .collect(),
+        policy_revision: 1,
+        windows_session_id: 7,
+        issued_at_ms: 1_000,
+        expires_at_ms: 2_000,
+        authorization_expires_at_ms: 2_500,
+    };
+    send_service_message(
+        &mut service_stream,
+        &ServiceToAgent::ConsentRequest(consent.clone()),
+    )
+    .await;
+    match read_agent_message(&mut service_stream).await {
+        AgentToService::ConsentResult(result) => {
+            assert_eq!(result.request_id, consent.request_id);
+            assert_eq!(result.decision, ConsentDecision::Approved);
+        }
+        other => panic!("expected consent result, got {other:?}"),
+    }
+
+    let mut wrong_session = signed_start_capture([30; 32], [31; 16], 3);
     wrong_session.grant.claims.session_id = SessionId("untrusted-session".to_owned());
     resign(&mut wrong_session);
     assert_eq!(
@@ -521,7 +576,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         CommandOutcome::Rejected
     );
 
-    let mut wrong_peer = signed_start_capture([32; 32], [33; 16], &binding, 1);
+    let mut wrong_peer = signed_start_capture([32; 32], [33; 16], 3);
     wrong_peer.grant.claims.peer.key_id = [99; 32];
     resign(&mut wrong_peer);
     assert_eq!(
@@ -531,7 +586,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         CommandOutcome::Rejected
     );
 
-    let mut wrong_policy = signed_start_capture([34; 32], [35; 16], &binding, 1);
+    let mut wrong_policy = signed_start_capture([34; 32], [35; 16], 3);
     wrong_policy.grant.claims.policy_revision += 1;
     resign(&mut wrong_policy);
     assert_eq!(
@@ -541,7 +596,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         CommandOutcome::Rejected
     );
 
-    let mut wrong_desktop = signed_start_capture([36; 32], [37; 16], &binding, 1);
+    let mut wrong_desktop = signed_start_capture([36; 32], [37; 16], 3);
     wrong_desktop.grant.claims.desktop_kind = DesktopKind::Secure;
     resign(&mut wrong_desktop);
     assert_eq!(
@@ -556,7 +611,7 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         desktop_epoch: 2,
         desktop_kind: DesktopKind::Secure,
     });
-    let stale_after_switch = signed_start_capture([38; 32], [39; 16], &binding, 1);
+    let stale_after_switch = signed_start_capture([38; 32], [39; 16], 3);
     assert_eq!(
         send_execute_and_read_result(&mut service_stream, stale_after_switch)
             .await
@@ -568,16 +623,8 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
         desktop_epoch: 3,
         desktop_kind: DesktopKind::Default,
     });
-    let stale_after_return = signed_start_capture([40; 32], [41; 16], &binding, 1);
-    assert_eq!(
-        send_execute_and_read_result(&mut service_stream, stale_after_return)
-            .await
-            .outcome,
-        CommandOutcome::Rejected
-    );
-    assert_eq!(executions.load(Ordering::SeqCst), 0);
 
-    let first = signed_start_capture([20; 32], [21; 16], &binding, 3);
+    let first = signed_start_capture([20; 32], [21; 16], 3);
     let first_result = send_execute_and_read_result(&mut service_stream, first.clone()).await;
     assert_eq!(first_result.command_id, [21; 16]);
     assert_eq!(first_result.outcome, CommandOutcome::Completed);
@@ -587,13 +634,13 @@ async fn execute_replays_are_cached_and_semantic_conflicts_close_the_agent() {
     assert_eq!(exact_replay, first_result);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
 
-    let new_grant_same_command = signed_start_capture([22; 32], [21; 16], &binding, 3);
+    let new_grant_same_command = signed_start_capture([22; 32], [21; 16], 3);
     let command_id_replay =
         send_execute_and_read_result(&mut service_stream, new_grant_same_command).await;
     assert_eq!(command_id_replay, first_result);
     assert_eq!(executions.load(Ordering::SeqCst), 1);
 
-    let conflicting_command = signed_start_capture([20; 32], [23; 16], &binding, 3);
+    let conflicting_command = signed_start_capture([20; 32], [23; 16], 3);
     send_service_message(
         &mut service_stream,
         &ServiceToAgent::Execute(Box::new(conflicting_command)),

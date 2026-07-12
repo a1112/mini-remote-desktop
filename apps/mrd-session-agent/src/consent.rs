@@ -1,9 +1,19 @@
 //! Agent-local consent authority state.
-// The write-side state machine is intentionally wired by the next consent-
-// manager slice. Registry writes stay crate-private; the public source trait is
-// a transitional test-injection seam until B2.4 production wiring removes it.
-#![cfg_attr(not(test), allow(dead_code))]
-
+//!
+//! Binding and registry types are deliberately crate-private. External callers
+//! can supply only the display-safe [`ConsentBackend`] boundary:
+//!
+//! ```compile_fail
+//! use mrd_session_agent::consent::TrustedSessionBinding;
+//! ```
+//!
+//! ```compile_fail
+//! use mrd_session_agent::consent::TrustedSessionBindingSource;
+//! ```
+//!
+//! ```compile_fail
+//! use mrd_session_agent::consent::ConsentAuthorityRegistry;
+//! ```
 use mrd_agent_ipc::{
     CancelConsent, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind, PeerBinding,
     AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_MAX_IDENTIFIER_BYTES,
@@ -31,39 +41,21 @@ pub const MAX_PENDING_CONSENTS: usize = 32;
 /// Maximum completed/cancelled consent identities retained against replay.
 pub const MAX_CONSENT_TOMBSTONES: usize = 4_096;
 
-/// Independently trusted, agent-local authorization for one product session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrustedSessionBinding {
-    /// Consent request that created this authority.
-    pub consent_request_id: [u8; 16],
-    /// Exact service registration authorized by the local user decision.
-    pub registration_id: [u8; 16],
-    /// Exact service registration generation authorized by the decision.
-    pub registration_epoch: u64,
-    /// Active product session.
-    pub session_id: SessionId,
-    /// Authenticated remote peer shown to the local user.
-    pub peer: PeerBinding,
-    /// Exact permission scopes approved locally.
-    pub approved_scopes: PermissionScopes,
-    /// Local-policy revision shown to the user.
-    pub policy_revision: u64,
-    /// Interactive Windows session in which approval occurred.
-    pub windows_session_id: u32,
-    /// Exact input-desktop generation in which approval occurred.
-    pub desktop_epoch: u64,
-    /// Input-desktop kind in which approval occurred.
-    pub desktop_kind: DesktopKind,
-    /// Exclusive expiry of the local authorization.
-    pub authorization_expires_at_ms: u64,
-    /// Sole execute-grant issuer accepted for this authority.
-    pub expected_issuer_key_id: [u8; 32],
-}
-
-/// Read-only source of agent-local consent bindings used during execution.
-pub trait TrustedSessionBindingSource: Send + Sync {
-    /// Resolve an unexpired binding using trusted current wall-clock time.
-    fn resolve(&self, session_id: &SessionId, now_ms: u64) -> Option<TrustedSessionBinding>;
+pub(crate) struct TrustedSessionBinding {
+    pub(crate) authority_generation: u64,
+    pub(crate) consent_request_id: [u8; 16],
+    pub(crate) registration_id: [u8; 16],
+    pub(crate) registration_epoch: u64,
+    pub(crate) session_id: SessionId,
+    pub(crate) peer: PeerBinding,
+    pub(crate) approved_scopes: PermissionScopes,
+    pub(crate) policy_revision: u64,
+    pub(crate) windows_session_id: u32,
+    pub(crate) desktop_epoch: u64,
+    pub(crate) desktop_kind: DesktopKind,
+    pub(crate) authorization_expires_at_ms: u64,
+    pub(crate) expected_issuer_key_id: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +235,19 @@ pub(crate) struct ConsentCompletion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FreshAuthorityChange {
+    pub(crate) session_id: SessionId,
+    pub(crate) consent_request_id: [u8; 16],
+    authority_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConsentManagerCompletion {
+    pub(crate) results: Vec<ConsentResult>,
+    pub(crate) fresh_authority_change: Option<FreshAuthorityChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConsentCompletionOutcome {
     Completed(ConsentCompletion),
     Ignored,
@@ -367,11 +372,7 @@ impl ConsentAuthorityState {
 }
 
 /// Bounded in-memory source of consent-derived authority.
-///
-/// Registry mutation is crate-private. The public binding/source types remain
-/// a transitional test-injection seam until B2.4 seals production wiring; an
-/// arbitrary source must not be treated as product consent authority.
-pub struct ConsentAuthorityRegistry {
+pub(crate) struct ConsentAuthorityRegistry {
     state: Mutex<ConsentAuthorityState>,
     limits: RegistryLimits,
 }
@@ -383,8 +384,7 @@ impl Default for ConsentAuthorityRegistry {
 }
 
 impl ConsentAuthorityRegistry {
-    /// Construct an empty fail-closed consent registry.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(ConsentAuthorityState::default()),
             limits: RegistryLimits::default(),
@@ -467,6 +467,23 @@ impl ConsentAuthorityRegistry {
         }))
     }
 
+    pub(crate) fn resolve(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Option<TrustedSessionBinding> {
+        let mut state = self.state.lock().ok()?;
+        if state
+            .bindings
+            .get(session_id)
+            .is_some_and(|binding| now_ms >= binding.authorization_expires_at_ms)
+        {
+            state.bindings.remove(session_id);
+            return None;
+        }
+        state.bindings.get(session_id).cloned()
+    }
+
     pub(crate) fn complete(
         &self,
         attempt_id: u64,
@@ -514,6 +531,7 @@ impl ConsentAuthorityRegistry {
             state.bindings.insert(
                 pending.request.session_id.clone(),
                 TrustedSessionBinding {
+                    authority_generation: pending.attempt_id,
                     consent_request_id: pending.request.request_id,
                     registration_id: pending.context.registration_id,
                     registration_epoch: pending.context.registration_epoch,
@@ -590,20 +608,26 @@ impl ConsentAuthorityRegistry {
         }
         Ok(ConsentCancelOutcome::Cancelled(result))
     }
-}
 
-impl TrustedSessionBindingSource for ConsentAuthorityRegistry {
-    fn resolve(&self, session_id: &SessionId, now_ms: u64) -> Option<TrustedSessionBinding> {
-        let mut state = self.state.lock().ok()?;
-        if state
+    pub(crate) fn invalidate_fresh_authority(
+        &self,
+        change: &FreshAuthorityChange,
+    ) -> Result<bool, ConsentRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        let matches = state
             .bindings
-            .get(session_id)
-            .is_some_and(|binding| now_ms >= binding.authorization_expires_at_ms)
-        {
-            state.bindings.remove(session_id);
-            return None;
+            .get(&change.session_id)
+            .is_some_and(|binding| {
+                binding.consent_request_id == change.consent_request_id
+                    && binding.authority_generation == change.authority_generation
+            });
+        if matches {
+            state.bindings.remove(&change.session_id);
         }
-        state.bindings.get(session_id).cloned()
+        Ok(matches)
     }
 }
 
@@ -669,8 +693,17 @@ impl ConsentManager {
         catch_unwind(AssertUnwindSafe(|| self.backend.is_available())).unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub(crate) fn registry(&self) -> Arc<ConsentAuthorityRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    pub(crate) fn resolve_binding(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Option<TrustedSessionBinding> {
+        self.registry.resolve(session_id, now_ms)
     }
 
     pub(crate) fn begin(
@@ -714,12 +747,18 @@ impl ConsentManager {
         &mut self,
         completion: BackendCompletion,
         context: TrustedConsentContext,
-    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+    ) -> Result<ConsentManagerCompletion, ConsentRegistryError> {
         let Some(active) = self.active.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(ConsentManagerCompletion {
+                results: Vec::new(),
+                fresh_authority_change: None,
+            });
         };
         if active.prompt.pending.attempt_id != completion.attempt_id {
-            return Ok(Vec::new());
+            return Ok(ConsentManagerCompletion {
+                results: Vec::new(),
+                fresh_authority_change: None,
+            });
         }
         let now = Instant::now();
         let now_ms = context.now_ms;
@@ -735,11 +774,15 @@ impl ConsentManager {
             self.active.take();
             self.expire_queued_due(now, now_ms, &mut results)?;
             self.start_next(Instant::now(), &context, &mut results)?;
-            return Ok(results);
+            return Ok(ConsentManagerCompletion {
+                results,
+                fresh_authority_change: None,
+            });
         }
         let Some(active) = self.active.take() else {
             return Err(ConsentRegistryError::Unavailable);
         };
+        let mut fresh_authority_change = None;
         if active.phase != ActivePromptPhase::Closing {
             let (decision, scopes) = match completion.outcome {
                 BackendCompletionOutcome::Decision(ConsentBackendDecision::Approved(scopes)) => {
@@ -762,13 +805,45 @@ impl ConsentManager {
                 scopes,
                 context.clone(),
             )? {
-                ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
+                ConsentCompletionOutcome::Completed(completed) => {
+                    if completed.binding_changed {
+                        fresh_authority_change = Some(FreshAuthorityChange {
+                            session_id: completed.result.session_id.clone(),
+                            consent_request_id: completed.result.request_id,
+                            authority_generation: active.prompt.pending.attempt_id,
+                        });
+                    }
+                    results.push(completed.result);
+                }
                 ConsentCompletionOutcome::Ignored => {}
             }
         }
         self.expire_queued_due(now, now_ms, &mut results)?;
+        if fresh_authority_change.is_none() {
+            self.start_next(Instant::now(), &context, &mut results)?;
+        }
+        Ok(ConsentManagerCompletion {
+            results,
+            fresh_authority_change,
+        })
+    }
+
+    pub(crate) fn resume_after_fresh_authority(
+        &mut self,
+        context: TrustedConsentContext,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let mut results = Vec::new();
+        let now = Instant::now();
+        self.expire_queued_due(now, context.now_ms, &mut results)?;
         self.start_next(Instant::now(), &context, &mut results)?;
         Ok(results)
+    }
+
+    pub(crate) fn invalidate_fresh_authority(
+        &self,
+        change: &FreshAuthorityChange,
+    ) -> Result<bool, ConsentRegistryError> {
+        self.registry.invalidate_fresh_authority(change)
     }
 
     pub(crate) fn expire_due(

@@ -6,6 +6,7 @@ use mrd_agent_ipc::{
     InputEventPayload, InputFailure, InputKey, InputRejection, ValidatedInputEvent,
 };
 use mrd_input::{InputError, InputEvent, InputInjector, TrackedInputInjector};
+use mrd_proto::SessionId;
 use std::collections::{HashMap, HashSet};
 
 const REPLAY_CACHE_CAPACITY: usize = 4_096;
@@ -46,6 +47,8 @@ pub trait InputBackend: Send {
     ) -> InputAckOutcome;
     /// Stop one resource and release its pressed state.
     fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome;
+    /// Release pressed state and remove resources owned by one product session.
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError>;
     /// Release all pressed state and clear resources.
     fn release_all(&mut self) -> Result<(), InputError>;
 }
@@ -163,6 +166,28 @@ impl<I: InputInjector> InputResourceManager<I> {
             }
             Err(error) => map_input_error(error),
         }
+    }
+
+    /// Release pressed state and remove every resource owned by one session.
+    pub fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        let resources = self
+            .resources
+            .values()
+            .filter(|state| state.resource.session_id() == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for resource in &resources {
+            match self.release_state(resource) {
+                Ok(()) => {
+                    self.resources.remove(resource.resource.resource_id());
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Release every pressed input and remove all input resources.
@@ -328,6 +353,10 @@ impl<I: InputInjector + Send> InputBackend for InputResourceManager<I> {
 
     fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
         Self::stop(self, resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        Self::release_session(self, session_id)
     }
 
     fn release_all(&mut self) -> Result<(), InputError> {

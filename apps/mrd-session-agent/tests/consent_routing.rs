@@ -16,7 +16,7 @@ use mrd_session_agent::{
     runtime::{
         AgentClock, AgentExit, AgentRuntime, AgentRuntimeConfig, AuthorizedCommandExecutor,
         RegistrationSigner, RegistrationSigningError, SessionDescriptor, TrustedDesktopState,
-        TrustedDesktopStateSource, TrustedSessionBinding, TrustedSessionBindingSource,
+        TrustedDesktopStateSource,
     },
 };
 use std::{
@@ -76,14 +76,6 @@ impl RegistrationProofVerifier for FixedVerifier {
     }
 }
 
-struct EmptyBindings;
-
-impl TrustedSessionBindingSource for EmptyBindings {
-    fn resolve(&self, _session_id: &SessionId, _now_ms: u64) -> Option<TrustedSessionBinding> {
-        None
-    }
-}
-
 struct RejectExecuteGrant;
 
 impl ExecuteGrantVerifier for RejectExecuteGrant {
@@ -127,17 +119,6 @@ impl TrustedDesktopStateSource for SecureDesktop {
         Some(TrustedDesktopState {
             desktop_epoch: 10,
             desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
-        })
-    }
-}
-
-struct OtherDefaultDesktop;
-
-impl TrustedDesktopStateSource for OtherDefaultDesktop {
-    fn current_state(&self) -> Option<TrustedDesktopState> {
-        Some(TrustedDesktopState {
-            desktop_epoch: 10,
-            desktop_kind: mrd_agent_ipc::DesktopKind::Default,
         })
     }
 }
@@ -407,8 +388,14 @@ async fn start_agent_with_environment_and_snapshot(
         Arc::new(FixedSigner),
     )
     .expect("valid fixed runtime")
-    .with_consent_backend(backend, desktop, EXECUTE_ISSUER_KEY_ID)
-    .expect("valid consent manager configuration");
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        desktop,
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("valid attended authority configuration");
     start_configured_agent(runtime, expect_consent_capability).await
 }
 
@@ -1341,39 +1328,10 @@ async fn nondefault_desktop_does_not_publish_consent_or_receive_prompt() {
     stop_agent(agent, &mut service).await;
 }
 
-#[tokio::test]
-async fn unavailable_consent_desktop_hides_consent_without_stopping_runtime() {
-    let (backend, _state, mut started) = backend();
-    let (agent, mut service, snapshot) =
-        start_agent_with_environment_and_snapshot(backend, Arc::new(UnavailableDesktop), false)
-            .await;
-    assert_eq!(snapshot.desktop_epoch, 1);
-    let request = consent_request(81);
-    send_service_message(
-        &mut service,
-        &ServiceToAgent::ConsentRequest(request.clone()),
-    )
-    .await;
-    let result = next_consent_result(&mut service).await;
-    assert_eq!(result.request_id, request.request_id);
-    assert_eq!(result.decision, ConsentDecision::Dismissed);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), started.recv())
-            .await
-            .is_err(),
-        "missing trusted desktop must not invoke the consent backend"
-    );
-    let heartbeat = match read_agent_message(&mut service).await {
-        AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
-        other => panic!("expected heartbeat after coarse dismissal, got {other:?}"),
-    };
-    assert_eq!(heartbeat.context.desktop_epoch, snapshot.desktop_epoch);
-    stop_agent(agent, &mut service).await;
-}
-
-#[tokio::test]
-async fn unavailable_consent_desktop_never_borrows_execution_desktop_for_prompt() {
-    let (backend, _state, mut started) = backend();
+#[test]
+fn attended_authority_cannot_be_replaced_by_builder_order() {
+    let (first_backend, _state, _started) = backend();
+    let (second_backend, _state, _started) = backend();
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: descriptor(),
@@ -1384,33 +1342,25 @@ async fn unavailable_consent_desktop_never_borrows_execution_desktop_for_prompt(
         Arc::new(FixedSigner),
     )
     .expect("valid fixed runtime")
-    .with_execution_security(
-        Arc::new(EmptyBindings),
+    .with_attended_authority(
+        first_backend,
         Arc::new(RejectExecuteGrant),
-        Arc::new(OtherDefaultDesktop),
+        Arc::new(DefaultDesktop),
+        EXECUTE_ISSUER_KEY_ID,
         Box::new(EmptyExecutor),
     )
-    .with_consent_backend(backend, Arc::new(UnavailableDesktop), EXECUTE_ISSUER_KEY_ID)
-    .expect("valid consent manager configuration");
-    let (agent, mut service, snapshot) = start_configured_agent(runtime, false).await;
-    assert_eq!(snapshot.desktop_epoch, 10);
-
-    let request = consent_request(82);
-    send_service_message(
-        &mut service,
-        &ServiceToAgent::ConsentRequest(request.clone()),
-    )
-    .await;
-    let result = next_consent_result(&mut service).await;
-    assert_eq!(result.request_id, request.request_id);
-    assert_eq!(result.decision, ConsentDecision::Dismissed);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(40), started.recv())
-            .await
-            .is_err(),
-        "execution desktop must not authorize a consent prompt"
+    .expect("first atomic authority installs");
+    let replacement = runtime.with_attended_authority(
+        second_backend,
+        Arc::new(RejectExecuteGrant),
+        Arc::new(SecureDesktop),
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
     );
-    stop_agent(agent, &mut service).await;
+    assert!(matches!(
+        replacement,
+        Err(mrd_session_agent::runtime::AgentRuntimeError::InvalidConfiguration)
+    ));
 }
 
 #[tokio::test]
@@ -1535,7 +1485,7 @@ async fn capability_and_heartbeat_share_the_consent_desktop_epoch() {
 }
 
 #[tokio::test]
-async fn conflicting_consent_and_execution_desktop_sources_fail_closed() {
+async fn unavailable_atomic_authority_desktop_fails_before_capabilities() {
     let (backend, _state, _started) = backend();
     let (agent_stream, mut service) = tokio::io::duplex(32 * 1024);
     let runtime = AgentRuntime::new(
@@ -1548,14 +1498,14 @@ async fn conflicting_consent_and_execution_desktop_sources_fail_closed() {
         Arc::new(FixedSigner),
     )
     .expect("valid fixed runtime")
-    .with_execution_security(
-        Arc::new(EmptyBindings),
+    .with_attended_authority(
+        backend,
         Arc::new(RejectExecuteGrant),
-        Arc::new(OtherDefaultDesktop),
+        Arc::new(UnavailableDesktop),
+        EXECUTE_ISSUER_KEY_ID,
         Box::new(EmptyExecutor),
     )
-    .with_consent_backend(backend, Arc::new(DefaultDesktop), EXECUTE_ISSUER_KEY_ID)
-    .expect("valid consent manager configuration");
+    .expect("valid attended authority configuration");
     let agent = tokio::spawn(runtime.run(agent_stream));
 
     let register = match read_agent_message(&mut service).await {
@@ -1586,9 +1536,9 @@ async fn conflicting_consent_and_execution_desktop_sources_fail_closed() {
 
     let error = tokio::time::timeout(TEST_TIMEOUT, agent)
         .await
-        .expect("desktop mismatch must close before capabilities")
+        .expect("unavailable desktop must close before capabilities")
         .expect("agent join")
-        .expect_err("conflicting desktop sources must fail closed");
+        .expect_err("the single authority desktop source must fail closed");
     assert!(matches!(
         error,
         mrd_session_agent::runtime::AgentRuntimeError::DesktopStateUnavailable
