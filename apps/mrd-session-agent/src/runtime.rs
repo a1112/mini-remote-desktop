@@ -291,9 +291,13 @@ pub struct TrustedSessionBinding {
     pub policy_revision: u64,
     /// Sole trusted execute-grant issuer for the session.
     pub expected_issuer_key_id: [u8; 32],
+    /// Exact permission scopes approved by the agent-local consent authority.
+    pub approved_scopes: mrd_session::PermissionScopes,
+    /// Exclusive expiry of the agent-local consent authorization.
+    pub authorization_expires_at_ms: u64,
 }
 
-/// Source of service-owned session bindings used during command validation.
+/// Source of agent-local consent bindings used during command validation.
 pub trait TrustedSessionBindingSource: Send + Sync {
     /// Resolve an active binding by an untrusted lookup key.
     fn resolve(&self, session_id: &SessionId) -> Option<TrustedSessionBinding>;
@@ -711,6 +715,8 @@ impl AgentRuntime {
                     desktop_kind: desktop.desktop_kind,
                     now_ms: self.clock.now_ms(),
                     expected_issuer_key_id: binding.expected_issuer_key_id,
+                    authorization_scopes: binding.approved_scopes,
+                    authorization_expires_at_ms: binding.authorization_expires_at_ms,
                 };
                 validate_execute_command(execute, &context, security.verifier.as_ref()).ok()
             } else {
@@ -761,6 +767,8 @@ impl AgentRuntime {
                     desktop_kind: desktop.desktop_kind,
                     now_ms: self.clock.now_ms(),
                     expected_issuer_key_id: binding.expected_issuer_key_id,
+                    authorization_scopes: binding.approved_scopes,
+                    authorization_expires_at_ms: binding.authorization_expires_at_ms,
                 };
                 let outcome = input.handle(&envelope, &context);
                 if matches!(

@@ -50,6 +50,20 @@ fn scopes(values: impl IntoIterator<Item = PermissionScope>) -> PermissionScopes
     values.into_iter().collect()
 }
 
+fn all_authorized_scopes() -> PermissionScopes {
+    scopes([
+        PermissionScope::ScreenView,
+        PermissionScope::InputPointer,
+        PermissionScope::InputKeyboard,
+        PermissionScope::AudioListen,
+        PermissionScope::AudioTalk,
+        PermissionScope::ClipboardRead,
+        PermissionScope::ClipboardWrite,
+        PermissionScope::FileRead,
+        PermissionScope::FileWrite,
+    ])
+}
+
 fn consent_request() -> ConsentRequest {
     ConsentRequest {
         request_token: 1,
@@ -128,17 +142,7 @@ fn grant() -> ExecuteGrant {
             registration_epoch: 1,
             session_id: session_id(),
             peer: peer(),
-            scopes: scopes([
-                PermissionScope::ScreenView,
-                PermissionScope::InputPointer,
-                PermissionScope::InputKeyboard,
-                PermissionScope::AudioListen,
-                PermissionScope::AudioTalk,
-                PermissionScope::ClipboardRead,
-                PermissionScope::ClipboardWrite,
-                PermissionScope::FileRead,
-                PermissionScope::FileWrite,
-            ]),
+            scopes: all_authorized_scopes(),
             policy_revision: 3,
             windows_session_id: 7,
             desktop_epoch: 4,
@@ -166,6 +170,8 @@ fn execution_context(now_ms: u64) -> ExecutionContext {
         desktop_kind: DesktopKind::Default,
         now_ms,
         expected_issuer_key_id: ISSUER_KEY_ID,
+        authorization_scopes: all_authorized_scopes(),
+        authorization_expires_at_ms: 2_500,
     }
 }
 
@@ -823,6 +829,66 @@ fn execute_grant_is_bound_to_all_authorization_context() {
 }
 
 #[test]
+fn execute_rejects_claim_scopes_outside_local_authorization() {
+    let execute = execute_command(AgentCommand::StartCapture {
+        resource_id: RESOURCE_ID,
+        display_id: 1,
+    });
+    let mut context = execution_context(1_500);
+    context.authorization_scopes = scopes([PermissionScope::ScreenView]);
+
+    assert_eq!(
+        validate_execute_command(&execute, &context, &AcceptAllVerifier),
+        Err(GrantValidationError::AuthorizationScopeMismatch)
+    );
+}
+
+#[test]
+fn execute_rejects_grant_that_outlives_local_authorization() {
+    let execute = execute_command(AgentCommand::StartCapture {
+        resource_id: RESOURCE_ID,
+        display_id: 1,
+    });
+    let mut context = execution_context(1_500);
+    context.authorization_expires_at_ms = execute.grant.claims.expires_at_ms;
+    assert!(validate_execute_command(&execute, &context, &AcceptAllVerifier).is_ok());
+
+    context.authorization_expires_at_ms -= 1;
+    assert_eq!(
+        validate_execute_command(&execute, &context, &AcceptAllVerifier),
+        Err(GrantValidationError::AuthorizationExpiryMismatch)
+    );
+}
+
+#[test]
+fn start_rejects_expired_local_authorization_but_cleanup_remains_authorizable() {
+    let start = execute_command(AgentCommand::StartCapture {
+        resource_id: RESOURCE_ID,
+        display_id: 1,
+    });
+    let cleanup = execute_command(AgentCommand::StopCapture {
+        resource_id: RESOURCE_ID,
+    });
+    let mut context = execution_context(2_000);
+    context.authorization_expires_at_ms = 2_000;
+
+    assert_eq!(
+        validate_execute_command(&start, &context, &AcceptAllVerifier),
+        Err(GrantValidationError::AuthorizationExpired)
+    );
+    assert!(validate_execute_command(&cleanup, &context, &AcceptAllVerifier).is_ok());
+
+    context
+        .authorization_scopes
+        .remove(&PermissionScope::ScreenView);
+    assert_eq!(
+        validate_execute_command(&cleanup, &context, &AcceptAllVerifier),
+        Err(GrantValidationError::AuthorizationScopeMismatch),
+        "cleanup bypasses time expiry only, not the local scope binding"
+    );
+}
+
+#[test]
 fn an_expired_grant_only_remains_usable_for_its_bound_cleanup_command() {
     let execute = execute_command(AgentCommand::StopCapture {
         resource_id: RESOURCE_ID,
@@ -837,6 +903,67 @@ fn an_expired_grant_only_remains_usable_for_its_bound_cleanup_command() {
     assert_eq!(
         validate_execute_command(&substituted, &context, &AcceptAllVerifier),
         Err(GrantValidationError::CommandMismatch)
+    );
+}
+
+#[test]
+fn input_event_rejects_expired_grant_or_local_authorization() {
+    let execute = execute_command(AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputPointer]),
+    });
+    let resource = authorize_input_resource(
+        validate_execute_command(&execute, &execution_context(1_500), &AcceptAllVerifier)
+            .expect("valid start-input grant"),
+    )
+    .expect("authorized input resource");
+    let envelope = input_event(1, InputEventPayload::MouseMove { x: 1, y: 2 });
+
+    let grant_expired = execution_context(execute.grant.claims.expires_at_ms);
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &grant_expired),
+        Err(InputRejection::Grant)
+    );
+
+    let mut authorization_expired = execution_context(execute.grant.claims.expires_at_ms);
+    authorization_expired.authorization_expires_at_ms = execute.grant.claims.expires_at_ms;
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &authorization_expired),
+        Err(InputRejection::Grant)
+    );
+
+    let mut scope_narrowed = execution_context(1_500);
+    scope_narrowed
+        .authorization_scopes
+        .remove(&PermissionScope::InputPointer);
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &scope_narrowed),
+        Err(InputRejection::Grant)
+    );
+}
+
+#[test]
+fn release_all_remains_valid_after_authorization_expiry() {
+    let execute = execute_command(AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputPointer]),
+    });
+    let resource = authorize_input_resource(
+        validate_execute_command(&execute, &execution_context(1_500), &AcceptAllVerifier)
+            .expect("valid start-input grant"),
+    )
+    .expect("authorized input resource");
+    let release = input_event(1, InputEventPayload::ReleaseAll);
+    let mut expired = execution_context(2_500);
+    expired.authorization_expires_at_ms = execute.grant.claims.expires_at_ms;
+
+    assert!(validate_input_event(&release, &resource, &expired).is_ok());
+
+    expired.authorization_expires_at_ms -= 1;
+    assert_eq!(
+        validate_input_event(&release, &resource, &expired),
+        Err(InputRejection::Grant),
+        "cleanup must still reject a grant whose outer expiry exceeded local authority"
     );
 }
 

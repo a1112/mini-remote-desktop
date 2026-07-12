@@ -150,6 +150,10 @@ pub struct ExecutionContext {
     pub now_ms: u64,
     /// Sole issuer key id trusted for this command path.
     pub expected_issuer_key_id: [u8; 32],
+    /// Scopes approved independently by the local attended-consent authority.
+    pub authorization_scopes: PermissionScopes,
+    /// Exclusive end of the local attended-consent authorization interval.
+    pub authorization_expires_at_ms: u64,
 }
 
 /// Reason an execute grant failed authorization.
@@ -245,6 +249,15 @@ pub enum GrantValidationError {
     /// The grant lacks at least one scope required by the command.
     #[error("execute grant does not contain every required scope")]
     InsufficientScopes,
+    /// The signed grant claims authority outside the local consent decision.
+    #[error("execute grant scopes exceed the local consent authorization")]
+    AuthorizationScopeMismatch,
+    /// The signed grant remains valid beyond the local consent authorization.
+    #[error("execute grant expiry exceeds the local consent authorization")]
+    AuthorizationExpiryMismatch,
+    /// Trusted current time reached the exclusive local authorization deadline.
+    #[error("local consent authorization has expired")]
+    AuthorizationExpired,
     /// No concrete scope was supplied for authorization.
     #[error("the command authorization context has no required scopes")]
     EmptyRequiredScopes,
@@ -407,13 +420,19 @@ pub fn validate_input_event(
         || context.peer != claims.peer
         || context.windows_session_id != claims.windows_session_id
         || context.expected_issuer_key_id != resource.grant.issuer_key_id
+        || !context.authorization_scopes.is_superset(&claims.scopes)
+        || claims.expires_at_ms > context.authorization_expires_at_ms
     {
         return Err(InputRejection::Grant);
     }
 
     let required_scope = envelope.event.required_scope();
     if let Some(required_scope) = required_scope {
-        if !resource.input_scopes.contains(&required_scope) {
+        if !resource.input_scopes.contains(&required_scope)
+            || !context.authorization_scopes.contains(&required_scope)
+            || context.now_ms >= claims.expires_at_ms
+            || context.now_ms >= context.authorization_expires_at_ms
+        {
             return Err(InputRejection::Grant);
         }
         if context.policy_revision != claims.policy_revision {
@@ -619,6 +638,9 @@ where
     if !claims.scopes.is_superset(required_scopes) {
         return Err(GrantValidationError::InsufficientScopes);
     }
+    if !context.authorization_scopes.is_superset(&claims.scopes) {
+        return Err(GrantValidationError::AuthorizationScopeMismatch);
+    }
 
     if claims.not_before_ms >= claims.expires_at_ms || claims.issued_at_ms >= claims.expires_at_ms {
         return Err(GrantValidationError::InvalidTimeWindow);
@@ -636,8 +658,14 @@ where
     {
         return Err(GrantValidationError::LifetimeExceeded);
     }
+    if claims.expires_at_ms > context.authorization_expires_at_ms {
+        return Err(GrantValidationError::AuthorizationExpiryMismatch);
+    }
     if context.now_ms < claims.not_before_ms {
         return Err(GrantValidationError::NotYetValid);
+    }
+    if purpose == ExecutionPurpose::Start && context.now_ms >= context.authorization_expires_at_ms {
+        return Err(GrantValidationError::AuthorizationExpired);
     }
     if purpose == ExecutionPurpose::Start && context.now_ms >= claims.expires_at_ms {
         return Err(GrantValidationError::Expired);

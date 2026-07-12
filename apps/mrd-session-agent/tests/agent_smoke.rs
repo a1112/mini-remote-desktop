@@ -130,6 +130,10 @@ fn trusted_binding() -> TrustedSessionBinding {
         },
         policy_revision: 1,
         expected_issuer_key_id: GRANT_ISSUER_KEY_ID,
+        approved_scopes: [mrd_session::PermissionScope::ScreenView]
+            .into_iter()
+            .collect(),
+        authorization_expires_at_ms: 2_500,
     }
 }
 

@@ -121,6 +121,11 @@ impl TrustedSessionBindingSource for FixedBindings {
             peer: peer(),
             policy_revision: 3,
             expected_issuer_key_id: ISSUER_KEY_ID,
+            approved_scopes: scopes(&[
+                PermissionScope::InputPointer,
+                PermissionScope::InputKeyboard,
+            ]),
+            authorization_expires_at_ms: 2_500,
         })
     }
 }
@@ -175,6 +180,11 @@ fn context() -> ExecutionContext {
         desktop_kind: DesktopKind::Default,
         now_ms: 1_500,
         expected_issuer_key_id: ISSUER_KEY_ID,
+        authorization_scopes: scopes(&[
+            PermissionScope::InputPointer,
+            PermissionScope::InputKeyboard,
+        ]),
+        authorization_expires_at_ms: 2_500,
     }
 }
 

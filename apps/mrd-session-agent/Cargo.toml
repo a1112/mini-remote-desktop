@@ -17,6 +17,7 @@ ed25519-dalek.workspace = true
 mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
 mrd-input = { path = "../../crates/mrd-input" }
 mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-session = { path = "../../crates/mrd-session" }
 ring.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -26,5 +27,4 @@ zeroize.workspace = true
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Pipes", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 [dev-dependencies]
-mrd-session = { path = "../../crates/mrd-session" }
 mrd-service = { path = "../mrd-service" }
