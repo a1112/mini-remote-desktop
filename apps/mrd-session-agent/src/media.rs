@@ -226,6 +226,37 @@ impl<C, R> MediaExecutor<C, R> {
     }
 }
 
+impl<C, R> MediaExecutor<C, R>
+where
+    C: CaptureAdapter,
+    R: RenderAdapter,
+{
+    /// Stops every resource owned by one invalidated session.
+    ///
+    /// Adapter failure leaves that exact resource registered so a later
+    /// shutdown/retry can attempt cleanup again; successful resources are
+    /// removed only after the platform adapter acknowledges the stop.
+    pub fn stop_session(&mut self, session_id: &SessionId) -> usize {
+        let resources = self.registry.resources_for_session(session_id);
+        let mut stopped = 0;
+        for resource in resources {
+            let acknowledged = match resource.kind {
+                MediaResourceKind::Capture => self.capture.stop(&resource.resource_id, session_id),
+                MediaResourceKind::Render => self.render.stop(&resource.resource_id, session_id),
+            };
+            if acknowledged
+                && self
+                    .registry
+                    .stop(&resource.resource_id, session_id, resource.kind)
+                    == MediaResourceMutation::Stopped
+            {
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+}
+
 impl<C, R> AuthorizedCommandExecutor for MediaExecutor<C, R>
 where
     C: CaptureAdapter,
@@ -375,6 +406,14 @@ impl MediaResourceRegistry {
         self.resources
             .retain(|_, resource| resource.session_id != *session_id);
         before - self.resources.len()
+    }
+
+    fn resources_for_session(&self, session_id: &SessionId) -> Vec<MediaResource> {
+        self.resources
+            .values()
+            .filter(|resource| resource.session_id == *session_id)
+            .cloned()
+            .collect()
     }
 
     /// Returns the exact live resource, if present.
