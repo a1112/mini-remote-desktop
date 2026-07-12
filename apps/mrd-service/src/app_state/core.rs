@@ -114,6 +114,20 @@ impl AppState {
         crate::lan_discovery::media_sender::drain_agent_access_units(&mut ingress, limit)
     }
 
+    /// Drains sender-ready units for one exact session.
+    pub(crate) async fn drain_agent_media_for_session_sender(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Vec<crate::lan_discovery::media_sender::AgentEncodedAccessUnit> {
+        let mut ingress = self.agent_media_ingress.lock().await;
+        crate::lan_discovery::media_sender::drain_agent_access_units_for_session(
+            &mut ingress,
+            session_id,
+            limit,
+        )
+    }
+
     /// Drains sender-ready units for one exact logical session.
     pub(crate) async fn drain_agent_media_for_session(
         &self,

@@ -64,6 +64,19 @@ pub(crate) fn drain_agent_access_units(
         .collect()
 }
 
+/// Takes a bounded batch belonging to one session for its sender loop.
+pub(crate) fn drain_agent_access_units_for_session(
+    ingress: &mut AgentMediaIngress,
+    session_id: &str,
+    limit: usize,
+) -> Vec<AgentEncodedAccessUnit> {
+    ingress
+        .drain_session(session_id, limit)
+        .into_iter()
+        .filter_map(validate_agent_access_unit)
+        .collect()
+}
+
 pub(super) fn create_lan_encoder(
     requested_codec: LanAccessUnitCodec,
     width: usize,
