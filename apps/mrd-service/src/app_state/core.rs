@@ -105,6 +105,15 @@ impl AppState {
         self.agent_media_ingress.lock().await.drain(limit)
     }
 
+    /// Drains and validates a bounded batch in the LAN sender representation.
+    pub async fn drain_agent_media_for_sender(
+        &self,
+        limit: usize,
+    ) -> Vec<crate::lan_discovery::media_sender::AgentEncodedAccessUnit> {
+        let mut ingress = self.agent_media_ingress.lock().await;
+        crate::lan_discovery::media_sender::drain_agent_access_units(&mut ingress, limit)
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
