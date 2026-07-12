@@ -74,7 +74,7 @@ mod media_receiver_decoder_candidates;
 mod media_receiver_runtime;
 mod media_render_policy;
 mod media_render_worker;
-mod media_sender;
+pub(crate) mod media_sender;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;

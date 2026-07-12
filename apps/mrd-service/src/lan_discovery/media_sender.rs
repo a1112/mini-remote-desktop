@@ -19,17 +19,17 @@ pub(super) struct LanSenderEncoder {
 
 /// Validated encoded payload received from the session agent boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct AgentEncodedAccessUnit {
-    pub(super) resource_id: [u8; 16],
-    pub(super) sequence: u64,
-    pub(super) timestamp_us: u64,
-    pub(super) codec: LanAccessUnitCodec,
-    pub(super) is_keyframe: bool,
-    pub(super) bytes: Vec<u8>,
+pub(crate) struct AgentEncodedAccessUnit {
+    pub(crate) resource_id: [u8; 16],
+    pub(crate) sequence: u64,
+    pub(crate) timestamp_us: u64,
+    pub(crate) codec: LanAccessUnitCodec,
+    pub(crate) is_keyframe: bool,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// Converts one authenticated agent message into the sender's transport form.
-pub(super) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentEncodedAccessUnit> {
+pub(crate) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentEncodedAccessUnit> {
     if !unit.is_valid() {
         return None;
     }

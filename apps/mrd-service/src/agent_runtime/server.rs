@@ -1049,7 +1049,9 @@ impl AgentServer {
                         Some(InboundEvent::Message(AgentToService::MediaAccessUnit(unit))) => {
                             // Media delivery is consumed by the LAN transport layer. Keep the
                             // authenticated agent connection alive while that hand-off is wired.
-                            if !unit.is_valid() {
+                            if crate::lan_discovery::media_sender::validate_agent_access_unit(unit)
+                                .is_none()
+                            {
                                 return Err(AgentServerError::UnsupportedRegisteredMessage);
                             }
                         }
