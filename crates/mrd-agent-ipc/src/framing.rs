@@ -10,12 +10,15 @@ pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 ///
 /// Minor version 1 adds mandatory nonzero request tokens to every correlated
 /// consent, execute, and input request/response pair. Minor version 2 adds
-/// exact-request consent cancellation cleanup.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 2;
+/// exact-request consent cancellation cleanup. Minor version 3 adds bounded
+/// service-to-agent render access units.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 3;
 /// Minimum negotiated minor version that supports correlated request tokens.
 pub const AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR: u16 = 1;
 /// Minimum negotiated minor version that supports consent cancellation cleanup.
 pub const AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR: u16 = 2;
+/// Minimum negotiated minor version that supports render access units.
+pub const AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR: u16 = 3;
 /// Maximum JSON payload carried by one control frame.
 pub const AGENT_IPC_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Bytes in the length-and-version frame header.

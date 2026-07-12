@@ -9,10 +9,11 @@ use mrd_agent_ipc::{
     ExecuteGrantVerifier, ExecutionContext, FileDirection, FrameError, GrantAudience,
     GrantValidationError, InputAck, InputAckOutcome, InputButton, InputEventEnvelope,
     InputEventPayload, InputFailure, InputKey, InputRejection, Locked, MediaAccessUnit, MediaCodec,
-    PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason, StoppingReason,
-    Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
-    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES,
-    AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    PeerBinding, RegistrationProofVerifier, RenderAccessUnit, ServiceToAgent, StopAgent,
+    StopReason, StoppingReason, Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS,
+    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AGENT_IPC_PROTOCOL_MINOR, AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
     AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -62,6 +63,31 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
     let mut oversized = unit;
     oversized.payload = vec![0; AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES + 1];
     assert!(!oversized.is_valid());
+}
+
+#[test]
+fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
+    assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
+    let unit = RenderAccessUnit {
+        resource_id: RESOURCE_ID,
+        session_id: "session-render".to_string(),
+        sequence: 9,
+        timestamp_us: 10,
+        codec: MediaCodec::H264,
+        is_keyframe: true,
+        payload: vec![0, 0, 0, 1, 0x65],
+    };
+    assert!(unit.is_valid());
+
+    round_trip(&ServiceToAgent::RenderAccessUnit(unit.clone()));
+
+    let mut wrong_resource = unit.clone();
+    wrong_resource.resource_id = [0; 16];
+    assert!(!wrong_resource.is_valid());
+    let mut empty_payload = unit;
+    empty_payload.payload.clear();
+    assert!(!empty_payload.is_valid());
 }
 const OTHER_GRANT_ID: [u8; 32] = [18; 32];
 
@@ -609,7 +635,7 @@ fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
 fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
     assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 2);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
 
     for reason in [
         ConsentCancelReason::CallerAborted,
@@ -1025,7 +1051,7 @@ fn execute_grant_digest_covers_the_command_id() {
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 2);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,

@@ -592,6 +592,14 @@ pub trait AuthorizedCommandExecutor: Send {
     fn capabilities(&self) -> AgentCapabilities;
     /// Execute one already-authorized command without blocking the event loop.
     fn execute(&mut self, command: AuthorizedCommand) -> CommandOutcome;
+    /// Route one authenticated encoded unit to an already-authorized render resource.
+    fn render_access_unit(&mut self, _unit: mrd_agent_ipc::RenderAccessUnit) -> bool {
+        false
+    }
+    /// Revoke every product resource owned by one invalidated logical session.
+    fn revoke_session(&mut self, _session_id: &SessionId) -> bool {
+        true
+    }
 }
 
 /// Normal termination reason for the agent event loop.
@@ -651,6 +659,12 @@ pub enum AgentRuntimeError {
     /// A fresh local authority could not synchronously retire old input state.
     #[error("session input cleanup failed")]
     InputCleanupFailed,
+    /// A revoked session retained a desktop-bound media resource.
+    #[error("session media cleanup failed")]
+    MediaCleanupFailed,
+    /// An encoded frame did not match a live authorized render resource.
+    #[error("render access unit is not authorized for a live resource")]
+    InvalidRenderAccessUnit,
     /// The bounded post-registration writer stopped or could not accept output.
     #[error("agent outbound channel is unavailable")]
     OutboundUnavailable,
@@ -1004,6 +1018,15 @@ impl AgentRuntime {
                     }
                     Some(InboundEvent::Message(ServiceToAgent::InputEvent(envelope))) => {
                         self.handle_input(&outbound, &identity, envelope).await?;
+                    }
+                    Some(InboundEvent::Message(ServiceToAgent::RenderAccessUnit(unit))) => {
+                        let accepted = self
+                            .authority
+                            .as_mut()
+                            .is_some_and(|authority| authority.executor.render_access_unit(unit));
+                        if !accepted {
+                            return Err(AgentRuntimeError::InvalidRenderAccessUnit);
+                        }
                     }
                     Some(InboundEvent::Message(ServiceToAgent::AgentChallenge(_))) => {
                         return Err(AgentRuntimeError::UnsupportedMessage);
@@ -1550,10 +1573,18 @@ impl AgentRuntime {
             return Ok(());
         }
         let mut first_error = None;
-        if let Some(authority) = self.authority.as_ref() {
-            if authority.manager.drain_authority().is_err() {
-                first_error = Some(AgentRuntimeError::ConsentStateUnavailable);
-            }
+        let invalidations = match self.authority.as_ref() {
+            Some(authority) => match authority.manager.drain_authority() {
+                Ok(invalidations) => invalidations,
+                Err(_) => {
+                    first_error = Some(AgentRuntimeError::ConsentStateUnavailable);
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        if let Err(error) = self.release_authority_invalidations(invalidations) {
+            first_error.get_or_insert(error);
         }
         if self.release_input().is_err() {
             first_error.get_or_insert(AgentRuntimeError::InputCleanupFailed);
@@ -1653,16 +1684,29 @@ impl AgentRuntime {
         &mut self,
         invalidations: Vec<AuthorityInvalidation>,
     ) -> Result<(), AgentRuntimeError> {
-        let Some(input) = self.input.as_mut() else {
-            return Ok(());
-        };
-        let mut first_error = None;
+        let mut input_failed = false;
+        let mut media_failed = false;
         for invalidation in invalidations {
-            if let Err(error) = input.release_session(&invalidation.session_id) {
-                first_error.get_or_insert(error);
+            if self
+                .input
+                .as_mut()
+                .is_some_and(|input| input.release_session(&invalidation.session_id).is_err())
+            {
+                input_failed = true;
+            }
+            if self.authority.as_mut().is_some_and(|authority| {
+                !authority.executor.revoke_session(&invalidation.session_id)
+            }) {
+                media_failed = true;
             }
         }
-        first_error.map_or(Ok(()), |_| Err(AgentRuntimeError::InputCleanupFailed))
+        if input_failed {
+            Err(AgentRuntimeError::InputCleanupFailed)
+        } else if media_failed {
+            Err(AgentRuntimeError::MediaCleanupFailed)
+        } else {
+            Ok(())
+        }
     }
 
     fn reconcile_desktop_authority(

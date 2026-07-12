@@ -9,9 +9,11 @@ use mrd_agent_ipc::{
     AgentStopping, AgentToService, CancelConsent, CommandResult, ConsentCancelReason,
     ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, ExecuteCommand,
     FrameError, InputAck, InputEventEnvelope, InputRejection, MediaAccessUnit,
-    RegisteredAgentIdentity, ServiceToAgent, StopAgent, StopReason, ValidatedConsent,
-    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
-    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    RegisteredAgentIdentity, RenderAccessUnit, ServiceToAgent, StopAgent, StopReason,
+    ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
+    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -142,6 +144,9 @@ pub enum AgentRequestError {
     /// Consent request or result violates its correlation contract.
     #[error("agent consent request is invalid: {0}")]
     InvalidConsent(ConsentValidationError),
+    /// A render unit violates the bounded service-to-agent media contract.
+    #[error("agent render access unit is invalid")]
+    InvalidRenderAccessUnit,
     /// No live server connection owns the exact bound connection.
     #[error("agent connection is unavailable")]
     ConnectionUnavailable,
@@ -644,6 +649,39 @@ impl AgentServer {
                 let _ = queue.push(unit);
             }
         }));
+    }
+
+    /// Route one bounded encoded unit to the exact persisted render binding.
+    pub fn send_render_access_unit(
+        &self,
+        binding: &AgentBinding,
+        unit: RenderAccessUnit,
+    ) -> Result<(), AgentRequestError> {
+        if !unit.is_valid() {
+            return Err(AgentRequestError::InvalidRenderAccessUnit);
+        }
+        if binding.required_capability() != AgentCapability::Render {
+            return Err(AgentRouteError::CapabilityBindingMismatch.into());
+        }
+        let route = self.registry.resolve_exact_with_minimum_minor(
+            binding,
+            AgentCapability::Render,
+            AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
+            self.clock.now_ms(),
+        )?;
+        let control = self
+            .controls
+            .lock()
+            .map_err(|_| AgentRequestError::ConnectionUnavailable)?
+            .get(&route.connection_id())
+            .cloned()
+            .ok_or(AgentRequestError::ConnectionUnavailable)?;
+        control
+            .outbound
+            .try_send(OutboundMessage::OneWay(ServiceToAgent::RenderAccessUnit(
+                unit,
+            )))
+            .map_err(|_| AgentRequestError::OutboundUnavailable)
     }
 
     /// Queue a bounded service command for one exact private connection.

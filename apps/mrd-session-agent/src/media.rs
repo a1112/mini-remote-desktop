@@ -11,7 +11,7 @@ use crate::runtime::AuthorizedCommandExecutor;
 use crate::{capture::CaptureAdapter, render::RenderAdapter};
 use mrd_agent_ipc::{
     AgentCapability, AgentCommand, AgentEventContext, AuthorizedCommand, CommandOutcome,
-    MediaAccessUnit, MediaCodec,
+    MediaAccessUnit, MediaCodec, RenderAccessUnit,
 };
 use mrd_proto::SessionId;
 use std::collections::{HashMap, VecDeque};
@@ -230,6 +230,7 @@ pub struct MediaExecutor<C, R> {
     capture: C,
     render: R,
     registry: MediaResourceRegistry,
+    render_sequences: HashMap<[u8; 16], u64>,
 }
 
 impl<C, R> MediaExecutor<C, R> {
@@ -239,6 +240,7 @@ impl<C, R> MediaExecutor<C, R> {
             capture,
             render,
             registry: MediaResourceRegistry::new(),
+            render_sequences: HashMap::new(),
         }
     }
 
@@ -272,6 +274,7 @@ where
                     .stop(&resource.resource_id, session_id, resource.kind)
                     == MediaResourceMutation::Stopped
             {
+                self.render_sequences.remove(&resource.resource_id);
                 stopped += 1;
             }
         }
@@ -329,6 +332,7 @@ where
                 }
                 let resource = self.registry.get(resource_id).expect("started resource");
                 if self.render.start(resource, session_id) {
+                    self.render_sequences.insert(*resource_id, 0);
                     CommandOutcome::Completed
                 } else {
                     let _ = self
@@ -369,10 +373,45 @@ where
                 let _ = self
                     .registry
                     .stop(resource_id, session_id, MediaResourceKind::Render);
+                self.render_sequences.remove(resource_id);
                 CommandOutcome::Completed
             }
             _ => CommandOutcome::Rejected,
         }
+    }
+
+    fn render_access_unit(&mut self, unit: RenderAccessUnit) -> bool {
+        if !unit.is_valid() {
+            return false;
+        }
+        let Some(resource) = self.registry.get(&unit.resource_id).cloned() else {
+            return false;
+        };
+        if resource.kind != MediaResourceKind::Render
+            || resource.session_id.0 != unit.session_id
+            || unit.sequence
+                <= self
+                    .render_sequences
+                    .get(&unit.resource_id)
+                    .copied()
+                    .unwrap_or(0)
+        {
+            return false;
+        }
+        if !self.render.push_access_unit(&resource, &unit) {
+            return false;
+        }
+        self.render_sequences
+            .insert(unit.resource_id, unit.sequence);
+        true
+    }
+
+    fn revoke_session(&mut self, session_id: &SessionId) -> bool {
+        self.stop_session(session_id);
+        self.registry
+            .resources
+            .values()
+            .all(|resource| resource.session_id != *session_id)
     }
 }
 
@@ -478,6 +517,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRender {
         stopped: Vec<[u8; 16]>,
+        pushed: Vec<mrd_agent_ipc::RenderAccessUnit>,
         acknowledge_stop: bool,
     }
 
@@ -489,6 +529,15 @@ mod tests {
         fn stop(&mut self, resource_id: &[u8; 16], _session_id: &SessionId) -> bool {
             self.stopped.push(*resource_id);
             self.acknowledge_stop
+        }
+
+        fn push_access_unit(
+            &mut self,
+            _resource: &MediaResource,
+            unit: &mrd_agent_ipc::RenderAccessUnit,
+        ) -> bool {
+            self.pushed.push(unit.clone());
+            true
         }
     }
 
@@ -632,5 +681,41 @@ mod tests {
         assert!(executor.registry.get(&render_id).is_some());
         assert_eq!(executor.capture.stopped, vec![capture_id]);
         assert_eq!(executor.render.stopped, vec![render_id]);
+    }
+
+    #[test]
+    fn render_units_require_the_exact_live_resource_session_and_sequence() {
+        let owner = session("owner");
+        let resource_id = [6; 16];
+        let mut executor = MediaExecutor::new(FakeCapture::default(), FakeRender::default());
+        assert_eq!(
+            executor
+                .registry
+                .start(resource_id, owner.clone(), 1, MediaResourceKind::Render,),
+            MediaResourceMutation::Started
+        );
+        let unit = |session_id: &str, sequence| mrd_agent_ipc::RenderAccessUnit {
+            resource_id,
+            session_id: session_id.to_string(),
+            sequence,
+            timestamp_us: sequence,
+            codec: MediaCodec::H264,
+            is_keyframe: sequence == 1,
+            payload: vec![1],
+        };
+
+        assert!(executor.render_access_unit(unit("owner", 1)));
+        assert!(!executor.render_access_unit(unit("other", 2)));
+        assert!(!executor.render_access_unit(unit("owner", 1)));
+        assert_eq!(executor.render.pushed.len(), 1);
+
+        assert_eq!(
+            executor
+                .registry
+                .stop(&resource_id, &owner, MediaResourceKind::Render,),
+            MediaResourceMutation::Stopped
+        );
+        assert!(!executor.render_access_unit(unit("owner", 2)));
+        assert_eq!(executor.render.pushed.len(), 1);
     }
 }

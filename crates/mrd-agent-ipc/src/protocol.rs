@@ -1219,6 +1219,38 @@ impl MediaAccessUnit {
     }
 }
 
+/// One grant-bound encoded access unit delivered to an agent render resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderAccessUnit {
+    /// Exact render resource previously authorized with `StartRender`.
+    pub resource_id: [u8; 16],
+    /// Logical product session owning the render resource.
+    pub session_id: String,
+    /// Monotonic sequence within the render resource.
+    pub sequence: u64,
+    /// Presentation timestamp in microseconds.
+    pub timestamp_us: u64,
+    /// Encoded video codec.
+    pub codec: MediaCodec,
+    /// Whether this unit is an intra-coded keyframe.
+    pub is_keyframe: bool,
+    /// Encoded payload bytes; raw desktop pixels are never carried here.
+    pub payload: Vec<u8>,
+}
+
+impl RenderAccessUnit {
+    /// Return whether identifiers, sequence, and payload bounds are valid.
+    pub fn is_valid(&self) -> bool {
+        self.resource_id != [0; 16]
+            && !self.session_id.is_empty()
+            && self.session_id.len() <= AGENT_IPC_MAX_IDENTIFIER_BYTES
+            && self.sequence > 0
+            && !self.payload.is_empty()
+            && self.payload.len() <= AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES
+    }
+}
+
 /// Outcome of an agent command.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1334,6 +1366,8 @@ pub enum ServiceToAgent {
     Execute(Box<ExecuteCommand>),
     /// Deliver one event to a previously authorized input resource.
     InputEvent(InputEventEnvelope),
+    /// Deliver one encoded frame to a previously authorized render resource.
+    RenderAccessUnit(RenderAccessUnit),
     /// Request graceful agent shutdown.
     StopAgent(StopAgent),
 }

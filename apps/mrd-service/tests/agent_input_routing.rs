@@ -3,8 +3,8 @@ use mrd_agent_ipc::{
     AgentRegister, AgentRegistered, AgentToService, CancelConsent, CommandOutcome, CommandResult,
     ConsentCancelReason, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
     ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, GrantAudience, InputAck, InputAckOutcome,
-    InputEventEnvelope, InputEventPayload, PeerBinding, RegistrationProofVerifier, ServiceToAgent,
-    AGENT_IPC_PROTOCOL_MINOR,
+    InputEventEnvelope, InputEventPayload, MediaCodec, PeerBinding, RegistrationProofVerifier,
+    RenderAccessUnit, ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
@@ -1693,6 +1693,49 @@ async fn one_way_compatibility_api_rejects_response_bearing_input() {
             .send_to_connection(connection_id(), ServiceToAgent::InputEvent(input_event(9)),),
         Err(AgentServerError::ResponseRequired)
     ));
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn render_access_unit_routes_only_to_the_exact_render_binding() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let mut agent = ConnectedAgent::connect_to(
+        Arc::clone(&registry),
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input, AgentCapability::Render]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let render_binding = registry
+        .bind_active_session(WINDOWS_SESSION_ID, AgentCapability::Render, NOW_MS)
+        .expect("bind render capability");
+    let unit = RenderAccessUnit {
+        resource_id: [31; 16],
+        session_id: "render-session".to_string(),
+        sequence: 1,
+        timestamp_us: 2,
+        codec: MediaCodec::H264,
+        is_keyframe: true,
+        payload: vec![1, 2, 3],
+    };
+
+    server
+        .send_render_access_unit(&render_binding, unit.clone())
+        .expect("route render frame");
+
+    assert_eq!(
+        read_frame::<_, ServiceToAgent>(&mut agent.stream)
+            .await
+            .expect("read render frame")
+            .message,
+        ServiceToAgent::RenderAccessUnit(unit)
+    );
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
 
