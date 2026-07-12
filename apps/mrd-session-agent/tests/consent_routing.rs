@@ -22,7 +22,7 @@ use mrd_session_agent::{
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -47,11 +47,84 @@ impl AgentClock for FixedClock {
     }
 }
 
-struct SlowInboundClock;
+struct GatedInboundClock {
+    gate: Mutex<InboundClockGate>,
+    release: Condvar,
+    entered: Notify,
+    delay: Duration,
+}
 
-impl AgentClock for SlowInboundClock {
+#[derive(Default)]
+struct InboundClockGate {
+    armed: bool,
+    entered: bool,
+    released: bool,
+}
+
+struct InboundClockReleaseGuard(Arc<GatedInboundClock>);
+
+impl Drop for InboundClockReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+impl GatedInboundClock {
+    fn new(delay: Duration) -> Self {
+        Self {
+            gate: Mutex::new(InboundClockGate::default()),
+            release: Condvar::new(),
+            entered: Notify::new(),
+            delay,
+        }
+    }
+
+    fn arm(&self) {
+        let mut gate = self.gate.lock().expect("inbound clock gate");
+        assert!(!gate.armed, "inbound clock gate arms once");
+        gate.armed = true;
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.entered.notified();
+            if self.gate.lock().expect("inbound clock gate").entered {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn is_entered_and_blocked(&self) -> bool {
+        let gate = self.gate.lock().expect("inbound clock gate");
+        gate.entered && !gate.released
+    }
+
+    fn release(&self) {
+        self.gate.lock().expect("inbound clock gate").released = true;
+        self.release.notify_all();
+    }
+}
+
+impl AgentClock for GatedInboundClock {
     fn now_ms(&self) -> u64 {
-        std::thread::sleep(Duration::from_millis(2));
+        let should_block = {
+            let mut gate = self.gate.lock().expect("inbound clock gate");
+            if gate.armed && !gate.entered {
+                gate.entered = true;
+                self.entered.notify_one();
+                true
+            } else {
+                false
+            }
+        };
+        if should_block {
+            let mut gate = self.gate.lock().expect("inbound clock gate");
+            while !gate.released {
+                gate = self.release.wait(gate).expect("inbound clock gate wait");
+            }
+        }
+        std::thread::sleep(self.delay);
         1_500
     }
 }
@@ -754,16 +827,17 @@ async fn pending_prompt_does_not_block_heartbeats() {
     stop_agent(agent, &mut service).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn continuous_inbound_cannot_starve_heartbeat() {
     let (backend, _state, _started) = backend();
+    let clock = Arc::new(GatedInboundClock::new(Duration::from_millis(2)));
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: descriptor(),
-            heartbeat_interval: Duration::from_millis(10),
+            heartbeat_interval: Duration::from_millis(50),
             handshake_timeout: Duration::from_millis(250),
         },
-        Arc::new(SlowInboundClock),
+        Arc::clone(&clock) as Arc<dyn AgentClock>,
         Arc::new(FixedSigner),
     )
     .expect("valid slow-clock runtime")
@@ -785,6 +859,19 @@ async fn continuous_inbound_cannot_starve_heartbeat() {
         session_id: SessionId("inbound-flood".to_owned()),
         reason: ConsentCancelReason::CallerAborted,
     });
+    clock.arm();
+    let _release_guard = InboundClockReleaseGuard(Arc::clone(&clock));
+    write_frame(&mut service_writer, &cancel)
+        .await
+        .expect("send first inbound flood frame");
+    tokio::time::timeout(Duration::from_millis(100), clock.wait_until_entered())
+        .await
+        .expect("first armed inbound must enter the synchronous clock gate");
+    for _ in 0..40 {
+        write_frame(&mut service_writer, &cancel)
+            .await
+            .expect("prefill inbound while control loop is gated");
+    }
     let flood = tokio::spawn(async move {
         let mut sent = 0_usize;
         while flood_flag.load(Ordering::SeqCst) {
@@ -798,14 +885,29 @@ async fn continuous_inbound_cannot_starve_heartbeat() {
         }
     });
 
-    let heartbeat = tokio::time::timeout(Duration::from_millis(150), async {
-        match read_frame::<_, AgentToService>(&mut service_reader)
-            .await
-            .expect("agent output while flooded")
-            .message
-        {
-            AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
-            other => panic!("unexpected output while flooding inbound: {other:?}"),
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert!(
+        clock.is_entered_and_blocked(),
+        "the inbound barrier must remain entered through the heartbeat interval",
+    );
+    clock.release();
+
+    let heartbeat = tokio::time::timeout(Duration::from_millis(250), async {
+        let mut observed = 0_u8;
+        loop {
+            match read_frame::<_, AgentToService>(&mut service_reader)
+                .await
+                .expect("agent output while flooded")
+                .message
+            {
+                AgentToService::AgentHeartbeat(heartbeat) => {
+                    observed += 1;
+                    if observed == 2 {
+                        return heartbeat;
+                    }
+                }
+                other => panic!("unexpected output while flooding inbound: {other:?}"),
+            }
         }
     })
     .await;
@@ -821,12 +923,12 @@ async fn continuous_inbound_cannot_starve_heartbeat() {
         }
     };
     assert_eq!(heartbeat.context.registration_id, REGISTRATION_ID);
-    drop(service_reader);
     agent.abort();
     let join_error = agent
         .await
         .expect_err("fairness probe cancels the runtime after observing heartbeat");
     assert!(join_error.is_cancelled());
+    drop(service_reader);
 }
 
 #[tokio::test]
