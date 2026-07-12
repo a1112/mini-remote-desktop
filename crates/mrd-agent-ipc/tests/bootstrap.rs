@@ -1,3 +1,7 @@
+use curve25519_dalek::{
+    constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION},
+    edwards::CompressedEdwardsY,
+};
 use mrd_agent_ipc::{
     derive_execute_grant_issuer_key_id, derive_registration_public_key, read_agent_bootstrap,
     windows_agent_bootstrap_pipe_name, write_agent_bootstrap, AgentBootstrap,
@@ -15,6 +19,32 @@ fn execute_issuer(seed: [u8; 32]) -> ([u8; 32], [u8; 32]) {
     let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
     let public_key: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
     (derive_execute_grant_issuer_key_id(&public_key), public_key)
+}
+
+fn noncanonical_nonweak_ed25519_encoding() -> [u8; 32] {
+    // p = 2^255 - 19 in little-endian form. ZIP-215 decoding reduces y modulo p,
+    // so some y = p + k encodings decompress even though RFC 8032 encoding is
+    // required to use the canonical representative k.
+    let mut field_modulus = [0xff_u8; 32];
+    field_modulus[0] = 0xed;
+    field_modulus[31] = 0x7f;
+
+    for k in 0_u8..19 {
+        for x_sign in [0_u8, 0x80] {
+            let mut candidate = field_modulus;
+            let (low, carry) = candidate[0].overflowing_add(k);
+            candidate[0] = low;
+            debug_assert!(!carry);
+            candidate[31] |= x_sign;
+            let compressed = CompressedEdwardsY(candidate);
+            if let Some(point) = compressed.decompress() {
+                if point.compress().to_bytes() != candidate && !point.is_small_order() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    panic!("test must find a decompressible noncanonical nonweak Ed25519 encoding");
 }
 
 async fn encoded_bootstrap(execute_issuer_seed: [u8; 32]) -> Vec<u8> {
@@ -152,7 +182,7 @@ async fn bootstrap_v2_rejects_zero_mismatched_and_invalid_execute_issuer_keys() 
     let invalid_public_key = (1_u8..=u8::MAX)
         .map(|value| [value; 32])
         .find(|candidate| ed25519_dalek::VerifyingKey::from_bytes(candidate).is_err())
-        .expect("test must find a non-canonical Ed25519 encoding");
+        .expect("test must find a non-decompressible Ed25519 encoding");
     let mut weak_public_key = [0_u8; 32];
     weak_public_key[0] = 1;
     assert!(ed25519_dalek::VerifyingKey::from_bytes(&weak_public_key)
@@ -194,6 +224,57 @@ async fn bootstrap_v2_rejects_zero_mismatched_and_invalid_execute_issuer_keys() 
             result.is_err(),
             "invalid issuer key case {case} was accepted"
         );
+    }
+}
+
+#[tokio::test]
+async fn execute_issuer_rejects_zip215_aliases_and_points_outside_the_prime_order_subgroup() {
+    let noncanonical = noncanonical_nonweak_ed25519_encoding();
+    let noncanonical_point = CompressedEdwardsY(noncanonical)
+        .decompress()
+        .expect("ZIP-215 alias must decompress");
+    assert_ne!(noncanonical_point.compress().to_bytes(), noncanonical);
+    assert!(!noncanonical_point.is_small_order());
+
+    let mixed_order = (ED25519_BASEPOINT_POINT + EIGHT_TORSION[1])
+        .compress()
+        .to_bytes();
+    let mixed_order_point = CompressedEdwardsY(mixed_order)
+        .decompress()
+        .expect("canonical mixed-order point must decompress");
+    assert_eq!(mixed_order_point.compress().to_bytes(), mixed_order);
+    assert!(!mixed_order_point.is_small_order());
+    assert!(!mixed_order_point.is_torsion_free());
+
+    for public_key in [noncanonical, mixed_order] {
+        let key_id = derive_execute_grant_issuer_key_id(&public_key);
+        assert!(BoundEd25519ExecuteGrantVerifier::new(key_id, public_key).is_err());
+
+        let registration_seed = [30_u8; 32];
+        let registration_key = derive_registration_public_key(&registration_seed).unwrap();
+        assert!(write_agent_bootstrap(
+            &mut tokio::io::sink(),
+            AgentBootstrap {
+                control_endpoint: r"\\.\pipe\mrd-agent-control-test",
+                service_process_id: 44,
+                service_process_creation_time: 55,
+                heartbeat_interval_ms: 1_000,
+                handshake_timeout_ms: 5_000,
+                registration_seed: Zeroizing::new(registration_seed),
+                expected_agent_key_id: registration_key.key_id,
+                execute_grant_issuer_key_id: key_id,
+                execute_grant_public_key: public_key,
+            },
+        )
+        .await
+        .is_err());
+
+        let mut encoded = encoded_bootstrap([31; 32]).await;
+        encoded[104..136].copy_from_slice(&key_id);
+        encoded[136..168].copy_from_slice(&public_key);
+        assert!(read_agent_bootstrap(&mut std::io::Cursor::new(encoded))
+            .await
+            .is_err());
     }
 }
 

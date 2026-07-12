@@ -834,6 +834,13 @@ async fn aborting_a_partially_written_consent_hard_closes_without_appending_canc
         decode_frame::<ServiceToAgent>(&partial).is_err(),
         "a CancelConsent frame must not be appended to a partial request frame"
     );
+    let cancel_tag = br#""type":"cancel_consent""#;
+    assert!(
+        !partial
+            .windows(cancel_tag.len())
+            .any(|window| window == cancel_tag),
+        "the hard-closed stream must not contain a serialized CancelConsent"
+    );
     assert_eq!(
         agent
             .serving

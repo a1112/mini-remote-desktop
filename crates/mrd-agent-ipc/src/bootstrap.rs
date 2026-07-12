@@ -1,6 +1,7 @@
 //! Secret-bearing launcher bootstrap codec and bound registration verifier.
 
 use crate::{ExecuteGrantVerifier, RegistrationProofVerifier, AGENT_IPC_MAX_IDENTIFIER_BYTES};
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use ring::digest::{Context as DigestContext, SHA256};
 use thiserror::Error;
@@ -236,6 +237,12 @@ impl BoundEd25519ExecuteGrantVerifier {
             || public_key.iter().all(|byte| *byte == 0)
             || derive_execute_grant_issuer_key_id(&public_key) != expected_key_id
         {
+            return Err(AgentBootstrapError::InvalidExecuteGrantIssuerKey);
+        }
+        let point = CompressedEdwardsY(public_key)
+            .decompress()
+            .ok_or(AgentBootstrapError::InvalidExecuteGrantIssuerKey)?;
+        if point.compress().to_bytes() != public_key || !point.is_torsion_free() {
             return Err(AgentBootstrapError::InvalidExecuteGrantIssuerKey);
         }
         let public_key = VerifyingKey::from_bytes(&public_key)

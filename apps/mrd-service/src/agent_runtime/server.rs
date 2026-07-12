@@ -1310,11 +1310,11 @@ where
     tokio::select! {
         biased;
         _ = &mut revocation => Ok(RequestWriteOutcome::Revoked),
+        reason = &mut cancellation => Ok(RequestWriteOutcome::Cancelled(reason)),
         result = write_service_frame(writer, message) => {
             result?;
             Ok(RequestWriteOutcome::Written)
         },
-        reason = &mut cancellation => Ok(RequestWriteOutcome::Cancelled(reason)),
     }
 }
 
@@ -1478,6 +1478,37 @@ mod tests {
         assert!(
             delivered.len() < complete_frame_len,
             "a revoked peer must not receive a complete stalled frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_already_cancelled_request_is_never_polled_for_write() {
+        let message = ServiceToAgent::StopAgent(StopAgent {
+            request_id: [8; 16],
+            deadline_ms: 5_000,
+            reason: StopReason::ServiceShutdown,
+        });
+        let (mut writer, mut reader) = duplex(1_024);
+
+        let outcome = write_request_frame_until_interrupted(
+            &mut writer,
+            &message,
+            std::future::pending(),
+            std::future::ready(RequestCancellation::CallerAborted),
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            outcome,
+            RequestWriteOutcome::Cancelled(RequestCancellation::CallerAborted)
+        );
+        let mut delivered = Vec::new();
+        reader.read_to_end(&mut delivered).await.unwrap();
+        assert!(
+            delivered.is_empty(),
+            "a cancellation already visible at the write boundary must win over a ready sink"
         );
     }
 }
