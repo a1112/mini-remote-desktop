@@ -41,9 +41,19 @@ const TEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct FixedClock;
 
+struct MutableClock {
+    now_ms: AtomicUsize,
+}
+
 impl AgentClock for FixedClock {
     fn now_ms(&self) -> u64 {
         1_500
+    }
+}
+
+impl AgentClock for MutableClock {
+    fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::SeqCst) as u64
     }
 }
 
@@ -1873,6 +1883,218 @@ async fn desktop_watch_immediately_publishes_revision_two_without_secure_capabil
     assert!(!changed.capabilities.contains(&AgentCapability::Input));
     assert!(!changed.capabilities.contains(&AgentCapability::Consent));
 
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn desktop_change_dismisses_active_and_queued_prompts_without_restarting_on_return() {
+    let (backend, _state, mut started) = backend();
+    let desktop = Arc::new(WatchDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let (agent, mut service, _) =
+        start_agent_with_environment_and_snapshot(backend, desktop.clone(), true).await;
+    let mut active_request = consent_request(92);
+    active_request.expires_at_ms = 10_000;
+    active_request.authorization_expires_at_ms = 11_000;
+    let mut queued_request = consent_request(93);
+    queued_request.expires_at_ms = 10_000;
+    queued_request.authorization_expires_at_ms = 11_000;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(active_request.clone()),
+    )
+    .await;
+    let mut active = next_started(&mut started).await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(queued_request.clone()),
+    )
+    .await;
+
+    let mut fifo_marker = consent_request(94);
+    fifo_marker.windows_session_id += 1;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(fifo_marker.clone()),
+    )
+    .await;
+    let marker_result = next_consent_result(&mut service).await;
+    assert_eq!(marker_result.request_id, fifo_marker.request_id);
+    assert_eq!(marker_result.decision, ConsentDecision::Dismissed);
+
+    desktop.set(Some(TrustedDesktopState {
+        desktop_epoch: 10,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
+    }));
+    tokio::time::timeout(TEST_TIMEOUT, active.abort.changed())
+        .await
+        .expect("desktop abort notification timeout")
+        .expect("desktop abort watch closed");
+    assert_eq!(
+        *active.abort.borrow_and_update(),
+        Some(ConsentAbortReason::DesktopChanged)
+    );
+
+    let mut results = Vec::new();
+    let mut saw_secure_snapshot = false;
+    while results.len() != 2 || !saw_secure_snapshot {
+        match read_agent_message(&mut service).await {
+            AgentToService::ConsentResult(result) => results.push(result),
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 10);
+                saw_secure_snapshot = true;
+            }
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected dismissal or capability snapshot, got {other:?}"),
+        }
+    }
+    assert_eq!(results[0].request_id, active_request.request_id);
+    assert_eq!(results[0].decision, ConsentDecision::Dismissed);
+    assert_eq!(results[1].request_id, queued_request.request_id);
+    assert_eq!(results[1].decision, ConsentDecision::Dismissed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "the invalidated queued prompt must not start while the old surface closes"
+    );
+
+    desktop.set(Some(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    loop {
+        match read_agent_message(&mut service).await {
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 11);
+                break;
+            }
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected restored capability snapshot, got {other:?}"),
+        }
+    }
+    active
+        .respond
+        .send(ConsentBackendDecision::Approved(
+            active_request.requested_scopes.clone(),
+        ))
+        .expect("close invalidated surface with a late approval");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "returning to Default must not resurrect an invalidated prompt"
+    );
+
+    let mut fresh_probe = consent_request(95);
+    fresh_probe.expires_at_ms = 10_000;
+    fresh_probe.authorization_expires_at_ms = 11_000;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(fresh_probe.clone()),
+    )
+    .await;
+    let fresh = next_started(&mut started).await;
+    assert_eq!(fresh.prompt.session_id(), &fresh_probe.session_id);
+    fresh
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("close fresh-epoch probe");
+    assert_eq!(
+        next_consent_result(&mut service).await.request_id,
+        fresh_probe.request_id
+    );
+
+    for request in [&active_request, &queued_request] {
+        let mut replay = request.clone();
+        replay.request_token += 1_000;
+        send_service_message(
+            &mut service,
+            &ServiceToAgent::ConsentRequest(replay.clone()),
+        )
+        .await;
+        let replayed = next_consent_result(&mut service).await;
+        assert_eq!(replayed.request_token, replay.request_token);
+        assert_eq!(replayed.request_id, replay.request_id);
+        assert_eq!(replayed.decision, ConsentDecision::Dismissed);
+    }
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn prompt_deadline_wins_when_desktop_mismatch_is_observed_at_the_same_time() {
+    let (backend, _state, mut started) = backend();
+    let desktop = Arc::new(WatchDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let clock = Arc::new(MutableClock {
+        now_ms: AtomicUsize::new(1_500),
+    });
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::clone(&clock) as Arc<dyn AgentClock>,
+        Arc::new(FixedSigner),
+    )
+    .expect("valid runtime")
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        desktop.clone(),
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("attended authority");
+    let (agent, mut service, _) = start_configured_agent(runtime, true).await;
+    let mut expiring = consent_request(96);
+    expiring.expires_at_ms = 1_600;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(expiring.clone()),
+    )
+    .await;
+    let mut prompt = next_started(&mut started).await;
+
+    clock.now_ms.store(1_600, Ordering::SeqCst);
+    desktop.set(Some(TrustedDesktopState {
+        desktop_epoch: 10,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Secure,
+    }));
+    tokio::time::timeout(TEST_TIMEOUT, prompt.abort.changed())
+        .await
+        .expect("deadline abort timeout")
+        .expect("deadline abort watch closed");
+    assert_eq!(
+        *prompt.abort.borrow_and_update(),
+        Some(ConsentAbortReason::PromptExpired)
+    );
+
+    let mut saw_expired = false;
+    let mut saw_secure = false;
+    while !saw_expired || !saw_secure {
+        match read_agent_message(&mut service).await {
+            AgentToService::ConsentResult(result) => {
+                assert_eq!(result.request_id, expiring.request_id);
+                assert_eq!(result.decision, ConsentDecision::Expired);
+                saw_expired = true;
+            }
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 10);
+                saw_secure = true;
+            }
+            other => panic!("expected expiry or secure snapshot, got {other:?}"),
+        }
+    }
+    prompt
+        .respond
+        .send(ConsentBackendDecision::Cancelled)
+        .expect("close expired surface");
     stop_agent(agent, &mut service).await;
 }
 

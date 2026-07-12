@@ -180,6 +180,8 @@ pub enum ConsentBackendDecision {
 pub enum ConsentAbortReason {
     /// The service withdrew this exact delivered request.
     Service(mrd_agent_ipc::ConsentCancelReason),
+    /// The trusted interactive desktop no longer matches this prompt.
+    DesktopChanged,
     /// The monotonic prompt deadline elapsed.
     PromptExpired,
     /// The agent is stopping and will not wait for the surface to close.
@@ -263,6 +265,12 @@ pub(crate) struct FreshAuthorityChange {
 pub(crate) struct ConsentManagerCompletion {
     pub(crate) results: Vec<ConsentResult>,
     pub(crate) fresh_authority_change: Option<FreshAuthorityChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConsentManagerBeginOutcome {
+    PromptAdmitted,
+    Cached(ConsentResult),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -815,15 +823,16 @@ impl ConsentManager {
         self.registry.resolve(session_id, now_ms)
     }
 
-    pub(crate) fn begin(
+    pub(crate) fn admit(
         &mut self,
         request: ConsentRequest,
         context: TrustedConsentContext,
-    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+    ) -> Result<ConsentManagerBeginOutcome, ConsentRegistryError> {
         let now = Instant::now();
-        let mut results = Vec::new();
         match self.registry.begin_at(request, context.clone(), now)? {
-            ConsentBeginOutcome::Cached(result) => results.push(result),
+            ConsentBeginOutcome::Cached(result) => {
+                return Ok(ConsentManagerBeginOutcome::Cached(result));
+            }
             ConsentBeginOutcome::Prompt(pending) => {
                 let prompt_lifetime_ms =
                     pending.request.expires_at_ms.saturating_sub(context.now_ms);
@@ -834,8 +843,40 @@ impl ConsentManager {
                 });
             }
         }
-        self.start_next(now, &context, &mut results)?;
+        Ok(ConsentManagerBeginOutcome::PromptAdmitted)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin(
+        &mut self,
+        request: ConsentRequest,
+        context: TrustedConsentContext,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let mut results = Vec::new();
+        if let ConsentManagerBeginOutcome::Cached(result) = self.admit(request, context.clone())? {
+            results.push(result);
+        }
+        results.append(&mut self.activate(context)?);
         Ok(results)
+    }
+
+    pub(crate) fn activate(
+        &mut self,
+        context: TrustedConsentContext,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let now = Instant::now();
+        let mut results = Vec::new();
+        self.expire_queued_due(now, context.now_ms, &mut results)?;
+        self.start_next(Instant::now(), &context, &mut results)?;
+        Ok(results)
+    }
+
+    pub(crate) fn has_active_prompt(&self) -> bool {
+        self.active.is_some()
+    }
+
+    pub(crate) fn needs_activation(&self) -> bool {
+        self.active.is_none() && !self.queued.is_empty()
     }
 
     pub(crate) fn next_deadline(&self) -> Result<Option<Instant>, ConsentRegistryError> {
@@ -977,6 +1018,73 @@ impl ConsentManager {
             .take_desktop_mismatch(desktop_epoch, desktop_kind)
     }
 
+    pub(crate) fn invalidate_desktop_prompts(
+        &mut self,
+        desktop_epoch: u64,
+        desktop_kind: DesktopKind,
+        now_ms: u64,
+    ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
+        let mut results = self.expire_due(Instant::now(), now_ms)?;
+        let active_mismatch = self.active.as_ref().is_some_and(|active| {
+            active.prompt.context.desktop_epoch != desktop_epoch
+                || active.prompt.context.desktop_kind != desktop_kind
+        });
+        if active_mismatch {
+            let active_prompting = self
+                .active
+                .as_ref()
+                .is_some_and(|active| active.phase == ActivePromptPhase::Prompting);
+            if active_prompting {
+                let outcome = {
+                    let active = self
+                        .active
+                        .as_ref()
+                        .ok_or(ConsentRegistryError::Unavailable)?;
+                    cancel_managed_prompt(&self.registry, &active.prompt, now_ms)?
+                };
+                let ConsentCancelOutcome::Cancelled(result) = outcome else {
+                    return Err(ConsentRegistryError::Unavailable);
+                };
+                let active = self
+                    .active
+                    .as_mut()
+                    .ok_or(ConsentRegistryError::Unavailable)?;
+                active.phase = ActivePromptPhase::Closing;
+                active
+                    .abort
+                    .send_replace(Some(ConsentAbortReason::DesktopChanged));
+                results.push(result);
+            }
+        }
+
+        let mut index = 0;
+        while index < self.queued.len() {
+            let mismatch = self.queued.get(index).is_some_and(|prompt| {
+                prompt.context.desktop_epoch != desktop_epoch
+                    || prompt.context.desktop_kind != desktop_kind
+            });
+            if !mismatch {
+                index += 1;
+                continue;
+            }
+            let outcome = {
+                let prompt = self
+                    .queued
+                    .get(index)
+                    .ok_or(ConsentRegistryError::Unavailable)?;
+                cancel_managed_prompt(&self.registry, prompt, now_ms)?
+            };
+            let ConsentCancelOutcome::Cancelled(result) = outcome else {
+                return Err(ConsentRegistryError::Unavailable);
+            };
+            self.queued
+                .remove(index)
+                .ok_or(ConsentRegistryError::Unavailable)?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     pub(crate) fn drain_authority(
         &self,
     ) -> Result<Vec<AuthorityInvalidation>, ConsentRegistryError> {
@@ -1094,6 +1202,16 @@ impl ConsentManager {
                 || current_context.now_ms >= prompt.pending.request.expires_at_ms
             {
                 complete_expired_prompt(&self.registry, &prompt, current_context.now_ms, results)?;
+                now = Instant::now();
+                continue;
+            }
+            if !prompt.context.same_authority(current_context) {
+                let outcome =
+                    cancel_managed_prompt(&self.registry, &prompt, current_context.now_ms)?;
+                let ConsentCancelOutcome::Cancelled(result) = outcome else {
+                    return Err(ConsentRegistryError::Unavailable);
+                };
+                results.push(result);
                 now = Instant::now();
                 continue;
             }

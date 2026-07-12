@@ -1,9 +1,9 @@
 use mrd_agent_ipc::{
     read_frame, validate_execute_command, write_frame, AgentChallenge, AgentCommand,
-    AgentProtocolState, AgentToService, CommandOutcome, ConsentDecision, ConsentRequest,
-    DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, ExecuteGrantVerifier,
-    ExecutionContext, GrantAudience, InputAckOutcome, InputButton, InputEventEnvelope,
-    InputEventPayload, InputFailure, InputKey, InputRejection, PeerBinding,
+    AgentProtocolState, AgentToService, CancelConsent, CommandOutcome, ConsentCancelReason,
+    ConsentDecision, ConsentRequest, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
+    ExecuteGrantVerifier, ExecutionContext, GrantAudience, InputAckOutcome, InputButton,
+    InputEventEnvelope, InputEventPayload, InputFailure, InputKey, InputRejection, PeerBinding,
     RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason,
 };
 use mrd_input::{InputError, InputEvent, InputInjector};
@@ -11,7 +11,10 @@ use mrd_proto::{DeviceId, SessionId};
 use mrd_session::{PermissionScope, PermissionScopes};
 use mrd_session_agent::{
     capabilities::AgentCapabilities,
-    consent::{ConsentBackend, ConsentBackendDecision, ConsentBackendFuture, ConsentPrompt},
+    consent::{
+        ConsentAbortReason, ConsentBackend, ConsentBackendDecision, ConsentBackendFuture,
+        ConsentPrompt,
+    },
     input::{InputBackend, InputResourceManager},
     runtime::{
         AgentClock, AgentExit, AgentRuntime, AgentRuntimeConfig, AuthorizedCommandExecutor,
@@ -29,7 +32,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 const REGISTRATION_ID: [u8; 16] = [1; 16];
 const RESOURCE_ID: [u8; 16] = [2; 16];
@@ -218,6 +221,40 @@ struct CountingCleanupInputBackend {
     release_all_calls: Arc<AtomicUsize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputConsentLifecycle {
+    ReleaseAllCompleted,
+    BackendFutureStarted,
+}
+
+struct InstrumentedInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    lifecycle: Arc<Mutex<Vec<InputConsentLifecycle>>>,
+    start_calls: Arc<AtomicUsize>,
+    handle_calls: Arc<AtomicUsize>,
+    stop_calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopSwitchTrigger {
+    ReleaseAll,
+    ReleaseSession,
+}
+
+struct DesktopSwitchingCleanupInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    desktop: Arc<MutableDesktop>,
+    trigger: Option<DesktopSwitchTrigger>,
+    next_state: TrustedDesktopState,
+    switches: Arc<AtomicUsize>,
+}
+
+struct ReleaseSessionObservingInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    releases: Arc<Mutex<Vec<SessionId>>>,
+    changed: Arc<Notify>,
+}
+
 struct PanicBoundaryInputBackend {
     inner: InputResourceManager<SharedInjector>,
     panic_next_handle: Arc<AtomicBool>,
@@ -287,9 +324,127 @@ impl InputBackend for CountingCleanupInputBackend {
     }
 
     fn release_all(&mut self) -> Result<(), InputError> {
-        if self.release_all_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+        if self.release_all_calls.fetch_add(1, Ordering::SeqCst) >= 2 {
             return Err(InputError::UipiDenied);
         }
+        self.inner.release_all()
+    }
+}
+
+impl InputBackend for InstrumentedInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.start_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        self.handle_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.stop_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        self.inner.release_all()?;
+        self.lifecycle
+            .lock()
+            .expect("input-consent lifecycle")
+            .push(InputConsentLifecycle::ReleaseAllCompleted);
+        Ok(())
+    }
+}
+
+impl DesktopSwitchingCleanupInputBackend {
+    fn switch_after(&mut self, completed: DesktopSwitchTrigger) {
+        if self.trigger == Some(completed) {
+            self.trigger = None;
+            self.switches.fetch_add(1, Ordering::SeqCst);
+            self.desktop.set(self.next_state);
+        }
+    }
+}
+
+impl InputBackend for DesktopSwitchingCleanupInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)?;
+        self.switch_after(DesktopSwitchTrigger::ReleaseSession);
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        self.inner.release_all()?;
+        self.switch_after(DesktopSwitchTrigger::ReleaseAll);
+        Ok(())
+    }
+}
+
+impl InputBackend for ReleaseSessionObservingInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)?;
+        self.releases
+            .lock()
+            .expect("release-session observations")
+            .push(session_id.clone());
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
         self.inner.release_all()
     }
 }
@@ -488,6 +643,28 @@ impl ConsentBackend for UnavailableConsentBackend {
 
 struct ApproveRequestedScopes;
 
+struct ControlledPrompt {
+    abort: watch::Receiver<Option<ConsentAbortReason>>,
+    respond: oneshot::Sender<ConsentBackendDecision>,
+    released_before_start: bool,
+}
+
+struct PlainControlledPrompt {
+    respond: oneshot::Sender<ConsentBackendDecision>,
+}
+
+struct ApproveFirstThenControl {
+    calls: AtomicUsize,
+    events: Arc<Mutex<Vec<InputEvent>>>,
+    lifecycle: Arc<Mutex<Vec<InputConsentLifecycle>>>,
+    started: mpsc::Sender<ControlledPrompt>,
+}
+
+struct ControlEveryPrompt {
+    calls: AtomicUsize,
+    started: mpsc::Sender<PlainControlledPrompt>,
+}
+
 impl ConsentBackend for ApproveRequestedScopes {
     fn is_available(&self) -> bool {
         true
@@ -501,6 +678,125 @@ impl ConsentBackend for ApproveRequestedScopes {
         let approved = prompt.requested_scopes().clone();
         Box::pin(async move { ConsentBackendDecision::Approved(approved) })
     }
+}
+
+impl ConsentBackend for ApproveFirstThenControl {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        prompt: ConsentPrompt,
+        abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let approved = prompt.requested_scopes().clone();
+            let lifecycle = Arc::clone(&self.lifecycle);
+            return Box::pin(async move {
+                lifecycle
+                    .lock()
+                    .expect("input-consent lifecycle")
+                    .push(InputConsentLifecycle::BackendFutureStarted);
+                ConsentBackendDecision::Approved(approved)
+            });
+        }
+        let events = Arc::clone(&self.events);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let started = self.started.clone();
+        Box::pin(async move {
+            lifecycle
+                .lock()
+                .expect("input-consent lifecycle")
+                .push(InputConsentLifecycle::BackendFutureStarted);
+            let released_before_start = events.lock().expect("events").last()
+                == Some(&InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: false,
+                });
+            let (respond, decision) = oneshot::channel();
+            if started
+                .send(ControlledPrompt {
+                    abort,
+                    respond,
+                    released_before_start,
+                })
+                .await
+                .is_err()
+            {
+                return ConsentBackendDecision::Dismissed;
+            }
+            decision.await.unwrap_or(ConsentBackendDecision::Cancelled)
+        })
+    }
+}
+
+impl ConsentBackend for ControlEveryPrompt {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        _prompt: ConsentPrompt,
+        _abort: watch::Receiver<Option<ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let started = self.started.clone();
+        Box::pin(async move {
+            let (respond, decision) = oneshot::channel();
+            if started
+                .send(PlainControlledPrompt { respond })
+                .await
+                .is_err()
+            {
+                return ConsentBackendDecision::Dismissed;
+            }
+            decision.await.unwrap_or(ConsentBackendDecision::Cancelled)
+        })
+    }
+}
+
+fn approve_first_then_control(
+    events: Arc<Mutex<Vec<InputEvent>>>,
+) -> (
+    Arc<ApproveFirstThenControl>,
+    mpsc::Receiver<ControlledPrompt>,
+) {
+    approve_first_then_control_with_lifecycle(events, Arc::new(Mutex::new(Vec::new())))
+}
+
+fn approve_first_then_control_with_lifecycle(
+    events: Arc<Mutex<Vec<InputEvent>>>,
+    lifecycle: Arc<Mutex<Vec<InputConsentLifecycle>>>,
+) -> (
+    Arc<ApproveFirstThenControl>,
+    mpsc::Receiver<ControlledPrompt>,
+) {
+    let (started, receiver) = mpsc::channel(4);
+    (
+        Arc::new(ApproveFirstThenControl {
+            calls: AtomicUsize::new(0),
+            events,
+            lifecycle,
+            started,
+        }),
+        receiver,
+    )
+}
+
+fn control_every_prompt() -> (
+    Arc<ControlEveryPrompt>,
+    mpsc::Receiver<PlainControlledPrompt>,
+) {
+    let (started, receiver) = mpsc::channel(4);
+    (
+        Arc::new(ControlEveryPrompt {
+            calls: AtomicUsize::new(0),
+            started,
+        }),
+        receiver,
+    )
 }
 
 fn session_id() -> SessionId {
@@ -655,6 +951,14 @@ fn consent_request(request_token: u64, request_id: [u8; 16]) -> ConsentRequest {
     }
 }
 
+fn long_consent_request(request_token: u64, request_id: [u8; 16]) -> ConsentRequest {
+    ConsentRequest {
+        expires_at_ms: 10_000,
+        authorization_expires_at_ms: 11_000,
+        ..consent_request(request_token, request_id)
+    }
+}
+
 async fn start_attended_input_runtime(
     injector: SharedInjector,
 ) -> (
@@ -806,6 +1110,28 @@ async fn start_attended_runtime(
         desktop_epoch: 11,
         desktop_kind: DesktopKind::Default,
     });
+    start_attended_runtime_with_desktop(
+        backend,
+        executor,
+        input,
+        desktop,
+        expect_consent_capability,
+        expect_input_capability,
+    )
+    .await
+}
+
+async fn start_attended_runtime_with_desktop(
+    backend: Arc<dyn ConsentBackend>,
+    executor: Box<dyn AuthorizedCommandExecutor>,
+    input: Option<Box<dyn InputBackend>>,
+    desktop: Arc<dyn TrustedDesktopStateSource>,
+    expect_consent_capability: bool,
+    expect_input_capability: bool,
+) -> (
+    tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    tokio::io::DuplexStream,
+) {
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: SessionDescriptor::new([10; 16], 4_242, 55, [11; 32], 7, [12; 32], 11)
@@ -2121,8 +2447,20 @@ async fn runtime_cleanup_failure_withholds_approval_and_fails_closed() {
 #[tokio::test]
 async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (agent, mut service) =
-        start_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    let releases = Arc::new(Mutex::new(Vec::new()));
+    let release_changed = Arc::new(Notify::new());
+    let (agent, mut service) = start_attended_runtime(
+        Arc::new(ApproveRequestedScopes),
+        Box::new(NoopExecutor),
+        Some(Box::new(ReleaseSessionObservingInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(Arc::clone(&events))),
+            releases: Arc::clone(&releases),
+            changed: Arc::clone(&release_changed),
+        })),
+        true,
+        true,
+    )
+    .await;
     let mut consent = consent_request(40, [40; 16]);
     consent.expires_at_ms = 1_800;
     consent.authorization_expires_at_ms = 2_000;
@@ -2142,6 +2480,13 @@ async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
         }
         other => panic!("expected approval, got {other:?}"),
     }
+    let baseline_expiring_session_releases = releases
+        .lock()
+        .expect("release-session observations")
+        .iter()
+        .filter(|released| *released == &session_id())
+        .count();
+    assert_eq!(baseline_expiring_session_releases, 1);
 
     let mut start = execute_command(
         AgentCommand::StartInput {
@@ -2251,10 +2596,17 @@ async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if events.lock().expect("events").len() == 3 {
+            let changed = release_changed.notified();
+            let release_count = releases
+                .lock()
+                .expect("release-session observations")
+                .iter()
+                .filter(|released| *released == &session_id())
+                .count();
+            if release_count > baseline_expiring_session_releases {
                 break;
             }
-            tokio::task::yield_now().await;
+            changed.await;
         }
     })
     .await
@@ -2267,15 +2619,42 @@ async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
                 pressed: true,
             },
             InputEvent::Key {
-                key: mrd_input::InputKey::VirtualKey(0x42),
-                pressed: true,
-            },
-            InputEvent::Key {
                 key: mrd_input::InputKey::VirtualKey(0x41),
                 pressed: false,
             },
-        ]
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x42),
+                pressed: true,
+            },
+        ],
+        "the second prompt releases prior input before its backend starts",
     );
+
+    let expired_session_event = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        2,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x43 },
+            pressed: true,
+        },
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(expired_session_event),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::InputAck(ack)
+            if ack.outcome == InputAckOutcome::Rejected {
+                reason: InputRejection::Grant,
+            }
+    ));
 
     let other_after_expiry = event_for_session(
         other_session_id(),
@@ -2662,7 +3041,7 @@ async fn stop_deadline_is_anchored_before_a_slow_wall_clock_sample() {
         Arc::clone(&clock) as Arc<dyn AgentClock>,
     )
     .await;
-    clock.calls_until_delay.store(2, Ordering::SeqCst);
+    clock.calls_until_delay.store(3, Ordering::SeqCst);
 
     write_frame(
         &mut service,
@@ -2738,7 +3117,7 @@ async fn successful_stop_does_not_repeat_completed_terminal_cleanup() {
     );
     assert_eq!(
         release_all_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "successful Stop cleanup must not be repeated by outer finalization or Drop",
     );
 }
@@ -2967,6 +3346,947 @@ async fn disconnect_cleanup_failure_is_not_reported_as_clean_disconnect() {
             },
         ],
         "outer cleanup must retry while preserving the first disconnect failure",
+    );
+}
+
+#[tokio::test]
+async fn managed_prompt_releases_pressed_input_before_backend_start() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(Mutex::new(Vec::new()));
+    let handle_calls = Arc::new(AtomicUsize::new(0));
+    let (backend, mut started) =
+        approve_first_then_control_with_lifecycle(Arc::clone(&events), Arc::clone(&lifecycle));
+    let (agent, mut service) = start_attended_runtime(
+        backend,
+        Box::new(NoopExecutor),
+        Some(Box::new(InstrumentedInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(Arc::clone(&events))),
+            lifecycle: Arc::clone(&lifecycle),
+            start_calls: Arc::new(AtomicUsize::new(0)),
+            handle_calls,
+            stop_calls: Arc::new(AtomicUsize::new(0)),
+        })),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    lifecycle.lock().expect("input-consent lifecycle").clear();
+
+    let replacement = long_consent_request(60, [60; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let prompt = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("replacement backend start timeout")
+        .expect("replacement backend start channel closed");
+    assert!(
+        prompt.released_before_start,
+        "pressed input must be released before the backend future starts"
+    );
+    assert_eq!(
+        lifecycle
+            .lock()
+            .expect("input-consent lifecycle")
+            .as_slice(),
+        &[
+            InputConsentLifecycle::ReleaseAllCompleted,
+            InputConsentLifecycle::BackendFutureStarted,
+        ],
+        "the backend future may start only after release_all has returned successfully",
+    );
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ]
+    );
+    prompt
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("dismiss replacement prompt");
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == replacement.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn queued_prompt_does_not_repeat_input_cleanup_while_another_surface_is_active() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let lifecycle = Arc::new(Mutex::new(Vec::new()));
+    let (backend, mut started) = control_every_prompt();
+    let (agent, mut service) = start_attended_runtime(
+        Arc::clone(&backend) as Arc<dyn ConsentBackend>,
+        Box::new(NoopExecutor),
+        Some(Box::new(InstrumentedInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(events)),
+            lifecycle: Arc::clone(&lifecycle),
+            start_calls: Arc::new(AtomicUsize::new(0)),
+            handle_calls: Arc::new(AtomicUsize::new(0)),
+            stop_calls: Arc::new(AtomicUsize::new(0)),
+        })),
+        true,
+        true,
+    )
+    .await;
+
+    let active_request = long_consent_request(69, [69; 16]);
+    let queued_request = long_consent_request(70, [70; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(active_request.clone()),
+    )
+    .await
+    .unwrap();
+    let active = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("active prompt start timeout")
+        .expect("active prompt start channel closed");
+    assert_eq!(
+        lifecycle
+            .lock()
+            .expect("input-consent lifecycle")
+            .as_slice(),
+        &[InputConsentLifecycle::ReleaseAllCompleted]
+    );
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(queued_request.clone()),
+    )
+    .await
+    .unwrap();
+    let mut fifo_marker = consent_request(71, [71; 16]);
+    fifo_marker.windows_session_id += 1;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(fifo_marker.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == fifo_marker.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    assert_eq!(
+        lifecycle
+            .lock()
+            .expect("input-consent lifecycle")
+            .as_slice(),
+        &[InputConsentLifecycle::ReleaseAllCompleted],
+        "queue admission must not repeat cleanup while the visible slot is occupied",
+    );
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: queued_request.request_token,
+            request_id: queued_request.request_id,
+            session_id: queued_request.session_id.clone(),
+            reason: ConsentCancelReason::CallerAborted,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == queued_request.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    active
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("dismiss active prompt");
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == active_request.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn active_and_closing_prompt_reject_input_without_injection() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (backend, mut started) = approve_first_then_control(Arc::clone(&events));
+    let handle_calls = Arc::new(AtomicUsize::new(0));
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let (agent, mut service) = start_attended_runtime(
+        backend,
+        Box::new(NoopExecutor),
+        Some(Box::new(InstrumentedInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(Arc::clone(&events))),
+            lifecycle: Arc::new(Mutex::new(Vec::new())),
+            start_calls: Arc::new(AtomicUsize::new(0)),
+            handle_calls: Arc::clone(&handle_calls),
+            stop_calls: Arc::clone(&stop_calls),
+        })),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    let baseline_handle_calls = handle_calls.load(Ordering::SeqCst);
+    let replacement = long_consent_request(61, [61; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let mut prompt = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("replacement backend start timeout")
+        .expect("replacement backend start channel closed");
+
+    let blocked_start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        OTHER_START_GRANT_ID,
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(blocked_start)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result) if result.outcome == CommandOutcome::Rejected
+    ));
+
+    let cleanup_stop = execute_command(
+        AgentCommand::StopInput {
+            resource_id: OTHER_RESOURCE_ID,
+        },
+        [69; 32],
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(cleanup_stop)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result) if result.outcome == CommandOutcome::Rejected
+    ));
+    assert_eq!(
+        stop_calls.load(Ordering::SeqCst),
+        1,
+        "StopInput cleanup must still reach the input backend while consent is active",
+    );
+
+    let active_event = event(
+        OTHER_RESOURCE_ID,
+        OTHER_START_GRANT_ID,
+        1,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x42 },
+            pressed: true,
+        },
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(active_event.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::InputAck(ack)
+            if ack.request_token == active_event.request_token
+                && ack.outcome == (InputAckOutcome::Rejected {
+                    reason: InputRejection::Grant,
+                })
+    ));
+    assert_eq!(handle_calls.load(Ordering::SeqCst), baseline_handle_calls);
+    assert_eq!(events.lock().expect("events").len(), 2);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: replacement.request_token,
+            request_id: replacement.request_id,
+            session_id: replacement.session_id.clone(),
+            reason: ConsentCancelReason::CallerAborted,
+        }),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), prompt.abort.changed())
+        .await
+        .expect("closing prompt abort timeout")
+        .expect("closing prompt abort watch closed");
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == replacement.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    let closing_event = event(
+        OTHER_RESOURCE_ID,
+        OTHER_START_GRANT_ID,
+        2,
+        InputEventPayload::Key {
+            key: InputKey::VirtualKey { code: 0x43 },
+            pressed: true,
+        },
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(closing_event.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::InputAck(ack)
+            if ack.request_token == closing_event.request_token
+                && ack.outcome == (InputAckOutcome::Rejected {
+                    reason: InputRejection::Grant,
+                })
+    ));
+    assert_eq!(handle_calls.load(Ordering::SeqCst), baseline_handle_calls);
+    assert_eq!(events.lock().expect("events").len(), 2);
+
+    prompt
+        .respond
+        .send(ConsentBackendDecision::Cancelled)
+        .expect("finish closing prompt");
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn prompt_start_input_gate_preserves_exact_execute_replay_outcomes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let start_calls = Arc::new(AtomicUsize::new(0));
+    let (backend, mut started) = approve_first_then_control(Arc::clone(&events));
+    let (agent, mut service) = start_attended_runtime(
+        backend,
+        Box::new(NoopExecutor),
+        Some(Box::new(InstrumentedInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(events)),
+            lifecycle: Arc::new(Mutex::new(Vec::new())),
+            start_calls: Arc::clone(&start_calls),
+            handle_calls: Arc::new(AtomicUsize::new(0)),
+            stop_calls: Arc::new(AtomicUsize::new(0)),
+        })),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+
+    let replacement = long_consent_request(72, [72; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let prompt = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("replacement prompt start timeout")
+        .expect("replacement prompt start channel closed");
+
+    let completed_before_prompt = execute_command(
+        AgentCommand::StartInput {
+            resource_id: RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        START_GRANT_ID,
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(completed_before_prompt)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result)
+            if result.outcome == CommandOutcome::Completed
+    ));
+    assert_eq!(
+        start_calls.load(Ordering::SeqCst),
+        1,
+        "a cached Completed replay must not call StartInput again",
+    );
+
+    let blocked_first = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        OTHER_START_GRANT_ID,
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(blocked_first.clone())),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result)
+            if result.outcome == CommandOutcome::Rejected
+    ));
+    assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+
+    prompt
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("dismiss replacement prompt");
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == replacement.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(blocked_first)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result)
+            if result.outcome == CommandOutcome::Rejected
+    ));
+    assert_eq!(
+        start_calls.load(Ordering::SeqCst),
+        1,
+        "the first prompt-gated rejection must remain cached after the prompt closes",
+    );
+
+    let fresh_start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        [8; 32],
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(fresh_start)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result)
+            if result.outcome == CommandOutcome::Completed
+    ));
+    assert_eq!(start_calls.load(Ordering::SeqCst), 2);
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn prompt_input_cleanup_failure_fail_stops_before_backend_start() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let injector = SharedInjector::available(Arc::clone(&events));
+    let next_error = Arc::clone(&injector.next_error);
+    let (backend, mut started) = approve_first_then_control(Arc::clone(&events));
+    let (mut agent, mut service) = start_attended_runtime(
+        backend.clone(),
+        Box::new(NoopExecutor),
+        Some(Box::new(InputResourceManager::new(injector))),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    let baseline_backend_calls = backend.calls.load(Ordering::SeqCst);
+    *next_error.lock().expect("input error") = Some(InputError::UipiDenied);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(long_consent_request(62, [62; 16])),
+    )
+    .await
+    .unwrap();
+    let error = match tokio::time::timeout(Duration::from_secs(1), &mut agent).await {
+        Ok(joined) => joined
+            .expect("agent join")
+            .expect_err("prompt cleanup failure must fail-stop"),
+        Err(_) => {
+            agent.abort();
+            let _ = agent.await;
+            panic!("prompt cleanup failure did not fail-stop")
+        }
+    };
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::InputCleanupFailed
+    ));
+    assert_eq!(
+        backend.calls.load(Ordering::SeqCst),
+        baseline_backend_calls,
+        "the admitted prompt must not activate after input cleanup fails",
+    );
+    assert!(started.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn prompt_activation_resamples_desktop_after_input_cleanup() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let switches = Arc::new(AtomicUsize::new(0));
+    let (backend, _started) = control_every_prompt();
+    let (agent, mut service) = start_attended_runtime_with_desktop(
+        Arc::clone(&backend) as Arc<dyn ConsentBackend>,
+        Box::new(NoopExecutor),
+        Some(Box::new(DesktopSwitchingCleanupInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(events)),
+            desktop: Arc::clone(&desktop),
+            trigger: Some(DesktopSwitchTrigger::ReleaseAll),
+            next_state: TrustedDesktopState {
+                desktop_epoch: 12,
+                desktop_kind: DesktopKind::Secure,
+            },
+            switches: Arc::clone(&switches),
+        })),
+        Arc::clone(&desktop) as Arc<dyn TrustedDesktopStateSource>,
+        true,
+        true,
+    )
+    .await;
+
+    let request = long_consent_request(65, [65; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await
+    .unwrap();
+
+    let mut saw_dismissal = false;
+    let mut saw_secure_snapshot = false;
+    while !saw_dismissal || !saw_secure_snapshot {
+        match read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message
+        {
+            AgentToService::ConsentResult(result) => {
+                assert_eq!(result.request_id, request.request_id);
+                assert_eq!(result.decision, ConsentDecision::Dismissed);
+                saw_dismissal = true;
+            }
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 12);
+                saw_secure_snapshot = true;
+            }
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected prompt dismissal or secure snapshot, got {other:?}"),
+        }
+    }
+    assert_eq!(switches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend.calls.load(Ordering::SeqCst),
+        0,
+        "a prompt captured before cleanup must not start on the desktop observed after cleanup",
+    );
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn queued_prompt_resume_resamples_desktop_after_fresh_authority_cleanup() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let switches = Arc::new(AtomicUsize::new(0));
+    let (backend, mut started) = control_every_prompt();
+    let (agent, mut service) = start_attended_runtime_with_desktop(
+        Arc::clone(&backend) as Arc<dyn ConsentBackend>,
+        Box::new(NoopExecutor),
+        Some(Box::new(DesktopSwitchingCleanupInputBackend {
+            inner: InputResourceManager::new(SharedInjector::available(events)),
+            desktop: Arc::clone(&desktop),
+            trigger: Some(DesktopSwitchTrigger::ReleaseSession),
+            next_state: TrustedDesktopState {
+                desktop_epoch: 12,
+                desktop_kind: DesktopKind::Secure,
+            },
+            switches: Arc::clone(&switches),
+        })),
+        Arc::clone(&desktop) as Arc<dyn TrustedDesktopStateSource>,
+        true,
+        true,
+    )
+    .await;
+
+    let active_request = long_consent_request(66, [66; 16]);
+    let queued_request = long_consent_request(67, [67; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(active_request.clone()),
+    )
+    .await
+    .unwrap();
+    let active = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("active prompt start timeout")
+        .expect("active prompt start channel closed");
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(queued_request.clone()),
+    )
+    .await
+    .unwrap();
+
+    let mut fifo_marker = consent_request(68, [68; 16]);
+    fifo_marker.windows_session_id += 1;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(fifo_marker.clone()),
+    )
+    .await
+    .unwrap();
+    let marker = read_frame::<_, AgentToService>(&mut service)
+        .await
+        .unwrap()
+        .message;
+    assert!(matches!(
+        marker,
+        AgentToService::ConsentResult(result)
+            if result.request_id == fifo_marker.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+
+    active
+        .respond
+        .send(ConsentBackendDecision::Approved(
+            active_request.requested_scopes.clone(),
+        ))
+        .expect("approve active prompt");
+
+    let mut results = Vec::new();
+    let mut saw_secure_snapshot = false;
+    while results.len() != 2 || !saw_secure_snapshot {
+        match read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message
+        {
+            AgentToService::ConsentResult(result) => results.push(result),
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 12);
+                saw_secure_snapshot = true;
+            }
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected approval, dismissal, or secure snapshot, got {other:?}"),
+        }
+    }
+    assert_eq!(results[0].request_id, active_request.request_id);
+    assert_eq!(results[0].decision, ConsentDecision::Approved);
+    assert_eq!(results[1].request_id, queued_request.request_id);
+    assert_eq!(results[1].decision, ConsentDecision::Dismissed);
+    assert_eq!(switches.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        backend.calls.load(Ordering::SeqCst),
+        1,
+        "cleanup-time desktop changes must tombstone queued prompts before promotion",
+    );
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn desktop_change_wins_against_late_approval_and_start_input() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (backend, mut started) = approve_first_then_control(Arc::clone(&events));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service) = start_attended_runtime_with_desktop(
+        backend,
+        Box::new(NoopExecutor),
+        Some(Box::new(InputResourceManager::new(
+            SharedInjector::available(Arc::clone(&events)),
+        ))),
+        Arc::clone(&desktop) as Arc<dyn TrustedDesktopStateSource>,
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    let replacement = long_consent_request(63, [63; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replacement.clone()),
+    )
+    .await
+    .unwrap();
+    let mut prompt = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("replacement backend start timeout")
+        .expect("replacement backend start channel closed");
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 12,
+        desktop_kind: DesktopKind::Secure,
+    });
+    tokio::time::timeout(Duration::from_secs(1), prompt.abort.changed())
+        .await
+        .expect("desktop abort timeout")
+        .expect("desktop abort watch closed");
+    assert_eq!(
+        *prompt.abort.borrow_and_update(),
+        Some(ConsentAbortReason::DesktopChanged)
+    );
+    let mut saw_dismissal = false;
+    let mut saw_secure = false;
+    while !saw_dismissal || !saw_secure {
+        match read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message
+        {
+            AgentToService::ConsentResult(result) => {
+                assert_eq!(result.request_id, replacement.request_id);
+                assert_eq!(result.decision, ConsentDecision::Dismissed);
+                saw_dismissal = true;
+            }
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 12);
+                saw_secure = true;
+            }
+            other => panic!("expected desktop dismissal or capability snapshot, got {other:?}"),
+        }
+    }
+    prompt
+        .respond
+        .send(ConsentBackendDecision::Approved(
+            replacement.requested_scopes.clone(),
+        ))
+        .expect("send deliberately late approval");
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 13,
+        desktop_kind: DesktopKind::Default,
+    });
+    loop {
+        match read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message
+        {
+            AgentToService::AgentCapabilitySnapshot(snapshot) => {
+                assert_eq!(snapshot.desktop_epoch, 13);
+                break;
+            }
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected restored capability snapshot, got {other:?}"),
+        }
+    }
+
+    let fresh_probe = long_consent_request(64, [64; 16]);
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(fresh_probe.clone()),
+    )
+    .await
+    .unwrap();
+    let fresh = tokio::time::timeout(Duration::from_secs(1), started.recv())
+        .await
+        .expect("fresh-epoch prompt start timeout")
+        .expect("fresh-epoch prompt channel closed");
+    fresh
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("dismiss fresh-epoch prompt");
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_id == fresh_probe.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+
+    let mut replay = replacement.clone();
+    replay.request_token += 1_000;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replay.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::ConsentResult(result)
+            if result.request_token == replay.request_token
+                && result.request_id == replay.request_id
+                && result.decision == ConsentDecision::Dismissed
+    ));
+    let restored_context = ExecutionContext {
+        desktop_epoch: 13,
+        ..context()
+    };
+    let start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        OTHER_START_GRANT_ID,
+        &restored_context,
+    );
+    write_frame(&mut service, &ServiceToAgent::Execute(Box::new(start)))
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result) if result.outcome == CommandOutcome::Rejected
+    ));
+    assert_eq!(events.lock().expect("events").len(), 2);
+
+    drop(service);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::ServiceDisconnected
     );
 }
 

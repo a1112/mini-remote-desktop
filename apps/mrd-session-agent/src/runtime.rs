@@ -3,7 +3,7 @@
 use crate::capabilities::AgentCapabilities;
 use crate::consent::{
     AuthorityInvalidation, BackendCompletion, ConsentAbortReason, ConsentBackend, ConsentManager,
-    ConsentRegistryError, TrustedConsentContext, TrustedSessionBinding,
+    ConsentManagerBeginOutcome, ConsentRegistryError, TrustedConsentContext, TrustedSessionBinding,
 };
 use crate::input::InputBackend;
 use mrd_agent_ipc::{
@@ -897,10 +897,13 @@ impl AgentRuntime {
             };
             if matches!(
                 &event,
-                RegisteredLoopEvent::Inbound(_) | RegisteredLoopEvent::Heartbeat
+                RegisteredLoopEvent::Inbound(_)
+                    | RegisteredLoopEvent::Heartbeat
+                    | RegisteredLoopEvent::Consent(Some(_))
+                    | RegisteredLoopEvent::ConsentDeadline
             ) {
                 let desktop = self.current_desktop_state()?;
-                self.reconcile_desktop_authority(desktop)?;
+                self.reconcile_desktop_authority(&outbound, desktop)?;
                 if self.last_desktop_state != Some(desktop) {
                     self.last_desktop_state = Some(desktop);
                     capability_revision = capability_revision
@@ -1034,7 +1037,7 @@ impl AgentRuntime {
                 }
                 RegisteredLoopEvent::DesktopChanged(Some(Ok(()))) => {
                     let desktop = self.current_desktop_state()?;
-                    self.reconcile_desktop_authority(desktop)?;
+                    self.reconcile_desktop_authority(&outbound, desktop)?;
                     if self.last_desktop_state != Some(desktop) {
                         self.last_desktop_state = Some(desktop);
                         capability_revision = capability_revision
@@ -1191,18 +1194,23 @@ impl AgentRuntime {
         execute: &mrd_agent_ipc::ExecuteCommand,
     ) -> Result<(), AgentRuntimeError> {
         let now_ms = self.clock.now_ms();
-        let authorized = if self.authority.is_some() {
+        let (authorized, start_input_blocked) = if self.authority.is_some() {
             let desktop = self.current_desktop_state()?;
-            self.reconcile_desktop_authority(desktop)?;
+            self.reconcile_desktop_authority(writer, desktop)?;
             let authority = self
                 .authority
                 .as_ref()
                 .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
+            let start_input_blocked = authority.manager.has_active_prompt()
+                && matches!(
+                    &execute.command,
+                    mrd_agent_ipc::AgentCommand::StartInput { .. }
+                );
             let binding = authority
                 .manager
                 .resolve_binding(&execute.grant.claims.session_id, now_ms)
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
-            if let Some(binding) = binding {
+            let authorized = if let Some(binding) = binding {
                 if binding_matches_runtime(&binding, identity, desktop) {
                     let context = ExecutionContext {
                         registration_id: binding.registration_id,
@@ -1224,12 +1232,13 @@ impl AgentRuntime {
                 }
             } else {
                 None
-            }
+            };
+            (authorized, start_input_blocked)
         } else {
-            None
+            (None, false)
         };
         let outcome = match authorized {
-            Some(authorized) => self.execute_once(authorized)?,
+            Some(authorized) => self.execute_once(authorized, start_input_blocked)?,
             None => CommandOutcome::Rejected,
         };
 
@@ -1252,54 +1261,66 @@ impl AgentRuntime {
         let now_ms = self.clock.now_ms();
         let outcome = if self.input.is_some() && self.authority.is_some() {
             let desktop = self.current_desktop_state()?;
-            self.reconcile_desktop_authority(desktop)?;
-            let binding = self
+            self.reconcile_desktop_authority(writer, desktop)?;
+            let prompt_active = self
                 .authority
                 .as_ref()
                 .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
                 .manager
-                .resolve_binding(&envelope.session_id, now_ms)
-                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
-            if let Some(binding) = binding {
-                if binding_matches_runtime(&binding, identity, desktop) {
-                    let context = ExecutionContext {
-                        registration_id: binding.registration_id,
-                        registration_epoch: binding.registration_epoch,
-                        session_id: binding.session_id,
-                        peer: binding.peer,
-                        policy_revision: binding.policy_revision,
-                        windows_session_id: binding.windows_session_id,
-                        desktop_epoch: desktop.desktop_epoch,
-                        desktop_kind: desktop.desktop_kind,
-                        now_ms,
-                        expected_issuer_key_id: binding.expected_issuer_key_id,
-                        authorization_scopes: binding.approved_scopes,
-                        authorization_expires_at_ms: binding.authorization_expires_at_ms,
-                    };
-                    let input = self
-                        .input
-                        .as_mut()
-                        .ok_or(AgentRuntimeError::InputCleanupFailed)?;
-                    let outcome = input.handle(&envelope, &context);
-                    if matches!(
-                        outcome,
-                        InputAckOutcome::Rejected {
-                            reason: mrd_agent_ipc::InputRejection::StaleDesktop
+                .has_active_prompt();
+            if prompt_active {
+                InputAckOutcome::Rejected {
+                    reason: mrd_agent_ipc::InputRejection::Grant,
+                }
+            } else {
+                let binding = self
+                    .authority
+                    .as_ref()
+                    .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+                    .manager
+                    .resolve_binding(&envelope.session_id, now_ms)
+                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                if let Some(binding) = binding {
+                    if binding_matches_runtime(&binding, identity, desktop) {
+                        let context = ExecutionContext {
+                            registration_id: binding.registration_id,
+                            registration_epoch: binding.registration_epoch,
+                            session_id: binding.session_id,
+                            peer: binding.peer,
+                            policy_revision: binding.policy_revision,
+                            windows_session_id: binding.windows_session_id,
+                            desktop_epoch: desktop.desktop_epoch,
+                            desktop_kind: desktop.desktop_kind,
+                            now_ms,
+                            expected_issuer_key_id: binding.expected_issuer_key_id,
+                            authorization_scopes: binding.approved_scopes,
+                            authorization_expires_at_ms: binding.authorization_expires_at_ms,
+                        };
+                        let input = self
+                            .input
+                            .as_mut()
+                            .ok_or(AgentRuntimeError::InputCleanupFailed)?;
+                        let outcome = input.handle(&envelope, &context);
+                        if matches!(
+                            outcome,
+                            InputAckOutcome::Rejected {
+                                reason: mrd_agent_ipc::InputRejection::StaleDesktop
+                            }
+                        ) {
+                            input
+                                .release_all()
+                                .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
                         }
-                    ) {
-                        input
-                            .release_all()
-                            .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
+                        outcome
+                    } else {
+                        InputAckOutcome::Rejected {
+                            reason: mrd_agent_ipc::InputRejection::Grant,
+                        }
                     }
-                    outcome
                 } else {
                     InputAckOutcome::Rejected {
                         reason: mrd_agent_ipc::InputRejection::Grant,
                     }
-                }
-            } else {
-                InputAckOutcome::Rejected {
-                    reason: mrd_agent_ipc::InputRejection::Grant,
                 }
             }
         } else {
@@ -1331,19 +1352,45 @@ impl AgentRuntime {
             return self.handle_consent_without_manager(writer, request).await;
         }
         let context = self.trusted_consent_context(identity)?;
-        let authority = self
+        let due = self
             .authority
             .as_mut()
-            .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
-        let due = authority
+            .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
             .manager
             .expire_due(Instant::now(), context.now_ms)
             .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
         for result in due {
             writer.enqueue(AgentToService::ConsentResult(result))?;
         }
-        let immediate = match authority.manager.begin(request.clone(), context) {
-            Ok(results) => results,
+        let admission = self
+            .authority
+            .as_mut()
+            .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+            .manager
+            .admit(request.clone(), context.clone());
+        let immediate = match admission {
+            Ok(ConsentManagerBeginOutcome::Cached(result)) => vec![result],
+            Ok(ConsentManagerBeginOutcome::PromptAdmitted) => {
+                let needs_activation = self
+                    .authority
+                    .as_ref()
+                    .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+                    .manager
+                    .needs_activation();
+                if needs_activation {
+                    self.release_input()
+                        .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
+                    let activation_context = self.trusted_consent_context(identity)?;
+                    self.authority
+                        .as_mut()
+                        .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
+                        .manager
+                        .activate(activation_context)
+                        .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
+                } else {
+                    Vec::new()
+                }
+            }
             Err(ConsentRegistryError::InactiveRequest) => vec![coarse_consent_result(
                 &request,
                 ConsentDecision::Expired,
@@ -1405,12 +1452,13 @@ impl AgentRuntime {
             }
         }
         if completion.fresh_authority_change.is_some() {
+            let resume_context = self.trusted_consent_context(identity)?;
             let mut resumed = self
                 .authority
                 .as_mut()
                 .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
                 .manager
-                .resume_after_fresh_authority(context)
+                .resume_after_fresh_authority(resume_context)
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
             completion.results.append(&mut resumed);
         }
@@ -1542,6 +1590,7 @@ impl AgentRuntime {
     fn execute_once(
         &mut self,
         authorized: AuthorizedCommand,
+        start_input_blocked: bool,
     ) -> Result<CommandOutcome, AgentRuntimeError> {
         let grant_id = *authorized.grant_id();
         let command_id = *authorized.command_id();
@@ -1549,7 +1598,13 @@ impl AgentRuntime {
         match self.replay.reserve(grant_id, command_id, fingerprint)? {
             ReplayReservation::First => {
                 let capabilities = self.generic_executor_capabilities();
-                let outcome = if let Some(input) = &mut self.input {
+                let outcome = if start_input_blocked
+                    && matches!(
+                        authorized.command(),
+                        mrd_agent_ipc::AgentCommand::StartInput { .. }
+                    ) {
+                    CommandOutcome::Rejected
+                } else if let Some(input) = &mut self.input {
                     match authorized.command().clone() {
                         mrd_agent_ipc::AgentCommand::StartInput { .. } => input
                             .start(authorized)
@@ -1612,16 +1667,39 @@ impl AgentRuntime {
 
     fn reconcile_desktop_authority(
         &mut self,
+        writer: &OutboundWriter,
         desktop: TrustedDesktopState,
     ) -> Result<(), AgentRuntimeError> {
-        let invalidations = match self.authority.as_ref() {
-            Some(authority) => authority
-                .manager
-                .take_desktop_mismatch(desktop.desktop_epoch, desktop.desktop_kind)
-                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
-            None => Vec::new(),
+        let desktop_changed = self.last_desktop_state.is_some_and(|last| last != desktop);
+        let (had_active_prompt, prompt_results, invalidations) = match self.authority.as_mut() {
+            Some(authority) => {
+                let had_active_prompt = authority.manager.has_active_prompt();
+                let prompt_results = authority
+                    .manager
+                    .invalidate_desktop_prompts(
+                        desktop.desktop_epoch,
+                        desktop.desktop_kind,
+                        self.clock.now_ms(),
+                    )
+                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                let invalidations = authority
+                    .manager
+                    .take_desktop_mismatch(desktop.desktop_epoch, desktop.desktop_kind)
+                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                (had_active_prompt, prompt_results, invalidations)
+            }
+            None => (false, Vec::new(), Vec::new()),
         };
-        self.release_authority_invalidations(invalidations)
+        let prompt_invalidated = !prompt_results.is_empty();
+        self.release_authority_invalidations(invalidations)?;
+        if (desktop_changed && had_active_prompt) || prompt_invalidated {
+            self.release_input()
+                .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
+        }
+        for result in prompt_results {
+            writer.enqueue(AgentToService::ConsentResult(result))?;
+        }
+        Ok(())
     }
 
     fn reconcile_due_authority(&mut self) -> Result<Vec<SessionId>, AgentRuntimeError> {
