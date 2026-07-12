@@ -9,9 +9,13 @@ pub mod capabilities;
 /// Agent-local consent authority and trusted session bindings.
 pub mod consent;
 /// Fail-closed cached trusted desktop observations.
-#[allow(dead_code)] // Consumed by the native watcher added in Task 24.B3.2.
+#[allow(dead_code)] // Production bootstrap consumes this adapter in Task 24.B3.5.
 pub(crate) mod desktop;
 /// Authorized input-resource execution and pressed-state cleanup.
 pub mod input;
 /// Registration, control-loop, heartbeat, and shutdown runtime.
 pub mod runtime;
+/// Native Windows trusted-desktop observation.
+#[allow(dead_code)] // Production bootstrap consumes this adapter in Task 24.B3.5.
+#[cfg(windows)]
+pub(crate) mod windows_desktop;
