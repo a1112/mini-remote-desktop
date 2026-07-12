@@ -436,6 +436,40 @@ impl MediaResourceRegistry {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FakeCapture {
+        stopped: Vec<[u8; 16]>,
+        acknowledge_stop: bool,
+    }
+
+    impl CaptureAdapter for FakeCapture {
+        fn start(&mut self, _resource: &MediaResource, _session_id: &SessionId) -> bool {
+            true
+        }
+
+        fn stop(&mut self, resource_id: &[u8; 16], _session_id: &SessionId) -> bool {
+            self.stopped.push(*resource_id);
+            self.acknowledge_stop
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeRender {
+        stopped: Vec<[u8; 16]>,
+        acknowledge_stop: bool,
+    }
+
+    impl RenderAdapter for FakeRender {
+        fn start(&mut self, _resource: &MediaResource, _session_id: &SessionId) -> bool {
+            true
+        }
+
+        fn stop(&mut self, resource_id: &[u8; 16], _session_id: &SessionId) -> bool {
+            self.stopped.push(*resource_id);
+            self.acknowledge_stop
+        }
+    }
+
     fn session(name: &str) -> SessionId {
         SessionId(name.to_owned())
     }
@@ -519,5 +553,39 @@ mod tests {
         assert_eq!(queue.pop().unwrap().sequence(), 1);
         assert_eq!(queue.pop().unwrap().sequence(), 2);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn session_invalidation_calls_each_adapter_and_retains_failed_cleanup() {
+        let owner = session("owner");
+        let capture_id = [4; 16];
+        let render_id = [5; 16];
+        let mut executor = MediaExecutor::new(
+            FakeCapture {
+                acknowledge_stop: true,
+                ..FakeCapture::default()
+            },
+            FakeRender {
+                acknowledge_stop: false,
+                ..FakeRender::default()
+            },
+        );
+        assert_eq!(
+            executor
+                .registry
+                .start(capture_id, owner.clone(), 1, MediaResourceKind::Capture),
+            MediaResourceMutation::Started
+        );
+        assert_eq!(
+            executor
+                .registry
+                .start(render_id, owner.clone(), 2, MediaResourceKind::Render),
+            MediaResourceMutation::Started
+        );
+        assert_eq!(executor.stop_session(&owner), 1);
+        assert!(executor.registry.get(&capture_id).is_none());
+        assert!(executor.registry.get(&render_id).is_some());
+        assert_eq!(executor.capture.stopped, vec![capture_id]);
+        assert_eq!(executor.render.stopped, vec![render_id]);
     }
 }
