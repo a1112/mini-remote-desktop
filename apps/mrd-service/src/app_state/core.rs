@@ -82,6 +82,8 @@ pub struct AppState {
     pub media_render_queues: Arc<Mutex<MediaRenderQueueRegistry>>,
     /// Abort handles for active media tasks keyed by session.
     pub media_tasks: Arc<Mutex<MediaTaskRegistry>>,
+    /// Bounded encoded media ingress from authenticated session agents.
+    pub agent_media_ingress: Arc<Mutex<crate::agent_runtime::AgentMediaIngress>>,
 }
 
 impl AppState {
@@ -185,6 +187,10 @@ impl AppState {
             #[cfg(any(windows, target_os = "macos"))]
             media_render_queues: Arc::new(Mutex::new(MediaRenderQueueRegistry::default())),
             media_tasks: Arc::new(Mutex::new(MediaTaskRegistry::default())),
+            agent_media_ingress: Arc::new(Mutex::new(
+                crate::agent_runtime::AgentMediaIngress::new(32)
+                    .expect("non-zero agent media ingress capacity"),
+            )),
         }
     }
 
