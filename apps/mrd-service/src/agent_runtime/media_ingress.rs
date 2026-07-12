@@ -55,6 +55,12 @@ impl AgentMediaIngress {
     pub fn dropped(&self) -> u64 {
         self.dropped
     }
+
+    /// Clears queued units when the owning agent/session is invalidated.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.last_sequence = 0;
+    }
 }
 
 #[cfg(test)]
@@ -96,5 +102,8 @@ mod tests {
             invalid
         }));
         assert_eq!(ingress.dropped(), 3);
+        ingress.clear();
+        assert_eq!(ingress.len(), 0);
+        assert!(ingress.push(unit(1)));
     }
 }
