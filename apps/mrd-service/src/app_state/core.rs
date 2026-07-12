@@ -146,12 +146,17 @@ impl AppState {
         &self,
         session_id: &str,
         limit: usize,
-    ) -> crate::lan_discovery::media_sender::SenderMediaTurn {
+        negotiated_codec: crate::lan_discovery::media_sender::LanAccessUnitCodec,
+    ) -> Result<
+        crate::lan_discovery::media_sender::SenderMediaTurn,
+        crate::lan_discovery::media_sender::AgentTransportUnitError,
+    > {
         let mut ingress = self.agent_media_ingress.lock().await;
         crate::lan_discovery::media_sender::take_sender_media_turn(
             &mut ingress,
             session_id,
             limit,
+            negotiated_codec,
         )
     }
 

@@ -5,7 +5,8 @@ use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::ColorMode;
 use mrd_pipeline_core::VideoEncoder;
 
-use super::media_access_unit::LanAccessUnitCodec;
+use super::media_access_unit::h264_access_unit_is_keyframe;
+pub(crate) use super::media_access_unit::LanAccessUnitCodec;
 use super::media_profile::{
     default_media_profile, lan_color_mode_for_profile, lan_profile_requests_hevc_main10,
     missing_profile_receiver_media_capabilities,
@@ -30,6 +31,47 @@ pub(crate) struct AgentEncodedAccessUnit {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// Sender-ready access unit after checking it against the negotiated codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentTransportUnit {
+    pub(crate) codec: LanAccessUnitCodec,
+    pub(crate) timestamp_us: u64,
+    pub(crate) is_keyframe: bool,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// A validated agent unit cannot be used by the current transport profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentTransportUnitError {
+    CodecMismatch {
+        negotiated: LanAccessUnitCodec,
+        received: LanAccessUnitCodec,
+    },
+}
+
+/// Checks negotiated codec truth and normalizes keyframe metadata for transport.
+pub(crate) fn prepare_agent_transport_unit(
+    unit: AgentEncodedAccessUnit,
+    negotiated_codec: LanAccessUnitCodec,
+) -> Result<AgentTransportUnit, AgentTransportUnitError> {
+    if unit.codec != negotiated_codec {
+        return Err(AgentTransportUnitError::CodecMismatch {
+            negotiated: negotiated_codec,
+            received: unit.codec,
+        });
+    }
+    let is_keyframe = match unit.codec {
+        LanAccessUnitCodec::H264 => h264_access_unit_is_keyframe(unit.is_keyframe, &unit.bytes),
+        LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => unit.is_keyframe,
+    };
+    Ok(AgentTransportUnit {
+        codec: unit.codec,
+        timestamp_us: unit.timestamp_us,
+        is_keyframe,
+        bytes: unit.bytes,
+    })
+}
+
 /// Selects the active media source while the migration keeps a local fallback.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +83,7 @@ pub(crate) enum MediaSourceSelection {
 /// One atomic sender scheduling decision made while the ingress is locked.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SenderMediaTurn {
-    Agent(Vec<AgentEncodedAccessUnit>),
+    Agent(Vec<AgentTransportUnit>),
     LocalCapture,
 }
 
@@ -60,12 +102,17 @@ pub(crate) fn take_sender_media_turn(
     ingress: &mut AgentMediaIngress,
     session_id: &str,
     limit: usize,
-) -> SenderMediaTurn {
+    negotiated_codec: LanAccessUnitCodec,
+) -> Result<SenderMediaTurn, AgentTransportUnitError> {
     let batch = drain_agent_access_units_for_session(ingress, session_id, limit);
     if batch.is_empty() {
-        SenderMediaTurn::LocalCapture
+        Ok(SenderMediaTurn::LocalCapture)
     } else {
-        SenderMediaTurn::Agent(batch)
+        batch
+            .into_iter()
+            .map(|unit| prepare_agent_transport_unit(unit, negotiated_codec))
+            .collect::<Result<Vec<_>, _>>()
+            .map(SenderMediaTurn::Agent)
     }
 }
 
@@ -497,14 +544,20 @@ mod tests {
         assert!(ingress.push(make("target-session", 1)));
         assert!(ingress.push(make("target-session", 2)));
 
-        let turn = take_sender_media_turn(&mut ingress, "target-session", 1);
+        let turn = take_sender_media_turn(
+            &mut ingress,
+            "target-session",
+            1,
+            LanAccessUnitCodec::H264,
+        )
+        .expect("matching codec");
 
         let SenderMediaTurn::Agent(batch) = turn else {
             panic!("queued target-session media must preempt local capture");
         };
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].session_id, "target-session");
-        assert_eq!(batch[0].sequence, 1);
+        assert_eq!(batch[0].codec, LanAccessUnitCodec::H264);
+        assert_eq!(batch[0].timestamp_us, 1);
         assert_eq!(ingress.session_len("target-session"), 1);
         assert_eq!(ingress.session_len("other-session"), 1);
     }
@@ -531,9 +584,56 @@ mod tests {
         }));
 
         assert_eq!(
-            take_sender_media_turn(&mut ingress, "target-session", 1),
-            SenderMediaTurn::LocalCapture
+            take_sender_media_turn(
+                &mut ingress,
+                "target-session",
+                1,
+                LanAccessUnitCodec::H264,
+            ),
+            Ok(SenderMediaTurn::LocalCapture)
         );
         assert_eq!(ingress.session_len("other-session"), 1);
+    }
+
+    #[test]
+    fn agent_h264_transport_unit_recovers_keyframe_truth_from_the_payload() {
+        let unit = AgentEncodedAccessUnit {
+            resource_id: [9; 16],
+            session_id: "session-1".to_string(),
+            sequence: 7,
+            timestamp_us: 8,
+            codec: LanAccessUnitCodec::H264,
+            is_keyframe: false,
+            bytes: vec![0, 0, 0, 1, 0x65, 1, 2, 3],
+        };
+
+        let prepared = prepare_agent_transport_unit(unit, LanAccessUnitCodec::H264)
+            .expect("matching agent codec should be accepted");
+
+        assert_eq!(prepared.codec, LanAccessUnitCodec::H264);
+        assert_eq!(prepared.timestamp_us, 8);
+        assert!(prepared.is_keyframe);
+        assert_eq!(prepared.bytes, vec![0, 0, 0, 1, 0x65, 1, 2, 3]);
+    }
+
+    #[test]
+    fn agent_transport_unit_rejects_a_codec_outside_the_negotiated_profile() {
+        let unit = AgentEncodedAccessUnit {
+            resource_id: [9; 16],
+            session_id: "session-1".to_string(),
+            sequence: 7,
+            timestamp_us: 8,
+            codec: LanAccessUnitCodec::Hevc,
+            is_keyframe: true,
+            bytes: vec![1, 2, 3],
+        };
+
+        assert_eq!(
+            prepare_agent_transport_unit(unit, LanAccessUnitCodec::H264),
+            Err(AgentTransportUnitError::CodecMismatch {
+                negotiated: LanAccessUnitCodec::H264,
+                received: LanAccessUnitCodec::Hevc,
+            })
+        );
     }
 }
