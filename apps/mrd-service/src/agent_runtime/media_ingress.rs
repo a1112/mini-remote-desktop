@@ -1,0 +1,86 @@
+use mrd_agent_ipc::MediaAccessUnit;
+use std::collections::VecDeque;
+
+/// Bounded hand-off from authenticated agent IPC to the service media loop.
+#[derive(Debug)]
+pub struct AgentMediaIngress {
+    capacity: usize,
+    queue: VecDeque<MediaAccessUnit>,
+    dropped: u64,
+}
+
+impl AgentMediaIngress {
+    /// Creates a queue with an explicit backpressure limit.
+    pub fn new(capacity: usize) -> Option<Self> {
+        (capacity > 0).then_some(Self {
+            capacity,
+            queue: VecDeque::with_capacity(capacity),
+            dropped: 0,
+        })
+    }
+
+    /// Enqueues a validated unit, rejecting invalid or over-capacity input.
+    pub fn push(&mut self, unit: MediaAccessUnit) -> bool {
+        if !unit.is_valid() || self.queue.len() >= self.capacity {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        self.queue.push_back(unit);
+        true
+    }
+
+    /// Removes the oldest unit for the LAN sender.
+    pub fn pop(&mut self) -> Option<MediaAccessUnit> {
+        self.queue.pop_front()
+    }
+
+    /// Current queue depth.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Number of rejected units since creation.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mrd_agent_ipc::{AgentEventContext, MediaCodec};
+
+    fn unit(sequence: u64) -> MediaAccessUnit {
+        MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 1,
+                desktop_epoch: 1,
+                sequence,
+                observed_at_ms: sequence,
+            },
+            resource_id: [2; 16],
+            sequence,
+            timestamp_us: sequence,
+            codec: MediaCodec::H264,
+            is_keyframe: sequence == 1,
+            payload: vec![1, 2],
+        }
+    }
+
+    #[test]
+    fn ingress_applies_validation_and_backpressure() {
+        let mut ingress = AgentMediaIngress::new(1).unwrap();
+        assert!(ingress.push(unit(1)));
+        assert!(!ingress.push(unit(2)));
+        assert_eq!(ingress.dropped(), 1);
+        assert_eq!(ingress.pop().unwrap().sequence, 1);
+        assert!(!ingress.push({
+            let mut invalid = unit(3);
+            invalid.payload.clear();
+            invalid
+        }));
+        assert_eq!(ingress.dropped(), 2);
+    }
+}
