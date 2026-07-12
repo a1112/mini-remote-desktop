@@ -106,7 +106,7 @@ impl AppState {
     }
 
     /// Drains and validates a bounded batch in the LAN sender representation.
-    pub async fn drain_agent_media_for_sender(
+    pub(crate) async fn drain_agent_media_for_sender(
         &self,
         limit: usize,
     ) -> Vec<crate::lan_discovery::media_sender::AgentEncodedAccessUnit> {
