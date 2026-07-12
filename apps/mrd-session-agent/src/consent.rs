@@ -418,10 +418,21 @@ impl ConsentAuthorityRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn begin(
         &self,
         request: ConsentRequest,
         context: TrustedConsentContext,
+    ) -> Result<ConsentBeginOutcome, ConsentRegistryError> {
+        let anchor = Instant::now();
+        self.begin_at(request, context, anchor)
+    }
+
+    fn begin_at(
+        &self,
+        request: ConsentRequest,
+        context: TrustedConsentContext,
+        anchor: Instant,
     ) -> Result<ConsentBeginOutcome, ConsentRegistryError> {
         if !valid_request_shape(&request) {
             return Err(ConsentRegistryError::InvalidRequest);
@@ -464,7 +475,7 @@ impl ConsentAuthorityRegistry {
         }
 
         let authorization_deadline = checked_authority_deadline(
-            Instant::now(),
+            anchor,
             request
                 .authorization_expires_at_ms
                 .saturating_sub(context.now_ms),
@@ -811,7 +822,7 @@ impl ConsentManager {
     ) -> Result<Vec<ConsentResult>, ConsentRegistryError> {
         let now = Instant::now();
         let mut results = Vec::new();
-        match self.registry.begin(request, context.clone())? {
+        match self.registry.begin_at(request, context.clone(), now)? {
             ConsentBeginOutcome::Cached(result) => results.push(result),
             ConsentBeginOutcome::Prompt(pending) => {
                 let prompt_lifetime_ms =
@@ -823,7 +834,7 @@ impl ConsentManager {
                 });
             }
         }
-        self.start_next(Instant::now(), &context, &mut results)?;
+        self.start_next(now, &context, &mut results)?;
         Ok(results)
     }
 

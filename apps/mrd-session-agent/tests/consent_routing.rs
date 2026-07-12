@@ -47,6 +47,24 @@ impl AgentClock for FixedClock {
     }
 }
 
+struct SlowInboundClock;
+
+impl AgentClock for SlowInboundClock {
+    fn now_ms(&self) -> u64 {
+        std::thread::sleep(Duration::from_millis(2));
+        1_500
+    }
+}
+
+struct VerySlowInboundClock;
+
+impl AgentClock for VerySlowInboundClock {
+    fn now_ms(&self) -> u64 {
+        std::thread::sleep(Duration::from_millis(5));
+        1_500
+    }
+}
+
 struct FixedSigner;
 
 fn test_signature(message: &[u8]) -> [u8; 64] {
@@ -151,6 +169,63 @@ impl TrustedDesktopStateSource for UnavailableDesktop {
 struct WatchDesktop {
     state: Mutex<Option<TrustedDesktopState>>,
     changes: watch::Sender<()>,
+}
+
+struct SelfRefreshingDesktop {
+    state: TrustedDesktopState,
+    changes: watch::Sender<()>,
+}
+
+impl SelfRefreshingDesktop {
+    fn new(state: TrustedDesktopState) -> Self {
+        let (changes, _) = watch::channel(());
+        Self { state, changes }
+    }
+}
+
+impl TrustedDesktopStateSource for SelfRefreshingDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        self.changes.send_replace(());
+        Some(self.state)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+}
+
+struct ClosableDesktop {
+    state: TrustedDesktopState,
+    changes: Mutex<Option<watch::Sender<()>>>,
+}
+
+impl ClosableDesktop {
+    fn new(state: TrustedDesktopState) -> Self {
+        let (changes, _) = watch::channel(());
+        Self {
+            state,
+            changes: Mutex::new(Some(changes)),
+        }
+    }
+
+    fn close(&self) {
+        self.changes.lock().expect("desktop changes").take();
+    }
+}
+
+impl TrustedDesktopStateSource for ClosableDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        Some(self.state)
+    }
+
+    fn subscribe(&self) -> watch::Receiver<()> {
+        self.changes
+            .lock()
+            .expect("desktop changes")
+            .as_ref()
+            .expect("desktop source open before subscription")
+            .subscribe()
+    }
 }
 
 impl WatchDesktop {
@@ -677,6 +752,229 @@ async fn pending_prompt_does_not_block_heartbeats() {
         }
     }
     stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn continuous_inbound_cannot_starve_heartbeat() {
+    let (backend, _state, _started) = backend();
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_millis(10),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(SlowInboundClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid slow-clock runtime")
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        Arc::new(DefaultDesktop),
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("valid attended authority");
+    let (agent, service, _) = start_configured_agent(runtime, true).await;
+    let (mut service_reader, mut service_writer) = tokio::io::split(service);
+    let flooding = Arc::new(AtomicBool::new(true));
+    let flood_flag = Arc::clone(&flooding);
+    let cancel = ServiceToAgent::CancelConsent(CancelConsent {
+        request_token: 77,
+        request_id: [77; 16],
+        session_id: SessionId("inbound-flood".to_owned()),
+        reason: ConsentCancelReason::CallerAborted,
+    });
+    let flood = tokio::spawn(async move {
+        let mut sent = 0_usize;
+        while flood_flag.load(Ordering::SeqCst) {
+            if write_frame(&mut service_writer, &cancel).await.is_err() {
+                break;
+            }
+            sent += 1;
+            if sent.is_multiple_of(64) {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    let heartbeat = tokio::time::timeout(Duration::from_millis(150), async {
+        match read_frame::<_, AgentToService>(&mut service_reader)
+            .await
+            .expect("agent output while flooded")
+            .message
+        {
+            AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
+            other => panic!("unexpected output while flooding inbound: {other:?}"),
+        }
+    })
+    .await;
+    flooding.store(false, Ordering::SeqCst);
+    flood.abort();
+    let _ = flood.await;
+    let heartbeat = match heartbeat {
+        Ok(heartbeat) => heartbeat,
+        Err(_) => {
+            agent.abort();
+            let _ = agent.await;
+            panic!("continuous inbound must not starve the heartbeat window");
+        }
+    };
+    assert_eq!(heartbeat.context.registration_id, REGISTRATION_ID);
+    drop(service_reader);
+    agent.abort();
+    let join_error = agent
+        .await
+        .expect_err("fairness probe cancels the runtime after observing heartbeat");
+    assert!(join_error.is_cancelled());
+}
+
+#[tokio::test]
+async fn spurious_same_desktop_wakes_do_not_starve_stop_or_publish_revisions() {
+    let (backend, _state, _started) = backend();
+    let desktop = Arc::new(SelfRefreshingDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let (agent, mut service, _) =
+        start_agent_with_environment_and_snapshot(backend, desktop, true).await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [78; 16],
+            deadline_ms: 2_500,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await;
+
+    let observation = tokio::time::timeout(Duration::from_millis(150), async {
+        let mut extra_snapshots = 0_usize;
+        loop {
+            let message = match read_frame::<_, AgentToService>(&mut service).await {
+                Ok(frame) => frame.message,
+                Err(_) => return Err(extra_snapshots),
+            };
+            match message {
+                AgentToService::AgentCapabilitySnapshot(_) => extra_snapshots += 1,
+                AgentToService::AgentHeartbeat(_) => {}
+                AgentToService::AgentStopping(_) => return Ok(extra_snapshots),
+                other => panic!("unexpected output during Stop: {other:?}"),
+            }
+        }
+    })
+    .await;
+    let extra_snapshots = match observation {
+        Ok(Ok(extra_snapshots)) => extra_snapshots,
+        other => {
+            agent.abort();
+            let _ = agent.await;
+            panic!("spurious desktop wakes starved Stop: {other:?}");
+        }
+    };
+    assert_eq!(
+        extra_snapshots, 0,
+        "same-state notifications must be coalesced without capability revisions",
+    );
+    assert_eq!(
+        tokio::time::timeout(TEST_TIMEOUT, agent)
+            .await
+            .expect("agent stop timeout")
+            .expect("agent join")
+            .expect("agent stop"),
+        AgentExit::StoppedByService
+    );
+}
+
+#[tokio::test]
+async fn spurious_same_desktop_wakes_do_not_starve_prompt_deadline() {
+    let (backend, _state, mut started) = backend();
+    let desktop = Arc::new(SelfRefreshingDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let (agent, mut service) = start_agent_with_environment(backend, desktop, true).await;
+    let mut request = consent_request(79);
+    request.expires_at_ms = 1_530;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let _prompt = next_started(&mut started).await;
+    let result = next_consent_result(&mut service).await;
+    assert_eq!(result.request_id, request.request_id);
+    assert_eq!(result.decision, ConsentDecision::Expired);
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_desktop_watch_fail_stops_even_while_inbound_is_continuously_ready() {
+    let (backend, _state, _started) = backend();
+    let desktop = Arc::new(ClosableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 9,
+        desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+    }));
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_millis(10),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(VerySlowInboundClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid slow-clock runtime")
+    .with_attended_authority(
+        backend,
+        Arc::new(RejectExecuteGrant),
+        Arc::clone(&desktop) as Arc<dyn TrustedDesktopStateSource>,
+        EXECUTE_ISSUER_KEY_ID,
+        Box::new(EmptyExecutor),
+    )
+    .expect("valid attended authority");
+    let (mut agent, service, _) = start_configured_agent(runtime, true).await;
+    let (service_reader, mut service_writer) = tokio::io::split(service);
+    let cancel = ServiceToAgent::CancelConsent(CancelConsent {
+        request_token: 80,
+        request_id: [80; 16],
+        session_id: SessionId("closed-watch-flood".to_owned()),
+        reason: ConsentCancelReason::CallerAborted,
+    });
+    let flood = tokio::spawn(async move {
+        let mut sent = 0_usize;
+        loop {
+            if write_frame(&mut service_writer, &cancel).await.is_err() {
+                break;
+            }
+            sent += 1;
+            if sent.is_multiple_of(64) {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    desktop.close();
+
+    let joined = tokio::time::timeout(Duration::from_millis(150), &mut agent).await;
+    flood.abort();
+    let _ = flood.await;
+    drop(service_reader);
+    let joined = match joined {
+        Ok(joined) => joined,
+        Err(_) => {
+            agent.abort();
+            let _ = agent.await;
+            panic!("closed trusted desktop watch was starved by continuous inbound");
+        }
+    };
+    let error = joined
+        .expect("agent join")
+        .expect_err("closed desktop watcher must fail-stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::DesktopStateUnavailable
+    ));
 }
 
 #[tokio::test]
@@ -1458,7 +1756,7 @@ async fn desktop_watch_immediately_publishes_revision_two_without_secure_capabil
 }
 
 #[tokio::test]
-async fn subscribe_before_baseline_does_not_lose_a_racing_desktop_change() {
+async fn subscribe_before_baseline_coalesces_the_retained_same_state_notification() {
     let (backend, _state, _started) = backend();
     let desktop = Arc::new(SubscribeBaselineRaceDesktop::new());
     let runtime = AgentRuntime::new(
@@ -1483,14 +1781,15 @@ async fn subscribe_before_baseline_does_not_lose_a_racing_desktop_change() {
     assert_eq!(baseline.desktop_epoch, 10);
     assert!(!baseline.capabilities.contains(&AgentCapability::Consent));
 
-    let observed = match read_agent_message(&mut service).await {
-        AgentToService::AgentCapabilitySnapshot(snapshot) => snapshot,
-        other => panic!("expected retained desktop notification, got {other:?}"),
-    };
-    assert_eq!(observed.revision, 2);
-    assert_eq!(observed.desktop_epoch, 10);
-    assert!(!observed.capabilities.contains(&AgentCapability::Input));
-    assert!(!observed.capabilities.contains(&AgentCapability::Consent));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(40),
+            read_frame::<_, AgentToService>(&mut service),
+        )
+        .await
+        .is_err(),
+        "the retained notification must not duplicate a state already published as baseline",
+    );
     stop_agent(agent, &mut service).await;
 }
 

@@ -149,7 +149,7 @@ async fn monotonic_binding_deadline_wins_wall_clock_rollback() {
 async fn prompt_time_and_wall_rollback_do_not_restart_authority_lifetime() {
     let registry = ConsentAuthorityRegistry::new();
     let mut request = request([133; 16], 134, "anchored-deadline");
-    request.expires_at_ms = 150;
+    request.expires_at_ms = 260;
     request.authorization_expires_at_ms = 310;
     let attempt = prompt_attempt(registry.begin(request.clone(), context(110)).unwrap());
 
@@ -1317,6 +1317,35 @@ fn pending_manager() -> (ConsentManager, Arc<Notify>, Arc<AtomicBool>) {
         dropped: Arc::clone(&dropped),
     }));
     (manager, started, dropped)
+}
+
+#[tokio::test]
+async fn manager_uses_one_instant_anchor_for_prompt_and_authority_deadlines() {
+    let (mut manager, _started, _dropped) = pending_manager();
+    let mut request = request([134; 16], 134, "shared-manager-anchor");
+    request.expires_at_ms = 500;
+    request.authorization_expires_at_ms = 500;
+    manager.begin(request.clone(), context(110)).unwrap();
+
+    let prompt_deadline = manager
+        .active
+        .as_ref()
+        .expect("active prompt")
+        .prompt
+        .deadline;
+    let authorization_deadline = manager
+        .registry
+        .state
+        .lock()
+        .expect("registry state")
+        .pending
+        .get(&request.request_id)
+        .expect("pending consent")
+        .authorization_deadline;
+    assert_eq!(
+        prompt_deadline, authorization_deadline,
+        "one manager begin call must not sample two different monotonic anchors",
+    );
 }
 
 #[tokio::test]

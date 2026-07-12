@@ -26,10 +26,10 @@ use std::sync::{
 use std::time::Duration;
 use std::{
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::watch;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::sync::{watch, Notify};
 
 const REGISTRATION_ID: [u8; 16] = [1; 16];
 const RESOURCE_ID: [u8; 16] = [2; 16];
@@ -41,7 +41,56 @@ const PEER_KEY_ID: [u8; 32] = [7; 32];
 
 struct WriteGateStream {
     inner: tokio::io::DuplexStream,
-    blocked: Arc<AtomicBool>,
+    gate: Arc<WriteGate>,
+}
+
+#[derive(Default)]
+struct WriteGate {
+    state: Mutex<WriteGateState>,
+    entered: AtomicUsize,
+    prefix_written: AtomicUsize,
+    entered_notify: Notify,
+}
+
+#[derive(Default)]
+struct WriteGateState {
+    blocked: bool,
+    prefix_bytes: Option<usize>,
+    writer_waker: Option<Waker>,
+}
+
+impl WriteGate {
+    fn block(&self) {
+        let mut state = self.state.lock().expect("write gate lock");
+        state.blocked = true;
+        state.prefix_bytes = None;
+    }
+
+    fn block_after_next_prefix(&self, bytes: usize) {
+        let mut state = self.state.lock().expect("write gate lock");
+        state.blocked = true;
+        state.prefix_bytes = Some(bytes.max(1));
+    }
+
+    fn unblock(&self) {
+        let waker = {
+            let mut state = self.state.lock().expect("write gate lock");
+            state.blocked = false;
+            state.writer_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    async fn wait_until_writer_is_blocked(&self) {
+        loop {
+            if self.entered.load(Ordering::SeqCst) != 0 {
+                return;
+            }
+            self.entered_notify.notified().await;
+        }
+    }
 }
 
 impl AsyncRead for WriteGateStream {
@@ -60,10 +109,42 @@ impl AsyncWrite for WriteGateStream {
         context: &mut Context<'_>,
         buffer: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        if self.blocked.load(Ordering::SeqCst) {
-            Poll::Pending
+        let write_limit = {
+            let mut state = self.gate.state.lock().expect("write gate lock");
+            if !state.blocked {
+                Some((buffer.len(), false))
+            } else if let Some(prefix_bytes) = state.prefix_bytes.take() {
+                Some((prefix_bytes.min(buffer.len()), true))
+            } else {
+                state.writer_waker = Some(context.waker().clone());
+                None
+            }
+        };
+        if let Some((write_limit, is_prefix)) = write_limit {
+            let result = Pin::new(&mut self.inner).poll_write(context, &buffer[..write_limit]);
+            match result {
+                Poll::Ready(Ok(written)) => {
+                    if is_prefix {
+                        self.gate
+                            .prefix_written
+                            .fetch_add(written, Ordering::SeqCst);
+                    }
+                    Poll::Ready(Ok(written))
+                }
+                Poll::Pending if is_prefix => {
+                    self.gate
+                        .state
+                        .lock()
+                        .expect("write gate lock")
+                        .prefix_bytes = Some(write_limit);
+                    Poll::Pending
+                }
+                other => other,
+            }
         } else {
-            Pin::new(&mut self.inner).poll_write(context, buffer)
+            self.gate.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.entered_notify.notify_one();
+            Poll::Pending
         }
     }
 
@@ -132,6 +213,87 @@ struct SlowCleanupInputBackend {
     delay: Duration,
 }
 
+struct CountingCleanupInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    release_all_calls: Arc<AtomicUsize>,
+}
+
+struct PanicBoundaryInputBackend {
+    inner: InputResourceManager<SharedInjector>,
+    panic_next_handle: Arc<AtomicBool>,
+    panic_after_release: Arc<AtomicBool>,
+}
+
+impl InputBackend for PanicBoundaryInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        if self.panic_next_handle.swap(false, Ordering::SeqCst) {
+            panic!("controlled input callback panic");
+        }
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        let result = self.inner.release_all();
+        if self.panic_after_release.swap(false, Ordering::SeqCst) {
+            panic!("controlled cleanup callback panic");
+        }
+        result
+    }
+}
+
+impl InputBackend for CountingCleanupInputBackend {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, command: mrd_agent_ipc::AuthorizedCommand) -> Result<(), InputRejection> {
+        self.inner.start(command)
+    }
+
+    fn handle(
+        &mut self,
+        envelope: &InputEventEnvelope,
+        context: &ExecutionContext,
+    ) -> InputAckOutcome {
+        self.inner.handle(envelope, context)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16]) -> InputAckOutcome {
+        self.inner.stop(resource_id)
+    }
+
+    fn release_session(&mut self, session_id: &SessionId) -> Result<(), InputError> {
+        self.inner.release_session(session_id)
+    }
+
+    fn release_all(&mut self) -> Result<(), InputError> {
+        if self.release_all_calls.fetch_add(1, Ordering::SeqCst) != 0 {
+            return Err(InputError::UipiDenied);
+        }
+        self.inner.release_all()
+    }
+}
+
 impl InputBackend for SlowCleanupInputBackend {
     fn is_available(&self) -> bool {
         self.inner.is_available()
@@ -177,6 +339,33 @@ struct FixedClock;
 
 impl AgentClock for FixedClock {
     fn now_ms(&self) -> u64 {
+        1_500
+    }
+}
+
+struct ArmableSlowClock {
+    calls_until_delay: AtomicUsize,
+    delay: Duration,
+}
+
+impl AgentClock for ArmableSlowClock {
+    fn now_ms(&self) -> u64 {
+        let mut remaining = self.calls_until_delay.load(Ordering::SeqCst);
+        while remaining != 0 {
+            match self.calls_until_delay.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) if remaining == 1 => {
+                    std::thread::sleep(self.delay);
+                    break;
+                }
+                Ok(_) => break,
+                Err(actual) => remaining = actual,
+            }
+        }
         1_500
     }
 }
@@ -487,7 +676,7 @@ async fn start_gated_attended_input_runtime(
 ) -> (
     tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
     tokio::io::DuplexStream,
-    Arc<AtomicBool>,
+    Arc<WriteGate>,
 ) {
     let desktop = MutableDesktop::new(TrustedDesktopState {
         desktop_epoch: 11,
@@ -502,7 +691,20 @@ async fn start_gated_attended_input_runtime_with_desktop(
 ) -> (
     tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
     tokio::io::DuplexStream,
-    Arc<AtomicBool>,
+    Arc<WriteGate>,
+) {
+    start_gated_attended_input_runtime_with_environment(injector, desktop, Arc::new(FixedClock))
+        .await
+}
+
+async fn start_gated_attended_input_runtime_with_environment(
+    injector: SharedInjector,
+    desktop: Arc<dyn TrustedDesktopStateSource>,
+    clock: Arc<dyn AgentClock>,
+) -> (
+    tokio::task::JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    tokio::io::DuplexStream,
+    Arc<WriteGate>,
 ) {
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
@@ -511,7 +713,7 @@ async fn start_gated_attended_input_runtime_with_desktop(
             heartbeat_interval: Duration::from_secs(30),
             handshake_timeout: Duration::from_secs(1),
         },
-        Arc::new(FixedClock),
+        clock,
         Arc::new(FixedSigner),
     )
     .unwrap()
@@ -525,10 +727,10 @@ async fn start_gated_attended_input_runtime_with_desktop(
     .expect("attended authority")
     .with_input_backend(Box::new(InputResourceManager::new(injector)));
     let (agent_inner, mut service) = tokio::io::duplex(32 * 1024);
-    let blocked = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(WriteGate::default());
     let agent = tokio::spawn(runtime.run(WriteGateStream {
         inner: agent_inner,
-        blocked: Arc::clone(&blocked),
+        gate: Arc::clone(&gate),
     }));
 
     let register = match read_frame::<_, AgentToService>(&mut service)
@@ -587,7 +789,7 @@ async fn start_gated_attended_input_runtime_with_desktop(
         }
         other => panic!("expected capabilities, got {other:?}"),
     }
-    (agent, service, blocked)
+    (agent, service, gate)
 }
 
 async fn start_attended_runtime(
@@ -2163,14 +2365,14 @@ async fn expiry_cleanup_failure_revokes_authority_and_global_retry_still_fail_st
 #[tokio::test]
 async fn expiry_releases_input_while_outbound_writer_is_backpressured() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (agent, mut service, blocked) =
+    let (agent, mut service, gate) =
         start_gated_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
     let mut consent = consent_request(43, [43; 16]);
     consent.expires_at_ms = 1_800;
     consent.authorization_expires_at_ms = 2_000;
     establish_pressed_input_with_request(&mut service, consent, Some(1_900)).await;
 
-    blocked.store(true, Ordering::SeqCst);
+    gate.block();
     let queued = event(
         RESOURCE_ID,
         START_GRANT_ID,
@@ -2180,6 +2382,7 @@ async fn expiry_releases_input_while_outbound_writer_is_backpressured() {
     write_frame(&mut service, &ServiceToAgent::InputEvent(queued))
         .await
         .unwrap();
+    gate.wait_until_writer_is_blocked().await;
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -2212,10 +2415,10 @@ async fn expiry_releases_input_while_outbound_writer_is_backpressured() {
 #[tokio::test]
 async fn stop_under_writer_backpressure_releases_input_before_deadline_failure() {
     let events = Arc::new(Mutex::new(Vec::new()));
-    let (agent, mut service, blocked) =
+    let (agent, mut service, gate) =
         start_gated_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
     establish_pressed_input_with_request(&mut service, consent_request(44, [44; 16]), None).await;
-    blocked.store(true, Ordering::SeqCst);
+    gate.block();
 
     write_frame(
         &mut service,
@@ -2227,6 +2430,7 @@ async fn stop_under_writer_backpressure_releases_input_before_deadline_failure()
     )
     .await
     .unwrap();
+    gate.wait_until_writer_is_blocked().await;
 
     tokio::time::timeout(Duration::from_millis(500), async {
         loop {
@@ -2256,6 +2460,392 @@ async fn stop_under_writer_backpressure_releases_input_before_deadline_failure()
         !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
         "flush timeout must not masquerade as a successful stop",
     );
+}
+
+#[tokio::test]
+async fn stop_deadline_still_bounds_a_frame_queued_behind_blocked_ordinary_output() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (mut agent, mut service, gate) =
+        start_gated_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    establish_pressed_input_with_request(&mut service, consent_request(51, [51; 16]), None).await;
+    gate.block();
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(event(
+            RESOURCE_ID,
+            START_GRANT_ID,
+            2,
+            InputEventPayload::MouseMove { x: 8, y: 9 },
+        )),
+    )
+    .await
+    .unwrap();
+    gate.wait_until_writer_is_blocked().await;
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [51; 16],
+            deadline_ms: 1_600,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    let joined = tokio::time::timeout(Duration::from_millis(300), &mut agent).await;
+    let joined = match joined {
+        Ok(joined) => joined,
+        Err(_) => {
+            agent.abort();
+            let _ = agent.await;
+            panic!("a queued Stop frame must remain bounded by its absolute deadline");
+        }
+    };
+    let error = joined
+        .expect("agent join")
+        .expect_err("blocked ordinary output cannot produce a normal Stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    let read = tokio::time::timeout(
+        Duration::from_millis(100),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "a Stop queued behind a partial ordinary frame must never overtake it",
+    );
+}
+
+#[tokio::test]
+async fn stop_deadline_elapsed_before_write_resumes_never_emits_complete_stopping_frame() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, gate) =
+        start_gated_attended_input_runtime(SharedInjector::available(events)).await;
+    gate.block();
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [48; 16],
+            deadline_ms: 1_550,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    gate.wait_until_writer_is_blocked().await;
+
+    // Keep the single-threaded executor from polling either the writer or the
+    // control loop until the absolute deadline is already in the past.
+    std::thread::sleep(Duration::from_millis(80));
+    gate.unblock();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("stop deadline timeout")
+        .expect("agent join")
+        .expect_err("a post-deadline write cannot report a normal stopped exit");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_))),
+        "a deadline that elapsed inside the writer must prevent a complete stopping frame",
+    );
+}
+
+#[tokio::test]
+async fn stop_write_resumed_before_deadline_flushes_stopping_and_reports_stopped() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, gate) =
+        start_gated_attended_input_runtime(SharedInjector::available(events)).await;
+    gate.block();
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [50; 16],
+            deadline_ms: 1_800,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    gate.wait_until_writer_is_blocked().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gate.unblock();
+
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            read_frame::<_, AgentToService>(&mut service),
+        )
+        .await
+        .expect("stopping frame timeout")
+        .expect("stopping frame")
+        .message,
+        AgentToService::AgentStopping(_)
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .expect("agent stop timeout")
+            .expect("agent join")
+            .expect("pre-deadline flush succeeds"),
+        AgentExit::StoppedByService
+    );
+}
+
+#[tokio::test]
+async fn stop_deadline_after_partial_frame_closes_writer_without_completing_stopping() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, gate) =
+        start_gated_attended_input_runtime(SharedInjector::available(events)).await;
+    gate.block_after_next_prefix(4);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [52; 16],
+            deadline_ms: 1_550,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    gate.wait_until_writer_is_blocked().await;
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("partial Stop deadline timeout")
+        .expect("agent join")
+        .expect_err("a partial stopping frame cannot report normal Stop");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    assert!(gate.prefix_written.load(Ordering::SeqCst) > 0);
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await
+    .expect("partial frame EOF timeout");
+    assert!(
+        read.is_err(),
+        "deadline closure must leave only an incomplete frame, never AgentStopping",
+    );
+}
+
+#[tokio::test]
+async fn stop_deadline_is_anchored_before_a_slow_wall_clock_sample() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let clock = Arc::new(ArmableSlowClock {
+        calls_until_delay: AtomicUsize::new(0),
+        delay: Duration::from_millis(80),
+    });
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _gate) = start_gated_attended_input_runtime_with_environment(
+        SharedInjector::available(events),
+        desktop,
+        Arc::clone(&clock) as Arc<dyn AgentClock>,
+    )
+    .await;
+    clock.calls_until_delay.store(2, Ordering::SeqCst);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [53; 16],
+            deadline_ms: 1_550,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(1), agent)
+        .await
+        .expect("slow clock Stop timeout")
+        .expect("agent join")
+        .expect_err("wall-clock sampling delay must consume the anchored Stop budget");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::OutboundUnavailable
+    ));
+    let read = tokio::time::timeout(
+        Duration::from_millis(200),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(frame)) if matches!(frame.message, AgentToService::AgentStopping(_)))
+    );
+}
+
+#[tokio::test]
+async fn successful_stop_does_not_repeat_completed_terminal_cleanup() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let release_all_calls = Arc::new(AtomicUsize::new(0));
+    let input = CountingCleanupInputBackend {
+        inner: InputResourceManager::new(SharedInjector::available(events)),
+        release_all_calls: Arc::clone(&release_all_calls),
+    };
+    let (agent, mut service) = start_attended_runtime(
+        Arc::new(ApproveRequestedScopes),
+        Box::new(NoopExecutor),
+        Some(Box::new(input)),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [49; 16],
+            deadline_ms: 2_000,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::AgentStopping(_)
+    ));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), agent)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AgentExit::StoppedByService
+    );
+    assert_eq!(
+        release_all_calls.load(Ordering::SeqCst),
+        1,
+        "successful Stop cleanup must not be repeated by outer finalization or Drop",
+    );
+}
+
+#[tokio::test]
+async fn aborting_runtime_releases_pressed_input_and_closes_the_detached_reader() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service) =
+        start_attended_input_runtime(SharedInjector::available(Arc::clone(&events))).await;
+    establish_pressed_input(&mut service).await;
+
+    agent.abort();
+    let join_error = agent
+        .await
+        .expect_err("external runtime cancellation must cancel the task");
+    assert!(join_error.is_cancelled());
+
+    let released = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if events.lock().expect("events").len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let mut trailing = [0_u8; 1];
+    let reader_closed = matches!(
+        tokio::time::timeout(Duration::from_millis(200), service.read(&mut trailing)).await,
+        Ok(Ok(0))
+    );
+    assert!(
+        released && reader_closed,
+        "cancel cleanup evidence: released={released}, reader_closed={reader_closed}",
+    );
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn panicking_sync_callback_still_releases_input_and_closes_reader_without_double_panic() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let panic_next_handle = Arc::new(AtomicBool::new(false));
+    let panic_after_release = Arc::new(AtomicBool::new(false));
+    let input = PanicBoundaryInputBackend {
+        inner: InputResourceManager::new(SharedInjector::available(Arc::clone(&events))),
+        panic_next_handle: Arc::clone(&panic_next_handle),
+        panic_after_release: Arc::clone(&panic_after_release),
+    };
+    let (agent, mut service) = start_attended_runtime(
+        Arc::new(ApproveRequestedScopes),
+        Box::new(NoopExecutor),
+        Some(Box::new(input)),
+        true,
+        true,
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    panic_next_handle.store(true, Ordering::SeqCst);
+    panic_after_release.store(true, Ordering::SeqCst);
+
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(event(
+            RESOURCE_ID,
+            START_GRANT_ID,
+            2,
+            InputEventPayload::MouseMove { x: 4, y: 5 },
+        )),
+    )
+    .await
+    .unwrap();
+    let join_error = agent
+        .await
+        .expect_err("controlled synchronous callback must unwind the runtime task");
+    assert!(join_error.is_panic());
+
+    assert_eq!(
+        events.lock().expect("events").as_slice(),
+        &[
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: true,
+            },
+            InputEvent::Key {
+                key: mrd_input::InputKey::VirtualKey(0x41),
+                pressed: false,
+            },
+        ]
+    );
+    let mut trailing = [0_u8; 1];
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(200), service.read(&mut trailing)).await,
+        Ok(Ok(0))
+    ));
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ use mrd_proto::SessionId;
 use std::path::{Component, Path};
 use std::{
     collections::HashMap,
+    panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -40,7 +41,15 @@ const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct OutboundFrame {
     message: AgentToService,
-    flushed: Option<oneshot::Sender<Result<(), ()>>>,
+    deadline: Option<Instant>,
+    completion: Option<oneshot::Sender<OutboundWriteResult>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundWriteResult {
+    Flushed { completed_at: Instant },
+    DeadlineExceeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +59,7 @@ enum WriterTerminal {
 
 struct OutboundWriter {
     sender: Option<mpsc::Sender<OutboundFrame>>,
+    terminal_deadline: watch::Sender<Option<Instant>>,
     terminal: watch::Receiver<Option<WriterTerminal>>,
     task: Option<JoinHandle<()>>,
 }
@@ -60,24 +70,44 @@ impl OutboundWriter {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (sender, mut receiver) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
+        let (terminal_deadline, mut terminal_deadline_rx) = watch::channel(None);
         let (terminal_sender, terminal) = watch::channel(None);
         let task = tokio::spawn(async move {
-            while let Some(frame) = receiver.recv().await {
-                let result = write_frame(&mut writer, &frame.message).await;
-                if result.is_err() {
-                    if let Some(flushed) = frame.flushed {
-                        let _ = flushed.send(Err(()));
+            loop {
+                let frame = match receive_before_terminal_deadline(
+                    &mut receiver,
+                    &mut terminal_deadline_rx,
+                )
+                .await
+                {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return,
+                    Err(()) => {
+                        terminal_sender.send_replace(Some(WriterTerminal::Failed));
+                        return;
                     }
-                    terminal_sender.send_replace(Some(WriterTerminal::Failed));
-                    return;
+                };
+                let terminal_frame = frame.deadline.is_some();
+                let result = write_frame_under_terminal_deadline(
+                    &mut writer,
+                    &frame.message,
+                    &mut terminal_deadline_rx,
+                )
+                .await;
+                if let Some(completion) = frame.completion {
+                    let _ = completion.send(result);
                 }
-                if let Some(flushed) = frame.flushed {
-                    let _ = flushed.send(Ok(()));
+                if terminal_frame || !matches!(result, OutboundWriteResult::Flushed { .. }) {
+                    if !matches!(result, OutboundWriteResult::Flushed { .. }) {
+                        terminal_sender.send_replace(Some(WriterTerminal::Failed));
+                    }
+                    return;
                 }
             }
         });
         Self {
             sender: Some(sender),
+            terminal_deadline,
             terminal,
             task: Some(task),
         }
@@ -89,7 +119,8 @@ impl OutboundWriter {
             .ok_or(AgentRuntimeError::OutboundUnavailable)?
             .try_send(OutboundFrame {
                 message,
-                flushed: None,
+                deadline: None,
+                completion: None,
             })
             .map_err(|_| AgentRuntimeError::OutboundUnavailable)
     }
@@ -99,6 +130,19 @@ impl OutboundWriter {
             .as_ref()
             .cloned()
             .ok_or(AgentRuntimeError::OutboundUnavailable)
+    }
+
+    fn arm_terminal_deadline(&mut self, deadline: Instant) -> Result<(), AgentRuntimeError> {
+        if self
+            .task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+            || self.terminal_deadline.borrow().is_some()
+        {
+            return Err(AgentRuntimeError::OutboundUnavailable);
+        }
+        self.terminal_deadline.send_replace(Some(deadline));
+        Ok(())
     }
 
     fn terminal_subscription(&self) -> watch::Receiver<Option<WriterTerminal>> {
@@ -138,6 +182,121 @@ impl Drop for OutboundWriter {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
+        }
+    }
+}
+
+struct ReaderTaskGuard {
+    task: JoinHandle<()>,
+}
+
+impl ReaderTaskGuard {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self { task }
+    }
+
+    async fn abort_and_join(&mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for ReaderTaskGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn receive_before_terminal_deadline(
+    receiver: &mut mpsc::Receiver<OutboundFrame>,
+    terminal_deadline: &mut watch::Receiver<Option<Instant>>,
+) -> Result<Option<OutboundFrame>, ()> {
+    loop {
+        let deadline = *terminal_deadline.borrow_and_update();
+        match deadline {
+            Some(deadline) => {
+                return tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => Err(()),
+                    frame = receiver.recv() => Ok(frame),
+                };
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    changed = terminal_deadline.changed() => {
+                        if changed.is_err() {
+                            return Err(());
+                        }
+                    }
+                    frame = receiver.recv() => return Ok(frame),
+                }
+            }
+        }
+    }
+}
+
+async fn write_frame_under_terminal_deadline<W>(
+    writer: &mut W,
+    message: &AgentToService,
+    terminal_deadline: &mut watch::Receiver<Option<Instant>>,
+) -> OutboundWriteResult
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut write = std::pin::pin!(write_frame(writer, message));
+    loop {
+        let deadline = *terminal_deadline.borrow_and_update();
+        match deadline {
+            Some(deadline) => {
+                let guarded_write = std::future::poll_fn(|context| {
+                    if Instant::now() >= deadline {
+                        return std::task::Poll::Ready(OutboundWriteResult::DeadlineExceeded);
+                    }
+                    match std::future::Future::poll(write.as_mut(), context) {
+                        std::task::Poll::Ready(Ok(())) => {
+                            let completed_at = Instant::now();
+                            if completed_at < deadline {
+                                std::task::Poll::Ready(OutboundWriteResult::Flushed {
+                                    completed_at,
+                                })
+                            } else {
+                                std::task::Poll::Ready(OutboundWriteResult::DeadlineExceeded)
+                            }
+                        }
+                        std::task::Poll::Ready(Err(_)) => {
+                            std::task::Poll::Ready(OutboundWriteResult::Failed)
+                        }
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                });
+                tokio::pin!(guarded_write);
+                return tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => {
+                        OutboundWriteResult::DeadlineExceeded
+                    }
+                    result = &mut guarded_write => result,
+                };
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    changed = terminal_deadline.changed() => {
+                        if changed.is_err() {
+                            return OutboundWriteResult::Failed;
+                        }
+                    }
+                    result = &mut write => {
+                        return match result {
+                            Ok(()) => OutboundWriteResult::Flushed {
+                                completed_at: Instant::now(),
+                            },
+                            Err(_) => OutboundWriteResult::Failed,
+                        };
+                    }
+                }
+            }
         }
     }
 }
@@ -474,8 +633,8 @@ pub enum AgentRuntimeError {
     /// The service sent a message unsupported by the Task 22 shell.
     #[error("unsupported service-to-agent message")]
     UnsupportedMessage,
-    /// A StopAgent message carried an invalid request identity.
-    #[error("StopAgent request id is invalid")]
+    /// A StopAgent message carried an invalid request identity or deadline.
+    #[error("StopAgent request is invalid")]
     InvalidStopRequest,
     /// A grant or command identifier was reused for different semantics.
     #[error("execute command replay identity conflict")]
@@ -542,6 +701,23 @@ pub struct AgentRuntime {
     last_desktop_state: Option<TrustedDesktopState>,
     replay: ReplayLedger,
     event_sequence: u64,
+    cleanup_complete: bool,
+}
+
+impl Drop for AgentRuntime {
+    fn drop(&mut self) {
+        if self.cleanup_complete {
+            return;
+        }
+        if let Some(authority) = self.authority.as_ref() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _ = authority.manager.drain_authority();
+            }));
+        }
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _ = self.release_input();
+        }));
+    }
 }
 
 impl AgentRuntime {
@@ -567,6 +743,7 @@ impl AgentRuntime {
             last_desktop_state: None,
             replay: ReplayLedger::new(REPLAY_LEDGER_CAPACITY),
             event_sequence: 0,
+            cleanup_complete: false,
         })
     }
 
@@ -617,7 +794,7 @@ impl AgentRuntime {
     {
         let (reader, writer) = tokio::io::split(stream);
         let (inbound_tx, mut inbound_rx) = mpsc::channel(INBOUND_QUEUE_CAPACITY);
-        let reader_task = tokio::spawn(read_loop(reader, inbound_tx));
+        let mut reader_task = ReaderTaskGuard::new(tokio::spawn(read_loop(reader, inbound_tx)));
 
         let result = self.run_connected(writer, &mut inbound_rx).await;
         let shutdown_reason = match &result {
@@ -625,7 +802,7 @@ impl AgentRuntime {
             Ok(AgentExit::ServiceDisconnected) | Err(_) => ConsentAbortReason::ServiceDisconnected,
         };
         let final_cleanup = self.terminal_cleanup(shutdown_reason).await;
-        stop_reader(reader_task).await;
+        reader_task.abort_and_join().await;
         match (result, final_cleanup) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -665,6 +842,18 @@ impl AgentRuntime {
             heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
+            if desktop_changes
+                .as_ref()
+                .is_some_and(|changes| changes.has_changed().is_err())
+            {
+                return match self
+                    .terminal_cleanup(ConsentAbortReason::ServiceDisconnected)
+                    .await
+                {
+                    Ok(()) => Err(AgentRuntimeError::DesktopStateUnavailable),
+                    Err(error) => Err(error),
+                };
+            }
             let consent_deadline = self
                 .authority
                 .as_ref()
@@ -694,11 +883,11 @@ impl AgentRuntime {
                 tokio::select! {
                     biased;
                     _ = outbound.terminal_changed() => RegisteredLoopEvent::WriterTerminal,
-                    change = desktop_change => RegisteredLoopEvent::DesktopChanged(change),
                     _ = consent_deadline_wait => RegisteredLoopEvent::ConsentDeadline,
                     completion = consent_completion => RegisteredLoopEvent::Consent(completion),
-                    inbound_event = inbound.recv() => RegisteredLoopEvent::Inbound(inbound_event),
                     _ = heartbeat.tick() => RegisteredLoopEvent::Heartbeat,
+                    inbound_event = inbound.recv() => RegisteredLoopEvent::Inbound(inbound_event),
+                    change = desktop_change => RegisteredLoopEvent::DesktopChanged(change),
                 }
             };
             let due_sessions = if !matches!(&event, RegisteredLoopEvent::WriterTerminal) {
@@ -728,13 +917,14 @@ impl AgentRuntime {
                 match event {
                 RegisteredLoopEvent::Inbound(inbound_event) => match inbound_event {
                     Some(InboundEvent::Message(ServiceToAgent::StopAgent(stop))) => {
+                        let stop_anchor = Instant::now();
                         let now_ms = self.clock.now_ms();
                         if stop.request_id.iter().all(|byte| *byte == 0)
                             || stop.deadline_ms <= now_ms
                         {
                             return Err(AgentRuntimeError::InvalidStopRequest);
                         }
-                        let stop_deadline = Instant::now()
+                        let stop_deadline = stop_anchor
                             .checked_add(Duration::from_millis(
                                 stop.deadline_ms.saturating_sub(now_ms),
                             ))
@@ -750,10 +940,14 @@ impl AgentRuntime {
                                 context,
                                 reason: StoppingReason::ServiceRequest,
                             });
+                        outbound.arm_terminal_deadline(stop_deadline)?;
                         let sender = outbound.sender()?;
                         let mut writer_terminal = outbound.terminal_subscription();
                         let permit = tokio::select! {
                             biased;
+                            _ = tokio::time::sleep_until(stop_deadline) => {
+                                return Err(AgentRuntimeError::OutboundUnavailable);
+                            }
                             _ = wait_for_writer_terminal(&mut writer_terminal) => {
                                 return Err(AgentRuntimeError::OutboundUnavailable);
                             }
@@ -764,30 +958,33 @@ impl AgentRuntime {
                                     Some(InboundEvent::Message(_)) => Err(AgentRuntimeError::UnsupportedMessage),
                                 };
                             }
-                            _ = tokio::time::sleep_until(stop_deadline) => {
-                                return Err(AgentRuntimeError::OutboundUnavailable);
-                            }
                             permit = sender.reserve_owned() => {
                                 permit.map_err(|_| AgentRuntimeError::OutboundUnavailable)?
                             }
                         };
-                        let (flushed_sender, mut flushed) = oneshot::channel();
+                        let (completion_sender, completion) = oneshot::channel();
                         permit.send(OutboundFrame {
                             message: stopping,
-                            flushed: Some(flushed_sender),
+                            deadline: Some(stop_deadline),
+                            completion: Some(completion_sender),
                         });
                         let flush_result = tokio::select! {
                             biased;
-                            _ = wait_for_writer_terminal(&mut writer_terminal) => Err(AgentRuntimeError::OutboundUnavailable),
-                            inbound_event = inbound.recv() => match inbound_event {
-                                Some(InboundEvent::Disconnected) | None => Ok(AgentExit::ServiceDisconnected),
-                                Some(InboundEvent::Failed(error)) => Err(error.into()),
-                                Some(InboundEvent::Message(_)) => Err(AgentRuntimeError::UnsupportedMessage),
+                            result = completion => match result {
+                                Ok(OutboundWriteResult::Flushed { completed_at })
+                                    if completed_at < stop_deadline =>
+                                {
+                                    Ok(AgentExit::StoppedByService)
+                                }
+                                Ok(
+                                    OutboundWriteResult::Flushed { .. }
+                                    | OutboundWriteResult::DeadlineExceeded
+                                    | OutboundWriteResult::Failed,
+                                )
+                                | Err(_) => Err(AgentRuntimeError::OutboundUnavailable),
                             },
-                            _ = tokio::time::sleep_until(stop_deadline) => Err(AgentRuntimeError::OutboundUnavailable),
-                            result = &mut flushed => match result {
-                                Ok(Ok(())) => Ok(AgentExit::StoppedByService),
-                                Ok(Err(())) | Err(_) => Err(AgentRuntimeError::OutboundUnavailable),
+                            _ = wait_for_writer_terminal(&mut writer_terminal) => {
+                                Err(AgentRuntimeError::OutboundUnavailable)
                             },
                         };
                         return flush_result;
@@ -838,16 +1035,18 @@ impl AgentRuntime {
                 RegisteredLoopEvent::DesktopChanged(Some(Ok(()))) => {
                     let desktop = self.current_desktop_state()?;
                     self.reconcile_desktop_authority(desktop)?;
-                    self.last_desktop_state = Some(desktop);
-                    capability_revision = capability_revision
-                        .checked_add(1)
-                        .ok_or(AgentRuntimeError::EventSequenceExhausted)?;
-                    self.send_capabilities(
-                        &outbound,
-                        &identity,
-                        capability_revision,
-                        desktop,
-                    )?;
+                    if self.last_desktop_state != Some(desktop) {
+                        self.last_desktop_state = Some(desktop);
+                        capability_revision = capability_revision
+                            .checked_add(1)
+                            .ok_or(AgentRuntimeError::EventSequenceExhausted)?;
+                        self.send_capabilities(
+                            &outbound,
+                            &identity,
+                            capability_revision,
+                            desktop,
+                        )?;
+                    }
                 }
                 RegisteredLoopEvent::DesktopChanged(Some(Err(_)) | None) => {
                     return match self
@@ -1299,6 +1498,9 @@ impl AgentRuntime {
         &mut self,
         reason: ConsentAbortReason,
     ) -> Result<(), AgentRuntimeError> {
+        if self.cleanup_complete {
+            return Ok(());
+        }
         let mut first_error = None;
         if let Some(authority) = self.authority.as_ref() {
             if authority.manager.drain_authority().is_err() {
@@ -1311,7 +1513,13 @@ impl AgentRuntime {
         if let Err(error) = self.shutdown_consent(reason).await {
             first_error.get_or_insert(error);
         }
-        first_error.map_or(Ok(()), Err)
+        match first_error {
+            Some(error) => Err(error),
+            None => {
+                self.cleanup_complete = true;
+                Ok(())
+            }
+        }
     }
 
     async fn handle_consent_without_manager(
@@ -1666,11 +1874,6 @@ fn partial_frame_timeout_error() -> FrameError {
         std::io::ErrorKind::TimedOut,
         "partial agent IPC frame timed out",
     ))
-}
-
-async fn stop_reader(reader_task: JoinHandle<()>) {
-    reader_task.abort();
-    let _ = reader_task.await;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
