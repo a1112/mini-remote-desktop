@@ -1,6 +1,7 @@
 //! Fail-closed interactive-agent registration and event loop.
 
 use crate::capabilities::AgentCapabilities;
+pub use crate::consent::{TrustedSessionBinding, TrustedSessionBindingSource};
 use crate::input::InputBackend;
 use mrd_agent_ipc::{
     decode_frame, registration_proof_signing_bytes, validate_execute_command, write_frame,
@@ -278,29 +279,6 @@ pub trait RegistrationSigner: Send + Sync {
     fn key_id(&self) -> [u8; 32];
     /// Sign the canonical registration transcript.
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], RegistrationSigningError>;
-}
-
-/// Independently trusted session state resolved without copying grant claims.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrustedSessionBinding {
-    /// Active product session.
-    pub session_id: SessionId,
-    /// Authenticated remote peer.
-    pub peer: PeerBinding,
-    /// Active local-policy revision.
-    pub policy_revision: u64,
-    /// Sole trusted execute-grant issuer for the session.
-    pub expected_issuer_key_id: [u8; 32],
-    /// Exact permission scopes approved by the agent-local consent authority.
-    pub approved_scopes: mrd_session::PermissionScopes,
-    /// Exclusive expiry of the agent-local consent authorization.
-    pub authorization_expires_at_ms: u64,
-}
-
-/// Source of agent-local consent bindings used during command validation.
-pub trait TrustedSessionBindingSource: Send + Sync {
-    /// Resolve an active binding by an untrusted lookup key.
-    fn resolve(&self, session_id: &SessionId) -> Option<TrustedSessionBinding>;
 }
 
 /// Trusted platform observation used to invalidate grants across desktop changes.
@@ -701,24 +679,32 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        let now_ms = self.clock.now_ms();
         let authorized = if let Some(security) = &self.security {
-            if let Some(binding) = security.bindings.resolve(&execute.grant.claims.session_id) {
+            if let Some(binding) = security
+                .bindings
+                .resolve(&execute.grant.claims.session_id, now_ms)
+            {
                 let desktop = validated_desktop_state(security.desktop_state.as_ref())?;
-                let context = ExecutionContext {
-                    registration_id: identity.registration_id,
-                    registration_epoch: identity.registration_epoch,
-                    session_id: binding.session_id,
-                    peer: binding.peer,
-                    policy_revision: binding.policy_revision,
-                    windows_session_id: identity.windows_session_id,
-                    desktop_epoch: desktop.desktop_epoch,
-                    desktop_kind: desktop.desktop_kind,
-                    now_ms: self.clock.now_ms(),
-                    expected_issuer_key_id: binding.expected_issuer_key_id,
-                    authorization_scopes: binding.approved_scopes,
-                    authorization_expires_at_ms: binding.authorization_expires_at_ms,
-                };
-                validate_execute_command(execute, &context, security.verifier.as_ref()).ok()
+                if binding_matches_runtime(&binding, identity, desktop) {
+                    let context = ExecutionContext {
+                        registration_id: binding.registration_id,
+                        registration_epoch: binding.registration_epoch,
+                        session_id: binding.session_id,
+                        peer: binding.peer,
+                        policy_revision: binding.policy_revision,
+                        windows_session_id: binding.windows_session_id,
+                        desktop_epoch: binding.desktop_epoch,
+                        desktop_kind: binding.desktop_kind,
+                        now_ms,
+                        expected_issuer_key_id: binding.expected_issuer_key_id,
+                        authorization_scopes: binding.approved_scopes,
+                        authorization_expires_at_ms: binding.authorization_expires_at_ms,
+                    };
+                    validate_execute_command(execute, &context, security.verifier.as_ref()).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -753,33 +739,42 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
+        let now_ms = self.clock.now_ms();
         let outcome = if let (Some(input), Some(security)) = (&mut self.input, &self.security) {
-            if let Some(binding) = security.bindings.resolve(&envelope.session_id) {
+            if let Some(binding) = security.bindings.resolve(&envelope.session_id, now_ms) {
                 let desktop = validated_desktop_state(security.desktop_state.as_ref())?;
-                let context = ExecutionContext {
-                    registration_id: identity.registration_id,
-                    registration_epoch: identity.registration_epoch,
-                    session_id: binding.session_id,
-                    peer: binding.peer,
-                    policy_revision: binding.policy_revision,
-                    windows_session_id: identity.windows_session_id,
-                    desktop_epoch: desktop.desktop_epoch,
-                    desktop_kind: desktop.desktop_kind,
-                    now_ms: self.clock.now_ms(),
-                    expected_issuer_key_id: binding.expected_issuer_key_id,
-                    authorization_scopes: binding.approved_scopes,
-                    authorization_expires_at_ms: binding.authorization_expires_at_ms,
-                };
-                let outcome = input.handle(&envelope, &context);
-                if matches!(
-                    outcome,
-                    InputAckOutcome::Rejected {
-                        reason: mrd_agent_ipc::InputRejection::StaleDesktop
+                if binding_matches_registration(&binding, identity)
+                    && binding.desktop_kind == DesktopKind::Default
+                {
+                    let context = ExecutionContext {
+                        registration_id: binding.registration_id,
+                        registration_epoch: binding.registration_epoch,
+                        session_id: binding.session_id,
+                        peer: binding.peer,
+                        policy_revision: binding.policy_revision,
+                        windows_session_id: binding.windows_session_id,
+                        desktop_epoch: desktop.desktop_epoch,
+                        desktop_kind: desktop.desktop_kind,
+                        now_ms,
+                        expected_issuer_key_id: binding.expected_issuer_key_id,
+                        authorization_scopes: binding.approved_scopes,
+                        authorization_expires_at_ms: binding.authorization_expires_at_ms,
+                    };
+                    let outcome = input.handle(&envelope, &context);
+                    if matches!(
+                        outcome,
+                        InputAckOutcome::Rejected {
+                            reason: mrd_agent_ipc::InputRejection::StaleDesktop
+                        }
+                    ) {
+                        let _ = input.release_all();
                     }
-                ) {
-                    let _ = input.release_all();
+                    outcome
+                } else {
+                    InputAckOutcome::Rejected {
+                        reason: mrd_agent_ipc::InputRejection::Grant,
+                    }
                 }
-                outcome
             } else {
                 InputAckOutcome::Rejected {
                     reason: mrd_agent_ipc::InputRejection::Grant,
@@ -921,6 +916,26 @@ impl AgentRuntime {
             observed_at_ms: self.clock.now_ms(),
         })
     }
+}
+
+fn binding_matches_runtime(
+    binding: &TrustedSessionBinding,
+    identity: &RegisteredAgentIdentity,
+    desktop: TrustedDesktopState,
+) -> bool {
+    binding_matches_registration(binding, identity)
+        && binding.desktop_epoch == desktop.desktop_epoch
+        && binding.desktop_kind == desktop.desktop_kind
+        && binding.desktop_kind == DesktopKind::Default
+}
+
+fn binding_matches_registration(
+    binding: &TrustedSessionBinding,
+    identity: &RegisteredAgentIdentity,
+) -> bool {
+    binding.registration_id == identity.registration_id
+        && binding.registration_epoch == identity.registration_epoch
+        && binding.windows_session_id == identity.windows_session_id
 }
 
 fn command_outcome(outcome: InputAckOutcome) -> CommandOutcome {

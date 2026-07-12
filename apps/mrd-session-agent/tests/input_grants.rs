@@ -115,8 +115,11 @@ fn test_signature(message: &[u8]) -> [u8; 64] {
 struct FixedBindings;
 
 impl TrustedSessionBindingSource for FixedBindings {
-    fn resolve(&self, requested: &SessionId) -> Option<TrustedSessionBinding> {
-        (requested == &session_id()).then(|| TrustedSessionBinding {
+    fn resolve(&self, requested: &SessionId, now_ms: u64) -> Option<TrustedSessionBinding> {
+        (requested == &session_id() && now_ms < 2_500).then(|| TrustedSessionBinding {
+            consent_request_id: [12; 16],
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
             session_id: session_id(),
             peer: peer(),
             policy_revision: 3,
@@ -125,19 +128,21 @@ impl TrustedSessionBindingSource for FixedBindings {
                 PermissionScope::InputPointer,
                 PermissionScope::InputKeyboard,
             ]),
+            windows_session_id: 7,
+            desktop_epoch: 11,
+            desktop_kind: DesktopKind::Default,
             authorization_expires_at_ms: 2_500,
         })
     }
 }
 
-struct FixedDesktop;
+struct MutableDesktop {
+    state: Arc<Mutex<TrustedDesktopState>>,
+}
 
-impl TrustedDesktopStateSource for FixedDesktop {
+impl TrustedDesktopStateSource for MutableDesktop {
     fn current_state(&self) -> Option<TrustedDesktopState> {
-        Some(TrustedDesktopState {
-            desktop_epoch: 11,
-            desktop_kind: DesktopKind::Default,
-        })
+        self.state.lock().ok().map(|state| *state)
     }
 }
 
@@ -680,6 +685,10 @@ fn platform_failures_are_coarse_and_consume_the_sequence() {
 #[tokio::test]
 async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
     let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = Arc::new(Mutex::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    }));
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: SessionDescriptor::new([10; 16], 4_242, 55, [11; 32], 7, [12; 32], 11)
@@ -694,7 +703,9 @@ async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
     .with_execution_security(
         Arc::new(FixedBindings),
         Arc::new(AcceptVerifier),
-        Arc::new(FixedDesktop),
+        Arc::new(MutableDesktop {
+            state: Arc::clone(&desktop),
+        }),
         Box::new(NoopExecutor),
     )
     .with_input_backend(Box::new(InputResourceManager::new(
@@ -811,6 +822,35 @@ async fn runtime_routes_start_events_and_stop_cleanup_through_input_backend() {
         other => panic!("expected input acknowledgment, got {other:?}"),
     }
     assert_eq!(events.lock().expect("events").len(), 1);
+
+    *desktop.lock().expect("desktop") = TrustedDesktopState {
+        desktop_epoch: 12,
+        desktop_kind: DesktopKind::Secure,
+    };
+    let release = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        2,
+        InputEventPayload::ReleaseAll,
+    );
+    write_frame(
+        &mut service_stream,
+        &ServiceToAgent::InputEvent(release.clone()),
+    )
+    .await
+    .unwrap();
+    match read_frame::<_, AgentToService>(&mut service_stream)
+        .await
+        .unwrap()
+        .message
+    {
+        AgentToService::InputAck(ack) => {
+            assert_eq!(ack.request_token, release.request_token);
+            assert_eq!(ack.outcome, InputAckOutcome::Applied);
+        }
+        other => panic!("expected cleanup acknowledgment, got {other:?}"),
+    }
+    assert_eq!(events.lock().expect("events").len(), 2);
 
     write_frame(
         &mut service_stream,

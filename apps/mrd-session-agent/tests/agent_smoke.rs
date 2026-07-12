@@ -91,8 +91,10 @@ impl TrustedDesktopStateSource for MutableDesktopSource {
 }
 
 impl TrustedSessionBindingSource for FixedBindingSource {
-    fn resolve(&self, session_id: &SessionId) -> Option<TrustedSessionBinding> {
-        (session_id == &self.binding.session_id).then(|| self.binding.clone())
+    fn resolve(&self, session_id: &SessionId, now_ms: u64) -> Option<TrustedSessionBinding> {
+        (session_id == &self.binding.session_id
+            && now_ms < self.binding.authorization_expires_at_ms)
+            .then(|| self.binding.clone())
     }
 }
 
@@ -123,6 +125,9 @@ impl AuthorizedCommandExecutor for CountingCaptureExecutor {
 
 fn trusted_binding() -> TrustedSessionBinding {
     TrustedSessionBinding {
+        consent_request_id: [12; 16],
+        registration_id: REGISTRATION_ID,
+        registration_epoch: 1,
         session_id: SessionId("session-replay-test".to_owned()),
         peer: PeerBinding {
             device_id: DeviceId("peer-replay-test".to_owned()),
@@ -133,6 +138,9 @@ fn trusted_binding() -> TrustedSessionBinding {
         approved_scopes: [mrd_session::PermissionScope::ScreenView]
             .into_iter()
             .collect(),
+        windows_session_id: 7,
+        desktop_epoch: 3,
+        desktop_kind: DesktopKind::Default,
         authorization_expires_at_ms: 2_500,
     }
 }
