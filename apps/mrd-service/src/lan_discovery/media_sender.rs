@@ -31,6 +31,7 @@ pub(crate) struct AgentEncodedAccessUnit {
 }
 
 /// Selects the active media source while the migration keeps a local fallback.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MediaSourceSelection {
     Agent,
@@ -38,6 +39,7 @@ pub(crate) enum MediaSourceSelection {
 }
 
 /// Agent media takes precedence whenever a bounded batch is available.
+#[allow(dead_code)]
 pub(crate) fn select_media_source(agent_batch_len: usize) -> MediaSourceSelection {
     if agent_batch_len > 0 {
         MediaSourceSelection::Agent
