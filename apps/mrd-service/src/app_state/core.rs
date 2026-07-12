@@ -141,6 +141,20 @@ impl AppState {
         crate::lan_discovery::media_sender::select_media_source(depth)
     }
 
+    /// Atomically selects and takes one sender turn for an exact session.
+    pub(crate) async fn take_agent_media_turn(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> crate::lan_discovery::media_sender::SenderMediaTurn {
+        let mut ingress = self.agent_media_ingress.lock().await;
+        crate::lan_discovery::media_sender::take_sender_media_turn(
+            &mut ingress,
+            session_id,
+            limit,
+        )
+    }
+
     /// Drains sender-ready units for one exact logical session.
     pub(crate) async fn drain_agent_media_for_session(
         &self,

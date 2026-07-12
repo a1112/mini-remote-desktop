@@ -38,6 +38,13 @@ pub(crate) enum MediaSourceSelection {
     LocalCapture,
 }
 
+/// One atomic sender scheduling decision made while the ingress is locked.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SenderMediaTurn {
+    Agent(Vec<AgentEncodedAccessUnit>),
+    LocalCapture,
+}
+
 /// Agent media takes precedence whenever a bounded batch is available.
 #[allow(dead_code)]
 pub(crate) fn select_media_source(agent_batch_len: usize) -> MediaSourceSelection {
@@ -45,6 +52,20 @@ pub(crate) fn select_media_source(agent_batch_len: usize) -> MediaSourceSelectio
         MediaSourceSelection::Agent
     } else {
         MediaSourceSelection::LocalCapture
+    }
+}
+
+/// Selects and removes one bounded agent batch without a check-then-drain race.
+pub(crate) fn take_sender_media_turn(
+    ingress: &mut AgentMediaIngress,
+    session_id: &str,
+    limit: usize,
+) -> SenderMediaTurn {
+    let batch = drain_agent_access_units_for_session(ingress, session_id, limit);
+    if batch.is_empty() {
+        SenderMediaTurn::LocalCapture
+    } else {
+        SenderMediaTurn::Agent(batch)
     }
 }
 
@@ -450,5 +471,69 @@ mod tests {
     fn agent_media_source_precedes_local_capture_when_available() {
         assert_eq!(select_media_source(1), MediaSourceSelection::Agent);
         assert_eq!(select_media_source(0), MediaSourceSelection::LocalCapture);
+    }
+
+    #[test]
+    fn sender_source_turn_atomically_takes_only_the_target_session_batch() {
+        let mut ingress = AgentMediaIngress::new(4).unwrap();
+        let make = |session_id: &str, sequence| MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 1,
+                desktop_epoch: 1,
+                sequence,
+                observed_at_ms: sequence,
+            },
+            resource_id: [9; 16],
+            session_id: session_id.to_string(),
+            sequence,
+            timestamp_us: sequence,
+            codec: MediaCodec::H264,
+            is_keyframe: sequence == 1,
+            payload: vec![1],
+        };
+        assert!(ingress.push(make("other-session", 1)));
+        assert!(ingress.push(make("target-session", 1)));
+        assert!(ingress.push(make("target-session", 2)));
+
+        let turn = take_sender_media_turn(&mut ingress, "target-session", 1);
+
+        let SenderMediaTurn::Agent(batch) = turn else {
+            panic!("queued target-session media must preempt local capture");
+        };
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].session_id, "target-session");
+        assert_eq!(batch[0].sequence, 1);
+        assert_eq!(ingress.session_len("target-session"), 1);
+        assert_eq!(ingress.session_len("other-session"), 1);
+    }
+
+    #[test]
+    fn sender_source_turn_falls_back_when_only_other_sessions_are_queued() {
+        let mut ingress = AgentMediaIngress::new(2).unwrap();
+        assert!(ingress.push(MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 1,
+                desktop_epoch: 1,
+                sequence: 1,
+                observed_at_ms: 1,
+            },
+            resource_id: [9; 16],
+            session_id: "other-session".to_string(),
+            sequence: 1,
+            timestamp_us: 1,
+            codec: MediaCodec::H264,
+            is_keyframe: true,
+            payload: vec![1],
+        }));
+
+        assert_eq!(
+            take_sender_media_turn(&mut ingress, "target-session", 1),
+            SenderMediaTurn::LocalCapture
+        );
+        assert_eq!(ingress.session_len("other-session"), 1);
     }
 }
