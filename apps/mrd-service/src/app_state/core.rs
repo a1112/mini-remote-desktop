@@ -92,6 +92,11 @@ impl AppState {
         server.set_media_ingress(self.agent_media_ingress.clone());
     }
 
+    /// Clears queued agent media after the owning session is revoked.
+    pub async fn clear_agent_media_ingress(&self) {
+        self.agent_media_ingress.lock().await.clear();
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
