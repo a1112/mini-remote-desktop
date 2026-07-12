@@ -11,7 +11,7 @@ use crate::runtime::AuthorizedCommandExecutor;
 use crate::{capture::CaptureAdapter, render::RenderAdapter};
 use mrd_agent_ipc::{AgentCapability, AgentCommand, AuthorizedCommand, CommandOutcome};
 use mrd_proto::SessionId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Desktop-bound media operation represented by a live agent resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +66,130 @@ pub enum MediaResourceMutation {
     Missing,
     /// The requested cleanup belongs to another session or kind.
     Mismatch,
+}
+
+/// Encoded media crossing the agent's bounded process boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedMediaAccessUnit {
+    resource_id: [u8; 16],
+    session_id: SessionId,
+    sequence: u64,
+    timestamp_us: u64,
+    keyframe: bool,
+    payload: Vec<u8>,
+}
+
+impl EncodedMediaAccessUnit {
+    /// Creates an encoded unit for one live capture resource.
+    pub fn new(
+        resource_id: [u8; 16],
+        session_id: SessionId,
+        sequence: u64,
+        timestamp_us: u64,
+        keyframe: bool,
+        payload: Vec<u8>,
+    ) -> Option<Self> {
+        (sequence != 0).then_some(Self {
+            resource_id,
+            session_id,
+            sequence,
+            timestamp_us,
+            keyframe,
+            payload,
+        })
+    }
+
+    /// Exact source resource.
+    pub fn resource_id(&self) -> &[u8; 16] {
+        &self.resource_id
+    }
+
+    /// Product session bound to this unit.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// Monotonic resource-local sequence.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Presentation timestamp in microseconds.
+    pub fn timestamp_us(&self) -> u64 {
+        self.timestamp_us
+    }
+
+    /// Whether the unit is a random-access/keyframe unit.
+    pub fn is_keyframe(&self) -> bool {
+        self.keyframe
+    }
+
+    /// Encoded payload, never raw desktop pixels.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+/// Bounded queue for encoded units from one exact capture resource.
+#[derive(Debug)]
+pub struct MediaAccessUnitQueue {
+    resource_id: [u8; 16],
+    session_id: SessionId,
+    capacity: usize,
+    max_payload_bytes: usize,
+    last_sequence: u64,
+    units: VecDeque<EncodedMediaAccessUnit>,
+}
+
+impl MediaAccessUnitQueue {
+    /// Creates a queue with explicit depth and payload bounds.
+    pub fn new(
+        resource_id: [u8; 16],
+        session_id: SessionId,
+        capacity: usize,
+        max_payload_bytes: usize,
+    ) -> Option<Self> {
+        (capacity != 0 && max_payload_bytes != 0).then_some(Self {
+            resource_id,
+            session_id,
+            capacity,
+            max_payload_bytes,
+            last_sequence: 0,
+            units: VecDeque::with_capacity(capacity),
+        })
+    }
+
+    /// Enqueues a unit, rejecting mismatched identity, replayed sequence, or
+    /// oversized payload. A full queue rejects the new unit so backpressure is
+    /// explicit and no frame is silently retargeted or reordered.
+    pub fn push(&mut self, unit: EncodedMediaAccessUnit) -> bool {
+        if unit.resource_id != self.resource_id
+            || unit.session_id != self.session_id
+            || unit.payload.len() > self.max_payload_bytes
+            || unit.sequence <= self.last_sequence
+            || self.units.len() >= self.capacity
+        {
+            return false;
+        }
+        self.last_sequence = unit.sequence;
+        self.units.push_back(unit);
+        true
+    }
+
+    /// Removes the oldest queued unit.
+    pub fn pop(&mut self) -> Option<EncodedMediaAccessUnit> {
+        self.units.pop_front()
+    }
+
+    /// Current bounded depth.
+    pub fn len(&self) -> usize {
+        self.units.len()
+    }
+
+    /// Whether no unit is queued.
+    pub fn is_empty(&self) -> bool {
+        self.units.is_empty()
+    }
 }
 
 /// Bounded registry for desktop-bound media resources.
@@ -328,5 +452,33 @@ mod tests {
         );
         assert_eq!(registry.stop_session(&first), 0);
         assert_eq!(registry.stop_session(&second), 1);
+    }
+
+    #[test]
+    fn encoded_queue_rejects_cross_session_replay_and_unbounded_growth() {
+        let id = [3; 16];
+        let owner = session("owner");
+        let other = session("other");
+        let mut queue = MediaAccessUnitQueue::new(id, owner.clone(), 2, 4).unwrap();
+        let unit = |session_id, sequence, payload| {
+            EncodedMediaAccessUnit::new(
+                id,
+                session_id,
+                sequence,
+                sequence * 10,
+                sequence == 1,
+                payload,
+            )
+            .unwrap()
+        };
+        assert!(queue.push(unit(owner.clone(), 1, vec![1, 2])));
+        assert!(!queue.push(unit(owner.clone(), 1, vec![3])));
+        assert!(!queue.push(unit(other, 2, vec![4])));
+        assert!(queue.push(unit(owner.clone(), 2, vec![5, 6, 7, 8])));
+        assert!(!queue.push(unit(owner, 3, vec![9])));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pop().unwrap().sequence(), 1);
+        assert_eq!(queue.pop().unwrap().sequence(), 2);
+        assert!(queue.is_empty());
     }
 }
