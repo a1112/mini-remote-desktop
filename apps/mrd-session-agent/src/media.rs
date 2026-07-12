@@ -141,6 +141,7 @@ impl EncodedMediaAccessUnit {
         let unit = MediaAccessUnit {
             context,
             resource_id: self.resource_id,
+            session_id: self.session_id.0.clone(),
             sequence: self.sequence,
             timestamp_us: self.timestamp_us,
             codec,

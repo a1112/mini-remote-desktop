@@ -22,6 +22,7 @@ pub(super) struct LanSenderEncoder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentEncodedAccessUnit {
     pub(crate) resource_id: [u8; 16],
+    pub(crate) session_id: String,
     pub(crate) sequence: u64,
     pub(crate) timestamp_us: u64,
     pub(crate) codec: LanAccessUnitCodec,
@@ -41,6 +42,7 @@ pub(crate) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentE
     };
     Some(AgentEncodedAccessUnit {
         resource_id: unit.resource_id,
+        session_id: unit.session_id,
         sequence: unit.sequence,
         timestamp_us: unit.timestamp_us,
         codec,
@@ -372,6 +374,7 @@ mod tests {
                 observed_at_ms: 5,
             },
             resource_id: [9; 16],
+            session_id: "session-1".to_string(),
             sequence: 7,
             timestamp_us: 8,
             codec: MediaCodec::H264,
@@ -397,6 +400,7 @@ mod tests {
                 observed_at_ms: sequence,
             },
             resource_id: [9; 16],
+            session_id: "session-1".to_string(),
             sequence,
             timestamp_us: sequence,
             codec: MediaCodec::H264,

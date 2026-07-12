@@ -1192,6 +1192,8 @@ pub struct MediaAccessUnit {
     pub context: AgentEventContext,
     /// Authorized capture/render resource.
     pub resource_id: [u8; 16],
+    /// Logical product session owning this resource.
+    pub session_id: String,
     /// Monotonic sequence within the resource.
     pub sequence: u64,
     /// Presentation timestamp in microseconds.
@@ -1208,6 +1210,8 @@ impl MediaAccessUnit {
     /// Return whether identifiers, sequences, and payload bounds are valid.
     pub fn is_valid(&self) -> bool {
         self.resource_id != [0; 16]
+            && !self.session_id.is_empty()
+            && self.session_id.len() <= AGENT_IPC_MAX_IDENTIFIER_BYTES
             && self.sequence > 0
             && self.context.sequence > 0
             && !self.payload.is_empty()

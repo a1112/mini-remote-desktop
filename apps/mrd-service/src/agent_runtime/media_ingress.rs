@@ -79,6 +79,7 @@ mod tests {
                 observed_at_ms: sequence,
             },
             resource_id: [2; 16],
+            session_id: "session-1".to_string(),
             sequence,
             timestamp_us: sequence,
             codec: MediaCodec::H264,

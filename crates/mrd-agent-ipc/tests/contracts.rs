@@ -46,6 +46,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
             observed_at_ms: 4,
         },
         resource_id: RESOURCE_ID,
+        session_id: "session-1".to_string(),
         sequence: 9,
         timestamp_us: 10,
         codec: MediaCodec::H264,
