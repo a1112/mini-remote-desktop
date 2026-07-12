@@ -7,6 +7,7 @@ pub struct AgentMediaIngress {
     capacity: usize,
     queue: VecDeque<MediaAccessUnit>,
     dropped: u64,
+    last_sequence: u64,
 }
 
 impl AgentMediaIngress {
@@ -16,15 +17,20 @@ impl AgentMediaIngress {
             capacity,
             queue: VecDeque::with_capacity(capacity),
             dropped: 0,
+            last_sequence: 0,
         })
     }
 
     /// Enqueues a validated unit, rejecting invalid or over-capacity input.
     pub fn push(&mut self, unit: MediaAccessUnit) -> bool {
-        if !unit.is_valid() || self.queue.len() >= self.capacity {
+        if !unit.is_valid()
+            || unit.sequence <= self.last_sequence
+            || self.queue.len() >= self.capacity
+        {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
+        self.last_sequence = unit.sequence;
         self.queue.push_back(unit);
         true
     }
@@ -82,11 +88,13 @@ mod tests {
         assert!(!ingress.push(unit(2)));
         assert_eq!(ingress.dropped(), 1);
         assert_eq!(ingress.pop().unwrap().sequence, 1);
+        assert!(!ingress.push(unit(1)));
+        assert_eq!(ingress.dropped(), 2);
         assert!(!ingress.push({
             let mut invalid = unit(3);
             invalid.payload.clear();
             invalid
         }));
-        assert_eq!(ingress.dropped(), 2);
+        assert_eq!(ingress.dropped(), 3);
     }
 }
