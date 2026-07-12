@@ -10,6 +10,7 @@ use super::media_profile::{
     default_media_profile, lan_color_mode_for_profile, lan_profile_requests_hevc_main10,
     missing_profile_receiver_media_capabilities,
 };
+use crate::agent_runtime::AgentMediaIngress;
 
 pub(super) struct LanSenderEncoder {
     pub(super) codec: LanAccessUnitCodec,
@@ -46,6 +47,18 @@ pub(crate) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentE
         is_keyframe: unit.is_keyframe,
         bytes: unit.payload,
     })
+}
+
+/// Takes one bounded batch from the agent ingress and maps it for transport.
+pub(crate) fn drain_agent_access_units(
+    ingress: &mut AgentMediaIngress,
+    limit: usize,
+) -> Vec<AgentEncodedAccessUnit> {
+    ingress
+        .drain(limit)
+        .into_iter()
+        .filter_map(validate_agent_access_unit)
+        .collect()
 }
 
 pub(super) fn create_lan_encoder(
@@ -368,5 +381,32 @@ mod tests {
         assert_eq!(mapped.codec, LanAccessUnitCodec::H264);
         assert_eq!(mapped.resource_id, [9; 16]);
         assert_eq!(mapped.bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sender_drains_only_one_bounded_agent_batch() {
+        let mut ingress = AgentMediaIngress::new(4).unwrap();
+        let make = |sequence| MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 1,
+                desktop_epoch: 1,
+                sequence,
+                observed_at_ms: sequence,
+            },
+            resource_id: [9; 16],
+            sequence,
+            timestamp_us: sequence,
+            codec: MediaCodec::H264,
+            is_keyframe: sequence == 1,
+            payload: vec![1],
+        };
+        assert!(ingress.push(make(1)));
+        assert!(ingress.push(make(2)));
+        let batch = drain_agent_access_units(&mut ingress, 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].sequence, 1);
+        assert_eq!(ingress.len(), 1);
     }
 }

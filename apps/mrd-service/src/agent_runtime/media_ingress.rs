@@ -34,6 +34,12 @@ impl AgentMediaIngress {
         self.queue.pop_front()
     }
 
+    /// Drains at most `limit` units for one sender scheduling turn.
+    pub fn drain(&mut self, limit: usize) -> Vec<MediaAccessUnit> {
+        let count = limit.min(self.queue.len());
+        self.queue.drain(..count).collect()
+    }
+
     /// Current queue depth.
     pub fn len(&self) -> usize {
         self.queue.len()
