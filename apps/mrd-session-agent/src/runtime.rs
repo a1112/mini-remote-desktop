@@ -400,6 +400,12 @@ struct ConsentRuntime {
     expected_issuer_key_id: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedDesktopState {
+    runtime: TrustedDesktopState,
+    consent: Option<TrustedDesktopState>,
+}
+
 /// One connected session-agent runtime.
 pub struct AgentRuntime {
     config: AgentRuntimeConfig,
@@ -573,7 +579,8 @@ impl AgentRuntime {
                         let _ = self.release_input();
                         self.shutdown_consent(ConsentAbortReason::RuntimeStopping)
                             .await?;
-                        let context = self.next_event_context(&identity)?;
+                        let desktop = self.current_desktop_state()?;
+                        let context = self.next_event_context(&identity, desktop)?;
                         write_frame(
                             writer,
                             &AgentToService::AgentStopping(AgentStopping {
@@ -625,8 +632,9 @@ impl AgentRuntime {
                     self.handle_consent_deadline(writer).await?;
                 }
                 RegisteredLoopEvent::Heartbeat => {
-                    self.refresh_input_desktop()?;
-                    let context = self.next_event_context(&identity)?;
+                    let desktop = self.current_desktop_state()?;
+                    self.refresh_input_desktop(desktop);
+                    let context = self.next_event_context(&identity, desktop)?;
                     write_frame(
                         writer,
                         &AgentToService::AgentHeartbeat(AgentHeartbeat { context }),
@@ -702,22 +710,8 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
-        let consent_desktop = self.consent.as_ref().and_then(|consent| {
-            consent
-                .desktop_state
-                .current_state()
-                .filter(|state| state.desktop_epoch != 0)
-        });
-        let state = match consent_desktop {
-            Some(state) => state,
-            None => match &self.security {
-                Some(security) => validated_desktop_state(security.desktop_state.as_ref())?,
-                None => TrustedDesktopState {
-                    desktop_epoch: self.config.session.desktop_epoch,
-                    desktop_kind: DesktopKind::Default,
-                },
-            },
-        };
+        let resolved_desktop = self.resolve_desktop_state()?;
+        let state = resolved_desktop.runtime;
         self.last_desktop_state = Some(state);
         let desktop_epoch = state.desktop_epoch;
         let mut capabilities =
@@ -745,7 +739,8 @@ impl AgentRuntime {
         }
         if self.consent.as_ref().is_some_and(|consent| {
             consent.manager.is_available()
-                && consent_desktop
+                && resolved_desktop
+                    .consent
                     .is_some_and(|desktop| desktop.desktop_kind == DesktopKind::Default)
         }) {
             let mut advertised = capabilities.as_set().clone();
@@ -910,11 +905,7 @@ impl AgentRuntime {
     where
         W: AsyncWrite + Unpin,
     {
-        if !self
-            .consent
-            .as_ref()
-            .is_some_and(|consent| consent.manager.is_available())
-        {
+        if self.consent.is_none() {
             return self.handle_consent_without_manager(writer, request).await;
         }
         let context = self.trusted_consent_context(identity)?;
@@ -1020,13 +1011,14 @@ impl AgentRuntime {
         &self,
         identity: &RegisteredAgentIdentity,
     ) -> Result<TrustedConsentContext, AgentRuntimeError> {
-        let consent = self
+        let expected_issuer_key_id = self
             .consent
             .as_ref()
+            .map(|consent| consent.expected_issuer_key_id)
             .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
-        let desktop = consent
-            .desktop_state
-            .current_state()
+        let desktop = self
+            .resolve_desktop_state()?
+            .consent
             .unwrap_or(TrustedDesktopState {
                 desktop_epoch: 0,
                 desktop_kind: DesktopKind::Unknown,
@@ -1037,7 +1029,7 @@ impl AgentRuntime {
             windows_session_id: identity.windows_session_id,
             desktop_epoch: desktop.desktop_epoch,
             desktop_kind: desktop.desktop_kind,
-            expected_issuer_key_id: consent.expected_issuer_key_id,
+            expected_issuer_key_id,
             now_ms: self.clock.now_ms(),
         })
     }
@@ -1121,11 +1113,7 @@ impl AgentRuntime {
             .map_or(Ok(()), |input| input.release_all())
     }
 
-    fn refresh_input_desktop(&mut self) -> Result<(), AgentRuntimeError> {
-        let Some(security) = &self.security else {
-            return Ok(());
-        };
-        let current = validated_desktop_state(security.desktop_state.as_ref())?;
+    fn refresh_input_desktop(&mut self, current: TrustedDesktopState) {
         if self
             .last_desktop_state
             .is_some_and(|previous| previous != current)
@@ -1133,32 +1121,54 @@ impl AgentRuntime {
             let _ = self.release_input();
         }
         self.last_desktop_state = Some(current);
-        Ok(())
     }
 
     fn next_event_context(
         &mut self,
         identity: &RegisteredAgentIdentity,
+        desktop: TrustedDesktopState,
     ) -> Result<AgentEventContext, AgentRuntimeError> {
         self.event_sequence = self
             .event_sequence
             .checked_add(1)
             .filter(|sequence| *sequence != u64::MAX)
             .ok_or(AgentRuntimeError::EventSequenceExhausted)?;
-        let desktop_epoch = match &self.security {
-            Some(security) => {
-                validated_desktop_state(security.desktop_state.as_ref())?.desktop_epoch
-            }
-            None => self.config.session.desktop_epoch,
-        };
         Ok(AgentEventContext {
             registration_id: identity.registration_id,
             registration_epoch: identity.registration_epoch,
             windows_session_id: identity.windows_session_id,
-            desktop_epoch,
+            desktop_epoch: desktop.desktop_epoch,
             sequence: self.event_sequence,
             observed_at_ms: self.clock.now_ms(),
         })
+    }
+
+    fn current_desktop_state(&self) -> Result<TrustedDesktopState, AgentRuntimeError> {
+        self.resolve_desktop_state()
+            .map(|resolved| resolved.runtime)
+    }
+
+    fn resolve_desktop_state(&self) -> Result<ResolvedDesktopState, AgentRuntimeError> {
+        let consent = match self.consent.as_ref() {
+            Some(consent) => optional_desktop_state(consent.desktop_state.as_ref())?,
+            None => None,
+        };
+        let execution = self
+            .security
+            .as_ref()
+            .map(|security| validated_desktop_state(security.desktop_state.as_ref()))
+            .transpose()?;
+        let runtime = match (consent, execution) {
+            (Some(consent), Some(execution)) if consent == execution => Ok(consent),
+            (Some(_), Some(_)) => Err(AgentRuntimeError::DesktopStateUnavailable),
+            (Some(consent), None) => Ok(consent),
+            (None, Some(execution)) => Ok(execution),
+            (None, None) => Ok(TrustedDesktopState {
+                desktop_epoch: self.config.session.desktop_epoch,
+                desktop_kind: DesktopKind::Default,
+            }),
+        }?;
+        Ok(ResolvedDesktopState { runtime, consent })
     }
 }
 
@@ -1217,6 +1227,16 @@ fn validated_desktop_state(
         .current_state()
         .filter(|state| state.desktop_epoch != 0)
         .ok_or(AgentRuntimeError::DesktopStateUnavailable)
+}
+
+fn optional_desktop_state(
+    source: &dyn TrustedDesktopStateSource,
+) -> Result<Option<TrustedDesktopState>, AgentRuntimeError> {
+    match source.current_state() {
+        Some(state) if state.desktop_epoch != 0 => Ok(Some(state)),
+        Some(_) => Err(AgentRuntimeError::DesktopStateUnavailable),
+        None => Ok(None),
+    }
 }
 
 fn validate_challenge(

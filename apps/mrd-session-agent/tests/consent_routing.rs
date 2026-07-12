@@ -1,25 +1,27 @@
 use mrd_agent_ipc::{
-    read_frame, write_frame, AgentCapability, AgentChallenge, AgentProtocolState, AgentStopping,
-    AgentToService, CancelConsent, ConsentCancelReason, ConsentDecision, ConsentRequest,
-    ConsentResult, PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent, StopReason,
-    StoppingReason,
+    read_frame, write_frame, AgentCapability, AgentCapabilitySnapshot, AgentChallenge,
+    AgentProtocolState, AgentStopping, AgentToService, AuthorizedCommand, CancelConsent,
+    CommandOutcome, ConsentCancelReason, ConsentDecision, ConsentRequest, ConsentResult,
+    ExecuteGrantVerifier, PeerBinding, RegistrationProofVerifier, ServiceToAgent, StopAgent,
+    StopReason, StoppingReason,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::{PermissionScope, PermissionScopes};
 use mrd_session_agent::{
+    capabilities::AgentCapabilities,
     consent::{
         ConsentAbortReason, ConsentBackend, ConsentBackendDecision, ConsentBackendFuture,
         ConsentPrompt,
     },
     runtime::{
-        AgentClock, AgentExit, AgentRuntime, AgentRuntimeConfig, RegistrationSigner,
-        RegistrationSigningError, SessionDescriptor, TrustedDesktopState,
-        TrustedDesktopStateSource,
+        AgentClock, AgentExit, AgentRuntime, AgentRuntimeConfig, AuthorizedCommandExecutor,
+        RegistrationSigner, RegistrationSigningError, SessionDescriptor, TrustedDesktopState,
+        TrustedDesktopStateSource, TrustedSessionBinding, TrustedSessionBindingSource,
     },
 };
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -74,6 +76,39 @@ impl RegistrationProofVerifier for FixedVerifier {
     }
 }
 
+struct EmptyBindings;
+
+impl TrustedSessionBindingSource for EmptyBindings {
+    fn resolve(&self, _session_id: &SessionId, _now_ms: u64) -> Option<TrustedSessionBinding> {
+        None
+    }
+}
+
+struct RejectExecuteGrant;
+
+impl ExecuteGrantVerifier for RejectExecuteGrant {
+    fn verify(
+        &self,
+        _issuer_key_id: &[u8; 32],
+        _signing_bytes: &[u8],
+        _signature: &[u8; 64],
+    ) -> bool {
+        false
+    }
+}
+
+struct EmptyExecutor;
+
+impl AuthorizedCommandExecutor for EmptyExecutor {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::empty()
+    }
+
+    fn execute(&mut self, _command: AuthorizedCommand) -> CommandOutcome {
+        CommandOutcome::Rejected
+    }
+}
+
 struct DefaultDesktop;
 
 impl TrustedDesktopStateSource for DefaultDesktop {
@@ -96,6 +131,25 @@ impl TrustedDesktopStateSource for SecureDesktop {
     }
 }
 
+struct OtherDefaultDesktop;
+
+impl TrustedDesktopStateSource for OtherDefaultDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        Some(TrustedDesktopState {
+            desktop_epoch: 10,
+            desktop_kind: mrd_agent_ipc::DesktopKind::Default,
+        })
+    }
+}
+
+struct UnavailableDesktop;
+
+impl TrustedDesktopStateSource for UnavailableDesktop {
+    fn current_state(&self) -> Option<TrustedDesktopState> {
+        None
+    }
+}
+
 struct StartedPrompt {
     prompt: ConsentPrompt,
     abort: watch::Receiver<Option<ConsentAbortReason>>,
@@ -104,13 +158,13 @@ struct StartedPrompt {
 
 struct BackendState {
     started: mpsc::Sender<StartedPrompt>,
+    available: AtomicBool,
     visible: AtomicUsize,
     maximum_visible: AtomicUsize,
 }
 
 struct TestBackend {
     state: Arc<BackendState>,
-    available: bool,
 }
 
 struct VisiblePromptGuard {
@@ -125,7 +179,7 @@ impl Drop for VisiblePromptGuard {
 
 impl ConsentBackend for TestBackend {
     fn is_available(&self) -> bool {
-        self.available
+        self.state.available.load(Ordering::SeqCst)
     }
 
     fn prompt(
@@ -176,13 +230,13 @@ fn backend_with_availability(
     let (started, receiver) = mpsc::channel(32);
     let state = Arc::new(BackendState {
         started,
+        available: AtomicBool::new(available),
         visible: AtomicUsize::new(0),
         maximum_visible: AtomicUsize::new(0),
     });
     (
         Arc::new(TestBackend {
             state: Arc::clone(&state),
-            available,
         }),
         state,
         receiver,
@@ -211,7 +265,21 @@ async fn start_agent_with_environment(
     JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
     DuplexStream,
 ) {
-    let (agent_stream, mut service_stream) = tokio::io::duplex(32 * 1024);
+    let (agent, service, _) =
+        start_agent_with_environment_and_snapshot(backend, desktop, expect_consent_capability)
+            .await;
+    (agent, service)
+}
+
+async fn start_agent_with_environment_and_snapshot(
+    backend: Arc<TestBackend>,
+    desktop: Arc<dyn TrustedDesktopStateSource>,
+    expect_consent_capability: bool,
+) -> (
+    JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    DuplexStream,
+    AgentCapabilitySnapshot,
+) {
     let runtime = AgentRuntime::new(
         AgentRuntimeConfig {
             session: descriptor(),
@@ -224,6 +292,18 @@ async fn start_agent_with_environment(
     .expect("valid fixed runtime")
     .with_consent_backend(backend, desktop, EXECUTE_ISSUER_KEY_ID)
     .expect("valid consent manager configuration");
+    start_configured_agent(runtime, expect_consent_capability).await
+}
+
+async fn start_configured_agent(
+    runtime: AgentRuntime,
+    expect_consent_capability: bool,
+) -> (
+    JoinHandle<Result<AgentExit, mrd_session_agent::runtime::AgentRuntimeError>>,
+    DuplexStream,
+    AgentCapabilitySnapshot,
+) {
+    let (agent_stream, mut service_stream) = tokio::io::duplex(32 * 1024);
     let agent = tokio::spawn(runtime.run(agent_stream));
 
     let register = match read_agent_message(&mut service_stream).await {
@@ -272,7 +352,7 @@ async fn start_agent_with_environment(
             .contains(&AgentCapability::Consent),
         expect_consent_capability
     );
-    (agent, service_stream)
+    (agent, service_stream, capabilities)
 }
 
 fn consent_request(seed: u8) -> ConsentRequest {
@@ -570,6 +650,88 @@ async fn exact_active_cancel_tombstones_before_backend_closes() {
         .expect("close second prompt");
     let second_result = next_consent_result(&mut service).await;
     assert_eq!(second_result.request_id, second_request.request_id);
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn duplicate_exact_cancel_preserves_first_terminal_and_closing_slot() {
+    let (backend, _state, mut started) = backend();
+    let (agent, mut service) = start_agent(backend).await;
+    let first_request = consent_request(79);
+    let queued_request = consent_request(80);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(first_request.clone()),
+    )
+    .await;
+    let mut first = next_started(&mut started).await;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(queued_request.clone()),
+    )
+    .await;
+    let exact = |reason| {
+        ServiceToAgent::CancelConsent(CancelConsent {
+            request_token: first_request.request_token,
+            request_id: first_request.request_id,
+            session_id: first_request.session_id.clone(),
+            reason,
+        })
+    };
+    send_service_message(&mut service, &exact(ConsentCancelReason::CallerAborted)).await;
+    tokio::time::timeout(TEST_TIMEOUT, first.abort.changed())
+        .await
+        .expect("first cancel notification timeout")
+        .expect("first cancel watch closed");
+    assert_eq!(
+        *first.abort.borrow_and_update(),
+        Some(ConsentAbortReason::Service(
+            ConsentCancelReason::CallerAborted
+        ))
+    );
+    let first_terminal = next_consent_result(&mut service).await;
+    assert_eq!(first_terminal.decision, ConsentDecision::Dismissed);
+
+    send_service_message(&mut service, &exact(ConsentCancelReason::PolicyChanged)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), first.abort.changed())
+            .await
+            .is_err(),
+        "duplicate cancel must not overwrite the first abort reason"
+    );
+    assert_eq!(
+        *first.abort.borrow(),
+        Some(ConsentAbortReason::Service(
+            ConsentCancelReason::CallerAborted
+        ))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), next_consent_result(&mut service))
+            .await
+            .is_err(),
+        "duplicate cancel must not emit another terminal result"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "duplicate cancel must preserve the closing active slot"
+    );
+
+    first
+        .respond
+        .send(ConsentBackendDecision::Cancelled)
+        .expect("confirm first surface closed");
+    let queued = next_started(&mut started).await;
+    assert_eq!(queued.prompt.session_id(), &queued_request.session_id);
+    queued
+        .respond
+        .send(ConsentBackendDecision::Dismissed)
+        .expect("close queued prompt");
+    assert_eq!(
+        next_consent_result(&mut service).await.request_id,
+        queued_request.request_id
+    );
     stop_agent(agent, &mut service).await;
 }
 
@@ -1063,6 +1225,78 @@ async fn nondefault_desktop_does_not_publish_consent_or_receive_prompt() {
 }
 
 #[tokio::test]
+async fn unavailable_consent_desktop_hides_consent_without_stopping_runtime() {
+    let (backend, _state, mut started) = backend();
+    let (agent, mut service, snapshot) =
+        start_agent_with_environment_and_snapshot(backend, Arc::new(UnavailableDesktop), false)
+            .await;
+    assert_eq!(snapshot.desktop_epoch, 1);
+    let request = consent_request(81);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let result = next_consent_result(&mut service).await;
+    assert_eq!(result.request_id, request.request_id);
+    assert_eq!(result.decision, ConsentDecision::Dismissed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "missing trusted desktop must not invoke the consent backend"
+    );
+    let heartbeat = match read_agent_message(&mut service).await {
+        AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
+        other => panic!("expected heartbeat after coarse dismissal, got {other:?}"),
+    };
+    assert_eq!(heartbeat.context.desktop_epoch, snapshot.desktop_epoch);
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn unavailable_consent_desktop_never_borrows_execution_desktop_for_prompt() {
+    let (backend, _state, mut started) = backend();
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_millis(10),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid fixed runtime")
+    .with_execution_security(
+        Arc::new(EmptyBindings),
+        Arc::new(RejectExecuteGrant),
+        Arc::new(OtherDefaultDesktop),
+        Box::new(EmptyExecutor),
+    )
+    .with_consent_backend(backend, Arc::new(UnavailableDesktop), EXECUTE_ISSUER_KEY_ID)
+    .expect("valid consent manager configuration");
+    let (agent, mut service, snapshot) = start_configured_agent(runtime, false).await;
+    assert_eq!(snapshot.desktop_epoch, 10);
+
+    let request = consent_request(82);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let result = next_consent_result(&mut service).await;
+    assert_eq!(result.request_id, request.request_id);
+    assert_eq!(result.decision, ConsentDecision::Dismissed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "execution desktop must not authorize a consent prompt"
+    );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
 async fn empty_approval_is_normalized_and_cached_as_dismissed() {
     let (backend, _state, mut started) = backend();
     let (agent, mut service) = start_agent(backend).await;
@@ -1136,6 +1370,276 @@ async fn scope_escalation_is_normalized_and_cached_as_dismissed() {
             .await
             .is_err(),
         "scope escalation must be tombstoned"
+    );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn capability_and_heartbeat_share_the_consent_desktop_epoch() {
+    let (backend, _state, _started) = backend();
+    let (agent, mut service, snapshot) =
+        start_agent_with_environment_and_snapshot(backend, Arc::new(DefaultDesktop), true).await;
+    assert_eq!(snapshot.desktop_epoch, 9);
+    let heartbeat = match read_agent_message(&mut service).await {
+        AgentToService::AgentHeartbeat(heartbeat) => heartbeat,
+        other => panic!("expected heartbeat after snapshot, got {other:?}"),
+    };
+    assert_eq!(heartbeat.context.desktop_epoch, snapshot.desktop_epoch);
+    assert_eq!(heartbeat.context.registration_id, snapshot.registration_id);
+    assert_eq!(
+        heartbeat.context.windows_session_id,
+        snapshot.windows_session_id
+    );
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [97; 16],
+            deadline_ms: 2_500,
+            reason: StopReason::ServiceShutdown,
+        }),
+    )
+    .await;
+    let stopping = loop {
+        match read_agent_message(&mut service).await {
+            AgentToService::AgentStopping(stopping) => break stopping,
+            AgentToService::AgentHeartbeat(_) => {}
+            other => panic!("expected heartbeat or stopping, got {other:?}"),
+        }
+    };
+    assert_eq!(stopping.context.desktop_epoch, snapshot.desktop_epoch);
+    assert_eq!(
+        tokio::time::timeout(TEST_TIMEOUT, agent)
+            .await
+            .expect("agent stop timeout")
+            .expect("agent join")
+            .expect("agent exit"),
+        AgentExit::StoppedByService
+    );
+}
+
+#[tokio::test]
+async fn conflicting_consent_and_execution_desktop_sources_fail_closed() {
+    let (backend, _state, _started) = backend();
+    let (agent_stream, mut service) = tokio::io::duplex(32 * 1024);
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_millis(10),
+            handshake_timeout: Duration::from_millis(250),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .expect("valid fixed runtime")
+    .with_execution_security(
+        Arc::new(EmptyBindings),
+        Arc::new(RejectExecuteGrant),
+        Arc::new(OtherDefaultDesktop),
+        Box::new(EmptyExecutor),
+    )
+    .with_consent_backend(backend, Arc::new(DefaultDesktop), EXECUTE_ISSUER_KEY_ID)
+    .expect("valid consent manager configuration");
+    let agent = tokio::spawn(runtime.run(agent_stream));
+
+    let register = match read_agent_message(&mut service).await {
+        AgentToService::AgentRegister(register) => register,
+        other => panic!("expected register, got {other:?}"),
+    };
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::AgentChallenge(AgentChallenge {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            challenge_id: CHALLENGE_ID,
+            challenge_nonce: [10; 32],
+            expected_agent_instance_id: register.agent_instance_id,
+            expected_process_id: register.process_id,
+            expected_process_creation_time: register.process_creation_time,
+            expected_logon_sid_hash: register.logon_sid_hash,
+            expected_windows_session_id: register.windows_session_id,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentRegistered(_)
+    ));
+
+    let error = tokio::time::timeout(TEST_TIMEOUT, agent)
+        .await
+        .expect("desktop mismatch must close before capabilities")
+        .expect("agent join")
+        .expect_err("conflicting desktop sources must fail closed");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::DesktopStateUnavailable
+    ));
+    let mut trailing = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            tokio::io::AsyncReadExt::read(&mut service, &mut trailing)
+        )
+        .await
+        .expect("agent close timeout")
+        .expect("read agent close"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn completed_replay_survives_backend_becoming_unavailable() {
+    let (backend, state, mut started) = backend();
+    let (agent, mut service) = start_agent(backend).await;
+    let request = consent_request(74);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    next_started(&mut started)
+        .await
+        .respond
+        .send(ConsentBackendDecision::Approved(
+            [PermissionScope::ScreenView].into_iter().collect(),
+        ))
+        .expect("complete original prompt");
+    let original = next_consent_result(&mut service).await;
+    state.available.store(false, Ordering::SeqCst);
+
+    let mut replay = request;
+    replay.request_token += 100;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replay.clone()),
+    )
+    .await;
+    let cached = next_consent_result(&mut service).await;
+    let mut expected = original;
+    expected.request_token = replay.request_token;
+    assert_eq!(cached, expected);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "cached replay must not consult the unavailable backend"
+    );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn pending_semantic_conflict_survives_backend_becoming_unavailable() {
+    let (backend, state, mut started) = backend();
+    let (agent, mut service) = start_agent(backend).await;
+    let request = consent_request(75);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let mut prompt = next_started(&mut started).await;
+    state.available.store(false, Ordering::SeqCst);
+    let mut conflict = request;
+    conflict.request_token += 100;
+    conflict.peer.key_id[0] ^= 1;
+    send_service_message(&mut service, &ServiceToAgent::ConsentRequest(conflict)).await;
+
+    tokio::time::timeout(TEST_TIMEOUT, prompt.abort.changed())
+        .await
+        .expect("semantic conflict abort timeout")
+        .expect("semantic conflict abort watch closed");
+    assert_eq!(
+        *prompt.abort.borrow_and_update(),
+        Some(ConsentAbortReason::ServiceDisconnected)
+    );
+    let error = tokio::time::timeout(TEST_TIMEOUT, agent)
+        .await
+        .expect("semantic conflict shutdown timeout")
+        .expect("agent join")
+        .expect_err("semantic conflict must close while backend unavailable");
+    assert!(matches!(
+        error,
+        mrd_session_agent::runtime::AgentRuntimeError::ConsentStateUnavailable
+    ));
+}
+
+#[tokio::test]
+async fn queued_prompt_checks_availability_only_when_promoted() {
+    let (backend, state, mut started) = backend();
+    let (agent, mut service) = start_agent(backend).await;
+    let first_request = consent_request(76);
+    let queued_request = consent_request(77);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(first_request.clone()),
+    )
+    .await;
+    let first = next_started(&mut started).await;
+    state.available.store(false, Ordering::SeqCst);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(queued_request.clone()),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), next_consent_result(&mut service))
+            .await
+            .is_err(),
+        "queued request must not be dismissed before reaching the visible slot"
+    );
+
+    first
+        .respond
+        .send(ConsentBackendDecision::Denied)
+        .expect("close active surface");
+    let first_result = next_consent_result(&mut service).await;
+    let unavailable_result = next_consent_result(&mut service).await;
+    assert_eq!(first_result.request_id, first_request.request_id);
+    assert_eq!(first_result.decision, ConsentDecision::Denied);
+    assert_eq!(unavailable_result.request_id, queued_request.request_id);
+    assert_eq!(unavailable_result.decision, ConsentDecision::Dismissed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "unavailable queued request must never invoke the backend"
+    );
+    stop_agent(agent, &mut service).await;
+}
+
+#[tokio::test]
+async fn first_unavailable_dismissal_is_tombstoned() {
+    let (backend, state, mut started) = backend_with_availability(false);
+    let (agent, mut service) =
+        start_agent_with_environment(backend, Arc::new(DefaultDesktop), false).await;
+    let request = consent_request(78);
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(request.clone()),
+    )
+    .await;
+    let first = next_consent_result(&mut service).await;
+    assert_eq!(first.decision, ConsentDecision::Dismissed);
+    state.available.store(true, Ordering::SeqCst);
+
+    let mut replay = request;
+    replay.request_token += 100;
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(replay.clone()),
+    )
+    .await;
+    let cached = next_consent_result(&mut service).await;
+    let mut expected = first;
+    expected.request_token = replay.request_token;
+    assert_eq!(cached, expected);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), started.recv())
+            .await
+            .is_err(),
+        "unavailable dismissal replay must stay cached after recovery"
     );
     stop_agent(agent, &mut service).await;
 }

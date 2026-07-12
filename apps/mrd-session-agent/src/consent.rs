@@ -669,12 +669,12 @@ impl ConsentManager {
                     pending.request.expires_at_ms.saturating_sub(context.now_ms);
                 self.queued.push_back(ManagedPrompt {
                     pending,
-                    context,
+                    context: context.clone(),
                     deadline: now + std::time::Duration::from_millis(prompt_lifetime_ms),
                 });
             }
         }
-        self.start_next(Instant::now(), &mut results)?;
+        self.start_next(Instant::now(), &context, &mut results)?;
         Ok(results)
     }
 
@@ -716,7 +716,7 @@ impl ConsentManager {
             // decision (including Approved) is deliberately ignored.
             self.active.take();
             self.expire_queued_due(now, now_ms, &mut results)?;
-            self.start_next(Instant::now(), &mut results)?;
+            self.start_next(Instant::now(), &context, &mut results)?;
             return Ok(results);
         }
         let Some(active) = self.active.take() else {
@@ -736,14 +736,14 @@ impl ConsentManager {
                 active.prompt.pending.attempt_id,
                 decision,
                 scopes,
-                context,
+                context.clone(),
             )? {
                 ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
                 ConsentCompletionOutcome::Ignored => {}
             }
         }
         self.expire_queued_due(now, now_ms, &mut results)?;
-        self.start_next(Instant::now(), &mut results)?;
+        self.start_next(Instant::now(), &context, &mut results)?;
         Ok(results)
     }
 
@@ -762,7 +762,6 @@ impl ConsentManager {
             self.expire_active(now_ms, &mut results)?;
         }
         self.expire_queued_due(now, now_ms, &mut results)?;
-        self.start_next(Instant::now(), &mut results)?;
         Ok(results)
     }
 
@@ -842,6 +841,7 @@ impl ConsentManager {
     fn start_next(
         &mut self,
         mut now: Instant,
+        current_context: &TrustedConsentContext,
         results: &mut Vec<ConsentResult>,
     ) -> Result<(), ConsentRegistryError> {
         if self.active.is_some() {
@@ -851,16 +851,19 @@ impl ConsentManager {
             let Some(prompt) = self.queued.pop_front() else {
                 return Ok(());
             };
-            if now < prompt.deadline {
-                break prompt;
+            if now >= prompt.deadline
+                || current_context.now_ms >= prompt.pending.request.expires_at_ms
+            {
+                complete_expired_prompt(&self.registry, &prompt, current_context.now_ms, results)?;
+                now = Instant::now();
+                continue;
             }
-            complete_expired_prompt(
-                &self.registry,
-                &prompt,
-                prompt.pending.request.expires_at_ms,
-                results,
-            )?;
-            now = Instant::now();
+            if !self.backend.is_available() {
+                complete_unavailable_prompt(&self.registry, &prompt, current_context, results)?;
+                now = Instant::now();
+                continue;
+            }
+            break prompt;
         };
         let display_prompt = ConsentPrompt {
             session_id: prompt.pending.request.session_id.clone(),
@@ -970,6 +973,24 @@ fn complete_expired_prompt(
         ConsentDecision::Expired,
         PermissionScopes::new(),
         context,
+    )? {
+        ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
+        ConsentCompletionOutcome::Ignored => {}
+    }
+    Ok(())
+}
+
+fn complete_unavailable_prompt(
+    registry: &ConsentAuthorityRegistry,
+    prompt: &ManagedPrompt,
+    current_context: &TrustedConsentContext,
+    results: &mut Vec<ConsentResult>,
+) -> Result<(), ConsentRegistryError> {
+    match registry.complete(
+        prompt.pending.attempt_id,
+        ConsentDecision::Dismissed,
+        PermissionScopes::new(),
+        current_context.clone(),
     )? {
         ConsentCompletionOutcome::Completed(completed) => results.push(completed.result),
         ConsentCompletionOutcome::Ignored => {}
