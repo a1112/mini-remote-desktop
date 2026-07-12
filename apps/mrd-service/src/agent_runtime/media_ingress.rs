@@ -72,6 +72,14 @@ impl AgentMediaIngress {
         self.queue.len()
     }
 
+    /// Number of queued units for one logical session.
+    pub fn session_len(&self, session_id: &str) -> usize {
+        self.queue
+            .iter()
+            .filter(|unit| unit.session_id == session_id)
+            .count()
+    }
+
     /// Number of rejected units since creation.
     pub fn dropped(&self) -> u64 {
         self.dropped

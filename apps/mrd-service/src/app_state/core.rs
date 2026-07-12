@@ -128,6 +128,19 @@ impl AppState {
         )
     }
 
+    /// Reports whether the next sender turn should use agent or local media.
+    pub(crate) async fn media_source_selection(
+        &self,
+        session_id: &str,
+    ) -> crate::lan_discovery::media_sender::MediaSourceSelection {
+        let depth = self
+            .agent_media_ingress
+            .lock()
+            .await
+            .session_len(session_id);
+        crate::lan_discovery::media_sender::select_media_source(depth)
+    }
+
     /// Drains sender-ready units for one exact logical session.
     pub(crate) async fn drain_agent_media_for_session(
         &self,
