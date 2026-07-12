@@ -6,6 +6,10 @@
 //! retarget another resource.  Platform adapters are added only behind this
 //! registry in the next Task 25 slice.
 
+use crate::capabilities::AgentCapabilities;
+use crate::runtime::AuthorizedCommandExecutor;
+use crate::{capture::CaptureAdapter, render::RenderAdapter};
+use mrd_agent_ipc::{AgentCapability, AgentCommand, AuthorizedCommand, CommandOutcome};
 use mrd_proto::SessionId;
 use std::collections::HashMap;
 
@@ -68,6 +72,131 @@ pub enum MediaResourceMutation {
 #[derive(Debug, Default)]
 pub struct MediaResourceRegistry {
     resources: HashMap<[u8; 16], MediaResource>,
+}
+
+/// Generic authorized media executor that keeps platform work behind ports.
+///
+/// The executor is intentionally generic so capture/render implementations can
+/// be tested with synthetic adapters before binding to DXGI, D3D11, or a
+/// process-bound transport. It never creates a resource before the runtime has
+/// validated the signed [`AuthorizedCommand`].
+pub struct MediaExecutor<C, R> {
+    capture: C,
+    render: R,
+    registry: MediaResourceRegistry,
+}
+
+impl<C, R> MediaExecutor<C, R> {
+    /// Creates an executor with no live resources.
+    pub fn new(capture: C, render: R) -> Self {
+        Self {
+            capture,
+            render,
+            registry: MediaResourceRegistry::new(),
+        }
+    }
+
+    /// Returns the live-resource registry for diagnostics and shutdown tests.
+    pub fn registry(&self) -> &MediaResourceRegistry {
+        &self.registry
+    }
+}
+
+impl<C, R> AuthorizedCommandExecutor for MediaExecutor<C, R>
+where
+    C: CaptureAdapter,
+    R: RenderAdapter,
+{
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::from_implemented([AgentCapability::Capture, AgentCapability::Render])
+    }
+
+    fn execute(&mut self, authorized: AuthorizedCommand) -> CommandOutcome {
+        let session_id = &authorized.grant().claims().session_id;
+        match authorized.command() {
+            AgentCommand::StartCapture {
+                resource_id,
+                display_id,
+            } => {
+                let result = self.registry.start(
+                    *resource_id,
+                    session_id.clone(),
+                    *display_id,
+                    MediaResourceKind::Capture,
+                );
+                if result != MediaResourceMutation::Started {
+                    return CommandOutcome::Rejected;
+                }
+                let resource = self.registry.get(resource_id).expect("started resource");
+                if self.capture.start(resource, session_id) {
+                    CommandOutcome::Completed
+                } else {
+                    let _ = self
+                        .registry
+                        .stop(resource_id, session_id, MediaResourceKind::Capture);
+                    CommandOutcome::Failed
+                }
+            }
+            AgentCommand::StartRender {
+                resource_id,
+                display_id,
+            } => {
+                let result = self.registry.start(
+                    *resource_id,
+                    session_id.clone(),
+                    *display_id,
+                    MediaResourceKind::Render,
+                );
+                if result != MediaResourceMutation::Started {
+                    return CommandOutcome::Rejected;
+                }
+                let resource = self.registry.get(resource_id).expect("started resource");
+                if self.render.start(resource, session_id) {
+                    CommandOutcome::Completed
+                } else {
+                    let _ = self
+                        .registry
+                        .stop(resource_id, session_id, MediaResourceKind::Render);
+                    CommandOutcome::Failed
+                }
+            }
+            AgentCommand::StopCapture { resource_id } => {
+                let Some(resource) = self.registry.get(resource_id) else {
+                    return CommandOutcome::Rejected;
+                };
+                if resource.session_id() != session_id
+                    || resource.kind() != MediaResourceKind::Capture
+                {
+                    return CommandOutcome::Rejected;
+                }
+                if !self.capture.stop(resource_id, session_id) {
+                    return CommandOutcome::Failed;
+                }
+                let _ = self
+                    .registry
+                    .stop(resource_id, session_id, MediaResourceKind::Capture);
+                CommandOutcome::Completed
+            }
+            AgentCommand::StopRender { resource_id } => {
+                let Some(resource) = self.registry.get(resource_id) else {
+                    return CommandOutcome::Rejected;
+                };
+                if resource.session_id() != session_id
+                    || resource.kind() != MediaResourceKind::Render
+                {
+                    return CommandOutcome::Rejected;
+                }
+                if !self.render.stop(resource_id, session_id) {
+                    return CommandOutcome::Failed;
+                }
+                let _ = self
+                    .registry
+                    .stop(resource_id, session_id, MediaResourceKind::Render);
+                CommandOutcome::Completed
+            }
+            _ => CommandOutcome::Rejected,
+        }
+    }
 }
 
 impl MediaResourceRegistry {
