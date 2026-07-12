@@ -2,7 +2,7 @@
 mod windows_process_bootstrap {
     use mrd_agent_ipc::{
         derive_execute_grant_issuer_key_id, derive_registration_public_key,
-        windows_agent_bootstrap_pipe_name, write_agent_bootstrap, AgentBootstrap,
+        windows_agent_bootstrap_pipe_name, write_agent_bootstrap, AgentBootstrap, AgentCapability,
         BoundEd25519RegistrationVerifier, ServiceToAgent, StopAgent, StopReason,
     };
     use mrd_service::agent_runtime::{
@@ -151,6 +151,17 @@ mod windows_process_bootstrap {
         })
         .await
         .expect("agent heartbeat");
+
+        let initial = registry
+            .active_for_session_at(child_process.windows_session_id(), now_ms())
+            .expect("active agent snapshot");
+        assert_eq!(
+            initial.capabilities.capabilities,
+            [AgentCapability::Consent, AgentCapability::Input]
+                .into_iter()
+                .collect()
+        );
+        assert_ne!(initial.capabilities.desktop_epoch, 0);
 
         server
             .send_to_connection(

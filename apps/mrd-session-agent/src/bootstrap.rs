@@ -5,7 +5,10 @@ use crate::runtime::{
     RegistrationSigningError,
 };
 use ed25519_dalek::{Signer, SigningKey};
-use mrd_agent_ipc::{derive_registration_public_key, AgentBootstrapError};
+use mrd_agent_ipc::{
+    derive_registration_public_key, AgentBootstrapError, AuthorizedCommand,
+    BoundEd25519ExecuteGrantVerifier, CommandOutcome,
+};
 use std::sync::Mutex;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -13,10 +16,16 @@ use zeroize::Zeroizing;
 #[cfg(windows)]
 use crate::input::InputResourceManager;
 #[cfg(windows)]
+use crate::native_consent::NativeConsentBackend;
+#[cfg(windows)]
 use crate::runtime::{
     connect_private_endpoint, AgentRuntime, AgentRuntimeConfig, PrivateAgentEndpoint,
     PrivateAgentStream, SessionDescriptor, SystemClock,
 };
+#[cfg(windows)]
+use crate::windows_consent::WindowsConsentSurfaceDriver;
+#[cfg(windows)]
+use crate::windows_desktop::WindowsTrustedDesktopStateSource;
 #[cfg(windows)]
 use mrd_agent_ipc::{
     read_agent_bootstrap, windows_agent_bootstrap_pipe_name, ReceivedAgentBootstrap,
@@ -63,6 +72,10 @@ pub enum AgentLauncherError {
     /// Agent runtime registration or lifecycle failed.
     #[error(transparent)]
     Runtime(#[from] AgentRuntimeError),
+    /// The attended native authority could not be assembled safely.
+    #[cfg(windows)]
+    #[error("attended native authority is unavailable")]
+    AttendedAuthorityUnavailable,
     /// Windows security/process API failed.
     #[cfg(windows)]
     #[error(transparent)]
@@ -73,6 +86,18 @@ pub enum AgentLauncherError {
 pub struct OneShotEd25519Signer {
     key_id: [u8; 32],
     seed: Mutex<Option<Zeroizing<[u8; 32]>>>,
+}
+
+struct EmptyAuthorizedCommandExecutor;
+
+impl crate::runtime::AuthorizedCommandExecutor for EmptyAuthorizedCommandExecutor {
+    fn capabilities(&self) -> crate::capabilities::AgentCapabilities {
+        crate::capabilities::AgentCapabilities::empty()
+    }
+
+    fn execute(&mut self, _command: AuthorizedCommand) -> CommandOutcome {
+        CommandOutcome::Rejected
+    }
 }
 
 impl OneShotEd25519Signer {
@@ -124,6 +149,37 @@ mod tests {
             signer.sign(b"second transcript"),
             Err(RegistrationSigningError::Unavailable)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_verifier_binding_rejects_mismatched_bootstrap_material() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let signer = Ed25519KeyPair::from_seed_unchecked(&[91; 32]).unwrap();
+        let public_key: [u8; 32] = signer.public_key().as_ref().try_into().unwrap();
+        let key_id = mrd_agent_ipc::derive_execute_grant_issuer_key_id(&public_key);
+        assert!(bind_execute_verifier(key_id, public_key).is_ok());
+        assert!(matches!(
+            bind_execute_verifier([7; 32], public_key),
+            Err(AgentLauncherError::Bootstrap(
+                AgentBootstrapError::InvalidExecuteGrantIssuerKey
+            ))
+        ));
+        assert!(matches!(
+            bind_execute_verifier(key_id, [0; 32]),
+            Err(AgentLauncherError::Bootstrap(
+                AgentBootstrapError::InvalidExecuteGrantIssuerKey
+            ))
+        ));
+    }
+
+    #[test]
+    fn empty_production_executor_advertises_no_product_capabilities() {
+        use crate::runtime::AuthorizedCommandExecutor;
+
+        let executor = EmptyAuthorizedCommandExecutor;
+        assert!(executor.capabilities().is_empty());
     }
 }
 
@@ -183,6 +239,20 @@ async fn run_windows_launcher() -> Result<AgentExit, AgentLauncherError> {
         Arc::new(SystemClock),
         Arc::new(launch.signer),
     )?
+    .with_attended_authority(
+        {
+            let (driver, availability) = WindowsConsentSurfaceDriver::start()
+                .map_err(|_| AgentLauncherError::AttendedAuthorityUnavailable)?;
+            Arc::new(NativeConsentBackend::new(driver, availability))
+        },
+        Arc::new(launch.execute_verifier.clone()),
+        Arc::new(
+            WindowsTrustedDesktopStateSource::start(launch.windows_session_id)
+                .map_err(|_| AgentLauncherError::AttendedAuthorityUnavailable)?,
+        ),
+        launch.execute_grant_issuer_key_id,
+        Box::new(EmptyAuthorizedCommandExecutor),
+    )?
     .with_input_backend(Box::new(InputResourceManager::new(
         mrd_input::windows::WindowsSendInputInjector::new(),
     )));
@@ -208,8 +278,9 @@ struct AuthenticatedLaunch {
     service_process_creation_time: u64,
     config: AgentRuntimeConfig,
     signer: OneShotEd25519Signer,
-    _execute_grant_issuer_key_id: [u8; 32],
-    _execute_grant_public_key: [u8; 32],
+    execute_grant_issuer_key_id: [u8; 32],
+    execute_verifier: BoundEd25519ExecuteGrantVerifier,
+    windows_session_id: u32,
     _parent_process: windows_platform::ServiceProcessGuard,
 }
 
@@ -238,6 +309,8 @@ fn build_launch(
     {
         return Err(AgentLauncherError::InvalidTiming);
     }
+    let execute_verifier =
+        bind_execute_verifier(execute_grant_issuer_key_id, execute_grant_public_key)?;
     Ok(AuthenticatedLaunch {
         endpoint: PrivateAgentEndpoint::parse(endpoint)?,
         service_process_id,
@@ -248,10 +321,20 @@ fn build_launch(
             handshake_timeout,
         },
         signer: OneShotEd25519Signer::new(seed, expected_agent_key_id)?,
-        _execute_grant_issuer_key_id: execute_grant_issuer_key_id,
-        _execute_grant_public_key: execute_grant_public_key,
+        execute_grant_issuer_key_id,
+        execute_verifier,
+        windows_session_id: descriptor.windows_session_id,
         _parent_process: descriptor.parent_process,
     })
+}
+
+#[cfg(windows)]
+fn bind_execute_verifier(
+    expected_key_id: [u8; 32],
+    public_key: [u8; 32],
+) -> Result<BoundEd25519ExecuteGrantVerifier, AgentLauncherError> {
+    BoundEd25519ExecuteGrantVerifier::new(expected_key_id, public_key)
+        .map_err(AgentLauncherError::Bootstrap)
 }
 
 #[cfg(windows)]
