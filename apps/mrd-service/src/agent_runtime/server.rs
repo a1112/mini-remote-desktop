@@ -8,8 +8,8 @@ use mrd_agent_ipc::{
     decode_frame, validate_consent_result, write_frame, AgentCapability, AgentHeartbeat,
     AgentStopping, AgentToService, CancelConsent, CommandResult, ConsentCancelReason,
     ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, ExecuteCommand,
-    FrameError, InputAck, InputEventEnvelope, InputRejection, RegisteredAgentIdentity,
-    ServiceToAgent, StopAgent, StopReason, ValidatedConsent,
+    FrameError, InputAck, InputEventEnvelope, InputRejection, MediaAccessUnit,
+    RegisteredAgentIdentity, ServiceToAgent, StopAgent, StopReason, ValidatedConsent,
     AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
     AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
 };
@@ -597,6 +597,7 @@ pub struct AgentServer {
     request_timeout: Duration,
     next_request_token: AtomicU64,
     controls: Arc<Mutex<HashMap<AgentConnectionId, ConnectionControl>>>,
+    media_sink: Arc<Mutex<Option<Arc<dyn Fn(MediaAccessUnit) + Send + Sync>>>>,
 }
 
 impl AgentServer {
@@ -625,6 +626,14 @@ impl AgentServer {
             request_timeout,
             next_request_token: AtomicU64::new(1),
             controls: Arc::new(Mutex::new(HashMap::new())),
+            media_sink: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Installs the service-owned sink for validated agent media units.
+    pub fn set_media_sink(&self, sink: Arc<dyn Fn(MediaAccessUnit) + Send + Sync>) {
+        if let Ok(mut slot) = self.media_sink.lock() {
+            *slot = Some(sink);
         }
     }
 
@@ -1049,10 +1058,13 @@ impl AgentServer {
                         Some(InboundEvent::Message(AgentToService::MediaAccessUnit(unit))) => {
                             // Media delivery is consumed by the LAN transport layer. Keep the
                             // authenticated agent connection alive while that hand-off is wired.
-                            if crate::lan_discovery::media_sender::validate_agent_access_unit(unit)
-                                .is_none()
-                            {
+                            if crate::lan_discovery::media_sender::validate_agent_access_unit(unit.clone()).is_none() {
                                 return Err(AgentServerError::UnsupportedRegisteredMessage);
+                            }
+                            if let Ok(slot) = self.media_sink.lock() {
+                                if let Some(sink) = slot.as_ref() {
+                                    sink(unit);
+                                }
                             }
                         }
                         Some(InboundEvent::Message(AgentToService::ConsentResult(result))) => {
