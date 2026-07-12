@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use mrd_agent_ipc::{MediaAccessUnit, MediaCodec};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::ColorMode;
@@ -14,6 +15,37 @@ pub(super) struct LanSenderEncoder {
     pub(super) codec: LanAccessUnitCodec,
     pub(super) backend: &'static str,
     pub(super) encoder: Box<dyn VideoEncoder + Send>,
+}
+
+/// Validated encoded payload received from the session agent boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AgentEncodedAccessUnit {
+    pub(super) resource_id: [u8; 16],
+    pub(super) sequence: u64,
+    pub(super) timestamp_us: u64,
+    pub(super) codec: LanAccessUnitCodec,
+    pub(super) is_keyframe: bool,
+    pub(super) bytes: Vec<u8>,
+}
+
+/// Converts one authenticated agent message into the sender's transport form.
+pub(super) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentEncodedAccessUnit> {
+    if !unit.is_valid() {
+        return None;
+    }
+    let codec = match unit.codec {
+        MediaCodec::H264 => LanAccessUnitCodec::H264,
+        MediaCodec::Hevc => LanAccessUnitCodec::Hevc,
+        MediaCodec::Av1 => LanAccessUnitCodec::Av1,
+    };
+    Some(AgentEncodedAccessUnit {
+        resource_id: unit.resource_id,
+        sequence: unit.sequence,
+        timestamp_us: unit.timestamp_us,
+        codec,
+        is_keyframe: unit.is_keyframe,
+        bytes: unit.payload,
+    })
 }
 
 pub(super) fn create_lan_encoder(
@@ -292,6 +324,7 @@ pub(super) fn preferred_lan_h264_encoder_backends() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_agent_ipc::AgentEventContext;
 
     #[test]
     fn hevc_sender_h264_fallback_requires_peer_h264_receiver_capability() {
@@ -311,5 +344,29 @@ mod tests {
             LanAccessUnitCodec::H264,
             &["decode.videotoolbox_h264".to_string()],
         ));
+    }
+
+    #[test]
+    fn agent_access_unit_is_mapped_without_copying_raw_desktop_pixels() {
+        let mapped = validate_agent_access_unit(MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 3,
+                desktop_epoch: 2,
+                sequence: 4,
+                observed_at_ms: 5,
+            },
+            resource_id: [9; 16],
+            sequence: 7,
+            timestamp_us: 8,
+            codec: MediaCodec::H264,
+            is_keyframe: true,
+            payload: vec![1, 2, 3],
+        })
+        .expect("valid agent unit");
+        assert_eq!(mapped.codec, LanAccessUnitCodec::H264);
+        assert_eq!(mapped.resource_id, [9; 16]);
+        assert_eq!(mapped.bytes, vec![1, 2, 3]);
     }
 }
