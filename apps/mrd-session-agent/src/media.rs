@@ -9,7 +9,10 @@
 use crate::capabilities::AgentCapabilities;
 use crate::runtime::AuthorizedCommandExecutor;
 use crate::{capture::CaptureAdapter, render::RenderAdapter};
-use mrd_agent_ipc::{AgentCapability, AgentCommand, AuthorizedCommand, CommandOutcome};
+use mrd_agent_ipc::{
+    AgentCapability, AgentCommand, AgentEventContext, AuthorizedCommand, CommandOutcome,
+    MediaAccessUnit, MediaCodec,
+};
 use mrd_proto::SessionId;
 use std::collections::{HashMap, VecDeque};
 
@@ -127,6 +130,24 @@ impl EncodedMediaAccessUnit {
     /// Encoded payload, never raw desktop pixels.
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Converts the bounded agent-owned unit into the authenticated IPC form.
+    pub fn into_ipc(
+        self,
+        context: AgentEventContext,
+        codec: MediaCodec,
+    ) -> Option<MediaAccessUnit> {
+        let unit = MediaAccessUnit {
+            context,
+            resource_id: self.resource_id,
+            sequence: self.sequence,
+            timestamp_us: self.timestamp_us,
+            codec,
+            is_keyframe: self.keyframe,
+            payload: self.payload,
+        };
+        unit.is_valid().then_some(unit)
     }
 }
 
@@ -553,6 +574,29 @@ mod tests {
         assert_eq!(queue.pop().unwrap().sequence(), 1);
         assert_eq!(queue.pop().unwrap().sequence(), 2);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn encoded_unit_maps_to_authenticated_ipc_without_raw_frame_copy() {
+        let unit =
+            EncodedMediaAccessUnit::new([3; 16], session("owner"), 1, 42, true, vec![0x01, 0x02])
+                .unwrap();
+        let ipc = unit
+            .into_ipc(
+                AgentEventContext {
+                    registration_id: [8; 16],
+                    registration_epoch: 1,
+                    windows_session_id: 7,
+                    desktop_epoch: 1,
+                    sequence: 1,
+                    observed_at_ms: 99,
+                },
+                MediaCodec::H264,
+            )
+            .unwrap();
+        assert!(ipc.is_valid());
+        assert_eq!(ipc.payload, vec![0x01, 0x02]);
+        assert_eq!(ipc.resource_id, [3; 16]);
     }
 
     #[test]
