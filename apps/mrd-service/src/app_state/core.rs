@@ -97,6 +97,14 @@ impl AppState {
         self.agent_media_ingress.lock().await.clear();
     }
 
+    /// Drains one bounded batch for the LAN sender scheduler.
+    pub async fn drain_agent_media_batch(
+        &self,
+        limit: usize,
+    ) -> Vec<mrd_agent_ipc::MediaAccessUnit> {
+        self.agent_media_ingress.lock().await.drain(limit)
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
