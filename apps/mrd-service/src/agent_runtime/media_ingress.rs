@@ -122,4 +122,17 @@ mod tests {
         assert_eq!(ingress.len(), 0);
         assert!(ingress.push(unit(1)));
     }
+
+    #[test]
+    fn session_drain_does_not_cross_route_units() {
+        let mut ingress = AgentMediaIngress::new(4).unwrap();
+        let mut second = unit(2);
+        second.session_id = "session-2".to_string();
+        assert!(ingress.push(unit(1)));
+        assert!(ingress.push(second));
+        let first = ingress.drain_session("session-1", 8);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].session_id, "session-1");
+        assert_eq!(ingress.pop().unwrap().session_id, "session-2");
+    }
 }
