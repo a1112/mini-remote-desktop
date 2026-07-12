@@ -241,7 +241,10 @@ use media_render_worker::{
 use media_render_worker::{render_lan_h264_access_unit_frame, render_lan_hevc_access_unit_frame};
 #[cfg(test)]
 use media_sender::preferred_lan_h264_encoder_backends;
-use media_sender::{create_lan_encoder, lan_sender_allows_h264_encoder_fallback, LanSenderEncoder};
+use media_sender::{
+    create_lan_encoder, lan_sender_allows_h264_encoder_fallback, AgentTransportUnit,
+    LanSenderEncoder, SenderMediaTurn,
+};
 use media_sender_telemetry::{
     decode_lan_sender_stats_datagram, send_lan_sender_stats_datagram, LanMediaTestImpairment,
     LanSenderDatagramFrameReport, LanSenderStatsTracker,
@@ -4925,71 +4928,210 @@ async fn send_quic_media_loop(
             high_quality_datagram_supported,
         );
         let requested_codec = LanAccessUnitCodec::from_profile(&profile);
-        let source_id = selected_capture_source_id(&app_state, &session_id).await?;
-        let selected_config_key = lan_capture_config_key(&source_id, &profile);
-        let selected_dynamic_window_fps_config_key =
-            dynamic_window_fps_config_key(&source_id, &profile);
-        let selected_source_is_window = is_windows_window_source_id(&source_id);
-        let selected_window_capture_count = if selected_source_is_window {
-            active_window_capture_count(&app_state).await
-        } else {
-            0
-        };
-        if selected_source_is_window {
-            if dynamic_window_fps_config.as_ref() != Some(&selected_dynamic_window_fps_config_key) {
-                let policy = DynamicWindowFpsPolicy::new(profile.fps);
-                dynamic_window_fps_decision = Some(policy.current());
-                dynamic_window_fps_policy = Some(policy);
-                dynamic_window_fps_config = Some(selected_dynamic_window_fps_config_key);
-            }
-        } else {
-            dynamic_window_fps_config = None;
-            dynamic_window_fps_policy = None;
-            dynamic_window_fps_decision = None;
-        }
-        let capture_repeats_latest_frame = capture
-            .as_ref()
-            .is_some_and(LanSenderFrameCapture::repeats_latest_frame);
-        let frame_interval = if capture_repeats_latest_frame {
-            macos_capture_pump_repeat_frame_interval(&profile)
-        } else if selected_source_is_window {
-            media_frame_interval_for_dynamic_decision(&profile, dynamic_window_fps_decision)
-        } else {
-            media_frame_interval(&profile)
-        };
-        if active_frame_interval != frame_interval {
-            active_frame_interval = frame_interval;
-            next_frame_at = Instant::now() + frame_interval;
-        }
-        let capture_drives_sender_pacing = capture
-            .as_ref()
-            .is_some_and(LanSenderFrameCapture::drives_sender_pacing);
-        if capture_drives_sender_pacing {
-            next_frame_at = Instant::now() + frame_interval;
-        } else if let Some(delay_until) =
-            schedule_next_media_frame(Instant::now(), &mut next_frame_at, frame_interval)
-        {
-            let pacing_started = Instant::now();
-            sleep_until_media_frame(delay_until, &profile).await;
-            sender_stats.record_elapsed("sender.pacing_wait", pacing_started);
-        }
-        if !session_allows_media(&app_state, &session_id).await {
-            return Ok(());
-        }
         let loop_started = Instant::now();
-
-        if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile) {
-            match create_lan_frame_capture(&source_id, &profile).await {
-                Ok(next_capture) => match LanSenderFrameCapture::new(next_capture, &profile) {
-                    Ok(next_sender_capture) => {
-                        capture = Some(next_sender_capture);
-                        encoder = None;
-                        encoder_config = None;
-                        active_capture_config = Some(selected_config_key.clone());
-                        consecutive_frame_errors = 0;
-                        set_session_last_error(&app_state, &session_id, None).await;
+        let sender_turn = match app_state
+            .take_agent_media_turn(&session_id.0, 8, requested_codec)
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                handle_media_sender_frame_error(
+                    &app_state,
+                    &session_id,
+                    "agent-ipc",
+                    &mut consecutive_frame_errors,
+                    format!("rejected session-agent media unit: {error:?}"),
+                    true,
+                )
+                .await?;
+                continue;
+            }
+        };
+        let (access_units, capture_memory_path) =
+            if !media_sender::sender_turn_requires_local_capture(&sender_turn) {
+                let SenderMediaTurn::Agent(access_units) = sender_turn else {
+                    unreachable!("non-local sender turn must contain agent media")
+                };
+                capture = None;
+                encoder = None;
+                encoder_config = None;
+                active_capture_config = None;
+                dynamic_window_fps_config = None;
+                dynamic_window_fps_policy = None;
+                dynamic_window_fps_decision = None;
+                active_frame_interval = Duration::ZERO;
+                {
+                    let mut pipelines = app_state.media_pipelines.lock().await;
+                    pipelines.set_active_encoder(session_id.clone(), "session_agent");
+                    pipelines.set_active_media_profile(
+                        session_id.clone(),
+                        &lan_runtime_media_profile(&profile, requested_codec),
+                    );
+                    pipelines.set_codec_fallback_reason(session_id.clone(), None);
+                }
+                if access_units.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    sender_stats.record_elapsed("sender.agent_wait", loop_started);
+                    continue;
+                }
+                (access_units, "agent_encoded_ipc".to_string())
+            } else {
+                let source_id = selected_capture_source_id(&app_state, &session_id).await?;
+                let selected_config_key = lan_capture_config_key(&source_id, &profile);
+                let selected_dynamic_window_fps_config_key =
+                    dynamic_window_fps_config_key(&source_id, &profile);
+                let selected_source_is_window = is_windows_window_source_id(&source_id);
+                let selected_window_capture_count = if selected_source_is_window {
+                    active_window_capture_count(&app_state).await
+                } else {
+                    0
+                };
+                if selected_source_is_window {
+                    if dynamic_window_fps_config.as_ref()
+                        != Some(&selected_dynamic_window_fps_config_key)
+                    {
+                        let policy = DynamicWindowFpsPolicy::new(profile.fps);
+                        dynamic_window_fps_decision = Some(policy.current());
+                        dynamic_window_fps_policy = Some(policy);
+                        dynamic_window_fps_config = Some(selected_dynamic_window_fps_config_key);
                     }
+                } else {
+                    dynamic_window_fps_config = None;
+                    dynamic_window_fps_policy = None;
+                    dynamic_window_fps_decision = None;
+                }
+                let capture_repeats_latest_frame = capture
+                    .as_ref()
+                    .is_some_and(LanSenderFrameCapture::repeats_latest_frame);
+                let frame_interval = if capture_repeats_latest_frame {
+                    macos_capture_pump_repeat_frame_interval(&profile)
+                } else if selected_source_is_window {
+                    media_frame_interval_for_dynamic_decision(&profile, dynamic_window_fps_decision)
+                } else {
+                    media_frame_interval(&profile)
+                };
+                if active_frame_interval != frame_interval {
+                    active_frame_interval = frame_interval;
+                    next_frame_at = Instant::now() + frame_interval;
+                }
+                let capture_drives_sender_pacing = capture
+                    .as_ref()
+                    .is_some_and(LanSenderFrameCapture::drives_sender_pacing);
+                if capture_drives_sender_pacing {
+                    next_frame_at = Instant::now() + frame_interval;
+                } else if let Some(delay_until) =
+                    schedule_next_media_frame(Instant::now(), &mut next_frame_at, frame_interval)
+                {
+                    let pacing_started = Instant::now();
+                    sleep_until_media_frame(delay_until, &profile).await;
+                    sender_stats.record_elapsed("sender.pacing_wait", pacing_started);
+                }
+                if !session_allows_media(&app_state, &session_id).await {
+                    return Ok(());
+                }
+                if !lan_capture_config_matches(active_capture_config.as_ref(), &source_id, &profile)
+                {
+                    match create_lan_frame_capture(&source_id, &profile).await {
+                        Ok(next_capture) => {
+                            match LanSenderFrameCapture::new(next_capture, &profile) {
+                                Ok(next_sender_capture) => {
+                                    capture = Some(next_sender_capture);
+                                    encoder = None;
+                                    encoder_config = None;
+                                    active_capture_config = Some(selected_config_key.clone());
+                                    consecutive_frame_errors = 0;
+                                    set_session_last_error(&app_state, &session_id, None).await;
+                                }
+                                Err(error) => {
+                                    capture = None;
+                                    encoder = None;
+                                    encoder_config = None;
+                                    active_capture_config = None;
+                                    update_dynamic_window_fps_decision(
+                                        &mut dynamic_window_fps_policy,
+                                        &mut dynamic_window_fps_decision,
+                                        false,
+                                        false,
+                                        selected_window_capture_count,
+                                    );
+                                    handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            &source_id,
+                            &mut consecutive_frame_errors,
+                            format_capture_source_failure(
+                                &source_id,
+                                format!("failed to initialize LAN capture sender: {error:#}"),
+                                is_windows_window_source_id,
+                            ),
+                            selected_source_is_window,
+                        )
+                        .await?;
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            capture = None;
+                            encoder = None;
+                            encoder_config = None;
+                            active_capture_config = None;
+                            update_dynamic_window_fps_decision(
+                                &mut dynamic_window_fps_policy,
+                                &mut dynamic_window_fps_decision,
+                                false,
+                                false,
+                                selected_window_capture_count,
+                            );
+                            handle_media_sender_frame_error(
+                                &app_state,
+                                &session_id,
+                                &source_id,
+                                &mut consecutive_frame_errors,
+                                format_capture_source_failure(
+                                    &source_id,
+                                    format!("failed to create LAN capture source: {error:#}"),
+                                    is_windows_window_source_id,
+                                ),
+                                selected_source_is_window,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
+
+                let capture_started = Instant::now();
+                let raw_frame_result = capture
+                    .as_mut()
+                    .context("LAN media capture was not initialized")
+                    .and_then(|capture| {
+                        capture
+                            .capture_frame()
+                            .context("failed to capture LAN desktop frame")
+                    });
+                sender_stats.record_elapsed("sender.capture", capture_started);
+                let raw_capture = match raw_frame_result {
+                    Ok(capture) => capture,
                     Err(error) => {
+                        let error_source_id = active_capture_config
+                            .as_ref()
+                            .map(|config| config.source_id.as_str())
+                            .unwrap_or("<unknown>")
+                            .to_string();
+                        if selected_source_is_window
+                            && is_winrt_window_capture_no_frame_timeout(&error)
+                        {
+                            if let Some(policy) = dynamic_window_fps_policy.as_mut() {
+                                dynamic_window_fps_decision = Some(policy.update(
+                                    window_dynamic_fps_input_for_capture_error(
+                                        &error,
+                                        selected_window_capture_count,
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
                         capture = None;
                         encoder = None;
                         encoder_config = None;
@@ -5004,261 +5146,201 @@ async fn send_quic_media_loop(
                         handle_media_sender_frame_error(
                             &app_state,
                             &session_id,
-                            &source_id,
+                            &error_source_id,
                             &mut consecutive_frame_errors,
                             format_capture_source_failure(
-                                &source_id,
-                                format!("failed to initialize LAN capture sender: {error:#}"),
+                                &error_source_id,
+                                format!("{error:#}"),
                                 is_windows_window_source_id,
                             ),
-                            selected_source_is_window,
+                            is_windows_window_source_id(&error_source_id),
                         )
                         .await?;
                         continue;
                     }
-                },
-                Err(error) => {
-                    capture = None;
-                    encoder = None;
-                    encoder_config = None;
-                    active_capture_config = None;
-                    update_dynamic_window_fps_decision(
-                        &mut dynamic_window_fps_policy,
-                        &mut dynamic_window_fps_decision,
-                        false,
-                        false,
-                        selected_window_capture_count,
-                    );
-                    handle_media_sender_frame_error(
-                        &app_state,
-                        &session_id,
-                        &source_id,
-                        &mut consecutive_frame_errors,
-                        format_capture_source_failure(
-                            &source_id,
-                            format!("failed to create LAN capture source: {error:#}"),
-                            is_windows_window_source_id,
-                        ),
-                        selected_source_is_window,
-                    )
-                    .await?;
-                    continue;
+                };
+                if raw_capture.repeated_latest_frame {
+                    sender_stats.record_repeated_latest_frame();
                 }
-            }
-        }
-
-        let capture_started = Instant::now();
-        let raw_frame_result = capture
-            .as_mut()
-            .context("LAN media capture was not initialized")
-            .and_then(|capture| {
-                capture
-                    .capture_frame()
-                    .context("failed to capture LAN desktop frame")
-            });
-        sender_stats.record_elapsed("sender.capture", capture_started);
-        let raw_capture = match raw_frame_result {
-            Ok(capture) => capture,
-            Err(error) => {
-                let error_source_id = active_capture_config
-                    .as_ref()
-                    .map(|config| config.source_id.as_str())
-                    .unwrap_or("<unknown>")
-                    .to_string();
-                if selected_source_is_window && is_winrt_window_capture_no_frame_timeout(&error) {
-                    if let Some(policy) = dynamic_window_fps_policy.as_mut() {
-                        dynamic_window_fps_decision =
-                            Some(policy.update(window_dynamic_fps_input_for_capture_error(
-                                &error,
-                                selected_window_capture_count,
-                            )));
-                    }
-                    continue;
+                let raw_frame = raw_capture.frame;
+                sender_stats.record_captured_frame(&raw_frame);
+                let capture_memory_path = captured_frame_memory_path(&raw_frame).to_string();
+                if let Some(policy) = dynamic_window_fps_policy.as_mut() {
+                    dynamic_window_fps_decision = Some(policy.update(
+                        window_dynamic_fps_input_for_captured_frame(selected_window_capture_count),
+                    ));
                 }
-                capture = None;
-                encoder = None;
-                encoder_config = None;
-                active_capture_config = None;
-                update_dynamic_window_fps_decision(
-                    &mut dynamic_window_fps_policy,
-                    &mut dynamic_window_fps_decision,
-                    false,
-                    false,
-                    selected_window_capture_count,
-                );
-                handle_media_sender_frame_error(
-                    &app_state,
-                    &session_id,
-                    &error_source_id,
-                    &mut consecutive_frame_errors,
-                    format_capture_source_failure(
-                        &error_source_id,
-                        format!("{error:#}"),
-                        is_windows_window_source_id,
-                    ),
-                    is_windows_window_source_id(&error_source_id),
-                )
-                .await?;
-                continue;
-            }
-        };
-        if raw_capture.repeated_latest_frame {
-            sender_stats.record_repeated_latest_frame();
-        }
-        let raw_frame = raw_capture.frame;
-        sender_stats.record_captured_frame(&raw_frame);
-        let capture_memory_path = captured_frame_memory_path(&raw_frame).to_string();
-        if let Some(policy) = dynamic_window_fps_policy.as_mut() {
-            dynamic_window_fps_decision = Some(policy.update(
-                window_dynamic_fps_input_for_captured_frame(selected_window_capture_count),
-            ));
-        }
-        let prepare_started = Instant::now();
-        let frame_result = prepare_frame_for_h264(raw_frame, &profile);
-        sender_stats.record_elapsed("sender.prepare", prepare_started);
-        let frame = match frame_result {
-            Ok(frame) => frame,
-            Err(error) => {
-                handle_media_sender_frame_error(
-                    &app_state,
-                    &session_id,
-                    active_capture_config
-                        .as_ref()
-                        .map(|config| config.source_id.as_str())
-                        .unwrap_or("<unknown>"),
-                    &mut consecutive_frame_errors,
-                    format!("failed to prepare captured frame for H.264: {error:#}"),
-                    false,
-                )
-                .await?;
-                continue;
-            }
-        };
-        let expected_encoder_config = (
-            frame.width,
-            frame.height,
-            profile.fps,
-            profile.bitrate_mbps,
-            requested_codec,
-            profile.color_mode.clone(),
-            profile.color_pipeline.clone(),
-            profile.codec_profile.clone(),
-            profile.bit_depth,
-            profile.pixel_format.clone(),
-        );
-        if encoder_config.as_ref() != Some(&expected_encoder_config) {
-            let peer_media_capabilities = app_state
-                .peer_media_capabilities
-                .lock()
-                .await
-                .get(&session_id)
-                .unwrap_or_default();
-            let allow_h264_fallback =
-                lan_sender_allows_h264_encoder_fallback(requested_codec, &peer_media_capabilities);
-            let encoder_create_started = Instant::now();
-            match create_lan_encoder(
-                requested_codec,
-                frame.width,
-                frame.height,
-                profile.fps,
-                profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
-                &profile,
-                allow_h264_fallback,
-            )
-            .context("failed to create LAN media encoder")
-            {
-                Ok(next_encoder) => {
-                    sender_stats.record_elapsed("sender.encoder_create", encoder_create_started);
-                    let runtime_profile = lan_runtime_media_profile(&profile, next_encoder.codec);
-                    let fallback_reason = (next_encoder.codec != requested_codec).then(|| {
-                        format!(
-                            "{} unavailable; fell back to {} via {}",
-                            requested_codec.display_name(),
-                            next_encoder.codec.display_name(),
-                            next_encoder.backend
+                let prepare_started = Instant::now();
+                let frame_result = prepare_frame_for_h264(raw_frame, &profile);
+                sender_stats.record_elapsed("sender.prepare", prepare_started);
+                let frame = match frame_result {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("failed to prepare captured frame for H.264: {error:#}"),
+                            false,
                         )
-                    });
-                    {
-                        let mut pipelines = app_state.media_pipelines.lock().await;
-                        pipelines.set_active_encoder(session_id.clone(), next_encoder.backend);
-                        pipelines.set_active_media_profile(session_id.clone(), &runtime_profile);
-                        pipelines.set_codec_fallback_reason(session_id.clone(), fallback_reason);
+                        .await?;
+                        continue;
                     }
-                    encoder = Some(next_encoder);
-                    encoder_config = Some(expected_encoder_config);
-                }
-                Err(error) => {
-                    sender_stats.record_elapsed("sender.encoder_create", encoder_create_started);
-                    encoder = None;
-                    encoder_config = None;
-                    handle_media_sender_frame_error(
-                        &app_state,
-                        &session_id,
-                        active_capture_config
-                            .as_ref()
-                            .map(|config| config.source_id.as_str())
-                            .unwrap_or("<unknown>"),
-                        &mut consecutive_frame_errors,
-                        format!("{error:#}"),
-                        false,
+                };
+                let expected_encoder_config = (
+                    frame.width,
+                    frame.height,
+                    profile.fps,
+                    profile.bitrate_mbps,
+                    requested_codec,
+                    profile.color_mode.clone(),
+                    profile.color_pipeline.clone(),
+                    profile.codec_profile.clone(),
+                    profile.bit_depth,
+                    profile.pixel_format.clone(),
+                );
+                if encoder_config.as_ref() != Some(&expected_encoder_config) {
+                    let peer_media_capabilities = app_state
+                        .peer_media_capabilities
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .unwrap_or_default();
+                    let allow_h264_fallback = lan_sender_allows_h264_encoder_fallback(
+                        requested_codec,
+                        &peer_media_capabilities,
+                    );
+                    let encoder_create_started = Instant::now();
+                    match create_lan_encoder(
+                        requested_codec,
+                        frame.width,
+                        frame.height,
+                        profile.fps,
+                        profile.bitrate_mbps.saturating_mul(1_000_000).max(1),
+                        &profile,
+                        allow_h264_fallback,
                     )
-                    .await?;
-                    continue;
+                    .context("failed to create LAN media encoder")
+                    {
+                        Ok(next_encoder) => {
+                            sender_stats
+                                .record_elapsed("sender.encoder_create", encoder_create_started);
+                            let runtime_profile =
+                                lan_runtime_media_profile(&profile, next_encoder.codec);
+                            let fallback_reason =
+                                (next_encoder.codec != requested_codec).then(|| {
+                                    format!(
+                                        "{} unavailable; fell back to {} via {}",
+                                        requested_codec.display_name(),
+                                        next_encoder.codec.display_name(),
+                                        next_encoder.backend
+                                    )
+                                });
+                            {
+                                let mut pipelines = app_state.media_pipelines.lock().await;
+                                pipelines
+                                    .set_active_encoder(session_id.clone(), next_encoder.backend);
+                                pipelines
+                                    .set_active_media_profile(session_id.clone(), &runtime_profile);
+                                pipelines
+                                    .set_codec_fallback_reason(session_id.clone(), fallback_reason);
+                            }
+                            encoder = Some(next_encoder);
+                            encoder_config = Some(expected_encoder_config);
+                        }
+                        Err(error) => {
+                            sender_stats
+                                .record_elapsed("sender.encoder_create", encoder_create_started);
+                            encoder = None;
+                            encoder_config = None;
+                            handle_media_sender_frame_error(
+                                &app_state,
+                                &session_id,
+                                active_capture_config
+                                    .as_ref()
+                                    .map(|config| config.source_id.as_str())
+                                    .unwrap_or("<unknown>"),
+                                &mut consecutive_frame_errors,
+                                format!("{error:#}"),
+                                false,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
                 }
-            }
-        }
 
-        if pending_keyframe_request {
-            if let Some(encoder) = encoder.as_mut() {
-                encoder.encoder.request_keyframe();
-                pending_keyframe_request = false;
-            }
-        }
+                if pending_keyframe_request {
+                    if let Some(encoder) = encoder.as_mut() {
+                        encoder.encoder.request_keyframe();
+                        pending_keyframe_request = false;
+                    }
+                }
 
-        let encode_started = Instant::now();
-        let encode_result = encoder
-            .as_mut()
-            .context("LAN media encoder was not initialized")
-            .and_then(|encoder| {
-                encoder
-                    .encoder
-                    .encode(&frame)
-                    .context("failed to encode LAN desktop frame")
-            });
-        sender_stats.record_elapsed("sender.encode", encode_started);
-        let access_units = match encode_result {
-            Ok(access_units) => access_units,
-            Err(error) => {
-                encoder = None;
-                encoder_config = None;
-                handle_media_sender_frame_error(
-                    &app_state,
-                    &session_id,
-                    active_capture_config
-                        .as_ref()
-                        .map(|config| config.source_id.as_str())
-                        .unwrap_or("<unknown>"),
-                    &mut consecutive_frame_errors,
-                    format!("{error:#}"),
-                    false,
-                )
-                .await?;
-                continue;
-            }
-        };
+                let encode_started = Instant::now();
+                let encode_result = encoder
+                    .as_mut()
+                    .context("LAN media encoder was not initialized")
+                    .and_then(|encoder| {
+                        encoder
+                            .encoder
+                            .encode(&frame)
+                            .context("failed to encode LAN desktop frame")
+                    });
+                sender_stats.record_elapsed("sender.encode", encode_started);
+                let encoded_access_units = match encode_result {
+                    Ok(access_units) => access_units,
+                    Err(error) => {
+                        encoder = None;
+                        encoder_config = None;
+                        handle_media_sender_frame_error(
+                            &app_state,
+                            &session_id,
+                            active_capture_config
+                                .as_ref()
+                                .map(|config| config.source_id.as_str())
+                                .unwrap_or("<unknown>"),
+                            &mut consecutive_frame_errors,
+                            format!("{error:#}"),
+                            false,
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                let runtime_codec = encoder
+                    .as_ref()
+                    .map(|encoder| encoder.codec)
+                    .unwrap_or(requested_codec);
+                let access_units = encoded_access_units
+                    .into_iter()
+                    .map(|access_unit| AgentTransportUnit {
+                        codec: runtime_codec,
+                        timestamp_us: access_unit.timestamp_us,
+                        is_keyframe: match runtime_codec {
+                            LanAccessUnitCodec::H264 => h264_access_unit_is_keyframe(
+                                access_unit.is_keyframe,
+                                &access_unit.bytes,
+                            ),
+                            LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => {
+                                access_unit.is_keyframe
+                            }
+                        },
+                        bytes: access_unit.bytes,
+                    })
+                    .collect();
+                (access_units, capture_memory_path)
+            };
 
         for access_unit in access_units {
-            let runtime_codec = encoder
-                .as_ref()
-                .map(|encoder| encoder.codec)
-                .unwrap_or(requested_codec);
+            let runtime_codec = access_unit.codec;
             let runtime_profile = lan_runtime_media_profile(&profile, runtime_codec);
-            let is_keyframe = match runtime_codec {
-                LanAccessUnitCodec::H264 => {
-                    h264_access_unit_is_keyframe(access_unit.is_keyframe, &access_unit.bytes)
-                }
-                LanAccessUnitCodec::Hevc | LanAccessUnitCodec::Av1 => access_unit.is_keyframe,
-            };
+            let is_keyframe = access_unit.is_keyframe;
             sender_stats.record_encoded_access_unit(access_unit.bytes.len(), is_keyframe);
             let fragment_started = Instant::now();
             let fragments = if media_v3_supported {

@@ -87,6 +87,11 @@ pub(crate) enum SenderMediaTurn {
     LocalCapture,
 }
 
+/// Whether this scheduling turn must execute the legacy in-service media path.
+pub(crate) fn sender_turn_requires_local_capture(turn: &SenderMediaTurn) -> bool {
+    matches!(turn, SenderMediaTurn::LocalCapture)
+}
+
 /// Agent media takes precedence whenever a bounded batch is available.
 #[allow(dead_code)]
 pub(crate) fn select_media_source(agent_batch_len: usize) -> MediaSourceSelection {
@@ -104,8 +109,9 @@ pub(crate) fn take_sender_media_turn(
     limit: usize,
     negotiated_codec: LanAccessUnitCodec,
 ) -> Result<SenderMediaTurn, AgentTransportUnitError> {
+    let agent_owns_session = ingress.has_session(session_id);
     let batch = drain_agent_access_units_for_session(ingress, session_id, limit);
-    if batch.is_empty() {
+    if !agent_owns_session {
         Ok(SenderMediaTurn::LocalCapture)
     } else {
         batch
@@ -544,13 +550,9 @@ mod tests {
         assert!(ingress.push(make("target-session", 1)));
         assert!(ingress.push(make("target-session", 2)));
 
-        let turn = take_sender_media_turn(
-            &mut ingress,
-            "target-session",
-            1,
-            LanAccessUnitCodec::H264,
-        )
-        .expect("matching codec");
+        let turn =
+            take_sender_media_turn(&mut ingress, "target-session", 1, LanAccessUnitCodec::H264)
+                .expect("matching codec");
 
         let SenderMediaTurn::Agent(batch) = turn else {
             panic!("queued target-session media must preempt local capture");
@@ -584,12 +586,7 @@ mod tests {
         }));
 
         assert_eq!(
-            take_sender_media_turn(
-                &mut ingress,
-                "target-session",
-                1,
-                LanAccessUnitCodec::H264,
-            ),
+            take_sender_media_turn(&mut ingress, "target-session", 1, LanAccessUnitCodec::H264,),
             Ok(SenderMediaTurn::LocalCapture)
         );
         assert_eq!(ingress.session_len("other-session"), 1);
@@ -635,5 +632,53 @@ mod tests {
                 received: LanAccessUnitCodec::Hevc,
             })
         );
+    }
+
+    #[test]
+    fn an_agent_sender_turn_never_requests_service_local_capture() {
+        let turn = SenderMediaTurn::Agent(vec![AgentTransportUnit {
+            codec: LanAccessUnitCodec::H264,
+            timestamp_us: 1,
+            is_keyframe: true,
+            bytes: vec![1],
+        }]);
+
+        assert!(!sender_turn_requires_local_capture(&turn));
+        assert!(sender_turn_requires_local_capture(
+            &SenderMediaTurn::LocalCapture
+        ));
+    }
+
+    #[test]
+    fn an_established_agent_source_does_not_fall_back_between_access_units() {
+        let mut ingress = AgentMediaIngress::new(2).unwrap();
+        assert!(ingress.push(MediaAccessUnit {
+            context: AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 1,
+                desktop_epoch: 1,
+                sequence: 1,
+                observed_at_ms: 1,
+            },
+            resource_id: [9; 16],
+            session_id: "target-session".to_string(),
+            sequence: 1,
+            timestamp_us: 1,
+            codec: MediaCodec::H264,
+            is_keyframe: true,
+            payload: vec![1],
+        }));
+        let first =
+            take_sender_media_turn(&mut ingress, "target-session", 1, LanAccessUnitCodec::H264)
+                .expect("first agent turn");
+        assert!(matches!(first, SenderMediaTurn::Agent(batch) if batch.len() == 1));
+
+        let between_frames =
+            take_sender_media_turn(&mut ingress, "target-session", 1, LanAccessUnitCodec::H264)
+                .expect("established agent ownership");
+
+        assert_eq!(between_frames, SenderMediaTurn::Agent(Vec::new()));
+        assert!(!sender_turn_requires_local_capture(&between_frames));
     }
 }

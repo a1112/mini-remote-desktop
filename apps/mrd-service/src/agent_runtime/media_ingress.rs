@@ -80,6 +80,11 @@ impl AgentMediaIngress {
             .count()
     }
 
+    /// Whether authenticated media ownership has been established for a session.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.last_sequences.contains_key(session_id)
+    }
+
     /// Number of rejected units since creation.
     pub fn dropped(&self) -> u64 {
         self.dropped
