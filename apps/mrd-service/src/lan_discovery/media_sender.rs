@@ -30,6 +30,22 @@ pub(crate) struct AgentEncodedAccessUnit {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// Selects the active media source while the migration keeps a local fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaSourceSelection {
+    Agent,
+    LocalCapture,
+}
+
+/// Agent media takes precedence whenever a bounded batch is available.
+pub(crate) fn select_media_source(agent_batch_len: usize) -> MediaSourceSelection {
+    if agent_batch_len > 0 {
+        MediaSourceSelection::Agent
+    } else {
+        MediaSourceSelection::LocalCapture
+    }
+}
+
 /// Converts one authenticated agent message into the sender's transport form.
 pub(crate) fn validate_agent_access_unit(unit: MediaAccessUnit) -> Option<AgentEncodedAccessUnit> {
     if !unit.is_valid() {
@@ -426,5 +442,11 @@ mod tests {
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].sequence, 1);
         assert_eq!(ingress.len(), 1);
+    }
+
+    #[test]
+    fn agent_media_source_precedes_local_capture_when_available() {
+        assert_eq!(select_media_source(1), MediaSourceSelection::Agent);
+        assert_eq!(select_media_source(0), MediaSourceSelection::LocalCapture);
     }
 }
