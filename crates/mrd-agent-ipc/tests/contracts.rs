@@ -9,12 +9,12 @@ use mrd_agent_ipc::{
     ExecuteGrantVerifier, ExecutionContext, FileDirection, FrameError, GrantAudience,
     GrantValidationError, InputAck, InputAckOutcome, InputButton, InputEventEnvelope,
     InputEventPayload, InputFailure, InputKey, InputRejection, Locked, MediaAccessUnit, MediaCodec,
-    PeerBinding, RegistrationProofVerifier, RenderAccessUnit, ServiceToAgent, StopAgent,
-    StopReason, StoppingReason, Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS,
+    PeerBinding, RegistrationProofVerifier, RenderAccessUnit, RenderSurfaceTarget, ServiceToAgent,
+    StopAgent, StopReason, StoppingReason, Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS,
     AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
     AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
     AGENT_IPC_PROTOCOL_MINOR, AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
-    AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
+    AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::{PermissionScope, PermissionScopes};
@@ -68,7 +68,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
 #[test]
 fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
     let unit = RenderAccessUnit {
         resource_id: RESOURCE_ID,
         session_id: "session-render".to_string(),
@@ -635,7 +635,7 @@ fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
 fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
     assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
 
     for reason in [
         ConsentCancelReason::CallerAborted,
@@ -695,6 +695,10 @@ fn every_product_command_round_trips_with_an_execute_grant() {
         AgentCommand::StartRender {
             resource_id: RESOURCE_ID,
             display_id: 1,
+            surface: RenderSurfaceTarget {
+                surface_id: "surface-1".into(),
+                window_handle: 0x1234,
+            },
         },
         AgentCommand::StopRender {
             resource_id: RESOURCE_ID,
@@ -708,6 +712,47 @@ fn every_product_command_round_trips_with_an_execute_grant() {
         validate_execute_command(&execute, &execution_context(now_ms), &AcceptAllVerifier)
             .expect("every command has a validator-derived authorization context");
     }
+}
+
+#[test]
+fn start_render_digest_binds_surface_identity_and_native_handle() {
+    assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
+    assert_eq!(AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, 4);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
+    let command = AgentCommand::StartRender {
+        resource_id: RESOURCE_ID,
+        display_id: 1,
+        surface: RenderSurfaceTarget {
+            surface_id: "surface-a".into(),
+            window_handle: 0x1234,
+        },
+    };
+    let mut changed_id = command.clone();
+    let AgentCommand::StartRender { surface, .. } = &mut changed_id else {
+        unreachable!()
+    };
+    surface.surface_id = "surface-b".into();
+    let mut changed_handle = command.clone();
+    let AgentCommand::StartRender { surface, .. } = &mut changed_handle else {
+        unreachable!()
+    };
+    surface.window_handle = 0x5678;
+    assert_ne!(command.digest(), changed_id.digest());
+    assert_ne!(command.digest(), changed_handle.digest());
+
+    let mut invalid = command;
+    let AgentCommand::StartRender { surface, .. } = &mut invalid else {
+        unreachable!()
+    };
+    surface.window_handle = 0;
+    assert_eq!(
+        validate_execute_command(
+            &execute_command(invalid),
+            &execution_context(1_500),
+            &AcceptAllVerifier,
+        ),
+        Err(GrantValidationError::InvalidRenderSurface)
+    );
 }
 
 fn event_context(sequence: u64) -> AgentEventContext {
@@ -1051,7 +1096,7 @@ fn execute_grant_digest_covers_the_command_id() {
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 3);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,

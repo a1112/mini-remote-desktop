@@ -32,6 +32,7 @@ pub struct MediaResource {
     session_id: SessionId,
     display_id: u32,
     kind: MediaResourceKind,
+    render_surface: Option<mrd_agent_ipc::RenderSurfaceTarget>,
 }
 
 impl MediaResource {
@@ -54,6 +55,11 @@ impl MediaResource {
     pub fn kind(&self) -> MediaResourceKind {
         self.kind
     }
+
+    /// Immutable UI-owned presentation target for render resources.
+    pub fn render_surface(&self) -> Option<&mrd_agent_ipc::RenderSurfaceTarget> {
+        self.render_surface.as_ref()
+    }
 }
 
 /// Fail-closed result of a resource mutation.
@@ -69,6 +75,8 @@ pub enum MediaResourceMutation {
     Missing,
     /// The requested cleanup belongs to another session or kind.
     Mismatch,
+    /// Resource kind and render target are inconsistent or invalid.
+    InvalidTarget,
 }
 
 /// Encoded media crossing the agent's bounded process boundary.
@@ -303,6 +311,7 @@ where
                     session_id.clone(),
                     *display_id,
                     MediaResourceKind::Capture,
+                    None,
                 );
                 if result != MediaResourceMutation::Started {
                     return CommandOutcome::Rejected;
@@ -320,12 +329,14 @@ where
             AgentCommand::StartRender {
                 resource_id,
                 display_id,
+                surface,
             } => {
                 let result = self.registry.start(
                     *resource_id,
                     session_id.clone(),
                     *display_id,
                     MediaResourceKind::Render,
+                    Some(surface.clone()),
                 );
                 if result != MediaResourceMutation::Started {
                     return CommandOutcome::Rejected;
@@ -428,7 +439,17 @@ impl MediaResourceRegistry {
         session_id: SessionId,
         display_id: u32,
         kind: MediaResourceKind,
+        render_surface: Option<mrd_agent_ipc::RenderSurfaceTarget>,
     ) -> MediaResourceMutation {
+        let target_valid = match kind {
+            MediaResourceKind::Capture => render_surface.is_none(),
+            MediaResourceKind::Render => render_surface.as_ref().is_some_and(|surface| {
+                !surface.surface_id.is_empty() && surface.window_handle != 0
+            }),
+        };
+        if !target_valid {
+            return MediaResourceMutation::InvalidTarget;
+        }
         if self.resources.contains_key(&resource_id) {
             return MediaResourceMutation::Duplicate;
         }
@@ -439,6 +460,7 @@ impl MediaResourceRegistry {
                 session_id,
                 display_id,
                 kind,
+                render_surface,
             },
         );
         MediaResourceMutation::Started
@@ -545,13 +567,20 @@ mod tests {
         SessionId(name.to_owned())
     }
 
+    fn render_surface(name: &str) -> mrd_agent_ipc::RenderSurfaceTarget {
+        mrd_agent_ipc::RenderSurfaceTarget {
+            surface_id: name.to_owned(),
+            window_handle: 1,
+        }
+    }
+
     #[test]
     fn media_resources_are_bound_to_kind_session_and_display() {
         let mut registry = MediaResourceRegistry::new();
         let id = [1; 16];
         let owner = session("owner");
         assert_eq!(
-            registry.start(id, owner.clone(), 7, MediaResourceKind::Capture),
+            registry.start(id, owner.clone(), 7, MediaResourceKind::Capture, None),
             MediaResourceMutation::Started
         );
         assert_eq!(registry.get(&id).unwrap().display_id(), 7);
@@ -561,12 +590,32 @@ mod tests {
         );
         assert_eq!(registry.get(&id).unwrap().session_id(), &owner);
         assert_eq!(
-            registry.start(id, owner.clone(), 7, MediaResourceKind::Capture),
+            registry.start(id, owner.clone(), 7, MediaResourceKind::Capture, None),
             MediaResourceMutation::Duplicate
         );
         assert_eq!(
             registry.stop(&id, &owner, MediaResourceKind::Render),
             MediaResourceMutation::Mismatch
+        );
+
+        let render_id = [9; 16];
+        let surface = mrd_agent_ipc::RenderSurfaceTarget {
+            surface_id: "surface-9".into(),
+            window_handle: 0x1234,
+        };
+        assert_eq!(
+            registry.start(
+                render_id,
+                owner,
+                8,
+                MediaResourceKind::Render,
+                Some(surface.clone()),
+            ),
+            MediaResourceMutation::Started
+        );
+        assert_eq!(
+            registry.get(&render_id).unwrap().render_surface(),
+            Some(&surface)
         );
     }
 
@@ -577,7 +626,7 @@ mod tests {
         let first = session("first");
         let second = session("second");
         assert_eq!(
-            registry.start(id, first.clone(), 1, MediaResourceKind::Capture),
+            registry.start(id, first.clone(), 1, MediaResourceKind::Capture, None),
             MediaResourceMutation::Started
         );
         assert_eq!(
@@ -591,7 +640,13 @@ mod tests {
         );
         assert!(registry.is_empty());
         assert_eq!(
-            registry.start(id, second.clone(), 2, MediaResourceKind::Render),
+            registry.start(
+                id,
+                second.clone(),
+                2,
+                MediaResourceKind::Render,
+                Some(render_surface("second")),
+            ),
             MediaResourceMutation::Started
         );
         assert_eq!(registry.stop_session(&first), 0);
@@ -665,15 +720,23 @@ mod tests {
             },
         );
         assert_eq!(
-            executor
-                .registry
-                .start(capture_id, owner.clone(), 1, MediaResourceKind::Capture),
+            executor.registry.start(
+                capture_id,
+                owner.clone(),
+                1,
+                MediaResourceKind::Capture,
+                None,
+            ),
             MediaResourceMutation::Started
         );
         assert_eq!(
-            executor
-                .registry
-                .start(render_id, owner.clone(), 2, MediaResourceKind::Render),
+            executor.registry.start(
+                render_id,
+                owner.clone(),
+                2,
+                MediaResourceKind::Render,
+                Some(render_surface("cleanup")),
+            ),
             MediaResourceMutation::Started
         );
         assert_eq!(executor.stop_session(&owner), 1);
@@ -689,9 +752,13 @@ mod tests {
         let resource_id = [6; 16];
         let mut executor = MediaExecutor::new(FakeCapture::default(), FakeRender::default());
         assert_eq!(
-            executor
-                .registry
-                .start(resource_id, owner.clone(), 1, MediaResourceKind::Render,),
+            executor.registry.start(
+                resource_id,
+                owner.clone(),
+                1,
+                MediaResourceKind::Render,
+                Some(render_surface("unit")),
+            ),
             MediaResourceMutation::Started
         );
         let unit = |session_id: &str, sequence| mrd_agent_ipc::RenderAccessUnit {

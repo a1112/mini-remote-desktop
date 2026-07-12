@@ -1629,6 +1629,10 @@ async fn execute_issuer_binds_render_command_to_exact_agent_and_authority() {
     let command = AgentCommand::StartRender {
         resource_id: [78; 16],
         display_id: 1,
+        surface: mrd_agent_ipc::RenderSurfaceTarget {
+            surface_id: "issuer-surface".into(),
+            window_handle: 0x1111,
+        },
     };
     let template = ExecuteGrantTemplate::for_binding(
         &render_binding,
@@ -1922,6 +1926,10 @@ async fn signed_start_render_activates_route_only_after_agent_completion() {
                     template,
                     [92; 16],
                     1,
+                    mrd_agent_ipc::RenderSurfaceTarget {
+                        surface_id: "signed-surface".into(),
+                        window_handle: 0x2222,
+                    },
                     [93; 16],
                     [94; 32],
                 )
@@ -1942,6 +1950,10 @@ async fn signed_start_render_activates_route_only_after_agent_completion() {
         AgentCommand::StartRender {
             resource_id: [92; 16],
             display_id: 1,
+            surface: mrd_agent_ipc::RenderSurfaceTarget {
+                surface_id: "signed-surface".into(),
+                window_handle: 0x2222,
+            },
         }
     );
     assert_eq!(

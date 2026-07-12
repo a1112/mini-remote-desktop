@@ -213,6 +213,9 @@ pub enum GrantValidationError {
     /// StartInput did not request a non-empty subset of the input scopes.
     #[error("start-input scopes must contain only pointer and/or keyboard input")]
     InvalidInputScopes,
+    /// StartRender did not bind a valid product surface and native handle.
+    #[error("start-render surface target is invalid")]
+    InvalidRenderSurface,
     /// The grant belongs to a different registration.
     #[error("execute grant registration does not match")]
     RegistrationMismatch,
@@ -483,6 +486,14 @@ where
             })
         {
             return Err(GrantValidationError::InvalidInputScopes);
+        }
+    }
+    if let AgentCommand::StartRender { surface, .. } = &execute.command {
+        if surface.surface_id.is_empty()
+            || surface.surface_id.len() > crate::protocol::AGENT_IPC_MAX_IDENTIFIER_BYTES
+            || surface.window_handle == 0
+        {
+            return Err(GrantValidationError::InvalidRenderSurface);
         }
     }
 

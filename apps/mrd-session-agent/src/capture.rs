@@ -200,7 +200,7 @@ mod tests {
         let session = SessionId("capture-smoke".to_owned());
         let id = [0x41; 16];
         let mut registry = MediaResourceRegistry::new();
-        registry.start(id, session.clone(), 0, MediaResourceKind::Capture);
+        registry.start(id, session.clone(), 0, MediaResourceKind::Capture, None);
         let resource = registry.get(&id).unwrap();
         let mut adapter = WindowsDxgiOpenH264CaptureAdapter::new();
         assert!(adapter.start(resource, &session));

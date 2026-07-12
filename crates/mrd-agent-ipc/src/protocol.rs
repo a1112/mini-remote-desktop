@@ -749,6 +749,16 @@ pub struct InputAck {
     pub outcome: InputAckOutcome,
 }
 
+/// Native presentation target bound into a StartRender command digest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderSurfaceTarget {
+    /// Stable product surface identity; protects against native handle reuse.
+    pub surface_id: String,
+    /// Nonzero platform-native window/view handle represented as an unsigned integer.
+    pub window_handle: u64,
+}
+
 /// Product operation executed by an interactive-session agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
@@ -822,6 +832,8 @@ pub enum AgentCommand {
         resource_id: [u8; 16],
         /// Platform display identifier.
         display_id: u32,
+        /// Exact UI-owned native presentation surface.
+        surface: RenderSurfaceTarget,
     },
     /// Stop rendering.
     StopRender {
@@ -890,6 +902,7 @@ impl AgentCommand {
             Self::StartRender {
                 resource_id,
                 display_id,
+                ..
             } => (
                 b"start_render".as_slice(),
                 resource_id,
@@ -909,6 +922,11 @@ impl AgentCommand {
         }
         if let Some(direction) = direction {
             context.update(&[direction]);
+        }
+        if let Self::StartRender { surface, .. } = self {
+            context.update(&(surface.surface_id.len() as u64).to_le_bytes());
+            context.update(surface.surface_id.as_bytes());
+            context.update(&surface.window_handle.to_le_bytes());
         }
         if let Self::StartInput { input_scopes, .. } = self {
             let encoded_scopes = serde_json::to_vec(input_scopes)
@@ -1528,10 +1546,10 @@ impl AgentProtocolState {
             RegistrationPhase::Empty => return Err(RegistrationError::RegistrationRequired),
             RegistrationPhase::AwaitingChallenge(register) => register,
             RegistrationPhase::ChallengeIssued { .. } => {
-                return Err(RegistrationError::ChallengeAlreadyIssued)
+                return Err(RegistrationError::ChallengeAlreadyIssued);
             }
             RegistrationPhase::ChallengeConsumed(_) => {
-                return Err(RegistrationError::ChallengeConsumed)
+                return Err(RegistrationError::ChallengeConsumed);
             }
             RegistrationPhase::Registered(_) => return Err(RegistrationError::AlreadyRegistered),
         };

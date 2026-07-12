@@ -13,7 +13,7 @@ use mrd_agent_ipc::{
     ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
     AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
     AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
-    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
+    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -904,10 +904,19 @@ impl AgentServer {
         if binding.required_capability() != required_capability {
             return Err(AgentRouteError::CapabilityBindingMismatch.into());
         }
+        let minimum_protocol_minor = if matches!(
+            &execute.command,
+            mrd_agent_ipc::AgentCommand::StartRender { .. }
+                | mrd_agent_ipc::AgentCommand::StopRender { .. }
+        ) {
+            AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR
+        } else {
+            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR
+        };
         let route = self.registry.resolve_exact_with_minimum_minor(
             binding,
             required_capability,
-            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            minimum_protocol_minor,
             self.clock.now_ms(),
         )?;
         let control = self
@@ -953,7 +962,7 @@ impl AgentServer {
                 key,
                 binding: binding.clone(),
                 required_capability,
-                minimum_protocol_minor: AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+                minimum_protocol_minor,
                 cancellation: cancelled,
             })
             .map_err(|_| AgentRequestError::OutboundUnavailable)?;
@@ -1420,7 +1429,7 @@ async fn wait_for_revoked_stop(
             Some(InboundEvent::Message(_)) => {}
             Some(InboundEvent::Failed(error)) => return Err(error.into()),
             Some(InboundEvent::Disconnected) | None => {
-                return Ok(AgentConnectionExit::Disconnected)
+                return Ok(AgentConnectionExit::Disconnected);
             }
         }
     }

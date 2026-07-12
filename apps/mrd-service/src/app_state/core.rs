@@ -126,6 +126,7 @@ impl AppState {
         template: crate::agent_runtime::ExecuteGrantTemplate,
         resource_id: [u8; 16],
         display_id: u32,
+        surface: mrd_agent_ipc::RenderSurfaceTarget,
         command_id: [u8; 16],
         grant_id: [u8; 32],
     ) -> Result<(), crate::agent_runtime::AgentRenderControlError> {
@@ -147,6 +148,7 @@ impl AppState {
             mrd_agent_ipc::AgentCommand::StartRender {
                 resource_id,
                 display_id,
+                surface,
             },
             template,
         )?;
