@@ -638,9 +638,9 @@ impl AgentServer {
     }
 
     /// Binds the authenticated agent stream to a bounded service ingress queue.
-    pub fn set_media_ingress(&self, ingress: Arc<Mutex<AgentMediaIngress>>) {
+    pub fn set_media_ingress(&self, ingress: Arc<tokio::sync::Mutex<AgentMediaIngress>>) {
         self.set_media_sink(Arc::new(move |unit| {
-            if let Ok(mut queue) = ingress.lock() {
+            if let Ok(mut queue) = ingress.try_lock() {
                 let _ = queue.push(unit);
             }
         }));
