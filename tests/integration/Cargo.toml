@@ -14,7 +14,12 @@ path = "resolution_test.rs"
 
 [dependencies]
 anyhow = "1.0"
+mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
+mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-service = { path = "../../apps/mrd-service" }
+mrd-session = { path = "../../crates/mrd-session" }
+mrd-session-agent = { path = "../../apps/mrd-session-agent" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-decode = { path = "../../crates/mrd-decode" }
 mrd-render = { path = "../../crates/mrd-render" }
@@ -33,6 +38,10 @@ path = "automated_e2e_matrix.rs"
 [[test]]
 name = "threaded_transport_e2e"
 path = "threaded_transport_e2e.rs"
+
+[[test]]
+name = "service_agent_media"
+path = "service_agent_media.rs"
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../crates/mrd-capture-winrt" }

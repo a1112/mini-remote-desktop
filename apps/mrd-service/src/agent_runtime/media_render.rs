@@ -68,6 +68,14 @@ pub enum AgentRenderDispatch {
     Rejected,
 }
 
+impl AgentRenderDispatch {
+    /// Whether the migration may use service-local decode/render for this unit.
+    /// An installed Agent route remains authoritative even when delivery fails.
+    pub fn allows_local_render_fallback(self) -> bool {
+        self == Self::Unavailable
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentRenderRoute<B> {
     binding: B,

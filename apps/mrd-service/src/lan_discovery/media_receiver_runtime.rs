@@ -25,7 +25,7 @@ use std::sync::Arc;
 pub(super) fn receiver_should_use_local_render_fallback(
     dispatch: crate::agent_runtime::AgentRenderDispatch,
 ) -> bool {
-    dispatch == crate::agent_runtime::AgentRenderDispatch::Unavailable
+    dispatch.allows_local_render_fallback()
 }
 
 #[cfg(test)]
