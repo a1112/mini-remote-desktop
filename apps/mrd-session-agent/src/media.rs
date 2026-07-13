@@ -428,6 +428,10 @@ where
         true
     }
 
+    fn render_metrics(&self) -> Vec<crate::render::RenderAdapterMetrics> {
+        self.render.metrics()
+    }
+
     fn revoke_session(&mut self, session_id: &SessionId) -> bool {
         self.stop_session(session_id);
         self.registry

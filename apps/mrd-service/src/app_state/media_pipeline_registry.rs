@@ -1,6 +1,7 @@
 use mrd_ipc::{
-    AttachedRenderSurface, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    AgentRenderBoundarySnapshot, AttachedRenderSurface, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot,
 };
 use mrd_proto::SessionId;
 #[cfg(any(windows, target_os = "macos"))]
@@ -52,6 +53,7 @@ struct MediaPipelineState {
     display_refresh_hz: Option<u32>,
     render_thread_priority: Option<String>,
     render_waitable_timeouts: u64,
+    agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -296,6 +298,33 @@ impl MediaPipelineRegistry {
             .saturating_add(packet_delta);
     }
 
+    /// Apply the latest authenticated cumulative Session Agent render counters.
+    pub fn set_agent_render_boundary(
+        &mut self,
+        session_id: SessionId,
+        metrics: mrd_agent_ipc::RenderBoundaryMetrics,
+    ) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.active_decoder = Some(metrics.decoder_backend.clone());
+        state.active_renderer = Some("session_agent_d3d11".to_owned());
+        state.queue_depth = u32::try_from(
+            metrics
+                .enqueued_units
+                .saturating_sub(metrics.decoded_frames),
+        )
+        .unwrap_or(u32::MAX);
+        state.render_presented_frames = metrics.presented_frames;
+        state.render_queue_replacements = metrics.queue_replacements;
+        state.agent_render_boundary = Some(AgentRenderBoundarySnapshot {
+            resource_id: metrics.resource_id,
+            decoder_backend: metrics.decoder_backend,
+            enqueued_units: metrics.enqueued_units,
+            queue_replacements: metrics.queue_replacements,
+            decoded_frames: metrics.decoded_frames,
+            presented_frames: metrics.presented_frames,
+        });
+    }
+
     pub fn cumulative_sender_packets_sent(&self) -> u64 {
         self.cumulative_sender_packets_sent
     }
@@ -360,6 +389,7 @@ impl MediaPipelineRegistry {
             display_refresh_hz: state.and_then(|state| state.display_refresh_hz),
             render_thread_priority: state.and_then(|state| state.render_thread_priority.clone()),
             render_waitable_timeouts: state.map_or(0, |state| state.render_waitable_timeouts),
+            agent_render_boundary: state.and_then(|state| state.agent_render_boundary.clone()),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             sender_transport: state

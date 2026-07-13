@@ -12,9 +12,9 @@ use mrd_agent_ipc::{
     AgentRegistered, AgentStopping, AgentToService, AuthorizedCommand, CancelConsent,
     CommandOutcome, CommandResult, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
     ExecuteGrantVerifier, ExecutionContext, FrameError, InputAck, InputAckOutcome, PeerBinding,
-    RegisteredAgentIdentity, ServiceToAgent, StoppingReason, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
-    AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
+    RegisteredAgentIdentity, RenderBoundaryMetrics, ServiceToAgent, StoppingReason,
+    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AGENT_IPC_PROTOCOL_MINOR, AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::SessionId;
 #[cfg(unix)]
@@ -596,6 +596,10 @@ pub trait AuthorizedCommandExecutor: Send {
     fn render_access_unit(&mut self, _unit: mrd_agent_ipc::RenderAccessUnit) -> bool {
         false
     }
+    /// Snapshot cumulative metrics for live render resources.
+    fn render_metrics(&self) -> Vec<crate::render::RenderAdapterMetrics> {
+        Vec::new()
+    }
     /// Revoke every product resource owned by one invalidated logical session.
     fn revoke_session(&mut self, _session_id: &SessionId) -> bool {
         true
@@ -665,6 +669,9 @@ pub enum AgentRuntimeError {
     /// An encoded frame did not match a live authorized render resource.
     #[error("render access unit is not authorized for a live resource")]
     InvalidRenderAccessUnit,
+    /// A render adapter returned malformed cumulative metrics.
+    #[error("render boundary metrics are invalid")]
+    InvalidRenderMetrics,
     /// The bounded post-registration writer stopped or could not accept output.
     #[error("agent outbound channel is unavailable")]
     OutboundUnavailable,
@@ -1087,6 +1094,27 @@ impl AgentRuntime {
                     let desktop = self.current_desktop_state()?;
                     let context = self.next_event_context(&identity, desktop)?;
                     outbound.enqueue(AgentToService::AgentHeartbeat(AgentHeartbeat { context }))?;
+                    let render_metrics = self
+                        .authority
+                        .as_ref()
+                        .map(|authority| authority.executor.render_metrics())
+                        .unwrap_or_default();
+                    for metrics in render_metrics {
+                        let message = RenderBoundaryMetrics {
+                            context: self.next_event_context(&identity, desktop)?,
+                            resource_id: metrics.resource_id,
+                            session_id: metrics.session_id.0,
+                            decoder_backend: metrics.decoder_backend,
+                            enqueued_units: metrics.enqueued_units,
+                            queue_replacements: metrics.queue_replacements,
+                            decoded_frames: metrics.decoded_frames,
+                            presented_frames: metrics.presented_frames,
+                        };
+                        if !message.is_valid() {
+                            return Err(AgentRuntimeError::InvalidRenderMetrics);
+                        }
+                        outbound.enqueue(AgentToService::RenderBoundaryMetrics(message))?;
+                    }
                 }
                 RegisteredLoopEvent::WriterTerminal => {
                     return Err(AgentRuntimeError::OutboundUnavailable);

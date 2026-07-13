@@ -1190,6 +1190,47 @@ pub struct AgentHeartbeat {
     pub context: AgentEventContext,
 }
 
+/// Cumulative counters for one live Agent-owned render resource.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RenderBoundaryMetrics {
+    /// Authenticated lifecycle context for this observation.
+    pub context: AgentEventContext,
+    /// Exact authorized render resource.
+    pub resource_id: [u8; 16],
+    /// Logical product session owning the resource.
+    pub session_id: String,
+    /// Decoder backend selected by the worker.
+    pub decoder_backend: String,
+    /// Encoded units admitted from IPC.
+    pub enqueued_units: u64,
+    /// Disposable queued interframes replaced by newer work.
+    pub queue_replacements: u64,
+    /// Frames emitted by the decoder.
+    pub decoded_frames: u64,
+    /// Frames accepted by the renderer.
+    pub presented_frames: u64,
+}
+
+impl RenderBoundaryMetrics {
+    /// Validate identifiers and monotonic cumulative counter relationships.
+    pub fn is_valid(&self) -> bool {
+        self.context.registration_id != [0; 16]
+            && self.context.registration_epoch > 0
+            && self.context.windows_session_id > 0
+            && self.context.desktop_epoch > 0
+            && self.context.sequence > 0
+            && self.resource_id != [0; 16]
+            && !self.session_id.is_empty()
+            && self.session_id.len() <= AGENT_IPC_MAX_IDENTIFIER_BYTES
+            && !self.decoder_backend.is_empty()
+            && self.decoder_backend.len() <= AGENT_IPC_MAX_IDENTIFIER_BYTES
+            && self.decoded_frames <= self.enqueued_units
+            && self.presented_frames <= self.decoded_frames
+            && self.queue_replacements <= self.enqueued_units
+    }
+}
+
 /// Codec carried by an encoded media access unit.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1357,6 +1398,8 @@ pub enum AgentToService {
     AgentCrashed(AgentCrashed),
     /// Report liveness.
     AgentHeartbeat(AgentHeartbeat),
+    /// Report cumulative render-boundary counters.
+    RenderBoundaryMetrics(RenderBoundaryMetrics),
     /// Report command completion.
     CommandResult(CommandResult),
     /// Acknowledge one resource-bound input event.

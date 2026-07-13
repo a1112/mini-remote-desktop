@@ -1,6 +1,9 @@
 //! Windows decoder and D3D11 presentation adapter.
 
-use crate::{media::MediaResource, render::RenderAdapter};
+use crate::{
+    media::MediaResource,
+    render::{RenderAdapter, RenderAdapterMetrics},
+};
 use mrd_agent_ipc::{MediaCodec, RenderAccessUnit};
 use mrd_pipeline_core::{DecodedFrame, DecodedFrameData, PipelineError, VideoDecoder};
 use mrd_proto::SessionId;
@@ -421,6 +424,21 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
         self.queue_capacity != 0
             && self.decoder_factory.is_available()
             && self.renderer_factory.is_available()
+    }
+
+    fn metrics(&self) -> Vec<RenderAdapterMetrics> {
+        self.workers
+            .iter()
+            .map(|(resource_id, worker)| RenderAdapterMetrics {
+                resource_id: *resource_id,
+                session_id: worker.session_id.clone(),
+                decoder_backend: worker.decoder_backend.to_owned(),
+                enqueued_units: worker.metrics.enqueued_units.load(Ordering::Acquire),
+                queue_replacements: worker.metrics.queue_replacements.load(Ordering::Acquire),
+                decoded_frames: worker.metrics.decoded_frames.load(Ordering::Acquire),
+                presented_frames: worker.metrics.presented_frames.load(Ordering::Acquire),
+            })
+            .collect()
     }
 
     fn start(&mut self, resource: &MediaResource, session_id: &SessionId) -> bool {

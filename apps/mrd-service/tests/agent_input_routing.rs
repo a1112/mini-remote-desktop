@@ -5,7 +5,7 @@ use mrd_agent_ipc::{
     ConsentRequest, ConsentResult, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims,
     ExecuteGrantVerifier, GrantAudience, InputAck, InputAckOutcome, InputEventEnvelope,
     InputEventPayload, MediaCodec, PeerBinding, RegistrationProofVerifier, RenderAccessUnit,
-    ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
+    RenderBoundaryMetrics, ServiceToAgent, AGENT_IPC_PROTOCOL_MINOR,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_service::agent_runtime::{
@@ -1815,6 +1815,56 @@ async fn render_access_unit_routes_only_to_the_exact_render_binding() {
             .message,
         ServiceToAgent::RenderAccessUnit(unit)
     );
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn authenticated_render_boundary_metrics_are_retained_for_product_snapshots() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_secs(1));
+    let mut agent = ConnectedAgent::connect_to(
+        registry,
+        Arc::clone(&server),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input, AgentCapability::Render]
+            .into_iter()
+            .collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    let session_id = SessionId("metrics-session".into());
+    let metrics = RenderBoundaryMetrics {
+        context: mrd_agent_ipc::AgentEventContext {
+            registration_id: agent.identity.registration_id,
+            registration_epoch: agent.identity.registration_epoch,
+            windows_session_id: WINDOWS_SESSION_ID,
+            desktop_epoch: 1,
+            sequence: 1,
+            observed_at_ms: NOW_MS,
+        },
+        resource_id: [31; 16],
+        session_id: session_id.0.clone(),
+        decoder_backend: "h264_software".into(),
+        enqueued_units: 10,
+        queue_replacements: 1,
+        decoded_frames: 9,
+        presented_frames: 8,
+    };
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::RenderBoundaryMetrics(metrics.clone()),
+    )
+    .await
+    .unwrap();
+    for _ in 0..20 {
+        if server.render_boundary_metrics(&session_id).is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(server.render_boundary_metrics(&session_id), Some(metrics));
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
 }
 

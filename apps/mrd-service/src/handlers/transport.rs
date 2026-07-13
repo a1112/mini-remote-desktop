@@ -237,6 +237,7 @@ pub async fn media_pipeline_snapshot(
     app_state: &Arc<AppState>,
     session_id: SessionId,
 ) -> IpcResponse {
+    app_state.sync_agent_render_boundary(&session_id).await;
     let snapshot = app_state.media_pipelines.lock().await.snapshot(&session_id);
     IpcResponse::MediaPipelineSnapshot { snapshot }
 }

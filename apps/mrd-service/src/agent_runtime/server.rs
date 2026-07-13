@@ -9,11 +9,12 @@ use mrd_agent_ipc::{
     AgentStopping, AgentToService, CancelConsent, CommandResult, ConsentCancelReason,
     ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, ExecuteCommand,
     FrameError, InputAck, InputEventEnvelope, InputRejection, MediaAccessUnit,
-    RegisteredAgentIdentity, RenderAccessUnit, ServiceToAgent, StopAgent, StopReason,
-    ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
+    RegisteredAgentIdentity, RenderAccessUnit, RenderBoundaryMetrics, ServiceToAgent, StopAgent,
+    StopReason, ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
     AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
     AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
-    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
+    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR,
+    AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -603,6 +604,7 @@ pub struct AgentServer {
     next_request_token: AtomicU64,
     controls: Arc<Mutex<HashMap<AgentConnectionId, ConnectionControl>>>,
     media_sink: Arc<Mutex<Option<Arc<dyn Fn(MediaAccessUnit) + Send + Sync>>>>,
+    render_metrics: Arc<Mutex<HashMap<SessionId, RenderBoundaryMetrics>>>,
 }
 
 impl AgentServer {
@@ -632,6 +634,7 @@ impl AgentServer {
             next_request_token: AtomicU64::new(1),
             controls: Arc::new(Mutex::new(HashMap::new())),
             media_sink: Arc::new(Mutex::new(None)),
+            render_metrics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -649,6 +652,18 @@ impl AgentServer {
                 let _ = queue.push(unit);
             }
         }));
+    }
+
+    /// Return the latest authenticated cumulative metrics for one logical session.
+    pub fn render_boundary_metrics(&self, session_id: &SessionId) -> Option<RenderBoundaryMetrics> {
+        self.render_metrics.lock().ok()?.get(session_id).cloned()
+    }
+
+    /// Remove stale metrics when the exact logical render route is revoked.
+    pub fn clear_render_boundary_metrics(&self, session_id: &SessionId) {
+        if let Ok(mut metrics) = self.render_metrics.lock() {
+            metrics.remove(session_id);
+        }
     }
 
     /// Route one bounded encoded unit to the exact persisted render binding.
@@ -1122,6 +1137,33 @@ impl AgentServer {
                                     sink(unit);
                                 }
                             }
+                        }
+                        Some(InboundEvent::Message(AgentToService::RenderBoundaryMetrics(metrics))) => {
+                            if identity.protocol_minor < AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR
+                                || !metrics.is_valid()
+                            {
+                                return Err(AgentServerError::UnsupportedRegisteredMessage);
+                            }
+                            self.registry.record_heartbeat(
+                                connection_id,
+                                AgentHeartbeat { context: metrics.context.clone() },
+                                self.clock.now_ms(),
+                            )?;
+                            let session_id = SessionId(metrics.session_id.clone());
+                            let Ok(mut snapshots) = self.render_metrics.lock() else {
+                                return Err(AgentServerError::UnsupportedRegisteredMessage);
+                            };
+                            if let Some(previous) = snapshots.get(&session_id) {
+                                let same_resource = previous.resource_id == metrics.resource_id;
+                                let regressed = metrics.enqueued_units < previous.enqueued_units
+                                    || metrics.queue_replacements < previous.queue_replacements
+                                    || metrics.decoded_frames < previous.decoded_frames
+                                    || metrics.presented_frames < previous.presented_frames;
+                                if same_resource && regressed {
+                                    return Err(AgentServerError::UnsupportedRegisteredMessage);
+                                }
+                            }
+                            snapshots.insert(session_id, metrics);
                         }
                         Some(InboundEvent::Message(AgentToService::ConsentResult(result))) => {
                             control.resolve_consent_result(result, self.clock.now_ms());

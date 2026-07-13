@@ -12,8 +12,9 @@ pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 /// consent, execute, and input request/response pair. Minor version 2 adds
 /// exact-request consent cancellation cleanup. Minor version 3 adds bounded
 /// service-to-agent render access units. Minor version 4 binds StartRender to
-/// an immutable product surface id and native presentation handle.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 4;
+/// an immutable product surface id and native presentation handle. Minor 5
+/// adds authenticated render-boundary counters from the session agent.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 5;
 /// Minimum negotiated minor version that supports correlated request tokens.
 pub const AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR: u16 = 1;
 /// Minimum negotiated minor version that supports consent cancellation cleanup.
@@ -22,6 +23,8 @@ pub const AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR: u16 = 2;
 pub const AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR: u16 = 3;
 /// Minimum negotiated minor version that supports surface-bound StartRender.
 pub const AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR: u16 = 4;
+/// Minimum negotiated minor version that supports render-boundary metrics.
+pub const AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR: u16 = 5;
 /// Maximum JSON payload carried by one control frame.
 pub const AGENT_IPC_MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// Bytes in the length-and-version frame header.

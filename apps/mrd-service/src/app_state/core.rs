@@ -216,6 +216,7 @@ impl AppState {
         };
         let result = server.request_execute(&binding, execute).await;
         self.agent_render_routes.lock().await.remove(session_id);
+        server.clear_render_boundary_metrics(session_id);
         match result {
             Ok(mrd_agent_ipc::CommandResult {
                 outcome:
@@ -230,11 +231,39 @@ impl AppState {
 
     /// Revoke one logical session's render route without implicit retargeting.
     pub async fn remove_agent_render_route(&self, session_id: &mrd_proto::SessionId) -> bool {
-        self.agent_render_routes
+        let removed = self
+            .agent_render_routes
             .lock()
             .await
             .remove(session_id)
-            .is_some()
+            .is_some();
+        if removed {
+            if let Some(server) = self
+                .agent_media_server
+                .read()
+                .ok()
+                .and_then(|slot| slot.clone())
+            {
+                server.clear_render_boundary_metrics(session_id);
+            }
+        }
+        removed
+    }
+
+    /// Merge the latest authenticated Agent render counters into the product snapshot.
+    pub async fn sync_agent_render_boundary(&self, session_id: &mrd_proto::SessionId) {
+        let metrics = self
+            .agent_media_server
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .and_then(|server| server.render_boundary_metrics(session_id));
+        if let Some(metrics) = metrics {
+            self.media_pipelines
+                .lock()
+                .await
+                .set_agent_render_boundary(session_id.clone(), metrics);
+        }
     }
 
     /// Validate and deliver one encoded receiver unit to its exact session agent.

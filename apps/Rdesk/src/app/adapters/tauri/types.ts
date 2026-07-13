@@ -1328,6 +1328,15 @@ export interface MediaSenderTransportSnapshot {
   reliable_frames_sent: number;
 }
 
+export interface AgentRenderBoundarySnapshot {
+  resource_id: number[];
+  decoder_backend: string;
+  enqueued_units: number;
+  queue_replacements: number;
+  decoded_frames: number;
+  presented_frames: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
@@ -1363,6 +1372,7 @@ export interface MediaPipelineSnapshot {
   display_refresh_hz?: number | null;
   render_thread_priority?: string | null;
   render_waitable_timeouts?: number;
+  agent_render_boundary?: AgentRenderBoundarySnapshot | null;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
   sender_transport?: MediaSenderTransportSnapshot | null;

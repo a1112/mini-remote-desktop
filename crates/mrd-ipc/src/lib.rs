@@ -312,6 +312,17 @@ mod wire {
         pub queue_depth: u32,
     }
 
+    /// Authenticated cumulative metrics from an Agent-owned render worker.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AgentRenderBoundarySnapshot {
+        pub resource_id: [u8; 16],
+        pub decoder_backend: String,
+        pub enqueued_units: u64,
+        pub queue_replacements: u64,
+        pub decoded_frames: u64,
+        pub presented_frames: u64,
+    }
+
     /// Runtime state for a session media pipeline.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct MediaPipelineSnapshot {
@@ -400,6 +411,9 @@ mod wire {
         pub render_thread_priority: Option<String>,
         #[serde(default)]
         pub render_waitable_timeouts: u64,
+        /// Latest authenticated Session Agent render counters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
         pub stage_metrics: Vec<MediaStageMetrics>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub test_impairment: Option<MediaTestImpairmentSnapshot>,

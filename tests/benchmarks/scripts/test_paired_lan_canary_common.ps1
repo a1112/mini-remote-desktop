@@ -957,6 +957,11 @@ Assert-Equal $downgradedProfileArtifact.media.selected_profile "1280x720@60-h264
 Assert-True $downgradedProfileArtifact.media.profile_downgraded "Degraded probe is preserved in the quality artifact"
 
 $localDualScript = Get-Content -Path (Join-Path $scriptDir "run_local_dual_process_lan_canary.ps1") -Raw
+Assert-True ($localDualScript -match 'agent_render_boundary') "Local dual canary exports Agent render boundary evidence"
+Assert-True ($localDualScript -match 'enqueued_units') "Local dual canary exports Agent enqueue count"
+Assert-True ($localDualScript -match 'decoded_frames') "Local dual canary exports Agent decode count"
+Assert-True ($localDualScript -match 'presented_frames') "Local dual canary exports Agent present count"
+Assert-True ($localDualScript -match 'queue_replacements') "Local dual canary exports Agent replacement count"
 $pairedLanScript = Get-Content -Path (Join-Path $scriptDir "run_paired_lan_canary.ps1") -Raw
 $secureNegativeScript = Get-Content -Path (Join-Path $scriptDir "run_secure_lan_negative.ps1") -Raw
 Assert-True ($pairedLanScript -match 'ValidateSet\("h264", "hevc", "av1"\)') "Paired LAN canary accepts AV1 codec selection"

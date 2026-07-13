@@ -9,11 +9,12 @@ use mrd_agent_ipc::{
     ExecuteGrantVerifier, ExecutionContext, FileDirection, FrameError, GrantAudience,
     GrantValidationError, InputAck, InputAckOutcome, InputButton, InputEventEnvelope,
     InputEventPayload, InputFailure, InputKey, InputRejection, Locked, MediaAccessUnit, MediaCodec,
-    PeerBinding, RegistrationProofVerifier, RenderAccessUnit, RenderSurfaceTarget, ServiceToAgent,
-    StopAgent, StopReason, StoppingReason, Unlocked, AGENT_CONSENT_MAX_LIFETIME_MS,
-    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
-    AGENT_IPC_PROTOCOL_MINOR, AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
+    PeerBinding, RegistrationProofVerifier, RenderAccessUnit, RenderBoundaryMetrics,
+    RenderSurfaceTarget, ServiceToAgent, StopAgent, StopReason, StoppingReason, Unlocked,
+    AGENT_CONSENT_MAX_LIFETIME_MS, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
+    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES,
+    AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR,
     AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::{DeviceId, SessionId};
@@ -68,7 +69,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
 #[test]
 fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
     let unit = RenderAccessUnit {
         resource_id: RESOURCE_ID,
         session_id: "session-render".to_string(),
@@ -88,6 +89,31 @@ fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
     let mut empty_payload = unit;
     empty_payload.payload.clear();
     assert!(!empty_payload.is_valid());
+}
+
+#[test]
+fn render_boundary_metrics_round_trip_with_protocol_minor_five() {
+    assert_eq!(AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    let metrics = RenderBoundaryMetrics {
+        context: AgentEventContext {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            windows_session_id: 7,
+            desktop_epoch: 2,
+            sequence: 4,
+            observed_at_ms: 5,
+        },
+        resource_id: RESOURCE_ID,
+        session_id: "session-render".into(),
+        decoder_backend: "nvdec_d3d11_shared".into(),
+        enqueued_units: 100,
+        queue_replacements: 2,
+        decoded_frames: 98,
+        presented_frames: 97,
+    };
+    assert!(metrics.is_valid());
+    round_trip(&AgentToService::RenderBoundaryMetrics(metrics));
 }
 const OTHER_GRANT_ID: [u8; 32] = [18; 32];
 
@@ -635,7 +661,7 @@ fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
 fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
     assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
 
     for reason in [
         ConsentCancelReason::CallerAborted,
@@ -718,7 +744,7 @@ fn every_product_command_round_trips_with_an_execute_grant() {
 fn start_render_digest_binds_surface_identity_and_native_handle() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
     assert_eq!(AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, 4);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
     let command = AgentCommand::StartRender {
         resource_id: RESOURCE_ID,
         display_id: 1,
@@ -1096,7 +1122,7 @@ fn execute_grant_digest_covers_the_command_id() {
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 4);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
