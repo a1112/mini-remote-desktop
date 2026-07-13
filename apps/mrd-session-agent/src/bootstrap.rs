@@ -6,8 +6,7 @@ use crate::runtime::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use mrd_agent_ipc::{
-    derive_registration_public_key, AgentBootstrapError, AuthorizedCommand,
-    BoundEd25519ExecuteGrantVerifier, CommandOutcome,
+    derive_registration_public_key, AgentBootstrapError, BoundEd25519ExecuteGrantVerifier,
 };
 use std::sync::Mutex;
 use thiserror::Error;
@@ -88,18 +87,6 @@ pub struct OneShotEd25519Signer {
     seed: Mutex<Option<Zeroizing<[u8; 32]>>>,
 }
 
-struct EmptyAuthorizedCommandExecutor;
-
-impl crate::runtime::AuthorizedCommandExecutor for EmptyAuthorizedCommandExecutor {
-    fn capabilities(&self) -> crate::capabilities::AgentCapabilities {
-        crate::capabilities::AgentCapabilities::empty()
-    }
-
-    fn execute(&mut self, _command: AuthorizedCommand) -> CommandOutcome {
-        CommandOutcome::Rejected
-    }
-}
-
 impl OneShotEd25519Signer {
     /// Bind a zeroizing seed to the key id authenticated in the bootstrap.
     pub fn new(
@@ -174,13 +161,29 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn empty_production_executor_advertises_no_product_capabilities() {
+    fn production_media_executor_never_claims_unassembled_capture() {
         use crate::runtime::AuthorizedCommandExecutor;
+        use mrd_agent_ipc::AgentCapability;
 
-        let executor = EmptyAuthorizedCommandExecutor;
-        assert!(executor.capabilities().is_empty());
+        let executor = build_windows_media_executor();
+        assert!(!executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Capture));
     }
+}
+
+#[cfg(windows)]
+fn build_windows_media_executor() -> crate::media::MediaExecutor<
+    crate::capture::UnavailableCaptureAdapter,
+    crate::windows_render::WindowsRenderAdapter,
+> {
+    crate::media::MediaExecutor::new(
+        crate::capture::UnavailableCaptureAdapter,
+        crate::windows_render::WindowsRenderAdapter::new(),
+    )
 }
 
 /// Start the production agent only from an authenticated launcher bootstrap.
@@ -251,7 +254,7 @@ async fn run_windows_launcher() -> Result<AgentExit, AgentLauncherError> {
                 .map_err(|_| AgentLauncherError::AttendedAuthorityUnavailable)?,
         ),
         launch.execute_grant_issuer_key_id,
-        Box::new(EmptyAuthorizedCommandExecutor),
+        Box::new(build_windows_media_executor()),
     )?
     .with_input_backend(Box::new(InputResourceManager::new(
         mrd_input::windows::WindowsSendInputInjector::new(),

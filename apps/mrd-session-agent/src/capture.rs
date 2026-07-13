@@ -18,6 +18,25 @@ pub trait CaptureAdapter: Send {
     fn stop(&mut self, resource_id: &[u8; 16], session_id: &SessionId) -> bool;
 }
 
+/// Explicit placeholder used by production assembly until a capture adapter
+/// is enabled. It advertises no capability and rejects every operation.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UnavailableCaptureAdapter;
+
+impl CaptureAdapter for UnavailableCaptureAdapter {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn start(&mut self, _resource: &MediaResource, _session_id: &SessionId) -> bool {
+        false
+    }
+
+    fn stop(&mut self, _resource_id: &[u8; 16], _session_id: &SessionId) -> bool {
+        false
+    }
+}
+
 /// Windows CPU capture plus OpenH264 adapter used when a shared-GPU transport
 /// is not yet available. Encoded units remain in an explicitly bounded queue;
 /// raw desktop pixels never cross the adapter boundary.
