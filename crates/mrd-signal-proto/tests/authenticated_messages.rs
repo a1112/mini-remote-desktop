@@ -109,6 +109,7 @@ fn authenticated_message_keeps_session_and_peer_binding_inside_signature() {
         SessionIntentPayload {
             claims: intent_claims,
             session_id: SessionId("session-1".into()),
+            idempotency_key: [11; 16],
             target_device_id: DeviceId("target-1".into()),
             requested_transport: "webrtc".into(),
         },
@@ -168,6 +169,7 @@ fn session_intent_rejects_target_that_disagrees_with_signed_peer_claim() {
         SessionIntentPayload {
             claims: claims(&identity, [7; 16], 1),
             session_id: SessionId("session-1".into()),
+            idempotency_key: [12; 16],
             target_device_id: DeviceId("different-target".into()),
             requested_transport: "webrtc".into(),
         },

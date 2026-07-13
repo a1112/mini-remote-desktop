@@ -448,6 +448,7 @@ pub type PresenceHeartbeat = SignedSignal<PresenceHeartbeatPayload>;
 pub struct SessionIntentPayload {
     pub claims: AuthClaims,
     pub session_id: SessionId,
+    pub idempotency_key: [u8; 16],
     pub target_device_id: DeviceId,
     pub requested_transport: String,
 }
@@ -459,6 +460,9 @@ signed_payload!(
         {
             validate_identifier(&message.session_id.0)?;
             validate_identifier(&message.target_device_id.0)?;
+            if message.idempotency_key == [0; 16] {
+                return Err(SignalProtocolError::Malformed);
+            }
             if message.target_device_id != message.claims.intended_peer_device_id {
                 return Err(SignalProtocolError::WrongIntendedPeer);
             }
