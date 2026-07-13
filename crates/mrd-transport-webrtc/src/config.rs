@@ -1,3 +1,5 @@
+use std::fmt;
+
 use mrd_pipeline_core::VideoCodec;
 
 use crate::{H264Profile, TransportError};
@@ -14,11 +16,32 @@ pub enum IceTransportPolicy {
     Relay,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct IceServerConfig {
     pub urls: Vec<String>,
     pub username: String,
     pub credential: String,
+}
+
+impl IceServerConfig {
+    pub fn new(urls: Vec<String>, username: String, credential: String) -> Self {
+        Self {
+            urls,
+            username,
+            credential,
+        }
+    }
+}
+
+impl fmt::Debug for IceServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IceServerConfig")
+            .field("urls", &self.urls)
+            .field("username", &"[REDACTED]")
+            .field("credential", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

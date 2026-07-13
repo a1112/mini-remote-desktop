@@ -29,7 +29,7 @@ pub use control::{
     ControlChannelInfo, ControlChannels, ControlLane, CTRL_REL_LABEL, CTRL_RT_LABEL,
 };
 pub use peer::{IceCandidate, SessionDescription, SessionDescriptionType, WebRtcPeerConnection};
-pub use stats::SelectedCandidatePairStats;
+pub use stats::{CandidateKind, SelectedCandidatePairStats};
 
 #[derive(Debug, Error)]
 pub enum TransportError {

@@ -129,6 +129,14 @@ async fn exchanges_offer_answer_candidates_video_control_and_stats() {
     assert!(stats.nominated);
     assert!(!stats.local_candidate_id.is_empty());
     assert!(!stats.remote_candidate_id.is_empty());
+    assert_ne!(
+        stats.local_candidate_kind,
+        mrd_transport_webrtc::CandidateKind::Unknown
+    );
+    assert_ne!(
+        stats.remote_candidate_kind,
+        mrd_transport_webrtc::CandidateKind::Unknown
+    );
 
     assert!(offerer.active_task_count() >= 1);
     assert!(answerer.active_task_count() >= 1);

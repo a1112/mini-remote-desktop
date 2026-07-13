@@ -1,11 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use bytes::Bytes;
 use mrd_pipeline_core::EncodedAccessUnit;
 use mrd_proto::SessionId;
 use mrd_transport_webrtc::{
-    ControlLane, IceCandidate, PeerConnectionConfig, SelectedCandidatePairStats,
-    SessionDescription, WebRtcPeerConnection,
+    ControlLane, IceCandidate, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
+    SelectedCandidatePairStats, SessionDescription, WebRtcPeerConnection,
 };
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -18,6 +18,63 @@ pub enum ServiceWebRtcTransportError {
     SessionNotFound(SessionId),
     #[error("WebRTC transport failed: {0}")]
     Transport(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayUrlClass {
+    TurnUdp,
+    TurnTcp,
+    TurnsTcp,
+    Unknown,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ServiceTurnRelayCredentials {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+    pub expires_at_unix_seconds: u64,
+}
+
+impl fmt::Debug for ServiceTurnRelayCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServiceTurnRelayCredentials")
+            .field("url_classes", &self.url_classes())
+            .field("username", &"[REDACTED]")
+            .field("credential", &"[REDACTED]")
+            .field("expires_at_unix_seconds", &self.expires_at_unix_seconds)
+            .finish()
+    }
+}
+
+impl ServiceTurnRelayCredentials {
+    pub fn apply_relay_only(&self, mut config: PeerConnectionConfig) -> PeerConnectionConfig {
+        config.ice_servers = vec![IceServerConfig::new(
+            self.urls.clone(),
+            self.username.clone(),
+            self.credential.clone(),
+        )];
+        config.ice_transport_policy = IceTransportPolicy::Relay;
+        config
+    }
+
+    pub fn url_classes(&self) -> Vec<RelayUrlClass> {
+        self.urls
+            .iter()
+            .map(|url| {
+                if url.starts_with("turns:") {
+                    RelayUrlClass::TurnsTcp
+                } else if url.starts_with("turn:") && url.contains("transport=tcp") {
+                    RelayUrlClass::TurnTcp
+                } else if url.starts_with("turn:") && url.contains("transport=udp") {
+                    RelayUrlClass::TurnUdp
+                } else {
+                    RelayUrlClass::Unknown
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -222,4 +279,36 @@ impl ServiceWebRtcTransportHost {
 
 fn transport_error(error: mrd_transport_webrtc::TransportError) -> ServiceWebRtcTransportError {
     ServiceWebRtcTransportError::Transport(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mrd_transport_webrtc::PeerConnectionRole;
+
+    fn credentials() -> ServiceTurnRelayCredentials {
+        ServiceTurnRelayCredentials {
+            urls: vec!["turn:relay.example.test:3478?transport=udp".into()],
+            username: "temporary-user".into(),
+            credential: "temporary-password".into(),
+            expires_at_unix_seconds: 1_800_000_000,
+        }
+    }
+
+    #[test]
+    fn relay_credentials_force_relay_policy_without_debug_secret_leakage() {
+        let credentials = credentials();
+        let config = credentials.apply_relay_only(PeerConnectionConfig {
+            role: PeerConnectionRole::Offerer,
+            ..PeerConnectionConfig::default()
+        });
+        assert_eq!(config.ice_transport_policy, IceTransportPolicy::Relay);
+        assert_eq!(config.ice_servers.len(), 1);
+        assert_eq!(credentials.url_classes(), vec![RelayUrlClass::TurnUdp]);
+
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("temporary-user"));
+        assert!(!debug.contains("temporary-password"));
+        assert!(debug.contains("TurnUdp"));
+    }
 }
