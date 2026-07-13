@@ -3,7 +3,8 @@ use std::time::Duration;
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 use mrd_transport_webrtc::{
     ControlLane, H264CodecConfig, H264CodecProfile, IceCandidate, PeerConnectionConfig,
-    PeerConnectionRole, VideoCodecConfig, WebRtcPeerConnection, CTRL_REL_LABEL, CTRL_RT_LABEL,
+    PeerConnectionRole, VideoCodecConfig, WebRtcPeerConnection, BULK_LABEL, CTRL_REL_LABEL,
+    CTRL_RT_LABEL,
 };
 
 const WAIT: Duration = Duration::from_secs(10);
@@ -81,6 +82,9 @@ async fn exchanges_offer_answer_candidates_video_control_and_stats() {
     assert_eq!(channels.realtime.label, CTRL_RT_LABEL);
     assert!(!channels.realtime.ordered);
     assert_eq!(channels.realtime.max_retransmits, Some(0));
+    assert_eq!(channels.bulk.label, BULK_LABEL);
+    assert!(channels.bulk.ordered);
+    assert_eq!(channels.bulk.max_retransmits, None);
 
     offerer
         .send_control(ControlLane::Reliable, b"clipboard-sync")
@@ -101,6 +105,16 @@ async fn exchanges_offer_answer_candidates_video_control_and_stats() {
         .expect("realtime control timed out")
         .expect("realtime control channel closed");
     assert_eq!(realtime.as_ref(), b"mouse-move");
+
+    offerer
+        .send_control(ControlLane::Bulk, b"file-chunk")
+        .await
+        .expect("bulk channel should send");
+    let bulk = tokio::time::timeout(WAIT, answerer.next_control(ControlLane::Bulk))
+        .await
+        .expect("bulk channel timed out")
+        .expect("bulk channel closed");
+    assert_eq!(bulk.as_ref(), b"file-chunk");
 
     let access_unit = EncodedAccessUnit {
         codec: VideoCodec::H264,

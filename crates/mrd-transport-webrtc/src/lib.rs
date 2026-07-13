@@ -26,10 +26,12 @@ pub use config::{
     PeerConnectionRole, VideoCodecConfig,
 };
 pub use control::{
-    ControlChannelInfo, ControlChannels, ControlLane, CTRL_REL_LABEL, CTRL_RT_LABEL,
+    ControlChannelInfo, ControlChannels, ControlLane, BULK_LABEL, CTRL_REL_LABEL, CTRL_RT_LABEL,
 };
 pub use peer::{IceCandidate, SessionDescription, SessionDescriptionType, WebRtcPeerConnection};
 pub use stats::{CandidateKind, SelectedCandidatePairStats};
+
+pub const DEFAULT_MAX_H264_ACCESS_UNIT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -95,12 +97,25 @@ pub enum H264Profile {
     High,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct H264AccessUnitAssembler {
     annex_b_buffer: Vec<u8>,
     fua_active: bool,
     last_sequence_number: Option<u16>,
     drop_until_marker: bool,
+    max_access_unit_bytes: usize,
+}
+
+impl Default for H264AccessUnitAssembler {
+    fn default() -> Self {
+        Self {
+            annex_b_buffer: Vec::new(),
+            fua_active: false,
+            last_sequence_number: None,
+            drop_until_marker: false,
+            max_access_unit_bytes: DEFAULT_MAX_H264_ACCESS_UNIT_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -120,6 +135,11 @@ pub struct VvcAccessUnitAssembler {
 }
 
 impl H264AccessUnitAssembler {
+    pub fn with_max_access_unit_bytes(mut self, max_access_unit_bytes: usize) -> Self {
+        self.max_access_unit_bytes = max_access_unit_bytes.max(1);
+        self
+    }
+
     pub fn push_rtp_packet(
         &mut self,
         payload: &[u8],
@@ -146,6 +166,12 @@ impl H264AccessUnitAssembler {
     }
 
     pub fn push_rtp_payload(&mut self, payload: &[u8], marker: bool) -> Option<Vec<u8>> {
+        if self.drop_until_marker {
+            if marker {
+                self.drop_until_marker = false;
+            }
+            return None;
+        }
         if payload.is_empty() {
             return None;
         }
@@ -153,7 +179,10 @@ impl H264AccessUnitAssembler {
         let nal_type = payload[0] & 0x1f;
         match nal_type {
             1..=23 => {
-                self.append_nal(payload);
+                if !self.append_nal(payload) {
+                    self.reject_oversized_access_unit(marker);
+                    return None;
+                }
                 if marker {
                     self.take_access_unit()
                 } else {
@@ -187,11 +216,20 @@ impl H264AccessUnitAssembler {
             if self.fua_active {
                 self.reset();
             }
+            let additional = 5_usize.saturating_add(payload.len().saturating_sub(2));
+            if self.would_exceed_limit(additional) {
+                self.reject_oversized_access_unit(marker);
+                return None;
+            }
             self.annex_b_buffer
                 .extend_from_slice(&[0, 0, 0, 1, reconstructed_nal]);
             self.annex_b_buffer.extend_from_slice(&payload[2..]);
             self.fua_active = true;
         } else if self.fua_active {
+            if self.would_exceed_limit(payload.len().saturating_sub(2)) {
+                self.reject_oversized_access_unit(marker);
+                return None;
+            }
             self.annex_b_buffer.extend_from_slice(&payload[2..]);
         } else {
             self.reset();
@@ -220,7 +258,10 @@ impl H264AccessUnitAssembler {
                 self.reset();
                 return None;
             }
-            self.append_nal(&payload[offset..offset + nal_len]);
+            if !self.append_nal(&payload[offset..offset + nal_len]) {
+                self.reject_oversized_access_unit(marker);
+                return None;
+            }
             offset += nal_len;
         }
 
@@ -231,9 +272,13 @@ impl H264AccessUnitAssembler {
         None
     }
 
-    fn append_nal(&mut self, nal: &[u8]) {
+    fn append_nal(&mut self, nal: &[u8]) -> bool {
+        if self.would_exceed_limit(4_usize.saturating_add(nal.len())) {
+            return false;
+        }
         self.annex_b_buffer.extend_from_slice(&[0, 0, 0, 1]);
         self.annex_b_buffer.extend_from_slice(nal);
+        true
     }
 
     fn take_access_unit(&mut self) -> Option<Vec<u8>> {
@@ -248,6 +293,15 @@ impl H264AccessUnitAssembler {
     fn reset(&mut self) {
         self.annex_b_buffer.clear();
         self.fua_active = false;
+    }
+
+    fn would_exceed_limit(&self, additional: usize) -> bool {
+        self.annex_b_buffer.len().saturating_add(additional) > self.max_access_unit_bytes
+    }
+
+    fn reject_oversized_access_unit(&mut self, marker: bool) {
+        self.reset();
+        self.drop_until_marker = !marker;
     }
 
     fn has_incomplete_access_unit(&self) -> bool {
@@ -569,6 +623,13 @@ pub struct Av1RtpIngress {
 }
 
 impl H264RtpIngress {
+    pub fn with_max_access_unit_bytes(max_access_unit_bytes: usize) -> Self {
+        Self {
+            assembler: H264AccessUnitAssembler::default()
+                .with_max_access_unit_bytes(max_access_unit_bytes),
+        }
+    }
+
     pub fn push_packet(
         &mut self,
         payload: &[u8],
@@ -1605,6 +1666,26 @@ mod tests {
         assert_eq!(access_unit.codec, VideoCodec::H264);
         assert_eq!(access_unit.timestamp_us, 33_000);
         assert!(access_unit.is_keyframe);
+    }
+
+    #[test]
+    fn h264_assembler_drops_markerless_access_unit_at_byte_limit() {
+        let mut assembler = H264AccessUnitAssembler::default().with_max_access_unit_bytes(8);
+
+        assert!(assembler
+            .push_rtp_payload(&[0x61, 1, 2, 3], false)
+            .is_none());
+        assert_eq!(assembler.annex_b_buffer.len(), 8);
+        assert!(assembler
+            .push_rtp_payload(&[0x61, 4, 5, 6], false)
+            .is_none());
+        assert!(assembler.annex_b_buffer.is_empty());
+        assert!(assembler.push_rtp_payload(&[0x61, 7], true).is_none());
+
+        let recovered = assembler
+            .push_rtp_payload(&[0x65, 8], true)
+            .expect("assembler recovers after the next marker");
+        assert_eq!(recovered, vec![0, 0, 0, 1, 0x65, 8]);
     }
 
     #[test]

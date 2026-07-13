@@ -1,8 +1,10 @@
 use super::media_access_unit::{describe_lan_access_unit, LanAccessUnitCodec};
-use anyhow::Result;
+use anyhow::{bail, Result};
+use mrd_application::ports::{TransportEnvelope, TransportLane};
 #[cfg(any(test, target_os = "macos"))]
 use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::{DecodedFrame, VideoDecoder};
+use mrd_proto::SessionId;
 #[cfg(any(test, windows, target_os = "macos"))]
 use mrd_render::RendererSnapshot;
 #[cfg(any(test, target_os = "macos"))]
@@ -112,6 +114,49 @@ pub(super) fn decode_lan_desktop_frame(
     Ok(decoder.drain_decoded_frames())
 }
 
+/// Validated video-lane input ready for the existing LAN decoder pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransportVideoAccessUnit {
+    pub(crate) sequence: u64,
+    pub(crate) codec: LanAccessUnitCodec,
+    pub(crate) timestamp_us: u64,
+    pub(crate) is_keyframe: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Validates and converts a mux video envelope at the LAN decoder boundary.
+pub(crate) fn transport_video_access_unit(
+    expected_session_id: &SessionId,
+    envelope: TransportEnvelope,
+) -> Result<TransportVideoAccessUnit> {
+    if &envelope.session_id != expected_session_id {
+        bail!("transport video envelope belongs to a different session");
+    }
+    if envelope.lane != TransportLane::Video {
+        bail!("LAN decoder accepts only the transport video lane");
+    }
+    let metadata = envelope
+        .video
+        .ok_or_else(|| anyhow::anyhow!("transport video envelope is missing metadata"))?;
+    let codec = match metadata.codec.trim().to_ascii_lowercase().as_str() {
+        "h264" => LanAccessUnitCodec::H264,
+        "hevc" => LanAccessUnitCodec::Hevc,
+        "av1" => LanAccessUnitCodec::Av1,
+        codec => bail!("unsupported transport video codec {codec}"),
+    };
+    Ok(TransportVideoAccessUnit {
+        sequence: envelope.sequence,
+        codec,
+        timestamp_us: metadata.timestamp_us,
+        is_keyframe: metadata.keyframe,
+        width: metadata.width,
+        height: metadata.height,
+        bytes: envelope.payload,
+    })
+}
+
 #[cfg(any(test, target_os = "macos"))]
 pub(super) fn compressed_direct_render_candidate(
     proxy_enabled: bool,
@@ -147,8 +192,10 @@ fn high_throughput_media_profile(width: u32, height: u32, fps: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{QuicMediaCodec, QuicMediaPayloadType};
+    use mrd_application::ports::{TransportEnvelope, TransportLane, VideoEnvelopeMetadata};
     use mrd_ipc::MediaProfile;
     use mrd_pipeline_core::{DecodedFrame, PipelineError, VideoDecoder};
+    use mrd_proto::SessionId;
     use mrd_render::RendererSnapshot;
 
     #[test]
@@ -208,6 +255,58 @@ mod tests {
         assert!(!error.contains("H.264"));
         assert!(!error.contains("invalid magic"));
         assert!(!error.contains("probe fallback"));
+    }
+
+    #[test]
+    fn transport_video_envelope_becomes_a_validated_decoder_access_unit() {
+        let session_id = SessionId("session-transport".into());
+        let unit = super::transport_video_access_unit(
+            &session_id,
+            TransportEnvelope {
+                session_id: session_id.clone(),
+                lane: TransportLane::Video,
+                sequence: 21,
+                payload: vec![0, 0, 0, 1, 0x65],
+                video: Some(VideoEnvelopeMetadata {
+                    codec: "h264".into(),
+                    timestamp_us: 66_000,
+                    keyframe: true,
+                    width: 1920,
+                    height: 1080,
+                }),
+            },
+        )
+        .expect("valid transport video");
+
+        assert_eq!(unit.sequence, 21);
+        assert_eq!(unit.codec, super::LanAccessUnitCodec::H264);
+        assert_eq!(unit.timestamp_us, 66_000);
+        assert!(unit.is_keyframe);
+        assert_eq!((unit.width, unit.height), (1920, 1080));
+        assert_eq!(unit.bytes, vec![0, 0, 0, 1, 0x65]);
+    }
+
+    #[test]
+    fn transport_decoder_boundary_rejects_cross_session_video() {
+        let error = super::transport_video_access_unit(
+            &SessionId("expected".into()),
+            TransportEnvelope {
+                session_id: SessionId("other".into()),
+                lane: TransportLane::Video,
+                sequence: 1,
+                payload: vec![1],
+                video: Some(VideoEnvelopeMetadata {
+                    codec: "h264".into(),
+                    timestamp_us: 1,
+                    keyframe: false,
+                    width: 1,
+                    height: 1,
+                }),
+            },
+        )
+        .expect_err("cross-session media must fail");
+
+        assert!(error.to_string().contains("different session"));
     }
 
     #[test]

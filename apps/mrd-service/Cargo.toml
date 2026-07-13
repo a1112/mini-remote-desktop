@@ -36,7 +36,7 @@ mrd-signal-client = { path = "../../crates/mrd-signal-client" }
 mrd-signal-proto = { path = "../../crates/mrd-signal-proto" }
 mrd-store-sqlite = { path = "../../crates/mrd-store-sqlite" }
 mrd-transport-quic-quinn = { path = "../../crates/mrd-transport-quic-quinn" }
-mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc", optional = true }
+mrd-transport-webrtc = { path = "../../crates/mrd-transport-webrtc" }
 base64 = "0.22"
 bytes.workspace = true
 futures-util = "0.3"
@@ -77,7 +77,7 @@ mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 
 [features]
 default = []
-browser-webrtc-preview = ["dep:mrd-transport-webrtc", "dep:webrtc"]
+browser-webrtc-preview = ["dep:webrtc"]
 production-vvc-software-codec = [
   "dep:mrd-encode-vvenc",
   "mrd-decode/production-vvc-software-codec",

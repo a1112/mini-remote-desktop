@@ -1,8 +1,12 @@
 use crate::app_state::{AppState, AuthenticatedPeerTrust, DeviceIdentityRegistryError};
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue};
+use crate::transports::{quic::QuicTransportMux, TransportMuxConfig};
 use anyhow::{Context, Result};
-use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
+use mrd_application::ports::{
+    SessionLifecycleState, SessionSnapshot, TransportEnvelope, TransportLane, TransportMuxPort,
+    TransportSendOutcome, VideoEnvelopeMetadata,
+};
 use mrd_identity::UnattendedCredential;
 use mrd_ipc::{
     CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
@@ -248,12 +252,13 @@ use media_sender::{
     create_lan_encoder, lan_sender_allows_h264_encoder_fallback, AgentTransportUnit,
     LanSenderEncoder, SenderMediaTurn,
 };
-use media_sender_telemetry::{
-    decode_lan_sender_stats_datagram, send_lan_sender_stats_datagram, LanMediaTestImpairment,
-    LanSenderDatagramFrameReport, LanSenderStatsTracker,
-};
 #[cfg(test)]
-use media_sender_telemetry::{encode_lan_sender_stats_datagram, LanSenderStatsPayload};
+use media_sender_telemetry::LanSenderStatsPayload;
+use media_sender_telemetry::{
+    decode_lan_sender_stats_datagram, encode_lan_sender_stats_datagram,
+    send_lan_sender_stats_datagram, LanMediaTestImpairment, LanSenderDatagramFrameReport,
+    LanSenderStatsTracker,
+};
 #[cfg(target_os = "macos")]
 use media_timing::media_frame_interval_for_fps;
 use media_timing::{
@@ -299,7 +304,7 @@ use protocol::{
     LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
     LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_QUIC_TRANSPORT_MUX_V1,
 };
 #[cfg(test)]
 use protocol::{
@@ -4170,6 +4175,7 @@ async fn build_announcement(
         LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_TRANSPORT_MUX_V1.to_string(),
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
@@ -4860,12 +4866,32 @@ async fn send_quic_media_loop(
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
         .max(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN.max(QUIC_AU_FRAGMENT_HEADER_LEN) + 1);
+    let transport_mux_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_TRANSPORT_MUX_V1);
+    let transport_mux = transport_mux_supported.then(|| {
+        Arc::new(QuicTransportMux::new(
+            session_id.clone(),
+            TransportMuxConfig::default(),
+            endpoint.clone(),
+        ))
+    });
     let keyframe_requests = Arc::new(AtomicU64::new(0));
-    let _control_reader = spawn_lan_media_control_reader(
-        endpoint.clone(),
-        session_id.clone(),
-        keyframe_requests.clone(),
-    );
+    let _control_reader = if let Some(mux) = transport_mux.as_ref() {
+        spawn_lan_mux_control_reader(
+            Arc::clone(mux),
+            session_id.clone(),
+            keyframe_requests.clone(),
+        )
+    } else {
+        spawn_lan_media_control_reader(
+            endpoint.clone(),
+            session_id.clone(),
+            keyframe_requests.clone(),
+        )
+    };
 
     let mut frame_id = 1_u64;
     let mut active_capture_config: Option<LanCaptureConfigKey> = None;
@@ -5344,8 +5370,112 @@ async fn send_quic_media_loop(
         for access_unit in access_units {
             let runtime_codec = access_unit.codec;
             let runtime_profile = lan_runtime_media_profile(&profile, runtime_codec);
-            let is_keyframe = access_unit.is_keyframe;
-            sender_stats.record_encoded_access_unit(access_unit.bytes.len(), is_keyframe);
+            let transport_envelope = media_sender::transport_envelope_from_agent_unit(
+                &session_id,
+                frame_id,
+                profile.width,
+                profile.height,
+                access_unit,
+            );
+            let video_metadata = transport_envelope
+                .video
+                .as_ref()
+                .expect("LAN sender always creates video metadata");
+            let is_keyframe = video_metadata.keyframe;
+            let access_unit_payload = &transport_envelope.payload;
+            sender_stats.record_encoded_access_unit(access_unit_payload.len(), is_keyframe);
+
+            if let Some(mux) = transport_mux.as_ref() {
+                // The mux owns QUIC packetization, reliable-keyframe policy, and
+                // endpoint I/O. Keep authorization and test impairment at the
+                // application boundary before the envelope becomes visible.
+                let decision = test_impairment.next_datagram_decision();
+                if decision.drop_datagram {
+                    frame_id = frame_id.wrapping_add(1).max(1);
+                    continue;
+                }
+                if !decision.delay.is_zero()
+                    && run_lan_media_operation_while_authorized(
+                        &app_state,
+                        &session_id,
+                        &endpoint,
+                        tokio::time::sleep(decision.delay),
+                    )
+                    .await
+                    .is_none()
+                {
+                    return Ok(());
+                }
+                let Some(send_result) = run_lan_media_operation_while_authorized(
+                    &app_state,
+                    &session_id,
+                    &endpoint,
+                    mux.send(transport_envelope.clone()),
+                )
+                .await
+                else {
+                    return Ok(());
+                };
+                match send_result.context("failed to submit LAN video envelope to transport mux")? {
+                    // Enqueue acceptance is not wire-send evidence. The mux owns packetization
+                    // and asynchronous endpoint I/O, so legacy fragment counters intentionally
+                    // remain unchanged on this route.
+                    TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale => {}
+                    TransportSendOutcome::Backpressured => {
+                        frame_id = frame_id.wrapping_add(1).max(1);
+                        continue;
+                    }
+                    TransportSendOutcome::Closed => {
+                        anyhow::bail!("LAN transport mux closed while sending video");
+                    }
+                }
+                sender_stats.frame_completed();
+                if let Some(stats_payload) = sender_stats.take_payload(
+                    Instant::now(),
+                    frame_id,
+                    active_capture_config
+                        .as_ref()
+                        .map(|config| config.source_id.clone()),
+                    active_capture_config
+                        .as_ref()
+                        .and_then(|config| capture_source_kind_from_id(&config.source_id)),
+                    Some(capture_memory_path.clone()),
+                    &profile,
+                    dynamic_window_fps_decision,
+                    test_impairment.snapshot(),
+                ) {
+                    {
+                        let mut pipelines = app_state.media_pipelines.lock().await;
+                        pipelines
+                            .set_stage_metrics(session_id.clone(), stats_payload.metrics.clone());
+                        pipelines.set_test_impairment(
+                            session_id.clone(),
+                            stats_payload.test_impairment.clone(),
+                        );
+                        pipelines.set_sender_transport(
+                            session_id.clone(),
+                            stats_payload.sender_transport.clone(),
+                        );
+                    }
+                    let stats = encode_lan_sender_stats_datagram(&stats_payload)?;
+                    if stats.len() <= negotiated_max_datagram_size {
+                        if let Err(error) = mux
+                            .send_passthrough_datagram(bytes::Bytes::from(stats))
+                            .await
+                        {
+                            tracing::debug!(
+                                %error,
+                                session_id = %session_id.0,
+                                frame_id,
+                                "LAN mux sender stats datagram was dropped"
+                            );
+                        }
+                    }
+                }
+                frame_id = frame_id.wrapping_add(1).max(1);
+                continue;
+            }
+
             let fragment_started = Instant::now();
             let fragments = if media_v3_supported {
                 match fragment_media_payload_v3(
@@ -5353,9 +5483,9 @@ async fn send_quic_media_loop(
                     runtime_codec.quic_codec(),
                     lan_media_profile_id(&profile),
                     frame_id as u32,
-                    access_unit.timestamp_us,
+                    video_metadata.timestamp_us,
                     is_keyframe,
-                    &access_unit.bytes,
+                    access_unit_payload,
                     test_impairment.effective_datagram_size(max_datagram_size),
                 )
                 .context("failed to fragment LAN QUIC media v3 frame")
@@ -5383,9 +5513,9 @@ async fn send_quic_media_loop(
                     payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
                     codec: runtime_codec.envelope_codec(),
                     sequence: frame_id,
-                    timestamp_us: access_unit.timestamp_us,
+                    timestamp_us: video_metadata.timestamp_us,
                     profile: runtime_profile.clone(),
-                    payload: access_unit.bytes.clone(),
+                    payload: access_unit_payload.clone(),
                 }) {
                     Ok(media_payload) => media_payload,
                     Err(error) => {
@@ -5407,7 +5537,7 @@ async fn send_quic_media_loop(
                 };
                 match fragment_access_unit(
                     frame_id as u32,
-                    access_unit.timestamp_us,
+                    video_metadata.timestamp_us,
                     is_keyframe,
                     &media_payload,
                     test_impairment.effective_datagram_size(max_datagram_size),
@@ -5452,9 +5582,9 @@ async fn send_quic_media_loop(
                     runtime_codec.quic_codec(),
                     lan_media_profile_id(&profile),
                     frame_id as u32,
-                    access_unit.timestamp_us,
+                    video_metadata.timestamp_us,
                     is_keyframe,
-                    &access_unit.bytes,
+                    access_unit_payload,
                     LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
                 )
                 .context("failed to fragment LAN QUIC reliable media v3 frame");
@@ -5481,7 +5611,7 @@ async fn send_quic_media_loop(
             } else if should_send_access_unit_reliably(
                 reliable_media_enabled,
                 is_keyframe,
-                access_unit.bytes.len(),
+                access_unit_payload.len(),
                 max_datagram_size,
             ) {
                 Some(fragments.clone())
@@ -5987,6 +6117,7 @@ fn lan_local_render_refresh_hz() -> Option<u32> {
 
 async fn maybe_send_lan_keyframe_request(
     endpoint: &QuinnDatagramEndpoint,
+    transport_mux: Option<&QuicTransportMux>,
     session_id: &SessionId,
     profile: &MediaProfile,
     sequence: &mut u32,
@@ -6006,18 +6137,27 @@ async fn maybe_send_lan_keyframe_request(
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES);
     match encode_lan_keyframe_request_datagram(profile, *sequence, max_datagram_size) {
-        Ok(datagram) => match endpoint.send_datagram(datagram) {
-            Ok(()) => {
-                stats.record_ms("receiver.request_keyframe", 1.0);
+        Ok(datagram) => {
+            let send_result = if let Some(mux) = transport_mux {
+                mux.send_passthrough_datagram(datagram).await
+            } else {
+                endpoint
+                    .send_datagram(datagram)
+                    .map_err(anyhow::Error::from)
+            };
+            match send_result {
+                Ok(()) => {
+                    stats.record_ms("receiver.request_keyframe", 1.0);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        "LAN media receiver failed to send keyframe request"
+                    );
+                }
             }
-            Err(error) => {
-                tracing::debug!(
-                    %error,
-                    session_id = %session_id.0,
-                    "LAN media receiver failed to send keyframe request"
-                );
-            }
-        },
+        }
         Err(error) => {
             tracing::debug!(
                 %error,
@@ -6057,6 +6197,31 @@ fn spawn_lan_media_control_reader(
                         session_id = %session_id.0,
                         bytes = datagram.len(),
                         "LAN media sender ignored invalid control datagram"
+                    );
+                }
+            }
+        }
+    }))
+}
+
+fn spawn_lan_mux_control_reader(
+    mux: Arc<QuicTransportMux>,
+    session_id: SessionId,
+    keyframe_requests: Arc<AtomicU64>,
+) -> AbortOnDrop {
+    AbortOnDrop(tokio::spawn(async move {
+        while let Some(datagram) = mux.recv_passthrough_datagram().await {
+            match decode_lan_keyframe_request_datagram(&datagram) {
+                Ok(true) => {
+                    keyframe_requests.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        session_id = %session_id.0,
+                        bytes = datagram.len(),
+                        "LAN mux ignored invalid control datagram"
                     );
                 }
             }
@@ -6147,8 +6312,12 @@ async fn receive_quic_media_loop(
     session_id: SessionId,
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
-    let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config());
-    let mut media_v3_reassembler = QuicMediaReassembler::new(lan_media_reassembler_config());
+    let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config())
+        .with_max_frame_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+        .with_max_total_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES * 4);
+    let mut media_v3_reassembler = QuicMediaReassembler::new(lan_media_reassembler_config())
+        .with_max_frame_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+        .with_max_total_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES * 4);
     let mut frame_orderer =
         LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
     #[cfg(target_os = "macos")]
@@ -6159,6 +6328,18 @@ async fn receive_quic_media_loop(
         .context("failed to create LAN media receiver decoder")?;
     let mut consecutive_decode_errors = 0_u32;
     let mut decoder_waits_for_keyframe = true;
+    let transport_mux_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_TRANSPORT_MUX_V1);
+    let transport_mux = transport_mux_supported.then(|| {
+        Arc::new(QuicTransportMux::new(
+            session_id.clone(),
+            TransportMuxConfig::default(),
+            endpoint.clone(),
+        ))
+    });
     let persistent_reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -6170,11 +6351,15 @@ async fn receive_quic_media_loop(
         .await
         .supports(&session_id, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT);
     let initial_media_profile = selected_media_profile(&app_state, &session_id).await;
-    let reliable_media_read_mode = select_reliable_media_send_mode_for_profile(
-        per_message_reliable_media_supported,
-        persistent_reliable_media_supported,
-        &initial_media_profile,
-    );
+    let reliable_media_read_mode = if transport_mux.is_some() {
+        LanReliableMediaSendMode::Disabled
+    } else {
+        select_reliable_media_send_mode_for_profile(
+            per_message_reliable_media_supported,
+            persistent_reliable_media_supported,
+            &initial_media_profile,
+        )
+    };
     let (mut reliable_media_rx, _reliable_media_reader) =
         if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
             let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -6212,11 +6397,13 @@ async fn receive_quic_media_loop(
             (None, None)
         };
     let mut datagram_media_enabled = true;
+    let mut mux_legacy_fragments = std::collections::VecDeque::new();
     let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
     let mut keyframe_request_sequence = 0_u32;
     let mut last_keyframe_request_at = None;
     maybe_send_lan_keyframe_request(
         &endpoint,
+        transport_mux.as_deref(),
         &session_id,
         &initial_media_profile,
         &mut keyframe_request_sequence,
@@ -6229,7 +6416,56 @@ async fn receive_quic_media_loop(
             return Ok(());
         }
         let read_started = Instant::now();
-        let media_message = if let Some(rx) = reliable_media_rx.as_mut() {
+        let media_message = if let Some(fragment) = mux_legacy_fragments.pop_front() {
+            fragment
+        } else if let Some(mux) = transport_mux.as_ref() {
+            tokio::select! {
+                video = mux.recv(TransportLane::Video) => {
+                    let envelope = match video.context("LAN transport mux video receive failed")? {
+                        Some(envelope) => envelope,
+                        None => anyhow::bail!("LAN transport mux closed while receiving video"),
+                    };
+                    let unit = media_receiver::transport_video_access_unit(&session_id, envelope)
+                        .context("invalid LAN transport mux video envelope")?;
+                    let mut profile = lan_runtime_media_profile(
+                        &selected_media_profile(&app_state, &session_id).await,
+                        unit.codec,
+                    );
+                    profile.width = unit.width;
+                    profile.height = unit.height;
+                    let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
+                        payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+                        codec: unit.codec.envelope_codec(),
+                        sequence: unit.sequence,
+                        timestamp_us: unit.timestamp_us,
+                        profile,
+                        payload: unit.bytes,
+                    })?;
+                    let mut fragments = fragment_access_unit(
+                        unit.sequence as u32,
+                        unit.timestamp_us,
+                        unit.is_keyframe,
+                        &media_payload,
+                        mux.max_datagram_size().unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES),
+                    )?;
+                    let first = fragments
+                        .first()
+                        .cloned()
+                        .context("transport mux produced no compatibility fragment")?;
+                    mux_legacy_fragments.extend(fragments.drain(1..));
+                    first
+                }
+                legacy = mux.recv_passthrough_datagram() => {
+                    match legacy {
+                        Some(message) => message,
+                        None => anyhow::bail!("LAN transport mux passthrough closed"),
+                    }
+                }
+                _ = tokio::time::sleep(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL) => {
+                    continue;
+                }
+            }
+        } else if let Some(rx) = reliable_media_rx.as_mut() {
             if datagram_media_enabled {
                 let datagram_endpoint = endpoint.clone();
                 tokio::select! {
@@ -6398,7 +6634,7 @@ async fn receive_quic_media_loop(
             let ready_frames = frame_orderer.push(frame);
             receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
             for frame in ready_frames {
-                let envelope = match decode_lan_media_envelope(&frame.payload) {
+                let mut envelope = match decode_lan_media_envelope(&frame.payload) {
                     Ok(envelope) => envelope,
                     Err(error) => {
                         app_state.probes.lock().await.record_probe_drop(
@@ -6426,6 +6662,41 @@ async fn receive_quic_media_loop(
                                     continue;
                                 }
                             };
+                        let mux_envelope = TransportEnvelope {
+                            session_id: session_id.clone(),
+                            lane: TransportLane::Video,
+                            sequence: envelope.sequence,
+                            payload: std::mem::take(&mut envelope.payload),
+                            video: Some(VideoEnvelopeMetadata {
+                                codec: frame_codec.name().to_owned(),
+                                timestamp_us: envelope.timestamp_us,
+                                keyframe: frame.is_keyframe,
+                                width: envelope.profile.width,
+                                height: envelope.profile.height,
+                            }),
+                        };
+                        let transport_unit = match media_receiver::transport_video_access_unit(
+                            &session_id,
+                            mux_envelope,
+                        ) {
+                            Ok(unit) => unit,
+                            Err(error) => {
+                                app_state.probes.lock().await.record_probe_drop(
+                                    &session_id,
+                                    frame.payload.len() as u64,
+                                    now_ms(),
+                                    format!("invalid transport video envelope: {error:#}"),
+                                );
+                                continue;
+                            }
+                        };
+                        let frame_codec = transport_unit.codec;
+                        debug_assert_eq!(transport_unit.is_keyframe, frame.is_keyframe);
+                        envelope.sequence = transport_unit.sequence;
+                        envelope.timestamp_us = transport_unit.timestamp_us;
+                        envelope.profile.width = transport_unit.width;
+                        envelope.profile.height = transport_unit.height;
+                        envelope.payload = transport_unit.bytes;
                         if decoder.codec != frame_codec {
                             let next_decoder = create_lan_receiver_decoder_with_preference(
                                 &app_state,
@@ -6466,6 +6737,7 @@ async fn receive_quic_media_loop(
                             );
                             maybe_send_lan_keyframe_request(
                                 &endpoint,
+                                transport_mux.as_deref(),
                                 &session_id,
                                 &envelope.profile,
                                 &mut keyframe_request_sequence,
@@ -6587,6 +6859,7 @@ async fn receive_quic_media_loop(
                                     );
                                     maybe_send_lan_keyframe_request(
                                         &endpoint,
+                                        transport_mux.as_deref(),
                                         &session_id,
                                         &envelope.profile,
                                         &mut keyframe_request_sequence,
@@ -6910,6 +7183,7 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
             );
             maybe_send_lan_keyframe_request(
                 endpoint,
+                None,
                 session_id,
                 &profile,
                 keyframe_request_sequence,
@@ -6958,6 +7232,7 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
                 );
                 maybe_send_lan_keyframe_request(
                     endpoint,
+                    None,
                     session_id,
                     &profile,
                     keyframe_request_sequence,
@@ -6986,6 +7261,7 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
                 );
                 maybe_send_lan_keyframe_request(
                     endpoint,
+                    None,
                     session_id,
                     &profile,
                     keyframe_request_sequence,

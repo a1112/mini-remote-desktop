@@ -1,6 +1,7 @@
 use super::protocol::{
     LAN_INPUT_CONTROL_CAPABILITY, LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT,
     LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+    LAN_QUIC_TRANSPORT_MUX_V1,
 };
 
 #[cfg(windows)]
@@ -60,6 +61,7 @@ pub(super) fn lan_media_capabilities_with_input_control(
         LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_TRANSPORT_MUX_V1.to_string(),
     ];
     #[cfg(windows)]
     {

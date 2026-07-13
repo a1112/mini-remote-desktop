@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use mrd_agent_ipc::{MediaAccessUnit, MediaCodec};
+use mrd_application::ports::{TransportEnvelope, TransportLane, VideoEnvelopeMetadata};
 use mrd_encode_openh264::OpenH264Encoder;
 use mrd_ipc::MediaProfile;
 use mrd_pipeline_core::ColorMode;
 use mrd_pipeline_core::VideoEncoder;
+use mrd_proto::SessionId;
 
 use super::media_access_unit::h264_access_unit_is_keyframe;
 pub(crate) use super::media_access_unit::LanAccessUnitCodec;
@@ -38,6 +40,29 @@ pub(crate) struct AgentTransportUnit {
     pub(crate) timestamp_us: u64,
     pub(crate) is_keyframe: bool,
     pub(crate) bytes: Vec<u8>,
+}
+
+/// Converts a negotiated sender access unit into the transport-neutral video lane.
+pub(crate) fn transport_envelope_from_agent_unit(
+    session_id: &SessionId,
+    sequence: u64,
+    width: u32,
+    height: u32,
+    unit: AgentTransportUnit,
+) -> TransportEnvelope {
+    TransportEnvelope {
+        session_id: session_id.clone(),
+        lane: TransportLane::Video,
+        sequence,
+        payload: unit.bytes,
+        video: Some(VideoEnvelopeMetadata {
+            codec: unit.codec.name().to_owned(),
+            timestamp_us: unit.timestamp_us,
+            keyframe: unit.is_keyframe,
+            width,
+            height,
+        }),
+    }
 }
 
 /// A validated agent unit cannot be used by the current transport profile.
@@ -490,6 +515,33 @@ mod tests {
         assert_eq!(mapped.codec, LanAccessUnitCodec::H264);
         assert_eq!(mapped.resource_id, [9; 16]);
         assert_eq!(mapped.bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn negotiated_sender_unit_becomes_a_transport_video_envelope() {
+        let session_id = SessionId("session-transport".into());
+        let envelope = transport_envelope_from_agent_unit(
+            &session_id,
+            17,
+            2560,
+            1440,
+            AgentTransportUnit {
+                codec: LanAccessUnitCodec::Hevc,
+                timestamp_us: 55_000,
+                is_keyframe: true,
+                bytes: vec![1, 2, 3],
+            },
+        );
+
+        assert_eq!(envelope.session_id, session_id);
+        assert_eq!(envelope.lane, TransportLane::Video);
+        assert_eq!(envelope.sequence, 17);
+        assert_eq!(envelope.payload, vec![1, 2, 3]);
+        let metadata = envelope.video.expect("video metadata");
+        assert_eq!(metadata.codec, "hevc");
+        assert_eq!(metadata.timestamp_us, 55_000);
+        assert!(metadata.keyframe);
+        assert_eq!((metadata.width, metadata.height), (2560, 1440));
     }
 
     #[test]

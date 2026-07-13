@@ -2,7 +2,9 @@ use std::fmt;
 
 use mrd_pipeline_core::VideoCodec;
 
-use crate::{H264Profile, TransportError};
+use crate::{H264Profile, TransportError, DEFAULT_MAX_H264_ACCESS_UNIT_BYTES};
+
+const DATA_CHANNEL_WIRE_BUDGET_OVERHEAD: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnectionRole {
@@ -98,6 +100,11 @@ pub struct PeerConnectionConfig {
     pub fps: u32,
     pub mtu: u16,
     pub event_queue_capacity: usize,
+    pub max_h264_access_unit_bytes: usize,
+    pub video_queue_bytes: usize,
+    pub reliable_queue_bytes: usize,
+    pub realtime_queue_bytes: usize,
+    pub bulk_queue_bytes: usize,
 }
 
 impl Default for PeerConnectionConfig {
@@ -111,6 +118,11 @@ impl Default for PeerConnectionConfig {
             fps: 60,
             mtu: 1200,
             event_queue_capacity: 64,
+            max_h264_access_unit_bytes: DEFAULT_MAX_H264_ACCESS_UNIT_BYTES,
+            video_queue_bytes: 16 * 1024 * 1024,
+            reliable_queue_bytes: 4 * 1024 * 1024 + DATA_CHANNEL_WIRE_BUDGET_OVERHEAD,
+            realtime_queue_bytes: 64 * 1024,
+            bulk_queue_bytes: 16 * 1024 * 1024 + DATA_CHANNEL_WIRE_BUDGET_OVERHEAD,
         }
     }
 }
@@ -160,6 +172,35 @@ impl PeerConnectionConfig {
         if self.event_queue_capacity == 0 {
             return Err(TransportError::Message(
                 "WebRTC event queue capacity must be non-zero".into(),
+            ));
+        }
+        if self.max_h264_access_unit_bytes == 0
+            || self.video_queue_bytes == 0
+            || self.reliable_queue_bytes == 0
+            || self.realtime_queue_bytes == 0
+            || self.bulk_queue_bytes == 0
+        {
+            return Err(TransportError::Message(
+                "WebRTC byte budgets must be non-zero".into(),
+            ));
+        }
+        if self.max_h264_access_unit_bytes > self.video_queue_bytes {
+            return Err(TransportError::Message(
+                "WebRTC H.264 access-unit limit exceeds the completed-video queue byte budget"
+                    .into(),
+            ));
+        }
+        if [
+            self.video_queue_bytes,
+            self.reliable_queue_bytes,
+            self.realtime_queue_bytes,
+            self.bulk_queue_bytes,
+        ]
+        .into_iter()
+        .any(|bytes| bytes > tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return Err(TransportError::Message(
+                "WebRTC queue byte budget exceeds semaphore capacity".into(),
             ));
         }
         Ok(codec)

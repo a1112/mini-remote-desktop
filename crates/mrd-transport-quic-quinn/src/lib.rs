@@ -14,9 +14,44 @@ use ring::digest;
 use rustls::RootCertStore;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, OnceCell, Semaphore};
 
 const QUIC_SERVER_HANDSHAKE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const QUIC_RELIABLE_LANE_HEADER_TIMEOUT: Duration = Duration::from_millis(250);
+const QUIC_RELIABLE_LANE_CLASSIFIERS: usize = 8;
+
+/// Independent, persistent QUIC streams used by the session transport mux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuinnReliableLane {
+    Video,
+    Control,
+    Bulk,
+}
+
+impl QuinnReliableLane {
+    const COUNT: usize = 3;
+
+    fn index(self) -> usize {
+        match self {
+            Self::Video => 0,
+            Self::Control => 1,
+            Self::Bulk => 2,
+        }
+    }
+
+    fn wire_id(self) -> u8 {
+        self.index() as u8
+    }
+
+    fn from_wire_id(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Video),
+            1 => Some(Self::Control),
+            2 => Some(Self::Bulk),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicTransportMetadata {
@@ -181,6 +216,8 @@ impl QuinnServerListener {
                     metadata,
                     reliable_send_stream: Mutex::new(None),
                     reliable_recv_stream: Mutex::new(None),
+                    reliable_lane_send_streams: std::array::from_fn(|_| Mutex::new(None)),
+                    reliable_lane_receivers: OnceCell::new(),
                 }),
             });
         }
@@ -194,6 +231,19 @@ struct QuinnDatagramEndpointInner {
     metadata: QuicTransportMetadata,
     reliable_send_stream: Mutex<Option<quinn::SendStream>>,
     reliable_recv_stream: Mutex<Option<quinn::RecvStream>>,
+    reliable_lane_send_streams: [Mutex<Option<quinn::SendStream>>; QuinnReliableLane::COUNT],
+    reliable_lane_receivers: OnceCell<ReliableLaneReceivers>,
+}
+
+#[derive(Debug)]
+struct ReliableLaneReceivers {
+    lanes: [Mutex<ReliableLaneReceiver>; QuinnReliableLane::COUNT],
+}
+
+#[derive(Debug)]
+struct ReliableLaneReceiver {
+    incoming: mpsc::Receiver<quinn::RecvStream>,
+    stream: Option<quinn::RecvStream>,
 }
 
 impl Drop for QuinnDatagramEndpointInner {
@@ -355,6 +405,152 @@ impl QuinnDatagramEndpoint {
         Ok(Bytes::from(payload))
     }
 
+    /// Send one length-delimited message over a lane-specific persistent stream.
+    ///
+    /// Writes on separate lanes do not share a mutex or a QUIC stream, so a large
+    /// bulk transfer cannot head-of-line block ordered interactive control.
+    pub async fn send_reliable_lane_message(
+        &self,
+        lane: QuinnReliableLane,
+        payload: Bytes,
+    ) -> Result<(), QuinnTransportError> {
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            QuinnTransportError::Message(format!(
+                "reliable lane payload too large: {} bytes",
+                payload.len()
+            ))
+        })?;
+        let mut stream_guard = self.inner.reliable_lane_send_streams[lane.index()]
+            .lock()
+            .await;
+        if stream_guard.is_none() {
+            let mut stream = self.inner.connection.open_uni().await.map_err(|error| {
+                QuinnTransportError::Message(format!("open reliable lane stream failed: {error}"))
+            })?;
+            stream.write_all(&[lane.wire_id()]).await.map_err(|error| {
+                QuinnTransportError::Message(format!("reliable lane header write failed: {error}"))
+            })?;
+            *stream_guard = Some(stream);
+        }
+
+        let stream = stream_guard.as_mut().ok_or_else(|| {
+            QuinnTransportError::Message("reliable lane send stream missing".into())
+        })?;
+        if let Err(error) = stream.write_all(&payload_len.to_le_bytes()).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane length write failed: {error}"
+            )));
+        }
+        if let Err(error) = stream.write_all(payload.as_ref()).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane payload write failed: {error}"
+            )));
+        }
+        if let Err(error) = stream.flush().await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane flush failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Receive one length-delimited message from a lane-specific persistent stream.
+    pub async fn read_reliable_lane_message(
+        &self,
+        lane: QuinnReliableLane,
+        max_len: usize,
+    ) -> Result<Bytes, QuinnTransportError> {
+        let receivers = self
+            .inner
+            .reliable_lane_receivers
+            .get_or_init(|| async {
+                let mut senders = Vec::with_capacity(QuinnReliableLane::COUNT);
+                let mut receivers = Vec::with_capacity(QuinnReliableLane::COUNT);
+                for _ in 0..QuinnReliableLane::COUNT {
+                    let (sender, receiver) = mpsc::channel(1);
+                    senders.push(sender);
+                    receivers.push(Mutex::new(ReliableLaneReceiver {
+                        incoming: receiver,
+                        stream: None,
+                    }));
+                }
+                let connection = self.inner.connection.clone();
+                tokio::spawn(async move {
+                    let classifiers = Arc::new(Semaphore::new(QUIC_RELIABLE_LANE_CLASSIFIERS));
+                    loop {
+                        let Ok(permit) = Arc::clone(&classifiers).acquire_owned().await else {
+                            break;
+                        };
+                        let Ok(mut stream) = connection.accept_uni().await else {
+                            break;
+                        };
+                        let senders = senders.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let mut lane_header = [0_u8; 1];
+                            let Ok(Ok(())) = tokio::time::timeout(
+                                QUIC_RELIABLE_LANE_HEADER_TIMEOUT,
+                                stream.read_exact(&mut lane_header),
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            let Some(received_lane) =
+                                QuinnReliableLane::from_wire_id(lane_header[0])
+                            else {
+                                return;
+                            };
+                            // One persistent stream per lane is the protocol invariant. Reject
+                            // duplicates instead of allowing unbounded buffering.
+                            let _ = senders[received_lane.index()].try_send(stream);
+                        });
+                    }
+                });
+                ReliableLaneReceivers {
+                    lanes: receivers
+                        .try_into()
+                        .expect("reliable lane receiver count is fixed"),
+                }
+            })
+            .await;
+
+        let mut receiver = receivers.lanes[lane.index()].lock().await;
+        if receiver.stream.is_none() {
+            receiver.stream = Some(receiver.incoming.recv().await.ok_or_else(|| {
+                QuinnTransportError::Message("reliable lane dispatcher closed".into())
+            })?);
+        }
+        let stream = receiver.stream.as_mut().ok_or_else(|| {
+            QuinnTransportError::Message("reliable lane receive stream missing".into())
+        })?;
+        let mut header = [0_u8; 4];
+        if let Err(error) = stream.read_exact(&mut header).await {
+            receiver.stream = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane length read failed: {error}"
+            )));
+        }
+        let payload_len = u32::from_le_bytes(header) as usize;
+        if payload_len > max_len {
+            receiver.stream = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane payload too large: {payload_len} > {max_len}"
+            )));
+        }
+        let mut payload = vec![0_u8; payload_len];
+        if let Err(error) = stream.read_exact(&mut payload).await {
+            receiver.stream = None;
+            return Err(QuinnTransportError::Message(format!(
+                "reliable lane payload read failed: {error}"
+            )));
+        }
+        Ok(Bytes::from(payload))
+    }
+
     pub async fn connect_client(
         bind_addr: &str,
         bootstrap: &QuinnServerBootstrap,
@@ -398,6 +594,8 @@ impl QuinnDatagramEndpoint {
                 metadata,
                 reliable_send_stream: Mutex::new(None),
                 reliable_recv_stream: Mutex::new(None),
+                reliable_lane_send_streams: std::array::from_fn(|_| Mutex::new(None)),
+                reliable_lane_receivers: OnceCell::new(),
             }),
         })
     }
@@ -768,6 +966,8 @@ pub struct QuicMediaReassembler {
     config: QuicAuReassemblerConfig,
     stats: QuicAuReassemblerStats,
     pending: HashMap<u32, PendingMediaFrame>,
+    max_frame_bytes: Option<usize>,
+    max_total_bytes: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -789,12 +989,27 @@ impl QuicMediaReassembler {
             config,
             stats: QuicAuReassemblerStats::default(),
             pending: HashMap::new(),
+            max_frame_bytes: None,
+            max_total_bytes: None,
         }
+    }
+
+    /// Bound bytes retained for any one incomplete frame.
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = Some(max_frame_bytes.max(1));
+        self
+    }
+
+    /// Bound bytes retained across all incomplete frames.
+    pub fn with_max_total_bytes(mut self, max_total_bytes: usize) -> Self {
+        self.max_total_bytes = Some(max_total_bytes.max(1));
+        self
     }
 
     pub fn stats(&self) -> QuicAuReassemblerStats {
         let mut stats = self.stats;
         stats.pending_frames = self.pending.len() as u64;
+        stats.pending_bytes = self.pending_bytes() as u64;
         stats
     }
 
@@ -817,6 +1032,35 @@ impl QuicMediaReassembler {
                 return Err(error);
             }
         };
+        if let Some(existing) = self.pending.get(&fragment.frame_id) {
+            if existing.fragments.contains_key(&fragment.fragment_index) {
+                self.stats.duplicate_fragments = self.stats.duplicate_fragments.saturating_add(1);
+                return Ok(None);
+            }
+            if self.max_frame_bytes.is_some_and(|limit| {
+                existing
+                    .fragments
+                    .values()
+                    .map(|chunk| chunk.len())
+                    .sum::<usize>()
+                    .saturating_add(fragment.payload.len())
+                    > limit
+            }) {
+                self.pending.remove(&fragment.frame_id);
+                self.stats.rejected_fragments = self.stats.rejected_fragments.saturating_add(1);
+                return Err(QuinnTransportError::Message(
+                    "media v3 frame exceeds configured reassembly byte limit".into(),
+                ));
+            }
+        } else if self
+            .max_frame_bytes
+            .is_some_and(|limit| fragment.payload.len() > limit)
+        {
+            self.stats.rejected_fragments = self.stats.rejected_fragments.saturating_add(1);
+            return Err(QuinnTransportError::Message(
+                "media v3 frame exceeds configured reassembly byte limit".into(),
+            ));
+        }
         {
             let entry =
                 self.pending
@@ -848,15 +1092,15 @@ impl QuicMediaReassembler {
             }
 
             entry.updated_at = now;
-            if entry.fragments.contains_key(&fragment.fragment_index) {
-                self.stats.duplicate_fragments = self.stats.duplicate_fragments.saturating_add(1);
-                return Ok(None);
-            }
             entry
                 .fragments
                 .insert(fragment.fragment_index, fragment.payload);
         }
         self.enforce_pending_limit();
+
+        if !self.pending.contains_key(&fragment.frame_id) {
+            return Ok(None);
+        }
 
         if self.pending[&fragment.frame_id].fragments.len()
             != self.pending[&fragment.frame_id].fragment_count as usize
@@ -911,7 +1155,11 @@ impl QuicMediaReassembler {
     }
 
     fn enforce_pending_limit(&mut self) {
-        while self.pending.len() > self.config.max_pending_frames.max(1) {
+        while self.pending.len() > self.config.max_pending_frames.max(1)
+            || self
+                .max_total_bytes
+                .is_some_and(|limit| self.pending_bytes() > limit)
+        {
             let Some(oldest_frame_id) = self
                 .pending
                 .iter()
@@ -925,6 +1173,13 @@ impl QuicMediaReassembler {
             }
         }
     }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending
+            .values()
+            .flat_map(|frame| frame.fragments.values())
+            .fold(0_usize, |total, chunk| total.saturating_add(chunk.len()))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -932,6 +1187,8 @@ pub struct QuicAuReassembler {
     config: QuicAuReassemblerConfig,
     stats: QuicAuReassemblerStats,
     pending: HashMap<u32, PendingFrame>,
+    max_frame_bytes: Option<usize>,
+    max_total_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -957,6 +1214,7 @@ pub struct QuicAuReassemblerStats {
     pub duplicate_fragments: u64,
     pub rejected_fragments: u64,
     pub pending_frames: u64,
+    pub pending_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -975,12 +1233,33 @@ impl QuicAuReassembler {
             config,
             stats: QuicAuReassemblerStats::default(),
             pending: HashMap::new(),
+            max_frame_bytes: None,
+            max_total_bytes: None,
         }
+    }
+
+    /// Bound bytes retained for any one incomplete legacy access unit.
+    pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Self {
+        self.max_frame_bytes = Some(max_frame_bytes.max(1));
+        self
+    }
+
+    /// Bound bytes retained across all incomplete legacy access units.
+    pub fn with_max_total_bytes(mut self, max_total_bytes: usize) -> Self {
+        self.max_total_bytes = Some(max_total_bytes.max(1));
+        self
     }
 
     pub fn stats(&self) -> QuicAuReassemblerStats {
         let mut stats = self.stats;
         stats.pending_frames = self.pending.len() as u64;
+        stats.pending_bytes = self
+            .pending
+            .values()
+            .flat_map(|frame| frame.fragments.values())
+            .fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.len() as u64)
+            });
         stats
     }
 
@@ -1030,7 +1309,24 @@ impl QuicAuReassembler {
                 .fragments
                 .insert(fragment.fragment_index, fragment.payload);
         }
+        if self.max_frame_bytes.is_some_and(|limit| {
+            self.pending[&fragment.frame_id]
+                .fragments
+                .values()
+                .fold(0_usize, |total, chunk| total.saturating_add(chunk.len()))
+                > limit
+        }) {
+            self.pending.remove(&fragment.frame_id);
+            self.stats.rejected_fragments = self.stats.rejected_fragments.saturating_add(1);
+            return Err(QuinnTransportError::Message(
+                "legacy frame exceeds configured reassembly byte limit".into(),
+            ));
+        }
         self.enforce_pending_limit();
+
+        if !self.pending.contains_key(&fragment.frame_id) {
+            return Ok(None);
+        }
 
         if self.pending[&fragment.frame_id].fragments.len()
             != self.pending[&fragment.frame_id].fragment_count as usize
@@ -1082,7 +1378,11 @@ impl QuicAuReassembler {
     }
 
     fn enforce_pending_limit(&mut self) {
-        while self.pending.len() > self.config.max_pending_frames.max(1) {
+        while self.pending.len() > self.config.max_pending_frames.max(1)
+            || self
+                .max_total_bytes
+                .is_some_and(|limit| self.pending_bytes() > limit)
+        {
             let Some(oldest_frame_id) = self
                 .pending
                 .iter()
@@ -1095,6 +1395,13 @@ impl QuicAuReassembler {
                 self.stats.evicted_frames = self.stats.evicted_frames.saturating_add(1);
             }
         }
+    }
+
+    fn pending_bytes(&self) -> usize {
+        self.pending
+            .values()
+            .flat_map(|frame| frame.fragments.values())
+            .fold(0_usize, |total, chunk| total.saturating_add(chunk.len()))
     }
 }
 
@@ -1166,5 +1473,40 @@ mod tests {
     #[tokio::test]
     async fn close_before_cancelling_persistent_send_resets_the_partial_stream() {
         assert_close_rejects_partial_reliable_message(true).await;
+    }
+
+    #[tokio::test]
+    async fn headerless_stream_does_not_block_another_lane_classifier() {
+        let pair = QuinnDatagramPair::loopback()
+            .await
+            .expect("header classifier endpoint pair");
+        let _headerless_stream = pair
+            .client
+            .inner
+            .connection
+            .open_uni()
+            .await
+            .expect("open headerless stream");
+
+        let server = pair.server.clone();
+        let receive = tokio::spawn(async move {
+            server
+                .read_reliable_lane_message(QuinnReliableLane::Control, 1024)
+                .await
+        });
+        pair.client
+            .send_reliable_lane_message(
+                QuinnReliableLane::Control,
+                Bytes::from_static(b"classified-control"),
+            )
+            .await
+            .expect("send control behind headerless stream");
+
+        let received = timeout(Duration::from_millis(150), receive)
+            .await
+            .expect("headerless stream head-of-line blocked classification")
+            .expect("control receive task")
+            .expect("control receive result");
+        assert_eq!(received, Bytes::from_static(b"classified-control"));
     }
 }

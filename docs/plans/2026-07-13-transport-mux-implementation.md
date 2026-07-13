@@ -44,7 +44,8 @@ independence.
 
 - Modify `apps/mrd-service/src/transports/mod.rs`
 
-1. Add bounded FIFO queues for video, reliable control, and bulk.
+1. Add FIFO queues for video, reliable control, and bulk, bounded by both
+   envelope count and retained payload bytes.
 2. Add a single-slot latest-value queue for realtime control.
 3. Add shared atomic counters, close notification, and route snapshot helpers.
 4. Implement the fake pair inside the conformance test and make its suite pass
@@ -61,10 +62,13 @@ independence.
 1. Add versioned lane framing and strict session validation.
 2. Dispatch video/realtime datagrams and independent reliable-control/bulk
    stream messages into shared queues.
-3. Preserve reliable-control ordering using sequence numbers and a reorder
-   buffer without blocking bulk delivery.
-4. Populate endpoint evidence and close the Quinn connection cleanly.
-5. Make the unchanged conformance suite pass for QUIC loopback.
+3. Preserve reliable-control ordering on a dedicated persistent stream; keep
+   bulk and reliable video on separate streams. Merge reliable keyframes and
+   datagram video through one bounded sequence orderer.
+4. Classify new persistent streams with bounded concurrent header readers and
+   enforce per-frame plus aggregate media-reassembly byte limits.
+5. Populate endpoint evidence and close the Quinn connection cleanly.
+6. Make the unchanged conformance suite pass for QUIC loopback.
 
 ## Task 5: Implement the WebRTC adapter
 
@@ -79,8 +83,16 @@ independence.
 2. Convert mux video envelopes to/from encoded access units.
 3. Map reliable control, realtime control, and bulk to three distinct data
    channels.
-4. Project selected ICE candidate evidence and direct/relay classification.
-5. Make the unchanged conformance suite pass for WebRTC loopback.
+4. Pace bulk sends against a data-channel buffered-amount high-water mark so
+   stalled bulk cannot starve reliable interactive control.
+5. Fragment reliable-control/bulk envelopes below the SCTP message limit;
+   byte-bound RTP assembly, completed-video queues, and pre-mux channel ingress;
+   project pre-mux video drops into route evidence; retain only weak peer/channel
+   references in callbacks; and validate the exact label/reliability/uniqueness
+   contract of incoming data channels.
+6. Project selected ICE candidate evidence and direct/relay classification,
+   with a short recovery window for transient disconnected states.
+7. Make the unchanged conformance suite pass for WebRTC loopback.
 
 ## Task 6: Migrate the LAN media boundary
 
@@ -88,6 +100,8 @@ independence.
 
 - Modify `apps/mrd-service/src/lan_discovery/media_sender.rs`
 - Modify `apps/mrd-service/src/lan_discovery/media_receiver.rs`
+- Modify `apps/mrd-service/src/lan_discovery.rs`
+- Modify LAN capability/protocol declarations for negotiated legacy fallback.
 
 1. Replace direct endpoint-facing sender output with video mux envelopes while
    preserving existing access-unit packetization behavior behind the adapter.
@@ -107,4 +121,3 @@ independence.
    drops, test-only shortcuts, and unrelated changes.
 7. Commit implementation as `refactor: unify remote transport lanes` and
    fast-forward `codex/market-remote-capability-alignment` after verification.
-

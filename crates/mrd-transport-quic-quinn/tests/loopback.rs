@@ -5,7 +5,7 @@ use mrd_transport_quic_quinn::{
     certificate_fingerprint_sha256, fragment_access_unit, fragment_media_payload_v3,
     is_quic_media_v3_datagram, QuicAuReassembler, QuicAuReassemblerConfig, QuicMediaCodec,
     QuicMediaPayloadType, QuicMediaReassembler, QuinnDatagramEndpoint, QuinnDatagramPair,
-    QuinnPreparedServer, QuinnServerListener,
+    QuinnPreparedServer, QuinnReliableLane, QuinnServerListener,
 };
 
 #[tokio::test]
@@ -91,6 +91,67 @@ async fn quinn_loopback_pair_roundtrips_persistent_reliable_messages() {
 }
 
 #[tokio::test]
+async fn quinn_reliable_lane_preserves_control_order() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+
+    for sequence in 0_u8..8 {
+        pair.client
+            .send_reliable_lane_message(
+                QuinnReliableLane::Control,
+                Bytes::from(vec![sequence; 1024]),
+            )
+            .await
+            .expect("send ordered control message");
+    }
+    for sequence in 0_u8..8 {
+        let received = pair
+            .server
+            .read_reliable_lane_message(QuinnReliableLane::Control, 2048)
+            .await
+            .expect("read ordered control message");
+        assert_eq!(received, Bytes::from(vec![sequence; 1024]));
+    }
+}
+
+#[tokio::test]
+async fn stalled_bulk_stream_does_not_block_reliable_control() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+    let bulk_sender = pair.client.clone();
+    let blocked_bulk = tokio::spawn(async move {
+        bulk_sender
+            .send_reliable_lane_message(
+                QuinnReliableLane::Bulk,
+                Bytes::from(vec![0x5a; 16 * 1024 * 1024]),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    pair.client
+        .send_reliable_lane_message(
+            QuinnReliableLane::Control,
+            Bytes::from_static(b"interactive-control"),
+        )
+        .await
+        .expect("bulk pressure must not block control send");
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        pair.server
+            .read_reliable_lane_message(QuinnReliableLane::Control, 1024),
+    )
+    .await
+    .expect("bulk pressure blocked control receive")
+    .expect("read control while bulk is stalled");
+    assert_eq!(received, Bytes::from_static(b"interactive-control"));
+
+    blocked_bulk.abort();
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_fragmented_access_unit() {
     let pair = QuinnDatagramPair::loopback()
         .await
@@ -125,6 +186,103 @@ async fn quinn_loopback_pair_roundtrips_fragmented_access_unit() {
     assert_eq!(frame.timestamp_us, 123_456);
     assert!(frame.is_keyframe);
     assert_eq!(frame.payload, Bytes::from(payload));
+}
+
+#[test]
+fn media_v3_reassembly_rejects_a_frame_over_its_byte_budget() {
+    let fragments = fragment_media_payload_v3(
+        QuicMediaPayloadType::AccessUnit,
+        QuicMediaCodec::H264,
+        0,
+        99,
+        1,
+        false,
+        &[0x5a; 16],
+        mrd_transport_quic_quinn::QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + 8,
+    )
+    .expect("fragment bounded frame");
+    let mut reassembler =
+        QuicMediaReassembler::new(QuicAuReassemblerConfig::default()).with_max_frame_bytes(12);
+
+    assert!(reassembler
+        .push_datagram(&fragments[0])
+        .expect("first fragment fits")
+        .is_none());
+    let error = reassembler
+        .push_datagram(&fragments[1])
+        .expect_err("completed frame exceeds the configured byte budget");
+    assert!(error.to_string().contains("reassembly byte limit"));
+    assert_eq!(reassembler.stats().pending_frames, 0);
+}
+
+#[test]
+fn media_v3_reassembly_evicts_old_frames_at_total_byte_budget() {
+    let fragment_size = mrd_transport_quic_quinn::QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + 8;
+    let first = fragment_media_payload_v3(
+        QuicMediaPayloadType::AccessUnit,
+        QuicMediaCodec::H264,
+        0,
+        1,
+        1,
+        false,
+        &[0x11; 16],
+        fragment_size,
+    )
+    .expect("fragment first bounded frame");
+    let second = fragment_media_payload_v3(
+        QuicMediaPayloadType::AccessUnit,
+        QuicMediaCodec::H264,
+        0,
+        2,
+        2,
+        false,
+        &[0x22; 16],
+        fragment_size,
+    )
+    .expect("fragment second bounded frame");
+    let mut reassembler = QuicMediaReassembler::new(QuicAuReassemblerConfig::default())
+        .with_max_frame_bytes(16)
+        .with_max_total_bytes(12);
+
+    assert!(reassembler
+        .push_datagram(&first[0])
+        .expect("retain first incomplete frame")
+        .is_none());
+    assert!(reassembler
+        .push_datagram(&second[0])
+        .expect("retain newer incomplete frame")
+        .is_none());
+
+    let stats = reassembler.stats();
+    assert_eq!(stats.pending_frames, 1);
+    assert_eq!(stats.pending_bytes, 8);
+    assert_eq!(stats.evicted_frames, 1);
+}
+
+#[test]
+fn legacy_reassembly_evicts_old_frames_at_total_byte_budget() {
+    let fragment_size = mrd_transport_quic_quinn::QUIC_AU_FRAGMENT_HEADER_LEN + 8;
+    let first = fragment_access_unit(1, 1, false, &[0x11; 16], fragment_size)
+        .expect("fragment first legacy frame");
+    let second = fragment_access_unit(2, 2, false, &[0x22; 16], fragment_size)
+        .expect("fragment second legacy frame");
+    let mut reassembler = QuicAuReassembler::new(QuicAuReassemblerConfig::default())
+        .with_max_frame_bytes(16)
+        .with_max_total_bytes(12);
+
+    assert!(reassembler
+        .push_datagram(&first[0])
+        .expect("retain first legacy frame")
+        .is_none());
+    assert!(reassembler
+        .push_datagram(&second[0])
+        .expect("retain newer legacy frame")
+        .is_none());
+
+    let stats = reassembler.stats();
+    assert_eq!(stats.pending_frames, 1);
+    assert_eq!(stats.pending_bytes, 8);
+    assert_eq!(stats.evicted_frames, 1);
 }
 
 #[tokio::test]

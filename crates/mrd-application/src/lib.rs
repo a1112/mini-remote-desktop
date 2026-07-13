@@ -115,6 +115,9 @@ pub mod ports {
     use super::*;
     pub use mrd_session::SessionLifecycleState;
 
+    pub mod transport_mux;
+    pub use transport_mux::*;
+
     /// Signaling client port - handles communication with signaling server
     #[async_trait::async_trait]
     pub trait SignalingPort: Send + Sync {
