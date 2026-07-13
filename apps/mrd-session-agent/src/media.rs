@@ -296,7 +296,18 @@ where
     R: RenderAdapter,
 {
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities::from_implemented([AgentCapability::Capture, AgentCapability::Render])
+        AgentCapabilities::from_implemented(
+            [
+                self.capture
+                    .is_available()
+                    .then_some(AgentCapability::Capture),
+                self.render
+                    .is_available()
+                    .then_some(AgentCapability::Render),
+            ]
+            .into_iter()
+            .flatten(),
+        )
     }
 
     fn execute(&mut self, authorized: AuthorizedCommand) -> CommandOutcome {
@@ -523,9 +534,14 @@ mod tests {
     struct FakeCapture {
         stopped: Vec<[u8; 16]>,
         acknowledge_stop: bool,
+        available: bool,
     }
 
     impl CaptureAdapter for FakeCapture {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
         fn start(&mut self, _resource: &MediaResource, _session_id: &SessionId) -> bool {
             true
         }
@@ -541,9 +557,14 @@ mod tests {
         stopped: Vec<[u8; 16]>,
         pushed: Vec<mrd_agent_ipc::RenderAccessUnit>,
         acknowledge_stop: bool,
+        available: bool,
     }
 
     impl RenderAdapter for FakeRender {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
         fn start(&mut self, _resource: &MediaResource, _session_id: &SessionId) -> bool {
             true
         }
@@ -572,6 +593,43 @@ mod tests {
             surface_id: name.to_owned(),
             window_handle: 1,
         }
+    }
+
+    #[test]
+    fn capabilities_follow_adapter_availability() {
+        use crate::runtime::AuthorizedCommandExecutor;
+
+        let executor = MediaExecutor::new(
+            FakeCapture {
+                available: true,
+                ..FakeCapture::default()
+            },
+            FakeRender::default(),
+        );
+        assert!(executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Capture));
+        assert!(!executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Render));
+
+        let executor = MediaExecutor::new(
+            FakeCapture::default(),
+            FakeRender {
+                available: true,
+                ..FakeRender::default()
+            },
+        );
+        assert!(!executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Capture));
+        assert!(executor
+            .capabilities()
+            .as_set()
+            .contains(&AgentCapability::Render));
     }
 
     #[test]

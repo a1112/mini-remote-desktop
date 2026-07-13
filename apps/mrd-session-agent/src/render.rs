@@ -6,6 +6,8 @@ use mrd_proto::SessionId;
 
 /// Display/render implementation owned by the interactive-session agent.
 pub trait RenderAdapter: Send {
+    /// Whether this adapter has a viable production render implementation.
+    fn is_available(&self) -> bool;
     /// Start rendering for one already-authorized resource.
     fn start(&mut self, resource: &MediaResource, session_id: &SessionId) -> bool;
     /// Submit one validated encoded unit to the exact live render resource.

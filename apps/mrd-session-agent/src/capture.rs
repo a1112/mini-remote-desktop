@@ -9,6 +9,9 @@ use mrd_proto::SessionId;
 /// grant-bound media registry. They should return `false` on platform failure
 /// without exposing native error text to the control plane.
 pub trait CaptureAdapter: Send {
+    /// Whether this adapter has a production implementation that may accept
+    /// capture commands. Per-resource device failures are reported by `start`.
+    fn is_available(&self) -> bool;
     /// Start capture for one already-authorized resource.
     fn start(&mut self, resource: &MediaResource, session_id: &SessionId) -> bool;
     /// Stop capture for the exact resource identity.
@@ -65,6 +68,10 @@ impl Default for WindowsDxgiOpenH264CaptureAdapter {
 
 #[cfg(windows)]
 impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
+    fn is_available(&self) -> bool {
+        true
+    }
+
     fn start(&mut self, resource: &MediaResource, session_id: &SessionId) -> bool {
         use std::sync::atomic::{AtomicBool, Ordering};
 
