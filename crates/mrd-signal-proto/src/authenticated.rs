@@ -184,7 +184,7 @@ where
         expected_peer: &DeviceId,
         now_ms: u64,
         replay: &mut SignalReplayGuard,
-    ) -> Result<(), SignalProtocolError> {
+    ) -> Result<VerifiedSignalMetadata, SignalProtocolError> {
         if self.signer_public_key.len() != 32 || self.signature.len() != 64 {
             return Err(SignalProtocolError::InvalidSignature);
         }
@@ -205,7 +205,8 @@ where
             &self.payload.claims().issuer_key_id,
             self.payload.claims().counter,
             self.payload.claims().nonce,
-        )
+        )?;
+        Ok(VerifiedSignalMetadata::from_claims(self.payload.claims()))
     }
 }
 
