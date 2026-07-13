@@ -16,6 +16,21 @@ use webrtc::{
     },
 };
 
+mod config;
+mod control;
+mod peer;
+mod stats;
+
+pub use config::{
+    H264CodecConfig, H264CodecProfile, IceServerConfig, IceTransportPolicy, PeerConnectionConfig,
+    PeerConnectionRole, VideoCodecConfig,
+};
+pub use control::{
+    ControlChannelInfo, ControlChannels, ControlLane, CTRL_REL_LABEL, CTRL_RT_LABEL,
+};
+pub use peer::{IceCandidate, SessionDescription, SessionDescriptionType, WebRtcPeerConnection};
+pub use stats::SelectedCandidatePairStats;
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("{0}")]
