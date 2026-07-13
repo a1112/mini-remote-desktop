@@ -11,6 +11,8 @@ mod server;
 mod unsupported;
 #[cfg(windows)]
 mod windows_pipe;
+#[cfg(windows)]
+mod windows_sessions;
 
 pub use execute_issuer::*;
 pub use media_ingress::*;
@@ -21,3 +23,5 @@ pub use server::*;
 pub use unsupported::*;
 #[cfg(windows)]
 pub use windows_pipe::*;
+#[cfg(windows)]
+pub use windows_sessions::*;

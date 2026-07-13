@@ -28,9 +28,10 @@ pub use app_state::{AppState, DeviceRegistry, SessionRegistry};
 #[cfg(target_os = "macos")]
 pub use shell::macos::{MacosAutostart, MacosTray, MacosUiLauncher};
 pub use shell::{
-    build_tray_model, default_autostart, default_tray, default_ui_launcher, AutostartPort,
-    AutostartPortRef, InMemoryUiLauncher, NoOpAutostart, NoOpTray, TrayAction, TrayMenuItem,
-    TrayModel, TrayPort, UiLaunchRequest, UiLaunchResult, UiLauncherPort, UiLauncherPortRef,
+    build_tray_model, default_autostart, default_tray, default_ui_launcher, service_tray,
+    AutostartPort, AutostartPortRef, InMemoryUiLauncher, NoOpAutostart, NoOpTray, TrayAction,
+    TrayMenuItem, TrayModel, TrayPort, UiLaunchRequest, UiLaunchResult, UiLauncherPort,
+    UiLauncherPortRef,
 };
 #[cfg(windows)]
 pub use shell::{windows::WindowsTray, WindowsAutostart};

@@ -2,6 +2,13 @@
 
 use std::collections::BTreeSet;
 
+/// Stable SCM service name used by the binary, installer, and service SID ACL.
+pub const MRD_WINDOWS_SERVICE_NAME: &str = "MiniRemoteDesktop";
+
+/// Per-service SID deterministically assigned by SCM to `MiniRemoteDesktop`.
+pub const MRD_WINDOWS_SERVICE_SID: &str =
+    "S-1-5-80-1879472017-33930626-126605267-2295067401-1052995421";
+
 /// Current SCM-visible service state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {

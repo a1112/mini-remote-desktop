@@ -1,4 +1,4 @@
-// Windows tray implementation (placeholder)
+// Windows tray implementation for foreground-console compatibility only.
 //
 // This module provides a Windows-specific tray implementation.
 // Currently a placeholder that logs - full implementation would use
@@ -6,7 +6,7 @@
 
 use super::{TrayModel, TrayPort};
 
-/// Windows tray implementation (placeholder)
+/// Windows tray implementation used only outside the session-zero SCM host.
 ///
 /// Full implementation would use Win32 API:
 /// - Shell_NotifyIconW for icon management
