@@ -32,3 +32,6 @@ pub(crate) mod windows_consent;
 #[allow(dead_code)] // Production bootstrap consumes this adapter in Task 24.B3.5.
 #[cfg(windows)]
 pub(crate) mod windows_desktop;
+/// Windows hybrid decode and D3D11 presentation adapter.
+#[cfg(windows)]
+pub mod windows_render;
