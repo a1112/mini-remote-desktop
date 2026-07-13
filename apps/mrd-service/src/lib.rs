@@ -22,6 +22,7 @@ pub mod session_authorization;
 pub mod shell;
 pub mod wake_on_lan;
 pub mod web_bridge;
+pub mod windows_service;
 
 pub use app_state::{AppState, DeviceRegistry, SessionRegistry};
 #[cfg(target_os = "macos")]
