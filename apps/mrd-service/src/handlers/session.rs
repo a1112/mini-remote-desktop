@@ -1391,7 +1391,28 @@ pub async fn runtime_snapshot(app_state: &Arc<AppState>) -> IpcResponse {
             sessions: session_snapshots,
             device_id,
             is_registered: devices.is_registered(),
+            signaling: signaling_runtime_snapshot(&app_state.signaling_status.snapshot()),
         },
+    }
+}
+
+fn signaling_runtime_snapshot(
+    snapshot: &crate::signaling::SignalingRuntimeSnapshot,
+) -> mrd_ipc::SignalingRuntimeSnapshot {
+    let state = match snapshot.state {
+        crate::signaling::SignalingConnectionState::Disabled => "disabled",
+        crate::signaling::SignalingConnectionState::Connecting => "connecting",
+        crate::signaling::SignalingConnectionState::Authenticated => "authenticated",
+        crate::signaling::SignalingConnectionState::Backoff => "backoff",
+        crate::signaling::SignalingConnectionState::Stopped => "stopped",
+    };
+    mrd_ipc::SignalingRuntimeSnapshot {
+        state: state.into(),
+        reconnect_attempt: snapshot.reconnect_attempt,
+        next_retry_at_ms: snapshot.next_retry_at_ms,
+        last_connected_at_ms: snapshot.last_connected_at_ms,
+        last_message_at_ms: snapshot.last_message_at_ms,
+        last_error: snapshot.last_error.clone(),
     }
 }
 

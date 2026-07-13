@@ -11,7 +11,7 @@ use mrd_service::agent_runtime::{
 use mrd_service::{
     app_state::{self, AppState},
     ipc_server::IpcServer,
-    lan_discovery, security, shell, web_bridge,
+    lan_discovery, security, shell, signaling, web_bridge,
     windows_service::{
         ServiceControl as LifecycleControl, ServiceLifecycle,
         SessionChange as LifecycleSessionChange, MRD_WINDOWS_SERVICE_SID,
@@ -126,6 +126,15 @@ async fn run_service(
         }
     }
 
+    let signaling_task = signaling::spawn_from_env(Arc::clone(&app_state))
+        .await
+        .context("authenticated signaling startup failed")?;
+    if signaling_task.is_some() {
+        info!("Authenticated realtime signaling started");
+    } else {
+        info!("Authenticated realtime signaling disabled (MRD_SIGNAL_URL is unset)");
+    }
+
     let ipc_server = IpcServer::new(app_state);
     let web_bridge_task = web_bridge::spawn_from_env(ipc_server.clone()).await?;
     let mut ipc_task = Box::pin(ipc_server.run());
@@ -176,6 +185,9 @@ async fn run_service(
     reporter.stop_pending()?;
     drop(ipc_task);
     drop(web_task);
+    if let Some(signaling_task) = signaling_task {
+        signaling_task.shutdown().await;
+    }
     if let Some(supervisor) = agents.as_mut() {
         if let Err(error) = supervisor.stop_all(shutdown_reason).await {
             runtime_error.get_or_insert_with(|| error.into());

@@ -2532,6 +2532,39 @@ mod wire {
         pub sessions: Vec<SessionRuntimeSnapshot>,
         pub device_id: Option<DeviceId>,
         pub is_registered: bool,
+        /// Service-owned authenticated WAN signaling health.
+        #[serde(default)]
+        pub signaling: SignalingRuntimeSnapshot,
+    }
+
+    /// Secret-free authenticated signaling health projection.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SignalingRuntimeSnapshot {
+        /// `disabled`, `connecting`, `authenticated`, `backoff`, or `stopped`.
+        pub state: String,
+        /// Consecutive reconnect attempt count.
+        pub reconnect_attempt: u32,
+        /// Scheduled retry time in Unix milliseconds.
+        pub next_retry_at_ms: Option<u64>,
+        /// Most recent successful authentication time in Unix milliseconds.
+        pub last_connected_at_ms: Option<u64>,
+        /// Most recent accepted signaling message time in Unix milliseconds.
+        pub last_message_at_ms: Option<u64>,
+        /// Sanitized connection error, never a token or signaling body.
+        pub last_error: Option<String>,
+    }
+
+    impl Default for SignalingRuntimeSnapshot {
+        fn default() -> Self {
+            Self {
+                state: "disabled".to_string(),
+                reconnect_attempt: 0,
+                next_retry_at_ms: None,
+                last_connected_at_ms: None,
+                last_message_at_ms: None,
+                last_error: None,
+            }
+        }
     }
 
     /// Probe snapshot DTO

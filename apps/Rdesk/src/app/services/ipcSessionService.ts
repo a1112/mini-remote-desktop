@@ -67,6 +67,16 @@ export interface RuntimeSnapshot {
   sessions: SessionRuntimeSnapshot[];
   device_id?: string | null;
   is_registered: boolean;
+  signaling?: SignalingRuntimeSnapshot;
+}
+
+export interface SignalingRuntimeSnapshot {
+  state: 'disabled' | 'connecting' | 'authenticated' | 'backoff' | 'stopped';
+  reconnect_attempt: number;
+  next_retry_at_ms: number | null;
+  last_connected_at_ms: number | null;
+  last_message_at_ms: number | null;
+  last_error: string | null;
 }
 
 export type MediaProfile = tauriAdapter.MediaProfile;

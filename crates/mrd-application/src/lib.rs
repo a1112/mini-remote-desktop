@@ -8,7 +8,103 @@
 
 use anyhow::Result;
 use mrd_proto::{DeviceId, SessionId};
-use mrd_signal_proto::{IceCandidate, SignalMessage};
+use mrd_signal_proto::{IceCandidate, ProtocolReasonCode, SignalMessage};
+
+/// Identity metadata proven by an end-to-end signed signaling message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignalingIdentity {
+    /// Device identifier bound to the signing connection by the realtime server.
+    pub device_id: DeviceId,
+    /// Stable identifier derived from the signing public key.
+    pub key_id: String,
+    /// Ed25519 public key that verified the message.
+    pub public_key: Vec<u8>,
+    /// Monotonic counter carried by the signed claims.
+    pub counter: u64,
+    /// Replay-resistant nonce carried by the signed claims.
+    pub nonce: [u8; 16],
+    /// Time at which the signed command was issued.
+    pub issued_at_ms: u64,
+    /// Time after which the signed command must not be applied.
+    pub expires_at_ms: u64,
+}
+
+/// Authenticated session semantics emitted by a signaling adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthenticatedSessionSignal {
+    /// A controller requests attended authorization from this device.
+    AuthorizationRequested {
+        /// Globally stable session identifier.
+        session_id: SessionId,
+        /// Retry-stable key used to make request application idempotent.
+        idempotency_key: [u8; 16],
+        /// Requested transport identifier.
+        requested_transport: String,
+    },
+    /// The target granted a previously requested session route.
+    Granted {
+        /// Session whose route was granted.
+        session_id: SessionId,
+        /// Transport accepted by the target.
+        accepted_transport: String,
+        /// WebRTC candidates committed by the grant.
+        accepted_candidate_fingerprints: Vec<String>,
+    },
+    /// The target denied a previously requested session.
+    Denied {
+        /// Denied session identifier.
+        session_id: SessionId,
+        /// Stable protocol reason supplied by the target.
+        reason: ProtocolReasonCode,
+    },
+    /// Apply a remote WebRTC offer.
+    WebRtcOffer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Remote SDP offer.
+        sdp: String,
+        /// Candidate fingerprints committed by the offer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a remote WebRTC answer.
+    WebRtcAnswer {
+        /// Session identifier.
+        session_id: SessionId,
+        /// Remote SDP answer.
+        sdp: String,
+        /// Candidate fingerprints committed by the answer.
+        candidate_fingerprints: Vec<String>,
+    },
+    /// Apply a remote WebRTC ICE candidate.
+    WebRtcCandidate {
+        /// Session identifier.
+        session_id: SessionId,
+        /// ICE candidate line.
+        candidate: String,
+        /// Optional SDP media identifier.
+        sdp_mid: Option<String>,
+        /// Optional SDP media-line index.
+        sdp_mline_index: Option<u16>,
+        /// SHA-256 candidate fingerprint committed by a grant.
+        candidate_fingerprint: String,
+    },
+    /// The authenticated peer closed a session.
+    Closed {
+        /// Closed session identifier.
+        session_id: SessionId,
+        /// Stable protocol reason supplied by the peer.
+        reason: ProtocolReasonCode,
+    },
+}
+
+/// One verified signaling event ready for application policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedSignalingEvent {
+    /// Proven sender identity and replay metadata.
+    pub sender: VerifiedSignalingIdentity,
+    /// Session command carried by the signed message.
+    pub signal: AuthenticatedSessionSignal,
+}
 
 /// Abstract ports for external dependencies
 ///
@@ -27,6 +123,20 @@ pub mod ports {
 
         /// Get device ID for a registration handle
         async fn device_id(&self, handle: u64) -> Result<DeviceId>;
+    }
+
+    /// Authenticated signaling inbox owned by the local service.
+    #[async_trait::async_trait]
+    pub trait AuthenticatedSignalingPort: Send + Sync {
+        /// Drain verified, de-duplicated signaling events without blocking.
+        async fn drain_authenticated_events(&self) -> Result<Vec<VerifiedSignalingEvent>>;
+    }
+
+    /// Application boundary that applies verified signaling to session aggregates.
+    #[async_trait::async_trait]
+    pub trait AuthenticatedSessionSignalPort: Send + Sync {
+        /// Apply exactly one verified event using local authorization policy.
+        async fn apply_authenticated_signal(&self, event: VerifiedSignalingEvent) -> Result<()>;
     }
 
     /// Session coordinator port - manages session state and signaling metadata
@@ -180,6 +290,23 @@ pub mod usecases {
         }
 
         Ok(last_session_id)
+    }
+
+    /// Drain and apply all currently queued authenticated signaling events.
+    ///
+    /// Network adapters verify signatures and replay properties before exposing
+    /// events through the port. This use case keeps transport ownership out of
+    /// UI shells and applies each event through the service session boundary.
+    pub async fn apply_authenticated_realtime_events(
+        signaling: &dyn ports::AuthenticatedSignalingPort,
+        sessions: &dyn ports::AuthenticatedSessionSignalPort,
+    ) -> Result<usize> {
+        let events = signaling.drain_authenticated_events().await?;
+        let count = events.len();
+        for event in events {
+            sessions.apply_authenticated_signal(event).await?;
+        }
+        Ok(count)
     }
 
     /// Sync QUIC host from session snapshot

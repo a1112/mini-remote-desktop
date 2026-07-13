@@ -38,6 +38,8 @@ pub struct AppState {
     pub sessions: Arc<Mutex<SessionRegistry>>,
     /// Device registry
     pub devices: Arc<Mutex<DeviceRegistry>>,
+    /// Service-owned authenticated signaling connection health.
+    pub signaling_status: Arc<crate::signaling::SignalingStatus>,
     /// Service-owned security and operations audit events.
     pub audit_log: Arc<AuditLogRegistry>,
     /// Service-owned device pairing and identity state.
@@ -457,6 +459,7 @@ impl AppState {
             agent_registry: Arc::new(crate::agent_runtime::AgentRegistry::default()),
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
+            signaling_status: Arc::new(crate::signaling::SignalingStatus::default()),
             audit_log: Arc::new(audit_log),
             device_identities: Arc::new(device_identities),
             session_authorizations: Arc::new(
