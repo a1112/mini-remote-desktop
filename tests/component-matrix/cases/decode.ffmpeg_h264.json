@@ -1,9 +1,0 @@
-{
-  "component": "decode",
-  "crate": "mrd-decode",
-  "backend": "ffmpeg_h264",
-  "test_name": "perf_h264_ffmpeg_decode_reports_latency_distribution",
-  "case_name": "decode.ffmpeg_h264",
-  "sample_count": 60,
-  "threshold_file": "decode.json"
-}

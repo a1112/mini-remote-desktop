@@ -1,9 +1,0 @@
-{
-  "component": "encode",
-  "crate": "mrd-encode-openh264",
-  "backend": "openh264",
-  "test_name": "perf_openh264_encode_reports_latency_distribution",
-  "case_name": "encode.openh264",
-  "sample_count": 120,
-  "threshold_file": "encode.json"
-}

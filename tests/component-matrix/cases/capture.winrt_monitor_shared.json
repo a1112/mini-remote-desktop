@@ -1,9 +1,0 @@
-{
-  "component": "capture",
-  "crate": "mrd-capture-winrt",
-  "backend": "winrt_monitor_shared",
-  "test_name": "perf_winrt_monitor_shared_texture_capture_reports_latency_distribution",
-  "case_name": "capture.winrt_monitor_shared",
-  "sample_count": 60,
-  "threshold_file": "capture.json"
-}

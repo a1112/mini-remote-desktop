@@ -1,9 +1,0 @@
-{
-  "component": "render",
-  "crate": "mrd-render-d3d11",
-  "backend": "d3d11",
-  "test_name": "perf_d3d11_render_reports_latency_distribution",
-  "case_name": "render.d3d11",
-  "sample_count": 120,
-  "threshold_file": "render.json"
-}

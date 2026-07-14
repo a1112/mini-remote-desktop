@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/lib/devicestore.test.ts","./src/lib/devicestore.ts","./src/lib/signalingclient.test.ts","./src/lib/signalingclient.ts","./src/lib/types.ts","./src/lib/webrtcsession.ts","./src/lib/ws-url.test.ts","./src/lib/ws-url.ts"],"version":"5.9.3"}

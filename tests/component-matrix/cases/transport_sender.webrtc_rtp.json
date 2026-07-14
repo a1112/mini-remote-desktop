@@ -1,9 +1,0 @@
-{
-  "component": "transport",
-  "crate": "mrd-transport-webrtc",
-  "backend": "webrtc_rtp",
-  "test_name": "perf_webrtc_transport_sender_reports_latency_distribution",
-  "case_name": "transport_sender.webrtc_rtp",
-  "sample_count": 120,
-  "threshold_file": "transport_sender.json"
-}

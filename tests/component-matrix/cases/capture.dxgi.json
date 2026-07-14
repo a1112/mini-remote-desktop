@@ -1,9 +1,0 @@
-{
-  "component": "capture",
-  "crate": "mrd-capture-dxgi",
-  "backend": "dxgi",
-  "test_name": "perf_dxgi_capture_reports_latency_distribution",
-  "case_name": "capture.dxgi",
-  "sample_count": 30,
-  "threshold_file": "capture.json"
-}

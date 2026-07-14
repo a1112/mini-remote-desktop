@@ -42,6 +42,7 @@ members = [
   "crates/mrd-hardware",
   "crates/mrd-identity",
   "crates/mrd-quality-gate",
+  "crates/mrd-file-transfer",
   "heartbeat-rs",
   "tests/capture-render-demo",
   "tests/integration",
