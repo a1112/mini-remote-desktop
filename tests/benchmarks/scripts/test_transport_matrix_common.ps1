@@ -369,7 +369,7 @@ try {
   $stderr = Join-Path $processTmp "stderr.log"
   $exitCode = Invoke-TransportMatrixCommand `
     -FilePath "powershell" `
-    -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
+    -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Milliseconds 250; Write-Output 'stdout-ok'; Write-Output ([System.Diagnostics.Process]::GetCurrentProcess().PriorityClass); [Console]::Error.WriteLine('stderr-ok'); exit 7") `
     -WorkingDirectory $processTmp `
     -StdoutPath $stdout `
     -StderrPath $stderr
@@ -377,6 +377,7 @@ try {
   if ($exitCode.ExitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
   if ($exitCode.TimedOut) { throw "Invoke-TransportMatrixCommand should not mark a completed command as timed out" }
   if ((Get-Content $stdout -Raw) -notmatch "stdout-ok") { throw "Invoke-TransportMatrixCommand should capture stdout" }
+  if ((Get-Content $stdout -Raw) -notmatch "AboveNormal") { throw "Invoke-TransportMatrixCommand should run benchmark commands above normal priority" }
   if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
 
   $timeoutResult = Invoke-TransportMatrixCommand `
@@ -505,6 +506,7 @@ try {
   @"
 warning: failed to save last-use data
 database or disk is full
+     Running unittests src\main.rs (target\release\deps\app-test.exe)
 "@ | Set-Content -Path (Join-Path $summaryTmp "logs/host.stderr.log") -Encoding Ascii
 
   & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
@@ -513,6 +515,7 @@ database or disk is full
   $schemaProperties = @($schema.properties.PSObject.Properties.Name)
   $summarized = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
   if ($summarized.error_count -ne 0) { throw "cargo cache warning text must not be counted as benchmark errors" }
+  if ($summarized.warning_count -ne 0) { throw "cargo build diagnostics must not be counted as runtime warnings" }
   $extraProperties = @($summarized.PSObject.Properties.Name | Where-Object { $_ -notin $schemaProperties })
   if ($extraProperties.Count -gt 0) {
     throw "benchmark summary schema is missing properties: $($extraProperties -join ', ')"

@@ -27,6 +27,12 @@ foreach ($path in @($hostStdout, $hostStderr, $signalingStdout, $signalingStderr
   if (Test-Path $path) {
     $content = Get-Content $path -Raw
     if ($null -eq $content) { $content = "" }
+    if ($path -eq $hostStderr) {
+      $runtimeStart = [regex]::Match($content, '(?m)^\s+Running (?:unittests|tests\\)')
+      if ($runtimeStart.Success) {
+        $content = $content.Substring($runtimeStart.Index + $runtimeStart.Length)
+      }
+    }
     $warningCount += ([regex]::Matches($content, $warningPattern)).Count
     $errorCount += ([regex]::Matches($content, $errorPattern)).Count
     $restartCount += ([regex]::Matches($content, $restartPattern)).Count
@@ -67,6 +73,13 @@ function Test-FiniteNumber($Value) {
 $summary | Add-Member -Force -NotePropertyName render_queue_replacement_rate -NotePropertyValue (New-RateValue $summary.render_queue_replacements $summary.duration_secs)
 $summary | Add-Member -Force -NotePropertyName render_stale_frame_drop_rate -NotePropertyValue (New-RateValue $summary.render_stale_frame_drops $summary.duration_secs)
 $summary | Add-Member -Force -NotePropertyName render_present_skipped_rate -NotePropertyValue (New-RateValue $summary.render_present_skipped_frames $summary.duration_secs)
+$displayRefreshLimited = (
+  (Test-FiniteNumber $summary.display_refresh_hz) -and
+  (Test-FiniteNumber $summary.fps_target) -and
+  ([double]$summary.display_refresh_hz -gt 0) -and
+  ([double]$summary.display_refresh_hz -lt [double]$summary.fps_target)
+)
+$summary | Add-Member -Force -NotePropertyName render_present_validation_limited_by_display -NotePropertyValue $displayRefreshLimited
 
 if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPath)) {
   $thresholds = Get-Content $ThresholdPath -Raw | ConvertFrom-Json
@@ -79,15 +92,18 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
   }
   $missingEvidence = @($requiredEvidence.GetEnumerator() | Where-Object { -not (Test-FiniteNumber $_.Value) } | ForEach-Object { $_.Key })
   $requiredEvidenceValid = $missingEvidence.Count -eq 0
-  $hasRenderPresentThreshold = Test-HasProperty $thresholds "max_render_present_p95_ms"
+  # A local window cannot present at a rate higher than its attached display.
+  # Keep the media-pipeline checks strict, but do not treat physical refresh
+  # limits as a renderer regression in a high-refresh transport benchmark.
+  $hasRenderPresentThreshold = (Test-HasProperty $thresholds "max_render_present_p95_ms") -and (-not $displayRefreshLimited)
   $hasRenderExecuteThreshold = Test-HasProperty $thresholds "max_render_execute_p95_ms"
   $hasRenderPrepareWaitThreshold = Test-HasProperty $thresholds "max_render_prepare_wait_p95_ms"
   $hasRenderSharedResourceThreshold = Test-HasProperty $thresholds "max_render_shared_resource_p95_ms"
   $hasRenderDrawPresentThreshold = Test-HasProperty $thresholds "max_render_draw_present_p95_ms"
   $hasRenderQueueThreshold = Test-HasProperty $thresholds "max_render_queue_replacements"
   $hasRenderStaleThreshold = Test-HasProperty $thresholds "max_render_stale_frame_drops"
-  $hasRenderSkippedThreshold = Test-HasProperty $thresholds "max_render_present_skipped_frames"
-  $hasRenderSkippedRateThreshold = Test-HasProperty $thresholds "max_render_present_skipped_rate"
+  $hasRenderSkippedThreshold = (Test-HasProperty $thresholds "max_render_present_skipped_frames") -and (-not $displayRefreshLimited)
+  $hasRenderSkippedRateThreshold = (Test-HasProperty $thresholds "max_render_present_skipped_rate") -and (-not $displayRefreshLimited)
   $summary.run_passed = (
     $requiredEvidenceValid -and
     $summary.run_passed -and
@@ -165,6 +181,9 @@ if ((-not $summary.run_skipped) -and $ThresholdPath -and (Test-Path $ThresholdPa
     }
     $summary.failure_reason = if ($reasons.Count -gt 0) { $reasons -join "; " } else { "benchmark thresholds were not met" }
   }
+  if ($summary.run_passed) {
+    $summary.failure_reason = $null
+  }
 }
 
 $runStatus = if ($summary.run_skipped) { 'SKIP' } elseif ($summary.run_passed) { 'PASS' } else { 'FAIL' }
@@ -185,7 +204,7 @@ $headers = @(
   'render_prepare_wait_p95_ms','render_shared_resource_p95_ms','render_draw_present_p95_ms','render_present_p95_ms',
   'render_submitted_frames','render_uploaded_frames','render_presented_frames','render_present_skipped_frames',
   'render_queue_replacements','render_stale_frame_drops',
-  'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate',
+  'render_queue_replacement_rate','render_stale_frame_drop_rate','render_present_skipped_rate','render_present_validation_limited_by_display',
   'swap_chain_max_frame_latency','swap_chain_allow_tearing',
   'swap_chain_waitable_object','swap_chain_present_mode','display_refresh_hz','render_thread_priority','render_pixel_format',
   'color_mode','color_pipeline',
@@ -248,6 +267,7 @@ $report = @(
   "| render_queue_replacement_rate | $($summary.render_queue_replacement_rate) |",
   "| render_stale_frame_drop_rate | $($summary.render_stale_frame_drop_rate) |",
   "| render_present_skipped_rate | $($summary.render_present_skipped_rate) |",
+  "| render_present_validation_limited_by_display | $($summary.render_present_validation_limited_by_display) |",
   "| swap_chain_max_frame_latency | $($summary.swap_chain_max_frame_latency) |",
   "| swap_chain_allow_tearing | $($summary.swap_chain_allow_tearing) |",
   "| swap_chain_waitable_object | $($summary.swap_chain_waitable_object) |",

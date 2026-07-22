@@ -89,6 +89,7 @@ pub enum NVencMVPrecision {
     QuarterPel = 0x03,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub enum NVencBufferFormat {
     Undefined = 0x00000000,

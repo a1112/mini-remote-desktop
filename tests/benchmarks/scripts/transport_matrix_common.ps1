@@ -202,12 +202,63 @@ function Invoke-TransportMatrixCommand {
 
   $job = Start-Job -ScriptBlock {
     param($FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath)
-    Set-Location $WorkingDirectory
-    & $FilePath @ArgumentList > $StdoutPath 2> $StderrPath
-    if ($null -ne $LASTEXITCODE) {
-      return $LASTEXITCODE
+    function ConvertTo-WindowsCommandLineArgument {
+      param([AllowEmptyString()][string]$Value)
+
+      if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+      }
+
+      $builder = [Text.StringBuilder]::new()
+      [void]$builder.Append('"')
+      $backslashes = 0
+      foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+          $backslashes += 1
+          continue
+        }
+        if ($character -eq '"') {
+          [void]$builder.Append('\' * ($backslashes * 2 + 1))
+          [void]$builder.Append('"')
+          $backslashes = 0
+          continue
+        }
+        if ($backslashes -gt 0) {
+          [void]$builder.Append('\' * $backslashes)
+          $backslashes = 0
+        }
+        [void]$builder.Append($character)
+      }
+      if ($backslashes -gt 0) {
+        [void]$builder.Append('\' * ($backslashes * 2))
+      }
+      [void]$builder.Append('"')
+      return $builder.ToString()
     }
-    return 0
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (@($ArgumentList) | ForEach-Object {
+      ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+    }) -join ' '
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    if (-not $process.HasExited) {
+      $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [IO.File]::WriteAllText($StdoutPath, $stdoutTask.Result)
+    [IO.File]::WriteAllText($StderrPath, $stderrTask.Result)
+    return $process.ExitCode
   } -ArgumentList $FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath
 
   $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))

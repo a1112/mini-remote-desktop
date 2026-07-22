@@ -276,6 +276,7 @@ impl EncoderInternal {
             height: desc.Height,
             registered,
             mapped,
+            map_format: format,
         })
     }
 
@@ -540,6 +541,7 @@ pub enum CodecPicParams {
 pub struct RegisteredResource {
     registered: *mut c_void,
     mapped: *mut c_void,
+    map_format: NVencBufferFormat,
     pitch: u32,
     width: u32,
     height: u32,
@@ -548,11 +550,35 @@ pub struct RegisteredResource {
 
 impl Drop for RegisteredResource {
     fn drop(&mut self) {
-        unsafe {
-            let _ = self.encoder.unmap_input_resource(self.mapped);
-        }
+        let _ = self.unmap();
         unsafe {
             let _ = self.encoder.unregister_resource(self.registered);
         }
+    }
+}
+
+impl RegisteredResource {
+    /// Maps a registered DirectX resource for a single NVENC submission.
+    pub fn map(&mut self) -> Result<(), NVencError> {
+        if !self.mapped.is_null() {
+            return Ok(());
+        }
+        self.mapped = unsafe {
+            self.encoder
+                .map_input_resource_raw(self.registered, self.map_format)
+        }?;
+        Ok(())
+    }
+
+    /// Releases the NVENC mapping while retaining the registration.  Callers
+    /// that shut down a session can use this before EOS so the session closes
+    /// with no mapped input handles.
+    pub fn unmap(&mut self) -> Result<(), NVencError> {
+        if self.mapped.is_null() {
+            return Ok(());
+        }
+        unsafe { self.encoder.unmap_input_resource(self.mapped) }?;
+        self.mapped = std::ptr::null_mut();
+        Ok(())
     }
 }
