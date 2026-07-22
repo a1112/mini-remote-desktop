@@ -1,0 +1,28 @@
+﻿{
+  "duration_sec": 30,
+  "thresholds": {
+    "control_connect_timeout_sec": 20,
+    "min_frames": {
+      "webrtc": 300,
+      "quic": 300,
+      "webtransport": 150
+    },
+    "jitter": {
+      "p95_ms_max": 25.0,
+      "p99_ms_max": 80.0,
+      "gt_100ms_max": 5,
+      "gt_200ms_max": 1,
+      "gt_100ms_ratio_max": 0.01,
+      "gt_200ms_ratio_max": 0.002
+    },
+    "agent_pipeline_jitter": {
+      "capture_jitter_ms_max": 12.0,
+      "encode_output_jitter_ms_max": 12.0,
+      "send_interval_jitter_ms_max": 12.0,
+      "queue_wait_std_ms_max": 6.0,
+      "send_std_ms_max": 2.0
+    },
+    "agent_errors_max": 0,
+    "agent_quic_drop_max": 0
+  }
+}

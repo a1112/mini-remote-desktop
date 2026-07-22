@@ -1,0 +1,314 @@
+//! Session domain model.
+//!
+//! This crate owns session aggregates, lifecycle state, scheduling and
+//! transport-independent snapshots. It must not depend on concrete transport,
+//! capture, render or UI infrastructure.
+
+#![warn(missing_docs)]
+
+/// Authorization state for a session.
+pub mod authorization;
+/// Authenticated, grant-bound remote-control envelopes and replay tracking.
+pub mod control_envelope;
+/// Session-bound capability grants.
+pub mod grant;
+/// Media state for a session.
+pub mod media;
+/// Permission scope algebra and effective capability intersection.
+pub mod permissions;
+/// Service-owned remote session aggregate.
+pub mod remote_session;
+/// Route state for a session.
+pub mod route;
+/// Multi-session scheduling and resource isolation.
+pub mod scheduler;
+
+pub use authorization::AuthorizationState;
+pub use control_envelope::{
+    ControlEnvelopeError, ControlEnvelopeV2, ControlSequenceDecision, ControlSequenceError,
+    ControlSequenceWindow, SignedControlEnvelopeV2, CONTROL_ENVELOPE_MAX_CLOCK_SKEW_MS,
+    CONTROL_ENVELOPE_MAX_EVENT_BYTES, CONTROL_ENVELOPE_MAX_LIFETIME_MS,
+    CONTROL_ENVELOPE_MAX_WIRE_BYTES, CONTROL_ENVELOPE_SIGNATURE_CONTEXT, CONTROL_ENVELOPE_VERSION,
+};
+pub use grant::{GrantError, SessionGrant};
+pub use media::MediaState;
+pub use permissions::{EffectiveScopes, PermissionScope, PermissionScopes};
+pub use remote_session::{RemoteSessionAggregate, SessionTransitionError};
+pub use route::{RouteKind, RouteState};
+
+use mrd_proto::{BackendRole, DeviceId, SessionId};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Session lifecycle state - explicit state machine for session progression
+///
+/// This enum represents the authoritative lifecycle state of a session.
+/// Unlike inferred states from bootstrap metadata, this state is explicitly
+/// tracked and transitioned by the service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionLifecycleState {
+    /// Session created but not yet listening or connecting
+    #[default]
+    Created,
+    /// Local transport is listening for incoming connections (agent role)
+    Listening,
+    /// Actively connecting to remote peer (controller role)
+    Connecting,
+    /// Transport connection established
+    Connected,
+    /// Media streaming active
+    Streaming,
+    /// Session failed with error message
+    Failed {
+        /// Human-readable failure reason.
+        message: String,
+    },
+    /// Session closed cleanly
+    Closed,
+}
+
+impl SessionLifecycleState {
+    /// Check if this is an active state (can transition to streaming)
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Listening | Self::Connecting | Self::Connected | Self::Streaming
+        )
+    }
+
+    /// Check if this is a terminal state
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Failed { .. } | Self::Closed)
+    }
+
+    /// Get the string representation for IPC serialization
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Created => "created",
+            Self::Listening => "listening",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Streaming => "streaming",
+            Self::Failed { .. } => "failed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+impl std::fmt::Display for SessionLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Capability set for a device
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilitySet {
+    /// Whether this peer can negotiate a WebRTC session.
+    pub supports_webrtc: bool,
+    /// Whether this peer can negotiate a QUIC session.
+    pub supports_quic: bool,
+}
+
+/// Session plan containing routing and capability information
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionPlan {
+    /// Stable session identifier.
+    pub session_id: SessionId,
+    /// Device that initiated the session.
+    pub initiator: DeviceId,
+    /// Device that should accept the session.
+    pub target: DeviceId,
+    /// Backend role expected for this process.
+    pub role: BackendRole,
+    /// Capability set used when selecting the transport.
+    pub capabilities: CapabilitySet,
+}
+
+/// QUIC session snapshot (domain state, independent of Quinn)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuicSessionSnapshot {
+    /// Transport protocol identifier
+    pub transport: String,
+    /// Source device ID (controller)
+    pub source_device_id: Option<String>,
+    /// Target device ID (agent)
+    pub target_device_id: Option<String>,
+    /// Local listen address
+    pub local_listen_addr: Option<String>,
+    /// Local server name (SNI)
+    pub local_server_name: Option<String>,
+    /// Local certificate (DER, base64-encoded)
+    pub local_cert_der_b64: Option<String>,
+    /// Remote listen address
+    pub remote_listen_addr: Option<String>,
+    /// Remote server name
+    pub remote_server_name: Option<String>,
+    /// Remote certificate (DER, base64-encoded)
+    pub remote_cert_der_b64: Option<String>,
+    /// Explicit lifecycle state
+    pub lifecycle_state: SessionLifecycleState,
+    /// Last error message if any
+    pub last_error: Option<String>,
+}
+
+/// QUIC session coordinator - manages QUIC session state at domain level
+#[derive(Debug, Default)]
+pub struct QuicSessionCoordinator {
+    sessions: HashMap<SessionId, QuicSessionSnapshot>,
+}
+
+impl QuicSessionCoordinator {
+    /// Request a new QUIC session as controller
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_session(
+        &mut self,
+        session_id: SessionId,
+        source_device_id: DeviceId,
+        target_device_id: DeviceId,
+        transport: String,
+        local_listen_addr: Option<String>,
+        local_server_name: Option<String>,
+        local_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
+        let snapshot = self.sessions.entry(session_id).or_default();
+        snapshot.transport = transport;
+        snapshot.source_device_id = Some(source_device_id.0);
+        snapshot.target_device_id = Some(target_device_id.0);
+        snapshot.local_listen_addr = local_listen_addr;
+        snapshot.local_server_name = local_server_name;
+        snapshot.local_cert_der_b64 = local_cert_der_b64;
+        snapshot.lifecycle_state = SessionLifecycleState::Connecting;
+        Ok(())
+    }
+
+    /// Accept an incoming QUIC session as agent
+    pub fn accept_session(
+        &mut self,
+        session_id: SessionId,
+        transport: String,
+        remote_listen_addr: Option<String>,
+        remote_server_name: Option<String>,
+        remote_cert_der_b64: Option<String>,
+    ) -> Result<(), String> {
+        let snapshot = self.sessions.entry(session_id).or_default();
+        snapshot.transport = transport;
+        snapshot.remote_listen_addr = remote_listen_addr;
+        snapshot.remote_server_name = remote_server_name;
+        snapshot.remote_cert_der_b64 = remote_cert_der_b64;
+        snapshot.lifecycle_state = SessionLifecycleState::Listening;
+        Ok(())
+    }
+
+    /// Transition session to connected state
+    pub fn set_connected(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Connected;
+        Ok(())
+    }
+
+    /// Transition session to streaming state
+    pub fn set_streaming(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Streaming;
+        Ok(())
+    }
+
+    /// Mark session as failed
+    pub fn set_failed(&mut self, session_id: &SessionId, message: String) -> Result<(), String> {
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Failed {
+            message: message.clone(),
+        };
+        snapshot.last_error = Some(message);
+        Ok(())
+    }
+
+    /// Close session
+    pub fn close(&mut self, session_id: &SessionId) -> Result<(), String> {
+        let snapshot = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id.0))?;
+        snapshot.lifecycle_state = SessionLifecycleState::Closed;
+        Ok(())
+    }
+
+    /// Get a snapshot of session state
+    pub fn snapshot(&self, session_id: &SessionId) -> Option<&QuicSessionSnapshot> {
+        self.sessions.get(session_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requesting_quic_session_records_transport_and_local_bootstrap() {
+        let mut coordinator = QuicSessionCoordinator::default();
+
+        coordinator
+            .request_session(
+                SessionId("session-quic".into()),
+                DeviceId("controller-1".into()),
+                DeviceId("agent-1".into()),
+                "quic_quinn".into(),
+                Some("127.0.0.1:5000".into()),
+                Some("localhost".into()),
+                Some("AQID".into()),
+            )
+            .expect("request quic session");
+
+        let snapshot = coordinator
+            .snapshot(&SessionId("session-quic".into()))
+            .expect("quic request snapshot");
+
+        assert_eq!(snapshot.transport, "quic_quinn");
+        assert_eq!(snapshot.source_device_id.as_deref(), Some("controller-1"));
+        assert_eq!(snapshot.target_device_id.as_deref(), Some("agent-1"));
+        assert_eq!(
+            snapshot.local_listen_addr.as_deref(),
+            Some("127.0.0.1:5000")
+        );
+        assert_eq!(snapshot.local_server_name.as_deref(), Some("localhost"));
+        assert_eq!(snapshot.local_cert_der_b64.as_deref(), Some("AQID"));
+        assert_eq!(snapshot.remote_listen_addr, None);
+    }
+
+    #[test]
+    fn accepting_quic_session_records_remote_bootstrap() {
+        let mut coordinator = QuicSessionCoordinator::default();
+
+        coordinator
+            .accept_session(
+                SessionId("session-quic".into()),
+                "quic_quinn".into(),
+                Some("127.0.0.1:6000".into()),
+                Some("localhost".into()),
+                Some("BAUG".into()),
+            )
+            .expect("accept quic session");
+
+        let snapshot = coordinator
+            .snapshot(&SessionId("session-quic".into()))
+            .expect("quic accept snapshot");
+
+        assert_eq!(snapshot.transport, "quic_quinn");
+        assert_eq!(
+            snapshot.remote_listen_addr.as_deref(),
+            Some("127.0.0.1:6000")
+        );
+        assert_eq!(snapshot.remote_server_name.as_deref(), Some("localhost"));
+        assert_eq!(snapshot.remote_cert_der_b64.as_deref(), Some("BAUG"));
+    }
+}

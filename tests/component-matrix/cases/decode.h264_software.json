@@ -1,0 +1,9 @@
+{
+  "component": "decode",
+  "crate": "mrd-decode",
+  "backend": "h264_software",
+  "test_name": "perf_h264_software_decode_reports_latency_distribution",
+  "case_name": "decode.h264_software",
+  "sample_count": 120,
+  "threshold_file": "decode.json"
+}

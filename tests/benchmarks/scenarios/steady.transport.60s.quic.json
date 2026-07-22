@@ -1,0 +1,14 @@
+{
+  "scenario": "steady.transport.60s",
+  "profile": "transport-quic-quinn-baseline",
+  "transport": "quic_quinn",
+  "capture_backend": "synthetic",
+  "encode_backend": "openh264",
+  "decode_backend": "h264_software",
+  "renderer_backend": "d3d11",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "duration_secs": 60,
+  "threshold_file": "transport.60s.json"
+}

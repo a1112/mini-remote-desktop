@@ -1,0 +1,16 @@
+{
+  "scenario": "quick.transport",
+  "profile": "transport-webrtc-nvenc-hevc-main10-software",
+  "transport": "webrtc",
+  "capture_backend": "dxgi",
+  "encode_backend": "nvenc_hevc_main10",
+  "decode_backend": "software_hevc_main10",
+  "renderer_backend": "d3d11",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "duration_secs": 20,
+  "bitrate_bps": 12000000,
+  "pace_to_fps": true,
+  "threshold_file": "transport.quick.json"
+}

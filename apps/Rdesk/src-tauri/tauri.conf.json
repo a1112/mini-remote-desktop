@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Rdesk",
+  "version": "0.1.1",
+  "identifier": "com.a1112.rdesk",
+  "build": {
+    "beforeDevCommand": "npm run build:service:dev && npm run dev -- --host 127.0.0.1 --port 9531 --strictPort",
+    "beforeBuildCommand": "npm run build:service && npm run build",
+    "frontendDist": "../dist",
+    "devUrl": "http://127.0.0.1:9531"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Rdesk",
+        "width": 1100,
+        "height": 600,
+        "minWidth": 720,
+        "minHeight": 480,
+        "center": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "fullscreen": false,
+        "transparent": true,
+        "shadow": true,
+        "decorations": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Developer Tool",
+    "shortDescription": "Remote desktop application",
+    "longDescription": ""
+  }
+}

@@ -1,0 +1,40 @@
+{
+    "ws_url": "ws://127.0.0.1:9527",
+    "device_name": "Rust Controller",
+    "video": {
+        "decoder": "auto",
+        "enable_hardware_decode": true,
+        "enable_d3d11_video": true,
+        "num_decode_threads": 4
+    },
+    "render": {
+        "vsync": false,
+        "low_latency_mode": true,
+        "max_frame_latency": 1,
+        "swap_chain_format": "B8G8R8A8UNorm"
+    },
+    "webrtc": {
+        "ice_servers": [
+            "stun:stun.l.google.com:19302"
+        ]
+    },
+    "stats": {
+        "enabled": true,
+        "update_interval_ms": 1000,
+        "show_fps": true,
+        "show_latency": true
+    },
+    "record": {
+        "enabled": false,
+        "output_dir": "recordings",
+        "ffmpeg_path": "J:/ProjectTest/remote-desktop/mini-remote-desktop/tools/ffmpeg_full_build/bin/ffmpeg.exe",
+        "segment_seconds": 60,
+        "input_fps": 180,
+        "container": "mp4",
+        "video_codec": "copy",
+        "video_preset": "p4",
+        "video_crf": 23,
+        "video_bitrate_kbps": 0,
+        "queue_depth": 1024
+    }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "mrd-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = "1.6"
+mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+thiserror = "1.0"

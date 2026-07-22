@@ -1,0 +1,18 @@
+{
+  "max_first_frame_time_ms": 5000,
+  "min_fps_observed": 120.0,
+  "max_encode_total_p95_ms": 12.0,
+  "max_send_write_p95_ms": 8.0,
+  "max_decode_total_p95_ms": 8.0,
+  "max_render_present_p95_ms": 15.0,
+  "max_render_execute_p95_ms": 8.0,
+  "max_render_prepare_wait_p95_ms": 6.0,
+  "max_render_shared_resource_p95_ms": 0.5,
+  "max_render_draw_present_p95_ms": 8.0,
+  "max_render_queue_replacements": 30,
+  "max_render_stale_frame_drops": 30,
+  "max_render_present_skipped_frames": 1000,
+  "max_render_present_skipped_rate": 10.0,
+  "max_warning_count": 20,
+  "max_error_count": 0
+}

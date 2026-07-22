@@ -1,0 +1,1281 @@
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router";
+import { describe, expect, it } from "vitest";
+import { getMockInvoke } from "../../../test/mocks/tauri";
+import { E2ETestPage } from "./E2ETestPage";
+
+describe("E2ETestPage LAN automation", () => {
+  it("shows the render pipeline execution breakdown from harness metrics", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_hevc", "openh264"],
+          available_decoders: ["nvdec", "software"],
+          available_renderers: ["d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") return Promise.resolve(null);
+      if (command === "test_start_run") return Promise.resolve("run-render-breakdown");
+      if (command === "test_get_run") return Promise.resolve(null);
+      if (command === "test_harness_get_metrics") {
+        return Promise.resolve({
+          is_running: true,
+          capture_fps: 144,
+          encode_latency_p95_ms: 2.1,
+          decode_latency_p95_ms: 2.3,
+          render_latency_p95_ms: 0.7,
+          render_submit_wait_latency_p95_ms: 0.04,
+          render_execute_latency_p95_ms: 0.56,
+          render_prepare_wait_latency_p95_ms: 0.01,
+          render_shared_resource_latency_p95_ms: 0.02,
+          render_draw_present_latency_p95_ms: 0.53,
+          render_present_gap_p95_ms: 8.7,
+          render_queue_replacements: 3,
+          render_stale_frame_drops: 3,
+          frame_count: 240,
+          dropped_frames: 0,
+          resolution: [2560, 1440],
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /启动测试/ }));
+
+    expect(await screen.findByText("Render Pipeline Breakdown")).toBeInTheDocument();
+    expect(screen.getByText("Render Execute P95:")).toBeInTheDocument();
+    expect(screen.getByText("0.56 ms")).toBeInTheDocument();
+    expect(screen.getByText("Draw/Present P95:")).toBeInTheDocument();
+    expect(screen.getByText("0.53 ms")).toBeInTheDocument();
+  });
+
+  it("builds the local E2E config from service capability status", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "windows",
+          cpu_brand: "test",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "NVIDIA",
+          available_captures: ["dxgi", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["nvdec", "software", "none"],
+          available_renderers: ["d3d11"],
+          available_memory_modes: ["cpu", "d3d11_shared"],
+        });
+      }
+      if (command === "ipc_capability_snapshot") {
+        return Promise.resolve({
+          schema_version: 1,
+          platform: "windows",
+          service_version: "test",
+          capabilities: [
+            {
+              id: "capture.dxgi",
+              domain: "capture",
+              label: "DXGI",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "DXGI probe failed",
+            },
+            {
+              id: "capture.synthetic",
+              domain: "capture",
+              label: "Synthetic",
+              status: "available",
+              platform: "windows",
+            },
+            {
+              id: "encode.nvenc_h264",
+              domain: "encode",
+              label: "NVENC H.264",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "NVENC probe failed",
+            },
+            {
+              id: "encode.openh264",
+              domain: "encode",
+              label: "OpenH264",
+              status: "degraded",
+              platform: "windows",
+            },
+            {
+              id: "decode.nvdec",
+              domain: "decode",
+              label: "NVDEC",
+              status: "driver_missing",
+              platform: "windows",
+              reason: "NVDEC probe failed",
+            },
+            {
+              id: "decode.software",
+              domain: "decode",
+              label: "Software",
+              status: "degraded",
+              platform: "windows",
+            },
+          ],
+          constraints: [],
+          profiles: [],
+          updated_at_ms: 1,
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-service-fallback");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("synthetic")).toBeInTheDocument();
+      expect(screen.getByText("openh264")).toBeInTheDocument();
+      expect(screen.getByText("software")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.local",
+          config: expect.objectContaining({
+            capture_type: "synthetic",
+            encoder_type: "openh264",
+            decoder_type: "software",
+          }),
+        })
+      );
+    });
+  });
+
+  it("starts the Linux local end-to-end scenario with Linux capture and render", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "Mesa",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["openh264"],
+          available_decoders: ["software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-e2e");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByText("linux").length).toBeGreaterThanOrEqual(2);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.linux_local",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "openh264",
+            decoder_type: "software",
+            renderer_type: "linux",
+            render_display: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("uses the Linux NVENC to hardware decode path when available", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "linux",
+          cpu_brand: "test",
+          cpu_cores: 12,
+          memory_gb: 32,
+          gpu_info: "NVIDIA",
+          available_captures: ["linux", "synthetic"],
+          available_encoders: ["nvenc_h264", "openh264"],
+          available_decoders: ["linux_h264", "software"],
+          available_renderers: ["linux"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-linux-hw-e2e");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("nvenc_h264")).toBeInTheDocument();
+      expect(screen.getByText("linux_h264")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.linux_local",
+          config: expect.objectContaining({
+            capture_type: "linux",
+            encoder_type: "nvenc_h264",
+            decoder_type: "linux_h264",
+            renderer_type: "linux",
+            render_display: true,
+            zero_copy: undefined,
+          }),
+        })
+      );
+    });
+  });
+
+  it("falls back to software when macOS HEVC encode lacks a matching VideoToolbox decoder", async () => {
+    const mockInvoke = getMockInvoke();
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve({
+          os_type: "macos",
+          cpu_brand: "Apple",
+          cpu_cores: 8,
+          memory_gb: 16,
+          gpu_info: "Apple GPU",
+          available_captures: ["macos", "synthetic"],
+          available_encoders: ["videotoolbox_hevc", "videotoolbox_h264", "openh264"],
+          available_decoders: ["videotoolbox_h264", "software"],
+          available_renderers: ["macos"],
+          available_memory_modes: ["cpu"],
+        });
+      }
+      if (command === "test_start_run") return Promise.resolve("run-macos-software-decode");
+      if (command === "test_get_run") return Promise.resolve(null);
+      return Promise.resolve(null);
+    });
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("videotoolbox_hevc")).toBeInTheDocument();
+      expect(screen.getByText("software")).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_start_run",
+        expect.objectContaining({
+          scenarioId: "e2e.macos_local",
+          config: expect.objectContaining({
+            capture_type: "macos",
+            encoder_type: "videotoolbox_hevc",
+            decoder_type: "software",
+          }),
+        })
+      );
+    });
+  });
+
+  it("runs LAN remote display automation through IPC commands", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_start_lan_remote_session",
+        expect.objectContaining({
+          targetDeviceId: "agent-device",
+          transportKind: "quic",
+        })
+      );
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("ipc_start_receiver", expect.any(Object));
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "open_remote_display_window",
+      expect.objectContaining({
+        sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+      })
+    );
+    expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Agent PC/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
+    expect(screen.getAllByText(/全屏 shared \/ DISPLAY1 \/ 2560x1440/).length).toBeGreaterThan(0);
+  });
+
+  it("configures LAN E2E adaptive media with dynamic resolution from the UI", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.click(await screen.findByLabelText("启用自适应媒体"));
+    fireEvent.click(await screen.findByLabelText("启用动态分辨率"));
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_configure_media_adaptation",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          config: expect.objectContaining({
+            enabled: true,
+            dynamic_resolution_enabled: true,
+          }),
+        })
+      );
+    });
+  });
+
+  it("runs the cross-device discovery scenario without starting a LAN session", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter>
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    fireEvent.change(await screen.findByLabelText("跨设备场景"), {
+      target: { value: "cross.e2e.discovery" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: /开始跨设备 E2E/ }));
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.discovery",
+            metrics_csv: expect.stringContaining("frames_decoded"),
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.discovery",
+              dataPlaneVerified: false,
+              mediaVerified: false,
+            }),
+          }),
+        })
+      );
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_start_lan_remote_session")).toBe(false);
+    expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
+  });
+
+  it("autoruns the cross-device input control ACK scenario", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.input_control&targetDeviceId=agent-device&transport=quic",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({
+            type: "SendControlInput",
+            session_id: expect.stringMatching(/^lan-e2e-agent-device-/),
+            event: {
+              kind: "mouse_move",
+              x: 1,
+              y: 1,
+            },
+          }),
+        })
+      );
+    });
+    expect(mockInvoke.mock.calls.some(([command]) => command === "ipc_start_receiver")).toBe(false);
+    expect(mockInvoke.mock.calls.some(([command]) => command === "open_remote_display_window")).toBe(false);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.input_control",
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.input_control",
+              controlInputAck: expect.objectContaining({
+                lane: "realtime",
+                event_count: 1,
+              }),
+              dataPlaneVerified: false,
+              mediaVerified: false,
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("autoruns the cross-device fault recovery scenario through the fault command", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent-device&transport=quic",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "cross_e2e_inject_fault",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          faultType: "network.pause_peer",
+          durationMs: 1000,
+        })
+      );
+    });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "completed",
+            scenario_id: "cross.fault.recovery",
+            report: expect.objectContaining({
+              status: "completed",
+              faultEvents: [
+                expect.objectContaining({
+                  type: "network.pause_peer",
+                  status: "injected",
+                  message: "recorded test network pause impairment for 1000 ms",
+                }),
+              ],
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("autoruns LAN remote display automation from URL query parameters", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5&width=1920&height=1080&fps=180&bitrateMbps=20",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_start_lan_remote_session",
+        expect.objectContaining({
+          targetDeviceId: "agent-device",
+          transportKind: "quic",
+          requestedProfile: {
+            width: 1920,
+            height: 1080,
+            fps: 180,
+            bitrate_mbps: 20,
+            codec: "h264",
+          },
+        })
+      );
+    });
+    expect(await screen.findByText(/LAN E2E 完成/)).toBeInTheDocument();
+    expect(screen.getByText(/QUIC datagram decoded 25/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            scenario_id: "cross.e2e.remote_display_smoke",
+            requested_profile: expect.objectContaining({
+              width: 1920,
+              height: 1080,
+              fps: 180,
+            }),
+            summary: expect.objectContaining({
+              total_duration_ms: expect.any(Number),
+            }),
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.remote_display_smoke",
+              probeSnapshot: expect.objectContaining({
+                frames_decoded: 25,
+              }),
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("autoruns the secure LAN remote display gate with bound evidence", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.secure_remote_display&targetDeviceId=agent-device&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: {
+            type: "RequestRemoteSession",
+            request: expect.objectContaining({
+              target_device_id: "agent-device",
+              access_mode: "attended",
+              requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            }),
+          },
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "GetRemoteSession" }),
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "GetRouteEvidence" }),
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "ListTrustedDevices" }),
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "completed",
+            scenario_id: "cross.e2e.secure_remote_display",
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.secure_remote_display",
+              auditEventIds: ["40", "41"],
+              secureSessionEvidence: {
+                trustedIdentityVerified: true,
+                authorizationGranted: true,
+                authorizationBasis: "consent",
+                scopeAuthorized: true,
+                selectedRoute: "lan_quic",
+                quicPeerAuthenticated: true,
+                realFramesVerified: true,
+                authorizedInputVerified: true,
+                cleanupCompleted: true,
+              },
+              controlInputAck: expect.objectContaining({ event_count: 1 }),
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("publishes a failed secure report when cleanup is disabled by autorun input", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.secure_remote_display&targetDeviceId=agent-device&transport=quic&stopOnComplete=false",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "failed",
+            report: expect.objectContaining({
+              status: "failed",
+              scenarioId: "cross.e2e.secure_remote_display",
+              failureReason: "runtime_error",
+            }),
+          }),
+        })
+      );
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_start_lan_remote_session",
+      expect.anything()
+    );
+  });
+
+  it("autoruns LAN remote display automation with HEVC profile metadata", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_start_lan_remote_session",
+        expect.objectContaining({
+          targetDeviceId: "agent-device",
+          transportKind: "quic",
+          requestedProfile: {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "hevc",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
+            color_mode: "monochrome",
+            color_pipeline: "hdr_main10",
+          },
+        })
+      );
+    });
+  });
+
+  it("autoruns LAN remote display automation with AV1 profile metadata", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=80&codec=av1&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=full&colorPipeline=sdr8",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_start_lan_remote_session",
+        expect.objectContaining({
+          targetDeviceId: "agent-device",
+          transportKind: "quic",
+          requestedProfile: {
+            width: 2560,
+            height: 1440,
+            fps: 144,
+            bitrate_mbps: 80,
+            codec: "av1",
+            codec_profile: "main",
+            bit_depth: 8,
+            chroma_subsampling: "4:2:0",
+            pixel_format: "nv12",
+            hdr_enabled: false,
+            color_mode: "full",
+            color_pipeline: "sdr8",
+          },
+        })
+      );
+    });
+  });
+
+  it("records macOS LAN E2E reports with the VideoToolbox HEVC config", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock({
+      peer: {
+        device_id: "mac-agent",
+        device_name: "Agent Mac",
+        device_type: "desktop",
+        ip: "192.168.1.25",
+        discovery_port: 37777,
+        p2p_control_addr: "192.168.1.25:37778",
+        transports: [
+          "quic",
+          "quic_datagram",
+          "quic_datagram_2k144",
+          "quic_datagram_media_v3",
+          "media_profile_control_v1",
+        ],
+        protocol_version: 1,
+        service_build_id: "test-build",
+        media_protocol_version: 3,
+        media_capabilities: [
+          "quic_datagram_media_v3",
+          "macos_capture",
+          "videotoolbox_hevc",
+          "decode.videotoolbox_hevc",
+          "media.hevc_main_420_8bit",
+          "macos_native_render",
+        ],
+        age_ms: 25,
+        p2p_available: true,
+      },
+    });
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=mac-agent&transport=quic&width=2560&height=1440&fps=144&bitrateMbps=40&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "test_record_external_run",
+        expect.objectContaining({
+          record: expect.objectContaining({
+            config_snapshot: expect.objectContaining({
+              capture_type: "macos",
+              encoder_type: "videotoolbox_hevc",
+              decoder_type: "videotoolbox",
+              renderer_type: "macos",
+              zero_copy: false,
+              resolution: [2560, 1440],
+              fps: 144,
+              bitrate: 40_000_000,
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("passes an exact autorun capture source id through to LAN automation", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&captureSourceId=window-codex&captureSourceKind=display_shared&renderDisplaySourceId=windows:display-shared:0",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_select_remote_capture_source",
+        expect.objectContaining({
+          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
+          sourceId: "window-codex",
+        })
+      );
+    });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "open_remote_display_window",
+      expect.objectContaining({
+        preferredDisplaySourceId: "windows:display-shared:0",
+      })
+    );
+  });
+
+  it("honors autorun renderDisplay=false for LAN diagnostics", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&targetDeviceId=agent-device&transport=quic&renderDisplay=0",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            kind: "mainline_e2e_artifacts_v1",
+            final_status: "completed",
+            report: expect.objectContaining({
+              status: "completed",
+              displayWindow: undefined,
+            }),
+          }),
+        })
+      );
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "open_remote_display_window",
+      expect.anything()
+    );
+  });
+});
+
+function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unknown> } = {}) {
+  const mockInvoke = getMockInvoke();
+  let activeProfile = {
+    width: 2560,
+    height: 1440,
+    fps: 144,
+    bitrate_mbps: 64,
+    codec: "h264",
+  };
+  mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
+    if (command === "test_get_capabilities") {
+      return Promise.resolve({
+        os_type: "windows",
+        cpu_brand: "test",
+        cpu_cores: 8,
+        memory_gb: 16,
+        gpu_info: "NVIDIA",
+        available_captures: ["dxgi", "winrt", "synthetic"],
+        available_encoders: ["nvenc_h264", "openh264"],
+        available_decoders: ["nvdec", "software"],
+        available_renderers: ["d3d11"],
+        available_memory_modes: ["cpu", "d3d11_shared"],
+      });
+    }
+    if (command === "service_bootstrap_if_needed") return Promise.resolve(true);
+    if (command === "service_wait_for_healthy") return Promise.resolve(true);
+    if (command === "ipc_runtime_snapshot") {
+      return Promise.resolve({
+        device_id: "controller-device",
+        is_registered: true,
+        sessions: [],
+      });
+    }
+    if (command === "get_hardware_info") {
+      return Promise.resolve({
+        motherboard_serial: "MB-LOCAL-1234",
+        hostname: "Controller PC",
+        os_type: "windows",
+        os_version: "Windows",
+        cpu_info: {
+          name: "CPU",
+          vendor_id: "GenuineIntel",
+          cores: 8,
+        },
+        total_memory_mb: 16384,
+        gpu_info: [],
+      });
+    }
+    if (command === "ipc_register_device") return Promise.resolve("lan-MBLOCAL1234");
+    if (command === "ipc_refresh_lan_discovery") {
+      const peer = options.peer ?? {
+        device_id: "agent-device",
+        device_name: "Agent PC",
+        device_type: "desktop",
+        ip: "192.168.1.24",
+        discovery_port: 37777,
+        p2p_control_addr: "192.168.1.24:37778",
+        transports: [
+          "quic",
+          "quic_datagram",
+          "quic_datagram_2k144",
+          "quic_datagram_media_v2",
+          "media_profile_control_v1",
+          "input_control_v2",
+        ],
+        protocol_version: 1,
+        service_build_id: "test-build",
+        media_protocol_version: 2,
+        media_capabilities: [
+          "dxgi_capture",
+          "nvenc_h264",
+          "nvdec",
+          "d3d11_native_render",
+          "control.keyboard_mouse",
+        ],
+        age_ms: 25,
+        p2p_available: true,
+      };
+      return Promise.resolve({
+        enabled: true,
+        running: true,
+        discovery_port: 37777,
+        instance_id: "controller-instance",
+        peers: [peer],
+      });
+    }
+    if (command === "ipc_start_lan_remote_session") {
+      const requestedProfile = args?.requestedProfile as typeof activeProfile | undefined;
+      if (requestedProfile) {
+        activeProfile = requestedProfile;
+      }
+      return Promise.resolve("started");
+    }
+    if (command === "ipc_secure_remote") {
+      const request = args?.request as Record<string, unknown> | undefined;
+      if (request?.type === "RequestRemoteSession") {
+        const sessionRequest = request.request as Record<string, unknown>;
+        const requestedProfile = sessionRequest.requested_profile as
+          | typeof activeProfile
+          | null
+          | undefined;
+        if (requestedProfile) {
+          activeProfile = requestedProfile;
+        }
+        return Promise.resolve({
+          type: "RemoteSessionRequested",
+          session: {
+            session_id: sessionRequest.session_id,
+            role: "controller",
+            peer_device_id: sessionRequest.target_device_id,
+            peer_key_id: "sha256:agent-device-key",
+            access_mode: "attended",
+            authorization_state: "granted",
+            route_state: "connected",
+            route_kind: "lan_quic",
+            media_state: "streaming",
+            presentation_state: "streaming",
+            requested_scopes: sessionRequest.requested_scopes,
+            granted_scopes: sessionRequest.requested_scopes,
+            policy_revision: "7",
+            failure: null,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            authorization_expires_at_ms: Date.now() + 60_000,
+          },
+        });
+      }
+      if (request?.type === "GetRemoteSession") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: {
+            session_id: request.session_id,
+            role: "controller",
+            peer_device_id: "agent-device",
+            peer_key_id: "sha256:agent-device-key",
+            access_mode: "attended",
+            authorization_state: "granted",
+            route_state: "connected",
+            route_kind: "lan_quic",
+            media_state: "streaming",
+            presentation_state: "streaming",
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            policy_revision: "7",
+            failure: null,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            authorization_expires_at_ms: Date.now() + 60_000,
+          },
+        });
+      }
+      if (request?.type === "GetRouteEvidence") {
+        return Promise.resolve({
+          type: "RouteEvidence",
+          evidence: {
+            session_id: request.session_id,
+            route_state: "connected",
+            selected_route: "lan_quic",
+            policy_revision: "7",
+            transport_fingerprint_sha256: `sha256:${"ab".repeat(32)}`,
+            candidates: [{ route: "lan_quic", state: "connected" }],
+            observed_at_ms: Date.now(),
+          },
+        });
+      }
+      if (request?.type === "ListTrustedDevices") {
+        return Promise.resolve({
+          type: "TrustedDeviceList",
+          devices: [
+            {
+              peer_key_id: "sha256:agent-device-key",
+              display_name: "Agent PC",
+              key_epoch: "1",
+              state: "trusted",
+              permission_ceiling: ["screen.view", "input.pointer", "input.keyboard"],
+              trust_revision: "3",
+              approved_at_ms: Date.now() - 10_000,
+              updated_at_ms: Date.now() - 1_000,
+            },
+          ],
+        });
+      }
+      if (request?.type === "GetAuditEventsV2") {
+        return Promise.resolve({
+          type: "AuditEventsV2",
+          page: {
+            events: [
+              {
+                sequence: "40",
+                timestamp_ms: Date.now(),
+                action: "session.start_lan",
+                outcome: "success",
+                session_id: (request.query as { session_id?: string } | undefined)?.session_id,
+                actor_device_id: "controller-device",
+                peer_device_id: "agent-device",
+                peer_key_id: null,
+                transport_kind: "lan_quic",
+                reason_code: null,
+                metadata: { requested_scopes: [], granted_scopes: [] },
+              },
+              {
+                sequence: "41",
+                timestamp_ms: Date.now(),
+                action: "session.stop",
+                outcome: "success",
+                session_id: (request.query as { session_id?: string } | undefined)?.session_id,
+                actor_device_id: "controller-device",
+                peer_device_id: "agent-device",
+                peer_key_id: null,
+                transport_kind: "lan_quic",
+                reason_code: null,
+                metadata: { requested_scopes: [], granted_scopes: [] },
+              },
+            ],
+            next_after_sequence: "41",
+            cursor_state: "current",
+            has_more: false,
+            chain_verified: true,
+          },
+        });
+      }
+      if (request?.type !== "SendControlInput") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve({
+        type: "ControlInputAccepted",
+        session_id: request.session_id,
+        lane: "realtime",
+        event_count: 1,
+      });
+    }
+    if (command === "cross_e2e_inject_fault") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        fault_type: args?.faultType,
+        status: "injected",
+        message: `recorded test network pause impairment for ${args?.durationMs ?? 1000} ms`,
+        duration_ms: args?.durationMs ?? 1000,
+      });
+    }
+    if (command === "ipc_list_remote_capture_sources") {
+      return Promise.resolve([
+        {
+          id: "display-shared",
+          platform: "windows",
+          source_kind: "display_shared",
+          title: "DISPLAY1",
+          class_name: "Monitor",
+          width: 2560,
+          height: 1440,
+          process_id: 0,
+          app_name: null,
+        },
+        {
+          id: "window-codex",
+          platform: "windows",
+          source_kind: "window",
+          title: "Codex",
+          class_name: "Chrome_WidgetWin_1",
+          width: 1280,
+          height: 720,
+          process_id: 100,
+          app_name: "Codex",
+        },
+      ]);
+    }
+    if (command === "ipc_select_remote_capture_source") {
+      const sourceId = args?.sourceId as string | undefined;
+      const selectedSource =
+        sourceId === "window-codex"
+          ? {
+              id: "window-codex",
+              platform: "windows",
+              source_kind: "window",
+              title: "Codex",
+              class_name: "Chrome_WidgetWin_1",
+              width: 1280,
+              height: 720,
+              process_id: 100,
+              app_name: "Codex",
+            }
+          : {
+              id: "display-shared",
+              platform: "windows",
+              source_kind: "display_shared",
+              title: "DISPLAY1",
+              class_name: "Monitor",
+              width: 2560,
+              height: 1440,
+              process_id: 0,
+              app_name: null,
+            };
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        source: selectedSource,
+        status: "selected",
+        reason: null,
+      });
+    }
+    if (command === "ipc_configure_media_adaptation") {
+      return Promise.resolve({
+        enabled: true,
+        state: "steady",
+        ladder_index: 0,
+        current_profile: activeProfile,
+        target_profile: activeProfile,
+        last_reason: null,
+        last_change_ms: 0,
+        observed_fps: activeProfile.fps,
+        drop_ratio: 0,
+        queue_depth: 0,
+      });
+    }
+    if (command === "ipc_start_receiver") return Promise.resolve("receiver-started");
+    if (command === "open_remote_display_window") {
+      return Promise.resolve({
+        label: "remote-display-1",
+        session_id: args?.sessionId,
+        surface_id: "surface-1",
+        role: "controller",
+        renderer_attached: true,
+        render_mode: "d3d11_native",
+        native_surface_attached: true,
+        session_window_count: 1,
+      });
+    }
+    if (command === "ipc_session_snapshot") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        role: "controller",
+        state: "streaming",
+        transport_kind: "quic",
+        sender_active: false,
+        receiver_active: true,
+      });
+    }
+    if (command === "ipc_probe_snapshot") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        frames_received: 25,
+        frames_decoded: 25,
+        frames_dropped: 0,
+        current_fps: activeProfile.fps,
+        bitrate_mbps: activeProfile.bitrate_mbps,
+        media_probe_valid: true,
+        media_probe_format: "compressed_h264_test_pattern",
+        media_probe_width: activeProfile.width,
+        media_probe_height: activeProfile.height,
+        media_probe_target_fps: activeProfile.fps,
+        media_probe_target_bitrate_mbps: activeProfile.bitrate_mbps,
+        media_probe_payload_bytes: 55555,
+        last_media_sequence: 25,
+        last_media_timestamp_us: 123456,
+        last_media_payload_hash: "fnv1a64:abc123",
+        last_error: null,
+      });
+    }
+    if (command === "ipc_media_pipeline_snapshot") {
+      return Promise.resolve({
+        session_id: args?.sessionId,
+        attached_surfaces: [
+          {
+            surface_id: "surface-1",
+            backend: "d3d11",
+            window_handle: 1234,
+          },
+        ],
+        active_decoder: "nvdec",
+        active_renderer: "d3d11",
+        queue_depth: 1,
+        dropped_frames: 0,
+        render_presented_frames: 25,
+        stage_metrics: [
+          { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
+          { stage: "render_present", p50_ms: 5, p95_ms: 7 },
+        ],
+      });
+    }
+    if (command === "ipc_stop_session") return Promise.resolve("stopped");
+    if (command === "automation_write_report") return Promise.resolve(null);
+    return Promise.resolve(null);
+  });
+
+  return mockInvoke;
+}

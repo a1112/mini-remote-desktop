@@ -1,0 +1,9 @@
+{
+  "component": "decode",
+  "crate": "mrd-decode",
+  "backend": "nvenc_720p",
+  "test_name": "perf_nvenc_720p_decode_reports_latency_distribution",
+  "case_name": "decode.nvenc_720p",
+  "sample_count": 60,
+  "threshold_file": "decode.json"
+}

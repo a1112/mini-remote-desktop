@@ -1,0 +1,31 @@
+# Copy to turnserver.conf, replace every CHANGE_ME value, and keep the file private.
+listening-port=3478
+tls-listening-port=5349
+fingerprint
+realm=remote.example.com
+server-name=remote.example.com
+
+# Coturn REST API authentication. Must match RDESK_TURN_AUTH_SECRET.
+use-auth-secret
+static-auth-secret=CHANGE_ME_WITH_AT_LEAST_32_RANDOM_BYTES
+
+# Set these for a public deployment. For NAT, use PUBLIC_IP/PRIVATE_IP.
+listening-ip=0.0.0.0
+# external-ip=203.0.113.10
+
+min-port=49160
+max-port=49260
+stale-nonce=600
+no-multicast-peers
+no-cli
+no-loopback-peers
+
+# TLS is required for turns: URLs.
+cert=/etc/coturn/tls/fullchain.pem
+pkey=/etc/coturn/tls/privkey.pem
+no-tlsv1
+no-tlsv1_1
+
+# Keep credentials and client addresses out of verbose logs.
+simple-log
+log-file=stdout

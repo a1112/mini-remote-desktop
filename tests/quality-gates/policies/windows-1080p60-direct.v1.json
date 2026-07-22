@@ -1,0 +1,8 @@
+{
+  "id": "windows-1080p60-direct.v1",
+  "required_scenarios": ["windows.1080p60.direct"],
+  "allow_skips": [],
+  "thresholds": [
+    {"metric": "visible_first_frame_ms", "route": "direct", "max": 4000.0}
+  ]
+}

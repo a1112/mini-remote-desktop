@@ -1,0 +1,27 @@
+[package]
+name = "mrd-capture-pipewire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 capture support
+x11 = { version = "2.21", features = ["xlib", "xrandr", "xfixes", "xrender"], optional = true }
+# PipeWire/Portal support. The portal path uses xdg-desktop-portal for
+# authorization and GStreamer pipewiresrc for frame extraction, avoiding a
+# hard dependency on libspa bindgen in developer workstations.
+serde = { version = "1.0", features = ["derive"], optional = true }
+ashpd = { version = "0.10", default-features = false, features = ["tokio"], optional = true }
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["x11"]
+x11 = ["dep:x11"]
+pipewire = ["dep:serde", "dep:ashpd", "dep:libc"]
+portal = ["pipewire", "dep:ashpd"]
+all = ["x11", "pipewire", "portal"]

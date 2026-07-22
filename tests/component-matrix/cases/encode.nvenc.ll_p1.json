@@ -1,0 +1,9 @@
+{
+  "component": "encode",
+  "crate": "mrd-encode-nvenc",
+  "backend": "nvenc_ll_p1",
+  "test_name": "perf_nvenc_encode_reports_latency_distribution",
+  "case_name": "encode.nvenc.ll_p1",
+  "sample_count": 120,
+  "threshold_file": "encode.nvenc.json"
+}

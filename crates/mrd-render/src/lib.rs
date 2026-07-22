@@ -1,0 +1,450 @@
+pub use mrd_pipeline_core::RuntimeStatus;
+
+use bytes::Bytes;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderPixelFormat {
+    Rgb24,
+    Bgra32,
+    Nv12,
+    /// D3D11 shared BGRA texture (zero-copy direct capture-render path)
+    #[cfg(windows)]
+    D3D11SharedBgra,
+    /// D3D11 shared NV12 texture (zero-copy path)
+    #[cfg(windows)]
+    D3D11SharedNv12,
+    /// D3D11 shared P010/P016 texture (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010,
+}
+
+/// Frame data for rendering
+///
+/// Supports both CPU data and D3D11 shared texture (zero-copy path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderFrameData {
+    /// CPU RGB24 data
+    Rgb24(Vec<u8>),
+    /// CPU BGRA32 data
+    Bgra32(Vec<u8>),
+    /// CPU NV12 data with a single row pitch for both planes
+    Nv12 { data: Vec<u8>, pitch: usize },
+    /// CPU NV12 data backed by a shared byte buffer.
+    Nv12Bytes { data: Bytes, pitch: usize },
+    /// D3D11 shared texture handle (zero-copy path)
+    #[cfg(windows)]
+    D3D11SharedBgra {
+        shared_handle: isize,
+        width: u32,
+        height: u32,
+        row_pitch: u32,
+    },
+    /// D3D11 shared texture handle (zero-copy path)
+    #[cfg(windows)]
+    D3D11SharedNv12 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+    /// D3D11 shared P010/P016 texture handle (zero-copy Main10 path)
+    #[cfg(windows)]
+    D3D11SharedP010 {
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+        width: u32,
+        height: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderFrame {
+    pub width: usize,
+    pub height: usize,
+    pub pixel_format: RenderPixelFormat,
+    pub data: RenderFrameData,
+}
+
+impl RenderFrame {
+    /// Create a frame from CPU RGB24 data
+    pub fn from_rgb24(width: usize, height: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Rgb24,
+            data: RenderFrameData::Rgb24(data),
+        }
+    }
+
+    /// Create a frame from CPU BGRA32 data
+    pub fn from_bgra32(width: usize, height: usize, data: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Bgra32,
+            data: RenderFrameData::Bgra32(data),
+        }
+    }
+
+    /// Create a frame from CPU NV12 data.
+    pub fn from_nv12(width: usize, height: usize, data: Vec<u8>, pitch: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Nv12,
+            data: RenderFrameData::Nv12 { data, pitch },
+        }
+    }
+
+    /// Create a frame from CPU NV12 data without forcing Vec ownership.
+    pub fn from_nv12_bytes(width: usize, height: usize, data: Bytes, pitch: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::Nv12,
+            data: RenderFrameData::Nv12Bytes { data, pitch },
+        }
+    }
+
+    /// Create a frame from a D3D11 shared BGRA texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_bgra(
+        width: usize,
+        height: usize,
+        shared_handle: isize,
+        row_pitch: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedBgra,
+            data: RenderFrameData::D3D11SharedBgra {
+                shared_handle,
+                width: width as u32,
+                height: height as u32,
+                row_pitch,
+            },
+        }
+    }
+
+    /// Create a frame from D3D11 shared NV12 texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_nv12(
+        width: usize,
+        height: usize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedNv12,
+            data: RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                width: width as u32,
+                height: height as u32,
+            },
+        }
+    }
+
+    /// Create a frame from D3D11 shared P010/P016 texture
+    #[cfg(windows)]
+    pub fn from_d3d11_shared_p010(
+        width: usize,
+        height: usize,
+        shared_handle_y: isize,
+        shared_handle_uv: isize,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::D3D11SharedP010,
+            data: RenderFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                width: width as u32,
+                height: height as u32,
+            },
+        }
+    }
+
+    /// Get the CPU RGB24 data if available
+    pub fn as_rgb24(&self) -> Option<&[u8]> {
+        match &self.data {
+            RenderFrameData::Rgb24(data) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get the CPU BGRA32 data if available
+    pub fn as_bgra32(&self) -> Option<&[u8]> {
+        match &self.data {
+            RenderFrameData::Bgra32(data) => Some(data.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get the CPU NV12 data and pitch if available.
+    pub fn as_nv12(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            RenderFrameData::Nv12 { data, pitch } => Some((data.as_slice(), *pitch)),
+            RenderFrameData::Nv12Bytes { data, pitch } => Some((data.as_ref(), *pitch)),
+            _ => None,
+        }
+    }
+
+    /// Get the shared texture handle if available
+    #[cfg(windows)]
+    pub fn shared_handle(&self) -> Option<isize> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
+            RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y, ..
+            }
+            | RenderFrameData::D3D11SharedP010 {
+                shared_handle_y, ..
+            } => Some(*shared_handle_y),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture handle if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_handle(&self) -> Option<isize> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { shared_handle, .. } => Some(*shared_handle),
+            _ => None,
+        }
+    }
+
+    /// Get the shared BGRA texture row pitch if available.
+    #[cfg(windows)]
+    pub fn shared_bgra_row_pitch(&self) -> Option<u32> {
+        match &self.data {
+            RenderFrameData::D3D11SharedBgra { row_pitch, .. } => Some(*row_pitch),
+            _ => None,
+        }
+    }
+
+    /// Get the shared Y and UV texture handles if available.
+    #[cfg(windows)]
+    pub fn shared_handles(&self) -> Option<(isize, isize)> {
+        match &self.data {
+            RenderFrameData::D3D11SharedNv12 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            }
+            | RenderFrameData::D3D11SharedP010 {
+                shared_handle_y,
+                shared_handle_uv,
+                ..
+            } => Some((*shared_handle_y, *shared_handle_uv)),
+            _ => None,
+        }
+    }
+
+    /// Check if this frame uses shared texture (zero-copy)
+    pub fn is_shared_texture(&self) -> bool {
+        match &self.data {
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedBgra { .. } => true,
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } => {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendererDescriptor {
+    pub id: &'static str,
+    pub runtime_status: RuntimeStatus,
+    pub supported_formats: &'static [RenderPixelFormat],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RendererSnapshot {
+    pub attached_to_target: bool,
+    /// Frames accepted by the renderer upload boundary.
+    pub uploaded_frame_count: u64,
+    /// Frames that reached the platform presentation boundary.
+    ///
+    /// Renderers that cannot distinguish upload from presentation should keep
+    /// this aligned with `uploaded_frame_count`.
+    pub presented_frame_count: u64,
+    /// Frames skipped by a non-blocking present path, for example
+    /// `DXGI_ERROR_WAS_STILL_DRAWING` on D3D11.
+    pub present_skipped_count: u64,
+    /// Frames replaced inside a renderer-owned latest-frame queue before presentation.
+    pub render_queue_replacements: Option<u64>,
+    /// Last presentation status reported by the renderer.
+    pub last_present_status: Option<String>,
+    /// Renderer low-latency frame latency target, when the backend supports one.
+    pub low_latency_frame_latency_target: Option<u32>,
+    /// Actual swap-chain frame latency configured on the attached surface.
+    pub swap_chain_max_frame_latency: Option<u32>,
+    /// Whether the attached swap chain was created with tearing presents enabled.
+    pub swap_chain_allow_tearing: Option<bool>,
+    /// Whether the attached swap chain exposes a frame-latency waitable object.
+    pub swap_chain_waitable_object: Option<bool>,
+    /// Presentation policy selected by the renderer, for example `nonblocking` or `waitable`.
+    pub swap_chain_present_mode: Option<String>,
+    /// Refresh rate of the display hosting the render target, when known.
+    pub display_refresh_hz: Option<u32>,
+    /// Effective render thread priority label, when the backend can query it.
+    pub render_thread_priority: Option<String>,
+    /// Number of frame-latency waitable-object waits completed by the renderer.
+    pub waitable_wait_count: Option<u64>,
+    /// Total waitable-object wait duration in milliseconds.
+    pub waitable_wait_total_ms: Option<f64>,
+    /// Number of waitable-object waits that timed out.
+    pub waitable_timeout_count: Option<u64>,
+    /// Last waitable-object wait duration in milliseconds.
+    pub last_waitable_wait_ms: Option<f64>,
+    /// Last render-frame waitable prepare duration in milliseconds.
+    pub last_render_prepare_wait_ms: Option<f64>,
+    /// Last shared texture/resource/SRV preparation duration in milliseconds.
+    pub last_render_shared_resource_ms: Option<f64>,
+    /// Last wait for a platform drawable/backbuffer before encoding draw work.
+    pub last_render_wait_for_drawable_ms: Option<f64>,
+    /// Last render command encode plus commit duration in milliseconds.
+    pub last_render_encode_commit_ms: Option<f64>,
+    /// Last D3D draw/copy plus present duration in milliseconds.
+    pub last_render_draw_present_ms: Option<f64>,
+    pub last_width: usize,
+    pub last_height: usize,
+    pub last_pixel_format: Option<RenderPixelFormat>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderTarget {
+    WindowHandle(isize),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    #[error("{0}")]
+    Message(String),
+}
+
+pub trait RendererInstance: Send {
+    fn attach_target(&mut self, target: RenderTarget) -> Result<(), RenderError>;
+    fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError>;
+    fn upload_h264_access_unit(
+        &mut self,
+        _width: usize,
+        _height: usize,
+        _timestamp_us: u64,
+        _payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Message(
+            "renderer does not accept compressed H.264 access units".to_string(),
+        ))
+    }
+    fn upload_hevc_access_unit(
+        &mut self,
+        _width: usize,
+        _height: usize,
+        _timestamp_us: u64,
+        _payload: bytes::Bytes,
+    ) -> Result<(), RenderError> {
+        Err(RenderError::Message(
+            "renderer does not accept compressed HEVC access units".to_string(),
+        ))
+    }
+    fn snapshot(&self) -> RendererSnapshot;
+}
+
+pub type BoxedRenderer = Box<dyn RendererInstance>;
+
+pub trait RendererFactory: Send + Sync {
+    fn descriptor(&self) -> RendererDescriptor;
+    fn create(&self) -> Result<BoxedRenderer, RenderError>;
+}
+
+const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
+    RenderPixelFormat::Rgb24,
+    RenderPixelFormat::Bgra32,
+    #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedBgra,
+    #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedNv12,
+    #[cfg(windows)]
+    RenderPixelFormat::D3D11SharedP010,
+];
+
+pub fn d3d11_descriptor() -> RendererDescriptor {
+    RendererDescriptor {
+        id: "d3d11",
+        runtime_status: RuntimeStatus::RuntimeBacked,
+        supported_formats: SUPPORTED_FORMATS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::{d3d11_descriptor, RenderFrame, RenderFrameData, RenderPixelFormat, RuntimeStatus};
+
+    #[test]
+    fn d3d11_descriptor_reports_runtime_backed_formats() {
+        let descriptor = d3d11_descriptor();
+
+        assert_eq!(descriptor.id, "d3d11");
+        assert_eq!(descriptor.runtime_status, RuntimeStatus::RuntimeBacked);
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::Rgb24));
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::Bgra32));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedNv12));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedBgra));
+        #[cfg(windows)]
+        assert!(descriptor
+            .supported_formats
+            .contains(&RenderPixelFormat::D3D11SharedP010));
+    }
+
+    #[test]
+    fn nv12_bytes_frame_exposes_nv12_slice() {
+        let data = Bytes::from_static(&[16, 235, 81, 145, 128, 128]);
+        let frame = RenderFrame::from_nv12_bytes(2, 2, data.clone(), 2);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::Nv12);
+        assert_eq!(frame.as_nv12(), Some((data.as_ref(), 2)));
+        assert!(matches!(frame.data, RenderFrameData::Nv12Bytes { .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_shared_bgra_frame_is_zero_copy_render_data() {
+        let frame = super::RenderFrame::from_d3d11_shared_bgra(1280, 720, 42, 1280 * 4);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::D3D11SharedBgra);
+        assert!(frame.is_shared_texture());
+        assert_eq!(frame.shared_handle(), Some(42));
+        assert_eq!(frame.shared_bgra_handle(), Some(42));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn d3d11_shared_p010_frame_is_zero_copy_render_data() {
+        let frame = super::RenderFrame::from_d3d11_shared_p010(1280, 720, 42, 43);
+
+        assert_eq!(frame.pixel_format, RenderPixelFormat::D3D11SharedP010);
+        assert!(frame.is_shared_texture());
+        assert_eq!(frame.shared_handles(), Some((42, 43)));
+    }
+}

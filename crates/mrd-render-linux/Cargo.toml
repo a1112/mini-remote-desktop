@@ -1,0 +1,19 @@
+[package]
+name = "mrd-render-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+mrd-render = { path = "../mrd-render" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 support
+x11 = { version = "2.21", features = ["xlib", "xrandr"], optional = true }
+
+[features]
+default = ["x11"]
+x11 = ["dep:x11"]

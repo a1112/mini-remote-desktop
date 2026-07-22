@@ -1,0 +1,36 @@
+[package]
+name = "mrd-session-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "mrd_session_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mrd-session-agent"
+path = "src/main.rs"
+
+[dependencies]
+ed25519-dalek.workspace = true
+mrd-agent-ipc = { path = "../../crates/mrd-agent-ipc" }
+mrd-input = { path = "../../crates/mrd-input" }
+mrd-proto = { path = "../../crates/mrd-proto" }
+mrd-session = { path = "../../crates/mrd-session" }
+ring.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mrd-capture-dxgi = { path = "../../crates/mrd-capture-dxgi" }
+mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
+mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
+mrd-render = { path = "../../crates/mrd-render" }
+mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_StationsAndDesktops", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+mrd-service = { path = "../mrd-service" }

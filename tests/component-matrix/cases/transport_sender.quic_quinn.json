@@ -1,0 +1,9 @@
+{
+  "component": "transport",
+  "crate": "mrd-transport-quic-quinn",
+  "backend": "quic_quinn",
+  "test_name": "perf_quinn_transport_sender_reports_latency_distribution",
+  "case_name": "transport_sender.quic_quinn",
+  "sample_count": 120,
+  "threshold_file": "transport_sender_quic.json"
+}

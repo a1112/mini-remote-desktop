@@ -1,0 +1,94 @@
+# Multi-Protocol Remote Desktop Client Configuration
+
+# Signaling Server
+signaling:
+  ws_url: "ws://localhost:9527"
+  reconnect_interval: 5.0
+  ping_interval: 30.0
+
+# Client Info
+client:
+  name: "Qt Controller"
+  type: "controller"
+
+# Protocol Configuration
+protocols:
+  # Preferred protocol order
+  priority:
+    - webrtc
+    - quic
+    - jpeg
+
+  webrtc:
+    enabled: true
+    ice_servers:
+      - urls: "stun:stun.l.google.com:19302"
+      - urls: "stun:stun1.l.google.com:19302"
+
+  quic:
+    enabled: true
+    # QUIC-specific settings
+
+  jpeg:
+    enabled: true
+    # JPEG streaming settings
+
+# Runtime transport controls sent via signaling "updateCapture"
+transport_controls:
+  quic_pacer:
+    enable: false
+    mode: "auto"          # auto, manual
+    interval_ms: 2        # token refill interval
+    burst: 4              # token bucket burst
+    auto_on_full: 8       # queue-full pressure threshold to enable pacing
+    auto_off_ok: 64       # consecutive-send relief threshold to disable pacing
+
+# Video Configuration
+video:
+  # Decoder settings
+  decoder:
+    # Hardware acceleration settings
+    hardware_accelerated: true
+    # Preferred decoder priority (auto-detect if empty)
+    decoder_priority:
+      - "h264_nvdec"    # NVIDIA NVDEC (GPU)
+      - "h264_qsv"      # Intel Quick Sync
+      - "h264_d3d11va"  # D3D11 Video Acceleration
+      - "h264_dxva2"    # DXVA2 (Windows 7+)
+      - "h264"          # Software fallback
+    thread_count: 1  # Low latency (use 1 for minimal buffering)
+    low_delay: true
+
+    # Zero-copy settings (for minimal latency)
+    zero_copy: true
+
+  # Display/Renderer settings
+  display:
+    maintain_aspect_ratio: true
+    scale_mode: "fit"  # fit, fill, stretch
+
+    # Rendering backend (auto, opengl, d3d11, software)
+    renderer: "auto"  # auto will try: d3d11 > opengl > software
+
+    # OpenGL settings
+    opengl:
+      enabled: true
+      vsync: false  # Disable vsync for lowest latency
+
+    # D3D11 settings (Windows only)
+    d3d11:
+      enabled: true
+      flip_model: true  # Use flip model for lower latency
+      allow_tearing: true  # Allow tearing for lowest latency
+
+# UI Configuration
+ui:
+  theme: "dark"  # dark, light, auto
+  show_stats: true
+  stats_update_interval: 1000  # ms
+  device_list_update_interval: 5000  # ms
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "client-qt.log"

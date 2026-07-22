@@ -1,0 +1,22 @@
+[package]
+name = "mrd-decode-nvdec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_LibraryLoader",
+  "Win32_Graphics",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Direct3D",
+] }
+
+[features]
+default = []
+
+[dev-dependencies]
+openh264 = "0.8"

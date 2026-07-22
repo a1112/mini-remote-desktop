@@ -1,0 +1,28 @@
+﻿{
+    "analysis":  {
+                     "quic_pacer":  {
+                                        "burst":  4,
+                                        "mode":  "manual",
+                                        "auto_off_ok":  64,
+                                        "interval_ms":  2,
+                                        "enable":  false,
+                                        "auto_on_full":  8
+                                    }
+                 },
+    "duration_sec":  10,
+    "thresholds":  {
+                       "agent_errors_max":  20,
+                       "agent_quic_drop_max":  10000,
+                       "jitter":  {
+                                      "p95_ms_max":  120,
+                                      "p99_ms_max":  300,
+                                      "gt_200ms_max":  10,
+                                      "gt_100ms_max":  40
+                                  },
+                       "control_connect_timeout_sec":  20,
+                       "min_frames":  {
+                                          "quic":  20,
+                                          "webtransport":  10
+                                      }
+                   }
+}
