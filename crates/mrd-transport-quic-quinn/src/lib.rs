@@ -9,11 +9,19 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::RootCertStore;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+
+// Quinn's default send window is roughly 10 MiB, which can buffer multiple
+// seconds of a 20 Mbps desktop stream before write_all applies backpressure.
+// A LAN RTT is small enough for 256 KiB to sustain well above the supported
+// media bitrates while bounding obsolete reliable video queued in userspace.
+const LOW_LATENCY_SEND_WINDOW_BYTES: u64 = 256 * 1024;
+const LOW_LATENCY_STREAM_RECEIVE_WINDOW_BYTES: u32 = 256 * 1024;
+const LOW_LATENCY_CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicTransportMetadata {
@@ -51,11 +59,12 @@ impl QuinnServerListener {
         let cert_der = server_cert.as_ref().to_vec();
         let server_key =
             rustls::pki_types::PrivatePkcs8KeyDer::from(server_crypto.signing_key.serialize_der());
-        let server_config = ServerConfig::with_single_cert(
+        let mut server_config = ServerConfig::with_single_cert(
             vec![server_cert],
             rustls::pki_types::PrivateKeyDer::Pkcs8(server_key),
         )
         .map_err(|error| QuinnTransportError::Message(format!("server config failed: {error}")))?;
+        server_config.transport_config(low_latency_transport_config());
 
         let bind_addr = bind_addr.parse::<SocketAddr>().map_err(|error| {
             QuinnTransportError::Message(format!("parse bind_addr failed: {error}"))
@@ -347,10 +356,11 @@ impl QuinnDatagramEndpoint {
         roots.add(server_cert).map_err(|error| {
             QuinnTransportError::Message(format!("add root cert failed: {error}"))
         })?;
-        let client_config =
+        let mut client_config =
             ClientConfig::with_root_certificates(Arc::new(roots)).map_err(|error| {
                 QuinnTransportError::Message(format!("client config failed: {error}"))
             })?;
+        client_config.transport_config(low_latency_transport_config());
 
         let bind_addr = bind_addr.parse::<SocketAddr>().map_err(|error| {
             QuinnTransportError::Message(format!("parse bind_addr failed: {error}"))
@@ -384,6 +394,19 @@ impl QuinnDatagramEndpoint {
             }),
         })
     }
+}
+
+fn low_latency_transport_config() -> Arc<TransportConfig> {
+    let mut config = TransportConfig::default();
+    config
+        .send_window(LOW_LATENCY_SEND_WINDOW_BYTES)
+        .stream_receive_window(VarInt::from_u32(
+            LOW_LATENCY_STREAM_RECEIVE_WINDOW_BYTES,
+        ))
+        .receive_window(VarInt::from_u32(
+            LOW_LATENCY_CONNECTION_RECEIVE_WINDOW_BYTES,
+        ));
+    Arc::new(config)
 }
 
 pub struct QuinnDatagramPair {

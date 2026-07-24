@@ -3531,7 +3531,10 @@ async fn receive_quic_media_loop(
         &initial_media_profile,
     );
     let mut reliable_media_rx = if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        // Keep only a short handoff queue. QUIC flow control provides the
+        // upstream backpressure; a 32-frame queue alone adds over 500 ms at
+        // 60 fps before the bounded render queues are even reached.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
         let reliable_endpoint = endpoint.clone();
         tokio::spawn(async move {
             if reliable_media_read_mode == LanReliableMediaSendMode::PerMessage {

@@ -158,6 +158,33 @@ async fn persistent_reliable_stream_does_not_reset_while_idle() {
 }
 
 #[tokio::test]
+async fn persistent_reliable_stream_applies_low_latency_backpressure() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+    let payload = Bytes::from(vec![0x5a; 512 * 1024]);
+    let expected = payload.clone();
+    let client = pair.client.clone();
+    let send = tokio::spawn(async move { client.send_reliable_message_persistent(payload).await });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !send.is_finished(),
+        "sender buffered more than the low-latency flow-control window"
+    );
+
+    let received = pair
+        .server
+        .read_reliable_message_persistent(1024 * 1024)
+        .await
+        .expect("read flow-controlled persistent message");
+    send.await
+        .expect("persistent send task failed")
+        .expect("persistent send failed after receiver drained data");
+    assert_eq!(received, expected);
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_fragmented_access_unit() {
     let pair = QuinnDatagramPair::loopback()
         .await
