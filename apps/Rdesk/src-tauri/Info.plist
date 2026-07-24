@@ -2,6 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Rdesk needs local network access to discover devices and establish remote desktop sessions.</string>
   <key>NSScreenCaptureUsageDescription</key>
   <string>Rdesk needs screen recording permission to capture and stream your desktop.</string>
 </dict>

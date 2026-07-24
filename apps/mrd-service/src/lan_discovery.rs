@@ -641,12 +641,25 @@ pub async fn request_lan_remote_session(
         requested_media_profile: requested_profile,
         timestamp_ms: now_ms(),
     };
-    send_packet(&socket, &packet, target).await?;
+    let local_addr = socket
+        .local_addr()
+        .context("failed to inspect LAN remote request UDP socket")?;
+    send_packet(&socket, &packet, target)
+        .await
+        .with_context(|| {
+            format!("failed to send LAN remote request from {local_addr} to {target}")
+        })?;
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let (len, ack_addr) = timeout(LAN_REMOTE_SESSION_ACK_TIMEOUT, socket.recv_from(&mut buffer))
-        .await
-        .context("LAN remote request timed out")??;
+    let receive_result = timeout(
+        LAN_REMOTE_SESSION_ACK_TIMEOUT,
+        socket.recv_from(&mut buffer),
+    )
+    .await
+    .context("LAN remote request timed out")?;
+    let (len, ack_addr) = receive_result.with_context(|| {
+        format!("failed to receive LAN remote response on {local_addr} from {target}")
+    })?;
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
     match ack {
         LanDiscoveryPacket::RemoteSessionAck {

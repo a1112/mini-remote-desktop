@@ -297,12 +297,40 @@ fn candidate_service_paths() -> Vec<PathBuf> {
 
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
+            #[cfg(target_os = "macos")]
+            {
+                if let Some(contents_dir) = dir.parent() {
+                    candidates.push(
+                        contents_dir
+                            .join("Resources")
+                            .join("MrdService.app")
+                            .join("Contents")
+                            .join("MacOS")
+                            .join(service_exe_name()),
+                    );
+                }
+                candidates.push(
+                    dir.join("MrdService.app")
+                        .join("Contents")
+                        .join("MacOS")
+                        .join(service_exe_name()),
+                );
+            }
             candidates.push(dir.join(service_exe_name()));
         }
     }
 
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
         if !target_dir.trim().is_empty() {
+            #[cfg(target_os = "macos")]
+            candidates.push(
+                PathBuf::from(&target_dir)
+                    .join(cargo_profile_dir())
+                    .join("MrdService.app")
+                    .join("Contents")
+                    .join("MacOS")
+                    .join(service_exe_name()),
+            );
             candidates.push(
                 PathBuf::from(target_dir)
                     .join(cargo_profile_dir())
@@ -311,6 +339,16 @@ fn candidate_service_paths() -> Vec<PathBuf> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    candidates.push(
+        workspace_root()
+            .join("target")
+            .join(cargo_profile_dir())
+            .join("MrdService.app")
+            .join("Contents")
+            .join("MacOS")
+            .join(service_exe_name()),
+    );
     candidates.push(
         workspace_root()
             .join("target")
@@ -319,6 +357,18 @@ fn candidate_service_paths() -> Vec<PathBuf> {
     );
 
     if let Ok(current_dir) = std::env::current_dir() {
+        #[cfg(target_os = "macos")]
+        candidates.push(
+            current_dir
+                .join("..")
+                .join("..")
+                .join("target")
+                .join(cargo_profile_dir())
+                .join("MrdService.app")
+                .join("Contents")
+                .join("MacOS")
+                .join(service_exe_name()),
+        );
         candidates.push(
             current_dir
                 .join("..")
@@ -423,6 +473,21 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some(service_exe_name())
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_service_bundle_candidates_precede_raw_binaries() {
+        let candidates = candidate_service_paths();
+        assert!(candidates.windows(2).any(|pair| {
+            pair[0]
+                .components()
+                .any(|component| component.as_os_str() == "MrdService.app")
+                && !pair[1]
+                    .components()
+                    .any(|component| component.as_os_str() == "MrdService.app")
+                && pair[0].file_name() == pair[1].file_name()
+        }));
     }
 
     #[test]
