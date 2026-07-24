@@ -17,9 +17,11 @@ use tokio::sync::Mutex;
 
 // Quinn's default send window is roughly 10 MiB, which can buffer multiple
 // seconds of a 20 Mbps desktop stream before write_all applies backpressure.
-// A LAN RTT is small enough for 256 KiB to sustain well above the supported
-// media bitrates while bounding obsolete reliable video queued in userspace.
-const LOW_LATENCY_SEND_WINDOW_BYTES: u64 = 256 * 1024;
+// A LAN RTT is usually small, but Wi-Fi loss can temporarily shrink usable
+// capacity enough that 256 KiB repeatedly backpressures a 20 Mbps media sender.
+// Keep the aggregate window at 512 KiB while retaining a 256 KiB per-stream
+// receive window so an individual obsolete frame cannot build a large backlog.
+const LOW_LATENCY_SEND_WINDOW_BYTES: u64 = 512 * 1024;
 const LOW_LATENCY_STREAM_RECEIVE_WINDOW_BYTES: u32 = 256 * 1024;
 const LOW_LATENCY_CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 1024 * 1024;
 
