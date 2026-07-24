@@ -3248,12 +3248,20 @@ fn lan_capture_pump_drives_sender() -> bool {
 
 #[cfg(target_os = "macos")]
 fn lan_capture_pump_repeat_latest() -> bool {
-    env_bool_override(
+    lan_capture_pump_repeat_latest_from_env_value(
         std::env::var(LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV)
             .ok()
             .as_deref(),
     )
-    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_repeat_latest_from_env_value(value: Option<&str>) -> bool {
+    // ScreenCaptureKit can deliver below the requested cadence when the source display
+    // refreshes slowly or its contents are mostly idle. Prefer a fresh frame during the
+    // short grace window, then repeat the latest retained CVPixelBuffer so the transport
+    // and renderer still keep the negotiated frame cadence.
+    env_bool_override(value).unwrap_or(true)
 }
 
 #[cfg(target_os = "macos")]

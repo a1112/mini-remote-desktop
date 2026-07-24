@@ -4309,6 +4309,14 @@ fn macos_capture_pump_repeat_pacing_defaults_to_headroom() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_capture_pump_repeats_latest_by_default_and_allows_opt_out() {
+    assert!(lan_capture_pump_repeat_latest_from_env_value(None));
+    assert!(lan_capture_pump_repeat_latest_from_env_value(Some("true")));
+    assert!(!lan_capture_pump_repeat_latest_from_env_value(Some("false")));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_capture_pump_repeat_grace_uses_capture_headroom() {
     let profile = MediaProfile {
         width: 1280,
@@ -4370,6 +4378,34 @@ fn macos_capture_pump_waits_for_fresh_frame_before_repeating_latest() {
 
     assert!(!captured.repeated_latest_frame);
     assert_eq!(captured.frame.timestamp_us, 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_capture_pump_repeats_retained_frame_when_fresh_frame_misses_grace() {
+    let latest_frame =
+        CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 1, vec![7, 8, 9, 255]);
+    let shared = Arc::new((
+        StdMutex::new(MacosPumpedLanFrameState {
+            frames: VecDeque::new(),
+            latest_frame: Some(latest_frame),
+            sequence: 1,
+            error: None,
+        }),
+        StdCondvar::new(),
+    ));
+    let mut capture = MacosPumpedLanFrameCapture {
+        shared,
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: None,
+        repeat_grace_timeout: Duration::from_millis(1),
+    };
+
+    let captured = capture.capture_frame().expect("repeat retained frame");
+
+    assert!(captured.repeated_latest_frame);
+    assert_eq!(captured.frame.data, vec![7, 8, 9, 255]);
+    assert!(captured.frame.timestamp_us > 1);
 }
 
 #[cfg(windows)]
