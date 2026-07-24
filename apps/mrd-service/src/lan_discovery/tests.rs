@@ -5344,7 +5344,7 @@ fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
 }
 
 #[test]
-fn reliable_whole_frame_media_uses_per_frame_streams_for_low_bitrate_60fps() {
+fn reliable_whole_frame_media_uses_persistent_stream_for_60fps() {
     let desktop_60fps = MediaProfile {
         width: 1670,
         height: 1080,
@@ -5372,7 +5372,7 @@ fn reliable_whole_frame_media_uses_per_frame_streams_for_low_bitrate_60fps() {
 
     assert_eq!(
         select_reliable_media_send_mode_for_profile(true, true, true, &desktop_60fps),
-        LanReliableMediaSendMode::PerMessage
+        LanReliableMediaSendMode::Persistent
     );
     assert_eq!(
         select_reliable_media_send_mode_for_profile(true, true, false, &desktop_60fps),

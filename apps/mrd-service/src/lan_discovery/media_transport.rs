@@ -62,18 +62,7 @@ pub(crate) fn select_reliable_media_send_mode_for_profile(
     persistent_media_60fps_supported: bool,
     profile: &MediaProfile,
 ) -> LanReliableMediaSendMode {
-    if profile.fps <= 60
-        && use_best_effort_media_datagrams(profile)
-        && reliable_media_supported
-    {
-        // Keep each latency-sensitive desktop frame on its own QUIC stream. Loss
-        // then blocks only that frame instead of every newer frame sharing the
-        // persistent stream, while retaining reliable delivery across Wi-Fi.
-        LanReliableMediaSendMode::PerMessage
-    } else if profile.fps <= 60
-        && persistent_media_supported
-        && persistent_media_60fps_supported
-    {
+    if profile.fps <= 60 && persistent_media_supported && persistent_media_60fps_supported {
         LanReliableMediaSendMode::Persistent
     } else if reliable_media_supported
         && (profile.fps <= 60
