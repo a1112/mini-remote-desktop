@@ -17,6 +17,7 @@ import {
   buildWebCodecsDecoderConfig,
   buildWebRtcDiagnosticsStageRows,
   WebRtcPresentationLatencyTracker,
+  fitClientRectToRemoteFrame,
   localThreeFrameLatencyStatus,
   shouldAutoSwitchWebRtcVideoToWebCodecs,
   summarizeWebRtcInboundVideoStats,
@@ -230,6 +231,20 @@ function defaultRemoteDisplayInvoke(command: string): Promise<unknown> {
 }
 
 describe("RemoteDisplayWindowPage", () => {
+  it("fits a 1670x1080 render surface into the window without stretching", () => {
+    const fitted = fitClientRectToRemoteFrame(
+      { left: 0, top: 56, width: 1280, height: 720 },
+      { width: 1670, height: 1080 }
+    );
+
+    expect(fitted).not.toBeNull();
+    expect(fitted?.left).toBeCloseTo(83.33, 2);
+    expect(fitted?.top).toBe(56);
+    expect(fitted?.width).toBeCloseTo(1113.33, 2);
+    expect(fitted?.height).toBe(720);
+    expect((fitted?.width ?? 0) / (fitted?.height ?? 1)).toBeCloseTo(1670 / 1080, 6);
+  });
+
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -3346,7 +3361,7 @@ describe("RemoteDisplayWindowPage", () => {
     expect(configureCalls.some((call) => call.enabled === false)).toBe(false);
   });
 
-  it("passes the current remote frame size to native surface input configuration", async () => {
+  it("passes 1670x1080 frame size and aspect-fitted bounds to the native surface", async () => {
     const mockInvoke = getMockInvoke();
     const configureCalls: Record<string, unknown>[] = [];
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
@@ -3398,10 +3413,10 @@ describe("RemoteDisplayWindowPage", () => {
           current_fps: 144,
           bitrate_mbps: 70,
           media_probe_valid: true,
-          media_probe_width: 2560,
-          media_probe_height: 1440,
-          latest_frame_width: 2560,
-          latest_frame_height: 1440,
+          media_probe_width: 1670,
+          media_probe_height: 1080,
+          latest_frame_width: 1670,
+          latest_frame_height: 1080,
           latest_frame_data_url: null,
           last_error: null,
         });
@@ -3417,14 +3432,27 @@ describe("RemoteDisplayWindowPage", () => {
           const controlFrameSize = call.controlFrameSize as
             | { width?: number; height?: number }
             | undefined;
+          const rect = call.rect as
+            | { x?: number; y?: number; width?: number; height?: number }
+            | undefined;
           return (
             call.enabled === true &&
-            controlFrameSize?.width === 2560 &&
-            controlFrameSize.height === 1440
+            controlFrameSize?.width === 1670 &&
+            controlFrameSize.height === 1080 &&
+            rect?.x === 83 &&
+            rect.y === 56 &&
+            rect.width === 1113 &&
+            rect.height === 720
           );
         })
       ).toBe(true);
     });
+
+    const renderArea = screen.getByTestId("remote-render-area");
+    expect(renderArea).toHaveAttribute("data-frame-width", "1670");
+    expect(renderArea).toHaveAttribute("data-frame-height", "1080");
+    expect(renderArea).toHaveStyle({ aspectRatio: "1670 / 1080" });
+    expect(screen.getByTestId("remote-render-shell")).toContainElement(renderArea);
   });
 
   it("probes the D3D11 native surface before starting a local pipeline test", async () => {

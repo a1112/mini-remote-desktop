@@ -19,6 +19,15 @@ MAX_STEADY_STAGE_P95_MS=10
 MAX_REPEAT_LATEST_RATIO="0.25"
 MIN_CAPTURE_DIRECT_RATIO="0.99"
 MAX_RENDER_PRESENT_SKIP_RATIO="0.02"
+MAX_SAMPLE_DROP_RATIO="1.0"
+MIN_FPS_RATIO="0.50"
+TEST_IMPAIRMENT_LOSS_PCT="0"
+TEST_IMPAIRMENT_BASE_DELAY_MS="0"
+TEST_IMPAIRMENT_JITTER_MS="0"
+TEST_IMPAIRMENT_MTU_BYTES=""
+TEST_IMPAIRMENT_SEED="55715971976142"
+RELIABLE_WHOLE_FRAME_OVERRIDE=""
+ALLOW_ASPECT_PRESERVING_PROFILE=0
 RECEIVER_DECODER="videotoolbox"
 RENDER_PROXY_ASYNC_PRESENT=""
 HEVC_RAW_DECODE_ASYNC=""
@@ -42,6 +51,18 @@ Options:
   --min-capture-direct-ratio R  Minimum macOS CVPixelBuffer capture ratio. Default: 0.99
   --max-render-present-skip-ratio R
                                 Maximum native present skip ratio. Default: 0.02
+  --max-sample-drop-ratio R     Maximum sample-period media drop ratio. Default: 1.0
+  --min-fps-ratio R             Minimum decoded and rendered FPS as a fraction of
+                                requested FPS. Default: 0.50
+  --loss-pct PCT                Sender-side media datagram loss percentage. Default: 0
+  --base-delay-ms MS            Sender-side media delay in milliseconds. Default: 0
+  --jitter-ms MS                Additional seeded sender-side jitter. Default: 0
+  --mtu-bytes BYTES             Optional sender-side media fragmentation MTU
+  --impairment-seed N           Deterministic network impairment seed
+  --force-datagram-media        Disable reliable whole-frame media for loss/MTU tests
+  --allow-aspect-preserving-profile
+                                Accept a source-aspect-preserving resolution change
+                                when FPS, bitrate, codec, and native path still match
   --render-proxy-async-present VALUE
                                 Override MRD_MACOS_RENDER_PROXY_ASYNC_PRESENT for fallback proxy.
   --hevc-raw-decode-async VALUE Override MRD_VIDEOTOOLBOX_HEVC_RAW_DECODE_ASYNC for the app.
@@ -68,6 +89,15 @@ while [ "$#" -gt 0 ]; do
     --capture-source-kind) CAPTURE_SOURCE_KIND="$2"; shift 2 ;;
     --min-capture-direct-ratio) MIN_CAPTURE_DIRECT_RATIO="$2"; shift 2 ;;
     --max-render-present-skip-ratio) MAX_RENDER_PRESENT_SKIP_RATIO="$2"; shift 2 ;;
+    --max-sample-drop-ratio) MAX_SAMPLE_DROP_RATIO="$2"; shift 2 ;;
+    --min-fps-ratio) MIN_FPS_RATIO="$2"; shift 2 ;;
+    --loss-pct) TEST_IMPAIRMENT_LOSS_PCT="$2"; shift 2 ;;
+    --base-delay-ms) TEST_IMPAIRMENT_BASE_DELAY_MS="$2"; shift 2 ;;
+    --jitter-ms) TEST_IMPAIRMENT_JITTER_MS="$2"; shift 2 ;;
+    --mtu-bytes) TEST_IMPAIRMENT_MTU_BYTES="$2"; shift 2 ;;
+    --impairment-seed) TEST_IMPAIRMENT_SEED="$2"; shift 2 ;;
+    --force-datagram-media) RELIABLE_WHOLE_FRAME_OVERRIDE="false"; shift ;;
+    --allow-aspect-preserving-profile) ALLOW_ASPECT_PRESERVING_PROFILE=1; shift ;;
     --render-proxy-async-present) RENDER_PROXY_ASYNC_PRESENT="$2"; shift 2 ;;
     --hevc-raw-decode-async) HEVC_RAW_DECODE_ASYNC="$2"; shift 2 ;;
     --hevc-raw-decode-max-pending-inputs) HEVC_RAW_DECODE_MAX_PENDING_INPUTS="$2"; shift 2 ;;
@@ -105,7 +135,18 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-python3 - "$MAX_STEADY_STAGE_P95_MS" "$MAX_REPEAT_LATEST_RATIO" "$MIN_CAPTURE_DIRECT_RATIO" "$MAX_RENDER_PRESENT_SKIP_RATIO" <<'PY'
+python3 - \
+  "$MAX_STEADY_STAGE_P95_MS" \
+  "$MAX_REPEAT_LATEST_RATIO" \
+  "$MIN_CAPTURE_DIRECT_RATIO" \
+  "$MAX_RENDER_PRESENT_SKIP_RATIO" \
+  "$MAX_SAMPLE_DROP_RATIO" \
+  "$MIN_FPS_RATIO" \
+  "$TEST_IMPAIRMENT_LOSS_PCT" \
+  "$TEST_IMPAIRMENT_BASE_DELAY_MS" \
+  "$TEST_IMPAIRMENT_JITTER_MS" \
+  "$TEST_IMPAIRMENT_MTU_BYTES" \
+  "$TEST_IMPAIRMENT_SEED" <<'PY'
 import math
 import sys
 
@@ -114,14 +155,21 @@ names = [
     "MAX_REPEAT_LATEST_RATIO",
     "MIN_CAPTURE_DIRECT_RATIO",
     "MAX_RENDER_PRESENT_SKIP_RATIO",
+    "MAX_SAMPLE_DROP_RATIO",
+    "MIN_FPS_RATIO",
 ]
 
 try:
-    max_p95, max_repeat, min_direct, max_present_skip = [float(value) for value in sys.argv[1:5]]
+    max_p95, max_repeat, min_direct, max_present_skip, max_drop, min_fps_ratio = [
+        float(value) for value in sys.argv[1:7]
+    ]
 except ValueError as exc:
     raise SystemExit(f"invalid numeric canary threshold: {exc}")
 
-values = dict(zip(names, [max_p95, max_repeat, min_direct, max_present_skip]))
+values = dict(zip(
+    names,
+    [max_p95, max_repeat, min_direct, max_present_skip, max_drop, min_fps_ratio],
+))
 for name, value in values.items():
     if not math.isfinite(value):
         raise SystemExit(f"{name} must be finite")
@@ -131,6 +179,25 @@ for name in names[1:]:
     value = values[name]
     if value < 0 or value > 1:
         raise SystemExit(f"{name} must be between 0 and 1")
+
+loss_pct, base_delay_ms, jitter_ms, mtu_bytes, seed = sys.argv[7:12]
+try:
+    loss_pct_value = float(loss_pct)
+    base_delay_value = int(base_delay_ms)
+    jitter_value = int(jitter_ms)
+    seed_value = int(seed)
+    mtu_value = int(mtu_bytes) if mtu_bytes.strip() else None
+except ValueError as exc:
+    raise SystemExit(f"invalid network impairment value: {exc}")
+
+if not math.isfinite(loss_pct_value) or loss_pct_value < 0 or loss_pct_value > 100:
+    raise SystemExit("loss percentage must be finite and between 0 and 100")
+if base_delay_value < 0 or jitter_value < 0:
+    raise SystemExit("delay and jitter must be >= 0")
+if mtu_value is not None and mtu_value < 256:
+    raise SystemExit("MTU must be at least 256 bytes")
+if seed_value < 0:
+    raise SystemExit("impairment seed must be >= 0")
 PY
 
 REPO="$(cd "$REPO_ROOT" && pwd)"
@@ -141,10 +208,10 @@ mkdir -p "$RAW_DIR"
 GIT_COMMIT="$(git -C "$REPO" rev-parse --short=12 HEAD)"
 PNPM_BIN=""
 VITE_BIN=""
-if command -v pnpm >/dev/null 2>&1; then
-  PNPM_BIN="$(command -v pnpm)"
-elif [ -x "$REPO/apps/Rdesk/node_modules/.bin/vite" ]; then
+if [ -x "$REPO/apps/Rdesk/node_modules/.bin/vite" ]; then
   VITE_BIN="$REPO/apps/Rdesk/node_modules/.bin/vite"
+elif command -v pnpm >/dev/null 2>&1; then
+  PNPM_BIN="$(command -v pnpm)"
 else
   echo "pnpm or apps/Rdesk/node_modules/.bin/vite was not found; the runner will use the static Tauri harness fallback." >&2
 fi
@@ -1230,6 +1297,8 @@ run_static_tauri_lan_e2e_fallback() {
     kill_tree_force "$tauri_pid"
   fi
   kill_tree_force "$vite_pid"
+  reap_process "$tauri_pid"
+  reap_process "$vite_pid"
   tauri_pid=""
   vite_pid=""
   return 0
@@ -1321,7 +1390,16 @@ PY
 
 validate_report_performance_thresholds() {
   local report_path="$1"
-  python3 - "$report_path" "$MAX_STEADY_STAGE_P95_MS" "$MAX_REPEAT_LATEST_RATIO" "$MIN_CAPTURE_DIRECT_RATIO" "$MAX_RENDER_PRESENT_SKIP_RATIO" "$RENDER_DISPLAY" "$CODEC" <<'PY'
+  python3 - \
+    "$report_path" \
+    "$MAX_STEADY_STAGE_P95_MS" \
+    "$MAX_REPEAT_LATEST_RATIO" \
+    "$MIN_CAPTURE_DIRECT_RATIO" \
+    "$MAX_RENDER_PRESENT_SKIP_RATIO" \
+    "$MAX_SAMPLE_DROP_RATIO" \
+    "$RENDER_DISPLAY" \
+    "$CODEC" \
+    "$ALLOW_ASPECT_PRESERVING_PROFILE" <<'PY'
 import json
 import sys
 
@@ -1331,14 +1409,20 @@ import sys
     max_repeat_ratio_raw,
     min_capture_direct_ratio_raw,
     max_render_present_skip_ratio_raw,
+    max_sample_drop_ratio_raw,
     render_display_raw,
     expected_codec,
-) = sys.argv[1:8]
+    allow_aspect_preserving_profile_raw,
+) = sys.argv[1:10]
 max_p95 = float(max_p95_raw)
 max_repeat_ratio = float(max_repeat_ratio_raw)
 min_capture_direct_ratio = float(min_capture_direct_ratio_raw)
 max_render_present_skip_ratio = float(max_render_present_skip_ratio_raw)
+max_sample_drop_ratio = float(max_sample_drop_ratio_raw)
 render_display = render_display_raw not in {"0", "false", "False", "off", "OFF"}
+allow_aspect_preserving_profile = allow_aspect_preserving_profile_raw not in {
+    "0", "false", "False", "off", "OFF"
+}
 expected_codec = expected_codec.lower()
 expected_encoder = f"videotoolbox_{expected_codec}"
 expected_receiver_decoders = {
@@ -1353,6 +1437,89 @@ except Exception:
     raise SystemExit(0)
 
 report = document.get("report") if isinstance(document.get("report"), dict) else document
+
+if (
+    allow_aspect_preserving_profile
+    and report.get("status") == "skipped"
+    and report.get("failureReason") == "profile_downgraded"
+):
+    requested = report.get("requestedProfile") or {}
+    capture = report.get("captureSource") or {}
+    probe = report.get("probeSnapshot") or {}
+    pipeline = report.get("mediaPipelineSnapshot") or {}
+
+    requested_width = requested.get("width")
+    requested_height = requested.get("height")
+    source_width = capture.get("width")
+    source_height = capture.get("height")
+    selected_width = pipeline.get("active_width") or probe.get("media_probe_width")
+    selected_height = pipeline.get("active_height") or probe.get("media_probe_height")
+
+    dimensions = [
+        requested_width,
+        requested_height,
+        source_width,
+        source_height,
+        selected_width,
+        selected_height,
+    ]
+    dimensions_valid = all(
+        isinstance(value, (int, float)) and value > 0 for value in dimensions
+    )
+    aspect_preserved = False
+    expected_width = None
+    expected_height = None
+    if dimensions_valid:
+        scale = min(
+            requested_width / source_width,
+            requested_height / source_height,
+        )
+
+        def even_dimension(value):
+            rounded = max(2, int(round(value)))
+            return rounded if rounded % 2 == 0 else rounded - 1
+
+        expected_width = even_dimension(source_width * scale)
+        expected_height = even_dimension(source_height * scale)
+        aspect_preserved = (
+            abs(selected_width - expected_width) <= 2
+            and abs(selected_height - expected_height) <= 2
+        )
+
+    selected_fps = pipeline.get("active_fps") or probe.get("media_probe_target_fps")
+    selected_bitrate = (
+        pipeline.get("active_bitrate_mbps")
+        or probe.get("media_probe_target_bitrate_mbps")
+    )
+    selected_codec = str(pipeline.get("active_codec") or "").lower()
+    profile_identity_preserved = (
+        selected_fps == requested.get("fps")
+        and selected_bitrate == requested.get("bitrate_mbps")
+        and selected_codec == str(requested.get("codec") or "").lower()
+    )
+
+    if aspect_preserved and profile_identity_preserved:
+        report["status"] = "completed"
+        report["failureReason"] = None
+        report["errorMessage"] = None
+        report["aspectPreservingProfileAccepted"] = {
+            "requested_width": requested_width,
+            "requested_height": requested_height,
+            "source_width": source_width,
+            "source_height": source_height,
+            "selected_width": selected_width,
+            "selected_height": selected_height,
+            "expected_width": expected_width,
+            "expected_height": expected_height,
+        }
+        report.setdefault("stages", []).append({
+            "stage": "assert.aspect_preserving_profile",
+            "status": "completed",
+            "timestamp": report.get("finishedAt"),
+        })
+        if report is not document:
+            document["final_status"] = "completed"
+            document["script_classification"] = "completed"
 
 if report.get("status") != "completed":
     raise SystemExit(0)
@@ -1389,6 +1556,27 @@ steady_metrics = [
 sender_metrics = [item for item in steady_metrics if item["stage"].startswith("sender.")]
 receiver_metrics = [item for item in steady_metrics if item["stage"].startswith("receiver.")]
 failures = []
+sample_frames_decoded = report.get("sampleFramesDecoded") or 0
+sample_frames_dropped = report.get("sampleFramesDropped") or 0
+sample_sequence_gap_drops = report.get("sampleSequenceGapDrops") or 0
+sample_decode_error_drops = report.get("sampleDecodeErrorDrops") or 0
+sample_effective_drops = sample_sequence_gap_drops + sample_decode_error_drops
+sample_frame_total = sample_frames_decoded + sample_effective_drops
+sample_drop_ratio = (
+    sample_effective_drops / sample_frame_total
+    if sample_frame_total > 0
+    else 0.0
+)
+report["sampleDropRatio"] = sample_drop_ratio
+report["sampleReportedDropEvents"] = sample_frames_dropped
+report["sampleEffectiveDropFrames"] = sample_effective_drops
+if sample_drop_ratio > max_sample_drop_ratio:
+    failures.append(
+        f"effective sample media drop ratio {sample_drop_ratio:.4f} exceeds "
+        f"{max_sample_drop_ratio:.4f} "
+        f"({sample_effective_drops}/{sample_frame_total}; "
+        f"reported drop events {sample_frames_dropped})"
+    )
 if not sender_metrics:
     failures.append("missing sender steady-state stage metrics")
 if not receiver_metrics:
@@ -1572,6 +1760,13 @@ kill_tree_force() {
     kill_tree_force "$child"
   done
   kill -KILL "$pid" >/dev/null 2>&1 || true
+}
+
+reap_process() {
+  local pid="${1:-}"
+  if [ -n "$pid" ]; then
+    wait "$pid" 2>/dev/null || true
+  fi
 }
 
 write_failure_report() {
@@ -2057,6 +2252,7 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
     thresholds = report.get("thresholds") or {}
     sender_pipeline = report.get("senderMediaPipelineSnapshot") or {}
     sender_transport = sender_pipeline.get("sender_transport") or pipeline.get("sender_transport") or {}
+    test_impairment = sender_pipeline.get("test_impairment") or pipeline.get("test_impairment")
     sample_render_presented = report.get("sampleRenderFramesPresented")
     sample_queue_replacements = report.get("sampleRenderQueueReplacements")
     queue_replacements = sample_queue_replacements if isinstance(sample_queue_replacements, (int, float)) else pipeline.get("render_queue_replacements")
@@ -2106,6 +2302,7 @@ for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.
         "capture_cpu_frame_ratio": report.get("captureCpuFrameRatio") if isinstance(report.get("captureCpuFrameRatio"), (int, float)) else ratio(capture_cpu_frames, capture_frame_samples),
         "capture_memory_path": sender_transport.get("capture_memory_path"),
         "sender_datagram_fragments_sent": sender_transport.get("datagram_fragments_sent"),
+        "test_impairment": test_impairment,
         "receiver_proxy_forward_direct_v3_p95_ms": stage_p95(pipeline, "receiver.proxy_forward_direct_v3"),
         "render_proxy_next_drawable_p95_ms": stage_p95(pipeline, "render_proxy_next_drawable"),
         "render_proxy_draw_present_p95_ms": stage_p95(pipeline, "render_proxy_draw_present"),
@@ -2335,6 +2532,12 @@ EOF
     MRD_LAN_DISCOVERY_PROBE_ENDPOINTS="127.0.0.1:${controller_port}" \
     MRD_LAN_DISCOVERY_BROADCAST_ENABLED="false" \
     MRD_SERVICE_BUILD_ID="$GIT_COMMIT" \
+    MRD_LAN_TEST_IMPAIRMENT_LOSS_PCT="$TEST_IMPAIRMENT_LOSS_PCT" \
+    MRD_LAN_TEST_IMPAIRMENT_BASE_DELAY_MS="$TEST_IMPAIRMENT_BASE_DELAY_MS" \
+    MRD_LAN_TEST_IMPAIRMENT_JITTER_MS="$TEST_IMPAIRMENT_JITTER_MS" \
+    MRD_LAN_TEST_IMPAIRMENT_MTU_BYTES="$TEST_IMPAIRMENT_MTU_BYTES" \
+    MRD_LAN_TEST_IMPAIRMENT_SEED="$TEST_IMPAIRMENT_SEED" \
+    MRD_LAN_RELIABLE_WHOLE_FRAME="$RELIABLE_WHOLE_FRAME_OVERRIDE" \
     MRD_WEB_BRIDGE_ENABLED="false" \
     RUST_LOG="info" \
     "$run_service_bin" >"$logs_dir/peer/peer.stdout.log" 2>"$logs_dir/peer/peer.stderr.log" &
@@ -2346,10 +2549,14 @@ EOF
   local single_instance_port timeout_ms min_fps
   single_instance_port="$(free_tcp_port)"
   timeout_ms=$((DURATION_SECS * 1000 + 2500))
-  min_fps=$((fps / 2))
-  if [ "$min_fps" -lt 1 ]; then
-    min_fps=1
-  fi
+  min_fps="$(python3 - "$fps" "$MIN_FPS_RATIO" <<'PY'
+import sys
+
+requested_fps = float(sys.argv[1])
+minimum_ratio = float(sys.argv[2])
+print(max(1.0, requested_fps * minimum_ratio))
+PY
+)"
   local lan_e2e_stop_on_complete
   lan_e2e_stop_on_complete="true"
   if [ "$DISPLAY_MODE_POLICY" = "none" ]; then
@@ -2373,10 +2580,10 @@ EOF
       cd "$REPO/apps/Rdesk"
       if [ -n "$vite_node_bin" ]; then
         "$vite_node_bin" "$vite_js_path" --host 127.0.0.1 --port 9531 --strictPort
-      elif [ -n "$PNPM_BIN" ]; then
-        "$PNPM_BIN" exec vite --host 127.0.0.1 --port 9531 --strictPort
-      else
+      elif [ -n "$VITE_BIN" ]; then
         "$VITE_BIN" --host 127.0.0.1 --port 9531 --strictPort
+      else
+        "$PNPM_BIN" exec vite --host 127.0.0.1 --port 9531 --strictPort
       fi
     ) >"$logs_dir/vite.stdout.log" 2>"$logs_dir/vite.stderr.log" &
     vite_pid="$!"
@@ -2507,17 +2714,27 @@ PY
   kill_tree_force "$vite_pid"
   kill_tree_force "$controller_pid"
   kill_tree_force "$peer_pid"
+  reap_process "$tauri_pid"
+  reap_process "$vite_pid"
+  reap_process "$controller_pid"
+  reap_process "$peer_pid"
   rm -f "$controller_socket" "$peer_socket"
   trap - RETURN
 }
 
 IFS=',' read -r -a REQUESTED_PROFILES <<<"$PROFILE_IDS"
+overall_status=0
 for profile in "${REQUESTED_PROFILES[@]}"; do
   trimmed="$(printf '%s' "$profile" | xargs)"
   if [ -n "$trimmed" ]; then
     run_profile "$trimmed"
+    profile_status="$(status_from_report "$RAW_DIR/local-dual-${trimmed}.json")"
+    if [ "$profile_status" != "completed" ]; then
+      overall_status=1
+    fi
   fi
 done
 
 write_summary_report "$OUTPUT_ROOT" >/dev/null
 echo "macOS local dual-process LAN canary report written to $OUTPUT_ROOT"
+exit "$overall_status"
