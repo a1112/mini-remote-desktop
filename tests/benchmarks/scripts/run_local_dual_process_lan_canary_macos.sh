@@ -2290,12 +2290,13 @@ PY
 $ports
 EOF
 
-  local controller_socket peer_socket controller_device peer_device report_path
+  local controller_socket peer_socket controller_device peer_device report_path artifact_root
   controller_socket="/tmp/mrd-service-local-controller-${run_id}.sock"
   peer_socket="/tmp/mrd-service-local-peer-${run_id}.sock"
   controller_device="lan-local-controller-${run_id}"
   peer_device="lan-local-peer-${run_id}"
   report_path="$RAW_DIR/local-dual-${profile_id}.json"
+  artifact_root="$run_dir/artifacts"
   rm -f "$controller_socket" "$peer_socket" "$report_path"
 
   local controller_pid="" peer_pid="" tauri_pid="" vite_pid="" render_proxy_pid=""
@@ -2432,6 +2433,7 @@ PY
     MRD_LAN_E2E_MIN_FPS="$min_fps" \
     MRD_LAN_E2E_STOP_ON_COMPLETE="$lan_e2e_stop_on_complete" \
     MRD_LAN_E2E_REPORT_PATH="$report_path" \
+    MRD_E2E_ARTIFACT_ROOT="$artifact_root" \
     MRD_LAN_E2E_PROFILE_WIDTH="$width" \
     MRD_LAN_E2E_PROFILE_HEIGHT="$height" \
     MRD_LAN_E2E_PROFILE_FPS="$fps" \
