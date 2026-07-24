@@ -1247,9 +1247,11 @@ socket_path, report_path = sys.argv[1:3]
 
 try:
     with open(report_path, encoding="utf-8") as file:
-        report = json.load(file)
+        document = json.load(file)
 except Exception:
     raise SystemExit(0)
+
+report = document.get("report") if isinstance(document.get("report"), dict) else document
 
 session_id = report.get("sessionId")
 if not session_id:
@@ -1312,7 +1314,7 @@ else:
             pipeline["sender_transport"] = peer_snapshot.get("sender_transport")
 
 with open(report_path, "w", encoding="utf-8") as file:
-    json.dump(report, file, indent=2)
+    json.dump(document, file, indent=2)
 PY
 }
 
@@ -1345,9 +1347,11 @@ expected_receiver_decoders = {
 
 try:
     with open(path, encoding="utf-8") as file:
-        report = json.load(file)
+        document = json.load(file)
 except Exception:
     raise SystemExit(0)
+
+report = document.get("report") if isinstance(document.get("report"), dict) else document
 
 if report.get("status") != "completed":
     raise SystemExit(0)
@@ -1526,9 +1530,12 @@ if failures:
         "timestamp": report.get("finishedAt"),
         "error": report["errorMessage"],
     })
+    if report is not document:
+        document["final_status"] = "failed"
+        document["script_classification"] = "performance_threshold"
 
 with open(path, "w", encoding="utf-8") as file:
-    json.dump(report, file, indent=2)
+    json.dump(document, file, indent=2)
 PY
 }
 
@@ -1985,7 +1992,9 @@ import json
 import sys
 try:
     with open(sys.argv[1], encoding="utf-8") as file:
-        print(json.load(file).get("status", ""))
+        document = json.load(file)
+        nested = document.get("report") if isinstance(document.get("report"), dict) else {}
+        print(document.get("status") or document.get("final_status") or nested.get("status") or "")
 except Exception:
     print("")
 PY
@@ -2016,7 +2025,8 @@ def ratio(numerator, denominator):
 
 for raw_path in sorted(glob.glob(os.path.join(output_root, "raw", "local-dual-*.json"))):
     with open(raw_path, encoding="utf-8") as file:
-        report = json.load(file)
+        document = json.load(file)
+    report = document.get("report") if isinstance(document.get("report"), dict) else document
     raw_name = os.path.basename(raw_path)
     profile_id = raw_name[len("local-dual-"):-len(".json")]
     probe = report.get("probeSnapshot") or {}
@@ -2299,6 +2309,7 @@ EOF
     MRD_LAN_DEVICE_NAME="Local Dual Controller" \
     MRD_LAN_DISCOVERY_PORT="$controller_port" \
     MRD_LAN_DISCOVERY_PROBE_ENDPOINTS="127.0.0.1:${peer_port}" \
+    MRD_LAN_DISCOVERY_BROADCAST_ENABLED="false" \
     MRD_SERVICE_BUILD_ID="$GIT_COMMIT" \
     MRD_LAN_RECEIVER_DECODER="$RECEIVER_DECODER" \
     MRD_WEB_BRIDGE_ENABLED="false" \
@@ -2312,14 +2323,15 @@ EOF
     MRD_LAN_DEVICE_NAME="Local Dual Peer" \
     MRD_LAN_DISCOVERY_PORT="$peer_port" \
     MRD_LAN_DISCOVERY_PROBE_ENDPOINTS="127.0.0.1:${controller_port}" \
+    MRD_LAN_DISCOVERY_BROADCAST_ENABLED="false" \
     MRD_SERVICE_BUILD_ID="$GIT_COMMIT" \
     MRD_WEB_BRIDGE_ENABLED="false" \
     RUST_LOG="info" \
     "$run_service_bin" >"$logs_dir/peer/peer.stdout.log" 2>"$logs_dir/peer/peer.stderr.log" &
   peer_pid="$!"
 
-  wait_ipc_service_health "$controller_socket" 20
-  wait_ipc_service_health "$peer_socket" 20
+  wait_ipc_service_health "$controller_socket" 60
+  wait_ipc_service_health "$peer_socket" 60
 
   local single_instance_port timeout_ms min_fps
   single_instance_port="$(free_tcp_port)"

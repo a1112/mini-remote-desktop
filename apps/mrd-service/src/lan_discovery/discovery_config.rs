@@ -5,12 +5,14 @@ use std::time::Duration;
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
+const LAN_DISCOVERY_BROADCAST_ENABLED_ENV: &str = "MRD_LAN_DISCOVERY_BROADCAST_ENABLED";
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
 
 #[derive(Debug, Clone)]
 pub struct LanDiscoveryConfig {
     pub enabled: bool,
+    pub broadcast_enabled: bool,
     pub discovery_port: u16,
     pub probe_endpoints: Vec<SocketAddr>,
     pub announce_interval: Duration,
@@ -21,6 +23,7 @@ impl Default for LanDiscoveryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            broadcast_enabled: true,
             discovery_port: DEFAULT_DISCOVERY_PORT,
             probe_endpoints: Vec::new(),
             announce_interval: Duration::from_secs(ANNOUNCE_INTERVAL_SECS),
@@ -46,6 +49,14 @@ impl LanDiscoveryConfig {
         }
         if let Some(endpoints) = lookup(LAN_DISCOVERY_PROBE_ENDPOINTS_ENV) {
             config.probe_endpoints = parse_probe_endpoints(&endpoints)?;
+        }
+        if let Some(enabled) = lookup(LAN_DISCOVERY_BROADCAST_ENABLED_ENV) {
+            let enabled = enabled.trim();
+            if !enabled.is_empty() {
+                config.broadcast_enabled = enabled.parse::<bool>().with_context(|| {
+                    format!("invalid {LAN_DISCOVERY_BROADCAST_ENABLED_ENV}: {enabled}")
+                })?;
+            }
         }
         Ok(config)
     }
@@ -78,6 +89,7 @@ mod tests {
         let config = LanDiscoveryConfig::default();
 
         assert!(config.enabled);
+        assert!(config.broadcast_enabled);
         assert_eq!(config.discovery_port, DEFAULT_DISCOVERY_PORT);
         assert!(config.probe_endpoints.is_empty());
         assert_eq!(config.announce_interval, Duration::from_secs(3));
@@ -91,11 +103,13 @@ mod tests {
             LAN_DISCOVERY_PROBE_ENDPOINTS_ENV => {
                 Some("127.0.0.1:21217, 127.0.0.1:21218".to_string())
             }
+            LAN_DISCOVERY_BROADCAST_ENABLED_ENV => Some("false".to_string()),
             _ => None,
         })
         .expect("env config");
 
         assert_eq!(config.discovery_port, 21216);
+        assert!(!config.broadcast_enabled);
         assert_eq!(
             config.probe_endpoints,
             vec![
@@ -125,5 +139,16 @@ mod tests {
         .expect_err("invalid endpoint should fail");
 
         assert!(format!("{error:#}").contains("invalid LAN discovery probe endpoint"));
+    }
+
+    #[test]
+    fn env_config_reports_invalid_broadcast_flag() {
+        let error = LanDiscoveryConfig::from_env_lookup(|key| match key {
+            LAN_DISCOVERY_BROADCAST_ENABLED_ENV => Some("sometimes".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid broadcast flag should fail");
+
+        assert!(format!("{error:#}").contains(LAN_DISCOVERY_BROADCAST_ENABLED_ENV));
     }
 }

@@ -22,6 +22,8 @@ use super::media_render_policy::{
 use super::media_timing::MediaTimerResolution;
 #[cfg(any(windows, target_os = "macos"))]
 use super::selected_media_profile;
+#[cfg(target_os = "macos")]
+use super::macos_render_proxy_compressed_media_enabled_for_profile;
 #[cfg(any(windows, target_os = "macos"))]
 use super::time_utils::duration_as_millis;
 #[cfg(target_os = "macos")]

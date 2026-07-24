@@ -338,6 +338,7 @@ const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES: usize = 3;
 const LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT: usize = 8;
 const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
+const LAN_REMOTE_SESSION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
@@ -392,7 +393,9 @@ impl LanDiscoveryState {
 
     fn probe_targets(&self, discovery_port: u16) -> Vec<SocketAddr> {
         let mut targets = Vec::with_capacity(self.config.probe_endpoints.len() + 1);
-        targets.push(SocketAddr::from(([255, 255, 255, 255], discovery_port)));
+        if self.config.broadcast_enabled {
+            targets.push(SocketAddr::from(([255, 255, 255, 255], discovery_port)));
+        }
         for endpoint in &self.config.probe_endpoints {
             if !targets.iter().any(|target| target == endpoint) {
                 targets.push(*endpoint);
@@ -557,9 +560,11 @@ pub async fn start_lan_discovery(app_state: Arc<AppState>) -> Result<()> {
             .await
             .with_context(|| format!("failed to bind LAN discovery UDP port {port}"))?,
     );
-    socket
-        .set_broadcast(true)
-        .context("failed to enable LAN discovery UDP broadcast")?;
+    if app_state.lan_discovery.config.broadcast_enabled {
+        socket
+            .set_broadcast(true)
+            .context("failed to enable LAN discovery UDP broadcast")?;
+    }
 
     app_state
         .lan_discovery
@@ -639,7 +644,7 @@ pub async fn request_lan_remote_session(
     send_packet(&socket, &packet, target).await?;
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let (len, ack_addr) = timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
+    let (len, ack_addr) = timeout(LAN_REMOTE_SESSION_ACK_TIMEOUT, socket.recv_from(&mut buffer))
         .await
         .context("LAN remote request timed out")??;
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;

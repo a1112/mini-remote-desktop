@@ -959,9 +959,11 @@ export async function runLanE2EAutomation(
         captureSource,
         validationMode
       );
-      const profileMismatch =
-        describeProfileProbeFailure(profileProbeResult) ??
-        describeMediaPipelineProfileMismatch(mediaPipelineSnapshot, requestedProfile);
+      const profileProbeFailure = describeProfileProbeFailure(profileProbeResult);
+      const pipelineProfileMismatch = describeMediaPipelineProfileMismatch(
+        mediaPipelineSnapshot,
+        requestedProfile
+      );
       const sampleReadinessDurationMs = sampleFpsBaseline
         ? sampleFpsElapsedMs ?? 0
         : sampleDurationMs;
@@ -969,13 +971,17 @@ export async function runLanE2EAutomation(
         sampleReadinessDurationMs,
         minSampleDurationMs
       );
-      if (!options.adaptive && profileMismatch && sampleDurationReady) {
+      if (!options.adaptive && pipelineProfileMismatch && sampleDurationReady) {
+        stage("assert", "failed", pipelineProfileMismatch);
+        return finish("failed", "media_profile_mismatch", pipelineProfileMismatch);
+      }
+      if (!options.adaptive && profileProbeFailure && sampleDurationReady) {
         const exactProfileRequired = scenarioRequiresExactProfileMatch(scenarioId);
-        stage("assert", exactProfileRequired ? "failed" : "skipped", profileMismatch);
+        stage("assert", exactProfileRequired ? "failed" : "skipped", profileProbeFailure);
         return finish(
           exactProfileRequired ? "failed" : "skipped",
           exactProfileRequired ? "media_profile_mismatch" : "profile_downgraded",
-          profileMismatch
+          profileProbeFailure
         );
       }
       if (

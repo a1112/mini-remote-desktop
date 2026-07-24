@@ -9,7 +9,8 @@ use super::now_ms;
 #[cfg(target_os = "macos")]
 use super::{
     lan_capture_pump_drives_sender, lan_capture_pump_enabled, lan_capture_pump_repeat_latest,
-    macos_capture_pump_repeat_grace_timeout, now_us,
+    macos_capture_pump_repeat_grace_timeout, now_us, LAN_CAPTURE_PUMP_ERROR_BACKOFF,
+    LAN_CAPTURE_PUMP_QUEUE_CAPACITY, LAN_CAPTURE_PUMP_WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use super::{

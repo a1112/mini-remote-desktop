@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "macos")]
+use std::thread;
 
 #[derive(Clone)]
 struct SharedRecordingInputInjector {
