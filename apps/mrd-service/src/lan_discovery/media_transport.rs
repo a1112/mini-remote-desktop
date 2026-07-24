@@ -62,7 +62,8 @@ pub(crate) fn select_reliable_media_send_mode_for_profile(
     profile: &MediaProfile,
 ) -> LanReliableMediaSendMode {
     if reliable_media_supported
-        && profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS
+        && (profile.fps <= 60
+            || profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS)
     {
         LanReliableMediaSendMode::PerMessage
     } else {

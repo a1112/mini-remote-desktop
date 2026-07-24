@@ -5339,7 +5339,15 @@ fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
 }
 
 #[test]
-fn high_refresh_reliable_media_prefers_per_message_streams_to_reduce_hol() {
+fn reliable_whole_frame_media_prefers_per_message_streams_to_reduce_hol() {
+    let desktop_60fps = MediaProfile {
+        width: 1670,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264".to_string(),
+        ..MediaProfile::default()
+    };
     let high_bitrate = MediaProfile {
         width: 2560,
         height: 1600,
@@ -5357,6 +5365,10 @@ fn high_refresh_reliable_media_prefers_per_message_streams_to_reduce_hol() {
         ..MediaProfile::default()
     };
 
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(true, true, &desktop_60fps),
+        LanReliableMediaSendMode::PerMessage
+    );
     assert_eq!(
         select_reliable_media_send_mode_for_profile(true, true, &high_bitrate),
         LanReliableMediaSendMode::PerMessage
