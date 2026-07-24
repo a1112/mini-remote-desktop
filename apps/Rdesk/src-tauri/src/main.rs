@@ -67,6 +67,7 @@ const LAN_E2E_TIMEOUT_MS_ENV: &str = "MRD_LAN_E2E_TIMEOUT_MS";
 const LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV: &str = "MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS";
 const LAN_E2E_MIN_DECODED_FRAMES_ENV: &str = "MRD_LAN_E2E_MIN_DECODED_FRAMES";
 const LAN_E2E_MIN_FPS_ENV: &str = "MRD_LAN_E2E_MIN_FPS";
+const LAN_E2E_MIN_RENDER_FPS_ENV: &str = "MRD_LAN_E2E_MIN_RENDER_FPS";
 const LAN_E2E_STOP_ON_COMPLETE_ENV: &str = "MRD_LAN_E2E_STOP_ON_COMPLETE";
 const LAN_E2E_REPORT_PATH_ENV: &str = "MRD_LAN_E2E_REPORT_PATH";
 const LAN_E2E_PROFILE_WIDTH_ENV: &str = "MRD_LAN_E2E_PROFILE_WIDTH";
@@ -3703,6 +3704,7 @@ struct LanE2eAutorunLaunchConfig {
     min_sample_duration_ms: Option<String>,
     min_decoded_frames: Option<String>,
     min_fps: Option<String>,
+    min_render_fps: Option<String>,
     stop_on_complete: Option<String>,
     profile_width: Option<String>,
     profile_height: Option<String>,
@@ -3747,6 +3749,7 @@ where
         min_sample_duration_ms: non_empty_env(env(LAN_E2E_MIN_SAMPLE_DURATION_MS_ENV)),
         min_decoded_frames: non_empty_env(env(LAN_E2E_MIN_DECODED_FRAMES_ENV)),
         min_fps: non_empty_env(env(LAN_E2E_MIN_FPS_ENV)),
+        min_render_fps: non_empty_env(env(LAN_E2E_MIN_RENDER_FPS_ENV)),
         stop_on_complete: non_empty_env(env(LAN_E2E_STOP_ON_COMPLETE_ENV)),
         profile_width: non_empty_env(env(LAN_E2E_PROFILE_WIDTH_ENV)),
         profile_height: non_empty_env(env(LAN_E2E_PROFILE_HEIGHT_ENV)),
@@ -3785,6 +3788,7 @@ fn build_lan_e2e_autorun_route(config: LanE2eAutorunLaunchConfig) -> String {
     );
     push_query_param(&mut params, "minDecodedFrames", config.min_decoded_frames);
     push_query_param(&mut params, "minFps", config.min_fps);
+    push_query_param(&mut params, "minRenderFps", config.min_render_fps);
     push_query_param(&mut params, "stopOnComplete", config.stop_on_complete);
     push_query_param(&mut params, "width", config.profile_width);
     push_query_param(&mut params, "height", config.profile_height);
@@ -3909,6 +3913,7 @@ mod tray_tests {
             min_sample_duration_ms: Some("1500".to_string()),
             min_decoded_frames: Some("2".to_string()),
             min_fps: Some("5".to_string()),
+            min_render_fps: Some("4".to_string()),
             stop_on_complete: Some("false".to_string()),
             profile_width: Some("1920".to_string()),
             profile_height: Some("1080".to_string()),
@@ -3934,7 +3939,7 @@ mod tray_tests {
 
         assert_eq!(
             route,
-            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
+            "/test/e2e?autorun=lan-e2e&scenario=cross.fault.recovery&targetDeviceId=agent%20device%2F1&transport=quic&timeoutMs=2500&minSampleDurationMs=1500&minDecodedFrames=2&minFps=5&minRenderFps=4&stopOnComplete=false&width=1920&height=1080&fps=180&bitrateMbps=20&codec=hevc&codecProfile=main&bitDepth=8&chromaSubsampling=4%3A2%3A0&pixelFormat=nv12&hdrEnabled=false&colorMode=monochrome&colorPipeline=hdr_main10&displayModePolicy=temporary&captureSourceId=windows%3Adisplay-shared%3A1&captureSourceKind=display&renderDisplaySourceId=windows%3Adisplay-shared%3A0&expectedPeerBuildId=abc123def456&renderProfileCap=false&renderDisplay=false&adaptive=true"
         );
     }
 

@@ -88,6 +88,7 @@ export interface LanE2EAutomationOptions {
   minSampleDurationMs?: number;
   minDecodedFrames?: number;
   minFps?: number;
+  minRenderFps?: number;
   stopOnComplete?: boolean;
   requestedProfile?: MediaProfile;
   displayModePolicy?: "none" | "temporary" | "required";
@@ -148,6 +149,7 @@ export interface LanE2EAutomationReport {
     minSampleDurationMs: number;
     minDecodedFrames: number;
     minFps: number;
+    minRenderFps?: number;
   };
   failureReason?: LanE2EFailureReason;
   errorMessage?: string;
@@ -377,6 +379,7 @@ export async function runLanE2EAutomation(
   );
   const minDecodedFrames = options.minDecodedFrames ?? DEFAULT_MIN_DECODED_FRAMES;
   const minFps = options.minFps ?? DEFAULT_MIN_FPS;
+  const minRenderFps = options.minRenderFps;
   const stopOnComplete = options.stopOnComplete ?? true;
   const transportKind = options.transportKind ?? "quic";
   const displayModePolicy = options.displayModePolicy ?? "none";
@@ -494,6 +497,7 @@ export async function runLanE2EAutomation(
       minSampleDurationMs,
       minDecodedFrames,
       minFps,
+      minRenderFps,
     },
     failureReason,
     errorMessage,
@@ -943,6 +947,15 @@ export async function runLanE2EAutomation(
         );
       }
       const fpsForThreshold = sampleObservedFps ?? probeSnapshot.current_fps ?? 0;
+      const renderFpsForThreshold =
+        sampleObservedRenderFpsAtTargetDuration ?? sampleObservedRenderFps ?? 0;
+      const renderThresholdRequired =
+        renderDisplayEnabled &&
+        displayWindow != null &&
+        minSampleDurationMs > 0 &&
+        minRenderFps != null;
+      const renderThresholdReady =
+        !renderThresholdRequired || renderFpsForThreshold >= minRenderFps;
 
       if (sessionSnapshot.state === "failed" || sessionSnapshot.last_error) {
         const message = sessionSnapshot.last_error ?? "LAN session entered failed state";
@@ -1000,6 +1013,7 @@ export async function runLanE2EAutomation(
         probeSnapshot.frames_decoded >= minDecodedFrames &&
         (validationMode !== "quic_datagram" || probeSnapshot.media_probe_valid === true) &&
         fpsForThreshold >= minFps &&
+        renderThresholdReady &&
         sampleDurationReady
       ) {
         stage("sample", "completed");
@@ -1011,10 +1025,24 @@ export async function runLanE2EAutomation(
     }
 
     const finalFps = sampleObservedFps ?? probeSnapshot?.current_fps ?? 0;
+    const finalRenderFps =
+      sampleObservedRenderFpsAtTargetDuration ?? sampleObservedRenderFps ?? 0;
     const finalSampleDurationMs = sampleFpsElapsedMs ?? sampleDurationMs;
-    const message = `LAN ${formatValidationMode(validationMode)} did not reach threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${finalFps}/${minFps}, sample ${finalSampleDurationMs}/${minSampleDurationMs} ms`;
+    const renderThresholdFailed =
+      renderDisplayEnabled &&
+      displayWindow != null &&
+      minSampleDurationMs > 0 &&
+      minRenderFps != null &&
+      finalRenderFps < minRenderFps;
+    const renderThresholdText =
+      minRenderFps == null ? "not required" : `${finalRenderFps}/${minRenderFps}`;
+    const message = `LAN ${formatValidationMode(validationMode)} did not reach threshold: decoded ${probeSnapshot?.frames_decoded ?? 0}/${minDecodedFrames}, fps ${finalFps}/${minFps}, render fps ${renderThresholdText}, sample ${finalSampleDurationMs}/${minSampleDurationMs} ms`;
     stage("assert", "failed", message);
-    return finish("failed", "no_remote_frames", message);
+    return finish(
+      "failed",
+      renderThresholdFailed ? "performance_threshold" : "no_remote_frames",
+      message
+    );
   } catch (error) {
     const mapped = error instanceof LanE2ECommandError ? error.reason : "runtime_error";
     const message = error instanceof Error ? error.message : String(error);

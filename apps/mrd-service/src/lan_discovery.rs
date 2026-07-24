@@ -277,8 +277,9 @@ use protocol::{
     LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
     LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
-    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
+    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT,
+    LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+    LAN_REMOTE_POWER_CONTROL_TRANSPORT, PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use protocol::{DISCOVERY_SAFE_UDP_PAYLOAD_BYTES, LAN_INPUT_CONTROL_CAPABILITY};
@@ -327,6 +328,7 @@ const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
+const LAN_QUIC_PER_MESSAGE_CONCURRENT_READS: usize = 8;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
@@ -2139,6 +2141,7 @@ async fn build_announcement(app_state: &Arc<AppState>) -> Option<LanAnnouncement
         LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT.to_string(),
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
@@ -2468,6 +2471,11 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
+    let persistent_media_60fps_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT);
     let media_v3_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -2492,6 +2500,7 @@ async fn send_quic_media_loop(
         let reliable_media_send_mode = select_reliable_media_send_mode_for_profile(
             reliable_media_supported,
             persistent_media_supported,
+            persistent_media_60fps_supported,
             &profile,
         );
         let max_datagram_size = lan_media_datagram_size(
@@ -3498,6 +3507,11 @@ async fn receive_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
+    let persistent_reliable_media_60fps_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT);
     let per_message_reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -3507,19 +3521,88 @@ async fn receive_quic_media_loop(
     let reliable_media_read_mode = select_reliable_media_send_mode_for_profile(
         per_message_reliable_media_supported,
         persistent_reliable_media_supported,
+        persistent_reliable_media_60fps_supported,
         &initial_media_profile,
     );
     let mut reliable_media_rx = if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let reliable_endpoint = endpoint.clone();
         tokio::spawn(async move {
+            if reliable_media_read_mode == LanReliableMediaSendMode::PerMessage {
+                let (first_stream_id, first_payload) = match reliable_endpoint
+                    .read_reliable_message_with_stream_id(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                    .await
+                {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string())).await;
+                        return;
+                    }
+                };
+                if tx.send(Ok(first_payload)).await.is_err() {
+                    return;
+                }
+
+                let mut next_stream_id = first_stream_id.saturating_add(1);
+                let mut completed = std::collections::BTreeMap::new();
+                let mut reads = tokio::task::JoinSet::new();
+                for _ in 0..LAN_QUIC_PER_MESSAGE_CONCURRENT_READS {
+                    let endpoint = reliable_endpoint.clone();
+                    reads.spawn(async move {
+                        endpoint
+                            .read_reliable_message_with_stream_id(
+                                LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                            )
+                            .await
+                    });
+                }
+                while let Some(joined) = reads.join_next().await {
+                    let (stream_id, payload) = match joined {
+                        Ok(Ok(message)) => message,
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Err(error.to_string())).await;
+                            reads.abort_all();
+                            break;
+                        }
+                        Err(error) => {
+                            if error.is_cancelled() {
+                                break;
+                            }
+                            let _ = tx
+                                .send(Err(format!("reliable media read task failed: {error}")))
+                                .await;
+                            reads.abort_all();
+                            break;
+                        }
+                    };
+                    completed.insert(stream_id, payload);
+
+                    while let Some(payload) = completed.remove(&next_stream_id) {
+                        if tx.send(Ok(payload)).await.is_err() {
+                            reads.abort_all();
+                            return;
+                        }
+                        next_stream_id = next_stream_id.saturating_add(1);
+                    }
+
+                    while reads.len() + completed.len() < LAN_QUIC_PER_MESSAGE_CONCURRENT_READS {
+                        let endpoint = reliable_endpoint.clone();
+                        reads.spawn(async move {
+                            endpoint
+                                .read_reliable_message_with_stream_id(
+                                    LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                                )
+                                .await
+                        });
+                    }
+                }
+                return;
+            }
             loop {
                 let result = match reliable_media_read_mode {
                     LanReliableMediaSendMode::Disabled => break,
                     LanReliableMediaSendMode::PerMessage => {
-                        reliable_endpoint
-                            .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                            .await
+                        unreachable!("per-message reliable media uses concurrent stream readers")
                     }
                     LanReliableMediaSendMode::Persistent => {
                         reliable_endpoint

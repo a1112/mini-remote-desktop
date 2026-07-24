@@ -1921,6 +1921,7 @@ describe("runLanE2EAutomation", () => {
       minSampleDurationMs: 100,
       minDecodedFrames: 1,
       minFps: 50,
+      minRenderFps: 50,
       now: () => currentTime,
       createSessionId: () => "lan-e2e-test-session",
     });

@@ -179,14 +179,24 @@ impl QuinnDatagramEndpoint {
         &self,
         max_len: usize,
     ) -> Result<Bytes, QuinnTransportError> {
+        self.read_reliable_message_with_stream_id(max_len)
+            .await
+            .map(|(_, payload)| payload)
+    }
+
+    pub async fn read_reliable_message_with_stream_id(
+        &self,
+        max_len: usize,
+    ) -> Result<(u64, Bytes), QuinnTransportError> {
         let mut stream =
             self.inner.connection.accept_uni().await.map_err(|error| {
                 QuinnTransportError::Message(format!("accept_uni failed: {error}"))
             })?;
+        let stream_id = stream.id().index();
         let payload = stream.read_to_end(max_len).await.map_err(|error| {
             QuinnTransportError::Message(format!("reliable stream read failed: {error}"))
         })?;
-        Ok(Bytes::from(payload))
+        Ok((stream_id, Bytes::from(payload)))
     }
 
     pub async fn send_reliable_message_persistent(

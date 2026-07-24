@@ -755,6 +755,7 @@ function buildLanAutomationOptionsFromSearchParams(
     minSampleDurationMs: parsePositiveNumber(searchParams.get("minSampleDurationMs")),
     minDecodedFrames: parsePositiveNumber(searchParams.get("minDecodedFrames")),
     minFps: parsePositiveNumber(searchParams.get("minFps")),
+    minRenderFps: parsePositiveNumber(searchParams.get("minRenderFps")),
     stopOnComplete: parseOptionalBoolean(searchParams.get("stopOnComplete")),
     displayModePolicy: parseDisplayModePolicy(searchParams.get("displayModePolicy")),
     preferredCaptureSourceId:

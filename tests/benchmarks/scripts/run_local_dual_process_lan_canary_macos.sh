@@ -1146,6 +1146,7 @@ start_tauri_lan_e2e_app() {
     MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS="$((DURATION_SECS * 1000))" \
     MRD_LAN_E2E_MIN_DECODED_FRAMES="20" \
     MRD_LAN_E2E_MIN_FPS="$min_fps" \
+    MRD_LAN_E2E_MIN_RENDER_FPS="$min_fps" \
     MRD_LAN_E2E_STOP_ON_COMPLETE="$lan_e2e_stop_on_complete" \
     MRD_LAN_E2E_REPORT_PATH="$report_path" \
     MRD_LAN_E2E_PROFILE_WIDTH="$width" \
@@ -2431,6 +2432,7 @@ PY
     MRD_LAN_E2E_MIN_SAMPLE_DURATION_MS="$((DURATION_SECS * 1000))" \
     MRD_LAN_E2E_MIN_DECODED_FRAMES="20" \
     MRD_LAN_E2E_MIN_FPS="$min_fps" \
+    MRD_LAN_E2E_MIN_RENDER_FPS="$min_fps" \
     MRD_LAN_E2E_STOP_ON_COMPLETE="$lan_e2e_stop_on_complete" \
     MRD_LAN_E2E_REPORT_PATH="$report_path" \
     MRD_E2E_ARTIFACT_ROOT="$artifact_root" \

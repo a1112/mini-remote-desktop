@@ -5339,7 +5339,7 @@ fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
 }
 
 #[test]
-fn reliable_whole_frame_media_prefers_per_message_streams_to_reduce_hol() {
+fn reliable_whole_frame_media_uses_persistent_stream_for_60fps() {
     let desktop_60fps = MediaProfile {
         width: 1670,
         height: 1080,
@@ -5366,19 +5366,27 @@ fn reliable_whole_frame_media_prefers_per_message_streams_to_reduce_hol() {
     };
 
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(true, true, &desktop_60fps),
+        select_reliable_media_send_mode_for_profile(true, true, true, &desktop_60fps),
+        LanReliableMediaSendMode::Persistent
+    );
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(true, true, false, &desktop_60fps),
         LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(true, true, &high_bitrate),
+        select_reliable_media_send_mode_for_profile(true, false, false, &desktop_60fps),
         LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(true, true, &stable_bitrate),
+        select_reliable_media_send_mode_for_profile(true, true, true, &high_bitrate),
         LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(false, true, &high_bitrate),
+        select_reliable_media_send_mode_for_profile(true, true, true, &stable_bitrate),
+        LanReliableMediaSendMode::PerMessage
+    );
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(false, true, true, &high_bitrate),
         LanReliableMediaSendMode::Persistent
     );
 }

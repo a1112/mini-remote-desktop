@@ -59,9 +59,12 @@ pub(crate) fn select_reliable_media_send_mode(
 pub(crate) fn select_reliable_media_send_mode_for_profile(
     reliable_media_supported: bool,
     persistent_media_supported: bool,
+    persistent_media_60fps_supported: bool,
     profile: &MediaProfile,
 ) -> LanReliableMediaSendMode {
-    if reliable_media_supported
+    if profile.fps <= 60 && persistent_media_supported && persistent_media_60fps_supported {
+        LanReliableMediaSendMode::Persistent
+    } else if reliable_media_supported
         && (profile.fps <= 60
             || profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS)
     {

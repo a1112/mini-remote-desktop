@@ -58,6 +58,37 @@ async fn quinn_loopback_pair_roundtrips_reliable_message() {
 }
 
 #[tokio::test]
+async fn quinn_loopback_pair_exposes_ordered_reliable_stream_ids() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+
+    pair.client
+        .send_reliable_message(Bytes::from_static(b"first"))
+        .await
+        .expect("send first reliable message");
+    pair.client
+        .send_reliable_message(Bytes::from_static(b"second"))
+        .await
+        .expect("send second reliable message");
+
+    let (first_stream_id, first) = pair
+        .server
+        .read_reliable_message_with_stream_id(64)
+        .await
+        .expect("read first reliable message");
+    let (second_stream_id, second) = pair
+        .server
+        .read_reliable_message_with_stream_id(64)
+        .await
+        .expect("read second reliable message");
+
+    assert_eq!(first, Bytes::from_static(b"first"));
+    assert_eq!(second, Bytes::from_static(b"second"));
+    assert_eq!(second_stream_id, first_stream_id + 1);
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_persistent_reliable_messages() {
     let pair = QuinnDatagramPair::loopback()
         .await
