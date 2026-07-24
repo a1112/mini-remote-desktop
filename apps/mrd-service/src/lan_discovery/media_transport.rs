@@ -62,7 +62,18 @@ pub(crate) fn select_reliable_media_send_mode_for_profile(
     persistent_media_60fps_supported: bool,
     profile: &MediaProfile,
 ) -> LanReliableMediaSendMode {
-    if profile.fps <= 60 && persistent_media_supported && persistent_media_60fps_supported {
+    if profile.fps <= 60
+        && use_best_effort_media_datagrams(profile)
+        && reliable_media_supported
+    {
+        // Keep each latency-sensitive desktop frame on its own QUIC stream. Loss
+        // then blocks only that frame instead of every newer frame sharing the
+        // persistent stream, while retaining reliable delivery across Wi-Fi.
+        LanReliableMediaSendMode::PerMessage
+    } else if profile.fps <= 60
+        && persistent_media_supported
+        && persistent_media_60fps_supported
+    {
         LanReliableMediaSendMode::Persistent
     } else if reliable_media_supported
         && (profile.fps <= 60
@@ -190,16 +201,9 @@ pub(crate) fn should_send_access_unit_as_reliable_frame(
 }
 
 fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
-    // Low-bitrate desktop profiles already use best-effort datagrams. Keeping every
-    // access unit on the persistent reliable stream makes transport backpressure
-    // synchronous with capture and encode, so a transient LAN stall turns into a
-    // visible capture gap and queues obsolete video behind it. Send delta frames as
-    // datagrams for these latency-sensitive profiles; the caller still duplicates
-    // keyframes over the reliable stream for decoder recovery.
-    !use_best_effort_media_datagrams(profile)
-        && (profile.fps <= 60
-            || (profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
-                && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS))
+    profile.fps <= 60
+        || (profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+            && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS)
 }
 
 pub(crate) fn reliable_whole_frame_media_override() -> Option<bool> {

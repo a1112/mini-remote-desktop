@@ -5173,7 +5173,7 @@ fn lan_quic_media_routes_only_keyframes_reliably() {
 }
 
 #[test]
-fn lan_quic_media_uses_datagrams_for_low_latency_60fps_and_reliable_high_quality_frames() {
+fn lan_quic_media_uses_reliable_frames_for_60fps_and_keeps_high_refresh_opt_in() {
     let profile_1080p = MediaProfile {
         width: 1920,
         height: 1080,
@@ -5191,7 +5191,7 @@ fn lan_quic_media_uses_datagrams_for_low_latency_60fps_and_reliable_high_quality
         ..MediaProfile::default()
     };
 
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         2,
@@ -5344,7 +5344,7 @@ fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
 }
 
 #[test]
-fn reliable_whole_frame_media_uses_persistent_stream_for_60fps() {
+fn reliable_whole_frame_media_uses_per_frame_streams_for_low_bitrate_60fps() {
     let desktop_60fps = MediaProfile {
         width: 1670,
         height: 1080,
@@ -5372,7 +5372,7 @@ fn reliable_whole_frame_media_uses_persistent_stream_for_60fps() {
 
     assert_eq!(
         select_reliable_media_send_mode_for_profile(true, true, true, &desktop_60fps),
-        LanReliableMediaSendMode::Persistent
+        LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
         select_reliable_media_send_mode_for_profile(true, true, false, &desktop_60fps),
