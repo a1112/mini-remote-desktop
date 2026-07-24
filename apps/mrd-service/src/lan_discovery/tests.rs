@@ -5173,11 +5173,11 @@ fn lan_quic_media_routes_only_keyframes_reliably() {
 }
 
 #[test]
-fn lan_quic_media_uses_reliable_frames_for_60fps_and_keeps_high_refresh_opt_in() {
+fn lan_quic_media_uses_datagrams_for_low_latency_60fps_and_reliable_high_quality_frames() {
     let profile_1080p = MediaProfile {
         width: 1920,
         height: 1080,
-        fps: 144,
+        fps: 60,
         bitrate_mbps: 20,
         codec: "h264".to_string(),
         ..MediaProfile::default()
@@ -5186,7 +5186,7 @@ fn lan_quic_media_uses_reliable_frames_for_60fps_and_keeps_high_refresh_opt_in()
         width: 2560,
         height: 1440,
         fps: 60,
-        bitrate_mbps: 20,
+        bitrate_mbps: 80,
         codec: "h264".to_string(),
         ..MediaProfile::default()
     };
