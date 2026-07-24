@@ -186,8 +186,9 @@ pub(crate) fn should_send_access_unit_as_reliable_frame(
 }
 
 fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
-    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
-        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS
+    profile.fps <= 60
+        || (profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+            && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS)
 }
 
 pub(crate) fn reliable_whole_frame_media_override() -> Option<bool> {

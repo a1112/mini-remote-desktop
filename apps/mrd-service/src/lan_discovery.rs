@@ -3718,6 +3718,9 @@ async fn receive_quic_media_loop(
 
         if let Some(frame) = reassembled_frame {
             let ready_frames = frame_orderer.push(frame);
+            if frame_orderer.take_skipped_gap() {
+                decoder_waits_for_keyframe = true;
+            }
             receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
             for frame in ready_frames {
                 let envelope = match decode_lan_media_envelope(&frame.payload) {
@@ -4180,6 +4183,18 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
     }
 
     let ready_frames = frame_orderer.push(frame);
+    if frame_orderer.take_skipped_gap() {
+        *decoder_waits_for_keyframe = true;
+        maybe_send_lan_keyframe_request(
+            endpoint,
+            session_id,
+            &profile,
+            keyframe_request_sequence,
+            last_keyframe_request_at,
+            receiver_stats,
+        )
+        .await;
+    }
     receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
     for ready_frame in ready_frames {
         if *decoder_waits_for_keyframe && !ready_frame.is_keyframe() {

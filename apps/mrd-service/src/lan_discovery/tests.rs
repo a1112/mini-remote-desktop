@@ -3045,6 +3045,7 @@ fn lan_media_frame_orderer_holds_late_frames_until_gap_arrives() {
     assert_eq!(frame_ids(&first), vec![1]);
     assert!(third.is_empty());
     assert_eq!(frame_ids(&ready), vec![2, 3]);
+    assert!(!orderer.take_skipped_gap());
 }
 
 #[test]
@@ -3072,6 +3073,8 @@ fn lan_media_frame_orderer_skips_gap_when_pending_limit_is_reached() {
     let ready = orderer.push(test_quic_au_frame(13, false));
 
     assert_eq!(frame_ids(&ready), vec![12, 13]);
+    assert!(orderer.take_skipped_gap());
+    assert!(!orderer.take_skipped_gap());
 }
 
 #[test]
@@ -3085,6 +3088,7 @@ fn lan_media_frame_orderer_releases_first_late_frame_at_low_latency_limit() {
     let ready = orderer.push(test_quic_au_frame(22, false));
 
     assert_eq!(frame_ids(&ready), vec![22]);
+    assert!(orderer.take_skipped_gap());
 }
 
 #[test]
@@ -5164,7 +5168,7 @@ fn lan_quic_media_routes_only_keyframes_reliably() {
 }
 
 #[test]
-fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_enabled() {
+fn lan_quic_media_uses_reliable_frames_for_60fps_and_keeps_high_refresh_opt_in() {
     let profile_1080p = MediaProfile {
         width: 1920,
         height: 1080,
@@ -5189,14 +5193,14 @@ fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_e
         &profile_1080p,
         None
     ));
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         2,
         &profile_2k,
         None
     ));
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         1,
