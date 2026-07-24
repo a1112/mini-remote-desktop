@@ -1364,6 +1364,11 @@ steady_prefixes = ("sender.", "receiver.")
 ignored_stages = {
     "sender.encoder_create",
     "sender.pacing_wait",
+    # This is an end-to-end wall-clock estimate, not processing time spent in
+    # one steady-state stage. It remains in the report with p99/max.
+    "receiver.estimated_frame_age",
+    # Event marker for the bounded HOL watchdog, not per-frame processing work.
+    "receiver.reliable_hol_timeout",
     "receiver.message_wait",
     "receiver.read",
 }

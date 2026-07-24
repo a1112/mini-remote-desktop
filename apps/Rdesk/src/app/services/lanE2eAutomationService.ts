@@ -8,6 +8,7 @@ import type {
   LanDiscoverySnapshot,
   LanPeerInfo,
   MediaPipelineSnapshot,
+  MediaStageMetrics,
   MediaProfile,
   MediaAdaptationSnapshot,
   ProbeSnapshot,
@@ -79,6 +80,36 @@ export interface LanE2EStageEvent {
   error?: string;
 }
 
+export interface LanE2EMetricSample {
+  timestamp: number;
+  intervalMs: number;
+  framesDecoded: number;
+  framesDropped: number;
+  renderFramesPresented: number;
+  renderQueueReplacements: number;
+  repeatedLatestFrames: number;
+  reliableHolRecoveries: number;
+  observedFps?: number;
+  observedRenderFps?: number;
+  queueDepth: number;
+  receiveStall: boolean;
+  renderStall: boolean;
+  receiverMessageWaitP99Ms?: number;
+  receiverMessageWaitMaxMs?: number;
+  renderPresentGapP99Ms?: number;
+  renderPresentGapMaxMs?: number;
+  estimatedFrameAgeP99Ms?: number;
+  estimatedFrameAgeMaxMs?: number;
+}
+
+export interface LanE2EJankEvent {
+  timestamp: number;
+  kind: "receive_stall" | "render_stall" | "render_queue_burst" | "quic_hol_recovery";
+  intervalMs: number;
+  count: number;
+  detail?: string;
+}
+
 export interface LanE2EAutomationOptions {
   scenarioId?: CrossDeviceScenarioId;
   targetDeviceId?: string;
@@ -145,6 +176,8 @@ export interface LanE2EAutomationReport {
   sampleObservedRenderFpsAtTargetDuration?: number;
   sampleRenderQueueReplacements?: number;
   sampleRenderPresentSkips?: number;
+  metricSeries?: LanE2EMetricSample[];
+  jankEvents?: LanE2EJankEvent[];
   thresholds: {
     minSampleDurationMs: number;
     minDecodedFrames: number;
@@ -422,6 +455,19 @@ export async function runLanE2EAutomation(
   let sampleObservedRenderFpsAtTargetDuration: number | undefined;
   let sampleRenderQueueReplacements: number | undefined;
   let sampleRenderPresentSkips: number | undefined;
+  const metricSeries: LanE2EMetricSample[] = [];
+  const jankEvents: LanE2EJankEvent[] = [];
+  let lastMetricCounters:
+    | {
+        timestamp: number;
+        framesDecoded: number;
+        framesDropped: number;
+        renderPresentedFrames: number;
+        renderQueueReplacements: number;
+        repeatedLatestFrames: number;
+        reliableHolRecoveries: number;
+      }
+    | undefined;
   let renderCappedProfileApplied = false;
   let sampleFpsBaselineDeferred = false;
   let sampleFpsBaseline:
@@ -493,6 +539,8 @@ export async function runLanE2EAutomation(
     sampleObservedRenderFpsAtTargetDuration,
     sampleRenderQueueReplacements,
     sampleRenderPresentSkips,
+    metricSeries,
+    jankEvents,
     thresholds: {
       minSampleDurationMs,
       minDecodedFrames,
@@ -824,6 +872,9 @@ export async function runLanE2EAutomation(
         sampleObservedRenderFpsAtTargetDuration = undefined;
         sampleRenderQueueReplacements = undefined;
         sampleRenderPresentSkips = undefined;
+        metricSeries.length = 0;
+        jankEvents.length = 0;
+        lastMetricCounters = undefined;
         sampleFpsBaseline = undefined;
         sampleFpsBaselineDeferred = false;
         await sleep(sampleIntervalMs);
@@ -854,6 +905,116 @@ export async function runLanE2EAutomation(
           );
         }
       }
+      const currentMetricCounters = {
+        timestamp: sampleObservedAt,
+        framesDecoded: probeSnapshot.frames_decoded,
+        framesDropped: probeSnapshot.frames_dropped,
+        renderPresentedFrames: mediaPipelineSnapshot.render_presented_frames ?? 0,
+        renderQueueReplacements: mediaPipelineSnapshot.render_queue_replacements ?? 0,
+        repeatedLatestFrames:
+          mediaPipelineSnapshot.sender_transport?.repeated_latest_frames ?? 0,
+        reliableHolRecoveries: mediaPipelineSnapshot.reliable_hol_recoveries ?? 0,
+      };
+      if (lastMetricCounters) {
+        const intervalMs = Math.max(1, sampleObservedAt - lastMetricCounters.timestamp);
+        const framesDecoded = counterDelta(
+          currentMetricCounters.framesDecoded,
+          lastMetricCounters.framesDecoded
+        );
+        const framesDropped = counterDelta(
+          currentMetricCounters.framesDropped,
+          lastMetricCounters.framesDropped
+        );
+        const renderFramesPresented = counterDelta(
+          currentMetricCounters.renderPresentedFrames,
+          lastMetricCounters.renderPresentedFrames
+        );
+        const renderQueueReplacements = counterDelta(
+          currentMetricCounters.renderQueueReplacements,
+          lastMetricCounters.renderQueueReplacements
+        );
+        const repeatedLatestFrames = counterDelta(
+          currentMetricCounters.repeatedLatestFrames,
+          lastMetricCounters.repeatedLatestFrames
+        );
+        const reliableHolRecoveries = counterDelta(
+          currentMetricCounters.reliableHolRecoveries,
+          lastMetricCounters.reliableHolRecoveries
+        );
+        const receiveStall = firstFrameAt != null && framesDecoded === 0;
+        const renderStall =
+          firstFrameAt != null && displayWindow != null && renderFramesPresented === 0;
+        const receiverMessageWait = mediaStage(
+          mediaPipelineSnapshot.stage_metrics,
+          "receiver.message_wait"
+        );
+        const renderPresentGap = mediaStage(
+          mediaPipelineSnapshot.stage_metrics,
+          "render_present_gap"
+        );
+        const estimatedFrameAge = mediaStage(
+          mediaPipelineSnapshot.stage_metrics,
+          "receiver.estimated_frame_age"
+        );
+        metricSeries.push({
+          timestamp: sampleObservedAt,
+          intervalMs,
+          framesDecoded,
+          framesDropped,
+          renderFramesPresented,
+          renderQueueReplacements,
+          repeatedLatestFrames,
+          reliableHolRecoveries,
+          observedFps: (framesDecoded * 1000) / intervalMs,
+          observedRenderFps: (renderFramesPresented * 1000) / intervalMs,
+          queueDepth: mediaPipelineSnapshot.queue_depth,
+          receiveStall,
+          renderStall,
+          receiverMessageWaitP99Ms: finiteMetric(receiverMessageWait?.p99_ms),
+          receiverMessageWaitMaxMs: finiteMetric(receiverMessageWait?.max_ms),
+          renderPresentGapP99Ms: finiteMetric(renderPresentGap?.p99_ms),
+          renderPresentGapMaxMs: finiteMetric(renderPresentGap?.max_ms),
+          estimatedFrameAgeP99Ms: finiteMetric(estimatedFrameAge?.p99_ms),
+          estimatedFrameAgeMaxMs: finiteMetric(estimatedFrameAge?.max_ms),
+        });
+        if (receiveStall) {
+          jankEvents.push({
+            timestamp: sampleObservedAt,
+            kind: "receive_stall",
+            intervalMs,
+            count: 1,
+            detail: `No decoded frame progressed for ${intervalMs} ms`,
+          });
+        }
+        if (renderStall) {
+          jankEvents.push({
+            timestamp: sampleObservedAt,
+            kind: "render_stall",
+            intervalMs,
+            count: 1,
+            detail: `No presented frame progressed for ${intervalMs} ms`,
+          });
+        }
+        if (renderQueueReplacements >= 3) {
+          jankEvents.push({
+            timestamp: sampleObservedAt,
+            kind: "render_queue_burst",
+            intervalMs,
+            count: renderQueueReplacements,
+            detail: `${renderQueueReplacements} decoded frames replaced within one sample interval`,
+          });
+        }
+        if (reliableHolRecoveries > 0) {
+          jankEvents.push({
+            timestamp: sampleObservedAt,
+            kind: "quic_hol_recovery",
+            intervalMs,
+            count: reliableHolRecoveries,
+            detail: `${reliableHolRecoveries} persistent QUIC stream reset(s)`,
+          });
+        }
+      }
+      lastMetricCounters = currentMetricCounters;
       const renderPresentedFrames = mediaPipelineSnapshot.render_presented_frames;
       const sampleFpsBaselineReady =
         !displayWindow ||
@@ -1215,6 +1376,21 @@ function sampleDurationToleranceFor(minSampleDurationMs: number): number {
     SAMPLE_DURATION_TOLERANCE_MS,
     Math.floor(minSampleDurationMs * 0.01)
   );
+}
+
+function counterDelta(current: number, previous: number): number {
+  return Math.max(0, current - previous);
+}
+
+function mediaStage(
+  metrics: MediaStageMetrics[],
+  stage: string
+): MediaStageMetrics | undefined {
+  return metrics.find((metric) => metric.stage === stage);
+}
+
+function finiteMetric(value: number | null | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function buildAdaptiveMediaConfig(

@@ -237,6 +237,9 @@ impl LanSenderStatsTracker {
                 stage: (*stage).to_string(),
                 p50_ms: sender_stats_percentile(samples, 0.50),
                 p95_ms: sender_stats_percentile(samples, 0.95),
+                p99_ms: sender_stats_percentile(samples, 0.99),
+                max_ms: sender_stats_percentile(samples, 1.0),
+                sample_count: Some(samples.len().min(u32::MAX as usize) as u32),
             })
             .collect::<Vec<_>>();
         metrics.sort_by(|left, right| left.stage.cmp(&right.stage));

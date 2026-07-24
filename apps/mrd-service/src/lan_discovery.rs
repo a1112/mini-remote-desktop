@@ -328,6 +328,9 @@ const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
+// At 60 fps this is six frame intervals. A lost packet can no longer freeze
+// every later frame on the persistent reliable stream indefinitely.
+const LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT: Duration = Duration::from_millis(100);
 const LAN_QUIC_PER_MESSAGE_CONCURRENT_READS: usize = 8;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
@@ -3606,7 +3609,10 @@ async fn receive_quic_media_loop(
                     }
                     LanReliableMediaSendMode::Persistent => {
                         reliable_endpoint
-                            .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                            .read_reliable_message_persistent_with_timeout(
+                                LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                                LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT,
+                            )
                             .await
                     }
                 };
@@ -3667,6 +3673,16 @@ async fn receive_quic_media_loop(
                         match message {
                             Some(Ok(message)) => message,
                             Some(Err(error)) => {
+                                recover_persistent_media_hol_stall(
+                                    &app_state,
+                                    &session_id,
+                                    &endpoint,
+                                    &error,
+                                    &mut receiver_stats,
+                                    &mut keyframe_request_sequence,
+                                    &mut last_keyframe_request_at,
+                                )
+                                .await;
                                 tracing::warn!(
                                     %error,
                                     session_id = %session_id.0,
@@ -3689,6 +3705,16 @@ async fn receive_quic_media_loop(
                 match rx.recv().await {
                     Some(Ok(message)) => message,
                     Some(Err(error)) => {
+                        recover_persistent_media_hol_stall(
+                            &app_state,
+                            &session_id,
+                            &endpoint,
+                            &error,
+                            &mut receiver_stats,
+                            &mut keyframe_request_sequence,
+                            &mut last_keyframe_request_at,
+                        )
+                        .await;
                         tracing::warn!(
                             %error,
                             session_id = %session_id.0,
@@ -4169,6 +4195,39 @@ async fn receive_quic_media_loop(
         }
         flush_lan_receiver_stage_metrics(&app_state, &session_id, &mut receiver_stats).await;
     }
+}
+
+async fn recover_persistent_media_hol_stall(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    endpoint: &QuinnDatagramEndpoint,
+    error: &str,
+    receiver_stats: &mut LanSenderStatsTracker,
+    keyframe_request_sequence: &mut u32,
+    last_keyframe_request_at: &mut Option<Instant>,
+) {
+    if !error.contains("persistent reliable HOL timeout") {
+        return;
+    }
+    receiver_stats.record_ms(
+        "receiver.reliable_hol_timeout",
+        LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT.as_secs_f64() * 1000.0,
+    );
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .increment_reliable_hol_recoveries(session_id.clone(), 1);
+    let profile = selected_media_profile(app_state, session_id).await;
+    maybe_send_lan_keyframe_request(
+        endpoint,
+        session_id,
+        &profile,
+        keyframe_request_sequence,
+        last_keyframe_request_at,
+        receiver_stats,
+    )
+    .await;
 }
 
 async fn flush_lan_receiver_stage_metrics(

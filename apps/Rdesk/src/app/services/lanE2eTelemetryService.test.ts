@@ -152,6 +152,37 @@ describe("mainlineE2EArtifactPayloadFromReport", () => {
       maxZeroFrameWindowAfterFirstFrameMs: 1_200,
       sampleRenderQueueReplacements: 2,
       sampleRenderPresentSkips: 3,
+      metricSeries: [
+        {
+          timestamp: Date.UTC(2026, 5, 11, 1, 2, 9),
+          intervalMs: 250,
+          framesDecoded: 14,
+          framesDropped: 0,
+          renderFramesPresented: 13,
+          renderQueueReplacements: 4,
+          repeatedLatestFrames: 2,
+          reliableHolRecoveries: 1,
+          observedFps: 56,
+          observedRenderFps: 52,
+          queueDepth: 1,
+          receiveStall: false,
+          renderStall: false,
+          receiverMessageWaitP99Ms: 84,
+          receiverMessageWaitMaxMs: 101,
+          renderPresentGapP99Ms: 75,
+          renderPresentGapMaxMs: 99,
+          estimatedFrameAgeP99Ms: 48,
+          estimatedFrameAgeMaxMs: 63,
+        },
+      ],
+      jankEvents: [
+        {
+          timestamp: Date.UTC(2026, 5, 11, 1, 2, 9),
+          kind: "quic_hol_recovery",
+          intervalMs: 250,
+          count: 1,
+        },
+      ],
       thresholds: {
         minSampleDurationMs: 30_000,
         minDecodedFrames: 20,
@@ -208,9 +239,11 @@ describe("mainlineE2EArtifactPayloadFromReport", () => {
     expect(payload.classification.run_scope).toBe("cross_device");
     expect(payload.metric_series[0]).toEqual(
       expect.objectContaining({
-        frames_decoded: 118,
-        render_frames_presented: 117,
+        frames_decoded: 14,
+        render_frames_presented: 13,
         queue_depth: 1,
+        reliable_hol_recoveries: 1,
+        receiver_message_wait_p99_ms: 84,
         first_frame_time_ms: 5_000,
         max_zero_frame_window_after_first_frame_ms: 1_200,
       })
@@ -219,6 +252,7 @@ describe("mainlineE2EArtifactPayloadFromReport", () => {
     expect(payload.metrics_csv).toContain(
       "first_frame_time_ms,max_zero_frame_window_after_first_frame_ms"
     );
+    expect(payload.metrics_csv).toContain("receiver_message_wait_p99_ms");
     expect(payload.metrics_csv).toContain(",5000,1200");
     expect(payload.artifacts).toEqual(
       expect.arrayContaining([

@@ -121,6 +121,46 @@ async fn quinn_loopback_pair_roundtrips_persistent_reliable_messages() {
 }
 
 #[tokio::test]
+async fn persistent_reliable_stream_recovers_after_hol_timeout() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+
+    pair.client
+        .send_reliable_message_persistent(Bytes::from_static(b"first"))
+        .await
+        .expect("send first persistent message");
+    assert_eq!(
+        pair.server
+            .read_reliable_message_persistent(64)
+            .await
+            .expect("read first persistent message"),
+        Bytes::from_static(b"first")
+    );
+
+    let timeout_error = pair
+        .server
+        .read_reliable_message_persistent_with_timeout(64, Duration::from_millis(20))
+        .await
+        .expect_err("idle established stream should hit HOL timeout");
+    assert!(timeout_error.to_string().contains("HOL timeout"));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pair.client
+        .send_reliable_message_persistent(Bytes::from_static(b"recovered"))
+        .await
+        .expect("sender should reopen stopped persistent stream");
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(1),
+        pair.server.read_reliable_message_persistent(64),
+    )
+    .await
+    .expect("receiver should accept reopened stream")
+    .expect("read recovered persistent message");
+    assert_eq!(recovered, Bytes::from_static(b"recovered"));
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_fragmented_access_unit() {
     let pair = QuinnDatagramPair::loopback()
         .await

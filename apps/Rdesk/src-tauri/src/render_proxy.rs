@@ -73,7 +73,10 @@ const DEFAULT_SLOW_PRESENT_RESET_FALLBACK_AFTER_RESETS: u32 = 2;
 #[cfg(target_os = "macos")]
 const DEFAULT_RENDER_PROXY_MAX_DRAWABLE_COUNT: u32 = 2;
 #[cfg(target_os = "macos")]
-const DEFAULT_RENDER_PROXY_QUEUE_CAPACITY: usize = 3;
+// One frame may be in Metal while these two decoded frames wait. This keeps
+// the complete render path bounded to roughly three frames without dropping
+// compressed H.264/HEVC reference frames before VideoToolbox.
+const DEFAULT_RENDER_PROXY_QUEUE_CAPACITY: usize = 2;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -1347,21 +1350,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bounded_render_queue_preserves_short_decode_bursts() {
+    fn bounded_render_queue_preserves_two_frame_decode_bursts() {
         let mut pending = VecDeque::new();
 
-        assert!(!push_render_proxy_frame_bounded(&mut pending, 1, 3));
-        assert!(!push_render_proxy_frame_bounded(&mut pending, 2, 3));
-        assert!(!push_render_proxy_frame_bounded(&mut pending, 3, 3));
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(!push_render_proxy_frame_bounded(&mut pending, 1, 2));
+        assert!(!push_render_proxy_frame_bounded(&mut pending, 2, 2));
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
     fn bounded_render_queue_drops_oldest_frame_when_saturated() {
-        let mut pending = VecDeque::from([1, 2, 3]);
+        let mut pending = VecDeque::from([1, 2]);
 
-        assert!(push_render_proxy_frame_bounded(&mut pending, 4, 3));
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
+        assert!(push_render_proxy_frame_bounded(&mut pending, 3, 2));
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![2, 3]);
     }
 
     fn test_slow_present_config() -> RenderProxySlowPresentResetConfig {

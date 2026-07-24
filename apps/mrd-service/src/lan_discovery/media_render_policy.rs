@@ -81,7 +81,7 @@ pub(crate) fn lan_render_queue_policy_for_profile_with_override(
         return policy;
     }
     #[cfg(target_os = "macos")]
-    if _profile.fps >= LAN_RENDER_PACING_DEFAULT_MIN_FPS {
+    if _profile.fps >= 60 {
         return LanRenderQueuePolicy::Latest;
     }
     LanRenderQueuePolicy::PacedFifo

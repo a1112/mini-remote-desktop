@@ -1055,10 +1055,14 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             display_refresh_hz: Some(144),
             render_thread_priority: Some("highest".to_string()),
             render_waitable_timeouts: 1,
+            reliable_hol_recoveries: 2,
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
                 p50_ms: Some(1.0),
                 p95_ms: Some(2.0),
+                p99_ms: Some(2.5),
+                max_ms: Some(3.0),
+                sample_count: Some(120),
             }],
             test_impairment: None,
             sender_transport: MediaSenderTransportSnapshot {

@@ -50,6 +50,7 @@ struct MediaPipelineState {
     display_refresh_hz: Option<u32>,
     render_thread_priority: Option<String>,
     render_waitable_timeouts: u64,
+    reliable_hol_recoveries: u64,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -226,6 +227,11 @@ impl MediaPipelineRegistry {
         state.render_waitable_timeouts = state.render_waitable_timeouts.saturating_add(count);
     }
 
+    pub fn increment_reliable_hol_recoveries(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.reliable_hol_recoveries = state.reliable_hol_recoveries.saturating_add(count);
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -337,6 +343,7 @@ impl MediaPipelineRegistry {
             display_refresh_hz: state.and_then(|state| state.display_refresh_hz),
             render_thread_priority: state.and_then(|state| state.render_thread_priority.clone()),
             render_waitable_timeouts: state.map_or(0, |state| state.render_waitable_timeouts),
+            reliable_hol_recoveries: state.map_or(0, |state| state.reliable_hol_recoveries),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             sender_transport: state
@@ -360,6 +367,9 @@ fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMet
                 stage: stage.clone(),
                 p50_ms: percentile(samples, 0.50),
                 p95_ms: percentile(samples, 0.95),
+                p99_ms: percentile(samples, 0.99),
+                max_ms: percentile(samples, 1.0),
+                sample_count: Some(samples.len().min(u32::MAX as usize) as u32),
             },
         );
     }
@@ -410,5 +420,8 @@ mod tests {
             .expect("sender capture metrics");
         assert_eq!(capture.p50_ms, Some(140.0));
         assert_eq!(capture.p95_ms, Some(247.0));
+        assert_eq!(capture.p99_ms, Some(257.0));
+        assert_eq!(capture.max_ms, Some(259.0));
+        assert_eq!(capture.sample_count, Some(240));
     }
 }

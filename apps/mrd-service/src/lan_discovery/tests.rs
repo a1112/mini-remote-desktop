@@ -4316,7 +4316,9 @@ fn macos_capture_pump_repeat_pacing_defaults_to_headroom() {
 fn macos_capture_pump_repeats_latest_by_default_and_allows_opt_out() {
     assert!(lan_capture_pump_repeat_latest_from_env_value(None));
     assert!(lan_capture_pump_repeat_latest_from_env_value(Some("true")));
-    assert!(!lan_capture_pump_repeat_latest_from_env_value(Some("false")));
+    assert!(!lan_capture_pump_repeat_latest_from_env_value(Some(
+        "false"
+    )));
 }
 
 #[cfg(target_os = "macos")]
@@ -4871,6 +4873,9 @@ fn lan_sender_stats_datagram_round_trips_without_media_sequence() {
             stage: "sender.encode".to_string(),
             p50_ms: Some(1.2),
             p95_ms: Some(2.4),
+            p99_ms: Some(3.0),
+            max_ms: Some(3.2),
+            sample_count: Some(120),
         }],
         sender_transport: MediaSenderTransportSnapshot {
             capture_source_id: Some("windows:display-shared:0".to_string()),
@@ -5503,9 +5508,15 @@ fn render_queue_policy_defaults_by_platform_and_allows_latest_override() {
         lan_render_queue_policy_for_profile_with_override(&high_fps, None),
         expected_high_fps_default
     );
+    #[cfg(windows)]
     assert_eq!(
         lan_render_queue_policy_for_profile_with_override(&low_fps, None),
         LanRenderQueuePolicy::PacedFifo
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        lan_render_queue_policy_for_profile_with_override(&low_fps, None),
+        LanRenderQueuePolicy::Latest
     );
     assert_eq!(
         lan_render_queue_policy_for_profile_with_override(

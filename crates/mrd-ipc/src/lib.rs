@@ -183,6 +183,12 @@ mod wire {
         pub p50_ms: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub p95_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub p99_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sample_count: Option<u32>,
     }
 
     /// Synthetic transport impairment settings and counters for test runs.
@@ -400,6 +406,10 @@ mod wire {
         pub render_thread_priority: Option<String>,
         #[serde(default)]
         pub render_waitable_timeouts: u64,
+        /// Reliable media stream stalls that were bounded by resetting the
+        /// receive stream and requesting a fresh keyframe.
+        #[serde(default)]
+        pub reliable_hol_recoveries: u64,
         pub stage_metrics: Vec<MediaStageMetrics>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub test_impairment: Option<MediaTestImpairmentSnapshot>,

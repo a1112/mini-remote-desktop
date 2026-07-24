@@ -312,6 +312,9 @@ fn media_pipeline_registry_exposes_stage_metrics() {
             stage: "sender.encode".to_string(),
             p50_ms: Some(2.5),
             p95_ms: Some(4.5),
+            p99_ms: Some(5.0),
+            max_ms: Some(6.0),
+            sample_count: Some(20),
         }],
     );
 
