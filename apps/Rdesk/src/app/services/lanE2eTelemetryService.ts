@@ -94,6 +94,8 @@ export interface E2EMetricSeriesRow {
   render_present_gap_max_ms?: number | null;
   estimated_frame_age_p99_ms?: number | null;
   estimated_frame_age_max_ms?: number | null;
+  relative_frame_age_p99_ms?: number | null;
+  relative_frame_age_max_ms?: number | null;
 }
 
 export type MainlineE2EScriptClassification =
@@ -498,6 +500,8 @@ function metricSeriesFromLanE2EReport(report: LanE2EAutomationReport): E2EMetric
       render_present_gap_max_ms: nullableFinite(sample.renderPresentGapMaxMs),
       estimated_frame_age_p99_ms: nullableFinite(sample.estimatedFrameAgeP99Ms),
       estimated_frame_age_max_ms: nullableFinite(sample.estimatedFrameAgeMaxMs),
+      relative_frame_age_p99_ms: nullableFinite(sample.relativeFrameAgeP99Ms),
+      relative_frame_age_max_ms: nullableFinite(sample.relativeFrameAgeMaxMs),
     }));
   }
   return [
@@ -548,6 +552,8 @@ function metricsCsvFromRows(rows: E2EMetricSeriesRow[]): string {
     "render_present_gap_max_ms",
     "estimated_frame_age_p99_ms",
     "estimated_frame_age_max_ms",
+    "relative_frame_age_p99_ms",
+    "relative_frame_age_max_ms",
   ];
   const lines = rows.map((row) =>
     [
@@ -574,6 +580,8 @@ function metricsCsvFromRows(rows: E2EMetricSeriesRow[]): string {
       row.render_present_gap_max_ms,
       row.estimated_frame_age_p99_ms,
       row.estimated_frame_age_max_ms,
+      row.relative_frame_age_p99_ms,
+      row.relative_frame_age_max_ms,
     ].map(csvCell).join(",")
   );
   return `${headers.join(",")}\n${lines.join("\n")}\n`;

@@ -173,6 +173,8 @@ describe("mainlineE2EArtifactPayloadFromReport", () => {
           renderPresentGapMaxMs: 99,
           estimatedFrameAgeP99Ms: 48,
           estimatedFrameAgeMaxMs: 63,
+          relativeFrameAgeP99Ms: 12,
+          relativeFrameAgeMaxMs: 19,
         },
       ],
       jankEvents: [

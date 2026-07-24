@@ -1367,6 +1367,9 @@ ignored_stages = {
     # This is an end-to-end wall-clock estimate, not processing time spent in
     # one steady-state stage. It remains in the report with p99/max.
     "receiver.estimated_frame_age",
+    # This removes stable cross-device clock skew from the estimate above, but
+    # still includes frame cadence and queueing rather than CPU stage time.
+    "receiver.relative_frame_age",
     # Event marker for the bounded HOL watchdog, not per-frame processing work.
     "receiver.reliable_hol_timeout",
     "receiver.message_wait",

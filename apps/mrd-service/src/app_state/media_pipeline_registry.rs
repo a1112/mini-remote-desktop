@@ -51,6 +51,7 @@ struct MediaPipelineState {
     render_thread_priority: Option<String>,
     render_waitable_timeouts: u64,
     reliable_hol_recoveries: u64,
+    estimated_frame_age_baseline_ms: Option<f64>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -232,6 +233,27 @@ impl MediaPipelineRegistry {
         state.reliable_hol_recoveries = state.reliable_hol_recoveries.saturating_add(count);
     }
 
+    /// Records both the wall-clock frame-age estimate and its excess over the
+    /// best value observed in this session. The absolute estimate includes
+    /// sender/receiver clock skew; the relative value removes that stable
+    /// offset and is therefore the useful cross-device queue/jitter signal.
+    pub fn record_estimated_frame_age_ms(&mut self, session_id: SessionId, frame_age_ms: f64) {
+        if !frame_age_ms.is_finite() || frame_age_ms < 0.0 {
+            return;
+        }
+        let state = self.pipelines.entry(session_id).or_default();
+        let baseline_ms = state
+            .estimated_frame_age_baseline_ms
+            .map_or(frame_age_ms, |baseline| baseline.min(frame_age_ms));
+        state.estimated_frame_age_baseline_ms = Some(baseline_ms);
+        record_stage_sample(state, "receiver.estimated_frame_age", frame_age_ms);
+        record_stage_sample(
+            state,
+            "receiver.relative_frame_age",
+            (frame_age_ms - baseline_ms).max(0.0),
+        );
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -241,17 +263,8 @@ impl MediaPipelineRegistry {
         if !duration_ms.is_finite() || duration_ms < 0.0 {
             return;
         }
-        let samples = self
-            .pipelines
-            .entry(session_id)
-            .or_default()
-            .stage_samples
-            .entry(stage.into())
-            .or_default();
-        samples.push_back(duration_ms);
-        while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
-            samples.pop_front();
-        }
+        let state = self.pipelines.entry(session_id).or_default();
+        record_stage_sample(state, stage, duration_ms);
     }
 
     pub fn set_stage_metrics(
@@ -355,6 +368,14 @@ impl MediaPipelineRegistry {
 
     pub fn remove(&mut self, session_id: &SessionId) {
         self.pipelines.remove(session_id);
+    }
+}
+
+fn record_stage_sample(state: &mut MediaPipelineState, stage: impl Into<String>, duration_ms: f64) {
+    let samples = state.stage_samples.entry(stage.into()).or_default();
+    samples.push_back(duration_ms);
+    while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
+        samples.pop_front();
     }
 }
 

@@ -229,11 +229,7 @@ pub(super) async fn render_lan_h264_access_unit_frame(
             );
         }
         if let Some(frame_age_ms) = estimated_cross_device_frame_age_ms(timestamp_us) {
-            pipelines.record_stage_duration_ms(
-                session_id.clone(),
-                "receiver.estimated_frame_age",
-                frame_age_ms,
-            );
+            pipelines.record_estimated_frame_age_ms(session_id.clone(), frame_age_ms);
         }
     }
 
@@ -344,11 +340,7 @@ pub(super) async fn render_lan_hevc_access_unit_frame(
             );
         }
         if let Some(frame_age_ms) = estimated_cross_device_frame_age_ms(timestamp_us) {
-            pipelines.record_stage_duration_ms(
-                session_id.clone(),
-                "receiver.estimated_frame_age",
-                frame_age_ms,
-            );
+            pipelines.record_estimated_frame_age_ms(session_id.clone(), frame_age_ms);
         }
     }
 

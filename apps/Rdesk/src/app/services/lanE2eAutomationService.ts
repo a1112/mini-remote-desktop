@@ -100,6 +100,8 @@ export interface LanE2EMetricSample {
   renderPresentGapMaxMs?: number;
   estimatedFrameAgeP99Ms?: number;
   estimatedFrameAgeMaxMs?: number;
+  relativeFrameAgeP99Ms?: number;
+  relativeFrameAgeMaxMs?: number;
 }
 
 export interface LanE2EJankEvent {
@@ -956,6 +958,10 @@ export async function runLanE2EAutomation(
           mediaPipelineSnapshot.stage_metrics,
           "receiver.estimated_frame_age"
         );
+        const relativeFrameAge = mediaStage(
+          mediaPipelineSnapshot.stage_metrics,
+          "receiver.relative_frame_age"
+        );
         metricSeries.push({
           timestamp: sampleObservedAt,
           intervalMs,
@@ -976,6 +982,8 @@ export async function runLanE2EAutomation(
           renderPresentGapMaxMs: finiteMetric(renderPresentGap?.max_ms),
           estimatedFrameAgeP99Ms: finiteMetric(estimatedFrameAge?.p99_ms),
           estimatedFrameAgeMaxMs: finiteMetric(estimatedFrameAge?.max_ms),
+          relativeFrameAgeP99Ms: finiteMetric(relativeFrameAge?.p99_ms),
+          relativeFrameAgeMaxMs: finiteMetric(relativeFrameAge?.max_ms),
         });
         if (receiveStall) {
           jankEvents.push({

@@ -328,9 +328,12 @@ const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS: u32 = 100;
 const LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
-// At 60 fps this is six frame intervals. A lost packet can no longer freeze
-// every later frame on the persistent reliable stream indefinitely.
-const LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT: Duration = Duration::from_millis(100);
+// Only bounds an in-flight persistent-stream payload. Waiting for the next
+// frame header remains unbounded because an idle capture stream is not HOL.
+// Real 1080p keyframes can exceed 100 ms on a busy LAN, so keep enough margin
+// to avoid a reset/keyframe-request feedback loop while still bounding a
+// genuinely incomplete reliable frame.
+const LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT: Duration = Duration::from_millis(750);
 const LAN_QUIC_PER_MESSAGE_CONCURRENT_READS: usize = 8;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
@@ -3553,9 +3556,7 @@ async fn receive_quic_media_loop(
                     let endpoint = reliable_endpoint.clone();
                     reads.spawn(async move {
                         endpoint
-                            .read_reliable_message_with_stream_id(
-                                LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
-                            )
+                            .read_reliable_message_with_stream_id(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
                             .await
                     });
                 }
@@ -4206,7 +4207,7 @@ async fn recover_persistent_media_hol_stall(
     keyframe_request_sequence: &mut u32,
     last_keyframe_request_at: &mut Option<Instant>,
 ) {
-    if !error.contains("persistent reliable HOL timeout") {
+    if !error.contains("persistent reliable HOL payload timeout") {
         return;
     }
     receiver_stats.record_ms(

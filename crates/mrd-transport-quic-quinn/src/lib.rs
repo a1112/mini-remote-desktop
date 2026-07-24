@@ -265,8 +265,10 @@ impl QuinnDatagramEndpoint {
     }
 
     /// Reads a length-prefixed message while bounding head-of-line blocking
-    /// after the persistent stream has been established. On timeout the
-    /// receive stream is stopped so the sender can reopen a fresh stream.
+    /// after a message header has arrived. Waiting for the next header is not
+    /// timed: an idle stream is healthy and resetting it would turn a normal
+    /// capture pause into packet loss. Once a payload is in flight, the
+    /// receive stream is stopped on timeout so the sender can reopen it.
     pub async fn read_reliable_message_persistent_with_timeout(
         &self,
         max_len: usize,
@@ -292,46 +294,48 @@ impl QuinnDatagramEndpoint {
         let stream = stream_guard.as_mut().ok_or_else(|| {
             QuinnTransportError::Message("persistent receive stream missing".into())
         })?;
-        let read = async {
-            let mut header = [0_u8; 4];
-            stream.read_exact(&mut header).await.map_err(|error| {
-                QuinnTransportError::Message(format!(
-                    "persistent reliable length read failed: {error}"
-                ))
-            })?;
-            let payload_len = u32::from_le_bytes(header) as usize;
-            if payload_len > max_len {
-                return Err(QuinnTransportError::Message(format!(
-                    "persistent reliable payload too large: {payload_len} > {max_len}"
-                )));
-            }
-            let mut payload = vec![0_u8; payload_len];
+        let mut header = [0_u8; 4];
+        if let Err(error) = stream.read_exact(&mut header).await {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable length read failed: {error}"
+            )));
+        }
+        let payload_len = u32::from_le_bytes(header) as usize;
+        if payload_len > max_len {
+            *stream_guard = None;
+            return Err(QuinnTransportError::Message(format!(
+                "persistent reliable payload too large: {payload_len} > {max_len}"
+            )));
+        }
+        let mut payload = vec![0_u8; payload_len];
+        let read_payload = async {
             stream.read_exact(&mut payload).await.map_err(|error| {
                 QuinnTransportError::Message(format!(
                     "persistent reliable payload read failed: {error}"
                 ))
-            })?;
-            Ok(Bytes::from(payload))
+            })
         };
         let result = match read_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, read).await {
+            Some(timeout) => match tokio::time::timeout(timeout, read_payload).await {
                 Ok(result) => result,
                 Err(_) => {
                     if let Some(mut stream) = stream_guard.take() {
                         let _ = stream.stop(quinn::VarInt::from_u32(0x4d52));
                     }
                     return Err(QuinnTransportError::Message(format!(
-                        "persistent reliable HOL timeout after {} ms",
-                        timeout.as_millis()
+                        "persistent reliable HOL payload timeout after {} ms ({} bytes)",
+                        timeout.as_millis(),
+                        payload_len
                     )));
                 }
             },
-            None => read.await,
+            None => read_payload.await,
         };
         if result.is_err() {
             *stream_guard = None;
         }
-        result
+        result.map(|_| Bytes::from(payload))
     }
 
     pub async fn connect_client(
