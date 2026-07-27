@@ -2413,6 +2413,10 @@ export function RemoteDisplayWindowPage() {
     () => profileColorPipelineFromSearch(searchParams),
     [searchParams]
   );
+  const requestedCaptureSourceId = useMemo(
+    () => searchParams.get("captureSourceId")?.trim() || null,
+    [searchParams]
+  );
   const requestedEncoder = requestedCodec
     ? encoderForRequestedProfileCodec(
         requestedCodec,
@@ -5230,9 +5234,17 @@ export function RemoteDisplayWindowPage() {
     const nextSources = Array.isArray(sources) ? sources : [];
     setCaptureSources(nextSources);
 
-    const preferredSource = pickPreferredCaptureSource(nextSources);
+    const preferredSource = requestedCaptureSourceId
+      ? nextSources.find(
+          (source) => source.id.toLowerCase() === requestedCaptureSourceId.toLowerCase()
+        )
+      : pickPreferredCaptureSource(nextSources);
     if (!preferredSource) {
-      throw new Error("远端未发现可捕获的全屏/窗口源，无法启动接收");
+      throw new Error(
+        requestedCaptureSourceId
+          ? `远端未发现已选捕获源 ${requestedCaptureSourceId}，无法启动接收`
+          : "远端未发现可捕获的全屏/窗口源，无法启动接收"
+      );
     }
 
     const selection = await selectRemoteCaptureSource(sessionId, preferredSource.id);
@@ -5241,7 +5253,13 @@ export function RemoteDisplayWindowPage() {
       `默认捕获源（远端设备）: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
     );
     return selection;
-  }, [captureSourceSelection, captureSources, isLocalPipelinePreview, sessionId]);
+  }, [
+    captureSourceSelection,
+    captureSources,
+    isLocalPipelinePreview,
+    requestedCaptureSourceId,
+    sessionId,
+  ]);
 
   const handleStartRemoteReceiver = useCallback(async () => {
     setTestSettingsOpen(false);
@@ -5439,9 +5457,17 @@ export function RemoteDisplayWindowPage() {
 
         const nextSources = Array.isArray(sources) ? sources : [];
         setCaptureSources(nextSources);
-        const preferredSource = pickPreferredCaptureSource(nextSources);
+        const preferredSource = requestedCaptureSourceId
+          ? nextSources.find(
+              (source) => source.id.toLowerCase() === requestedCaptureSourceId.toLowerCase()
+            )
+          : pickPreferredCaptureSource(nextSources);
         if (!preferredSource) {
-          setTestMessage("远端未发现可捕获的全屏/窗口源");
+          setTestMessage(
+            requestedCaptureSourceId
+              ? `远端未发现已选捕获源 ${requestedCaptureSourceId}`
+              : "远端未发现可捕获的全屏/窗口源"
+          );
           return;
         }
 
@@ -5462,7 +5488,7 @@ export function RemoteDisplayWindowPage() {
     return () => {
       cancelled = true;
     };
-  }, [isLocalPipelinePreview, sessionId]);
+  }, [isLocalPipelinePreview, requestedCaptureSourceId, sessionId]);
 
   const waitForLocalRunFinished = useCallback(
     async (runId: string, timeoutMs: number): Promise<TestRun | null> => {

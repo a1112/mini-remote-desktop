@@ -5822,6 +5822,59 @@ describe("RemoteDisplayWindowPage", () => {
     });
   });
 
+  it("reuses the capture source selected by the controller automation", async () => {
+    const mockInvoke = getMockInvoke();
+    const syntheticSource = {
+      id: "test:synthetic-cv",
+      platform: "macos",
+      source_kind: "test",
+      title: "Synthetic CV",
+      class_name: "Synthetic",
+      width: 2560,
+      height: 1440,
+      process_id: 0,
+      app_name: "Rdesk",
+      bundle_identifier: null,
+      preview_data_url: null,
+      preview_width: null,
+      preview_height: null,
+    };
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "test_get_capabilities") {
+        return Promise.resolve(windowsCapabilities());
+      }
+      if (command === "ipc_list_remote_capture_sources") {
+        return Promise.resolve([remoteDisplaySource, syntheticSource]);
+      }
+      if (command === "ipc_select_remote_capture_source") {
+        const sourceId = (args as { sourceId?: string } | undefined)?.sourceId;
+        return Promise.resolve({
+          session_id: "p2p-quic-123",
+          source: sourceId === syntheticSource.id ? syntheticSource : remoteDisplaySource,
+          status: "selected",
+          reason: null,
+        });
+      }
+      return defaultRemoteDisplayInvoke(command);
+    });
+
+    renderRemoteDisplay(
+      "p2p-quic-123",
+      "?surface=surface-1&captureSourceId=test%3Asynthetic-cv"
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("ipc_select_remote_capture_source", {
+        sessionId: "p2p-quic-123",
+        sourceId: "test:synthetic-cv",
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("ipc_select_remote_capture_source", {
+      sessionId: "p2p-quic-123",
+      sourceId: remoteDisplaySource.id,
+    });
+  });
+
   it("does not render decoded remote desktop data URLs as preview frames", async () => {
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {

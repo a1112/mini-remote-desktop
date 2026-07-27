@@ -276,6 +276,7 @@ export async function openRemoteDisplayWindow(params: {
   surfaceId?: string | null;
   preferredDisplaySourceId?: string | null;
   avoidCaptureSourceId?: string | null;
+  captureSourceId?: string | null;
   requestedProfile?: MediaProfile | null;
 }): Promise<AdapterResult<RemoteDisplayWindowContext>> {
   if (shouldUseServiceBridge()) {
@@ -298,6 +299,7 @@ export async function openRemoteDisplayWindow(params: {
     surfaceId: params.surfaceId ?? null,
     preferredDisplaySourceId: params.preferredDisplaySourceId ?? null,
     avoidCaptureSourceId: params.avoidCaptureSourceId ?? null,
+    captureSourceId: params.captureSourceId ?? null,
     ...remoteDisplayProfileArgs(params.requestedProfile),
   });
 }

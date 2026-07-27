@@ -235,6 +235,7 @@ export interface LanE2EAutomationCommands {
     sessionId: string;
     preferredDisplaySourceId?: string;
     avoidCaptureSourceId?: string;
+    captureSourceId?: string;
     requestedProfile?: MediaProfile;
   }): Promise<AdapterResult<RemoteDisplayWindowContext>>;
   ipcSendControlInput?(
@@ -757,7 +758,10 @@ export async function runLanE2EAutomation(
             ? { preferredDisplaySourceId: options.preferredRenderDisplaySourceId }
             : {}),
           ...(captureSource
-            ? { avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource) }
+            ? {
+                avoidCaptureSourceId: captureSourceDisplayPlacementRef(captureSource),
+                captureSourceId: captureSource.id,
+              }
             : {}),
           ...(requestedProfile ? { requestedProfile } : {}),
         }),

@@ -3029,6 +3029,7 @@ async fn send_quic_media_loop(
                     ..LanSenderDatagramFrameReport::default()
                 };
                 let mut skip_unsent_datagram_frame = false;
+                let mut delayed_fragments = Vec::new();
                 for (fragment_index, fragment) in fragments.iter().enumerate() {
                     let frame_send_started =
                         datagram_report.fragments_sent > 0 || datagram_report.fragments_delayed > 0;
@@ -3058,28 +3059,7 @@ async fn send_quic_media_loop(
                     if !decision.delay.is_zero() {
                         datagram_report.fragments_delayed =
                             datagram_report.fragments_delayed.saturating_add(1);
-                        let delayed_endpoint = endpoint.clone();
-                        let delayed_session_id = session_id.clone();
-                        let delayed_frame_id = frame_id;
-                        let delayed_fragment = fragment.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(decision.delay).await;
-                            let send_result = send_lan_media_datagram(
-                                &delayed_endpoint,
-                                delayed_fragment,
-                                !best_effort_datagrams,
-                                None,
-                            )
-                            .await;
-                            if let Err(error) = send_result {
-                                tracing::debug!(
-                                    %error,
-                                    session_id = %delayed_session_id.0,
-                                    frame_id = delayed_frame_id,
-                                    "delayed LAN QUIC media datagram send failed"
-                                );
-                            }
-                        });
+                        delayed_fragments.push((decision.delay, fragment_index, fragment.clone()));
                         continue;
                     }
                     let send_fragment_result = send_lan_media_datagram(
@@ -3097,7 +3077,10 @@ async fn send_quic_media_loop(
                         Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
                             datagram_report.fragments_dropped_for_capacity = datagram_report
                                 .fragments_dropped_for_capacity
-                                .saturating_add((fragments.len() - fragment_index) as u64);
+                                .saturating_add(
+                                    (fragments.len() - fragment_index + delayed_fragments.len())
+                                        as u64,
+                                );
                             datagram_report.cut_short_for_capacity = true;
                             if !frame_send_started {
                                 skip_unsent_datagram_frame = true;
@@ -3111,6 +3094,53 @@ async fn send_quic_media_loop(
                             break;
                         }
                     }
+                }
+                if !skip_unsent_datagram_frame
+                    && send_result.is_ok()
+                    && !delayed_fragments.is_empty()
+                {
+                    delayed_fragments
+                        .sort_by_key(|(delay, fragment_index, _)| (*delay, *fragment_index));
+                    let delayed_endpoint = endpoint.clone();
+                    let delayed_session_id = session_id.clone();
+                    let delayed_frame_id = frame_id;
+                    tokio::spawn(async move {
+                        let delayed_send_started = Instant::now();
+                        for (delay, _, fragment) in delayed_fragments {
+                            let remaining_delay =
+                                delay.saturating_sub(delayed_send_started.elapsed());
+                            if !remaining_delay.is_zero() {
+                                tokio::time::sleep(remaining_delay).await;
+                            }
+                            match send_lan_media_datagram(
+                                &delayed_endpoint,
+                                fragment,
+                                !best_effort_datagrams,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(LanDatagramSendOutcome::Sent) => {}
+                                Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
+                                    tracing::debug!(
+                                        session_id = %delayed_session_id.0,
+                                        frame_id = delayed_frame_id,
+                                        "delayed LAN QUIC media frame cut short for capacity"
+                                    );
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::debug!(
+                                        %error,
+                                        session_id = %delayed_session_id.0,
+                                        frame_id = delayed_frame_id,
+                                        "delayed LAN QUIC media datagram send failed"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
                 sender_stats.record_datagram_frame(datagram_report);
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);

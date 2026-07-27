@@ -280,6 +280,7 @@ fn open_remote_display_window(
     surface_id: Option<String>,
     preferred_display_source_id: Option<String>,
     avoid_capture_source_id: Option<String>,
+    capture_source_id: Option<String>,
     profile_width: Option<u32>,
     profile_height: Option<u32>,
     profile_fps: Option<u32>,
@@ -295,7 +296,7 @@ fn open_remote_display_window(
 ) -> Result<RenderWindowContext, String> {
     let spec = {
         let mut registry = state.render_window_registry.lock().unwrap();
-        let query_params = remote_display_profile_query_params(
+        let mut query_params = remote_display_profile_query_params(
             profile_width,
             profile_height,
             profile_fps,
@@ -309,6 +310,11 @@ fn open_remote_display_window(
             profile_color_mode,
             profile_color_pipeline,
         );
+        if let Some(capture_source_id) =
+            capture_source_id.filter(|source_id| !source_id.trim().is_empty())
+        {
+            query_params.push(("captureSourceId".to_string(), capture_source_id));
+        }
         let session_id = SessionId(session_id);
         if query_params.is_empty() {
             registry.reserve_window(session_id, surface_id)?

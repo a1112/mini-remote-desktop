@@ -208,6 +208,12 @@ describe("launchRemoteDisplayForDevice", () => {
     expect(mocks.selectRemoteCaptureSource.mock.invocationCallOrder[0]!).toBeLessThan(
       mocks.openRemoteDisplayWindow.mock.invocationCallOrder[0]!
     );
+    expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "p2p-quic-session",
+        captureSourceId: "windows:window:0x1234",
+      })
+    );
     expect(result.captureSourceSelection?.source.id).toBe("windows:window:0x1234");
   });
 
@@ -312,6 +318,7 @@ describe("launchRemoteDisplayForDevice", () => {
     );
     expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "remote-app-session",
+      captureSourceId: "windows:window:0x1234",
       requestedProfile: DEFAULT_HEVC_1080P60_PROFILE,
     });
     expect(result.sessionId).toBe("remote-app-session");
@@ -337,6 +344,7 @@ describe("launchRemoteDisplayForDevice", () => {
     );
     expect(mocks.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "remote-mac-app-session",
+      captureSourceId: "windows:window:0x1234",
       requestedProfile: MACOS_HEVC_2K144_PROFILE,
     });
     expect(result.sessionId).toBe("remote-mac-app-session");

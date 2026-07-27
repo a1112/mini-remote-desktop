@@ -183,6 +183,9 @@ export async function launchRemoteDisplayForDevice(
   const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = {
     sessionId: startedSessionId,
   };
+  if (captureSourceSelection) {
+    windowParams.captureSourceId = captureSourceSelection.source.id;
+  }
   if (lanRequestedProfile) {
     windowParams.requestedProfile = lanRequestedProfile;
   }
@@ -272,7 +275,10 @@ export async function launchRemoteApplicationForDevice(
     captureSourceSelection = await selectRemoteCaptureSource(sessionId, sourceId);
     const requestedProfile =
       options?.requestedProfile ?? defaultRemoteMediaProfileForTarget(options?.targetOs);
-    const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = { sessionId };
+    const windowParams: Parameters<typeof openRemoteDisplayWindow>[0] = {
+      sessionId,
+      captureSourceId: captureSourceSelection.source.id,
+    };
     if (requestedProfile) {
       windowParams.requestedProfile = requestedProfile;
     }
