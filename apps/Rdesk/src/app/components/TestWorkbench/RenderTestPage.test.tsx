@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
 import { RenderTestPage } from "./RenderTestPage";
@@ -289,6 +290,7 @@ describe("RenderTestPage platform capabilities", () => {
   });
 
   it("uses direct macOS capture to Metal render without encode/decode", async () => {
+    const user = userEvent.setup();
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -333,7 +335,7 @@ describe("RenderTestPage platform capabilities", () => {
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /Metal/ })).toBeEnabled()
     );
-    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+    await user.click(screen.getByRole("button", { name: /启动测试/ }));
 
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith(

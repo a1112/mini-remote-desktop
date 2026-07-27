@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it } from "vitest";
 import { getMockInvoke } from "../../../test/mocks/tauri";
@@ -147,6 +148,7 @@ describe("CustomTestPage platform capabilities", () => {
   });
 
   it("blocks VideoToolbox HEVC custom runs without HEVC decode capability", async () => {
+    const user = userEvent.setup();
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -174,12 +176,12 @@ describe("CustomTestPage platform capabilities", () => {
     );
 
     const encoder = await screen.findByRole("radio", { name: /VideoToolbox HEVC/ });
-    fireEvent.click(encoder);
+    await user.click(encoder);
     const decoder = screen
       .getAllByRole("radio")
       .find((radio) => (radio as HTMLInputElement).value === "videotoolbox");
     expect(decoder).toBeDefined();
-    fireEvent.click(decoder!);
+    await user.click(decoder!);
 
     expect(screen.getByRole("button", { name: /启动测试/ })).toBeDisabled();
     expect(screen.getByText("当前环境未暴露 VideoToolbox HEVC 解码能力。")).toBeInTheDocument();

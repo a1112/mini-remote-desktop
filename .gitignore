@@ -10,7 +10,6 @@ dist/
 # Rust
 target/
 generated-images/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 

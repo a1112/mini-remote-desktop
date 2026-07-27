@@ -402,9 +402,7 @@ fn low_latency_transport_config() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
     config
         .send_window(LOW_LATENCY_SEND_WINDOW_BYTES)
-        .stream_receive_window(VarInt::from_u32(
-            LOW_LATENCY_STREAM_RECEIVE_WINDOW_BYTES,
-        ))
+        .stream_receive_window(VarInt::from_u32(LOW_LATENCY_STREAM_RECEIVE_WINDOW_BYTES))
         .receive_window(VarInt::from_u32(
             LOW_LATENCY_CONNECTION_RECEIVE_WINDOW_BYTES,
         ));

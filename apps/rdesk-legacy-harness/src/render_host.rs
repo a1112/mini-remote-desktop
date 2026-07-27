@@ -218,6 +218,8 @@ impl RenderHost {
                 let bytes = match &render_frame.data {
                     mrd_render::RenderFrameData::Rgb24(data) => data.len(),
                     mrd_render::RenderFrameData::Bgra32(data) => data.len(),
+                    mrd_render::RenderFrameData::Nv12 { data, .. } => data.len(),
+                    mrd_render::RenderFrameData::Nv12Bytes { data, .. } => data.len(),
                     #[cfg(windows)]
                     mrd_render::RenderFrameData::D3D11SharedBgra { .. } => {
                         render_frame.width * render_frame.height * 4
@@ -388,6 +390,7 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
         last_pixel_format: snapshot.last_pixel_format.map(|format| match format {
             RenderPixelFormat::Rgb24 => "Rgb24".to_string(),
             RenderPixelFormat::Bgra32 => "Bgra32".to_string(),
+            RenderPixelFormat::Nv12 => "Nv12".to_string(),
             #[cfg(windows)]
             RenderPixelFormat::D3D11SharedNv12 => "D3D11SharedNv12".to_string(),
             #[cfg(windows)]
@@ -398,7 +401,7 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::{RenderHost, SurfaceSourceBindingResponse};
     use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};

@@ -1899,7 +1899,10 @@ mod tests {
     #[test]
     fn d3d11_factory_reports_platform_error_off_windows() {
         let factory = D3d11RendererFactory;
-        let error = factory.create().expect_err("platform error");
+        let error = match factory.create() {
+            Ok(_) => panic!("expected platform error"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("Windows"));
     }

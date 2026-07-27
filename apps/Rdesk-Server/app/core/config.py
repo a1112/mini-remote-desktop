@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 9530
     db_url: str = "postgresql+asyncpg://postgres:519223@127.0.0.1:5432/rdesk_server"
-    jwt_secret: str = "change_me_for_production"
+    jwt_secret: str = "change_me_for_production_at_least_32_bytes"
     jwt_expire_minutes: int = 60 * 24 * 7
     signaling_ws_url: str = "ws://127.0.0.1:9532/ws"
     realtime_server_health_url: str = "http://127.0.0.1:9532/health"

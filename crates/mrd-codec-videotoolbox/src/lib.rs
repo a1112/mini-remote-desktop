@@ -2598,8 +2598,7 @@ mod imp {
         fn videotoolbox_h264_temporal_compression_emits_decodable_inter_frames() {
             let mut encoder = VideoToolboxH264Encoder::new_with_bitrate(64, 64, 60, 1_000_000)
                 .expect("create videotoolbox encoder");
-            let mut decoder =
-                VideoToolboxH264Decoder::new().expect("create videotoolbox decoder");
+            let mut decoder = VideoToolboxH264Decoder::new().expect("create videotoolbox decoder");
             let mut encoded_frames = 0_usize;
             let mut inter_frames = 0_usize;
             let mut decoded_frames = 0_usize;
@@ -2619,8 +2618,8 @@ mod imp {
                     decoder
                         .push_access_unit(&unit.bytes)
                         .expect("decode synthetic access unit");
-                    decoded_frames = decoded_frames
-                        .saturating_add(decoder.drain_decoded_frames().len());
+                    decoded_frames =
+                        decoded_frames.saturating_add(decoder.drain_decoded_frames().len());
                 }
             }
 

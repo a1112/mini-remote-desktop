@@ -1837,6 +1837,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires a working NVIDIA NVENC runtime"]
     async fn nvenc_single_process_pipeline_delivers_remote_frames() {
         ensure_rustls_crypto_provider();
         let Ok(encoder) = NvencH264Encoder::new(16, 16, 30) else {
@@ -1864,6 +1865,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a working NVIDIA NVENC runtime"]
     fn nvenc_720p_access_unit_survives_rtp_ingress_and_software_decode() {
         let Ok(mut encoder) = NvencH264Encoder::new(1280, 720, 30) else {
             return;

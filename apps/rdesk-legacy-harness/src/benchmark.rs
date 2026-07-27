@@ -588,7 +588,7 @@ Duration: `{duration}s`\n\n\
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use mrd_observability::{PipelineProbeSnapshot, StageId, StageStatsSnapshot};
     use mrd_proto::SessionId;
@@ -674,14 +674,24 @@ mod tests {
             "quick-webrtc-20260308-abc123".into(),
         );
 
-        assert!(paths.run_dir.ends_with(r"artifacts\benchmarks\2026-03-08\transport-webrtc-baseline\quick-webrtc-20260308-abc123"));
-        assert!(paths.summary_json.ends_with(r"summary.json"));
-        assert!(paths.summary_csv.ends_with(r"summary.csv"));
-        assert!(paths.report_md.ends_with(r"reports\markdown-report.md"));
-        assert!(paths.host_stdout.ends_with(r"logs\host.stdout.log"));
+        assert!(paths.run_dir.ends_with(
+            Path::new("artifacts")
+                .join("benchmarks")
+                .join("2026-03-08")
+                .join("transport-webrtc-baseline")
+                .join("quick-webrtc-20260308-abc123")
+        ));
+        assert!(paths.summary_json.ends_with("summary.json"));
+        assert!(paths.summary_csv.ends_with("summary.csv"));
+        assert!(paths
+            .report_md
+            .ends_with(Path::new("reports").join("markdown-report.md")));
+        assert!(paths
+            .host_stdout
+            .ends_with(Path::new("logs").join("host.stdout.log")));
         assert!(paths
             .probe_json("session-bench")
-            .ends_with(r"sessions\session-bench.probe.json"));
+            .ends_with(Path::new("sessions").join("session-bench.probe.json")));
     }
 
     #[test]
