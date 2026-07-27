@@ -312,9 +312,12 @@ export function E2ETestPage() {
       runMode: "manual",
       runIdPrefix: "e2e-lan",
     } as const;
-    void commands.testRecordExternalRun(
+    const recordResult = await commands.testRecordExternalRun(
       externalRunRecordFromLanE2EReport(report, reportConfig, reportOptions)
     );
+    if (!recordResult.ok) {
+      console.error("Failed to persist LAN E2E run history", recordResult.error);
+    }
     void commands.automationWriteReport(
       mainlineE2EArtifactPayloadFromReport(report, reportConfig, reportOptions)
     ).then((result) => {

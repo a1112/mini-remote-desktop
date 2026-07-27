@@ -107,11 +107,10 @@ interface EncoderMetrics {
   encode_fps: number;
   encode_latency_p50_ms: number;
   encode_latency_p95_ms: number;
-  encode_latency_p99_ms: number;
   encoded_units: number;
   dropped_frames: number;
   resolution: [number, number];
-  bitrate_kbps: number;
+  bitrate_kbps: number | null;
 }
 
 function buildEncodeRun(
@@ -297,20 +296,26 @@ export function EncodeTestPage() {
       try {
         const result = await commands.testHarnessGetMetrics();
         if (result.ok) {
+          const encodedFps = result.value.encoded_fps ?? result.value.capture_fps;
+          const encodedUnits = result.value.encoded_units ?? result.value.frame_count;
+          const sampleSeconds =
+            encodedFps > 0 && encodedUnits > 0 ? encodedUnits / encodedFps : 0;
           if (!result.value.is_running) {
             setIsRunning(false);
             setActiveRunId(null);
           }
           setMetrics({
             is_running: result.value.is_running,
-            encode_fps: result.value.encoded_fps ?? result.value.capture_fps,
+            encode_fps: encodedFps,
             encode_latency_p50_ms: result.value.encode_latency_p50_ms,
             encode_latency_p95_ms: result.value.encode_latency_p95_ms,
-            encode_latency_p99_ms: result.value.encode_latency_p95_ms * 1.15,
-            encoded_units: result.value.encoded_units ?? result.value.frame_count,
+            encoded_units: encodedUnits,
             dropped_frames: result.value.dropped_frames,
             resolution: result.value.resolution,
-            bitrate_kbps: 5000, // Default, would need actual measurement
+            bitrate_kbps:
+              sampleSeconds > 0
+                ? (result.value.total_bitstream_bytes * 8) / sampleSeconds / 1000
+                : null,
           });
         }
       } finally {
@@ -350,12 +355,14 @@ export function EncodeTestPage() {
   };
 
   const handleStop = async () => {
-    if (activeRunId) {
-      await commands.testStopRun(activeRunId);
-      setActiveRunId(null);
-    } else {
-      await commands.testHarnessStop();
+    const result = activeRunId
+      ? await commands.testStopRun(activeRunId)
+      : await commands.testHarnessStop();
+    if (!result.ok) {
+      setStartError(`停止测试失败：${result.error.message}`);
+      return;
     }
+    setActiveRunId(null);
     setIsRunning(false);
   };
 
@@ -572,7 +579,9 @@ export function EncodeTestPage() {
             <div className="space-y-3">
               <PercentileBar label="P50 (中位数)" value={metrics.encode_latency_p50_ms} />
               <PercentileBar label="P95 (95%)" value={metrics.encode_latency_p95_ms} />
-              <PercentileBar label="P99 (99%)" value={metrics.encode_latency_p99_ms} />
+              <p className="text-xs text-muted-foreground">
+                P99 未由后端采集，因此不生成推算值。
+              </p>
             </div>
           </div>
 
@@ -582,9 +591,11 @@ export function EncodeTestPage() {
             <div className="grid grid-cols-3 gap-4">
               <div className="text-center">
                 <p className="text-2xl font-bold text-green-500">
-                  {metrics.bitrate_kbps}K
+                  {metrics.bitrate_kbps === null
+                    ? "未采集"
+                    : `${metrics.bitrate_kbps.toFixed(0)}K`}
                 </p>
-                <p className="text-sm text-muted-foreground">实际码率</p>
+                <p className="text-sm text-muted-foreground">实测媒体载荷速率</p>
               </div>
               <div className="text-center">
                 <p className="text-2xl font-bold">-</p>

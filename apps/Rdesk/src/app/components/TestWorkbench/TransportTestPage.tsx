@@ -89,12 +89,12 @@ const TRANSPORT_OPTIONS: TransportOption[] = [
 
 interface TransportMetrics {
   is_running: boolean;
-  throughput_mbps: number;
-  latency_ms: number;
-  jitter_ms: number;
-  packet_loss_percent: number;
-  bytes_sent: number;
-  bytes_received: number;
+  throughput_mbps: number | null;
+  latency_ms: number | null;
+  jitter_ms: number | null;
+  packet_loss_percent: number | null;
+  bytes_sent: number | null;
+  bytes_received: number | null;
   connection_count: number;
   frames_received: number;
   frames_decoded: number;
@@ -139,6 +139,7 @@ export function TransportTestPage() {
       : shouldShowCapabilityOption(option.available, showUnavailable)
   );
   const selectedOption = visibleTransportOptions.find((o) => o.id === selectedTransport);
+  const throughputChartMax = Math.max(1, ...throughputHistory);
 
   const TEST_PROFILES = [
     { id: "latency", name: "延迟优先", desc: "优化低延迟传输" },
@@ -218,34 +219,52 @@ export function TransportTestPage() {
   }, [refreshLanPeers, runScope]);
 
   useEffect(() => {
-    if (!isRunning) return;
+    if (!isRunning || !currentRunId) return;
 
     const interval = setInterval(async () => {
-      // Simulated metrics - in reality would come from transport layer
-      const simulatedMetrics: TransportMetrics = {
-        is_running: true,
-        throughput_mbps: testProfile === "throughput" ? 800 + Math.random() * 200 : 100 + Math.random() * 50,
-        latency_ms: testProfile === "latency" ? 5 + Math.random() * 5 : 20 + Math.random() * 30,
-        jitter_ms: Math.random() * 5,
-        packet_loss_percent: Math.random() * 0.1,
-        bytes_sent: Math.floor(Math.random() * 10000000),
-        bytes_received: Math.floor(Math.random() * 5000000),
-        connection_count: 1,
-        frames_received: 0,
-        frames_decoded: 0,
+      const result = await commands.testHarnessGetMetrics();
+      if (!result.ok) return;
+
+      const sample = result.value;
+      const encodedFps = sample.encoded_fps ?? 0;
+      const sampleSeconds =
+        encodedFps > 0 && sample.encoded_units > 0
+          ? sample.encoded_units / encodedFps
+          : 0;
+      const payloadRateMbps =
+        sampleSeconds > 0
+          ? (sample.total_bitstream_bytes * 8) / sampleSeconds / 1_000_000
+          : null;
+      const totalFrames = sample.frame_count + sample.dropped_frames;
+      const dropRate =
+        totalFrames > 0 ? (sample.dropped_frames / totalFrames) * 100 : null;
+      const nextMetrics: TransportMetrics = {
+        is_running: sample.is_running,
+        throughput_mbps: payloadRateMbps,
+        latency_ms:
+          sample.encoded_units > 0 ? sample.transport_latency_p95_ms : null,
+        jitter_ms: null,
+        packet_loss_percent: dropRate,
+        bytes_sent: sample.total_bitstream_bytes,
+        bytes_received:
+          sample.decoded_frames > 0 ? sample.total_bitstream_bytes : null,
+        connection_count: sample.is_running ? 1 : 0,
+        frames_received: sample.encoded_units,
+        frames_decoded: sample.decoded_frames,
       };
 
-      setMetrics(simulatedMetrics);
-
-      // Update throughput history
-      setThroughputHistory((prev) => {
-        const newHistory = [...prev, simulatedMetrics.throughput_mbps];
-        return newHistory.slice(-30);
-      });
+      setMetrics(nextMetrics);
+      if (payloadRateMbps !== null) {
+        setThroughputHistory((prev) => [...prev, payloadRateMbps].slice(-30));
+      }
+      if (!sample.is_running) {
+        setIsRunning(false);
+        setCurrentRunId(null);
+      }
     }, 500);
 
     return () => clearInterval(interval);
-  }, [isRunning, testProfile]);
+  }, [currentRunId, isRunning]);
 
   const handleStart = async () => {
     if (!selectedOption?.available) return;
@@ -285,11 +304,12 @@ export function TransportTestPage() {
         createSessionId: () =>
           `transport-lan-${sanitizeSessionPart(selectedPeer.device_id)}-${Date.now()}`,
       });
-      setMetrics(transportMetricsFromLanReport(report, requestedProfile));
-      setThroughputHistory([
-        report.probeSnapshot?.bitrate_mbps ?? requestedProfile.bitrate_mbps,
-      ]);
-      void commands.testRecordExternalRun(
+      const reportMetrics = transportMetricsFromLanReport(report, requestedProfile);
+      setMetrics(reportMetrics);
+      setThroughputHistory(
+        reportMetrics.throughput_mbps === null ? [] : [reportMetrics.throughput_mbps]
+      );
+      const recordResult = await commands.testRecordExternalRun(
         externalRunRecordFromLanE2EReport(report, crossDeviceConfig, {
           environment: capabilities,
           peer: selectedPeer,
@@ -299,7 +319,9 @@ export function TransportTestPage() {
       );
       setIsRunning(false);
 
-      if (report.status !== "completed") {
+      if (!recordResult.ok) {
+        setStartError(`测试完成，但保存历史记录失败：${recordResult.error.message}`);
+      } else if (report.status !== "completed") {
         setStartError(
           report.errorMessage ?? report.failureReason ?? "跨设备传输测试失败"
         );
@@ -367,10 +389,12 @@ export function TransportTestPage() {
   };
 
   const handleStop = async () => {
-    if (currentRunId) {
-      await commands.testStopRun(currentRunId);
-    } else {
-      await commands.testHarnessStop();
+    const result = currentRunId
+      ? await commands.testStopRun(currentRunId)
+      : await commands.testHarnessStop();
+    if (!result.ok) {
+      setStartError(`停止测试失败：${result.error.message}`);
+      return;
     }
     setIsRunning(false);
     setCurrentRunId(null);
@@ -573,24 +597,35 @@ export function TransportTestPage() {
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
             <MetricCard
               icon={<Gauge className="h-4 w-4" />}
-              label="吞吐量"
-              value={`${metrics.throughput_mbps.toFixed(1)} Mbps`}
-              color={getThroughputColor(metrics.throughput_mbps)}
+              label="媒体载荷速率"
+              value={formatOptionalRate(metrics.throughput_mbps)}
+              color={
+                metrics.throughput_mbps === null
+                  ? "text-muted-foreground"
+                  : getThroughputColor(metrics.throughput_mbps)
+              }
             />
             <MetricCard
               icon={<Network className="h-4 w-4" />}
-              label="延迟"
-              value={`${metrics.latency_ms.toFixed(1)} ms`}
-              color={getLatencyColor(metrics.latency_ms)}
+              label="传输 P95 延迟"
+              value={formatOptionalMs(metrics.latency_ms, 1)}
+              color={
+                metrics.latency_ms === null
+                  ? "text-muted-foreground"
+                  : getLatencyColor(metrics.latency_ms)
+              }
             />
             <MetricCard
               label="抖动"
-              value={`${metrics.jitter_ms.toFixed(2)} ms`}
+              value={formatOptionalMs(metrics.jitter_ms, 2)}
             />
             <MetricCard
-              label="丢包率"
-              value={`${metrics.packet_loss_percent.toFixed(3)}%`}
-              highlight={metrics.packet_loss_percent > 0.05}
+              label="帧丢弃率"
+              value={formatOptionalPercent(metrics.packet_loss_percent)}
+              highlight={
+                metrics.packet_loss_percent !== null &&
+                metrics.packet_loss_percent > 0.05
+              }
             />
           </div>
 
@@ -602,7 +637,7 @@ export function TransportTestPage() {
                 <div
                   key={idx}
                   className="flex-1 bg-blue-500 rounded-t transition-all"
-                  style={{ height: `${(value / 1000) * 100}%` }}
+                  style={{ height: `${(value / throughputChartMax) * 100}%` }}
                 />
               ))}
               {throughputHistory.length === 0 && (
@@ -619,11 +654,11 @@ export function TransportTestPage() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
               <div>
                 <p className="text-muted-foreground">发送字节</p>
-                <p className="font-mono">{formatBytes(metrics.bytes_sent)}</p>
+                <p className="font-mono">{formatOptionalBytes(metrics.bytes_sent)}</p>
               </div>
               <div>
                 <p className="text-muted-foreground">接收字节</p>
-                <p className="font-mono">{formatBytes(metrics.bytes_received)}</p>
+                <p className="font-mono">{formatOptionalBytes(metrics.bytes_received)}</p>
               </div>
               <div>
                 <p className="text-muted-foreground">连接数</p>
@@ -684,6 +719,20 @@ function MetricCard({
 }
 
 function PerformanceGrade({ metrics }: { metrics: TransportMetrics }) {
+  if (metrics.latency_ms === null || metrics.packet_loss_percent === null) {
+    return (
+      <div className="flex items-center gap-4">
+        <div className="text-4xl font-bold text-muted-foreground">N/A</div>
+        <div>
+          <p className="font-medium">指标不足，未进行评级</p>
+          <p className="text-sm text-muted-foreground">
+            评级需要真实的传输延迟和帧丢弃采样。
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   let grade: { letter: string; color: string; description: string };
 
   if (metrics.latency_ms < 10 && metrics.packet_loss_percent < 0.01) {
@@ -719,6 +768,22 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1000).toFixed(2)} KB`;
   }
   return `${bytes} B`;
+}
+
+function formatOptionalBytes(bytes: number | null): string {
+  return bytes === null ? "未采集" : formatBytes(bytes);
+}
+
+function formatOptionalRate(rateMbps: number | null): string {
+  return rateMbps === null ? "未采集" : `${rateMbps.toFixed(1)} Mbps`;
+}
+
+function formatOptionalMs(value: number | null, precision: number): string {
+  return value === null ? "未采集" : `${value.toFixed(precision)} ms`;
+}
+
+function formatOptionalPercent(value: number | null): string {
+  return value === null ? "未采集" : `${value.toFixed(3)}%`;
 }
 
 function mediaProfileForTestProfile(testProfile: TestProfile): MediaProfile {
@@ -861,25 +926,26 @@ export function crossDeviceConfigForPeer(
 
 function transportMetricsFromLanReport(
   report: LanE2EAutomationReport,
-  requestedProfile: MediaProfile
+  _requestedProfile: MediaProfile
 ): TransportMetrics {
   const probe = report.probeSnapshot;
   const framesReceived = probe?.frames_received ?? 0;
   const framesDropped = probe?.frames_dropped ?? 0;
-  const packetLossPercent =
+  const dropRatePercent =
     framesReceived > 0 ? (framesDropped / framesReceived) * 100 : 0;
-  const throughputMbps = probe?.bitrate_mbps ?? requestedProfile.bitrate_mbps;
-  const sampleSeconds = Math.max(report.sampleDurationMs / 1000, 1);
-  const estimatedBytes = Math.round((throughputMbps * 1_000_000 * sampleSeconds) / 8);
+  const mediaRateMbps =
+    typeof probe?.bitrate_mbps === "number" && Number.isFinite(probe.bitrate_mbps)
+      ? probe.bitrate_mbps
+      : null;
 
   return {
     is_running: false,
-    throughput_mbps: throughputMbps,
-    latency_ms: 0,
-    jitter_ms: 0,
-    packet_loss_percent: packetLossPercent,
-    bytes_sent: estimatedBytes,
-    bytes_received: estimatedBytes,
+    throughput_mbps: mediaRateMbps,
+    latency_ms: null,
+    jitter_ms: null,
+    packet_loss_percent: framesReceived > 0 ? dropRatePercent : null,
+    bytes_sent: null,
+    bytes_received: null,
     connection_count: report.peer ? 1 : 0,
     frames_received: framesReceived,
     frames_decoded: probe?.frames_decoded ?? 0,

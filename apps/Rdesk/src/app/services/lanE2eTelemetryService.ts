@@ -196,7 +196,7 @@ export function externalRunRecordFromLanE2EReport(
       report.status === "completed"
         ? "completed"
         : report.status === "skipped"
-          ? "cancelled"
+          ? "skipped"
           : "failed",
     started_at: report.startedAt,
     finished_at: report.finishedAt,

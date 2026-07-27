@@ -399,12 +399,18 @@ export function RenderTestPage() {
   };
 
   const handleStop = async () => {
+    let stopResult;
     if (currentRunUsesWebView) {
       // WebView rendering is local to this page and does not own a backend run.
+      stopResult = { ok: true as const, value: undefined };
     } else if (currentRunId) {
-      await commands.testStopRun(currentRunId);
+      stopResult = await commands.testStopRun(currentRunId);
     } else {
-      await commands.testHarnessStop();
+      stopResult = await commands.testHarnessStop();
+    }
+    if (!stopResult.ok) {
+      setStartError(`停止测试失败：${stopResult.error.message}`);
+      return;
     }
     setIsRunning(false);
     setCurrentRunId(null);

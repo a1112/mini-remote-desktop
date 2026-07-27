@@ -1009,7 +1009,16 @@ function applyRunScopeToDimensions(
       ...dimension,
       options: dimension.options.map((option) => ({
         ...option,
-        scopeBlockedReason: undefined,
+        enabled:
+          (dimension.id === "adaptive" || dimension.id === "dynamic_resolution") &&
+          option.id === "on"
+            ? false
+            : option.enabled,
+        scopeBlockedReason:
+          (dimension.id === "adaptive" || dimension.id === "dynamic_resolution") &&
+          option.id === "on"
+            ? "自适应媒体与动态分辨率仅由跨设备 LAN 自动化链路实现。"
+            : undefined,
       })),
     }));
   }
@@ -1037,6 +1046,13 @@ function optionScopeBlockedReason(
   dimensionId: string,
   optionId: string
 ): string | null {
+  if (
+    runScope === "local" &&
+    (dimensionId === "adaptive" || dimensionId === "dynamic_resolution") &&
+    optionId === "on"
+  ) {
+    return "自适应媒体与动态分辨率仅由跨设备 LAN 自动化链路实现。";
+  }
   return runScope === "cross-device" && dimensionId === "transport" && optionId === "loopback"
     ? CROSS_DEVICE_LOOPBACK_REASON
     : null;
@@ -1783,7 +1799,10 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
     const activeRunId = activeRunIdRef.current;
     if (activeRunId) {
-      await commands.testStopRun(activeRunId);
+      const result = await commands.testStopRun(activeRunId);
+      if (!result.ok) {
+        setMatrixNotice(`停止当前矩阵用例失败：${result.error.message}`);
+      }
     }
   }, []);
 
@@ -2077,13 +2096,16 @@ export function MatrixTestPage({ runDelayMs = 7000 }: MatrixTestPageProps = {}) 
 
         const summary = summaryFromLanE2EReport(report);
         const duration = Date.now() - startTime;
-        void commands.testRecordExternalRun(
+        const recordResult = await commands.testRecordExternalRun(
           externalRunRecordFromLanE2EReport(report, test.config, {
             environment: capabilities,
             peer: targetPeer,
             runMode: "matrix",
           })
         );
+        if (!recordResult.ok) {
+          setMatrixNotice(`测试已完成，但保存历史记录失败：${recordResult.error.message}`);
+        }
 
         if (stopRequestedRef.current) {
           markSkipped("用户停止矩阵测试", duration);

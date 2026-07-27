@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LanE2EAutomationReport } from "./lanE2eAutomationService";
 import {
+  externalRunRecordFromLanE2EReport,
   mainlineE2EArtifactPayloadFromReport,
   scriptClassificationFromLanE2EReport,
   summaryFromLanE2EReport,
@@ -53,6 +54,33 @@ describe("summaryFromLanE2EReport", () => {
     expect(summary.render_queue_replacement_ratio).toBeCloseTo(12 / 4320);
     expect(summary.render_present_skips).toBe(3);
     expect(summary.render_present_skip_ratio).toBeCloseTo(3 / 4320);
+  });
+});
+
+describe("externalRunRecordFromLanE2EReport", () => {
+  it("preserves skipped as a distinct run status", () => {
+    const report = {
+      status: "skipped",
+      scenarioId: "cross.e2e.remote_display_smoke",
+      validationMode: "quic_datagram",
+      dataPlaneVerified: false,
+      mediaVerified: false,
+      startedAt: 100,
+      finishedAt: 200,
+      sampleDurationMs: 0,
+      sampleFramesDecoded: 0,
+      sampleFramesDropped: 0,
+      sampleRenderFramesPresented: 0,
+      faultEvents: [],
+      thresholds: {
+        minSampleDurationMs: 500,
+        minDecodedFrames: 1,
+        minFps: 1,
+      },
+      stages: [],
+    } as LanE2EAutomationReport;
+
+    expect(externalRunRecordFromLanE2EReport(report, {}).status).toBe("skipped");
   });
 });
 
