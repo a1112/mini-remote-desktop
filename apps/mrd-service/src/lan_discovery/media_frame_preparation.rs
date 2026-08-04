@@ -79,14 +79,14 @@ pub(super) fn prepare_frame_for_h264(
             return Ok(frame);
         }
 
-        let source_rgb = nv12_to_rgb24(&frame.data, frame.width, frame.width, frame.height)?;
         let mut rgb = Vec::with_capacity(target_width * target_height * 3);
         for y in 0..target_height {
             let source_y = y * frame.height / target_height;
             for x in 0..target_width {
                 let source_x = x * frame.width / target_width;
-                let offset = (source_y * frame.width + source_x) * 3;
-                rgb.extend_from_slice(&source_rgb[offset..offset + 3]);
+                let (r, g, b) =
+                    read_nv12_rgb(&frame.data, frame.width, frame.height, source_x, source_y);
+                rgb.extend_from_slice(&[r, g, b]);
             }
         }
 
@@ -313,7 +313,7 @@ pub(super) fn decoded_frame_to_rgb24(frame: DecodedFrame) -> Result<(u32, u32, V
     Ok((frame.width as u32, frame.height as u32, rgb))
 }
 
-pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
+pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> &'static str {
     match &frame.data {
         DecodedFrameData::CpuRgb24(_) => "cpu_rgb24",
         DecodedFrameData::CpuBgra32(_) => "cpu_bgra32",
@@ -325,7 +325,20 @@ pub(super) fn decoded_frame_pixel_format(frame: &DecodedFrame) -> String {
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedP010 { .. } => "d3d11_shared_p010",
     }
-    .to_string()
+}
+
+pub(super) fn decoded_frame_format_stage(frame: &DecodedFrame) -> &'static str {
+    match &frame.data {
+        DecodedFrameData::CpuRgb24(_) => "receiver.format.cpu_rgb24",
+        DecodedFrameData::CpuBgra32(_) => "receiver.format.cpu_bgra32",
+        DecodedFrameData::CpuI420 { .. } => "receiver.format.cpu_i420",
+        DecodedFrameData::CpuNv12 { .. } => "receiver.format.cpu_nv12",
+        DecodedFrameData::CpuP010 { .. } => "receiver.format.cpu_p010",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedNv12 { .. } => "receiver.format.d3d11_shared_nv12",
+        #[cfg(windows)]
+        DecodedFrameData::D3D11SharedP010 { .. } => "receiver.format.d3d11_shared_p010",
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -416,6 +429,23 @@ fn clamp_yuv_to_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+fn read_nv12_rgb(data: &[u8], pitch: usize, height: usize, x: usize, y: usize) -> (u8, u8, u8) {
+    let y_offset = y * pitch;
+    let uv_offset = pitch * height + (y / 2) * pitch;
+    let luma = data[y_offset + x] as i32;
+    let uv_x = (x / 2) * 2;
+    let u = data[uv_offset + uv_x] as i32;
+    let v = data[uv_offset + uv_x + 1] as i32;
+    let c = (luma - 16).max(0);
+    let d = u - 128;
+    let e = v - 128;
+    (
+        clamp_yuv_to_u8((298 * c + 409 * e + 128) >> 8),
+        clamp_yuv_to_u8((298 * c - 100 * d - 208 * e + 128) >> 8),
+        clamp_yuv_to_u8((298 * c + 516 * d + 128) >> 8),
+    )
+}
+
 fn read_captured_rgb(
     frame: &CapturedFrame,
     x: usize,
@@ -494,6 +524,40 @@ mod tests {
         };
 
         assert_eq!(decoded_frame_pixel_format(&frame), "cpu_nv12");
+    }
+
+    #[test]
+    fn prepare_frame_for_h264_scales_nv12_without_changing_sampled_colors() {
+        let width = 4;
+        let height = 4;
+        let data = vec![
+            16, 48, 80, 112, 32, 64, 96, 128, 48, 80, 112, 144, 64, 96, 128, 160, // Y
+            90, 240, 100, 230, 110, 220, 120, 210, // UV
+        ];
+        let source_rgb = nv12_to_rgb24(&data, width, width, height).unwrap();
+        let profile = MediaProfile {
+            width: 2,
+            height: 2,
+            ..MediaProfile::default()
+        };
+
+        let prepared = prepare_frame_for_h264(
+            CapturedFrame::from_cpu(width, height, FramePixelFormat::Nv12, 42, data),
+            &profile,
+        )
+        .unwrap();
+
+        let expected = [0, 2, 8, 10]
+            .into_iter()
+            .flat_map(|pixel_index| {
+                source_rgb[pixel_index * 3..pixel_index * 3 + 3]
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!((prepared.width, prepared.height), (2, 2));
+        assert_eq!(prepared.pixel_format, FramePixelFormat::Rgb24);
+        assert_eq!(prepared.data, expected);
     }
 
     #[cfg(any(windows, target_os = "macos"))]

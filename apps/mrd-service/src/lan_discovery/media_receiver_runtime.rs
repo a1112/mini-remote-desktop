@@ -4,7 +4,7 @@ use super::media_envelope::{
     LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
     LAN_MEDIA_PAYLOAD_PROBE_FRAME,
 };
-use super::media_frame_preparation::decoded_frame_pixel_format;
+use super::media_frame_preparation::{decoded_frame_format_stage, decoded_frame_pixel_format};
 use super::media_probe::decoded_video_probe_format;
 use super::media_profile::normalize_lan_media_profile;
 use super::media_render_policy::lan_media_payload_hash_for_profile;
@@ -109,6 +109,7 @@ pub(super) async fn record_lan_decoded_frames(
         let width = decoded_frame.width as u32;
         let height = decoded_frame.height as u32;
         let decoded_pixel_format = decoded_frame_pixel_format(&decoded_frame);
+        let decoded_format_stage = decoded_frame_format_stage(&decoded_frame);
 
         #[cfg(any(windows, target_os = "macos"))]
         if let Err(error) = render_lan_decoded_frame(app_state, session_id, decoded_frame).await {
@@ -124,21 +125,13 @@ pub(super) async fn record_lan_decoded_frames(
             .media_pipelines
             .lock()
             .await
-            .record_active_media_sample(
+            .record_decoded_media_sample(
                 session_id.clone(),
                 profile,
                 width,
                 height,
-                decoded_pixel_format.clone(),
-            );
-        app_state
-            .media_pipelines
-            .lock()
-            .await
-            .record_stage_duration_ms(
-                session_id.clone(),
-                format!("receiver.format.{decoded_pixel_format}"),
-                1.0,
+                decoded_pixel_format,
+                decoded_format_stage,
             );
         let payload_hash =
             lan_media_payload_hash_for_profile(profile, sequence, timestamp_us, encoded_payload);
@@ -155,7 +148,7 @@ pub(super) async fn record_lan_decoded_frames(
                 target_bitrate_mbps: profile.bitrate_mbps,
                 encoded_bytes: encoded_payload.len() as u32,
                 format: decoded_video_probe_format(&profile.codec),
-                pixel_format: decoded_pixel_format,
+                pixel_format: decoded_pixel_format.to_owned(),
                 payload_hash,
                 preview_width: None,
                 preview_height: None,
