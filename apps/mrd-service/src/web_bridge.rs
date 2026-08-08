@@ -37,7 +37,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{info, warn};
 
-const DEFAULT_BIND: &str = "127.0.0.1:9532";
+const DEFAULT_BIND: &str = "127.0.0.1:9533";
 const TOKEN_HEADER: &str = "x-mrd-bridge-token";
 
 #[derive(Debug, Clone)]
@@ -51,7 +51,7 @@ impl WebBridgeConfig {
     pub fn from_env() -> Result<Option<Self>> {
         let enabled = env::var("MRD_WEB_BRIDGE_ENABLED")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
-            .unwrap_or(true);
+            .unwrap_or(false);
         if !enabled {
             return Ok(None);
         }
@@ -65,9 +65,9 @@ impl WebBridgeConfig {
     }
 
     pub fn new(bind: SocketAddr, token: Option<String>) -> Result<Self> {
-        if !is_loopback_addr(&bind) && token.is_none() {
+        if token.is_none() {
             return Err(anyhow!(
-                "MRD_WEB_BRIDGE_TOKEN is required when MRD_WEB_BRIDGE_BIND is not loopback"
+                "MRD_WEB_BRIDGE_TOKEN is required whenever the web bridge is enabled"
             ));
         }
 
@@ -756,7 +756,7 @@ mod tests {
     #[test]
     fn private_lan_origins_require_tokenized_bridge() {
         let loopback_config =
-            WebBridgeConfig::new("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None).unwrap();
+            WebBridgeConfig::new("127.0.0.1:9533".parse::<SocketAddr>().unwrap(), Some("test-token".to_string())).unwrap();
         let lan_config = WebBridgeConfig::new(
             "0.0.0.0:9533".parse::<SocketAddr>().unwrap(),
             Some("secret".to_string()),
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn websocket_query_token_authorizes_without_header() {
         let config = WebBridgeConfig::new(
-            "0.0.0.0:9532".parse::<SocketAddr>().unwrap(),
+            "0.0.0.0:9533".parse::<SocketAddr>().unwrap(),
             Some("secret".to_string()),
         )
         .expect("LAN bridge config with token");
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn index_document_explains_bridge_and_web_ui_target() {
         let config =
-            WebBridgeConfig::new("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None).unwrap();
+            WebBridgeConfig::new("127.0.0.1:9533".parse::<SocketAddr>().unwrap(), Some("test-token".to_string())).unwrap();
 
         let html = index_document(&config);
 
@@ -801,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn browser_webrtc_preview_reports_disabled_without_feature() {
         let config =
-            WebBridgeConfig::new("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None).unwrap();
+            WebBridgeConfig::new("127.0.0.1:9533".parse::<SocketAddr>().unwrap(), Some("test-token".to_string())).unwrap();
         let state = WebBridgeState {
             config,
             ipc_server: IpcServer::new(Arc::new(crate::app_state::AppState::new())),
