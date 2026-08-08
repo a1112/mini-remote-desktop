@@ -72,7 +72,7 @@ impl NVENCLibrary {
     pub fn create_instance(&self) -> Result<NVencFunctionList, NVencError> {
         let mut list = MaybeUninit::zeroed();
         unsafe { *(list.as_mut_ptr() as *mut u32) = NVENC_API_LIST_VERSION };
-        unsafe { (self.init)(&raw mut list) }.into_error().unwrap();
+        unsafe { (self.init)(&raw mut list) }.into_error()?;
         Ok(unsafe { list.assume_init() })
     }
 
