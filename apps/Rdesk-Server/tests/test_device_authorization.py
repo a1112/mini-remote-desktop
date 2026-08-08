@@ -94,6 +94,20 @@ class Device:
         self.bound_at = None
 
 
+STUBBED_MODULE_NAMES = (
+    "fastapi",
+    "sqlalchemy",
+    "sqlalchemy.ext",
+    "sqlalchemy.ext.asyncio",
+    "sqlalchemy.orm",
+    "app.core.security",
+    "app.db.session",
+    "app.models.device",
+    "app.models.user",
+)
+MISSING_MODULE = object()
+
+
 def _install_dependency_stubs() -> None:
     fastapi = types.ModuleType("fastapi")
     fastapi.APIRouter = APIRouter
@@ -136,9 +150,39 @@ def _install_dependency_stubs() -> None:
     )
 
 
-_install_dependency_stubs()
-devices = importlib.import_module("app.api.v1.devices")
 schemas = importlib.import_module("app.schemas.device")
+
+
+def _load_devices_with_stubs():
+    target_name = "app.api.v1.devices"
+    module_names = (*STUBBED_MODULE_NAMES, target_name)
+    previous_modules = {
+        name: sys.modules.get(name, MISSING_MODULE) for name in module_names
+    }
+    api_package = importlib.import_module("app.api.v1")
+    previous_package_attribute = getattr(api_package, "devices", MISSING_MODULE)
+
+    try:
+        _install_dependency_stubs()
+        sys.modules.pop(target_name, None)
+        return importlib.import_module(target_name)
+    finally:
+        for name, previous_module in previous_modules.items():
+            if previous_module is MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous_module
+
+        if previous_package_attribute is MISSING_MODULE:
+            try:
+                delattr(api_package, "devices")
+            except AttributeError:
+                pass
+        else:
+            api_package.devices = previous_package_attribute
+
+
+devices = _load_devices_with_stubs()
 
 
 class ScalarRows:
