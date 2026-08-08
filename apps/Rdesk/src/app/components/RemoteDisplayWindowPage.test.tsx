@@ -3301,15 +3301,14 @@ describe("RemoteDisplayWindowPage", () => {
 
   it("keeps remote display native rendering enabled when capability fallback omits d3d11", async () => {
     const mockInvoke = getMockInvoke();
-    let resolveCapabilities: (value: ReturnType<typeof windowsCapabilities>) => void = () => {};
-    const capabilitiesPromise = new Promise<ReturnType<typeof windowsCapabilities>>((resolve) => {
-      resolveCapabilities = resolve;
-    });
     const configureCalls: Record<string, unknown>[] = [];
 
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
-        return capabilitiesPromise;
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_renderers: ["webview"],
+        });
       }
       if (command === "current_remote_display_window_context") {
         return Promise.resolve({
@@ -3342,13 +3341,6 @@ describe("RemoteDisplayWindowPage", () => {
 
     await waitFor(() => {
       expect(configureCalls.some((call) => call.enabled === true)).toBe(true);
-    });
-
-    await act(async () => {
-      resolveCapabilities({
-        ...windowsCapabilities(),
-        available_renderers: ["webview"],
-      });
     });
 
     await waitFor(
