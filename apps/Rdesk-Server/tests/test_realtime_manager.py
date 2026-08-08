@@ -50,6 +50,14 @@ class RealtimeManagerTests(unittest.TestCase):
         self.assertFalse(status.reachable)
         self.assertEqual(status.status, "unexpected-service")
 
+    @patch("app.services.realtime_manager.urlopen")
+    def test_rejects_non_object_health_payload(self, urlopen: MagicMock) -> None:
+        urlopen.return_value = _health_response(b"[]")
+        status = self.manager().status()
+        self.assertFalse(status.reachable)
+        self.assertEqual(status.status, "unexpected-service")
+
 
 if __name__ == "__main__":
     unittest.main()
+

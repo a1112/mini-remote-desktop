@@ -67,7 +67,8 @@ class RealtimeSidecarManager:
             with urlopen(self.health_url, timeout=1.5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
                 if (
-                    payload.get("status") == "ok"
+                    isinstance(payload, dict)
+                    and payload.get("status") == "ok"
                     and payload.get("service") == EXPECTED_SERVICE
                     and payload.get("protocol_version") == EXPECTED_PROTOCOL_VERSION
                 ):
@@ -113,3 +114,4 @@ class RealtimeSidecarManager:
     def restart(self) -> RealtimeStatus:
         self.stop()
         return self.start()
+
