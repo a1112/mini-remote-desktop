@@ -148,7 +148,7 @@ jobs:
           cache-dependency-path: apps/Rdesk/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm type-check
-      - run: pnpm test
+      - run: pnpm exec vitest run --maxWorkers=1
       - run: pnpm build
 
   backend:
