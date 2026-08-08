@@ -3316,9 +3316,9 @@ describe("RemoteDisplayWindowPage", () => {
           session_id: "p2p-quic-123",
           surface_id: "surface-1",
           role: "controller",
-          renderer_attached: false,
-          render_mode: "web",
-          native_surface_attached: false,
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
           session_window_count: 1,
         });
       }
