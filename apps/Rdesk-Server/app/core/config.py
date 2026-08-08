@@ -7,6 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _DEV_DB_URL = "postgresql+asyncpg://postgres@127.0.0.1:5432/rdesk_server"
 _DEV_JWT_SECRET = "development-only-secret-change-before-production"
+_EXAMPLE_DB_URL = "postgresql+asyncpg://rdesk:replace-me@127.0.0.1:5432/rdesk_server"
+_EXAMPLE_JWT_SECRET = "replace-with-at-least-32-random-bytes"
 
 
 def _repository_root() -> str:
@@ -56,9 +58,11 @@ class Settings(BaseSettings):
             raise ValueError("RDESK_INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
 
         if self.environment == "production":
-            if self.db_url == _DEV_DB_URL:
+            if self.db_url in {_DEV_DB_URL, _EXAMPLE_DB_URL}:
                 raise ValueError("RDESK_DB_URL must be configured for production")
-            if self.jwt_secret == _DEV_JWT_SECRET or len(self.jwt_secret.encode("utf-8")) < 32:
+            if self.jwt_secret in {_DEV_JWT_SECRET, _EXAMPLE_JWT_SECRET} or len(
+                self.jwt_secret.encode("utf-8")
+            ) < 32:
                 raise ValueError(
                     "RDESK_JWT_SECRET must be a production-specific secret of at least 32 bytes"
                 )

@@ -47,11 +47,9 @@ def _demo_devices() -> list[Device]:
 
 async def seed_initial_data(session: AsyncSession) -> None:
     user_exists = await session.scalar(select(User).limit(1))
-    if user_exists:
-        return
 
     changed = False
-    if settings.initial_admin_username:
+    if not user_exists and settings.initial_admin_username:
         session.add(
             User(
                 username=settings.initial_admin_username,
@@ -63,8 +61,11 @@ async def seed_initial_data(session: AsyncSession) -> None:
         changed = True
 
     if settings.seed_demo_data:
-        session.add_all(_demo_devices())
-        changed = True
+        device_exists = await session.scalar(select(Device).limit(1))
+        if not device_exists:
+            session.add_all(_demo_devices())
+            changed = True
 
     if changed:
         await session.commit()
+

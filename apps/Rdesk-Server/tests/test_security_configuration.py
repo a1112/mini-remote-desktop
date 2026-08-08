@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from pydantic import ValidationError
 
@@ -19,6 +20,17 @@ class SecurityConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(settings.environment, "production")
         self.assertEqual(settings.jwt_expire_minutes, 60)
+
+    def test_production_rejects_checked_in_example_placeholders(self) -> None:
+        env_values = {}
+        env_file = Path(__file__).resolve().parents[1] / ".env.example"
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                env_values[key.removeprefix("RDESK_").lower()] = value
+
+        with self.assertRaises(ValidationError):
+            Settings(_env_file=None, **env_values)
 
     def test_initial_admin_requires_complete_bootstrap_configuration(self) -> None:
         with self.assertRaises(ValidationError):
@@ -41,3 +53,4 @@ class SecurityConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
