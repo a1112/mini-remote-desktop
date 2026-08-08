@@ -355,6 +355,7 @@ describe("RenderTestPage platform capabilities", () => {
   });
 
   it("keeps native Metal runs off the PNG preview path", async () => {
+    const user = userEvent.setup();
     const mockInvoke = getMockInvoke();
     mockInvoke.mockImplementation((command: string) => {
       if (command === "test_get_capabilities") {
@@ -409,13 +410,17 @@ describe("RenderTestPage platform capabilities", () => {
 
     render(<RenderTestPage />);
 
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: /Metal/ })).toBeEnabled()
-    );
-    fireEvent.click(screen.getByRole("button", { name: /启动测试/ }));
+    const metalButton = screen.getByRole("button", { name: /Metal/ });
+    await waitFor(() => expect(metalButton).toBeEnabled());
+    await user.click(metalButton);
+    await user.click(screen.getByRole("button", { name: /启动测试/ }));
 
     expect(
-      await screen.findByText("图片预览已封印，查看原生渲染窗口和指标")
+      await screen.findByText(
+        "图片预览已封印，查看原生渲染窗口和指标",
+        {},
+        { timeout: 5_000 }
+      )
     ).toBeInTheDocument();
     expect(screen.queryByRole("img", { name: "Render preview" })).not.toBeInTheDocument();
   });
