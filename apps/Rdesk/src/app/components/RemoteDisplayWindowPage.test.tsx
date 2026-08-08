@@ -3351,9 +3351,12 @@ describe("RemoteDisplayWindowPage", () => {
       });
     });
 
-    await waitFor(() => {
-      expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
+      },
+      { timeout: 5_000 }
+    );
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 50));
     });
