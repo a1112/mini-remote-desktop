@@ -120,6 +120,13 @@ jobs:
         with:
           shared-key: desktop-shell-${{ runner.os }}
 
+      - name: Prepare macOS check-only service resource
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p target/release/MrdService.app/Contents/MacOS
+          touch target/release/MrdService.app/Contents/MacOS/mrd-service
+
       - name: Check native desktop host
         run: cargo check --locked -p app --bin app
 
