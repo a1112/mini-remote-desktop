@@ -2992,7 +2992,9 @@ describe("RemoteDisplayWindowPage", () => {
       renderArea.focus();
     });
     fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-    window.dispatchEvent(new Event("blur"));
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
 
     await waitFor(() => {
       const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
