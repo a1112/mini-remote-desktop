@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from subprocess import Popen
 from typing import Callable, Protocol
 from urllib.error import URLError
 from urllib.request import urlopen
 import json
 import subprocess
+
+
+EXPECTED_SERVICE = "realtime-server"
+EXPECTED_PROTOCOL_VERSION = 1
 
 
 class ProcessHandle(Protocol):
@@ -63,9 +66,16 @@ class RealtimeSidecarManager:
         try:
             with urlopen(self.health_url, timeout=1.5) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-                reachable = True
-                health_status = payload.get("status", "ok")
-        except (URLError, TimeoutError, json.JSONDecodeError):
+                if (
+                    payload.get("status") == "ok"
+                    and payload.get("service") == EXPECTED_SERVICE
+                    and payload.get("protocol_version") == EXPECTED_PROTOCOL_VERSION
+                ):
+                    reachable = True
+                    health_status = "ok"
+                else:
+                    health_status = "unexpected-service"
+        except (URLError, OSError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
             reachable = False
 
         pid = getattr(process, "pid", None) if running else None
@@ -79,6 +89,8 @@ class RealtimeSidecarManager:
     def start(self) -> RealtimeStatus:
         if self._process and self._process.poll() is None:
             return self.status()
+        if not self.workdir.is_dir():
+            raise RuntimeError(f"realtime-server workdir does not exist: {self.workdir}")
 
         self._process = self.spawner(self.command, self.workdir)
         return self.status()
