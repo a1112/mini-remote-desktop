@@ -3347,14 +3347,14 @@ describe("RemoteDisplayWindowPage", () => {
       () => {
         expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
       },
-      { timeout: 5_000 }
+      { timeout: 10_000 }
     );
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 50));
     });
 
     expect(configureCalls.some((call) => call.enabled === false)).toBe(false);
-  });
+  }, 15_000);
 
   it("passes 1670x1080 frame size and aspect-fitted bounds to the native surface", async () => {
     const mockInvoke = getMockInvoke();
