@@ -275,6 +275,29 @@ mod tests {
         format!("ws://{}/ws", addr)
     }
 
+    async fn drain_events_until(
+        runtime: &RealtimeRuntime,
+        handle: u64,
+        expected: usize,
+    ) -> Vec<SignalMessage> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut events = Vec::new();
+
+        while events.len() < expected && tokio::time::Instant::now() < deadline {
+            events.extend(
+                runtime
+                    .drain_events(handle)
+                    .await
+                    .expect("drain realtime events"),
+            );
+            if events.len() < expected {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        events
+    }
+
     #[tokio::test]
     async fn registering_connection_returns_handle_and_device_id() {
         let runtime = RealtimeRuntime::new(spawn_server().await);
@@ -319,10 +342,7 @@ mod tests {
             .await
             .expect("accept session");
 
-        let events = runtime
-            .drain_events(registration.handle)
-            .await
-            .expect("drain realtime events");
+        let events = drain_events_until(&runtime, registration.handle, 2).await;
 
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], SignalMessage::SessionRequest(_)));
@@ -377,10 +397,7 @@ mod tests {
             .await
             .expect("send ice candidate");
 
-        let events = runtime
-            .drain_events(registration.handle)
-            .await
-            .expect("drain realtime events");
+        let events = drain_events_until(&runtime, registration.handle, 3).await;
 
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], SignalMessage::WebrtcOffer(_)));
