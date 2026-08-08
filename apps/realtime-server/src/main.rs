@@ -18,15 +18,20 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 use uuid::Uuid;
 
+const DEFAULT_BIND: &str = "127.0.0.1:9542";
+const PEER_QUEUE_CAPACITY: usize = 128;
+const PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
+    protocol_version: u16,
 }
 
 #[derive(Debug, Default)]
 struct SignalingState {
-    peers: HashMap<DeviceId, mpsc::UnboundedSender<String>>,
+    peers: HashMap<DeviceId, mpsc::Sender<String>>,
     routes: SessionRouter,
 }
 
@@ -34,6 +39,7 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "realtime-server",
+        protocol_version: PROTOCOL_VERSION,
     })
 }
 
@@ -45,7 +51,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> i
 
 async fn handle_socket(socket: WebSocket, state: SharedState) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::channel::<String>(PEER_QUEUE_CAPACITY);
 
     let mut current_device: Option<DeviceId> = None;
 
@@ -86,9 +92,15 @@ async fn handle_socket(socket: WebSocket, state: SharedState) {
                 let Ok(encoded) = encode_message(&ack) else {
                     continue;
                 };
-                let _ = tx.send(encoded);
+                let _ = tx.send(encoded).await;
             }
             SignalMessage::SessionRequest(request) => {
+                let Some(sender_id) = current_device.as_ref() else {
+                    continue;
+                };
+                if &request.source_device_id != sender_id {
+                    continue;
+                }
                 let target = request.target_device_id.clone();
                 {
                     let mut guard = state.lock().await;
@@ -175,9 +187,9 @@ async fn forward_to_peer(state: &SharedState, target: &DeviceId, message: Signal
         return;
     };
 
-    let guard = state.lock().await;
-    if let Some(peer) = guard.peers.get(target) {
-        let _ = peer.send(encoded);
+    let peer = state.lock().await.peers.get(target).cloned();
+    if let Some(peer) = peer {
+        let _ = peer.send(encoded).await;
     }
 }
 
@@ -194,7 +206,10 @@ async fn main() {
 
     let state = Arc::new(Mutex::new(SignalingState::default()));
     let app = build_router(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], 9532));
+    let addr = std::env::var("MRD_REALTIME_BIND_ADDR")
+        .unwrap_or_else(|_| DEFAULT_BIND.to_string())
+        .parse::<SocketAddr>()
+        .expect("parse MRD_REALTIME_BIND_ADDR");
 
     info!("realtime-server listening on {}", addr);
 
