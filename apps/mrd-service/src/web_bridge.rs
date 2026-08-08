@@ -713,7 +713,8 @@ fn is_localhost_origin(origin: &HeaderValue) -> bool {
 }
 
 fn is_allowed_browser_origin(config: &WebBridgeConfig, origin: &HeaderValue) -> bool {
-    is_localhost_origin(origin) || (config.requires_token() && is_private_lan_origin(origin))
+    is_localhost_origin(origin)
+        || (!is_loopback_addr(&config.bind) && is_private_lan_origin(origin))
 }
 
 fn is_private_lan_origin(origin: &HeaderValue) -> bool {
@@ -817,9 +818,11 @@ mod tests {
             resource_monitor: Arc::new(Mutex::new(ResourceMonitor::new())),
         };
 
+        let mut headers = HeaderMap::new();
+        headers.insert(TOKEN_HEADER, HeaderValue::from_static("test-token"));
         let response = browser_webrtc_preview_start(
             State(state),
-            HeaderMap::new(),
+            headers,
             Json(serde_json::json!({
                 "session_id": "preview-session",
                 "offer_sdp": "v=0"
