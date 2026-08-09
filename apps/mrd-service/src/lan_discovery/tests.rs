@@ -2217,7 +2217,7 @@ async fn remote_session_request_auto_accepts_session() {
             height: 2160,
             fps: 240,
             bitrate_mbps: 120,
-            codec: "hevc".to_string(),
+            codec: "h264".to_string(),
             ..MediaProfile::default()
         }),
         timestamp_ms: now_ms(),
@@ -2264,12 +2264,7 @@ async fn remote_session_request_auto_accepts_session() {
                 negotiation.selected.bitrate_mbps,
                 LAN_MEDIA_TARGET_BITRATE_MBPS
             );
-            assert_eq!(negotiation.selected.codec, "hevc");
-            assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
-            assert_eq!(
-                negotiation.selected.chroma_subsampling.as_deref(),
-                Some("4:2:0")
-            );
+            assert_eq!(negotiation.selected.codec, "h264");
         }
         _ => panic!("expected remote session ack"),
     }

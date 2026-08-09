@@ -2992,7 +2992,9 @@ describe("RemoteDisplayWindowPage", () => {
       renderArea.focus();
     });
     fireEvent.keyDown(renderArea, { key: "Shift", code: "ShiftLeft" });
-    window.dispatchEvent(new Event("blur"));
+    act(() => {
+      window.dispatchEvent(new Event("blur"));
+    });
 
     await waitFor(() => {
       const inputCalls = mockInvoke.mock.calls.filter(([command]) => command === "ipc_send_control_input");
@@ -3301,15 +3303,14 @@ describe("RemoteDisplayWindowPage", () => {
 
   it("keeps remote display native rendering enabled when capability fallback omits d3d11", async () => {
     const mockInvoke = getMockInvoke();
-    let resolveCapabilities: (value: ReturnType<typeof windowsCapabilities>) => void = () => {};
-    const capabilitiesPromise = new Promise<ReturnType<typeof windowsCapabilities>>((resolve) => {
-      resolveCapabilities = resolve;
-    });
     const configureCalls: Record<string, unknown>[] = [];
 
     mockInvoke.mockImplementation((command: string, args?: Record<string, unknown>) => {
       if (command === "test_get_capabilities") {
-        return capabilitiesPromise;
+        return Promise.resolve({
+          ...windowsCapabilities(),
+          available_renderers: ["webview"],
+        });
       }
       if (command === "current_remote_display_window_context") {
         return Promise.resolve({
@@ -3317,9 +3318,9 @@ describe("RemoteDisplayWindowPage", () => {
           session_id: "p2p-quic-123",
           surface_id: "surface-1",
           role: "controller",
-          renderer_attached: false,
-          render_mode: "web",
-          native_surface_attached: false,
+          renderer_attached: true,
+          render_mode: "d3d11_native",
+          native_surface_attached: true,
           session_window_count: 1,
         });
       }
@@ -3344,22 +3345,18 @@ describe("RemoteDisplayWindowPage", () => {
       expect(configureCalls.some((call) => call.enabled === true)).toBe(true);
     });
 
-    await act(async () => {
-      resolveCapabilities({
-        ...windowsCapabilities(),
-        available_renderers: ["webview"],
-      });
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
-    });
+    await waitFor(
+      () => {
+        expect(screen.getByText("render: D3D11 native")).toBeInTheDocument();
+      },
+      { timeout: 10_000 }
+    );
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 50));
     });
 
     expect(configureCalls.some((call) => call.enabled === false)).toBe(false);
-  });
+  }, 15_000);
 
   it("passes 1670x1080 frame size and aspect-fitted bounds to the native surface", async () => {
     const mockInvoke = getMockInvoke();

@@ -28,7 +28,7 @@ use windows::core::Interface;
 impl Session<NeedsConfig> {
     #[cfg(windows)]
     pub fn open_dx(device: &impl Interface) -> Result<Self, NVencError> {
-        let lib = crate::nvenc_init().unwrap();
+        let lib = crate::nvenc_init().map_err(|_| NVencError::NotInitialized)?;
         let function_list = lib.create_instance()?;
         let mut session_params: NVencOpenEncodeSessionExParams = unsafe { std::mem::zeroed() };
         session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
@@ -52,7 +52,7 @@ impl Session<NeedsConfig> {
     }
 
     pub fn open_gl() -> Result<Self, NVencError> {
-        let lib = crate::nvenc_init().unwrap();
+        let lib = crate::nvenc_init().map_err(|_| NVencError::NotInitialized)?;
         let function_list = lib.create_instance()?;
         let mut session_params: NVencOpenEncodeSessionExParams = unsafe { std::mem::zeroed() };
         session_params.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;

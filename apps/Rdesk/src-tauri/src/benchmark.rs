@@ -2323,22 +2323,37 @@ mod tests {
 
     #[test]
     fn benchmark_paths_place_outputs_under_artifacts_tree() {
-        let root = PathBuf::from(r"G:\Project\mini-remote-desktop");
+        let root = PathBuf::from("project-root");
         let paths = BenchmarkPaths::new(
             &root,
             "2026-03-08".into(),
             "transport-webrtc-baseline".into(),
             "quick-webrtc-20260308-abc123".into(),
         );
+        let expected_run_dir = root
+            .join("artifacts")
+            .join("benchmarks")
+            .join("2026-03-08")
+            .join("transport-webrtc-baseline")
+            .join("quick-webrtc-20260308-abc123");
 
-        assert!(paths.run_dir.ends_with(r"artifacts\benchmarks\2026-03-08\transport-webrtc-baseline\quick-webrtc-20260308-abc123"));
-        assert!(paths.summary_json.ends_with(r"summary.json"));
-        assert!(paths.summary_csv.ends_with(r"summary.csv"));
-        assert!(paths.report_md.ends_with(r"reports\markdown-report.md"));
-        assert!(paths.host_stdout.ends_with(r"logs\host.stdout.log"));
-        assert!(paths
-            .probe_json("session-bench")
-            .ends_with(r"sessions\session-bench.probe.json"));
+        assert_eq!(paths.run_dir, expected_run_dir);
+        assert_eq!(paths.summary_json, expected_run_dir.join("summary.json"));
+        assert_eq!(paths.summary_csv, expected_run_dir.join("summary.csv"));
+        assert_eq!(
+            paths.report_md,
+            expected_run_dir.join("reports").join("markdown-report.md")
+        );
+        assert_eq!(
+            paths.host_stdout,
+            expected_run_dir.join("logs").join("host.stdout.log")
+        );
+        assert_eq!(
+            paths.probe_json("session-bench"),
+            expected_run_dir
+                .join("sessions")
+                .join("session-bench.probe.json")
+        );
     }
 
     #[test]

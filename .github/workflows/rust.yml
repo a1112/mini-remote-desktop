@@ -1,43 +1,219 @@
-name: Rust
+name: Cross-platform CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cross-platform-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
 
 jobs:
-  build:
-
+  rustfmt:
+    name: Rust formatting
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt -p realtime-server -p mrd-service --check
+
+  rust-core:
+    name: Rust core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Install Linux system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          pkg-config \
-          libglib2.0-dev \
-          libgtk-3-dev \
-          libwebkit2gtk-4.1-dev \
-          libayatana-appindicator3-dev \
-          libsoup-3.0-dev \
-          librsvg2-dev \
-          libxdo-dev \
-          libssl-dev \
-          libdbus-1-dev \
-          libpipewire-0.3-dev \
-          libx11-dev \
-          libxrandr-dev \
-          libxcb-randr0-dev \
-          libxkbcommon-dev \
-          libxkbcommon-x11-dev
-    - name: Build
-      run: cargo build --bins --verbose
-    - name: Run tests
-      run: cargo test --lib --bins --verbose
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcb-randr0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-core-${{ runner.os }}
+
+      - name: Test service kernel and signaling
+        run: >-
+          cargo test --locked
+          -p mrd-ipc
+          -p mrd-session
+          -p mrd-application
+          -p mrd-signal-proto
+          -p mrd-signal-server
+          -p realtime-server
+          -p mrd-service
+
+  desktop-shell:
+    name: Desktop shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcb-randr0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-shell-${{ runner.os }}
+
+      - name: Prepare macOS check-only service resource
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p target/release/MrdService.app/Contents/MacOS
+          touch target/release/MrdService.app/Contents/MacOS/mrd-service
+
+      - name: Check native desktop host
+        run: cargo check --locked -p app --bin app
+
+  frontend:
+    name: Frontend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        working-directory: apps/Rdesk
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/Rdesk/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm type-check
+      - run: pnpm exec vitest run --maxWorkers=1
+      - run: pnpm build
+
+  backend:
+    name: Backend (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    defaults:
+      run:
+        working-directory: apps/Rdesk-Server
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: apps/Rdesk-Server/requirements-dev.txt
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m compileall -q app
+      - run: python -m unittest discover -s tests -v
+
+  full-workspace-linux:
+    name: Full Rust workspace (Linux)
+    runs-on: ubuntu-latest
+    needs: rust-core
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcb-randr0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: full-workspace-linux
+      - run: cargo test --workspace --lib --bins --locked
