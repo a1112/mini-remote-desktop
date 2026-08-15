@@ -73,7 +73,7 @@ class TurnCredentialService:
         credential = base64.b64encode(
             # TURN REST temporary credentials use HMAC-SHA1 for coturn
             # interoperability. This is a protocol MAC, not password hashing.
-            # codeql[py/weak-sensitive-data-hashing]
+            # lgtm[py/weak-sensitive-data-hashing]
             hmac.new(self._auth_secret, username.encode("utf-8"), hashlib.sha1).digest()
         ).decode("ascii")
         return TurnCredential(
@@ -94,7 +94,7 @@ class TurnCredentialService:
         expected = base64.b64encode(
             # TURN REST temporary credentials use HMAC-SHA1 for coturn
             # interoperability. This is a protocol MAC, not password hashing.
-            # codeql[py/weak-sensitive-data-hashing]
+            # lgtm[py/weak-sensitive-data-hashing]
             hmac.new(self._auth_secret, username.encode("utf-8"), hashlib.sha1).digest()
         ).decode("ascii")
         return hmac.compare_digest(expected, credential)
