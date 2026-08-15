@@ -119,7 +119,7 @@ jobs:
           cargo test -p mrd-ipc
           cargo test -p mrd-session
           cargo test -p mrd-application
-          cargo test -p mrd-service
+          cargo test -p mrd-service -- --test-threads=1
           cargo test -p app automation_report_tests -- --nocapture
 
       - name: L1 synthetic pipeline matrix
@@ -137,6 +137,112 @@ jobs:
           name: l1-synthetic-e2e-report
           path: target/e2e-matrix/
           if-no-files-found: ignore
+
+  quality-gate:
+    name: Gate 0 quality gate
+    needs: l0-l1-generic
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            libdbus-1-dev \
+            libpipewire-0.3-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxcb-randr0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/Rdesk/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: apps/Rdesk
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Gate 0 contract suite
+        id: gate-tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p mrd-quality-gate 2>&1 | tee quality-gate-cargo.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/component-matrix/scripts/test_component_matrix_common.ps1 2>&1 | tee component-matrix.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_transport_matrix_common.ps1 2>&1 | tee transport-matrix.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/test_paired_lan_canary_common.ps1 2>&1 | tee paired-canary.log
+          pwsh -NoProfile -ExecutionPolicy Bypass -File tests/benchmarks/scripts/run_secure_lan_negative.ps1 2>&1 | tee secure-lan-negative.log
+          pnpm --dir apps/Rdesk test -- --run src/app/services/lanE2eAutomationService.test.ts src/app/services/lanE2eTelemetryService.test.ts
+          pnpm --dir apps/Rdesk type-check
+
+      - name: Upload Gate 0 artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-0-contract-artifacts
+          path: |
+            quality-gate-cargo.log
+            component-matrix.log
+            transport-matrix.log
+            paired-canary.log
+            secure-lan-negative.log
+            artifacts/e2e/security-negative/
+          if-no-files-found: warn
+
+      - name: Enforce quality gate
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.gate-tests.outcome }}" != "success" ]; then
+            echo "Gate 0 contract suite failed"
+            exit 2
+          fi
+
+  windows-release-policy:
+    name: Windows 1080p60 release policy
+    needs: quality-gate
+    if: ${{ always() && needs.quality-gate.result == 'success' }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Evaluate Windows required row
+        shell: powershell
+        run: |
+          cargo run -p mrd-quality-gate --bin mrd-quality-gate -- `
+            --artifact tests/quality-gates/fixtures/valid-direct.json `
+            --policy tests/quality-gates/policies/windows-1080p60-direct.v1.json `
+            --output windows-1080p60-direct.evaluation.json
+      - name: Upload Windows policy evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-1080p60-release-policy
+          path: windows-1080p60-direct.evaluation.json
 
   windows-gpu-smoke:
     name: Windows GPU L0/L3 smoke
@@ -244,3 +350,57 @@ jobs:
           name: device-lab-mainline-e2e
           path: artifacts/e2e/device-lab/
           if-no-files-found: ignore
+
+  secure-lan-device-lab:
+    name: Secure LAN device-lab positive gate
+    needs: [l0-l1-generic, quality-gate]
+    if: >-
+      ${{
+        always() &&
+        needs.l0-l1-generic.result == 'success' &&
+        needs.quality-gate.result == 'success' &&
+        vars.MRD_DEVICE_LAB_SECURE_LAN_ENABLED == 'true' &&
+        (inputs.target_device_id != '' || vars.MRD_DEVICE_LAB_TARGET_DEVICE_ID != '') &&
+        (
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && inputs.run_device_lab)
+        )
+      }}
+    runs-on: [self-hosted, Windows, X64, device-lab]
+    timeout-minutes: 180
+    env:
+      TARGET_DEVICE_ID: ${{ inputs.target_device_id || vars.MRD_DEVICE_LAB_TARGET_DEVICE_ID }}
+      TARGET_ADDRESS: ${{ inputs.target_address || vars.MRD_DEVICE_LAB_TARGET_ADDRESS || '' }}
+      DURATION_SECS: ${{ inputs.duration_secs || vars.MRD_DEVICE_LAB_DURATION_SECS || '30' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run secure LAN paired positive scenario
+        shell: powershell
+        run: |
+          $args = @(
+            "-ExecutionPolicy", "Bypass",
+            "-File", "tests/benchmarks/scripts/run_paired_lan_canary.ps1",
+            "-SkipLocal",
+            "-OutputDir", "artifacts/e2e/device-lab/secure-lan",
+            "-ScenarioId", "cross.e2e.secure_remote_display",
+            "-ProfileId", "1080p60",
+            "-DurationSecs", $env:DURATION_SECS,
+            "-TargetDeviceId", $env:TARGET_DEVICE_ID
+          )
+          if ($env:TARGET_ADDRESS) {
+            $args += @("-TargetAddress", $env:TARGET_ADDRESS)
+          }
+          & powershell @args
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload secure LAN device-lab artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: secure-lan-device-lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/e2e/device-lab/secure-lan/
+          if-no-files-found: warn

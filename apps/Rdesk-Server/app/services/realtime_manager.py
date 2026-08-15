@@ -114,4 +114,3 @@ class RealtimeSidecarManager:
     def restart(self) -> RealtimeStatus:
         self.stop()
         return self.start()
-

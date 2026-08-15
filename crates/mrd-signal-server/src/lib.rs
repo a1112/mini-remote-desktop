@@ -1,4 +1,7 @@
 use mrd_proto::{DeviceId, SessionId};
+use mrd_signal_proto::{
+    SignalEnvelope, SignalProtocolError, SignalReplayGuard, VerifiedSignalMetadata,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -49,9 +52,43 @@ pub enum SessionRouteError {
     UnknownSender,
 }
 
+/// Stateful signature, peer-binding, expiry, counter, and nonce verifier.
+#[derive(Debug)]
+pub struct AuthenticatedMessageVerifier {
+    local_device_id: DeviceId,
+    replay: SignalReplayGuard,
+}
+
+impl AuthenticatedMessageVerifier {
+    pub fn new(local_device_id: DeviceId, max_signers: usize, nonce_capacity: usize) -> Self {
+        Self {
+            local_device_id,
+            replay: SignalReplayGuard::new(max_signers, nonce_capacity),
+        }
+    }
+
+    pub fn verify(
+        &mut self,
+        envelope: &SignalEnvelope,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, AuthenticatedMessageError> {
+        envelope.validate_version()?;
+        envelope
+            .message
+            .verify_for(&self.local_device_id, now_ms, &mut self.replay)
+            .map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AuthenticatedMessageError {
+    #[error(transparent)]
+    Protocol(#[from] SignalProtocolError),
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{SessionRoute, SessionRouter};
+    use super::{AuthenticatedMessageVerifier, SessionRoute, SessionRouter};
     use mrd_proto::{DeviceId, SessionId};
 
     #[test]
@@ -74,5 +111,67 @@ mod tests {
             .expect("resolve controller peer");
 
         assert_eq!(peer, agent);
+    }
+
+    #[test]
+    fn verifier_rejects_unsigned_server_to_client_message_on_authenticated_ingress() {
+        use mrd_signal_proto::{
+            AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
+            SignalProtocolError,
+        };
+        let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::ProtocolError(
+            SignalErrorMessage {
+                reason: ProtocolReasonCode::Malformed,
+                correlation_id: None,
+                detail: "invalid".into(),
+            },
+        ));
+        let mut verifier =
+            AuthenticatedMessageVerifier::new(DeviceId("signal-server".into()), 8, 64);
+        assert_eq!(
+            verifier.verify(&envelope, 1_000),
+            Err(SignalProtocolError::UnsignedMessage.into())
+        );
+    }
+
+    #[test]
+    fn verifier_accepts_one_signed_register_then_rejects_replay() {
+        use mrd_identity::DeviceIdentity;
+        use mrd_signal_proto::{
+            AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, RegisterPayload,
+            SignalEnvelope, SignalProtocolError,
+        };
+        use ring::rand::SystemRandom;
+
+        let identity = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+        let register = AuthenticatedRegister::sign(
+            &identity,
+            RegisterPayload {
+                claims: AuthClaims {
+                    issuer_device_id: DeviceId("controller-1".into()),
+                    issuer_key_id: identity.key_id().into(),
+                    intended_peer_device_id: DeviceId("signal-server".into()),
+                    issued_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                    counter: 1,
+                    nonce: [9; 16],
+                },
+                role: mrd_proto::BackendRole::Controller,
+                device_name: "Rdesk".into(),
+                backend_device_token: "backend-token".into(),
+                challenge_id: [7; 16],
+                challenge_nonce: [8; 32],
+            },
+        )
+        .unwrap();
+        let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::Register(register));
+        let mut verifier =
+            AuthenticatedMessageVerifier::new(DeviceId("signal-server".into()), 8, 64);
+        let metadata = verifier.verify(&envelope, 1_500).unwrap();
+        assert_eq!(metadata.issuer_device_id, DeviceId("controller-1".into()));
+        assert_eq!(
+            verifier.verify(&envelope, 1_500),
+            Err(SignalProtocolError::RepeatedNonce.into())
+        );
     }
 }

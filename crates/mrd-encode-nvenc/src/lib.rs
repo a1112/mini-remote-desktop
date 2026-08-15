@@ -108,16 +108,19 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 "#;
 
     pub struct NvencH264Encoder {
-        _device: ID3D11Device,
-        context: ID3D11DeviceContext,
-        texture: ID3D11Texture2D,
-        encoder: Encoder,
-        registered: RegisteredResource,
-        shared_inputs: Vec<SharedInputResource>,
-        shared_encode_slots: Vec<SharedEncodeSlot>,
+        // Rust drops fields in declaration order.  Keep the NVENC-owned
+        // objects first so every bitstream is destroyed and every resource is
+        // unregistered while the backing D3D11 textures/device are still live.
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
-        color_transform_pipeline: Option<ColorTransformPipeline>,
+        shared_encode_slots: Vec<SharedEncodeSlot>,
         bitstream: BitStream,
+        registered: RegisteredResource,
+        encoder: Encoder,
+        shared_inputs: Vec<SharedInputResource>,
+        color_transform_pipeline: Option<ColorTransformPipeline>,
+        texture: ID3D11Texture2D,
+        context: ID3D11DeviceContext,
+        _device: ID3D11Device,
         width: usize,
         height: usize,
         fps: u32,
@@ -129,16 +132,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     unsafe impl Send for NvencH264Encoder {}
 
     pub struct NvencHevcEncoder {
-        _device: ID3D11Device,
-        context: ID3D11DeviceContext,
-        texture: ID3D11Texture2D,
-        encoder: Encoder,
-        registered: RegisteredResource,
-        shared_inputs: Vec<SharedInputResource>,
-        shared_encode_slots: Vec<SharedEncodeSlot>,
+        // See `NvencH264Encoder`: native encoder resources must be released
+        // before the D3D11 resources backing their registrations.
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
-        color_transform_pipeline: Option<ColorTransformPipeline>,
+        shared_encode_slots: Vec<SharedEncodeSlot>,
         bitstream: BitStream,
+        registered: RegisteredResource,
+        encoder: Encoder,
+        shared_inputs: Vec<SharedInputResource>,
+        color_transform_pipeline: Option<ColorTransformPipeline>,
+        texture: ID3D11Texture2D,
+        context: ID3D11DeviceContext,
+        _device: ID3D11Device,
         width: usize,
         height: usize,
         fps: u32,
@@ -167,15 +172,15 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         shared_handle: isize,
         width: u32,
         height: u32,
-        _texture: ID3D11Texture2D,
         shader_resource_view: Option<ID3D11ShaderResourceView>,
+        _texture: ID3D11Texture2D,
     }
 
     struct SharedEncodeSlot {
-        texture: ID3D11Texture2D,
-        render_target_view: Option<ID3D11RenderTargetView>,
-        registered: RegisteredResource,
         bitstream: BitStream,
+        registered: RegisteredResource,
+        render_target_view: Option<ID3D11RenderTargetView>,
+        texture: ID3D11Texture2D,
     }
 
     struct PendingSharedEncode {
@@ -185,8 +190,8 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     }
 
     struct SharedInputBinding {
-        texture: ID3D11Texture2D,
         shader_resource_view: Option<ID3D11ShaderResourceView>,
+        texture: ID3D11Texture2D,
     }
 
     struct ColorTransformPipeline {
@@ -662,7 +667,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 }
             }
 
-            let slot = self
+            let mut slot = self
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC encode slot"))?;
@@ -673,7 +678,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
-                &slot.registered,
+                &mut slot.registered,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -745,9 +750,12 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         fn complete_oldest_shared_encode(
             &mut self,
         ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
-            let Some(pending) = self.pending_shared_encodes.pop_front() else {
+            let Some(mut pending) = self.pending_shared_encodes.pop_front() else {
                 return Ok(None);
             };
+            pending.slot.registered.unmap().map_err(|error| {
+                PipelineError::message(format!("NVENC unmap input failed: {error:?}"))
+            })?;
             let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
                 .map_err(|error| PipelineError::message(error.to_string()))?;
             let access_unit = EncodedAccessUnit {
@@ -758,6 +766,21 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             };
             self.shared_encode_slots.push(pending.slot);
             Ok(Some(access_unit))
+        }
+
+        fn drain_pending_shared_encodes_for_shutdown(&mut self) {
+            while !self.pending_shared_encodes.is_empty() {
+                if self.complete_oldest_shared_encode().is_err() {
+                    break;
+                }
+            }
+        }
+
+        fn unmap_registered_resources_for_shutdown(&mut self) {
+            let _ = self.registered.unmap();
+            for slot in &mut self.shared_encode_slots {
+                let _ = slot.registered.unmap();
+            }
         }
 
         fn copy_or_transform_shared_bgra_to_texture(
@@ -1162,7 +1185,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 }
             }
 
-            let slot = self
+            let mut slot = self
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
@@ -1174,7 +1197,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             submit_encode_picture(
                 &mut self.encoder,
                 &slot.bitstream,
-                &slot.registered,
+                &mut slot.registered,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -1245,9 +1268,12 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         fn complete_oldest_shared_encode(
             &mut self,
         ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
-            let Some(pending) = self.pending_shared_encodes.pop_front() else {
+            let Some(mut pending) = self.pending_shared_encodes.pop_front() else {
                 return Ok(None);
             };
+            pending.slot.registered.unmap().map_err(|error| {
+                PipelineError::message(format!("NVENC unmap input failed: {error:?}"))
+            })?;
             let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
                 .map_err(|error| PipelineError::message(error.to_string()))?;
             if self.main10 {
@@ -1261,6 +1287,21 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             };
             self.shared_encode_slots.push(pending.slot);
             Ok(Some(access_unit))
+        }
+
+        fn drain_pending_shared_encodes_for_shutdown(&mut self) {
+            while !self.pending_shared_encodes.is_empty() {
+                if self.complete_oldest_shared_encode().is_err() {
+                    break;
+                }
+            }
+        }
+
+        fn unmap_registered_resources_for_shutdown(&mut self) {
+            let _ = self.registered.unmap();
+            for slot in &mut self.shared_encode_slots {
+                let _ = slot.registered.unmap();
+            }
         }
 
         fn copy_or_transform_shared_bgra_to_texture(
@@ -1457,7 +1498,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
-                &self.registered,
+                &mut self.registered,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -1524,7 +1565,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
                 &self.bitstream,
-                &self.registered,
+                &mut self.registered,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -1541,6 +1582,28 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 is_keyframe: force_idr,
                 bytes: normalize_annexb_au(bytes),
             }])
+        }
+    }
+
+    impl Drop for NvencH264Encoder {
+        fn drop(&mut self) {
+            // The shared path has asynchronous NVENC submissions.  Do not
+            // unregister their D3D11 textures while a bitstream is still in
+            // flight: flush D3D work, wait for every pending slot through the
+            // NVENC lock, then close the encode stream before field teardown.
+            unsafe { self.context.Flush() };
+            self.drain_pending_shared_encodes_for_shutdown();
+            self.unmap_registered_resources_for_shutdown();
+            let _ = self.encoder.end_encode();
+        }
+    }
+
+    impl Drop for NvencHevcEncoder {
+        fn drop(&mut self) {
+            unsafe { self.context.Flush() };
+            self.drain_pending_shared_encodes_for_shutdown();
+            self.unmap_registered_resources_for_shutdown();
+            let _ = self.encoder.end_encode();
         }
     }
 
@@ -1905,7 +1968,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     fn encode_picture_with_sps_pps(
         encoder: &mut Encoder,
         bitstream: &BitStream,
-        registered: &RegisteredResource,
+        registered: &mut RegisteredResource,
         frame_index: usize,
         force_idr: bool,
         buffer_format: NVencBufferFormat,
@@ -1918,17 +1981,23 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             force_idr,
             buffer_format,
         )?;
+        registered
+            .unmap()
+            .map_err(|error| anyhow!("NVENC unmap input failed: {error:?}"))?;
         lock_bitstream_bytes(bitstream)
     }
 
     fn submit_encode_picture(
         encoder: &mut Encoder,
         bitstream: &BitStream,
-        registered: &RegisteredResource,
+        registered: &mut RegisteredResource,
         frame_index: usize,
         force_idr: bool,
         buffer_format: NVencBufferFormat,
     ) -> anyhow::Result<()> {
+        registered
+            .map()
+            .map_err(|error| anyhow!("NVENC map input failed: {error:?}"))?;
         let flags = if force_idr {
             NVencPicFlags::ForceIDR as u32 | NVencPicFlags::OutputSpspps as u32
         } else {

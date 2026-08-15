@@ -1,9 +1,15 @@
 export type TauriWindowLike = {
+  label?: string;
   startDragging: () => Promise<void> | void;
   minimize: () => Promise<void> | void;
   toggleMaximize: () => Promise<void> | void;
   isMaximized: () => Promise<boolean> | boolean;
   close: () => Promise<void> | void;
+};
+
+export const getTauriWindowLabel = async (): Promise<string | null> => {
+  const win = await getTauriWindow();
+  return typeof win?.label === "string" ? win.label : null;
 };
 
 const getTauriWindow = async (): Promise<TauriWindowLike | null> => {

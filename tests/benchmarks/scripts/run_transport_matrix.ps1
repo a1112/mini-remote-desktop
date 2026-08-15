@@ -1,7 +1,7 @@
 param(
   [string]$ScenarioPath = "tests/benchmarks/scenarios/quick.transport.json",
   [string]$RepoRoot = ".",
-  [int]$TimeoutSeconds = 300,
+  [int]$TimeoutSeconds = 0,
   [switch]$Debug
 )
 
@@ -9,8 +9,12 @@ $ErrorActionPreference = "Stop"
 
 $repo = (Resolve-Path $RepoRoot).Path
 . (Join-Path $repo 'tests/benchmarks/scripts/transport_matrix_common.ps1')
-$scenarioFile = Join-Path $repo $ScenarioPath
+. (Join-Path $repo 'tests/benchmarks/scripts/benchmark_execution_state.ps1')
+$scenarioFile = Resolve-BenchmarkPath -RepoRoot $repo -Path $ScenarioPath
 $scenario = Get-Content $scenarioFile -Raw | ConvertFrom-Json
+if ($TimeoutSeconds -le 0) {
+  $TimeoutSeconds = Get-TransportMatrixTimeoutSeconds -Scenario $scenario
+}
 $gitCommit = (git -C $repo rev-parse --short HEAD).Trim()
 $date = Get-Date -Format 'yyyy-MM-dd'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -92,13 +96,20 @@ foreach ($key in @("MRD_D3D11_RENDER_WAITABLE_OBJECT", "MRD_RENDER_THREAD_PRIORI
   }
 }
 
-$exitCode = Invoke-TransportMatrixCommand `
-  -FilePath "cargo" `
-  -ArgumentList $cargoArgs `
-  -WorkingDirectory $repo `
-  -StdoutPath $hostStdout `
-  -StderrPath $hostStderr `
-  -TimeoutSeconds $TimeoutSeconds
+$executionStateHeld = Enable-BenchmarkExecutionState -DisplayRequired
+try {
+  $exitCode = Invoke-TransportMatrixCommand `
+    -FilePath "cargo" `
+    -ArgumentList $cargoArgs `
+    -WorkingDirectory $repo `
+    -StdoutPath $hostStdout `
+    -StderrPath $hostStderr `
+    -TimeoutSeconds $TimeoutSeconds
+} finally {
+  if ($executionStateHeld) {
+    Restore-BenchmarkExecutionState
+  }
+}
 
 if ($exitCode.TimedOut) {
   throw "benchmark cargo test timed out after $TimeoutSeconds seconds. See $hostStdout and $hostStderr"
@@ -112,7 +123,12 @@ powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/benchmarks/scri
   -RunDir $runDir `
   -ThresholdPath $thresholdPath
 
-Assert-TransportMatrixSummaryPassed -SummaryPath (Join-Path $runDir 'summary.json')
+try {
+  Assert-TransportMatrixSummaryPassed -SummaryPath (Join-Path $runDir 'summary.json')
+} catch {
+  Write-Error $_
+  exit 2
+}
 
 Write-Output "Benchmark run completed."
 Write-Output "Run directory: $runDir"

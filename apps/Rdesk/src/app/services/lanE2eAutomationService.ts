@@ -1,6 +1,8 @@
 import type {
   AdapterResult,
   AdaptiveMediaConfig,
+  AuditEventPageV2,
+  AuditEventsQueryV2,
   CaptureSource,
   CaptureSourceSelection,
   DisplayMode,
@@ -12,11 +14,15 @@ import type {
   MediaProfile,
   MediaAdaptationSnapshot,
   ProbeSnapshot,
+  RemoteSessionRequest,
+  RemoteSessionSnapshot,
   RemoteDisplayWindowContext,
+  RouteEvidence,
   RuntimeSnapshot,
   SessionRuntimeSnapshot,
   ControlInputAccepted,
   ControlInputEvent,
+  TrustedDeviceSnapshot,
 } from "../adapters/tauri";
 import {
   evaluateProfileProbe,
@@ -30,6 +36,7 @@ export type CrossDeviceScenarioId =
   | "lan.e2e.remote_display"
   | "cross.e2e.discovery"
   | "cross.e2e.remote_display_smoke"
+  | "cross.e2e.secure_remote_display"
   | "cross.e2e.input_control"
   | "cross.e2e.media_profile"
   | "cross.fault.recovery";
@@ -154,6 +161,8 @@ export interface LanE2EAutomationReport {
   mediaAdaptationSnapshot?: MediaAdaptationSnapshot;
   profileProbeResult?: ProfileProbeResult;
   controlInputAck?: ControlInputAccepted;
+  secureSessionEvidence?: SecureSessionEvidence;
+  auditEventIds?: string[];
   requestedProfile?: MediaProfile;
   faultPlan?: CrossDeviceFaultPlan;
   faultEvents: CrossDeviceFaultEvent[];
@@ -193,6 +202,26 @@ export interface LanE2EAutomationReport {
   stages: LanE2EStageEvent[];
 }
 
+export interface SecureSessionEvidence {
+  trustedIdentityVerified: boolean;
+  authorizationGranted: boolean;
+  authorizationBasis: "consent" | "unattended" | null;
+  scopeAuthorized: boolean;
+  selectedRoute: string | null;
+  quicPeerAuthenticated: boolean;
+  realFramesVerified: boolean;
+  authorizedInputVerified: boolean;
+  cleanupCompleted: boolean;
+}
+
+interface SecureAuthorityBinding {
+  peerKeyId: string;
+  policyRevision: string;
+  trustRevision: string;
+  transportFingerprintSha256: string;
+  authorizationBasis: "consent" | "unattended";
+}
+
 export interface LanE2EAutomationCommands {
   serviceBootstrapIfNeeded(): Promise<AdapterResult<boolean>>;
   serviceWaitForHealthy(timeoutSecs?: number): Promise<AdapterResult<boolean>>;
@@ -206,6 +235,18 @@ export interface LanE2EAutomationCommands {
     transportKind: string,
     requestedProfile?: MediaProfile
   ): Promise<AdapterResult<string>>;
+  ipcRequestRemoteSession?(
+    request: RemoteSessionRequest
+  ): Promise<AdapterResult<RemoteSessionSnapshot>>;
+  ipcGetRemoteSession?(
+    sessionId: string
+  ): Promise<AdapterResult<RemoteSessionSnapshot>>;
+  ipcGetRouteEvidence?(
+    sessionId: string
+  ): Promise<AdapterResult<RouteEvidence>>;
+  ipcListTrustedDevices?(
+    includeRevoked?: boolean
+  ): Promise<AdapterResult<TrustedDeviceSnapshot[]>>;
   ipcUpdateMediaProfile?(
     sessionId: string,
     requestedProfile: MediaProfile
@@ -242,6 +283,9 @@ export interface LanE2EAutomationCommands {
     sessionId: string,
     event: ControlInputEvent
   ): Promise<AdapterResult<ControlInputAccepted>>;
+  ipcGetAuditEventsV2?(
+    query: AuditEventsQueryV2
+  ): Promise<AdapterResult<AuditEventPageV2>>;
   ipcSessionSnapshot(sessionId: string): Promise<AdapterResult<SessionRuntimeSnapshot>>;
   ipcProbeSnapshot(sessionId: string): Promise<AdapterResult<ProbeSnapshot>>;
   ipcMediaPipelineSnapshot(sessionId: string): Promise<AdapterResult<MediaPipelineSnapshot>>;
@@ -281,6 +325,8 @@ const QUIC_2K144_MEDIA_CAPABILITY = "quic_datagram_2k144";
 const QUIC_DATAGRAM_MEDIA_V2_CAPABILITY = "quic_datagram_media_v2";
 const QUIC_DATAGRAM_MEDIA_V3_CAPABILITY = "quic_datagram_media_v3";
 const MEDIA_PROFILE_CONTROL_CAPABILITY = "media_profile_control_v1";
+const AUTHENTICATED_INPUT_TRANSPORT_CAPABILITY = "input_control_v2";
+const KEYBOARD_MOUSE_CONTROL_CAPABILITY = "control.keyboard_mouse";
 interface RequiredPlatformMediaCapabilityProfile {
   id: "windows" | "macos_hevc" | "macos_h264" | "linux";
   platform: "windows" | "macos" | "linux";
@@ -390,6 +436,10 @@ const ADAPTIVE_STARTUP_SAFE_BITRATE_RATIO = 0.8;
 const SAMPLE_DURATION_TOLERANCE_MS = 250;
 const REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS = 10_000;
 const REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS = 100;
+const SECURE_ROUTE_EVIDENCE_MAX_AGE_MS = 30_000;
+const SECURE_ROUTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
+const SECURE_AUDIT_PAGE_LIMIT = 200;
+const SECURE_AUDIT_MAX_PAGES = 32;
 const INPUT_CONTROL_ACK_PROBE_EVENT: ControlInputEvent = {
   kind: "mouse_move",
   x: 1,
@@ -421,6 +471,8 @@ export async function runLanE2EAutomation(
   const displayModePolicy = options.displayModePolicy ?? "none";
   const renderProfileCapEnabled = options.renderProfileCap ?? true;
   const renderDisplayEnabled = options.renderDisplay ?? true;
+  const secureRemoteDisplayScenario =
+    scenarioId === "cross.e2e.secure_remote_display";
   const requestMediaProfile = shouldRequestMediaProfile(scenarioId, transportKind);
   let requestedProfile = options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
@@ -436,6 +488,21 @@ export async function runLanE2EAutomation(
   let mediaAdaptationSnapshot: MediaAdaptationSnapshot | undefined;
   let profileProbeResult: ProfileProbeResult | undefined;
   let controlInputAck: ControlInputAccepted | undefined;
+  const auditEventIds: string[] = [];
+  const secureSessionEvidence: SecureSessionEvidence | undefined =
+    secureRemoteDisplayScenario
+      ? {
+          trustedIdentityVerified: false,
+          authorizationGranted: false,
+          authorizationBasis: null,
+          scopeAuthorized: false,
+          selectedRoute: null,
+          quicPeerAuthenticated: false,
+          realFramesVerified: false,
+          authorizedInputVerified: false,
+          cleanupCompleted: false,
+        }
+      : undefined;
   let controllerDeviceId: string | null | undefined;
   let sessionStarted = false;
   let sampleDurationMs = 0;
@@ -486,6 +553,9 @@ export async function runLanE2EAutomation(
         sampleDurationMs: number;
       }
     | undefined;
+  let terminalReport: LanE2EAutomationReport | undefined;
+  let secureAuthorityBinding: SecureAuthorityBinding | undefined;
+  let sessionStartRequestedAt: number | undefined;
 
   const stage = (
     event: LanE2EStageEvent["stage"],
@@ -499,66 +569,86 @@ export async function runLanE2EAutomation(
     status: LanE2EStatus,
     failureReason?: LanE2EFailureReason,
     errorMessage?: string
-  ): LanE2EAutomationReport => ({
-    status,
-    scenarioId,
-    sessionId,
-    controllerDeviceId,
-    peer,
-    displayWindow,
-    captureSource,
-    captureSourceSelection,
-    displayModeChange,
-    sessionSnapshot,
-    probeSnapshot,
-    mediaPipelineSnapshot,
-    mediaAdaptationSnapshot,
-    profileProbeResult,
-    controlInputAck,
-    requestedProfile,
-    faultPlan: options.faultPlan,
-    faultEvents,
-    validationMode,
-    dataPlaneVerified: status === "completed" && scenarioRequiresMediaPipeline(scenarioId),
-    mediaVerified:
-      status === "completed" &&
-      scenarioRequiresMediaPipeline(scenarioId) &&
-      (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
-    sampleDurationMs,
-    sampleFramesDecoded,
-    sampleFramesDropped,
-    sampleSequenceGapDrops,
-    sampleDecodeErrorDrops,
-    sampleTransientDrops,
-    sampleFpsElapsedMs,
-    sampleFpsTargetDurationMs,
-    sampleObservedFps,
-    sampleObservedFpsAtTargetDuration,
-    firstFrameAt,
-    firstFrameTimeMs,
-    maxZeroFrameWindowAfterFirstFrameMs,
-    sampleRenderFramesPresented,
-    sampleObservedRenderFps,
-    sampleObservedRenderFpsAtTargetDuration,
-    sampleRenderQueueReplacements,
-    sampleRenderPresentSkips,
-    metricSeries,
-    jankEvents,
-    thresholds: {
-      minSampleDurationMs,
-      minDecodedFrames,
-      minFps,
-      minRenderFps,
-    },
-    failureReason,
-    errorMessage,
-    startedAt,
-    finishedAt: now(),
-    stages,
-  });
+  ): LanE2EAutomationReport => {
+    terminalReport = {
+      status,
+      scenarioId,
+      sessionId,
+      controllerDeviceId,
+      peer,
+      displayWindow,
+      captureSource,
+      captureSourceSelection,
+      displayModeChange,
+      sessionSnapshot,
+      probeSnapshot,
+      mediaPipelineSnapshot,
+      mediaAdaptationSnapshot,
+      profileProbeResult,
+      controlInputAck,
+      secureSessionEvidence,
+      auditEventIds,
+      requestedProfile,
+      faultPlan: options.faultPlan,
+      faultEvents,
+      validationMode,
+      dataPlaneVerified:
+        status === "completed" && scenarioRequiresMediaPipeline(scenarioId),
+      mediaVerified:
+        status === "completed" &&
+        scenarioRequiresMediaPipeline(scenarioId) &&
+        (validationMode === "webrtc_rtp" || profileProbeResult?.status === "passed"),
+      sampleDurationMs,
+      sampleFramesDecoded,
+      sampleFramesDropped,
+      sampleSequenceGapDrops,
+      sampleDecodeErrorDrops,
+      sampleTransientDrops,
+      sampleFpsElapsedMs,
+      sampleFpsTargetDurationMs,
+      sampleObservedFps,
+      sampleObservedFpsAtTargetDuration,
+      firstFrameAt,
+      firstFrameTimeMs,
+      maxZeroFrameWindowAfterFirstFrameMs,
+      sampleRenderFramesPresented,
+      sampleObservedRenderFps,
+      sampleObservedRenderFpsAtTargetDuration,
+      sampleRenderQueueReplacements,
+      sampleRenderPresentSkips,
+      metricSeries,
+      jankEvents,
+      thresholds: {
+        minSampleDurationMs,
+        minDecodedFrames,
+        minFps,
+        minRenderFps,
+      },
+      failureReason,
+      errorMessage,
+      startedAt,
+      finishedAt: now(),
+      stages,
+    };
+    return terminalReport;
+  };
 
   try {
     stage("preflight", "started");
+    if (secureRemoteDisplayScenario) {
+      const incompatibleOption =
+        transportKind !== "quic"
+          ? "Secure LAN remote display requires QUIC"
+          : !stopOnComplete
+            ? "Secure LAN remote display requires authoritative cleanup"
+            : !renderDisplayEnabled
+              ? "Secure LAN remote display requires native presentation"
+              : null;
+      if (incompatibleOption) {
+        stage("preflight", "failed", incompatibleOption);
+        return finish("failed", "runtime_error", incompatibleOption);
+      }
+    }
     await unwrap(commands.serviceBootstrapIfNeeded(), "service_unhealthy");
     await unwrap(commands.serviceWaitForHealthy(10), "service_unhealthy");
     const runtime = await unwrap(commands.ipcRuntimeSnapshot(), "service_unhealthy");
@@ -581,7 +671,10 @@ export async function runLanE2EAutomation(
       stage("preflight", "failed", "No LAN peer available");
       return finish("failed", "peer_not_found", "No LAN peer available");
     }
-    if (scenarioId === "cross.e2e.input_control") {
+    if (
+      scenarioId === "cross.e2e.input_control" ||
+      secureRemoteDisplayScenario
+    ) {
       const inputControlGate = describeInputControlPeerGate(selectedPeer, transportKind);
       if (inputControlGate) {
         stage("preflight", "failed", inputControlGate);
@@ -591,6 +684,19 @@ export async function runLanE2EAutomation(
         const message = "Cross-device input control requires ipcSendControlInput support";
         stage("control", "skipped", message);
         return finish("skipped", "control_input_unsupported", message);
+      }
+      if (
+        secureRemoteDisplayScenario &&
+        (!commands.ipcRequestRemoteSession ||
+          !commands.ipcGetRemoteSession ||
+          !commands.ipcGetRouteEvidence ||
+          !commands.ipcListTrustedDevices ||
+          !commands.ipcGetAuditEventsV2)
+      ) {
+        const message =
+          "Secure LAN remote display requires authoritative session and audit evidence";
+        stage("preflight", "failed", message);
+        return finish("failed", "runtime_error", message);
       }
     }
     if (
@@ -645,17 +751,51 @@ export async function runLanE2EAutomation(
 
     stage("pairing", "started");
     sessionId = options.createSessionId?.() ?? createDefaultSessionId(selectedPeer.device_id, now());
-    await unwrap(
-      commands.ipcStartLanRemoteSession(
-        sessionId,
-        selectedPeer.device_id,
-        transportKind,
-        sessionStartProfile
-      ),
-      "session_start_failed"
-    );
+    sessionStartRequestedAt = now();
+    if (secureRemoteDisplayScenario) {
+      // The service may have committed the session before a durable lifecycle
+      // audit append fails. Always run the emergency stop path after an
+      // attempted secure start, even when the request returns an error.
+      sessionStarted = true;
+      await unwrap(
+        commands.ipcRequestRemoteSession!({
+          session_id: sessionId,
+          target_device_id: selectedPeer.device_id,
+          access_mode: "attended",
+          requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+          requested_profile: sessionStartProfile ?? null,
+        }),
+        "session_start_failed"
+      );
+    } else {
+      await unwrap(
+        commands.ipcStartLanRemoteSession(
+          sessionId,
+          selectedPeer.device_id,
+          transportKind,
+          sessionStartProfile
+        ),
+        "session_start_failed"
+      );
+    }
     sessionStarted = true;
     stage("pairing", "completed");
+
+    if (secureRemoteDisplayScenario && secureSessionEvidence) {
+      secureAuthorityBinding = await loadSecureAuthorityBinding(commands, {
+        sessionId,
+        peerDeviceId: selectedPeer.device_id,
+        now,
+      });
+      Object.assign(secureSessionEvidence, {
+        trustedIdentityVerified: true,
+        authorizationGranted: true,
+        authorizationBasis: secureAuthorityBinding.authorizationBasis,
+        scopeAuthorized: true,
+        selectedRoute: "lan_quic",
+        quicPeerAuthenticated: true,
+      });
+    }
 
     if (scenarioId === "cross.e2e.input_control") {
       stage("control", "started");
@@ -767,13 +907,21 @@ export async function runLanE2EAutomation(
         }),
         "display_window_failed"
       );
+      if (secureRemoteDisplayScenario) {
+        assertSessionScopedResponse(
+          "remote display window",
+          displayWindow.session_id,
+          sessionId
+        );
+      }
 
       const nativeSurface = await waitForRemoteDisplayNativeSurface(
         commands,
         sessionId,
         displayWindow,
         timeoutMs,
-        now
+        now,
+        secureRemoteDisplayScenario
       );
       displayWindow = nativeSurface.displayWindow;
       mediaPipelineSnapshot = nativeSurface.mediaPipelineSnapshot;
@@ -838,6 +986,15 @@ export async function runLanE2EAutomation(
         commands.ipcMediaPipelineSnapshot(sessionId),
         "runtime_error"
       );
+      if (secureRemoteDisplayScenario) {
+        assertSessionScopedResponse("session snapshot", sessionSnapshot.session_id, sessionId);
+        assertSessionScopedResponse("probe snapshot", probeSnapshot.session_id, sessionId);
+        assertSessionScopedResponse(
+          "media pipeline snapshot",
+          mediaPipelineSnapshot.session_id,
+          sessionId
+        );
+      }
       mediaAdaptationSnapshot = mediaPipelineSnapshot.adaptation ?? mediaAdaptationSnapshot;
       if (displayWindow) {
         displayWindow = syncDisplayWindowFromPipeline(displayWindow, mediaPipelineSnapshot);
@@ -1162,7 +1319,9 @@ export async function runLanE2EAutomation(
         return finish("failed", "media_profile_mismatch", pipelineProfileMismatch);
       }
       if (!options.adaptive && profileProbeFailure && sampleDurationReady) {
-        const exactProfileRequired = scenarioRequiresExactProfileMatch(scenarioId);
+        const exactProfileRequired =
+          scenarioRequiresExactProfileMatch(scenarioId) ||
+          (requestedProfile ? requestedProfileRequiresExactColorMatch(requestedProfile) : false);
         stage("assert", exactProfileRequired ? "failed" : "skipped", profileProbeFailure);
         return finish(
           exactProfileRequired ? "failed" : "skipped",
@@ -1190,6 +1349,43 @@ export async function runLanE2EAutomation(
         sampleDurationReady
       ) {
         stage("sample", "completed");
+        if (secureRemoteDisplayScenario && secureSessionEvidence) {
+          const presentedFrames = mediaPipelineSnapshot.render_presented_frames ?? 0;
+          const nativeFramesPresented =
+            Boolean(displayWindow) &&
+            remoteDisplayNativeSurfaceAttached(displayWindow!, mediaPipelineSnapshot) &&
+            presentedFrames > 0 &&
+            (sampleRenderFramesPresented > 0 || minSampleDurationMs === 0);
+          secureSessionEvidence.realFramesVerified =
+            probeSnapshot.frames_decoded > 0 &&
+            (sampleFramesDecoded > 0 || minSampleDurationMs === 0) &&
+            nativeFramesPresented;
+          if (!secureSessionEvidence.realFramesVerified) {
+            const message =
+              "Secure LAN scenario did not prove decoded frames on an attached native presentation surface";
+            stage("assert", "failed", message);
+            return finish("failed", "no_remote_frames", message);
+          }
+          stage("control", "started");
+          controlInputAck = await runControlInputAckProbe(commands, sessionId);
+          secureSessionEvidence.authorizedInputVerified =
+            controlInputAck.event_count > 0;
+          if (!secureSessionEvidence.authorizedInputVerified) {
+            const message = `Authenticated control input ACK did not confirm any events for ${sessionId}`;
+            stage("control", "failed", message);
+            return finish("failed", "control_input_failed", message);
+          }
+          const finalAuthorityBinding = await loadSecureAuthorityBinding(commands, {
+            sessionId,
+            peerDeviceId: selectedPeer.device_id,
+            now,
+          });
+          assertSecureAuthorityBindingStable(
+            secureAuthorityBinding,
+            finalAuthorityBinding
+          );
+          stage("control", "completed");
+        }
         stage("assert", "completed");
         return finish("completed");
       }
@@ -1224,23 +1420,306 @@ export async function runLanE2EAutomation(
   } finally {
     if (stopOnComplete && sessionStarted && sessionId) {
       stage("cleanup", "started");
+      let cleanupSucceeded = true;
+      let cleanupFailure: string | undefined;
       if (
         displayModeChange?.restore_required &&
         commands.ipcRestoreRemoteDisplayMode
       ) {
         const restoreResult = await commands.ipcRestoreRemoteDisplayMode(sessionId);
         if (!restoreResult.ok) {
-          stage("cleanup", "failed", restoreResult.error.message);
+          cleanupSucceeded = false;
+          cleanupFailure = restoreResult.error.message;
         }
       }
       const stopResult = await commands.ipcStopSession(sessionId);
-      if (stopResult.ok) {
-        stage("cleanup", "completed");
+      if (!stopResult.ok) {
+        cleanupSucceeded = false;
+        cleanupFailure = stopResult.error.message;
+      }
+      if (secureSessionEvidence) {
+        secureSessionEvidence.cleanupCompleted = cleanupSucceeded;
+        if (cleanupSucceeded && commands.ipcGetAuditEventsV2) {
+          try {
+            auditEventIds.push(
+              ...(await collectSecureLifecycleAuditIds(commands, {
+                sessionId,
+                controllerDeviceId,
+                peerDeviceId: peer?.device_id,
+                startedAtMs: sessionStartRequestedAt ?? startedAt,
+                now,
+              }))
+            );
+          } catch (error) {
+            cleanupFailure =
+              error instanceof Error ? error.message : String(error);
+          }
+        }
+      }
+
+      if (cleanupFailure) {
+        stage("cleanup", "failed", cleanupFailure);
+        if (secureSessionEvidence && terminalReport && terminalReport.status !== "failed") {
+          terminalReport.status = "failed";
+          terminalReport.failureReason = cleanupSucceeded
+            ? "runtime_error"
+            : "stop_failed";
+          terminalReport.errorMessage = cleanupFailure;
+          terminalReport.dataPlaneVerified = false;
+          terminalReport.mediaVerified = false;
+        }
       } else {
-        stage("cleanup", "failed", stopResult.error.message);
+        stage("cleanup", "completed");
       }
     }
+    if (terminalReport) terminalReport.finishedAt = now();
   }
+}
+
+function assertSessionScopedResponse(
+  label: string,
+  actualSessionId: string,
+  expectedSessionId: string
+): void {
+  if (actualSessionId !== expectedSessionId) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      `${label} belongs to ${actualSessionId}, expected ${expectedSessionId}`
+    );
+  }
+}
+
+async function loadSecureAuthorityBinding(
+  commands: LanE2EAutomationCommands,
+  params: {
+    sessionId: string;
+    peerDeviceId: string;
+    now: () => number;
+  }
+): Promise<SecureAuthorityBinding> {
+  const [remoteSession, routeEvidence, trustedDevices] = await Promise.all([
+    unwrap(commands.ipcGetRemoteSession!(params.sessionId), "runtime_error"),
+    unwrap(commands.ipcGetRouteEvidence!(params.sessionId), "runtime_error"),
+    unwrap(commands.ipcListTrustedDevices!(true), "runtime_error"),
+  ]);
+  const nowMs = params.now();
+  const requiredScopes: RemoteSessionSnapshot["granted_scopes"] = [
+    "screen.view",
+    "input.pointer",
+    "input.keyboard",
+  ];
+  const authorizationBasis =
+    remoteSession.access_mode === "attended"
+      ? "consent"
+      : remoteSession.access_mode === "unattended"
+        ? "unattended"
+        : null;
+  const trustedDevice = trustedDevices.find(
+    (device) => device.peer_key_id === remoteSession.peer_key_id
+  );
+  const fingerprint = routeEvidence.transport_fingerprint_sha256?.trim() ?? "";
+  const failures = [
+    remoteSession.session_id !== params.sessionId && "remote session id mismatch",
+    routeEvidence.session_id !== params.sessionId && "route evidence session id mismatch",
+    remoteSession.role !== "controller" && "remote session role is not controller",
+    remoteSession.peer_device_id !== params.peerDeviceId && "peer device id mismatch",
+    !remoteSession.peer_key_id.trim() && "peer key id is empty",
+    remoteSession.authorization_state !== "granted" && "authorization is not granted",
+    !authorizationBasis && "authorization basis is not consent or unattended",
+    typeof remoteSession.authorization_expires_at_ms !== "number" &&
+      "authorization expiry is missing",
+    typeof remoteSession.authorization_expires_at_ms === "number" &&
+      (!Number.isFinite(remoteSession.authorization_expires_at_ms) ||
+        remoteSession.authorization_expires_at_ms <= nowMs) &&
+      "authorization is expired",
+    remoteSession.route_state !== "connected" && "session route is not connected",
+    remoteSession.route_kind !== "lan_quic" && "session route is not LAN QUIC",
+    remoteSession.media_state !== "streaming" && "session media is not streaming",
+    remoteSession.presentation_state !== "streaming" &&
+      "session presentation is not streaming",
+    !requiredScopes.every((scope) => remoteSession.requested_scopes.includes(scope)) &&
+      "required scopes were not requested",
+    !requiredScopes.every((scope) => remoteSession.granted_scopes.includes(scope)) &&
+      "required scopes were not granted",
+    !trustedDevice && "peer key is absent from the trusted-device registry",
+    trustedDevice?.state !== "trusted" && "peer key is not trusted",
+    trustedDevice != null &&
+      !requiredScopes.every((scope) => trustedDevice.permission_ceiling.includes(scope)) &&
+      "trusted-device ceiling does not authorize required scopes",
+    trustedDevice != null && !isCanonicalDecimalU64(trustedDevice.trust_revision) &&
+      "trust revision is invalid",
+    routeEvidence.route_state !== "connected" && "route evidence is not connected",
+    routeEvidence.selected_route !== "lan_quic" && "selected route is not LAN QUIC",
+    routeEvidence.policy_revision !== remoteSession.policy_revision &&
+      "route and authorization policy revisions differ",
+    !isCanonicalDecimalU64(remoteSession.policy_revision) && "policy revision is invalid",
+    !/^sha256:[0-9a-f]{64}$/i.test(fingerprint) &&
+      "transport certificate fingerprint is not a SHA-256 binding",
+    !routeEvidence.candidates.some(
+      (candidate) => candidate.route === "lan_quic" && candidate.state === "connected"
+    ) && "connected LAN QUIC candidate is missing",
+    !Number.isFinite(routeEvidence.observed_at_ms) && "route evidence timestamp is invalid",
+    routeEvidence.observed_at_ms < remoteSession.updated_at_ms &&
+      "route evidence predates the session snapshot",
+    nowMs - routeEvidence.observed_at_ms > SECURE_ROUTE_EVIDENCE_MAX_AGE_MS &&
+      "route evidence is stale",
+    routeEvidence.observed_at_ms - nowMs > SECURE_ROUTE_EVIDENCE_FUTURE_SKEW_MS &&
+      "route evidence is from the future",
+  ].filter((failure): failure is string => typeof failure === "string");
+
+  if (failures.length > 0 || !authorizationBasis || !trustedDevice) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      `Secure LAN authority evidence is invalid: ${failures.join(", ")}`
+    );
+  }
+
+  return {
+    peerKeyId: remoteSession.peer_key_id,
+    policyRevision: remoteSession.policy_revision,
+    trustRevision: trustedDevice.trust_revision,
+    transportFingerprintSha256: fingerprint.toLowerCase(),
+    authorizationBasis,
+  };
+}
+
+function assertSecureAuthorityBindingStable(
+  initial: SecureAuthorityBinding | undefined,
+  final: SecureAuthorityBinding
+): void {
+  if (!initial) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      "Initial secure LAN authority binding is missing"
+    );
+  }
+  const changed = [
+    initial.peerKeyId !== final.peerKeyId && "peer key",
+    initial.policyRevision !== final.policyRevision && "policy revision",
+    initial.trustRevision !== final.trustRevision && "trust revision",
+    initial.transportFingerprintSha256 !== final.transportFingerprintSha256 &&
+      "transport fingerprint",
+    initial.authorizationBasis !== final.authorizationBasis && "authorization basis",
+  ].filter(Boolean);
+  if (changed.length > 0) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      `Secure LAN authority binding changed during the run: ${changed.join(", ")}`
+    );
+  }
+}
+
+async function collectSecureLifecycleAuditIds(
+  commands: LanE2EAutomationCommands,
+  params: {
+    sessionId: string;
+    controllerDeviceId?: string | null;
+    peerDeviceId?: string | null;
+    startedAtMs: number;
+    now: () => number;
+  }
+): Promise<string[]> {
+  let afterSequence = "0";
+  const events: AuditEventPageV2["events"] = [];
+  const seenSequences = new Set<string>();
+
+  for (let pageIndex = 0; pageIndex < SECURE_AUDIT_MAX_PAGES; pageIndex += 1) {
+    const page = await unwrap(
+      commands.ipcGetAuditEventsV2!({
+        after_sequence: afterSequence,
+        limit: SECURE_AUDIT_PAGE_LIMIT,
+        session_id: params.sessionId,
+      }),
+      "runtime_error"
+    );
+    if (!page.chain_verified || page.cursor_state !== "current") {
+      throw new LanE2ECommandError(
+        "runtime_error",
+        "Secure LAN audit history is not contiguous and chain-verified"
+      );
+    }
+    for (const event of page.events) {
+      if (event.session_id !== params.sessionId) {
+        throw new LanE2ECommandError(
+          "runtime_error",
+          `Audit event ${event.sequence} belongs to another session`
+        );
+      }
+      if (!isCanonicalDecimalU64(event.sequence) || seenSequences.has(event.sequence)) {
+        throw new LanE2ECommandError(
+          "runtime_error",
+          `Audit event sequence is invalid or duplicated: ${event.sequence}`
+        );
+      }
+      seenSequences.add(event.sequence);
+      events.push(event);
+    }
+    if (!page.has_more) break;
+    const next = page.next_after_sequence;
+    if (!next || next === afterSequence || !isCanonicalDecimalU64(next)) {
+      throw new LanE2ECommandError(
+        "runtime_error",
+        "Secure LAN audit pagination did not advance"
+      );
+    }
+    afterSequence = next;
+    if (pageIndex === SECURE_AUDIT_MAX_PAGES - 1) {
+      throw new LanE2ECommandError(
+        "runtime_error",
+        "Secure LAN audit history exceeded the bounded page limit"
+      );
+    }
+  }
+
+  const matchesLifecycleEvent = (
+    event: AuditEventPageV2["events"][number],
+    action: string
+  ) =>
+    event.action === action &&
+    event.outcome === "success" &&
+    event.session_id === params.sessionId &&
+    event.actor_device_id === params.controllerDeviceId &&
+    event.peer_device_id === params.peerDeviceId &&
+    event.transport_kind === "lan_quic";
+  const observedAtMs = params.now();
+  const occurredDuringRun = (event: AuditEventPageV2["events"][number]) =>
+    Number.isSafeInteger(event.timestamp_ms) &&
+    event.timestamp_ms >= params.startedAtMs &&
+    event.timestamp_ms <= observedAtMs;
+  const startEvent = events.find(
+    (event) =>
+      matchesLifecycleEvent(event, "session.start_lan") && occurredDuringRun(event)
+  );
+  const stopEvent = startEvent
+    ? events.find(
+        (event) =>
+          matchesLifecycleEvent(event, "session.stop") &&
+          occurredDuringRun(event) &&
+          compareCanonicalDecimalU64(startEvent.sequence, event.sequence) < 0
+      )
+    : undefined;
+  if (!startEvent || !stopEvent) {
+    throw new LanE2ECommandError(
+      "runtime_error",
+      "Secure LAN audit history lacks an ordered start and stop from this run"
+    );
+  }
+  return [startEvent.sequence, stopEvent.sequence];
+}
+
+function isCanonicalDecimalU64(value: string): boolean {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  const maxU64 = "18446744073709551615";
+  return (
+    value.length < maxU64.length ||
+    (value.length === maxU64.length && value <= maxU64)
+  );
+}
+
+function compareCanonicalDecimalU64(left: string, right: string): number {
+  if (left.length !== right.length) return left.length < right.length ? -1 : 1;
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
 }
 
 function syncDisplayWindowFromPipeline(
@@ -1251,12 +1730,14 @@ function syncDisplayWindowFromPipeline(
     (surface) => surface.surface_id === displayWindow.surface_id
   );
   if (!attachedSurface) return displayWindow;
+  const renderMode = renderModeForAttachedSurface(attachedSurface.backend);
+  if (!renderMode) return displayWindow;
 
   return {
     ...displayWindow,
     renderer_attached: true,
     native_surface_attached: true,
-    render_mode: renderModeForAttachedSurface(attachedSurface.backend),
+    render_mode: renderMode,
   };
 }
 
@@ -1270,10 +1751,23 @@ async function runControlInputAckProbe(
       "Cross-device input control requires ipcSendControlInput support"
     );
   }
-  return unwrap(
+  const accepted = await unwrap(
     commands.ipcSendControlInput(sessionId, INPUT_CONTROL_ACK_PROBE_EVENT),
     "control_input_failed"
   );
+  if (accepted.session_id !== sessionId) {
+    throw new LanE2ECommandError(
+      "control_input_failed",
+      `Control input ACK belongs to ${accepted.session_id}, expected ${sessionId}`
+    );
+  }
+  if (accepted.lane !== "realtime") {
+    throw new LanE2ECommandError(
+      "control_input_failed",
+      `Mouse-move ACK used ${accepted.lane} lane, expected realtime`
+    );
+  }
+  return accepted;
 }
 
 async function waitForRemoteDisplayNativeSurface(
@@ -1281,7 +1775,8 @@ async function waitForRemoteDisplayNativeSurface(
   sessionId: string,
   displayWindow: RemoteDisplayWindowContext,
   timeoutMs: number,
-  now: () => number
+  now: () => number,
+  requireSessionBinding = false
 ): Promise<{
   attached: boolean;
   displayWindow: RemoteDisplayWindowContext;
@@ -1298,6 +1793,13 @@ async function waitForRemoteDisplayNativeSurface(
       commands.ipcMediaPipelineSnapshot(sessionId),
       "runtime_error"
     );
+    if (requireSessionBinding) {
+      assertSessionScopedResponse(
+        "media pipeline snapshot",
+        latestSnapshot.session_id,
+        sessionId
+      );
+    }
     currentWindow = syncDisplayWindowFromPipeline(currentWindow, latestSnapshot);
     if (remoteDisplayNativeSurfaceAttached(currentWindow, latestSnapshot)) {
       return {
@@ -1329,16 +1831,21 @@ function remoteDisplayNativeSurfaceAttached(
   return (
     displayWindow.native_surface_attached === true &&
     snapshot.attached_surfaces.some(
-      (surface) => surface.surface_id === displayWindow.surface_id
+      (surface) =>
+        surface.surface_id === displayWindow.surface_id &&
+        renderModeForAttachedSurface(surface.backend) === displayWindow.render_mode
     )
   );
 }
 
-function renderModeForAttachedSurface(backend: string): RemoteDisplayWindowContext["render_mode"] {
+function renderModeForAttachedSurface(
+  backend: string
+): RemoteDisplayWindowContext["render_mode"] | undefined {
+  if (backend === "d3d11") return "d3d11_native";
+  if (backend === "d3d12") return "d3d12_native";
   if (backend === "macos") return "macos_native";
   if (backend === "linux") return "linux_native";
-  if (backend === "d3d12") return "d3d12_native";
-  return "d3d11_native";
+  return undefined;
 }
 
 function buildRenderCappedMediaProfile(
@@ -1825,6 +2332,16 @@ function scenarioRequiresExactProfileMatch(scenarioId: CrossDeviceScenarioId): b
   return scenarioId === "cross.e2e.media_profile";
 }
 
+function requestedProfileRequiresExactColorMatch(profile: MediaProfile): boolean {
+  return (
+    profile.hdr_enabled === true ||
+    (profile.bit_depth ?? 8) > 8 ||
+    profile.pixel_format === "p010" ||
+    (profile.color_pipeline !== undefined && profile.color_pipeline !== "sdr8") ||
+    (profile.color_mode !== undefined && profile.color_mode !== "full")
+  );
+}
+
 function shouldRequestMediaProfile(
   scenarioId: CrossDeviceScenarioId,
   transportKind: string
@@ -1898,6 +2415,15 @@ function describeInputControlPeerGate(peer: LanPeerInfo, transportKind: string):
   if (!transports.includes(transportKind.toLowerCase())) {
     const transportList = peer.transports.length > 0 ? peer.transports.join(", ") : "none";
     return `LAN peer does not support ${transportKind} for input control: ${peer.device_id} supports ${transportList}`;
+  }
+  const mediaCapabilities = (peer.media_capabilities ?? []).map((capability) =>
+    capability.toLowerCase()
+  );
+  if (
+    !transports.includes(AUTHENTICATED_INPUT_TRANSPORT_CAPABILITY) ||
+    !mediaCapabilities.includes(KEYBOARD_MOUSE_CONTROL_CAPABILITY)
+  ) {
+    return `LAN peer is missing authenticated input-control V2 capability: ${peer.device_id}`;
   }
   return null;
 }

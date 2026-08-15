@@ -1,6 +1,7 @@
 use mrd_ipc::{
-    AttachedRenderSurface, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaSenderTransportSnapshot, MediaStageMetrics, MediaTestImpairmentSnapshot,
+    AgentRenderBoundarySnapshot, AttachedRenderSurface, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaSenderTransportSnapshot, MediaStageMetrics,
+    MediaTestImpairmentSnapshot,
 };
 use mrd_proto::SessionId;
 #[cfg(any(windows, target_os = "macos"))]
@@ -13,6 +14,8 @@ const MEDIA_STAGE_SAMPLE_LIMIT: usize = 240;
 #[derive(Debug, Default)]
 pub struct MediaPipelineRegistry {
     pipelines: HashMap<SessionId, MediaPipelineState>,
+    cumulative_sender_packets_sent: u64,
+    cumulative_render_presented_frames: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -50,6 +53,7 @@ struct MediaPipelineState {
     display_refresh_hz: Option<u32>,
     render_thread_priority: Option<String>,
     render_waitable_timeouts: u64,
+    agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
     reliable_hol_recoveries: u64,
     estimated_frame_age_baseline_ms: Option<f64>,
     stage_samples: HashMap<String, VecDeque<f64>>,
@@ -170,6 +174,9 @@ impl MediaPipelineRegistry {
     pub fn increment_render_presented_frames(&mut self, session_id: SessionId, count: u64) {
         let state = self.pipelines.entry(session_id).or_default();
         state.render_presented_frames = state.render_presented_frames.saturating_add(count);
+        self.cumulative_render_presented_frames = self
+            .cumulative_render_presented_frames
+            .saturating_add(count);
     }
 
     pub fn increment_render_queue_replacements(&mut self, session_id: SessionId, count: u64) {
@@ -301,10 +308,55 @@ impl MediaPipelineRegistry {
         session_id: SessionId,
         transport: MediaSenderTransportSnapshot,
     ) {
-        self.pipelines
-            .entry(session_id)
-            .or_default()
-            .sender_transport = transport;
+        let next_packets = sender_packets_sent(&transport);
+        let packet_delta = {
+            let state = self.pipelines.entry(session_id).or_default();
+            let previous_packets = sender_packets_sent(&state.sender_transport);
+            state.sender_transport = transport;
+            if next_packets >= previous_packets {
+                next_packets - previous_packets
+            } else {
+                next_packets
+            }
+        };
+        self.cumulative_sender_packets_sent = self
+            .cumulative_sender_packets_sent
+            .saturating_add(packet_delta);
+    }
+
+    /// Apply the latest authenticated cumulative Session Agent render counters.
+    pub fn set_agent_render_boundary(
+        &mut self,
+        session_id: SessionId,
+        metrics: mrd_agent_ipc::RenderBoundaryMetrics,
+    ) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.active_decoder = Some(metrics.decoder_backend.clone());
+        state.active_renderer = Some("session_agent_d3d11".to_owned());
+        state.queue_depth = u32::try_from(
+            metrics
+                .enqueued_units
+                .saturating_sub(metrics.decoded_frames),
+        )
+        .unwrap_or(u32::MAX);
+        state.render_presented_frames = metrics.presented_frames;
+        state.render_queue_replacements = metrics.queue_replacements;
+        state.agent_render_boundary = Some(AgentRenderBoundarySnapshot {
+            resource_id: metrics.resource_id,
+            decoder_backend: metrics.decoder_backend,
+            enqueued_units: metrics.enqueued_units,
+            queue_replacements: metrics.queue_replacements,
+            decoded_frames: metrics.decoded_frames,
+            presented_frames: metrics.presented_frames,
+        });
+    }
+
+    pub fn cumulative_sender_packets_sent(&self) -> u64 {
+        self.cumulative_sender_packets_sent
+    }
+
+    pub fn cumulative_render_presented_frames(&self) -> u64 {
+        self.cumulative_render_presented_frames
     }
 
     pub fn set_adaptation(
@@ -363,6 +415,7 @@ impl MediaPipelineRegistry {
             display_refresh_hz: state.and_then(|state| state.display_refresh_hz),
             render_thread_priority: state.and_then(|state| state.render_thread_priority.clone()),
             render_waitable_timeouts: state.map_or(0, |state| state.render_waitable_timeouts),
+            agent_render_boundary: state.and_then(|state| state.agent_render_boundary.clone()),
             reliable_hol_recoveries: state.map_or(0, |state| state.reliable_hol_recoveries),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
@@ -376,6 +429,12 @@ impl MediaPipelineRegistry {
     pub fn remove(&mut self, session_id: &SessionId) {
         self.pipelines.remove(session_id);
     }
+}
+
+fn sender_packets_sent(snapshot: &MediaSenderTransportSnapshot) -> u64 {
+    snapshot
+        .datagram_fragments_sent
+        .saturating_add(snapshot.reliable_fragments_sent)
 }
 
 fn set_active_media_profile(state: &mut MediaPipelineState, profile: &MediaProfile) {
@@ -541,5 +600,37 @@ mod tests {
             .expect("decoded format stage");
         assert_eq!(stage.sample_count, Some(2));
         assert_eq!(stage.p50_ms, Some(1.0));
+    }
+
+    #[test]
+    fn cumulative_activity_survives_pipeline_removal() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("pipeline-cumulative-session".to_string());
+
+        registry.set_sender_transport(
+            session_id.clone(),
+            MediaSenderTransportSnapshot {
+                datagram_fragments_sent: 3,
+                reliable_fragments_sent: 2,
+                ..Default::default()
+            },
+        );
+        registry.set_sender_transport(
+            session_id.clone(),
+            MediaSenderTransportSnapshot {
+                datagram_fragments_sent: 4,
+                reliable_fragments_sent: 3,
+                ..Default::default()
+            },
+        );
+        registry.increment_render_presented_frames(session_id.clone(), 4);
+
+        assert_eq!(registry.cumulative_sender_packets_sent(), 7);
+        assert_eq!(registry.cumulative_render_presented_frames(), 4);
+
+        registry.remove(&session_id);
+
+        assert_eq!(registry.cumulative_sender_packets_sent(), 7);
+        assert_eq!(registry.cumulative_render_presented_frames(), 4);
     }
 }

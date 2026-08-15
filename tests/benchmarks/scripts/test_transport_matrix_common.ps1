@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "transport_matrix_common.ps1")
+. (Join-Path $scriptDir "benchmark_execution_state.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 
 function Assert-ArrayEqual([object[]]$Actual, [object[]]$Expected, [string]$Message) {
@@ -25,6 +26,35 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern, [string]$Message)
     throw "$Message. Threw unexpected message: $($_.Exception.Message)"
   }
   throw "$Message. Expected an exception matching '$Pattern'"
+}
+
+if ((Get-BenchmarkExecutionStateFlags -DisplayRequired) -ne [uint32]2147483651) {
+  throw "Display-required benchmark execution state must keep both system and display awake"
+}
+if ((Get-BenchmarkExecutionStateFlags) -ne [uint32]2147483649) {
+  throw "Default benchmark execution state must keep the system awake"
+}
+
+$relativeScenario = Resolve-BenchmarkPath `
+  -RepoRoot $repoRoot `
+  -Path "tests/benchmarks/scenarios/quick.transport.json"
+$expectedRelativeScenario = [System.IO.Path]::GetFullPath(
+  (Join-Path $repoRoot "tests/benchmarks/scenarios/quick.transport.json")
+)
+if ($relativeScenario -ne $expectedRelativeScenario) {
+  throw "Relative benchmark paths must resolve under the repository root"
+}
+$absoluteOutput = [System.IO.Path]::GetFullPath(
+  (Join-Path ([System.IO.Path]::GetTempPath()) "mrd-benchmark-absolute")
+)
+if ((Resolve-BenchmarkPath -RepoRoot $repoRoot -Path $absoluteOutput) -ne $absoluteOutput) {
+  throw "Absolute benchmark paths must not be joined to the repository root"
+}
+if ((Get-TransportMatrixTimeoutSeconds -Scenario ([pscustomobject]@{ duration_secs = 20 })) -ne 440) {
+  throw "Quick transport timeout must retain a cold release-build allowance"
+}
+if ((Get-TransportMatrixTimeoutSeconds -Scenario ([pscustomobject]@{ duration_secs = 180 })) -ne 600) {
+  throw "Stress transport timeout must include scenario duration and build allowance"
 }
 
 $hevcArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "software_hevc"
@@ -365,11 +395,13 @@ foreach ($spec in $scenarioSpecs) {
 $processTmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-transport-process-{0}" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $processTmp | Out-Null
 try {
+  $powerShellHost = Get-CurrentPowerShellExecutable
+  if (-not (Test-Path $powerShellHost)) { throw "Current PowerShell executable should resolve to an existing file" }
   $stdout = Join-Path $processTmp "stdout.log"
   $stderr = Join-Path $processTmp "stderr.log"
   $exitCode = Invoke-TransportMatrixCommand `
-    -FilePath "powershell" `
-    -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
+    -FilePath $powerShellHost `
+    -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Milliseconds 250; Write-Output 'stdout-ok'; Write-Output ([System.Diagnostics.Process]::GetCurrentProcess().PriorityClass); [Console]::Error.WriteLine('stderr-ok'); exit 7") `
     -WorkingDirectory $processTmp `
     -StdoutPath $stdout `
     -StderrPath $stderr
@@ -377,10 +409,16 @@ try {
   if ($exitCode.ExitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
   if ($exitCode.TimedOut) { throw "Invoke-TransportMatrixCommand should not mark a completed command as timed out" }
   if ((Get-Content $stdout -Raw) -notmatch "stdout-ok") { throw "Invoke-TransportMatrixCommand should capture stdout" }
+  if (
+    [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT -and
+    (Get-Content $stdout -Raw) -notmatch "AboveNormal"
+  ) {
+    throw "Invoke-TransportMatrixCommand should run benchmark commands above normal priority on Windows"
+  }
   if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
 
   $timeoutResult = Invoke-TransportMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powerShellHost `
     -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 5; Write-Output 'too-late'; exit 0") `
     -WorkingDirectory $processTmp `
     -StdoutPath $stdout `
@@ -505,6 +543,7 @@ try {
   @"
 warning: failed to save last-use data
 database or disk is full
+     Running unittests src\main.rs (target\release\deps\app-test.exe)
 "@ | Set-Content -Path (Join-Path $summaryTmp "logs/host.stderr.log") -Encoding Ascii
 
   & (Join-Path $scriptDir "summarize_transport_results.ps1") -RunDir $summaryTmp
@@ -513,6 +552,7 @@ database or disk is full
   $schemaProperties = @($schema.properties.PSObject.Properties.Name)
   $summarized = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
   if ($summarized.error_count -ne 0) { throw "cargo cache warning text must not be counted as benchmark errors" }
+  if ($summarized.warning_count -ne 0) { throw "cargo build diagnostics must not be counted as runtime warnings" }
   $extraProperties = @($summarized.PSObject.Properties.Name | Where-Object { $_ -notin $schemaProperties })
   if ($extraProperties.Count -gt 0) {
     throw "benchmark summary schema is missing properties: $($extraProperties -join ', ')"
@@ -564,6 +604,11 @@ database or disk is full
   if ($report -notmatch "nvdec_shared_copy_last_error \\| shared texture copy succeeded") { throw "markdown report must include NVDEC shared copy last error" }
 
   $thresholdPath = Join-Path $summaryTmp "strict-thresholds.json"
+  $strictInput = Get-Content (Join-Path $summaryTmp "summary.json") -Raw | ConvertFrom-Json
+  $strictInput | Add-Member -Force -NotePropertyName encode_total_p95_ms -NotePropertyValue $null
+  $strictInput | Add-Member -Force -NotePropertyName send_write_p95_ms -NotePropertyValue $null
+  $strictInput | Add-Member -Force -NotePropertyName decode_total_p95_ms -NotePropertyValue $null
+  $strictInput | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $summaryTmp "summary.json") -Encoding Ascii
   [ordered]@{
     max_first_frame_time_ms = 5000
     min_fps_observed = 120.0
@@ -592,6 +637,7 @@ database or disk is full
   if ($strict.failure_reason -notmatch "render shared resource p95") { throw "failure reason should include render shared resource threshold" }
   if ($strict.failure_reason -notmatch "render queue replacements") { throw "failure reason should include render queue replacement threshold" }
   if ($strict.failure_reason -notmatch "render present skipped rate") { throw "failure reason should include render present skipped rate threshold" }
+  if ($strict.failure_reason -notmatch "required evidence missing or non-finite") { throw "missing transport evidence should fail closed" }
   $strictCsv = Import-Csv (Join-Path $summaryTmp "summary.csv")
   if ($strictCsv.run_status -ne "FAIL") { throw "strict threshold CSV should expose FAIL run_status" }
 

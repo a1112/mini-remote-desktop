@@ -4,9 +4,17 @@ use std::{
 };
 
 use mrd_decode_nvdec::{probe_runtime as probe_nvdec_runtime, NvdecCapabilityProbe};
+use mrd_ipc::{
+    ExperienceEndpointSide, ExperienceFpsWindow, ExperienceFreezeMetrics, ExperienceProbeSnapshot,
+    ExperienceResourceSample,
+};
 use mrd_observability::{PipelineProbeSnapshot, StageId};
 use mrd_pipeline_core::{ColorMode, ColorPipeline};
 use serde::{Deserialize, Serialize};
+
+const MAX_EXPERIENCE_FPS_WINDOWS: usize = 3_600;
+const MAX_EXPERIENCE_FRAME_INTERVALS: usize = 4_096;
+const MAX_EXPERIENCE_RESOURCE_SAMPLES: usize = 600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchmarkManifest {
@@ -131,7 +139,117 @@ pub struct BenchmarkSummary {
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub run_skipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experience: Option<ExperienceProbeSnapshot>,
     pub run_passed: bool,
+}
+
+fn experience_from_present_intervals(
+    first_visible_frame_ms: Option<f64>,
+    duration_secs: u64,
+    target_fps: u32,
+    frame_intervals_ms: &[f64],
+) -> ExperienceProbeSnapshot {
+    let duration_ms = duration_secs.saturating_mul(1_000) as f64;
+    let window_limit = usize::try_from(duration_secs)
+        .unwrap_or(usize::MAX)
+        .min(MAX_EXPERIENCE_FPS_WINDOWS);
+    let mut window_counts = vec![0_u32; window_limit];
+    let bounded_intervals = frame_intervals_ms
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .take(MAX_EXPERIENCE_FRAME_INTERVALS)
+        .collect::<Vec<_>>();
+    if let Some(mut presented_ms) =
+        first_visible_frame_ms.filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        if presented_ms < duration_ms {
+            if let Some(count) = window_counts.get_mut((presented_ms / 1_000.0) as usize) {
+                *count = count.saturating_add(1);
+            }
+        }
+        for interval_ms in bounded_intervals.iter().copied() {
+            presented_ms += interval_ms;
+            if presented_ms >= duration_ms {
+                break;
+            }
+            if let Some(count) = window_counts.get_mut((presented_ms / 1_000.0) as usize) {
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+
+    let expected_ms = 1_000.0 / f64::from(target_fps.max(1));
+    let mut prior_total_ms = 0.0;
+    let mut prior_count = 0_u64;
+    let mut stall_count = 0_u64;
+    let mut total_stall_duration_ms = 0.0;
+    let mut freeze_count = 0_u64;
+    let mut total_freeze_duration_ms = 0.0;
+    for interval_ms in bounded_intervals.iter().copied() {
+        if interval_ms > (expected_ms * 3.0).max(100.0) {
+            stall_count = stall_count.saturating_add(1);
+            total_stall_duration_ms += interval_ms;
+        }
+        let prior_mean_ms = if prior_count == 0 {
+            expected_ms
+        } else {
+            prior_total_ms / prior_count as f64
+        };
+        if interval_ms > (prior_mean_ms * 3.0).max(150.0) {
+            freeze_count = freeze_count.saturating_add(1);
+            total_freeze_duration_ms += interval_ms;
+        }
+        prior_total_ms += interval_ms;
+        prior_count = prior_count.saturating_add(1);
+    }
+
+    ExperienceProbeSnapshot {
+        first_visible_frame_ms,
+        fps_windows: window_counts
+            .into_iter()
+            .enumerate()
+            .map(|(window, frame_count)| ExperienceFpsWindow {
+                start_monotonic_ms: window as f64 * 1_000.0,
+                duration_ms: 1_000.0,
+                frame_count,
+                fps: f64::from(frame_count),
+            })
+            .collect(),
+        frame_intervals_ms: bounded_intervals,
+        stall_count,
+        total_stall_duration_ms,
+        freeze_metrics: ExperienceFreezeMetrics {
+            freeze_count,
+            total_freeze_duration_ms,
+        },
+        input_probes: Vec::new(),
+        resource_samples: Vec::new(),
+        adaptation_transitions: Vec::new(),
+    }
+}
+
+fn controller_resource_sample(
+    snapshot: &crate::resource_monitor::SystemResourceSnapshot,
+    monotonic_ms: f64,
+) -> Option<ExperienceResourceSample> {
+    if !snapshot.target_found {
+        return None;
+    }
+    let sample = ExperienceResourceSample {
+        side: ExperienceEndpointSide::Controller,
+        monotonic_ms,
+        cpu_usage_percent: f64::from(snapshot.cpu_usage_percent).clamp(0.0, 100.0),
+        rss_mb: snapshot.memory_used_mb as f64,
+        gpu_usage_percent: (snapshot.gpu_usage_metrics_scope == "process")
+            .then_some(snapshot.gpu_usage_percent.map(f64::from))
+            .flatten(),
+        vram_used_mb: (snapshot.gpu_memory_metrics_scope == "process")
+            .then_some(snapshot.gpu_memory_used_mb.map(|value| value as f64))
+            .flatten(),
+    };
+    sample.is_finite().then_some(sample)
 }
 
 impl BenchmarkSummary {
@@ -340,6 +458,7 @@ impl BenchmarkSummary {
             nvdec_hevc_main10_capability,
             failure_reason,
             run_skipped: false,
+            experience: None,
             run_passed,
         }
     }
@@ -499,6 +618,7 @@ impl BenchmarkSummary {
             nvdec_hevc_main10_capability,
             failure_reason,
             run_skipped: false,
+            experience: None,
             run_passed,
         }
     }
@@ -964,7 +1084,34 @@ mod tests {
         TransportKind,
     };
 
-    use super::{BenchmarkManifest, BenchmarkPaths, BenchmarkSummary};
+    use super::{
+        controller_resource_sample, experience_from_present_intervals, BenchmarkManifest,
+        BenchmarkPaths, BenchmarkSummary, MAX_EXPERIENCE_RESOURCE_SAMPLES,
+    };
+
+    #[test]
+    fn experience_artifact_uses_present_intervals_for_windows_stalls_and_freezes() {
+        let snapshot = experience_from_present_intervals(
+            Some(100.0),
+            2,
+            60,
+            &[16.0, 16.0, 200.0, 800.0, 16.0],
+        );
+
+        assert_eq!(snapshot.first_visible_frame_ms, Some(100.0));
+        assert_eq!(snapshot.frame_intervals_ms.len(), 5);
+        assert_eq!(snapshot.fps_windows.len(), 2);
+        assert_eq!(
+            snapshot
+                .fps_windows
+                .iter()
+                .map(|window| window.frame_count)
+                .sum::<u32>(),
+            6
+        );
+        assert_eq!(snapshot.stall_count, 2);
+        assert_eq!(snapshot.freeze_metrics.freeze_count, 2);
+    }
 
     #[tokio::test]
     async fn benchmark_run_writes_requested_artifacts() {
@@ -1053,6 +1200,9 @@ mod tests {
         if let Some(reason) = unsupported_encoder_backend_reason(&manifest.encode_backend) {
             return unsupported_benchmark_result(manifest, session_id, reason);
         }
+        if let Some(reason) = unsupported_capture_backend_reason(&manifest.capture_backend) {
+            return unsupported_benchmark_result(manifest, session_id, reason);
+        }
 
         let mut harness = TestHarness::new().expect("create benchmark harness");
         harness.set_chain(TestChain::Custom {
@@ -1080,14 +1230,31 @@ mod tests {
 
         let started = Instant::now();
         harness.start().expect("start benchmark harness");
-        let first_frame_time_ms = wait_for_first_decoded_frame(&harness, Duration::from_secs(8));
-        thread::sleep(Duration::from_secs(manifest.duration_secs));
-        harness.stop().expect("stop benchmark harness");
+        let first_frame_time_ms = wait_for_first_presented_frame(&harness, Duration::from_secs(8));
+        let sample_deadline = Instant::now() + Duration::from_secs(manifest.duration_secs);
+        let mut resource_monitor = crate::resource_monitor::ResourceMonitor::new();
+        let mut resource_samples = Vec::new();
+        while Instant::now() < sample_deadline {
+            let snapshot = resource_monitor
+                .snapshot_for_process(Some(std::process::id()), "Rdesk benchmark controller");
+            if let Some(sample) =
+                controller_resource_sample(&snapshot, started.elapsed().as_secs_f64() * 1_000.0)
+            {
+                if resource_samples.len() == MAX_EXPERIENCE_RESOURCE_SAMPLES {
+                    resource_samples.remove(0);
+                }
+                resource_samples.push(sample);
+            }
+            let remaining = sample_deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining.min(Duration::from_secs(1)));
+            }
+        }
+        harness.stop_and_wait().expect("stop benchmark harness");
         let metrics = harness.get_metrics();
         let elapsed_secs = started.elapsed().as_secs_f64().max(0.001);
         let bitrate_kbps = (metrics.total_bitstream_bytes as f64 * 8.0) / elapsed_secs / 1000.0;
-        let first_frame_seen =
-            first_frame_time_ms.is_some() || metrics.decoded_frames > 0 || metrics.frame_count > 0;
+        let first_frame_seen = first_frame_time_ms.is_some();
         let probe = probe_from_metrics(manifest, session_id, &metrics, bitrate_kbps);
         let render_probe_complete = manifest.renderer_backend == "none"
             || (metrics.render_latency_p95_ms > 0.0 && metrics.render_present_gap_p95_ms > 0.0);
@@ -1108,6 +1275,13 @@ mod tests {
             && metrics.decode_failures == 0
             && failure_reason.is_none();
 
+        let mut experience = experience_from_present_intervals(
+            first_frame_time_ms,
+            manifest.duration_secs,
+            manifest.fps,
+            &metrics.render_present_intervals_ms,
+        );
+        experience.resource_samples = resource_samples;
         let summary = BenchmarkSummary {
             run_id: manifest.run_id.clone(),
             scenario: manifest.scenario.clone(),
@@ -1190,6 +1364,7 @@ mod tests {
             nvdec_hevc_main10_capability: String::new(),
             failure_reason,
             run_skipped: false,
+            experience: Some(experience),
             run_passed,
         };
 
@@ -1212,7 +1387,7 @@ mod tests {
             return Some("decoder produced no frames".to_string());
         }
         if first_frame_time_ms.is_none() {
-            return Some("first decoded frame was not observed before timeout".to_string());
+            return Some("first successful present was not observed before timeout".to_string());
         }
         if !probe_complete {
             return Some("benchmark probe did not collect all required stage metrics".to_string());
@@ -1228,11 +1403,11 @@ mod tests {
         None
     }
 
-    fn wait_for_first_decoded_frame(harness: &TestHarness, timeout: Duration) -> Option<f64> {
+    fn wait_for_first_presented_frame(harness: &TestHarness, timeout: Duration) -> Option<f64> {
         let started = Instant::now();
         while started.elapsed() < timeout {
             let metrics = harness.get_metrics();
-            if metrics.decoded_frames > 0 || metrics.frame_count > 0 {
+            if metrics.render_presented_frames > 0 {
                 return Some(started.elapsed().as_secs_f64() * 1000.0);
             }
             thread::sleep(Duration::from_millis(20));
@@ -1548,6 +1723,41 @@ mod tests {
         None
     }
 
+    fn unsupported_capture_backend_reason(value: &str) -> Option<String> {
+        unsupported_capture_backend_reason_with_probe(value, || {
+            #[cfg(windows)]
+            {
+                mrd_capture_dxgi::enumerate_dxgi_output_targets()
+                    .map(|outputs| outputs.len())
+                    .map_err(|error| error.to_string())
+            }
+            #[cfg(not(windows))]
+            {
+                Err("DXGI is unavailable on this platform".to_string())
+            }
+        })
+    }
+
+    fn unsupported_capture_backend_reason_with_probe(
+        value: &str,
+        probe: impl FnOnce() -> Result<usize, String>,
+    ) -> Option<String> {
+        if value != "dxgi" {
+            return None;
+        }
+
+        match probe() {
+            Ok(count) if count > 0 => None,
+            Ok(_) => Some(
+                "DXGI benchmark skipped: current desktop session has no attached DXGI output"
+                    .to_string(),
+            ),
+            Err(error) => Some(format!(
+                "DXGI benchmark skipped: output capability probe failed ({error})"
+            )),
+        }
+    }
+
     fn unsupported_benchmark_result(
         manifest: &BenchmarkManifest,
         session_id: &SessionId,
@@ -1650,6 +1860,7 @@ mod tests {
             nvdec_hevc_main10_capability: String::new(),
             failure_reason: Some(reason),
             run_skipped: true,
+            experience: None,
             run_passed: false,
         };
 
@@ -2293,6 +2504,17 @@ mod tests {
         assert_eq!(probe.codec.as_deref(), Some("vvc"));
     }
 
+    #[test]
+    fn benchmark_dxgi_backend_is_capability_gated_without_an_attached_output() {
+        let reason = unsupported_capture_backend_reason_with_probe("dxgi", || Ok(0))
+            .expect("missing DXGI output must skip the benchmark");
+        assert!(reason.contains("no attached DXGI output"));
+        assert_eq!(
+            unsupported_capture_backend_reason_with_probe("winrt", || Ok(0)),
+            None
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn benchmark_nvenc_av1_capability_probe_does_not_reject_supported_hardware() {
@@ -2432,6 +2654,7 @@ mod tests {
             nvdec_hevc_main10_capability: "runtime=false wired=false".into(),
             failure_reason: Some("encode produced no HEVC Main10 access units".into()),
             run_skipped: false,
+            experience: None,
             run_passed: false,
         };
 

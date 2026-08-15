@@ -318,6 +318,17 @@ mod wire {
         pub queue_depth: u32,
     }
 
+    /// Authenticated cumulative metrics from an Agent-owned render worker.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AgentRenderBoundarySnapshot {
+        pub resource_id: [u8; 16],
+        pub decoder_backend: String,
+        pub enqueued_units: u64,
+        pub queue_replacements: u64,
+        pub decoded_frames: u64,
+        pub presented_frames: u64,
+    }
+
     /// Runtime state for a session media pipeline.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct MediaPipelineSnapshot {
@@ -406,6 +417,9 @@ mod wire {
         pub render_thread_priority: Option<String>,
         #[serde(default)]
         pub render_waitable_timeouts: u64,
+        /// Latest authenticated Session Agent render counters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
         /// Reliable media stream stalls that were bounded by resetting the
         /// receive stream and requesting a fresh keyframe.
         #[serde(default)]
@@ -1157,6 +1171,105 @@ mod wire {
         pub artifacts: Vec<TelemetryArtifactRef>,
     }
 
+    /// Endpoint that owns one resource sample in a two-sided remote session.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ExperienceEndpointSide {
+        /// Controlled machine performing capture and encode.
+        Target,
+        /// Controlling machine performing decode and present.
+        Controller,
+    }
+
+    /// One monotonic, endpoint-scoped resource observation.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceResourceSample {
+        pub side: ExperienceEndpointSide,
+        pub monotonic_ms: f64,
+        pub cpu_usage_percent: f64,
+        pub rss_mb: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gpu_usage_percent: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub vram_used_mb: Option<f64>,
+    }
+
+    impl ExperienceResourceSample {
+        /// Whether every supplied metric is finite and in its physical domain.
+        pub fn is_finite(&self) -> bool {
+            self.monotonic_ms.is_finite()
+                && self.monotonic_ms >= 0.0
+                && self.cpu_usage_percent.is_finite()
+                && (0.0..=100.0).contains(&self.cpu_usage_percent)
+                && self.rss_mb.is_finite()
+                && self.rss_mb >= 0.0
+                && self
+                    .gpu_usage_percent
+                    .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+                && self
+                    .vram_used_mb
+                    .is_none_or(|value| value.is_finite() && value >= 0.0)
+        }
+    }
+
+    /// Exact one-second visible-frame window.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceFpsWindow {
+        pub start_monotonic_ms: f64,
+        pub duration_ms: f64,
+        pub frame_count: u32,
+        pub fps: f64,
+    }
+
+    /// W3C-compatible freeze aggregation based on visible-frame gaps.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceFreezeMetrics {
+        pub freeze_count: u64,
+        pub total_freeze_duration_ms: f64,
+    }
+
+    /// Controller-monotonic input marker result.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceInputProbeResult {
+        pub probe_id: [u8; 16],
+        pub issued_monotonic_ms: f64,
+        pub presented_monotonic_ms: f64,
+        pub input_to_photon_ms: f64,
+        /// Always absent: cross-machine wall-clock values are not accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_wall_clock_ms: Option<u64>,
+    }
+
+    /// One media adaptation completed by the first successful present.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceAdaptationTransition {
+        pub transition_id: [u8; 16],
+        pub started_monotonic_ms: f64,
+        pub presented_monotonic_ms: f64,
+        pub transition_time_ms: f64,
+        pub present_stall_ms: f64,
+    }
+
+    /// Canonical end-to-end experience metrics derived only from monotonic events.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceProbeSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first_visible_frame_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub fps_windows: Vec<ExperienceFpsWindow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub frame_intervals_ms: Vec<f64>,
+        pub stall_count: u64,
+        pub total_stall_duration_ms: f64,
+        pub freeze_metrics: ExperienceFreezeMetrics,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub input_probes: Vec<ExperienceInputProbeResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub resource_samples: Vec<ExperienceResourceSample>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub adaptation_transitions: Vec<ExperienceAdaptationTransition>,
+    }
+
     /// Query used to retrieve service-owned audit events.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
     pub struct AuditLogQuery {
@@ -1200,6 +1313,630 @@ mod wire {
         /// Deterministic key/value details for UI and export.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub details: Vec<(String, String)>,
+    }
+
+    /// Canonical decimal representation of an unsigned 64-bit integer.
+    ///
+    /// The wire value is always a JSON string so JavaScript clients cannot lose
+    /// precision. Deserialization rejects signs, leading zeroes, exponent form,
+    /// and values outside the `u64` range.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct DecimalU64(u64);
+
+    impl DecimalU64 {
+        /// Construct a canonical decimal value.
+        pub const fn new(value: u64) -> Self {
+            Self(value)
+        }
+
+        /// Return the represented integer.
+        pub const fn get(self) -> u64 {
+            self.0
+        }
+    }
+
+    impl From<u64> for DecimalU64 {
+        fn from(value: u64) -> Self {
+            Self::new(value)
+        }
+    }
+
+    impl std::fmt::Display for DecimalU64 {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl Serialize for DecimalU64 {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(&self.0.to_string())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for DecimalU64 {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            use serde::de::Error as _;
+
+            let raw = String::deserialize(deserializer)?;
+            let value = raw.parse::<u64>().map_err(D::Error::custom)?;
+            if raw != value.to_string() {
+                return Err(D::Error::custom("expected a canonical decimal u64 string"));
+            }
+            Ok(Self(value))
+        }
+    }
+
+    /// Permission scope exposed on the stable remote-session wire contract.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum RemotePermissionScope {
+        #[serde(rename = "screen.view")]
+        ScreenView,
+        #[serde(rename = "input.pointer")]
+        InputPointer,
+        #[serde(rename = "input.keyboard")]
+        InputKeyboard,
+        #[serde(rename = "clipboard.read")]
+        ClipboardRead,
+        #[serde(rename = "clipboard.write")]
+        ClipboardWrite,
+        #[serde(rename = "file.read")]
+        FileRead,
+        #[serde(rename = "file.write")]
+        FileWrite,
+        #[serde(rename = "audio.listen")]
+        AudioListen,
+        #[serde(rename = "audio.talk")]
+        AudioTalk,
+        #[serde(rename = "display.switch")]
+        DisplaySwitch,
+        #[serde(rename = "display.multi_view")]
+        DisplayMultiView,
+        #[serde(rename = "power.restart")]
+        PowerRestart,
+        #[serde(rename = "power.shutdown")]
+        PowerShutdown,
+        #[serde(rename = "terminal.open")]
+        TerminalOpen,
+        #[serde(rename = "privacy.block_local_input")]
+        PrivacyBlockLocalInput,
+        #[serde(rename = "privacy.blank_screen")]
+        PrivacyBlankScreen,
+        #[serde(rename = "secure_desktop.view")]
+        SecureDesktopView,
+        #[serde(rename = "secure_desktop.control")]
+        SecureDesktopControl,
+    }
+
+    impl From<mrd_session::PermissionScope> for RemotePermissionScope {
+        fn from(scope: mrd_session::PermissionScope) -> Self {
+            use mrd_session::PermissionScope as Domain;
+
+            match scope {
+                Domain::ScreenView => Self::ScreenView,
+                Domain::InputPointer => Self::InputPointer,
+                Domain::InputKeyboard => Self::InputKeyboard,
+                Domain::ClipboardRead => Self::ClipboardRead,
+                Domain::ClipboardWrite => Self::ClipboardWrite,
+                Domain::FileRead => Self::FileRead,
+                Domain::FileWrite => Self::FileWrite,
+                Domain::AudioListen => Self::AudioListen,
+                Domain::AudioTalk => Self::AudioTalk,
+                Domain::DisplaySwitch => Self::DisplaySwitch,
+                Domain::DisplayMultiView => Self::DisplayMultiView,
+                Domain::PowerRestart => Self::PowerRestart,
+                Domain::PowerShutdown => Self::PowerShutdown,
+                Domain::TerminalOpen => Self::TerminalOpen,
+                Domain::PrivacyBlockLocalInput => Self::PrivacyBlockLocalInput,
+                Domain::PrivacyBlankScreen => Self::PrivacyBlankScreen,
+                Domain::SecureDesktopView => Self::SecureDesktopView,
+                Domain::SecureDesktopControl => Self::SecureDesktopControl,
+            }
+        }
+    }
+
+    impl From<RemotePermissionScope> for mrd_session::PermissionScope {
+        fn from(scope: RemotePermissionScope) -> Self {
+            match scope {
+                RemotePermissionScope::ScreenView => Self::ScreenView,
+                RemotePermissionScope::InputPointer => Self::InputPointer,
+                RemotePermissionScope::InputKeyboard => Self::InputKeyboard,
+                RemotePermissionScope::ClipboardRead => Self::ClipboardRead,
+                RemotePermissionScope::ClipboardWrite => Self::ClipboardWrite,
+                RemotePermissionScope::FileRead => Self::FileRead,
+                RemotePermissionScope::FileWrite => Self::FileWrite,
+                RemotePermissionScope::AudioListen => Self::AudioListen,
+                RemotePermissionScope::AudioTalk => Self::AudioTalk,
+                RemotePermissionScope::DisplaySwitch => Self::DisplaySwitch,
+                RemotePermissionScope::DisplayMultiView => Self::DisplayMultiView,
+                RemotePermissionScope::PowerRestart => Self::PowerRestart,
+                RemotePermissionScope::PowerShutdown => Self::PowerShutdown,
+                RemotePermissionScope::TerminalOpen => Self::TerminalOpen,
+                RemotePermissionScope::PrivacyBlockLocalInput => Self::PrivacyBlockLocalInput,
+                RemotePermissionScope::PrivacyBlankScreen => Self::PrivacyBlankScreen,
+                RemotePermissionScope::SecureDesktopView => Self::SecureDesktopView,
+                RemotePermissionScope::SecureDesktopControl => Self::SecureDesktopControl,
+            }
+        }
+    }
+
+    /// Stable machine-readable remote-session reason codes.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteReasonCode {
+        IdentityMismatch,
+        CertificateBindingMismatch,
+        TrustRequired,
+        ConsentDenied,
+        CredentialInvalid,
+        CredentialLocked,
+        AuthorizationTimeout,
+        GrantExpired,
+        GrantRevoked,
+        PolicyChanged,
+        ReplayDetected,
+        ScopeDenied,
+        ProtocolDowngradeBlocked,
+        LanUnreachable,
+        IceDirectFailed,
+        TurnAllocationFailed,
+        RouteLost,
+        RouteMigrationTimeout,
+        EncoderUnavailable,
+        DecoderUnavailable,
+        CaptureSourceLost,
+        ProfileDowngraded,
+        CongestionDownshift,
+        RenderBudgetExceeded,
+    }
+
+    /// Typed failure safe for local UI presentation and remediation.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RemoteFailure {
+        pub code: RemoteReasonCode,
+        pub message: String,
+        pub suggested_action: Option<String>,
+    }
+
+    /// Requested authorization path for a remote session.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteAccessMode {
+        Attended,
+        Unattended,
+    }
+
+    /// Local role in the authoritative remote-session aggregate.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteSessionRole {
+        Controller,
+        Agent,
+    }
+
+    /// Explicit authorization projection for UI and IPC consumers.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteAuthorizationState {
+        Discovered,
+        Authenticating,
+        Authorizing,
+        AwaitingLocalConsent,
+        VerifyingUnattendedCredential,
+        Granted,
+        Denied,
+        Expired,
+        Revoked,
+        LockedOut,
+        PolicyChanged,
+    }
+
+    impl From<&mrd_session::AuthorizationState> for RemoteAuthorizationState {
+        fn from(state: &mrd_session::AuthorizationState) -> Self {
+            match state {
+                mrd_session::AuthorizationState::Pending => Self::Authorizing,
+                mrd_session::AuthorizationState::Granted { .. } => Self::Granted,
+                mrd_session::AuthorizationState::Denied { .. } => Self::Denied,
+                mrd_session::AuthorizationState::Revoked { .. } => Self::Revoked,
+            }
+        }
+    }
+
+    /// Transport route selected or attempted by a remote session.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum RemoteRouteKind {
+        #[serde(rename = "lan_quic")]
+        LanQuic,
+        #[serde(rename = "webrtc_direct")]
+        WebRtcDirect,
+        #[serde(rename = "webrtc_relay")]
+        WebRtcRelay,
+    }
+
+    impl From<mrd_session::RouteKind> for RemoteRouteKind {
+        fn from(kind: mrd_session::RouteKind) -> Self {
+            match kind {
+                mrd_session::RouteKind::LanQuic => Self::LanQuic,
+                mrd_session::RouteKind::WebRtcDirect => Self::WebRtcDirect,
+                mrd_session::RouteKind::WebRtcRelay => Self::WebRtcRelay,
+            }
+        }
+    }
+
+    /// Explicit route lifecycle projection.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteRouteState {
+        Idle,
+        Gathering,
+        Connecting,
+        Connected,
+        Migrating,
+        Reconnecting,
+        Failed,
+        Closed,
+    }
+
+    impl From<&mrd_session::RouteState> for RemoteRouteState {
+        fn from(state: &mrd_session::RouteState) -> Self {
+            match state {
+                mrd_session::RouteState::Idle => Self::Idle,
+                mrd_session::RouteState::Establishing(_) => Self::Connecting,
+                mrd_session::RouteState::Active(_) => Self::Connected,
+                mrd_session::RouteState::Failed { .. } => Self::Failed,
+            }
+        }
+    }
+
+    /// Explicit media lifecycle projection.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteMediaState {
+        Idle,
+        Starting,
+        Streaming,
+        Degraded,
+        Paused,
+        Stopped,
+        Failed,
+    }
+
+    impl From<&mrd_session::MediaState> for RemoteMediaState {
+        fn from(state: &mrd_session::MediaState) -> Self {
+            match state {
+                mrd_session::MediaState::Idle => Self::Idle,
+                mrd_session::MediaState::Starting => Self::Starting,
+                mrd_session::MediaState::Streaming => Self::Streaming,
+                mrd_session::MediaState::Stopped => Self::Stopped,
+                mrd_session::MediaState::Failed { .. } => Self::Failed,
+            }
+        }
+    }
+
+    /// Truthful UI-facing state derived from authorization, route, and media state.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemotePresentationState {
+        IncomingApprovalRequired,
+        Authenticating,
+        Connecting,
+        ConnectedWithoutMedia,
+        Streaming,
+        Degraded,
+        Reconnecting,
+        Denied,
+        Failed,
+        Closed,
+    }
+
+    /// Request body for starting an authorized remote session.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RemoteSessionRequest {
+        pub session_id: SessionId,
+        pub target_device_id: DeviceId,
+        pub access_mode: RemoteAccessMode,
+        pub requested_scopes: Vec<RemotePermissionScope>,
+        pub requested_profile: Option<MediaProfile>,
+    }
+
+    /// Authoritative UI-safe remote-session snapshot.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RemoteSessionSnapshot {
+        pub session_id: SessionId,
+        pub role: RemoteSessionRole,
+        pub peer_device_id: DeviceId,
+        pub peer_key_id: String,
+        pub access_mode: RemoteAccessMode,
+        pub authorization_state: RemoteAuthorizationState,
+        pub route_state: RemoteRouteState,
+        pub route_kind: Option<RemoteRouteKind>,
+        pub media_state: RemoteMediaState,
+        pub presentation_state: RemotePresentationState,
+        pub requested_scopes: Vec<RemotePermissionScope>,
+        pub granted_scopes: Vec<RemotePermissionScope>,
+        /// Decimal u64 string to preserve precision in JavaScript clients.
+        pub policy_revision: DecimalU64,
+        pub failure: Option<RemoteFailure>,
+        pub created_at_ms: u64,
+        pub updated_at_ms: u64,
+        /// Exact service-owned pending-authorization or active-grant deadline.
+        pub authorization_expires_at_ms: Option<u64>,
+    }
+
+    /// Local user's response to an exact incoming session request.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ConsentResponse {
+        pub session_id: SessionId,
+        pub decision: ConsentDecision,
+        pub approved_scopes: Vec<RemotePermissionScope>,
+        /// Decimal u64 string used for optimistic policy concurrency.
+        pub expected_policy_revision: DecimalU64,
+    }
+
+    /// Local attended-consent decision.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ConsentDecision {
+        Approve,
+        Deny,
+    }
+
+    /// Non-secret unattended-access policy supplied by the local user.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct UnattendedAccessPolicy {
+        pub trusted_devices_only: bool,
+        pub allowed_peer_key_ids: Vec<String>,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+        pub expires_at_ms: Option<u64>,
+    }
+
+    /// Non-secret unattended-access state. No credential or verifier is exposed.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct UnattendedAccessSnapshot {
+        pub enabled: bool,
+        /// Decimal u64 string.
+        pub policy_revision: DecimalU64,
+        /// Decimal u64 metadata for the current generated access material epoch.
+        pub access_epoch: DecimalU64,
+        pub policy: UnattendedAccessPolicy,
+        pub locked_until_ms: Option<u64>,
+        pub updated_at_ms: u64,
+    }
+
+    /// Durable trust state projected to the UI.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TrustedDeviceState {
+        Pending,
+        Trusted,
+        Suspended,
+        Revoked,
+        RotationPending,
+    }
+
+    /// UI-safe trusted-device record keyed only by its public-key identifier.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TrustedDeviceSnapshot {
+        pub peer_key_id: String,
+        pub display_name: Option<String>,
+        /// Decimal u64 string.
+        pub key_epoch: DecimalU64,
+        pub state: TrustedDeviceState,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+        /// Decimal u64 string.
+        pub trust_revision: DecimalU64,
+        pub approved_at_ms: Option<u64>,
+        pub updated_at_ms: u64,
+    }
+
+    /// Approval for an already authenticated pending peer key.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TrustedDeviceApproval {
+        pub peer_key_id: String,
+        /// Decimal u64 string.
+        pub key_epoch: DecimalU64,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+    }
+
+    /// Approval metadata for an already verified key-rotation transition.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TrustedDeviceRotation {
+        pub peer_key_id: String,
+        pub new_peer_key_id: String,
+        /// Decimal u64 string.
+        pub new_key_epoch: DecimalU64,
+        /// Decimal u64 string.
+        pub expected_trust_revision: DecimalU64,
+    }
+
+    /// Revision-checked request to replace the exact desired session scopes.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SessionPermissionChange {
+        pub session_id: SessionId,
+        pub requested_scopes: Vec<RemotePermissionScope>,
+        /// Decimal u64 string.
+        pub expected_policy_revision: DecimalU64,
+    }
+
+    /// Typed session event sent through the bounded subscription contract.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    pub enum RemoteSessionEvent {
+        ConsentRequested {
+            requested_scopes: Vec<RemotePermissionScope>,
+        },
+        ConsentResolved {
+            decision: ConsentDecision,
+            approved_scopes: Vec<RemotePermissionScope>,
+        },
+        AuthorizationChanged {
+            state: RemoteAuthorizationState,
+            failure: Option<RemoteFailure>,
+        },
+        PermissionsChanged {
+            granted_scopes: Vec<RemotePermissionScope>,
+            policy_revision: DecimalU64,
+        },
+        TrustChanged {
+            peer_key_id: String,
+            state: TrustedDeviceState,
+            trust_revision: DecimalU64,
+        },
+        RouteChanged {
+            state: RemoteRouteState,
+            route: Option<RemoteRouteKind>,
+            failure: Option<RemoteFailure>,
+        },
+        MediaChanged {
+            state: RemoteMediaState,
+            failure: Option<RemoteFailure>,
+        },
+        SessionClosed {
+            failure: Option<RemoteFailure>,
+        },
+    }
+
+    /// Monotonic event envelope. Sequence is a decimal u64 string for JS safety.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RemoteSessionEventEnvelope {
+        pub sequence: DecimalU64,
+        pub timestamp_ms: u64,
+        pub session_id: SessionId,
+        pub event: RemoteSessionEvent,
+    }
+
+    /// Cursor and bounds for one session-event long-poll batch.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SessionEventSubscriptionQuery {
+        pub session_id: Option<SessionId>,
+        /// Exclusive service-global cursor. Only events with greater sequence values are returned.
+        pub after_sequence: Option<DecimalU64>,
+        pub limit: u32,
+        pub wait_timeout_ms: u32,
+    }
+
+    /// Whether a cursor was accepted or the caller must refresh authoritative state.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RemoteCursorState {
+        /// The supplied cursor was accepted and this page is contiguous.
+        Current,
+        /// The supplied cursor predates retained history; refresh snapshots before continuing.
+        ResetRequired,
+    }
+
+    /// One bounded event batch.
+    ///
+    /// `next_after_sequence` is the greatest sequence already delivered, not the
+    /// next unseen sequence. Passing it back as `after_sequence` therefore cannot
+    /// skip an event. When `cursor_state` is `reset_required`, `events` must be
+    /// empty and the caller must refresh authoritative session snapshots.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SessionEventSubscription {
+        pub events: Vec<RemoteSessionEventEnvelope>,
+        /// Bounded authoritative pending consent projections included on an
+        /// initial subscription or stale-cursor reset so a restarted UI cannot
+        /// lose an approval request after event-history truncation.
+        #[serde(default)]
+        pub pending_sessions: Vec<RemoteSessionSnapshot>,
+        pub next_after_sequence: Option<DecimalU64>,
+        pub cursor_state: RemoteCursorState,
+        pub has_more: bool,
+        pub poll_after_ms: u32,
+    }
+
+    /// Outcome for one route candidate without exposing raw relay credentials or endpoints.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RouteCandidateState {
+        NotTried,
+        Connecting,
+        Connected,
+        Failed,
+    }
+
+    /// Evidence recorded for one policy-allowed route candidate.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RouteCandidateEvidence {
+        pub route: RemoteRouteKind,
+        pub state: RouteCandidateState,
+        pub started_at_ms: Option<u64>,
+        pub completed_at_ms: Option<u64>,
+        pub round_trip_ms: Option<u32>,
+        pub failure: Option<RemoteFailure>,
+    }
+
+    /// Route selection and connection evidence for one authorized session.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct RouteEvidence {
+        pub session_id: SessionId,
+        pub route_state: RemoteRouteState,
+        pub selected_route: Option<RemoteRouteKind>,
+        /// Decimal u64 string.
+        pub policy_revision: DecimalU64,
+        pub transport_fingerprint_sha256: Option<String>,
+        pub candidates: Vec<RouteCandidateEvidence>,
+        pub observed_at_ms: u64,
+    }
+
+    /// Cursor query for durable, redacted audit events.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AuditEventsQueryV2 {
+        /// Exclusive service-global cursor.
+        pub after_sequence: Option<DecimalU64>,
+        pub limit: u32,
+        pub session_id: Option<SessionId>,
+        pub action: Option<String>,
+        pub outcome: Option<String>,
+        pub peer_device_id: Option<DeviceId>,
+    }
+
+    /// Allowlisted, content-free metadata for a durable audit event.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+    pub struct AuditEventMetadataV2 {
+        pub authorization_state: Option<RemoteAuthorizationState>,
+        pub access_mode: Option<RemoteAccessMode>,
+        pub route_state: Option<RemoteRouteState>,
+        pub media_state: Option<RemoteMediaState>,
+        pub requested_scopes: Vec<RemotePermissionScope>,
+        pub granted_scopes: Vec<RemotePermissionScope>,
+        pub policy_revision: Option<DecimalU64>,
+        pub trust_revision: Option<DecimalU64>,
+    }
+
+    /// Durable audit record projection. Integrity HMACs and storage identifiers remain private.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AuditEventV2 {
+        /// Service-global sequence encoded as a canonical decimal string.
+        pub sequence: DecimalU64,
+        pub timestamp_ms: u64,
+        pub action: String,
+        pub outcome: String,
+        pub session_id: Option<SessionId>,
+        pub actor_device_id: Option<DeviceId>,
+        pub peer_device_id: Option<DeviceId>,
+        pub peer_key_id: Option<String>,
+        pub transport_kind: Option<RemoteRouteKind>,
+        pub reason_code: Option<RemoteReasonCode>,
+        pub metadata: AuditEventMetadataV2,
+    }
+
+    /// Cursor page of durable audit records with service-side chain verification status.
+    ///
+    /// `next_after_sequence` is the greatest delivered sequence. A reset-required
+    /// page must not contain events and must not be treated as verified history.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AuditEventPageV2 {
+        pub events: Vec<AuditEventV2>,
+        pub next_after_sequence: Option<DecimalU64>,
+        pub cursor_state: RemoteCursorState,
+        pub has_more: bool,
+        pub chain_verified: bool,
     }
 
     // === Core IPC Types ===
@@ -1263,6 +2000,48 @@ mod wire {
         },
         /// List all active sessions
         ListSessions,
+        /// Get the authoritative authorization/route/media snapshot for a remote session.
+        GetRemoteSession { session_id: SessionId },
+        /// Request a new authorized remote session without starting media early.
+        RequestRemoteSession { request: RemoteSessionRequest },
+        /// Record local attended consent for exact scopes and policy revision.
+        RespondToConsent { response: ConsentResponse },
+        /// Enable unattended access under a non-secret local policy.
+        EnableUnattendedAccess { policy: UnattendedAccessPolicy },
+        /// Disable unattended access with optimistic policy concurrency.
+        DisableUnattendedAccess {
+            expected_policy_revision: DecimalU64,
+        },
+        /// Rotate generated unattended access material without exposing it over IPC.
+        RotateUnattendedAccess {
+            expected_policy_revision: DecimalU64,
+        },
+        /// List public-key-pinned trusted device projections.
+        ListTrustedDevices { include_revoked: bool },
+        /// Approve an already authenticated pending peer key.
+        ApproveTrustedDevice { approval: TrustedDeviceApproval },
+        /// Suspend a trusted peer key.
+        SuspendTrustedDevice {
+            peer_key_id: String,
+            expected_trust_revision: DecimalU64,
+        },
+        /// Permanently revoke a trusted peer key.
+        RevokeTrustedDevice {
+            peer_key_id: String,
+            expected_trust_revision: DecimalU64,
+        },
+        /// Approve an already verified key rotation.
+        RotateTrustedDevice { rotation: TrustedDeviceRotation },
+        /// Replace desired session permissions under policy-revision concurrency.
+        ChangeSessionPermissions { change: SessionPermissionChange },
+        /// Fetch one bounded long-poll batch of typed session events.
+        SubscribeSessionEvents {
+            query: SessionEventSubscriptionQuery,
+        },
+        /// Get evidence for actual route attempts and the selected route.
+        GetRouteEvidence { session_id: SessionId },
+        /// Query durable redacted audit events by monotonic cursor.
+        GetAuditEventsV2 { query: AuditEventsQueryV2 },
         /// Start a new session as controller
         StartSession {
             session_id: SessionId,
@@ -1458,6 +2237,33 @@ mod wire {
         ShutdownService { mode: ShutdownMode },
     }
 
+    impl IpcRequest {
+        /// Return whether this request belongs to the secure remote-session contract.
+        ///
+        /// Shell passthroughs use this exact allowlist to avoid exposing unrelated
+        /// filesystem, lifecycle, control, or test-only service operations.
+        pub fn is_secure_remote(&self) -> bool {
+            matches!(
+                self,
+                Self::GetRemoteSession { .. }
+                    | Self::RequestRemoteSession { .. }
+                    | Self::RespondToConsent { .. }
+                    | Self::EnableUnattendedAccess { .. }
+                    | Self::DisableUnattendedAccess { .. }
+                    | Self::RotateUnattendedAccess { .. }
+                    | Self::ListTrustedDevices { .. }
+                    | Self::ApproveTrustedDevice { .. }
+                    | Self::SuspendTrustedDevice { .. }
+                    | Self::RevokeTrustedDevice { .. }
+                    | Self::RotateTrustedDevice { .. }
+                    | Self::ChangeSessionPermissions { .. }
+                    | Self::SubscribeSessionEvents { .. }
+                    | Self::GetRouteEvidence { .. }
+                    | Self::GetAuditEventsV2 { .. }
+            )
+        }
+    }
+
     /// IPC response from mrd-service to Rdesk
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     #[allow(clippy::large_enum_variant)]
@@ -1499,6 +2305,36 @@ mod wire {
         },
         /// List of active sessions
         SessionList { sessions: Vec<SessionInfo> },
+        /// Authoritative secure remote-session snapshot.
+        RemoteSession { session: RemoteSessionSnapshot },
+        /// Newly requested secure remote-session snapshot.
+        RemoteSessionRequested { session: RemoteSessionSnapshot },
+        /// Snapshot after recording attended consent.
+        ConsentRecorded { session: RemoteSessionSnapshot },
+        /// Current unattended-access policy and non-secret metadata.
+        UnattendedAccessUpdated { access: UnattendedAccessSnapshot },
+        /// Trusted device projections.
+        TrustedDeviceList { devices: Vec<TrustedDeviceSnapshot> },
+        /// Trusted device projection after a state transition.
+        TrustedDeviceUpdated { device: TrustedDeviceSnapshot },
+        /// Session snapshot after a permission transition.
+        SessionPermissionsChanged { session: RemoteSessionSnapshot },
+        /// One bounded event subscription batch and continuation cursor.
+        SessionEventsSubscribed {
+            subscription: SessionEventSubscription,
+        },
+        /// One typed session event for transports that support unsolicited delivery.
+        SessionEvent { event: RemoteSessionEventEnvelope },
+        /// Actual route-attempt evidence.
+        RouteEvidence { evidence: RouteEvidence },
+        /// Durable redacted audit event page.
+        AuditEventsV2 { page: AuditEventPageV2 },
+        /// Typed secure-remote rejection that preserves stable reason codes.
+        RemoteAccessError {
+            session_id: Option<SessionId>,
+            peer_key_id: Option<String>,
+            failure: RemoteFailure,
+        },
         /// Session started successfully
         SessionStarted { session_id: SessionId },
         /// Session accepted successfully
@@ -1805,6 +2641,39 @@ mod wire {
         pub sessions: Vec<SessionRuntimeSnapshot>,
         pub device_id: Option<DeviceId>,
         pub is_registered: bool,
+        /// Service-owned authenticated WAN signaling health.
+        #[serde(default)]
+        pub signaling: SignalingRuntimeSnapshot,
+    }
+
+    /// Secret-free authenticated signaling health projection.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SignalingRuntimeSnapshot {
+        /// `disabled`, `connecting`, `authenticated`, `backoff`, or `stopped`.
+        pub state: String,
+        /// Consecutive reconnect attempt count.
+        pub reconnect_attempt: u32,
+        /// Scheduled retry time in Unix milliseconds.
+        pub next_retry_at_ms: Option<u64>,
+        /// Most recent successful authentication time in Unix milliseconds.
+        pub last_connected_at_ms: Option<u64>,
+        /// Most recent accepted signaling message time in Unix milliseconds.
+        pub last_message_at_ms: Option<u64>,
+        /// Sanitized connection error, never a token or signaling body.
+        pub last_error: Option<String>,
+    }
+
+    impl Default for SignalingRuntimeSnapshot {
+        fn default() -> Self {
+            Self {
+                state: "disabled".to_string(),
+                reconnect_attempt: 0,
+                next_retry_at_ms: None,
+                last_connected_at_ms: None,
+                last_message_at_ms: None,
+                last_error: None,
+            }
+        }
     }
 
     /// Probe snapshot DTO

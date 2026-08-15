@@ -1,16 +1,34 @@
+. (Join-Path $PSScriptRoot "../../scripts/process_tree_common.ps1")
+
+function Get-ComponentMatrixUnsupportedReason {
+  param(
+    [Parameter(Mandatory = $true)]$Case,
+    [Parameter(Mandatory = $true)][bool]$DxgiOutputAvailable
+  )
+
+  $requiresDxgiOutput = $null -ne $Case.PSObject.Properties["requires_dxgi_output"] -and
+    [bool]$Case.requires_dxgi_output
+  if ($requiresDxgiOutput -and -not $DxgiOutputAvailable) {
+    return "dxgi_output_unavailable"
+  }
+  return $null
+}
+
+function Get-CurrentPowerShellExecutable {
+  $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    throw "Unable to resolve the current PowerShell executable"
+  }
+  return $path
+}
+
 function Stop-ComponentProcessTree {
   param(
     [Parameter(Mandatory = $true)]
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-ComponentProcessTree -ProcessId $child.ProcessId
-  }
-
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTreeCrossPlatform -ProcessId $ProcessId
 }
 
 function Invoke-ComponentMatrixCommand {
@@ -42,10 +60,9 @@ function Invoke-ComponentMatrixCommand {
 
   $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
   if ($null -eq $completed) {
-    $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.ParentProcessId -eq $job.ChildJobs[0].ProcessId })
-    foreach ($child in $childProcesses) {
-      Stop-ComponentProcessTree -ProcessId $child.ProcessId
+    $jobProcessId = $job.ChildJobs[0].ProcessId
+    if ($null -ne $jobProcessId) {
+      Stop-ComponentProcessTree -ProcessId $jobProcessId
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
@@ -82,7 +99,7 @@ function Invoke-ComponentMatrixSummaryIfAvailable {
   if ($ThresholdPath) {
     $args += @("-ThresholdPath", $ThresholdPath)
   }
-  & powershell @args
+  & (Get-CurrentPowerShellExecutable) @args
   if ($LASTEXITCODE -ne 0) {
     throw "component summary failed with exit code $LASTEXITCODE for $RunDir"
   }

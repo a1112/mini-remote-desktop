@@ -176,15 +176,26 @@ describe("CustomTestPage platform capabilities", () => {
     );
 
     const encoder = await screen.findByRole("radio", { name: /VideoToolbox HEVC/ });
+    await waitFor(() => {
+      expect(screen.getByRole("radio", { name: /直连渲染/ })).toBeChecked();
+      expect(screen.getByRole("radio", { name: /无解码/ })).toBeChecked();
+    });
     await user.click(encoder);
+    await waitFor(() => expect(encoder).toBeChecked());
     const decoder = screen
       .getAllByRole("radio")
       .find((radio) => (radio as HTMLInputElement).value === "videotoolbox");
     expect(decoder).toBeDefined();
     await user.click(decoder!);
 
-    expect(screen.getByRole("button", { name: /启动测试/ })).toBeDisabled();
-    expect(screen.getByText("当前环境未暴露 VideoToolbox HEVC 解码能力。")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(encoder).toBeChecked();
+      expect(decoder).toBeChecked();
+      expect(screen.getByRole("button", { name: /启动测试/ })).toBeDisabled();
+      expect(
+        screen.getByText("当前环境未暴露 VideoToolbox HEVC 解码能力。")
+      ).toBeInTheDocument();
+    });
     expect(mockInvoke).not.toHaveBeenCalledWith("test_start_run", expect.anything());
   });
 });

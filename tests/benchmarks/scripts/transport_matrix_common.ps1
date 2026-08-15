@@ -1,3 +1,36 @@
+. (Join-Path $PSScriptRoot "../../scripts/process_tree_common.ps1")
+
+function Resolve-BenchmarkPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  if ([System.IO.Path]::IsPathRooted($Path)) {
+    return [System.IO.Path]::GetFullPath($Path)
+  }
+  [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
+}
+
+function Get-CurrentPowerShellExecutable {
+  $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    throw "Unable to resolve the current PowerShell executable"
+  }
+  return $path
+}
+
+function Get-TransportMatrixTimeoutSeconds {
+  param([Parameter(Mandatory = $true)]$Scenario)
+
+  $durationSeconds = if ($null -ne $Scenario.PSObject.Properties["duration_secs"]) {
+    [int]$Scenario.duration_secs
+  } else {
+    0
+  }
+  [Math]::Max(440, $durationSeconds + 420)
+}
+
 function Get-TransportMatrixCargoFeatureArgs {
   param(
     [string]$EncodeBackend = "",
@@ -174,13 +207,7 @@ function Stop-TransportProcessTree {
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-TransportProcessTree -ProcessId $child.ProcessId
-  }
-
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTreeCrossPlatform -ProcessId $ProcessId
 }
 
 function Invoke-TransportMatrixCommand {
@@ -202,23 +229,76 @@ function Invoke-TransportMatrixCommand {
 
   $job = Start-Job -ScriptBlock {
     param($FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath)
-    Set-Location $WorkingDirectory
-    & $FilePath @ArgumentList > $StdoutPath 2> $StderrPath
-    if ($null -ne $LASTEXITCODE) {
-      return $LASTEXITCODE
+    function ConvertTo-WindowsCommandLineArgument {
+      param([AllowEmptyString()][string]$Value)
+
+      if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') {
+        return $Value
+      }
+
+      $builder = [Text.StringBuilder]::new()
+      [void]$builder.Append('"')
+      $backslashes = 0
+      foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+          $backslashes += 1
+          continue
+        }
+        if ($character -eq '"') {
+          [void]$builder.Append('\' * ($backslashes * 2 + 1))
+          [void]$builder.Append('"')
+          $backslashes = 0
+          continue
+        }
+        if ($backslashes -gt 0) {
+          [void]$builder.Append('\' * $backslashes)
+          $backslashes = 0
+        }
+        [void]$builder.Append($character)
+      }
+      if ($backslashes -gt 0) {
+        [void]$builder.Append('\' * ($backslashes * 2))
+      }
+      [void]$builder.Append('"')
+      return $builder.ToString()
     }
-    return 0
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (@($ArgumentList) | ForEach-Object {
+      ConvertTo-WindowsCommandLineArgument -Value ([string]$_)
+    }) -join ' '
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+    if (-not $process.HasExited -and
+      [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+      try {
+        $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal
+      } catch {
+        # Raising process priority is a Windows-only best effort. Hosted Linux
+        # runners reject the equivalent setter for unprivileged processes.
+      }
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    [IO.File]::WriteAllText($StdoutPath, $stdoutTask.Result)
+    [IO.File]::WriteAllText($StderrPath, $stderrTask.Result)
+    return $process.ExitCode
   } -ArgumentList $FilePath, $ArgumentList, $WorkingDirectory, $StdoutPath, $StderrPath
 
   $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
   if ($null -eq $completed) {
     $jobProcessId = $job.ChildJobs[0].ProcessId
     if ($null -ne $jobProcessId) {
-      $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ParentProcessId -eq $jobProcessId })
-      foreach ($child in $childProcesses) {
-        Stop-TransportProcessTree -ProcessId $child.ProcessId
-      }
+      Stop-TransportProcessTree -ProcessId $jobProcessId
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue

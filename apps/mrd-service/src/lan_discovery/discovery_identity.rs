@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
-pub(super) const DISCOVERY_APP_ID: &str = "rdesk";
+pub const DISCOVERY_MAGIC: &str = "mrd-lan-discovery-v1";
+pub const DISCOVERY_APP_ID: &str = "rdesk";
 
 static LAN_DISCOVERY_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 

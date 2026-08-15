@@ -62,7 +62,8 @@ mod tests {
 
     #[test]
     fn telemetry_handler_returns_service_health() {
-        let response = super::telemetry::service_health();
+        let app_state = AppState::new();
+        let response = super::telemetry::service_health(&app_state);
 
         match response {
             IpcResponse::ServiceHealth { status } => {
@@ -72,6 +73,14 @@ mod tests {
             }
             _ => panic!("expected service health response"),
         }
+
+        app_state.mark_security_unhealthy();
+        let IpcResponse::ServiceHealth { status } = super::telemetry::service_health(&app_state)
+        else {
+            panic!("expected unhealthy service response");
+        };
+        assert!(status.running);
+        assert!(!status.healthy);
     }
 
     #[test]
@@ -163,9 +172,9 @@ mod tests {
     async fn telemetry_handler_returns_audit_log_and_empty_bundle_contract() {
         let app_state = Arc::new(AppState::new());
         let session_id = SessionId("session-a".to_string());
-        {
-            let mut audit_log = app_state.audit_log.lock().await;
-            audit_log.record(
+        app_state
+            .audit_log
+            .record(
                 "control_input",
                 "accepted",
                 Some(session_id.clone()),
@@ -174,8 +183,11 @@ mod tests {
                 Some("lan".to_string()),
                 None,
                 vec![("sequence".to_string(), "41".to_string())],
-            );
-            audit_log.record(
+            )
+            .unwrap();
+        app_state
+            .audit_log
+            .record(
                 "session",
                 "started",
                 Some(session_id.clone()),
@@ -184,8 +196,8 @@ mod tests {
                 Some("lan".to_string()),
                 None,
                 Vec::new(),
-            );
-        }
+            )
+            .unwrap();
 
         let audit_response = super::telemetry::audit_log(
             &app_state,
@@ -401,6 +413,6 @@ mod tests {
         .await
         .expect_err("missing LAN peer should fail preflight");
 
-        assert!(error.contains("LAN peer missing-lan-peer was not found"));
+        assert!(error.contains("LAN peer missing-lan-peer is not authenticated and trusted"));
     }
 }

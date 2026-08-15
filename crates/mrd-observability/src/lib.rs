@@ -633,8 +633,16 @@ impl ProbeState {
         } else {
             0.0
         };
+        let media_bytes = [
+            StageId::EncodeTotal,
+            StageId::NetworkIngress,
+            StageId::SendWrite,
+        ]
+        .into_iter()
+        .find_map(|stage| bytes_by_stage.get(&stage).copied())
+        .unwrap_or(total_bytes);
         let bitrate_kbps = if seconds > 0.0 {
-            (total_bytes as f64 * 8.0) / 1000.0 / seconds
+            (media_bytes as f64 * 8.0) / 1000.0 / seconds
         } else {
             0.0
         };
@@ -854,6 +862,38 @@ mod tests {
             .counters
             .iter()
             .any(|(name, value)| name == "reassembly_expired" && *value == 2));
+    }
+
+    #[test]
+    fn pipeline_probe_bitrate_counts_encoded_bytes_once() {
+        let registry = ProbeRegistry::default();
+        let session_id = SessionId("session-bitrate".into());
+        let handle = registry.session_handle(session_id.clone(), "video-main");
+        handle.record_stage(StageId::CaptureCopy, Duration::ZERO, 2_000_000, false);
+        handle.record_stage(StageId::EncodeTotal, Duration::ZERO, 1_000, false);
+        handle.record_stage(StageId::SendWrite, Duration::ZERO, 1_000, false);
+
+        let snapshot = registry
+            .snapshot(&session_id, "video-main")
+            .expect("probe snapshot");
+
+        assert_eq!(snapshot.bitrate_kbps, 1.6);
+    }
+
+    #[test]
+    fn pipeline_probe_bitrate_uses_network_bytes_for_receiver() {
+        let registry = ProbeRegistry::default();
+        let session_id = SessionId("session-receiver-bitrate".into());
+        let handle = registry.session_handle(session_id.clone(), "video-main");
+        handle.record_stage(StageId::NetworkIngress, Duration::ZERO, 2_000, false);
+        handle.record_stage(StageId::DecodeTotal, Duration::ZERO, 2_000, false);
+        handle.record_stage(StageId::FrameSinkIngest, Duration::ZERO, 8_000_000, false);
+
+        let snapshot = registry
+            .snapshot(&session_id, "video-main")
+            .expect("probe snapshot");
+
+        assert_eq!(snapshot.bitrate_kbps, 3.2);
     }
 
     #[test]

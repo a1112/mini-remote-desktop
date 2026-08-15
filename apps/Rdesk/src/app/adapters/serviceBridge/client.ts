@@ -103,8 +103,10 @@ export async function invokeServiceBridgeIpc<T = ServiceBridgeIpcResponse>(
       return adapterError('mrd-service web bridge returned an empty IPC envelope');
     }
     if (ipcResponse.type === 'Error') {
-      const code = ipcResponse.code ? `${ipcResponse.code}: ` : '';
-      return adapterError(`${code}${ipcResponse.message ?? 'web bridge IPC failed'}`);
+      return adapterError(
+        ipcResponse.message ?? 'web bridge IPC failed',
+        ipcResponse.code
+      );
     }
 
     return {
@@ -156,8 +158,8 @@ function serviceBridgeToken(): string {
   return window.localStorage?.getItem(TOKEN_STORAGE_KEY)?.trim() || ENV_TOKEN;
 }
 
-function adapterError<T = never>(message: string): AdapterResult<T> {
-  return { ok: false, error: { message } };
+function adapterError<T = never>(message: string, code?: string): AdapterResult<T> {
+  return { ok: false, error: { message, ...(code ? { code } : {}) } };
 }
 
 function errorMessage(error: unknown): string {

@@ -5,6 +5,7 @@ use std::time::Duration;
 const DEFAULT_DISCOVERY_PORT: u16 = 21116;
 const LAN_DISCOVERY_PORT_ENV: &str = "MRD_LAN_DISCOVERY_PORT";
 const LAN_DISCOVERY_PROBE_ENDPOINTS_ENV: &str = "MRD_LAN_DISCOVERY_PROBE_ENDPOINTS";
+const LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV: &str = "MRD_LAN_ALLOW_UNSIGNED_DIAGNOSTICS";
 const LAN_DISCOVERY_BROADCAST_ENABLED_ENV: &str = "MRD_LAN_DISCOVERY_BROADCAST_ENABLED";
 const ANNOUNCE_INTERVAL_SECS: u64 = 3;
 const PEER_TTL_SECS: u64 = 12;
@@ -17,6 +18,8 @@ pub struct LanDiscoveryConfig {
     pub probe_endpoints: Vec<SocketAddr>,
     pub announce_interval: Duration,
     pub peer_ttl: Duration,
+    /// Allows unsigned v1 announcements to appear as non-controllable diagnostics only.
+    pub allow_unsigned_diagnostics: bool,
 }
 
 impl Default for LanDiscoveryConfig {
@@ -28,6 +31,7 @@ impl Default for LanDiscoveryConfig {
             probe_endpoints: Vec::new(),
             announce_interval: Duration::from_secs(ANNOUNCE_INTERVAL_SECS),
             peer_ttl: Duration::from_secs(PEER_TTL_SECS),
+            allow_unsigned_diagnostics: false,
         }
     }
 }
@@ -49,6 +53,18 @@ impl LanDiscoveryConfig {
         }
         if let Some(endpoints) = lookup(LAN_DISCOVERY_PROBE_ENDPOINTS_ENV) {
             config.probe_endpoints = parse_probe_endpoints(&endpoints)?;
+        }
+        if let Some(value) = lookup(LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV) {
+            let value = value.trim();
+            if !value.is_empty() {
+                config.allow_unsigned_diagnostics = match value.to_ascii_lowercase().as_str() {
+                    "1" | "true" => true,
+                    "0" | "false" => false,
+                    _ => anyhow::bail!(
+                        "invalid {LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV}: expected true/false or 1/0"
+                    ),
+                };
+            }
         }
         if let Some(enabled) = lookup(LAN_DISCOVERY_BROADCAST_ENABLED_ENV) {
             let enabled = enabled.trim();
@@ -94,6 +110,7 @@ mod tests {
         assert!(config.probe_endpoints.is_empty());
         assert_eq!(config.announce_interval, Duration::from_secs(3));
         assert_eq!(config.peer_ttl, Duration::from_secs(12));
+        assert!(!config.allow_unsigned_diagnostics);
     }
 
     #[test]
@@ -139,6 +156,23 @@ mod tests {
         .expect_err("invalid endpoint should fail");
 
         assert!(format!("{error:#}").contains("invalid LAN discovery probe endpoint"));
+    }
+
+    #[test]
+    fn unsigned_legacy_diagnostics_require_an_explicit_valid_opt_in() {
+        let enabled = LanDiscoveryConfig::from_env_lookup(|key| {
+            (key == LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV).then(|| "true".to_string())
+        })
+        .expect("explicit diagnostics setting");
+        assert!(enabled.allow_unsigned_diagnostics);
+
+        let error = LanDiscoveryConfig::from_env_lookup(|key| {
+            (key == LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV).then(|| "maybe".to_string())
+        })
+        .expect_err("ambiguous compatibility setting must fail closed");
+        assert!(error
+            .to_string()
+            .contains(LAN_ALLOW_UNSIGNED_DIAGNOSTICS_ENV));
     }
 
     #[test]

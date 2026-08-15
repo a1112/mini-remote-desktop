@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     realtime_server_args: str = "run -p realtime-server"
     realtime_server_workdir: str = Field(default_factory=_repository_root)
     cors_origins: str = "http://localhost:9531,http://127.0.0.1:9531"
+    turn_urls: str = "turn:127.0.0.1:3478?transport=udp,turn:127.0.0.1:3478?transport=tcp,turns:127.0.0.1:5349?transport=tcp"
+    turn_auth_secret: str = ""
+    turn_credential_ttl_seconds: int = 600
     development_reload: bool = False
 
     initial_admin_username: str | None = None

@@ -846,6 +846,16 @@ export interface RuntimeSnapshot {
   sessions: SessionRuntimeSnapshot[];
   device_id?: string | null;
   is_registered: boolean;
+  signaling?: SignalingRuntimeSnapshot;
+}
+
+export interface SignalingRuntimeSnapshot {
+  state: 'disabled' | 'connecting' | 'authenticated' | 'backoff' | 'stopped';
+  reconnect_attempt: number;
+  next_retry_at_ms: number | null;
+  last_connected_at_ms: number | null;
+  last_message_at_ms: number | null;
+  last_error: string | null;
 }
 
 export interface AuditLogQuery {
@@ -865,6 +875,323 @@ export interface AuditEvent {
   transport_kind?: string | null;
   reason?: string | null;
   details: Array<[string, string]>;
+}
+
+/** Canonical unsigned 64-bit decimal encoded as a JSON string. */
+export type DecimalU64 = string;
+
+export type RemotePermissionScope =
+  | "screen.view"
+  | "input.pointer"
+  | "input.keyboard"
+  | "clipboard.read"
+  | "clipboard.write"
+  | "file.read"
+  | "file.write"
+  | "audio.listen"
+  | "audio.talk"
+  | "display.switch"
+  | "display.multi_view"
+  | "power.restart"
+  | "power.shutdown"
+  | "terminal.open"
+  | "privacy.block_local_input"
+  | "privacy.blank_screen"
+  | "secure_desktop.view"
+  | "secure_desktop.control";
+
+export type RemoteReasonCode =
+  | "identity_mismatch"
+  | "trust_required"
+  | "consent_denied"
+  | "credential_invalid"
+  | "credential_locked"
+  | "authorization_timeout"
+  | "grant_expired"
+  | "grant_revoked"
+  | "policy_changed"
+  | "replay_detected"
+  | "scope_denied"
+  | "protocol_downgrade_blocked"
+  | "lan_unreachable"
+  | "ice_direct_failed"
+  | "turn_allocation_failed"
+  | "route_lost"
+  | "route_migration_timeout"
+  | "encoder_unavailable"
+  | "decoder_unavailable"
+  | "capture_source_lost"
+  | "profile_downgraded"
+  | "congestion_downshift"
+  | "render_budget_exceeded";
+
+export interface RemoteFailure {
+  code: RemoteReasonCode;
+  message: string;
+  suggested_action?: string | null;
+}
+
+export type RemoteAccessMode = "attended" | "unattended";
+export type RemoteSessionRole = "controller" | "agent";
+export type RemoteAuthorizationState =
+  | "discovered"
+  | "authenticating"
+  | "authorizing"
+  | "awaiting_local_consent"
+  | "verifying_unattended_credential"
+  | "granted"
+  | "denied"
+  | "expired"
+  | "revoked"
+  | "locked_out"
+  | "policy_changed";
+export type RemoteRouteKind = "lan_quic" | "webrtc_direct" | "webrtc_relay";
+export type RemoteRouteState =
+  | "idle"
+  | "gathering"
+  | "connecting"
+  | "connected"
+  | "migrating"
+  | "reconnecting"
+  | "failed"
+  | "closed";
+export type RemoteMediaState =
+  | "idle"
+  | "starting"
+  | "streaming"
+  | "degraded"
+  | "paused"
+  | "stopped"
+  | "failed";
+export type RemotePresentationState =
+  | "incoming_approval_required"
+  | "authenticating"
+  | "connecting"
+  | "connected_without_media"
+  | "streaming"
+  | "degraded"
+  | "reconnecting"
+  | "denied"
+  | "failed"
+  | "closed";
+
+export interface RemoteSessionRequest {
+  session_id: string;
+  target_device_id: string;
+  access_mode: RemoteAccessMode;
+  requested_scopes: RemotePermissionScope[];
+  requested_profile?: MediaProfile | null;
+}
+
+export interface RemoteSessionSnapshot {
+  session_id: string;
+  role: RemoteSessionRole;
+  peer_device_id: string;
+  peer_key_id: string;
+  access_mode: RemoteAccessMode;
+  authorization_state: RemoteAuthorizationState;
+  route_state: RemoteRouteState;
+  route_kind?: RemoteRouteKind | null;
+  media_state: RemoteMediaState;
+  presentation_state: RemotePresentationState;
+  requested_scopes: RemotePermissionScope[];
+  granted_scopes: RemotePermissionScope[];
+  policy_revision: DecimalU64;
+  failure?: RemoteFailure | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+  authorization_expires_at_ms?: number | null;
+}
+
+export type ConsentDecision = "approve" | "deny";
+
+export interface ConsentResponse {
+  session_id: string;
+  decision: ConsentDecision;
+  approved_scopes: RemotePermissionScope[];
+  expected_policy_revision: DecimalU64;
+}
+
+export interface UnattendedAccessPolicy {
+  trusted_devices_only: boolean;
+  allowed_peer_key_ids: string[];
+  permission_ceiling: RemotePermissionScope[];
+  expires_at_ms?: number | null;
+}
+
+export interface UnattendedAccessSnapshot {
+  enabled: boolean;
+  policy_revision: DecimalU64;
+  access_epoch: DecimalU64;
+  policy: UnattendedAccessPolicy;
+  locked_until_ms?: number | null;
+  updated_at_ms: number;
+}
+
+export type TrustedDeviceState =
+  | "pending"
+  | "trusted"
+  | "suspended"
+  | "revoked"
+  | "rotation_pending";
+
+export interface TrustedDeviceSnapshot {
+  peer_key_id: string;
+  display_name?: string | null;
+  key_epoch: DecimalU64;
+  state: TrustedDeviceState;
+  permission_ceiling: RemotePermissionScope[];
+  trust_revision: DecimalU64;
+  approved_at_ms?: number | null;
+  updated_at_ms: number;
+}
+
+export interface TrustedDeviceApproval {
+  peer_key_id: string;
+  key_epoch: DecimalU64;
+  permission_ceiling: RemotePermissionScope[];
+}
+
+export interface TrustedDeviceRotation {
+  peer_key_id: string;
+  new_peer_key_id: string;
+  new_key_epoch: DecimalU64;
+  expected_trust_revision: DecimalU64;
+}
+
+export interface SessionPermissionChange {
+  session_id: string;
+  requested_scopes: RemotePermissionScope[];
+  expected_policy_revision: DecimalU64;
+}
+
+export type RemoteSessionEvent =
+  | { kind: "consent_requested"; requested_scopes: RemotePermissionScope[] }
+  | {
+      kind: "consent_resolved";
+      decision: ConsentDecision;
+      approved_scopes: RemotePermissionScope[];
+    }
+  | {
+      kind: "authorization_changed";
+      state: RemoteAuthorizationState;
+      failure?: RemoteFailure | null;
+    }
+  | {
+      kind: "permissions_changed";
+      granted_scopes: RemotePermissionScope[];
+      policy_revision: DecimalU64;
+    }
+  | {
+      kind: "trust_changed";
+      peer_key_id: string;
+      state: TrustedDeviceState;
+      trust_revision: DecimalU64;
+    }
+  | {
+      kind: "route_changed";
+      state: RemoteRouteState;
+      route?: RemoteRouteKind | null;
+      failure?: RemoteFailure | null;
+    }
+  | {
+      kind: "media_changed";
+      state: RemoteMediaState;
+      failure?: RemoteFailure | null;
+    }
+  | { kind: "session_closed"; failure?: RemoteFailure | null };
+
+export interface RemoteSessionEventEnvelope {
+  sequence: DecimalU64;
+  timestamp_ms: number;
+  session_id: string;
+  event: RemoteSessionEvent;
+}
+
+export interface SessionEventSubscriptionQuery {
+  session_id?: string | null;
+  /** Exclusive service-global cursor. */
+  after_sequence?: DecimalU64 | null;
+  limit: number;
+  wait_timeout_ms: number;
+}
+
+export interface SessionEventSubscription {
+  events: RemoteSessionEventEnvelope[];
+  /** Authoritative pending consent snapshots supplied on initial/reset pages. */
+  pending_sessions: RemoteSessionSnapshot[];
+  /** Greatest delivered sequence; pass back as after_sequence without incrementing. */
+  next_after_sequence?: DecimalU64 | null;
+  cursor_state: RemoteCursorState;
+  has_more: boolean;
+  poll_after_ms: number;
+}
+
+export type RemoteCursorState = "current" | "reset_required";
+
+export type RouteCandidateState = "not_tried" | "connecting" | "connected" | "failed";
+
+export interface RouteCandidateEvidence {
+  route: RemoteRouteKind;
+  state: RouteCandidateState;
+  started_at_ms?: number | null;
+  completed_at_ms?: number | null;
+  round_trip_ms?: number | null;
+  failure?: RemoteFailure | null;
+}
+
+export interface RouteEvidence {
+  session_id: string;
+  route_state: RemoteRouteState;
+  selected_route?: RemoteRouteKind | null;
+  policy_revision: DecimalU64;
+  transport_fingerprint_sha256?: string | null;
+  candidates: RouteCandidateEvidence[];
+  observed_at_ms: number;
+}
+
+export interface AuditEventsQueryV2 {
+  /** Exclusive service-global cursor. */
+  after_sequence?: DecimalU64 | null;
+  limit: number;
+  session_id?: string | null;
+  action?: string | null;
+  outcome?: string | null;
+  peer_device_id?: string | null;
+}
+
+export interface AuditEventMetadataV2 {
+  authorization_state?: RemoteAuthorizationState | null;
+  access_mode?: RemoteAccessMode | null;
+  route_state?: RemoteRouteState | null;
+  media_state?: RemoteMediaState | null;
+  requested_scopes: RemotePermissionScope[];
+  granted_scopes: RemotePermissionScope[];
+  policy_revision?: DecimalU64 | null;
+  trust_revision?: DecimalU64 | null;
+}
+
+export interface AuditEventV2 {
+  sequence: DecimalU64;
+  timestamp_ms: number;
+  action: string;
+  outcome: string;
+  session_id?: string | null;
+  actor_device_id?: string | null;
+  peer_device_id?: string | null;
+  peer_key_id?: string | null;
+  transport_kind?: RemoteRouteKind | null;
+  reason_code?: RemoteReasonCode | null;
+  metadata: AuditEventMetadataV2;
+}
+
+export interface AuditEventPageV2 {
+  events: AuditEventV2[];
+  /** Greatest delivered sequence; pass back as after_sequence without incrementing. */
+  next_after_sequence?: DecimalU64 | null;
+  cursor_state: RemoteCursorState;
+  has_more: boolean;
+  chain_verified: boolean;
 }
 
 export interface MediaProfile {
@@ -1014,6 +1341,15 @@ export interface MediaSenderTransportSnapshot {
   reliable_frames_sent: number;
 }
 
+export interface AgentRenderBoundarySnapshot {
+  resource_id: number[];
+  decoder_backend: string;
+  enqueued_units: number;
+  queue_replacements: number;
+  decoded_frames: number;
+  presented_frames: number;
+}
+
 export interface MediaPipelineSnapshot {
   session_id: string;
   attached_surfaces: AttachedRenderSurface[];
@@ -1049,6 +1385,7 @@ export interface MediaPipelineSnapshot {
   display_refresh_hz?: number | null;
   render_thread_priority?: string | null;
   render_waitable_timeouts?: number;
+  agent_render_boundary?: AgentRenderBoundarySnapshot | null;
   reliable_hol_recoveries?: number;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;

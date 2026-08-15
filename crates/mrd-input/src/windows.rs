@@ -117,8 +117,16 @@ fn send_windows_input(command: WindowsInputCommand) -> Result<(), InputError> {
 fn send_input(
     input: ::windows::Win32::UI::Input::KeyboardAndMouse::INPUT,
 ) -> Result<(), InputError> {
+    use ::windows::Win32::Foundation::{
+        GetLastError, SetLastError, ERROR_ACCESS_DENIED, WIN32_ERROR,
+    };
+
     let inputs = [input];
     let sent = unsafe {
+        // SendInput does not clear the thread's last-error value on entry. Reset
+        // it so an access-denied classification cannot be inherited from an
+        // unrelated API call on this thread.
+        SetLastError(WIN32_ERROR(0));
         ::windows::Win32::UI::Input::KeyboardAndMouse::SendInput(
             &inputs,
             std::mem::size_of::<::windows::Win32::UI::Input::KeyboardAndMouse::INPUT>() as i32,
@@ -126,6 +134,8 @@ fn send_input(
     };
     if sent == inputs.len() as u32 {
         Ok(())
+    } else if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+        Err(InputError::UipiDenied)
     } else {
         Err(InputError::Platform(
             ::windows::core::Error::from_thread().to_string(),

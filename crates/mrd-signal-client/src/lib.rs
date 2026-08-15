@@ -1,11 +1,17 @@
-use mrd_signal_proto::SignalMessage;
+use mrd_signal_proto::{SignalEnvelope, SignalMessage, SignalProtocolError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SignalClientError {
     #[error("serialize signal message failed: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error(transparent)]
+    Protocol(#[from] SignalProtocolError),
+    #[error("signal message exceeds the bounded wire size")]
+    MessageTooLarge,
 }
+
+pub const MAX_SIGNAL_MESSAGE_BYTES: usize = 512 * 1_024;
 
 pub fn encode_message(message: &SignalMessage) -> Result<String, SignalClientError> {
     serde_json::to_string(message).map_err(Into::into)
@@ -15,9 +21,31 @@ pub fn decode_message(raw: &str) -> Result<SignalMessage, SignalClientError> {
     serde_json::from_str(raw).map_err(Into::into)
 }
 
+/// Encode one mandatory-version authenticated signaling envelope.
+pub fn encode_authenticated_message(
+    envelope: &SignalEnvelope,
+) -> Result<String, SignalClientError> {
+    envelope.validate_version()?;
+    let encoded = serde_json::to_string(envelope)?;
+    if encoded.len() > MAX_SIGNAL_MESSAGE_BYTES {
+        return Err(SignalClientError::MessageTooLarge);
+    }
+    Ok(encoded)
+}
+
+/// Decode only the authenticated protocol; legacy unversioned JSON is rejected.
+pub fn decode_authenticated_message(raw: &str) -> Result<SignalEnvelope, SignalClientError> {
+    if raw.len() > MAX_SIGNAL_MESSAGE_BYTES {
+        return Err(SignalClientError::MessageTooLarge);
+    }
+    serde_json::from_str(raw).map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_message, encode_message};
+    use super::{
+        decode_authenticated_message, decode_message, encode_authenticated_message, encode_message,
+    };
     use mrd_proto::{BackendRole, DeviceId, SessionId};
     use mrd_signal_proto::{RegisterRequest, SessionAccept, SessionRequest, SignalMessage};
 
@@ -61,5 +89,49 @@ mod tests {
         let encoded_accept = encode_message(&accept).expect("encode quic accept");
         let decoded_accept = decode_message(&encoded_accept).expect("decode quic accept");
         assert_eq!(decoded_accept, accept);
+    }
+
+    #[test]
+    fn authenticated_decode_rejects_legacy_unversioned_message() {
+        let legacy = encode_message(&SignalMessage::Register(RegisterRequest {
+            role: BackendRole::Controller,
+            device_id: Some(DeviceId("controller-1".into())),
+            name: "Rdesk".into(),
+        }))
+        .unwrap();
+        assert!(decode_authenticated_message(&legacy).is_err());
+    }
+
+    #[test]
+    fn authenticated_encode_rejects_in_memory_wrong_version() {
+        use mrd_signal_proto::{
+            AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
+            SIGNAL_PROTOCOL_VERSION,
+        };
+        let mut envelope = SignalEnvelope::new(AuthenticatedSignalMessage::ProtocolError(
+            SignalErrorMessage {
+                reason: ProtocolReasonCode::Malformed,
+                correlation_id: None,
+                detail: "invalid".into(),
+            },
+        ));
+        envelope.version = SIGNAL_PROTOCOL_VERSION + 1;
+        assert!(encode_authenticated_message(&envelope).is_err());
+    }
+
+    #[test]
+    fn authenticated_codec_roundtrips_versioned_envelope() {
+        use mrd_signal_proto::{
+            AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
+        };
+        let envelope = SignalEnvelope::new(AuthenticatedSignalMessage::ProtocolError(
+            SignalErrorMessage {
+                reason: ProtocolReasonCode::RateLimited,
+                correlation_id: Some([3; 16]),
+                detail: "retry later".into(),
+            },
+        ));
+        let encoded = encode_authenticated_message(&envelope).unwrap();
+        assert_eq!(decode_authenticated_message(&encoded).unwrap(), envelope);
     }
 }

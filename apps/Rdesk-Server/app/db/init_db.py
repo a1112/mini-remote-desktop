@@ -68,4 +68,3 @@ async def seed_initial_data(session: AsyncSession) -> None:
 
     if changed:
         await session.commit()
-

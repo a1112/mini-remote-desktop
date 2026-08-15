@@ -3,6 +3,18 @@ use mrd_ipc::IpcResponse;
 use mrd_proto::{DeviceId, SessionId};
 
 impl IpcServer {
+    pub(super) async fn verify_audit_integrity(&self) -> Result<(), ()> {
+        let audit_log = self.app_state.audit_log.clone();
+        match tokio::task::spawn_blocking(move || audit_log.verify_integrity()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => {
+                self.app_state.mark_security_unhealthy();
+                tracing::error!("authoritative security audit verification failed");
+                Err(())
+            }
+        }
+    }
+
     pub(super) async fn local_device_id(&self) -> Option<DeviceId> {
         self.app_state
             .devices
@@ -38,23 +50,75 @@ impl IpcServer {
         transport_kind: Option<String>,
         reason: Option<String>,
         details: Vec<(String, String)>,
-    ) {
-        self.app_state.audit_log.lock().await.record(
-            action,
-            outcome,
-            session_id,
-            actor_device_id,
-            peer_device_id,
-            transport_kind,
-            reason,
-            details,
-        );
+    ) -> Result<(), ()> {
+        let audit_log = self.app_state.audit_log.clone();
+        let action = action.into();
+        let outcome = outcome.into();
+        match tokio::task::spawn_blocking(move || {
+            audit_log.record(
+                action,
+                outcome,
+                session_id,
+                actor_device_id,
+                peer_device_id,
+                transport_kind,
+                reason,
+                details,
+            )
+        })
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) | Err(_) => {
+                self.app_state.mark_security_unhealthy();
+                tracing::error!("authoritative security audit append failed");
+                Err(())
+            }
+        }
     }
 }
 
 pub(super) fn audit_outcome(response: &IpcResponse) -> (&'static str, Option<String>) {
     match response {
-        IpcResponse::Error { message, .. } => ("error", Some(message.clone())),
+        IpcResponse::Error { code, .. } => ("error", Some(code.clone())),
+        IpcResponse::RemoteAccessError { failure, .. } => (
+            "denied",
+            Some(crate::lan_discovery::remote_reason_code_wire_name(
+                failure.code,
+            )),
+        ),
         _ => ("success", None),
+    }
+}
+
+pub(super) fn security_store_unavailable_response() -> IpcResponse {
+    IpcResponse::Error {
+        code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+        message: "authoritative security state is unavailable".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_outcome;
+    use mrd_ipc::{IpcResponse, RemoteFailure, RemoteReasonCode};
+    use mrd_proto::SessionId;
+
+    #[test]
+    fn audit_outcome_preserves_typed_remote_access_rejections() {
+        let response = IpcResponse::RemoteAccessError {
+            session_id: Some(SessionId("certificate-session".to_string())),
+            peer_key_id: Some("sha256:peer".to_string()),
+            failure: RemoteFailure {
+                code: RemoteReasonCode::CertificateBindingMismatch,
+                message: "certificate binding mismatch".to_string(),
+                suggested_action: None,
+            },
+        };
+
+        assert_eq!(
+            audit_outcome(&response),
+            ("denied", Some("certificate_binding_mismatch".to_string()))
+        );
     }
 }

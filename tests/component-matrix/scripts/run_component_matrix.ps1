@@ -21,10 +21,19 @@ $cases = @(
   "tests/component-matrix/cases/render.d3d11.json"
 )
 
+$failures = @()
 foreach ($casePath in $cases) {
   powershell -ExecutionPolicy Bypass -File (Join-Path $repo 'tests/component-matrix/scripts/run_component_case.ps1') `
     -CasePath $casePath `
     -RepoRoot $repo
+  if ($LASTEXITCODE -ne 0) {
+    $failures += "${casePath} (exit=$LASTEXITCODE)"
+  }
+}
+
+if ($failures.Count -gt 0) {
+  Write-Error "Component matrix failed: $($failures -join '; ')"
+  exit 2
 }
 
 Write-Output "Component matrix completed."

@@ -15,13 +15,22 @@ function Assert-True($Condition, [string]$Message) {
   }
 }
 
+$dxgiCase = [pscustomobject]@{ requires_dxgi_output = $true }
+Assert-Equal (Get-ComponentMatrixUnsupportedReason -Case $dxgiCase -DxgiOutputAvailable $false) `
+  "dxgi_output_unavailable" "DXGI component case is skipped without an attached output"
+Assert-Equal (Get-ComponentMatrixUnsupportedReason -Case $dxgiCase -DxgiOutputAvailable $true) `
+  $null "DXGI component case remains runnable with an attached output"
+
+$powerShellHost = Get-CurrentPowerShellExecutable
+Assert-True (Test-Path $powerShellHost) "Current PowerShell executable should resolve to an existing file"
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-component-common-{0}" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
   $stdout = Join-Path $tmp "stdout.log"
   $stderr = Join-Path $tmp "stderr.log"
   $result = Invoke-ComponentMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powerShellHost `
     -ArgumentList @("-NoProfile", "-Command", "Write-Output 'stdout-ok'; [Console]::Error.WriteLine('stderr-ok'); exit 7") `
     -WorkingDirectory $tmp `
     -StdoutPath $stdout `
@@ -36,7 +45,7 @@ try {
   $timeoutStdout = Join-Path $tmp "timeout.stdout.log"
   $timeoutStderr = Join-Path $tmp "timeout.stderr.log"
   $timeout = Invoke-ComponentMatrixCommand `
-    -FilePath "powershell" `
+    -FilePath $powerShellHost `
     -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 10") `
     -WorkingDirectory $tmp `
     -StdoutPath $timeoutStdout `
@@ -89,6 +98,17 @@ try {
   Assert-True (Test-Path (Join-Path $runDir "summary.csv")) "summary.csv should be written when result.json exists"
   $summary = Import-Csv (Join-Path $runDir "summary.csv")
   Assert-Equal $summary.passed "True" "summary should evaluate thresholds"
+
+  foreach ($fixtureName in @('threshold-failure-result.json', 'null-latency-result.json')) {
+    $fixtureRun = Join-Path $tmp ([IO.Path]::GetFileNameWithoutExtension($fixtureName))
+    New-Item -ItemType Directory -Force -Path (Join-Path $fixtureRun 'logs'), (Join-Path $fixtureRun 'reports') | Out-Null
+    Copy-Item (Join-Path $scriptDir "../fixtures/$fixtureName") (Join-Path $fixtureRun 'result.json')
+    Copy-Item (Join-Path $runDir 'manifest.json') (Join-Path $fixtureRun 'manifest.json')
+    New-Item -ItemType File -Force -Path (Join-Path $fixtureRun 'logs/component.stdout.log'), (Join-Path $fixtureRun 'logs/component.stderr.log') | Out-Null
+    & $powerShellHost -ExecutionPolicy Bypass -File (Join-Path $scriptDir 'summarize_component_results.ps1') -RunDir $fixtureRun -ThresholdPath (Join-Path $scriptDir '../thresholds/decode.json')
+    $fixtureSummary = Import-Csv (Join-Path $fixtureRun 'summary.csv')
+    Assert-Equal $fixtureSummary.passed "False" "$fixtureName should fail closed"
+  }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

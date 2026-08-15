@@ -79,6 +79,7 @@ jobs:
           -p mrd-signal-server
           -p realtime-server
           -p mrd-service
+          -- --test-threads=1
 
   desktop-shell:
     name: Desktop shell (${{ matrix.os }})

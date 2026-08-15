@@ -56,7 +56,7 @@ const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 8;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
-const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 2_000;
+const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 10_000;
 #[cfg(target_os = "linux")]
 const DEFAULT_LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 30_000;
 const CAPTURE_NO_FRAME_TIMEOUT_MS: u64 = 2_500;
@@ -155,6 +155,10 @@ fn configured_nvenc_av1_mode() -> NvencAv1Mode {
 
 fn prefer_max_speed_nvenc_for_hardware_decode(width: usize, height: usize, fps: u32) -> bool {
     fps >= 120 && width.saturating_mul(height) >= 2560usize.saturating_mul(1440)
+}
+
+fn resolved_openh264_bitrate(configured_bitrate: Option<u32>) -> u32 {
+    configured_bitrate.unwrap_or(12_000_000).max(1)
 }
 
 /// Available decoder types
@@ -442,6 +446,8 @@ pub struct HarnessMetrics {
     pub render_present_gap_avg_ms: f64,
     pub render_present_gap_p50_ms: f64,
     pub render_present_gap_p95_ms: f64,
+    /// Bounded intervals from successful renderer Present callbacks.
+    pub render_present_intervals_ms: Vec<f64>,
     pub total_latency_avg_ms: f64,
     pub total_latency_p50_ms: f64,
     pub total_latency_p95_ms: f64,
@@ -564,6 +570,7 @@ impl Default for HarnessMetrics {
             render_present_gap_avg_ms: 0.0,
             render_present_gap_p50_ms: 0.0,
             render_present_gap_p95_ms: 0.0,
+            render_present_intervals_ms: Vec::new(),
             total_latency_avg_ms: 0.0,
             total_latency_p50_ms: 0.0,
             total_latency_p95_ms: 0.0,
@@ -896,6 +903,7 @@ impl NvdecSharedCopyStats {
 #[derive(Debug, Clone)]
 struct RenderCompletion {
     snapshot: RendererSnapshot,
+    present_events: Vec<mrd_render::RendererPresentEvent>,
     upload_started_at: Instant,
     upload_completed_at: Instant,
 }
@@ -980,6 +988,7 @@ struct LatestRenderScheduler {
     shared: Arc<LatestRenderShared>,
     completions: mpsc::Receiver<AsyncRenderCompletion>,
     worker_done: mpsc::Receiver<()>,
+    returned_renderer: mpsc::Receiver<PipelineRenderer>,
     worker_finished: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -989,14 +998,22 @@ impl LatestRenderScheduler {
         let shared = Arc::new(LatestRenderShared::new());
         let (completion_tx, completions) = mpsc::channel();
         let (worker_done_tx, worker_done) = mpsc::channel();
+        let (returned_renderer_tx, returned_renderer) = mpsc::sync_channel(1);
         let worker_shared = Arc::clone(&shared);
         let worker_finished = Arc::new(AtomicBool::new(false));
         let worker_finished_thread = Arc::clone(&worker_finished);
+        // Keep this sender alive until the worker state is published.  Otherwise the
+        // receiver can observe a disconnected channel in the small window between
+        // `run_latest_render_worker` returning and `worker_finished` being set.
+        let worker_completion_tx = completion_tx.clone();
         let worker = thread::Builder::new()
             .name("mrd-latest-render-scheduler".to_string())
             .spawn(move || {
-                run_latest_render_worker(renderer, worker_shared, completion_tx);
-                worker_finished_thread.store(true, Ordering::Relaxed);
+                let renderer =
+                    run_latest_render_worker(renderer, worker_shared, worker_completion_tx);
+                let _ = returned_renderer_tx.send(renderer);
+                worker_finished_thread.store(true, Ordering::Release);
+                drop(completion_tx);
                 let _ = worker_done_tx.send(());
             })
             .map_err(|error| anyhow::anyhow!("spawn latest render scheduler failed: {error}"))?;
@@ -1005,6 +1022,7 @@ impl LatestRenderScheduler {
             shared,
             completions,
             worker_done,
+            returned_renderer,
             worker_finished,
             worker: Some(worker),
         })
@@ -1019,7 +1037,7 @@ impl LatestRenderScheduler {
             Ok(completion) => Ok(Some(completion)),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => {
-                if self.worker_finished.load(Ordering::Relaxed) {
+                if self.worker_finished.load(Ordering::Acquire) {
                     Ok(None)
                 } else {
                     anyhow::bail!("latest render scheduler stopped")
@@ -1033,28 +1051,37 @@ impl LatestRenderScheduler {
     }
 
     fn is_finished(&self) -> bool {
-        self.worker_finished.load(Ordering::Relaxed)
+        self.worker_finished.load(Ordering::Acquire)
+    }
+
+    fn shutdown_and_take_renderer(&mut self) -> Result<Option<PipelineRenderer>> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(None);
+        };
+        self.stop();
+        if !self.is_finished() {
+            self.worker_done
+                .recv_timeout(Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS))
+                .map_err(|_| anyhow::anyhow!("latest render scheduler did not stop in time"))?;
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("latest render scheduler panicked"))?;
+        self.returned_renderer
+            .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("latest render scheduler did not return its renderer"))
     }
 }
 
 impl Drop for LatestRenderScheduler {
     fn drop(&mut self) {
-        self.stop();
-        let worker_finished = self.is_finished()
-            || self
-                .worker_done
-                .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
-                .is_ok();
-        if let Some(worker) = self.worker.take() {
-            if worker_finished {
-                let _ = worker.join();
-            }
-        }
+        let _ = self.shutdown_and_take_renderer();
     }
 }
 
 struct PipelineRenderer {
-    sender: mpsc::SyncSender<RenderCommand>,
+    sender: Option<mpsc::SyncSender<RenderCommand>>,
     render_thread: Option<thread::JoinHandle<()>>,
     render_done: Option<mpsc::Receiver<()>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -1101,7 +1128,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
-                sender,
+                sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
                 last_error,
@@ -1136,7 +1163,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
-                sender,
+                sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
                 last_error,
@@ -1165,7 +1192,7 @@ impl PipelineRenderer {
             .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error,
@@ -1191,6 +1218,8 @@ impl PipelineRenderer {
 
         let (completion, done) = mpsc::sync_channel(1);
         self.sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native render thread is stopping"))?
             .send(RenderCommand::Frame(RenderJob { input, completion }))
             .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
         match done.recv_timeout(Duration::from_millis(NATIVE_RENDER_FRAME_TIMEOUT_MS)) {
@@ -1214,21 +1243,19 @@ impl PipelineRenderer {
 
 impl Drop for PipelineRenderer {
     fn drop(&mut self) {
-        let _ = self.sender.try_send(RenderCommand::Stop);
-        let render_finished = match self.render_done.take() {
-            Some(done) => match done
-                .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
-            {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => true,
-                Err(mpsc::RecvTimeoutError::Timeout) => false,
-            },
-            None => true,
-        };
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(RenderCommand::Stop);
+            // A full bounded queue can reject the stop command. Disconnecting
+            // the final sender guarantees the render loop exits after any
+            // already queued frame instead of blocking forever on recv().
+            drop(sender);
+        }
+        if let Some(done) = self.render_done.take() {
+            let _ = done.recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS));
+        }
 
         if let Some(render_thread) = self.render_thread.take() {
-            if render_finished {
-                let _ = render_thread.join();
-            }
+            let _ = render_thread.join();
         }
     }
 }
@@ -1237,13 +1264,13 @@ fn run_latest_render_worker(
     mut renderer: PipelineRenderer,
     shared: Arc<LatestRenderShared>,
     completions: mpsc::Sender<AsyncRenderCompletion>,
-) {
+) -> PipelineRenderer {
     loop {
         let input = {
             let mut slot = shared.slot.lock().unwrap();
             loop {
                 if slot.stopping {
-                    return;
+                    return renderer;
                 }
                 if let Some(input) = slot.take_next() {
                     break input;
@@ -1266,10 +1293,10 @@ fn run_latest_render_worker(
             })
             .is_err()
         {
-            return;
+            return renderer;
         }
         if failed {
-            return;
+            return renderer;
         }
     }
 }
@@ -1567,6 +1594,7 @@ fn complete_render_job(renderer: &mut dyn RendererInstance, job: RenderJob) -> R
         Ok(timing) => {
             let completion = RenderCompletion {
                 snapshot: renderer.snapshot(),
+                present_events: renderer.drain_present_events(),
                 upload_started_at: timing.started_at,
                 upload_completed_at: timing.completed_at,
             };
@@ -1997,18 +2025,7 @@ impl TestHarness {
             || self.thread_handle.is_some()
             || self.stopping.load(Ordering::Relaxed)
         {
-            self.stop()?;
-
-            let started = Instant::now();
-            while self.stopping.load(Ordering::Relaxed) {
-                if started.elapsed() >= Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS) {
-                    anyhow::bail!(
-                        "test harness is still stopping after {} ms",
-                        HARNESS_STOP_JOIN_TIMEOUT_MS
-                    );
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
+            self.stop_and_wait()?;
         }
 
         self.start()
@@ -2284,10 +2301,12 @@ impl TestHarness {
                 )
             }
             TestChain::OpenH264 => {
-                let encoder = match config.bitrate {
-                    Some(bitrate) => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate),
-                    None => OpenH264Encoder::new(width, height, fps),
-                }
+                let encoder = OpenH264Encoder::new_with_bitrate(
+                    width,
+                    height,
+                    fps,
+                    resolved_openh264_bitrate(config.bitrate),
+                )
                 .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -2297,10 +2316,12 @@ impl TestHarness {
             }
             #[cfg(target_os = "linux")]
             TestChain::LinuxOpenh264 => {
-                let encoder = match config.bitrate {
-                    Some(bitrate) => OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate),
-                    None => OpenH264Encoder::new(width, height, fps),
-                }
+                let encoder = OpenH264Encoder::new_with_bitrate(
+                    width,
+                    height,
+                    fps,
+                    resolved_openh264_bitrate(config.bitrate),
+                )
                 .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                 (
                     Some(Box::new(encoder) as Box<dyn VideoEncoder>),
@@ -2574,12 +2595,12 @@ impl TestHarness {
                     }
                 }
                 EncoderType::OpenH264 => {
-                    let enc = match config.bitrate {
-                        Some(bitrate) => {
-                            OpenH264Encoder::new_with_bitrate(width, height, fps, bitrate)
-                        }
-                        None => OpenH264Encoder::new(width, height, fps),
-                    }
+                    let enc = OpenH264Encoder::new_with_bitrate(
+                        width,
+                        height,
+                        fps,
+                        resolved_openh264_bitrate(config.bitrate),
+                    )
                     .map_err(|e| anyhow::anyhow!("OpenH264 编码器初始化失败: {:?}", e))?;
                     match decoder {
                         DecoderType::None => {
@@ -2963,7 +2984,7 @@ impl TestHarness {
             None
         };
         let mut next_frame_at = Instant::now();
-        let render_scheduler = match state.renderer.take() {
+        let mut render_scheduler = match state.renderer.take() {
             Some(renderer) => match LatestRenderScheduler::new(renderer) {
                 Ok(scheduler) => Some(scheduler),
                 Err(error) => {
@@ -3304,7 +3325,7 @@ impl TestHarness {
             }
         }
 
-        if let Some(scheduler) = render_scheduler.as_ref() {
+        let retained_renderer = if let Some(scheduler) = render_scheduler.as_mut() {
             if let Err(error) = Self::stop_render_scheduler_and_drain(
                 scheduler,
                 &mut render_pacing,
@@ -3321,7 +3342,23 @@ impl TestHarness {
                 let mut m = metrics.lock().unwrap();
                 m.error_message = Some(error.to_string());
             }
-        }
+            match scheduler.shutdown_and_take_renderer() {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // NVDEC shared-texture decoders borrow the renderer's D3D11 device.
+        // Destroy the decoder while the returned renderer still owns that
+        // device, then release the renderer and device last.
+        drop(state.decoder.take());
+        drop(retained_renderer);
 
         Self::update_metrics(
             &metrics,
@@ -3498,6 +3535,10 @@ impl TestHarness {
         m.render_present_gap_avg_ms = avg_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p50_ms = p50_present_gap.as_secs_f64() * 1000.0;
         m.render_present_gap_p95_ms = p95_present_gap.as_secs_f64() * 1000.0;
+        m.render_present_intervals_ms = render_present_gaps
+            .iter()
+            .map(|gap| gap.as_secs_f64() * 1_000.0)
+            .collect();
         m.present_latency_avg_ms = m.render_present_gap_avg_ms;
         m.total_latency_avg_ms = avg_total.as_secs_f64() * 1000.0;
         m.total_latency_p50_ms = p50_total.as_secs_f64() * 1000.0;
@@ -3511,6 +3552,7 @@ impl TestHarness {
         previous_snapshot: Option<&RendererSnapshot>,
         current_snapshot: &RendererSnapshot,
         completed_at: Instant,
+        present_events: &[mrd_render::RendererPresentEvent],
     ) {
         render_pacing.uploaded_frames = current_snapshot.uploaded_frame_count;
         render_pacing.presented_frames = current_snapshot.presented_frame_count;
@@ -3529,10 +3571,15 @@ impl TestHarness {
             .map(|snapshot| snapshot.presented_frame_count)
             .unwrap_or_default();
         if current_snapshot.presented_frame_count > previous_presented {
+            let actual_presented_at = present_events
+                .last()
+                .map(|event| event.presented_at)
+                .unwrap_or(completed_at);
             if let Some(last_present_at) = *last_render_present_at {
-                render_present_gaps.push(completed_at.saturating_duration_since(last_present_at));
+                render_present_gaps
+                    .push(actual_presented_at.saturating_duration_since(last_present_at));
             }
-            *last_render_present_at = Some(completed_at);
+            *last_render_present_at = Some(actual_presented_at);
         }
     }
 
@@ -3562,6 +3609,7 @@ impl TestHarness {
                         previous_snapshot.as_ref(),
                         &render_completion.snapshot,
                         completion.completed_at,
+                        &render_completion.present_events,
                     );
                     let upload_started_at = render_completion.upload_started_at;
                     let upload_completed_at = render_completion.upload_completed_at;
@@ -3762,6 +3810,21 @@ impl TestHarness {
             m.is_running = false;
         }
 
+        Ok(())
+    }
+
+    pub fn stop_and_wait(&mut self) -> Result<()> {
+        self.stop()?;
+        let started = Instant::now();
+        while self.stopping.load(Ordering::Relaxed) {
+            if started.elapsed() >= Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS) {
+                anyhow::bail!(
+                    "test harness is still stopping after {} ms",
+                    HARNESS_STOP_JOIN_TIMEOUT_MS
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 
@@ -5734,6 +5797,7 @@ mod tests {
             Some(&previous),
             &current,
             previous_present_at + Duration::from_millis(7),
+            &[],
         );
 
         assert_eq!(counters.uploaded_frames, 8);
@@ -5748,6 +5812,7 @@ mod tests {
             Some(&current),
             &same_present,
             previous_present_at + Duration::from_millis(12),
+            &[],
         );
 
         assert_eq!(counters.uploaded_frames, 9);
@@ -5789,6 +5854,7 @@ mod tests {
             Some(&previous),
             &current,
             Instant::now(),
+            &[],
         );
 
         assert_eq!(counters.swap_chain_max_frame_latency, Some(1));
@@ -5948,6 +6014,13 @@ mod tests {
         assert!(prefer_max_speed_nvenc_for_hardware_decode(3840, 2160, 120));
         assert!(!prefer_max_speed_nvenc_for_hardware_decode(2560, 1440, 60));
         assert!(!prefer_max_speed_nvenc_for_hardware_decode(1920, 1080, 144));
+    }
+
+    #[test]
+    fn openh264_defaults_to_remote_desktop_bitrate_control() {
+        assert_eq!(resolved_openh264_bitrate(None), 12_000_000);
+        assert_eq!(resolved_openh264_bitrate(Some(5_000_000)), 5_000_000);
+        assert_eq!(resolved_openh264_bitrate(Some(0)), 1);
     }
 
     #[cfg(windows)]
@@ -6547,6 +6620,95 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_wait_returns_after_pipeline_thread_cleanup() {
+        let mut harness = TestHarness::new().expect("create harness");
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_finished_thread = Arc::clone(&cleanup_finished);
+        harness.running.store(true, Ordering::Relaxed);
+        harness.thread_handle = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            cleanup_finished_thread.store(true, Ordering::Relaxed);
+        }));
+
+        harness.stop_and_wait().expect("stop and wait");
+
+        assert!(cleanup_finished.load(Ordering::Relaxed));
+        assert!(!harness.stopping.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn stop_and_wait_allows_native_cleanup_beyond_two_seconds() {
+        let mut harness = TestHarness::new().expect("create harness");
+        harness.running.store(true, Ordering::Relaxed);
+        harness.thread_handle = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(2_100));
+        }));
+
+        harness
+            .stop_and_wait()
+            .expect("native codec cleanup may exceed the legacy two-second budget");
+
+        assert!(!harness.stopping.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pipeline_renderer_drop_waits_for_native_render_thread_cleanup() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (render_done_tx, render_done_rx) = mpsc::channel();
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_finished_thread = Arc::clone(&cleanup_finished);
+        let render_thread = thread::spawn(move || {
+            let _ = receiver.recv();
+            thread::sleep(Duration::from_millis(
+                NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS + 50,
+            ));
+            cleanup_finished_thread.store(true, Ordering::Relaxed);
+            let _ = render_done_tx.send(());
+        });
+        let renderer = PipelineRenderer {
+            sender: Some(sender),
+            render_thread: Some(render_thread),
+            render_done: Some(render_done_rx),
+            last_error: Arc::new(Mutex::new(None)),
+            d3d11_device_ptr: None,
+        };
+
+        drop(renderer);
+
+        assert!(cleanup_finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pipeline_renderer_drop_disconnects_a_full_command_queue_before_join() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(RenderCommand::Stop)
+            .expect("fill render command queue");
+        let (render_done_tx, render_done_rx) = mpsc::channel();
+        let render_thread = thread::spawn(move || {
+            while receiver.recv().is_ok() {}
+            let _ = render_done_tx.send(());
+        });
+        let renderer = PipelineRenderer {
+            sender: Some(sender),
+            render_thread: Some(render_thread),
+            render_done: Some(render_done_rx),
+            last_error: Arc::new(Mutex::new(None)),
+            d3d11_device_ptr: None,
+        };
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            drop(renderer);
+            let _ = drop_done_tx.send(());
+        });
+
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full render queue must not deadlock renderer drop");
+    }
+
+    #[test]
     fn start_returns_before_initialization_errors_are_reported() {
         let mut harness = TestHarness::new().expect("create harness");
         harness.set_chain(TestChain::Custom {
@@ -7138,7 +7300,7 @@ mod tests {
         });
         harness.start().expect("start harness");
         thread::sleep(Duration::from_secs(seconds));
-        harness.stop().expect("stop harness");
+        harness.stop_and_wait().expect("stop harness");
         let metrics = harness.get_metrics();
         let comparison = harness.get_pipeline_comparison_result();
         println!("{metrics:#?}");

@@ -2,6 +2,9 @@ use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 17;
+pub const AUTHENTICATED_INPUT_PROTOCOL_VERSION: u8 = 2;
+pub const AUTHENTICATED_INPUT_MAX_BYTES: usize = 64;
+const AUTHENTICATED_INPUT_HEADER_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelClass {
@@ -26,6 +29,7 @@ pub enum EventType {
     FileMount = 12,
     AudioRouteControl = 13,
     MouseHorizontalWheel = 14,
+    ReleaseAll = 15,
 }
 
 impl TryFrom<u8> for EventType {
@@ -47,6 +51,7 @@ impl TryFrom<u8> for EventType {
             12 => Ok(Self::FileMount),
             13 => Ok(Self::AudioRouteControl),
             14 => Ok(Self::MouseHorizontalWheel),
+            15 => Ok(Self::ReleaseAll),
             _ => Err(ProtoError::UnknownEventType(value)),
         }
     }
@@ -119,6 +124,9 @@ pub enum ControlEvent {
         flags: u32,
         path: String,
     },
+    ReleaseAll {
+        scope: AuthenticatedInputScope,
+    },
 }
 
 impl ControlEvent {
@@ -138,6 +146,7 @@ impl ControlEvent {
             Self::AudioControl { .. } => EventType::AudioControl,
             Self::FileMount { .. } => EventType::FileMount,
             Self::AudioRouteControl { .. } => EventType::AudioRouteControl,
+            Self::ReleaseAll { .. } => EventType::ReleaseAll,
         }
     }
 
@@ -156,9 +165,17 @@ impl ControlEvent {
             | Self::FileChunk { .. }
             | Self::AudioControl { .. }
             | Self::FileMount { .. }
-            | Self::AudioRouteControl { .. } => ChannelClass::Reliable,
+            | Self::AudioRouteControl { .. }
+            | Self::ReleaseAll { .. } => ChannelClass::Reliable,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AuthenticatedInputScope {
+    Pointer = 1,
+    Keyboard = 2,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +250,14 @@ pub enum ProtoError {
         expected: usize,
         actual: usize,
     },
+    #[error("event type is not supported by authenticated remote input: {0:?}")]
+    UnsupportedAuthenticatedInput(EventType),
+    #[error("authenticated input boolean must be 0 or 1: {0}")]
+    InvalidBoolean(u8),
+    #[error("unknown authenticated input scope: {0}")]
+    InvalidAuthenticatedInputScope(u8),
+    #[error("authenticated input frame is too large: actual={actual}, max={max}")]
+    AuthenticatedInputTooLarge { actual: usize, max: usize },
 }
 
 fn encode_event_payload(event: &ControlEvent) -> Vec<u8> {
@@ -348,6 +373,7 @@ fn encode_event_payload(event: &ControlEvent) -> Vec<u8> {
             v.push(u8::from(*follow_children));
             v
         }
+        ControlEvent::ReleaseAll { scope } => vec![*scope as u8],
     }
 }
 
@@ -538,7 +564,98 @@ fn decode_event_payload(typ: EventType, payload: &[u8]) -> Result<ControlEvent, 
                 follow_children: payload[6] != 0,
             })
         }
+        EventType::ReleaseAll => {
+            expect_payload_len(typ, payload, 1)?;
+            let scope = match payload[0] {
+                value if value == AuthenticatedInputScope::Pointer as u8 => {
+                    AuthenticatedInputScope::Pointer
+                }
+                value if value == AuthenticatedInputScope::Keyboard as u8 => {
+                    AuthenticatedInputScope::Keyboard
+                }
+                value => return Err(ProtoError::InvalidAuthenticatedInputScope(value)),
+            };
+            Ok(ControlEvent::ReleaseAll { scope })
+        }
     }
+}
+
+pub fn authenticated_input_scope(
+    event: &ControlEvent,
+) -> Result<AuthenticatedInputScope, ProtoError> {
+    match event {
+        ControlEvent::MouseMove { .. }
+        | ControlEvent::MouseButton { .. }
+        | ControlEvent::MouseWheel { .. }
+        | ControlEvent::MouseHorizontalWheel { .. } => Ok(AuthenticatedInputScope::Pointer),
+        ControlEvent::Key { .. } => Ok(AuthenticatedInputScope::Keyboard),
+        ControlEvent::ReleaseAll { scope } => Ok(*scope),
+        unsupported => Err(ProtoError::UnsupportedAuthenticatedInput(
+            unsupported.event_type(),
+        )),
+    }
+}
+
+pub fn encode_authenticated_input_event(event: &ControlEvent) -> Result<Vec<u8>, ProtoError> {
+    authenticated_input_scope(event)?;
+    let payload = encode_event_payload(event);
+    let payload_len =
+        u16::try_from(payload.len()).map_err(|_| ProtoError::AuthenticatedInputTooLarge {
+            actual: payload.len(),
+            max: AUTHENTICATED_INPUT_MAX_BYTES,
+        })?;
+    let total_len = AUTHENTICATED_INPUT_HEADER_LEN + payload.len();
+    if total_len > AUTHENTICATED_INPUT_MAX_BYTES {
+        return Err(ProtoError::AuthenticatedInputTooLarge {
+            actual: total_len,
+            max: AUTHENTICATED_INPUT_MAX_BYTES,
+        });
+    }
+    let mut encoded = Vec::with_capacity(total_len);
+    encoded.push(AUTHENTICATED_INPUT_PROTOCOL_VERSION);
+    encoded.push(event.event_type() as u8);
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+pub fn decode_authenticated_input_event(bytes: &[u8]) -> Result<ControlEvent, ProtoError> {
+    if bytes.len() > AUTHENTICATED_INPUT_MAX_BYTES {
+        return Err(ProtoError::AuthenticatedInputTooLarge {
+            actual: bytes.len(),
+            max: AUTHENTICATED_INPUT_MAX_BYTES,
+        });
+    }
+    if bytes.len() < AUTHENTICATED_INPUT_HEADER_LEN {
+        return Err(ProtoError::FrameTooShort {
+            actual: bytes.len(),
+            min: AUTHENTICATED_INPUT_HEADER_LEN,
+        });
+    }
+    if bytes[0] != AUTHENTICATED_INPUT_PROTOCOL_VERSION {
+        return Err(ProtoError::UnsupportedVersion(bytes[0]));
+    }
+    let event_type = EventType::try_from(bytes[1])?;
+    let payload_len = u16::from_be_bytes([bytes[2], bytes[3]]) as usize;
+    if bytes.len() != AUTHENTICATED_INPUT_HEADER_LEN + payload_len {
+        return Err(ProtoError::PayloadLengthMismatch {
+            declared: payload_len,
+            actual: bytes.len().saturating_sub(AUTHENTICATED_INPUT_HEADER_LEN),
+        });
+    }
+    let payload = &bytes[AUTHENTICATED_INPUT_HEADER_LEN..];
+    match event_type {
+        EventType::MouseButton if payload.len() == 2 && payload[1] > 1 => {
+            return Err(ProtoError::InvalidBoolean(payload[1]));
+        }
+        EventType::Key if payload.len() == 5 && payload[4] > 1 => {
+            return Err(ProtoError::InvalidBoolean(payload[4]));
+        }
+        _ => {}
+    }
+    let event = decode_event_payload(event_type, payload)?;
+    authenticated_input_scope(&event)?;
+    Ok(event)
 }
 
 fn expect_payload_len(
@@ -656,6 +773,12 @@ mod tests {
                 },
                 ChannelClass::Reliable,
             ),
+            (
+                ControlEvent::ReleaseAll {
+                    scope: AuthenticatedInputScope::Pointer,
+                },
+                ChannelClass::Reliable,
+            ),
         ];
 
         for (event, expected) in cases {
@@ -714,5 +837,201 @@ mod tests {
         let bytes = frame.encode();
         let decoded = Frame::decode(&bytes).expect("decode file mount");
         assert_eq!(decoded, frame);
+    }
+
+    #[test]
+    fn authenticated_input_codec_roundtrips_supported_events_and_derives_scope() {
+        let cases = [
+            (
+                ControlEvent::MouseMove { x: -100, y: 200 },
+                AuthenticatedInputScope::Pointer,
+            ),
+            (
+                ControlEvent::MouseButton {
+                    button: 2,
+                    pressed: true,
+                },
+                AuthenticatedInputScope::Pointer,
+            ),
+            (
+                ControlEvent::MouseWheel { delta: -120 },
+                AuthenticatedInputScope::Pointer,
+            ),
+            (
+                ControlEvent::MouseHorizontalWheel { delta: 120 },
+                AuthenticatedInputScope::Pointer,
+            ),
+            (
+                ControlEvent::Key {
+                    key: 0x41,
+                    pressed: false,
+                },
+                AuthenticatedInputScope::Keyboard,
+            ),
+            (
+                ControlEvent::ReleaseAll {
+                    scope: AuthenticatedInputScope::Pointer,
+                },
+                AuthenticatedInputScope::Pointer,
+            ),
+            (
+                ControlEvent::ReleaseAll {
+                    scope: AuthenticatedInputScope::Keyboard,
+                },
+                AuthenticatedInputScope::Keyboard,
+            ),
+        ];
+
+        for (event, expected_scope) in cases {
+            let first = encode_authenticated_input_event(&event).expect("encode input event");
+            let second = encode_authenticated_input_event(&event).expect("deterministic encoding");
+            assert_eq!(first, second);
+            assert!(first.len() <= AUTHENTICATED_INPUT_MAX_BYTES);
+            assert_eq!(
+                decode_authenticated_input_event(&first).expect("decode input event"),
+                event
+            );
+            assert_eq!(
+                authenticated_input_scope(&event).expect("derive input scope"),
+                expected_scope
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_input_codec_rejects_non_input_events() {
+        let event = ControlEvent::ClipboardSet {
+            mime: 1,
+            bytes: b"secret".to_vec(),
+        };
+
+        assert!(matches!(
+            encode_authenticated_input_event(&event),
+            Err(ProtoError::UnsupportedAuthenticatedInput(
+                EventType::ClipboardSet
+            ))
+        ));
+        assert!(matches!(
+            authenticated_input_scope(&event),
+            Err(ProtoError::UnsupportedAuthenticatedInput(
+                EventType::ClipboardSet
+            ))
+        ));
+
+        assert_eq!(
+            decode_authenticated_input_event(&[
+                AUTHENTICATED_INPUT_PROTOCOL_VERSION,
+                EventType::ClipboardGet as u8,
+                0,
+                0,
+            ]),
+            Err(ProtoError::UnsupportedAuthenticatedInput(
+                EventType::ClipboardGet
+            ))
+        );
+    }
+
+    #[test]
+    fn authenticated_input_decoder_rejects_trailing_bytes_and_noncanonical_booleans() {
+        let mut trailing =
+            encode_authenticated_input_event(&ControlEvent::MouseMove { x: 1, y: 2 })
+                .expect("encode pointer event");
+        trailing.push(0);
+        assert!(matches!(
+            decode_authenticated_input_event(&trailing),
+            Err(ProtoError::PayloadLengthMismatch { .. })
+        ));
+
+        let wrong_fixed_payload = [
+            AUTHENTICATED_INPUT_PROTOCOL_VERSION,
+            EventType::MouseMove as u8,
+            0,
+            4,
+            0,
+            0,
+            0,
+            1,
+        ];
+        assert_eq!(
+            decode_authenticated_input_event(&wrong_fixed_payload),
+            Err(ProtoError::InvalidEventPayloadLength {
+                event_type: EventType::MouseMove,
+                expected: 8,
+                actual: 4,
+            })
+        );
+
+        let mut invalid_button = encode_authenticated_input_event(&ControlEvent::MouseButton {
+            button: 1,
+            pressed: true,
+        })
+        .expect("encode button");
+        *invalid_button.last_mut().expect("button state byte") = 2;
+        assert_eq!(
+            decode_authenticated_input_event(&invalid_button),
+            Err(ProtoError::InvalidBoolean(2))
+        );
+
+        let mut invalid_key = encode_authenticated_input_event(&ControlEvent::Key {
+            key: 0x41,
+            pressed: false,
+        })
+        .expect("encode key");
+        *invalid_key.last_mut().expect("key state byte") = 0xFF;
+        assert_eq!(
+            decode_authenticated_input_event(&invalid_key),
+            Err(ProtoError::InvalidBoolean(0xFF))
+        );
+    }
+
+    #[test]
+    fn authenticated_input_decoder_rejects_wrong_version_unknown_type_and_oversize() {
+        let mut wrong_version = encode_authenticated_input_event(&ControlEvent::ReleaseAll {
+            scope: AuthenticatedInputScope::Pointer,
+        })
+        .expect("encode cleanup");
+        wrong_version[0] = AUTHENTICATED_INPUT_PROTOCOL_VERSION.wrapping_sub(1);
+        assert_eq!(
+            decode_authenticated_input_event(&wrong_version),
+            Err(ProtoError::UnsupportedVersion(
+                AUTHENTICATED_INPUT_PROTOCOL_VERSION.wrapping_sub(1)
+            ))
+        );
+
+        let mut unknown = encode_authenticated_input_event(&ControlEvent::ReleaseAll {
+            scope: AuthenticatedInputScope::Pointer,
+        })
+        .expect("encode cleanup");
+        unknown[1] = 0xFE;
+        assert_eq!(
+            decode_authenticated_input_event(&unknown),
+            Err(ProtoError::UnknownEventType(0xFE))
+        );
+
+        let oversize = vec![0; AUTHENTICATED_INPUT_MAX_BYTES + 1];
+        assert_eq!(
+            decode_authenticated_input_event(&oversize),
+            Err(ProtoError::AuthenticatedInputTooLarge {
+                actual: AUTHENTICATED_INPUT_MAX_BYTES + 1,
+                max: AUTHENTICATED_INPUT_MAX_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_frame_codec_roundtrips_release_all_for_cleanup_compatibility() {
+        let frame = Frame {
+            flags: 0,
+            seq: 77,
+            ts_us: 88,
+            event: ControlEvent::ReleaseAll {
+                scope: AuthenticatedInputScope::Keyboard,
+            },
+        };
+
+        assert_eq!(
+            Frame::decode(&frame.encode()).expect("decode cleanup"),
+            frame
+        );
     }
 }

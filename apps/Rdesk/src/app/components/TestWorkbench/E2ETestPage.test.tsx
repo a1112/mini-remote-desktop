@@ -433,14 +433,17 @@ describe("E2ETestPage LAN automation", () => {
 
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith(
-        "ipc_send_control_input",
+        "ipc_secure_remote",
         expect.objectContaining({
-          sessionId: expect.stringMatching(/^lan-e2e-agent-device-/),
-          event: {
-            kind: "mouse_move",
-            x: 1,
-            y: 1,
-          },
+          request: expect.objectContaining({
+            type: "SendControlInput",
+            session_id: expect.stringMatching(/^lan-e2e-agent-device-/),
+            event: {
+              kind: "mouse_move",
+              x: 1,
+              y: 1,
+            },
+          }),
         })
       );
     });
@@ -574,6 +577,117 @@ describe("E2ETestPage LAN automation", () => {
         })
       );
     });
+  });
+
+  it("autoruns the secure LAN remote display gate with bound evidence", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.secure_remote_display&targetDeviceId=agent-device&transport=quic&timeoutMs=2500&minDecodedFrames=2&minFps=5",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: {
+            type: "RequestRemoteSession",
+            request: expect.objectContaining({
+              target_device_id: "agent-device",
+              access_mode: "attended",
+              requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            }),
+          },
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "GetRemoteSession" }),
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "GetRouteEvidence" }),
+        })
+      );
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "ipc_secure_remote",
+        expect.objectContaining({
+          request: expect.objectContaining({ type: "ListTrustedDevices" }),
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "completed",
+            scenario_id: "cross.e2e.secure_remote_display",
+            report: expect.objectContaining({
+              status: "completed",
+              scenarioId: "cross.e2e.secure_remote_display",
+              auditEventIds: ["40", "41"],
+              secureSessionEvidence: {
+                trustedIdentityVerified: true,
+                authorizationGranted: true,
+                authorizationBasis: "consent",
+                scopeAuthorized: true,
+                selectedRoute: "lan_quic",
+                quicPeerAuthenticated: true,
+                realFramesVerified: true,
+                authorizedInputVerified: true,
+                cleanupCompleted: true,
+              },
+              controlInputAck: expect.objectContaining({ event_count: 1 }),
+            }),
+          }),
+        })
+      );
+    });
+  });
+
+  it("publishes a failed secure report when cleanup is disabled by autorun input", async () => {
+    const mockInvoke = installSuccessfulLanAutomationMock();
+
+    render(
+      <MemoryRouter
+        initialEntries={[
+          "/test/e2e?autorun=lan-e2e&scenario=cross.e2e.secure_remote_display&targetDeviceId=agent-device&transport=quic&stopOnComplete=false",
+        ]}
+      >
+        <E2ETestPage />
+      </MemoryRouter>
+    );
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "automation_write_report",
+        expect.objectContaining({
+          report: expect.objectContaining({
+            final_status: "failed",
+            report: expect.objectContaining({
+              status: "failed",
+              scenarioId: "cross.e2e.secure_remote_display",
+              failureReason: "runtime_error",
+            }),
+          }),
+        })
+      );
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "ipc_start_lan_remote_session",
+      expect.anything()
+    );
   });
 
   it("autoruns LAN remote display automation with HEVC profile metadata", async () => {
@@ -843,6 +957,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
           "quic_datagram_2k144",
           "quic_datagram_media_v2",
           "media_profile_control_v1",
+          "input_control_v2",
         ],
         protocol_version: 1,
         service_build_id: "test-build",
@@ -852,6 +967,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
           "nvenc_h264",
           "nvdec",
           "d3d11_native_render",
+          "control.keyboard_mouse",
         ],
         age_ms: 25,
         p2p_available: true,
@@ -871,9 +987,140 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
       }
       return Promise.resolve("started");
     }
-    if (command === "ipc_send_control_input") {
+    if (command === "ipc_secure_remote") {
+      const request = args?.request as Record<string, unknown> | undefined;
+      if (request?.type === "RequestRemoteSession") {
+        const sessionRequest = request.request as Record<string, unknown>;
+        const requestedProfile = sessionRequest.requested_profile as
+          | typeof activeProfile
+          | null
+          | undefined;
+        if (requestedProfile) {
+          activeProfile = requestedProfile;
+        }
+        return Promise.resolve({
+          type: "RemoteSessionRequested",
+          session: {
+            session_id: sessionRequest.session_id,
+            role: "controller",
+            peer_device_id: sessionRequest.target_device_id,
+            peer_key_id: "sha256:agent-device-key",
+            access_mode: "attended",
+            authorization_state: "granted",
+            route_state: "connected",
+            route_kind: "lan_quic",
+            media_state: "streaming",
+            presentation_state: "streaming",
+            requested_scopes: sessionRequest.requested_scopes,
+            granted_scopes: sessionRequest.requested_scopes,
+            policy_revision: "7",
+            failure: null,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            authorization_expires_at_ms: Date.now() + 60_000,
+          },
+        });
+      }
+      if (request?.type === "GetRemoteSession") {
+        return Promise.resolve({
+          type: "RemoteSession",
+          session: {
+            session_id: request.session_id,
+            role: "controller",
+            peer_device_id: "agent-device",
+            peer_key_id: "sha256:agent-device-key",
+            access_mode: "attended",
+            authorization_state: "granted",
+            route_state: "connected",
+            route_kind: "lan_quic",
+            media_state: "streaming",
+            presentation_state: "streaming",
+            requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            granted_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+            policy_revision: "7",
+            failure: null,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            authorization_expires_at_ms: Date.now() + 60_000,
+          },
+        });
+      }
+      if (request?.type === "GetRouteEvidence") {
+        return Promise.resolve({
+          type: "RouteEvidence",
+          evidence: {
+            session_id: request.session_id,
+            route_state: "connected",
+            selected_route: "lan_quic",
+            policy_revision: "7",
+            transport_fingerprint_sha256: `sha256:${"ab".repeat(32)}`,
+            candidates: [{ route: "lan_quic", state: "connected" }],
+            observed_at_ms: Date.now(),
+          },
+        });
+      }
+      if (request?.type === "ListTrustedDevices") {
+        return Promise.resolve({
+          type: "TrustedDeviceList",
+          devices: [
+            {
+              peer_key_id: "sha256:agent-device-key",
+              display_name: "Agent PC",
+              key_epoch: "1",
+              state: "trusted",
+              permission_ceiling: ["screen.view", "input.pointer", "input.keyboard"],
+              trust_revision: "3",
+              approved_at_ms: Date.now() - 10_000,
+              updated_at_ms: Date.now() - 1_000,
+            },
+          ],
+        });
+      }
+      if (request?.type === "GetAuditEventsV2") {
+        return Promise.resolve({
+          type: "AuditEventsV2",
+          page: {
+            events: [
+              {
+                sequence: "40",
+                timestamp_ms: Date.now(),
+                action: "session.start_lan",
+                outcome: "success",
+                session_id: (request.query as { session_id?: string } | undefined)?.session_id,
+                actor_device_id: "controller-device",
+                peer_device_id: "agent-device",
+                peer_key_id: null,
+                transport_kind: "lan_quic",
+                reason_code: null,
+                metadata: { requested_scopes: [], granted_scopes: [] },
+              },
+              {
+                sequence: "41",
+                timestamp_ms: Date.now(),
+                action: "session.stop",
+                outcome: "success",
+                session_id: (request.query as { session_id?: string } | undefined)?.session_id,
+                actor_device_id: "controller-device",
+                peer_device_id: "agent-device",
+                peer_key_id: null,
+                transport_kind: "lan_quic",
+                reason_code: null,
+                metadata: { requested_scopes: [], granted_scopes: [] },
+              },
+            ],
+            next_after_sequence: "41",
+            cursor_state: "current",
+            has_more: false,
+            chain_verified: true,
+          },
+        });
+      }
+      if (request?.type !== "SendControlInput") {
+        return Promise.resolve(null);
+      }
       return Promise.resolve({
-        session_id: args?.sessionId,
+        type: "ControlInputAccepted",
+        session_id: request.session_id,
         lane: "realtime",
         event_count: 1,
       });
@@ -940,7 +1187,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
               app_name: null,
             };
       return Promise.resolve({
-        session_id: "lan-e2e-agent-device-1000",
+        session_id: args?.sessionId,
         source: selectedSource,
         status: "selected",
         reason: null,
@@ -964,7 +1211,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
     if (command === "open_remote_display_window") {
       return Promise.resolve({
         label: "remote-display-1",
-        session_id: "lan-e2e-agent-device-1000",
+        session_id: args?.sessionId,
         surface_id: "surface-1",
         role: "controller",
         renderer_attached: true,
@@ -975,7 +1222,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
     }
     if (command === "ipc_session_snapshot") {
       return Promise.resolve({
-        session_id: "lan-e2e-agent-device-1000",
+        session_id: args?.sessionId,
         role: "controller",
         state: "streaming",
         transport_kind: "quic",
@@ -985,7 +1232,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
     }
     if (command === "ipc_probe_snapshot") {
       return Promise.resolve({
-        session_id: "lan-e2e-agent-device-1000",
+        session_id: args?.sessionId,
         frames_received: 25,
         frames_decoded: 25,
         frames_dropped: 0,
@@ -1006,7 +1253,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
     }
     if (command === "ipc_media_pipeline_snapshot") {
       return Promise.resolve({
-        session_id: "lan-e2e-agent-device-1000",
+        session_id: args?.sessionId,
         attached_surfaces: [
           {
             surface_id: "surface-1",
@@ -1018,6 +1265,7 @@ function installSuccessfulLanAutomationMock(options: { peer?: Record<string, unk
         active_renderer: "d3d11",
         queue_depth: 1,
         dropped_frames: 0,
+        render_presented_frames: 25,
         stage_metrics: [
           { stage: "decode", p50_ms: 0.8, p95_ms: 1.2 },
           { stage: "render_present", p50_ms: 5, p95_ms: 7 },

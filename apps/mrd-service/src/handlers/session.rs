@@ -6,11 +6,515 @@ use crate::app_state::AppState;
 use mrd_application::ports::{SessionLifecycleState, SessionSnapshot};
 use mrd_ipc::{
     ControlInputEvent, CrossE2EFaultInjectionResult, DisplayMode, IpcResponse, MediaProfile,
-    MediaTestImpairmentSnapshot,
+    MediaTestImpairmentSnapshot, RemoteAccessMode, RemoteAuthorizationState, RemoteFailure,
+    RemoteReasonCode, RemoteSessionRequest,
 };
 use mrd_proto::{DeviceId, SessionId};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Return the authoritative secure remote-session projection.
+pub async fn get_remote_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let session = app_state
+        .session_authorizations
+        .snapshot_at(&session_id, current_time_ms())
+        .await;
+    if session.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Denied
+                | RemoteAuthorizationState::Expired
+                | RemoteAuthorizationState::Revoked
+                | RemoteAuthorizationState::LockedOut
+                | RemoteAuthorizationState::PolicyChanged
+        )
+    }) {
+        crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    }
+    match session {
+        Some(session) => IpcResponse::RemoteSession { session },
+        None => IpcResponse::Error {
+            code: "E_REMOTE_SESSION_NOT_FOUND".to_string(),
+            message: format!("remote session not found: {}", session_id.0),
+        },
+    }
+}
+
+/// Return route evidence only when it is bound to the active verified session grant.
+pub async fn get_route_evidence(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let result = app_state
+        .session_authorizations
+        .verified_route_evidence_at(&session_id, current_time_ms())
+        .await;
+    let terminal = if result.is_err() {
+        app_state
+            .session_authorizations
+            .snapshot_at(&session_id, current_time_ms())
+            .await
+            .is_some_and(|snapshot| {
+                matches!(
+                    snapshot.authorization_state,
+                    RemoteAuthorizationState::Denied
+                        | RemoteAuthorizationState::Expired
+                        | RemoteAuthorizationState::Revoked
+                        | RemoteAuthorizationState::LockedOut
+                        | RemoteAuthorizationState::PolicyChanged
+                )
+            })
+    } else {
+        false
+    };
+    if terminal {
+        crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    }
+    match result {
+        Ok(Some(evidence)) => IpcResponse::RouteEvidence { evidence },
+        Ok(None) => IpcResponse::Error {
+            code: "E_REMOTE_SESSION_NOT_FOUND".to_string(),
+            message: format!("remote session not found: {}", session_id.0),
+        },
+        Err(failure) => IpcResponse::RemoteAccessError {
+            session_id: Some(session_id),
+            peer_key_id: None,
+            failure,
+        },
+    }
+}
+
+/// Resolve a single exact attended-consent request.
+pub async fn respond_to_consent(
+    app_state: &Arc<AppState>,
+    response: mrd_ipc::ConsentResponse,
+) -> IpcResponse {
+    let session_id = response.session_id.clone();
+    let approved_scope_count = response.approved_scopes.len();
+    let peer_device_id = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .map(|snapshot| snapshot.peer_device_id);
+    let result = app_state
+        .session_authorizations
+        .respond_to_consent_with_audit(response, current_time_ms(), |snapshot, response| {
+            let decision = match response.decision {
+                mrd_ipc::ConsentDecision::Approve => "approve",
+                mrd_ipc::ConsentDecision::Deny => "deny",
+            };
+            app_state
+                .audit_log
+                .record(
+                    "session.consent_decision",
+                    decision,
+                    Some(session_id.clone()),
+                    None,
+                    Some(snapshot.peer_device_id.clone()),
+                    Some("lan_quic".to_string()),
+                    (response.decision == mrd_ipc::ConsentDecision::Deny)
+                        .then(|| "consent_denied".to_string()),
+                    vec![(
+                        "approved_scope_count".to_string(),
+                        response.approved_scopes.len().to_string(),
+                    )],
+                )
+                .is_ok()
+        })
+        .await;
+    match result {
+        Ok(session) => IpcResponse::ConsentRecorded { session },
+        Err(crate::session_authorization::ConsentResolutionError::AuditUnavailable) => {
+            app_state.mark_security_unhealthy();
+            IpcResponse::Error {
+                code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+                message: "consent decision could not be durably audited".to_string(),
+            }
+        }
+        Err(crate::session_authorization::ConsentResolutionError::Rejected(failure)) => {
+            let failure_reason = crate::lan_discovery::remote_reason_code_wire_name(failure.code);
+            if app_state
+                .audit_log
+                .record(
+                    "session.consent_decision",
+                    "rejected",
+                    Some(session_id.clone()),
+                    None,
+                    peer_device_id,
+                    Some("lan_quic".to_string()),
+                    Some(failure_reason),
+                    vec![(
+                        "approved_scope_count".to_string(),
+                        approved_scope_count.to_string(),
+                    )],
+                )
+                .is_err()
+            {
+                app_state.mark_security_unhealthy();
+                return IpcResponse::Error {
+                    code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+                    message: "rejected consent decision could not be durably audited".to_string(),
+                };
+            }
+            IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id: None,
+                failure,
+            }
+        }
+    }
+}
+
+/// Fetch one bounded service-global remote-session event batch.
+pub async fn subscribe_session_events(
+    app_state: &Arc<AppState>,
+    query: mrd_ipc::SessionEventSubscriptionQuery,
+) -> IpcResponse {
+    match app_state.session_authorizations.subscribe(query).await {
+        Ok(subscription) => IpcResponse::SessionEventsSubscribed { subscription },
+        Err(failure) => IpcResponse::RemoteAccessError {
+            session_id: None,
+            peer_key_id: None,
+            failure,
+        },
+    }
+}
+
+/// Request a LAN remote session through the secure authorization pipeline.
+pub async fn request_remote_session(
+    app_state: &Arc<AppState>,
+    request: RemoteSessionRequest,
+) -> IpcResponse {
+    let session_id = request.session_id.clone();
+    if request.access_mode == RemoteAccessMode::Unattended {
+        return unattended_enrollment_unavailable(Some(session_id));
+    }
+    let peer_device_id = request.target_device_id.clone();
+    match crate::lan_discovery::request_lan_remote_session_authorized(
+        app_state,
+        &request.target_device_id,
+        &request.session_id,
+        "quic",
+        request.requested_profile,
+        request.access_mode,
+        request.requested_scopes,
+        None,
+    )
+    .await
+    {
+        Ok(_) => match app_state.session_authorizations.snapshot(&session_id).await {
+            Some(session) => IpcResponse::RemoteSessionRequested { session },
+            None => IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id: None,
+                failure: RemoteFailure {
+                    code: RemoteReasonCode::PolicyChanged,
+                    message: "authorized LAN session has no service snapshot".to_string(),
+                    suggested_action: Some("retry the connection".to_string()),
+                },
+            },
+        },
+        Err(error) => {
+            let mut secure_session = app_state.session_authorizations.snapshot(&session_id).await;
+            if let Some(session) = secure_session.as_ref() {
+                if let Some(failure) = session.failure.as_ref() {
+                    return IpcResponse::RemoteAccessError {
+                        session_id: Some(session_id.clone()),
+                        peer_key_id: Some(session.peer_key_id.clone()),
+                        failure: failure.clone(),
+                    };
+                }
+            }
+            let failure = map_lan_remote_session_error(&error, &peer_device_id);
+            if let Some(session) = secure_session.as_ref() {
+                let terminal_state =
+                    if session.authorization_state == mrd_ipc::RemoteAuthorizationState::Granted {
+                        mrd_ipc::RemoteAuthorizationState::Revoked
+                    } else {
+                        mrd_ipc::RemoteAuthorizationState::Denied
+                    };
+                secure_session = app_state
+                    .session_authorizations
+                    .record_failure(
+                        &session_id,
+                        terminal_state,
+                        failure.clone(),
+                        current_time_ms(),
+                    )
+                    .await;
+            }
+            IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id: secure_session.map(|session| session.peer_key_id),
+                failure,
+            }
+        }
+    }
+}
+
+fn map_lan_remote_session_error(error: &anyhow::Error, peer_device_id: &DeviceId) -> RemoteFailure {
+    let message = error.to_string();
+    let diagnostic = format!("{error:#}").to_ascii_lowercase();
+    let authorization_timeout = (diagnostic.contains("authorization")
+        || diagnostic.contains("consent"))
+        && (diagnostic.contains("timed out")
+            || diagnostic.contains("timeout")
+            || diagnostic.contains("expired"));
+    let protocol_reason =
+        crate::lan_discovery::LanProtocolError::remote_reason_code_from_diagnostic(&diagnostic);
+    let code = if let Some(code) = protocol_reason {
+        code
+    } else if diagnostic.contains("fingerprint")
+        || diagnostic.contains("identity")
+        || diagnostic.contains("signature")
+        || diagnostic.contains("public key")
+        || diagnostic.contains("key identifier")
+        || diagnostic.contains("key epoch")
+        || diagnostic.contains("certificate")
+    {
+        RemoteReasonCode::IdentityMismatch
+    } else if diagnostic.contains("trust")
+        || diagnostic.contains("not authenticated")
+        || diagnostic.contains("not trusted")
+    {
+        RemoteReasonCode::TrustRequired
+    } else if authorization_timeout {
+        RemoteReasonCode::AuthorizationTimeout
+    } else if diagnostic.contains("decoder") {
+        RemoteReasonCode::DecoderUnavailable
+    } else if diagnostic.contains("encoder") {
+        RemoteReasonCode::EncoderUnavailable
+    } else if diagnostic.contains("media profile")
+        || diagnostic.contains("media capabilities")
+        || diagnostic.contains("codec")
+    {
+        RemoteReasonCode::ProfileDowngraded
+    } else if diagnostic.contains("protocol")
+        || diagnostic.contains("signed")
+        || diagnostic.contains("bootstrap")
+        || diagnostic.contains("grant")
+        || diagnostic.contains("downgrade")
+        || diagnostic.contains("unexpected lan remote session response")
+    {
+        RemoteReasonCode::ProtocolDowngradeBlocked
+    } else {
+        RemoteReasonCode::LanUnreachable
+    };
+    let suggested_action = match code {
+        RemoteReasonCode::IdentityMismatch | RemoteReasonCode::CertificateBindingMismatch => {
+            Some("verify the peer identity and pair the device again".to_string())
+        }
+        RemoteReasonCode::TrustRequired => Some(format!(
+            "pair and trust {} before connecting",
+            peer_device_id.0
+        )),
+        RemoteReasonCode::AuthorizationTimeout => {
+            Some("ask the remote user to approve a new connection request".to_string())
+        }
+        RemoteReasonCode::ReplayDetected => Some("start a new secure session request".to_string()),
+        RemoteReasonCode::DecoderUnavailable
+        | RemoteReasonCode::EncoderUnavailable
+        | RemoteReasonCode::ProfileDowngraded => {
+            Some("choose a media profile supported by both devices".to_string())
+        }
+        RemoteReasonCode::ProtocolDowngradeBlocked => {
+            Some("update both devices to compatible secure LAN protocol versions".to_string())
+        }
+        _ => Some(format!(
+            "verify that {} is online and reachable on the LAN",
+            peer_device_id.0
+        )),
+    };
+    RemoteFailure {
+        code,
+        message,
+        suggested_action,
+    }
+}
+
+async fn finish_start_lan_remote_session_error(
+    app_state: &Arc<AppState>,
+    session_id: SessionId,
+    peer_device_id: &DeviceId,
+    error: anyhow::Error,
+) -> IpcResponse {
+    let mut failure = map_lan_remote_session_error(&error, peer_device_id);
+    let mut peer_key_id = None;
+    if let Some(session) = app_state.session_authorizations.snapshot(&session_id).await {
+        peer_key_id = Some(session.peer_key_id.clone());
+        if let Some(existing_failure) = session.failure {
+            failure = existing_failure;
+        } else {
+            let terminal_state =
+                if session.authorization_state == mrd_ipc::RemoteAuthorizationState::Granted {
+                    mrd_ipc::RemoteAuthorizationState::Revoked
+                } else {
+                    mrd_ipc::RemoteAuthorizationState::Denied
+                };
+            app_state
+                .session_authorizations
+                .record_failure(
+                    &session_id,
+                    terminal_state,
+                    failure.clone(),
+                    current_time_ms(),
+                )
+                .await;
+        }
+    }
+    IpcResponse::RemoteAccessError {
+        session_id: Some(session_id),
+        peer_key_id,
+        failure,
+    }
+}
+
+pub async fn enable_unattended_access(
+    app_state: &Arc<AppState>,
+    policy: mrd_ipc::UnattendedAccessPolicy,
+) -> IpcResponse {
+    if app_state
+        .audit_log
+        .record(
+            "unattended.enable",
+            "requested",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![(
+                "permission_scope_count".to_string(),
+                policy.permission_ceiling.len().to_string(),
+            )],
+        )
+        .is_err()
+    {
+        app_state.mark_security_unhealthy();
+        return IpcResponse::Error {
+            code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+            message: "unattended policy could not be audited".to_string(),
+        };
+    }
+    unattended_enrollment_unavailable(None)
+}
+
+pub async fn disable_unattended_access(
+    app_state: &Arc<AppState>,
+    expected_policy_revision: u64,
+) -> IpcResponse {
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    if !audit_unattended_mutation(app_state, "unattended.disable", expected_policy_revision) {
+        return security_audit_unavailable();
+    }
+    match app_state
+        .session_authorizations
+        .disable_unattended(expected_policy_revision, current_time_ms())
+        .await
+    {
+        Ok(access) => {
+            let revoked_session_ids = app_state
+                .session_authorizations
+                .revoke_unattended_authorizations(current_time_ms())
+                .await;
+            crate::lan_discovery::terminate_authorized_remote_sessions_under_security_gate(
+                app_state,
+                &revoked_session_ids,
+            )
+            .await;
+            IpcResponse::UnattendedAccessUpdated { access }
+        }
+        Err(failure) => unattended_result(Err(failure)),
+    }
+}
+
+pub async fn rotate_unattended_access(
+    app_state: &Arc<AppState>,
+    expected_policy_revision: u64,
+) -> IpcResponse {
+    if !audit_unattended_mutation(app_state, "unattended.rotate", expected_policy_revision) {
+        return security_audit_unavailable();
+    }
+    unattended_enrollment_unavailable(None)
+}
+
+fn unattended_enrollment_unavailable(session_id: Option<SessionId>) -> IpcResponse {
+    IpcResponse::RemoteAccessError {
+        session_id,
+        peer_key_id: None,
+        failure: RemoteFailure {
+            code: RemoteReasonCode::ProtocolDowngradeBlocked,
+            message: "unattended credential enrollment is unavailable in this service build"
+                .to_string(),
+            suggested_action: Some(
+                "use attended access until credential enrollment is available".to_string(),
+            ),
+        },
+    }
+}
+
+fn audit_unattended_mutation(
+    app_state: &Arc<AppState>,
+    action: &str,
+    expected_policy_revision: u64,
+) -> bool {
+    if app_state
+        .audit_log
+        .record(
+            action,
+            "requested",
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![(
+                "expected_policy_revision".to_string(),
+                expected_policy_revision.to_string(),
+            )],
+        )
+        .is_ok()
+    {
+        true
+    } else {
+        app_state.mark_security_unhealthy();
+        false
+    }
+}
+
+fn security_audit_unavailable() -> IpcResponse {
+    IpcResponse::Error {
+        code: "E_SECURITY_STORE_UNAVAILABLE".to_string(),
+        message: "security policy mutation could not be audited".to_string(),
+    }
+}
+
+fn unattended_result(
+    result: Result<mrd_ipc::UnattendedAccessSnapshot, mrd_ipc::RemoteFailure>,
+) -> IpcResponse {
+    match result {
+        Ok(access) => IpcResponse::UnattendedAccessUpdated { access },
+        Err(failure) => IpcResponse::RemoteAccessError {
+            session_id: None,
+            peer_key_id: None,
+            failure,
+        },
+    }
+}
+
+fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
 
 /// Handle session start request
 pub async fn start_session(
@@ -26,7 +530,22 @@ pub async fn start_session(
         transport_kind
     );
 
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    if app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_some()
+    {
+        return secure_legacy_bypass_error(session_id, "StartSession");
+    }
     let mut sessions = app_state.sessions.lock().await;
+    if sessions.get(&session_id).is_some() {
+        return IpcResponse::Error {
+            code: "E409".to_string(),
+            message: format!("Session already exists: {}", session_id.0),
+        };
+    }
     sessions.insert(
         session_id.clone(),
         SessionSnapshot {
@@ -50,7 +569,7 @@ pub async fn start_session(
     IpcResponse::SessionStarted { session_id }
 }
 
-/// Start a LAN P2P remote session and request auto-accept on the target peer.
+/// Start a LAN P2P remote session through attended authorization.
 pub async fn start_lan_remote_session(
     app_state: &Arc<AppState>,
     session_id: SessionId,
@@ -65,29 +584,6 @@ pub async fn start_lan_remote_session(
         transport_kind
     );
 
-    {
-        let mut sessions = app_state.sessions.lock().await;
-        sessions.insert(
-            session_id.clone(),
-            SessionSnapshot {
-                session_id: session_id.clone(),
-                transport: transport_kind.clone(),
-                source_device_id: None,
-                target_device_id: Some(target_device_id.clone()),
-                local_listen_addr: None,
-                local_server_name: None,
-                local_cert_der_b64: None,
-                remote_listen_addr: None,
-                remote_server_name: None,
-                remote_cert_der_b64: None,
-                lifecycle_state: SessionLifecycleState::Connecting,
-                last_error: None,
-                sender_active: false,
-                receiver_active: false,
-            },
-        );
-    }
-
     match crate::lan_discovery::request_lan_remote_session(
         app_state,
         &target_device_id,
@@ -97,39 +593,13 @@ pub async fn start_lan_remote_session(
     )
     .await
     {
-        Ok(_negotiation) => {
-            let mut sessions = app_state.sessions.lock().await;
-            if let Some(snapshot) = sessions.get(&session_id).cloned() {
-                sessions.insert(
-                    session_id.clone(),
-                    SessionSnapshot {
-                        lifecycle_state: SessionLifecycleState::Connected,
-                        last_error: None,
-                        ..snapshot
-                    },
-                );
-            }
-            IpcResponse::SessionStarted { session_id }
-        }
+        // The secure LAN flow already commits the compatibility snapshot with
+        // its authoritative Streaming state. Do not downgrade it back to
+        // Connected after the request completes.
+        Ok(_negotiation) => IpcResponse::SessionStarted { session_id },
         Err(error) => {
-            let message = error.to_string();
-            let mut sessions = app_state.sessions.lock().await;
-            if let Some(snapshot) = sessions.get(&session_id).cloned() {
-                sessions.insert(
-                    session_id.clone(),
-                    SessionSnapshot {
-                        lifecycle_state: SessionLifecycleState::Failed {
-                            message: message.clone(),
-                        },
-                        last_error: Some(message.clone()),
-                        ..snapshot
-                    },
-                );
-            }
-            IpcResponse::Error {
-                code: "E_LAN_REMOTE".to_string(),
-                message,
-            }
+            finish_start_lan_remote_session_error(app_state, session_id, &target_device_id, error)
+                .await
         }
     }
 }
@@ -201,6 +671,27 @@ pub async fn send_control_input(
     session_id: SessionId,
     event: ControlInputEvent,
 ) -> IpcResponse {
+    if let Some(secure_session) = app_state.session_authorizations.snapshot(&session_id).await {
+        let peer_key_id = Some(secure_session.peer_key_id);
+        return match crate::lan_discovery::request_authenticated_lan_control_input(
+            app_state,
+            &session_id,
+            event,
+        )
+        .await
+        {
+            Ok(result) => IpcResponse::ControlInputAccepted {
+                session_id,
+                lane: result.lane,
+                event_count: result.event_count,
+            },
+            Err(failure) => IpcResponse::RemoteAccessError {
+                session_id: Some(session_id),
+                peer_key_id,
+                failure,
+            },
+        };
+    }
     let route_to_peer = match {
         let sessions = app_state.sessions.lock().await;
         sessions.get(&session_id).cloned()
@@ -518,6 +1009,15 @@ pub async fn accept_session(
     session_id: SessionId,
     source_device_id: DeviceId,
 ) -> IpcResponse {
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    if app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_some()
+    {
+        return secure_legacy_bypass_error(session_id, "AcceptSession");
+    }
     tracing::info!(
         "Accepting session: {} from {}",
         session_id.0,
@@ -560,19 +1060,75 @@ pub async fn accept_session(
     IpcResponse::SessionAccepted { session_id }
 }
 
+fn secure_legacy_bypass_error(session_id: SessionId, operation: &str) -> IpcResponse {
+    IpcResponse::RemoteAccessError {
+        session_id: Some(session_id),
+        peer_key_id: None,
+        failure: RemoteFailure {
+            code: RemoteReasonCode::ProtocolDowngradeBlocked,
+            message: format!("{operation} cannot mutate a secure remote session"),
+            suggested_action: Some("use the secure remote-session IPC contract".to_string()),
+        },
+    }
+}
+
 /// Handle session stop request
 pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Stopping session: {}", session_id.0);
 
+    let authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    let secure_session_exists = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_some();
     let snapshot = {
         let sessions = app_state.sessions.lock().await;
         sessions.get(&session_id).cloned()
     };
+    if snapshot.is_none() && !secure_session_exists {
+        return IpcResponse::Error {
+            code: "E404".to_string(),
+            message: format!("Session not found: {}", session_id.0),
+        };
+    }
+    if let Some(snapshot) = snapshot.as_ref() {
+        release_control_input_for_terminal_session(
+            app_state,
+            &session_id,
+            snapshot,
+            secure_session_exists,
+            "stopping",
+        )
+        .await;
+    }
+    if secure_session_exists {
+        terminalize_secure_session(
+            app_state,
+            &session_id,
+            RemoteReasonCode::GrantRevoked,
+            "session stopped".to_string(),
+            None,
+        )
+        .await;
+    }
+    drop(authorization_security_guard);
 
+    if secure_session_exists {
+        crate::lan_discovery::terminate_authorized_remote_sessions(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    } else {
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .abort_session(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
+    }
     if let Some(snapshot) = snapshot {
-        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "stopping")
-            .await;
-
         let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
@@ -584,20 +1140,8 @@ pub async fn stop_session(app_state: &Arc<AppState>, session_id: SessionId) -> I
                 ..snapshot
             },
         );
-        drop(sessions);
-        app_state
-            .media_tasks
-            .lock()
-            .await
-            .abort_session(&session_id);
-        clear_session_media_state(app_state, &session_id).await;
-        return IpcResponse::SessionStopped { session_id };
     }
-
-    IpcResponse::Error {
-        code: "E404".to_string(),
-        message: format!("Session not found: {}", session_id.0),
-    }
+    IpcResponse::SessionStopped { session_id }
 }
 
 /// Handle session failure request.
@@ -608,15 +1152,59 @@ pub async fn fail_session(
 ) -> IpcResponse {
     tracing::warn!("Failing session: {} reason={}", session_id.0, reason);
 
+    let authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    let secure_session_exists = app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_some();
     let snapshot = {
         let sessions = app_state.sessions.lock().await;
         sessions.get(&session_id).cloned()
     };
+    if snapshot.is_none() && !secure_session_exists {
+        return IpcResponse::Error {
+            code: "E404".to_string(),
+            message: format!("Session not found: {}", session_id.0),
+        };
+    }
+    if let Some(snapshot) = snapshot.as_ref() {
+        release_control_input_for_terminal_session(
+            app_state,
+            &session_id,
+            snapshot,
+            secure_session_exists,
+            "failing",
+        )
+        .await;
+    }
+    if secure_session_exists {
+        terminalize_secure_session(
+            app_state,
+            &session_id,
+            RemoteReasonCode::RouteLost,
+            reason.clone(),
+            Some("retry the secure remote session".to_string()),
+        )
+        .await;
+    }
+    drop(authorization_security_guard);
 
+    if secure_session_exists {
+        crate::lan_discovery::terminate_authorized_remote_sessions(
+            app_state,
+            std::slice::from_ref(&session_id),
+        )
+        .await;
+    } else {
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .abort_session(&session_id);
+        clear_session_media_state(app_state, &session_id).await;
+    }
     if let Some(snapshot) = snapshot {
-        release_control_input_for_terminal_session(app_state, &session_id, &snapshot, "failing")
-            .await;
-
         let mut sessions = app_state.sessions.lock().await;
         sessions.insert(
             session_id.clone(),
@@ -630,24 +1218,34 @@ pub async fn fail_session(
                 ..snapshot
             },
         );
-        drop(sessions);
-        app_state
-            .media_tasks
-            .lock()
-            .await
-            .abort_session(&session_id);
-        clear_session_media_state(app_state, &session_id).await;
-
-        let mut shell = app_state.shell.lock().await;
-        shell.last_error = Some(reason);
-
-        return IpcResponse::SessionFailed { session_id };
     }
 
-    IpcResponse::Error {
-        code: "E404".to_string(),
-        message: format!("Session not found: {}", session_id.0),
-    }
+    let mut shell = app_state.shell.lock().await;
+    shell.last_error = Some(reason);
+
+    IpcResponse::SessionFailed { session_id }
+}
+
+async fn terminalize_secure_session(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    code: RemoteReasonCode,
+    message: String,
+    suggested_action: Option<String>,
+) {
+    let _ = app_state
+        .session_authorizations
+        .record_failure(
+            session_id,
+            mrd_ipc::RemoteAuthorizationState::Revoked,
+            RemoteFailure {
+                code,
+                message,
+                suggested_action,
+            },
+            current_time_ms(),
+        )
+        .await;
 }
 
 async fn clear_session_media_state(app_state: &Arc<AppState>, session_id: &SessionId) {
@@ -671,12 +1269,22 @@ async fn release_control_input_for_terminal_session(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     snapshot: &SessionSnapshot,
+    secure_session_exists: bool,
     action: &'static str,
 ) {
     let route_release_to_peer = snapshot.target_device_id.is_some()
         && snapshot.lifecycle_state == SessionLifecycleState::Streaming
         && snapshot.receiver_active;
-    let result = if route_release_to_peer {
+    let result = if route_release_to_peer && secure_session_exists {
+        crate::lan_discovery::request_authenticated_lan_control_input_under_security_gate(
+            app_state,
+            session_id,
+            ControlInputEvent::ReleaseAll,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|failure| anyhow::anyhow!(failure.message))
+    } else if route_release_to_peer {
         crate::lan_discovery::request_lan_control_input(
             app_state,
             session_id,
@@ -706,6 +1314,15 @@ async fn release_control_input_for_terminal_session(
 pub async fn recover_session(app_state: &Arc<AppState>, session_id: SessionId) -> IpcResponse {
     tracing::info!("Recovering session: {}", session_id.0);
 
+    let _authorization_security_guard = app_state.authorization_security_gate.lock().await;
+    if app_state
+        .session_authorizations
+        .snapshot(&session_id)
+        .await
+        .is_some()
+    {
+        return secure_legacy_bypass_error(session_id, "RecoverSession");
+    }
     let mut sessions = app_state.sessions.lock().await;
     if let Some(snapshot) = sessions.get(&session_id).cloned() {
         let lifecycle_state = recovery_state_for(&snapshot);
@@ -774,7 +1391,28 @@ pub async fn runtime_snapshot(app_state: &Arc<AppState>) -> IpcResponse {
             sessions: session_snapshots,
             device_id,
             is_registered: devices.is_registered(),
+            signaling: signaling_runtime_snapshot(&app_state.signaling_status.snapshot()),
         },
+    }
+}
+
+fn signaling_runtime_snapshot(
+    snapshot: &crate::signaling::SignalingRuntimeSnapshot,
+) -> mrd_ipc::SignalingRuntimeSnapshot {
+    let state = match snapshot.state {
+        crate::signaling::SignalingConnectionState::Disabled => "disabled",
+        crate::signaling::SignalingConnectionState::Connecting => "connecting",
+        crate::signaling::SignalingConnectionState::Authenticated => "authenticated",
+        crate::signaling::SignalingConnectionState::Backoff => "backoff",
+        crate::signaling::SignalingConnectionState::Stopped => "stopped",
+    };
+    mrd_ipc::SignalingRuntimeSnapshot {
+        state: state.into(),
+        reconnect_attempt: snapshot.reconnect_attempt,
+        next_retry_at_ms: snapshot.next_retry_at_ms,
+        last_connected_at_ms: snapshot.last_connected_at_ms,
+        last_message_at_ms: snapshot.last_message_at_ms,
+        last_error: snapshot.last_error.clone(),
     }
 }
 
@@ -863,6 +1501,52 @@ fn recovery_state_for(snapshot: &SessionSnapshot) -> SessionLifecycleState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrd_input::{InputError, InputEvent, InputInjector};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct SharedRecordingInputInjector {
+        events: Arc<StdMutex<Vec<InputEvent>>>,
+    }
+
+    impl InputInjector for SharedRecordingInputInjector {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(*event);
+            Ok(())
+        }
+    }
+
+    async fn begin_secure_outgoing_authorization(app_state: &Arc<AppState>, session_id: SessionId) {
+        let created_at_ms = current_time_ms();
+        app_state
+            .session_authorizations
+            .begin_outgoing(
+                crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+                    session_id,
+                    peer_device_id: DeviceId("secure-peer".to_string()),
+                    peer_key_id: "secure-peer-key".to_string(),
+                    peer_key_epoch: 1,
+                    access_mode: RemoteAccessMode::Attended,
+                    requested_scopes: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    peer_permission_ceiling: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    machine_permission_ceiling: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    runtime_capabilities: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    transport_kind: "quic".to_string(),
+                    request_nonce: [7; 16],
+                    created_at_ms,
+                    expires_at_ms: created_at_ms.saturating_add(60_000),
+                },
+            )
+            .await
+            .expect("secure outgoing authorization");
+    }
 
     #[tokio::test]
     async fn start_session_creates_session_in_registry() {
@@ -895,7 +1579,227 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_lan_remote_session_marks_missing_peer_failure() {
+    async fn start_session_rejects_secure_remote_session_bypass() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("secure-start-session".to_string());
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+
+        let response = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("legacy-target".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: returned_session_id,
+            failure,
+            ..
+        } = response
+        else {
+            panic!("expected secure legacy bypass error");
+        };
+        assert_eq!(returned_session_id, Some(session_id.clone()));
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_session_rechecks_secure_authorization_after_gate_contention() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("secure-accept-race".to_string());
+        let authorization_guard = app_state.authorization_security_gate.lock().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_state = app_state.clone();
+        let task_session_id = session_id.clone();
+        let mut accept_task = tokio::spawn(async move {
+            started_tx.send(()).expect("signal accept task start");
+            accept_session(
+                &task_state,
+                task_session_id,
+                DeviceId("legacy-source".to_string()),
+            )
+            .await
+        });
+
+        started_rx.await.expect("accept task started");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut accept_task)
+                .await
+                .is_err(),
+            "AcceptSession must serialize with secure authorization admission"
+        );
+
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+        drop(authorization_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), accept_task)
+            .await
+            .expect("AcceptSession resumed after authorization gate release")
+            .expect("AcceptSession task completed");
+        let IpcResponse::RemoteAccessError { failure, .. } = response else {
+            panic!("expected secure legacy bypass error");
+        };
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        assert!(app_state.sessions.lock().await.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_session_holds_authorization_gate_through_legacy_mutation() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("legacy-accept-gate-symmetry".to_string());
+        let sessions_guard = app_state.sessions.lock().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_state = app_state.clone();
+        let task_session_id = session_id.clone();
+        let accept_task = tokio::spawn(async move {
+            started_tx.send(()).expect("signal accept task start");
+            accept_session(
+                &task_state,
+                task_session_id,
+                DeviceId("legacy-source".to_string()),
+            )
+            .await
+        });
+
+        started_rx.await.expect("accept task started");
+        let gate_was_held = tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            loop {
+                match app_state.authorization_security_gate.try_lock() {
+                    Ok(guard) => drop(guard),
+                    Err(_) => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            gate_was_held,
+            "AcceptSession must retain the authorization gate while waiting to mutate sessions"
+        );
+
+        drop(sessions_guard);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), accept_task)
+            .await
+            .expect("AcceptSession completed after session registry release")
+            .expect("AcceptSession task completed");
+        assert!(matches!(response, IpcResponse::SessionAccepted { .. }));
+        assert!(app_state.authorization_security_gate.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_remote_session_expires_a_grant_even_without_a_media_task() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("secure-snapshot-expiry".to_string());
+        let injected = Arc::new(StdMutex::new(Vec::new()));
+        *app_state.control_input().lock().await =
+            crate::control_input::ControlInputRegistry::with_injector(
+                SharedRecordingInputInjector {
+                    events: Arc::clone(&injected),
+                },
+            );
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+        let issued_at_ms = current_time_ms();
+        app_state
+            .session_authorizations
+            .install_verified_grant(
+                crate::session_authorization::VerifiedSessionGrant {
+                    grant_id: "snapshot-expiry-grant".to_string(),
+                    session_id: session_id.clone(),
+                    granted_scopes: vec![mrd_ipc::RemotePermissionScope::ScreenView],
+                    issued_at_ms,
+                    expires_at_ms: issued_at_ms.saturating_add(1),
+                    policy_revision: 1,
+                    route_constraint: "quic".to_string(),
+                    transport_fingerprint_sha256: [0x71; 32],
+                },
+                issued_at_ms,
+            )
+            .await
+            .expect("short-lived grant");
+        app_state
+            .control_input()
+            .lock()
+            .await
+            .handle_session_event(
+                &session_id,
+                &ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
+            .expect("key down before grant expiry");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let IpcResponse::RemoteSession { session } =
+            get_remote_session(&app_state, session_id).await
+        else {
+            panic!("expected authoritative remote session snapshot");
+        };
+        assert_eq!(
+            session.authorization_state,
+            mrd_ipc::RemoteAuthorizationState::Expired
+        );
+        assert_eq!(
+            session.failure.as_ref().map(|failure| failure.code),
+            Some(RemoteReasonCode::GrantExpired)
+        );
+        assert_eq!(
+            injected
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            &[
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: true,
+                },
+                InputEvent::Key {
+                    key: mrd_input::InputKey::VirtualKey(0x41),
+                    pressed: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_start_session_returns_conflict_without_overwriting() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("duplicate-start-session".to_string());
+        let original_target = DeviceId("original-target".to_string());
+        let _ = start_session(
+            &app_state,
+            session_id.clone(),
+            original_target.clone(),
+            "quic".to_string(),
+        )
+        .await;
+
+        let response = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("replacement-target".to_string()),
+            "webrtc".to_string(),
+        )
+        .await;
+
+        let IpcResponse::Error { code, message } = response else {
+            panic!("expected duplicate-session conflict");
+        };
+        assert_eq!(code, "E409");
+        assert!(message.contains(&session_id.0));
+        let sessions = app_state.sessions.lock().await;
+        let stored = sessions
+            .get(&session_id)
+            .expect("original session retained");
+        assert_eq!(stored.target_device_id, Some(original_target));
+        assert_eq!(stored.transport, "quic");
+    }
+
+    #[tokio::test]
+    async fn start_lan_remote_session_rejects_missing_peer_without_session_side_effects() {
         let app_state = Arc::new(AppState::new());
         app_state
             .devices
@@ -913,21 +1817,68 @@ mod tests {
         )
         .await;
 
-        match response {
-            IpcResponse::Error { code, message } => {
-                assert_eq!(code, "E_LAN_REMOTE");
-                assert!(message.contains("missing-peer"));
-            }
-            _ => panic!("Expected LAN remote error response"),
-        }
+        let IpcResponse::RemoteAccessError {
+            session_id: failed_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("expected typed LAN remote error response");
+        };
+        assert_eq!(failed_session_id, Some(session_id.clone()));
+        assert_eq!(peer_key_id, None);
+        assert_eq!(failure.code, RemoteReasonCode::TrustRequired);
+        assert!(failure.message.contains("missing-peer"));
 
         let sessions = app_state.sessions.lock().await;
-        let stored = sessions.get(&session_id).expect("failed LAN session");
-        assert!(matches!(
-            stored.lifecycle_state,
-            SessionLifecycleState::Failed { .. }
-        ));
-        assert!(stored.last_error.is_some());
+        assert!(sessions.get(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn start_lan_remote_session_error_terminalizes_admitted_authorization() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("failed-admitted-lan-session".to_string());
+        let peer_device_id = DeviceId("secure-peer".to_string());
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+
+        let response = finish_start_lan_remote_session_error(
+            &app_state,
+            session_id.clone(),
+            &peer_device_id,
+            anyhow::anyhow!("LAN remote request timed out"),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: failed_session_id,
+            peer_key_id,
+            failure,
+        } = response
+        else {
+            panic!("expected typed LAN start error response");
+        };
+        assert_eq!(failed_session_id, Some(session_id.clone()));
+        assert_eq!(peer_key_id.as_deref(), Some("secure-peer-key"));
+        assert_eq!(failure.code, RemoteReasonCode::LanUnreachable);
+        assert!(failure.message.contains("timed out"));
+        let authorization = app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("terminal outgoing authorization");
+        assert_eq!(
+            authorization.authorization_state,
+            mrd_ipc::RemoteAuthorizationState::Denied
+        );
+        assert_eq!(
+            authorization.presentation_state,
+            mrd_ipc::RemotePresentationState::Failed
+        );
+        assert_eq!(
+            authorization.failure.as_ref().map(|failure| failure.code),
+            Some(RemoteReasonCode::LanUnreachable)
+        );
+        assert!(authorization.granted_scopes.is_empty());
     }
 
     #[tokio::test]
@@ -1041,6 +1992,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_session_revokes_authorization_only_session_and_terminates_media() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("authorization-only-stop".to_string());
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+        let media_task = tokio::spawn(std::future::pending::<()>());
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .register(session_id.clone(), media_task.abort_handle());
+
+        let response = stop_session(&app_state, session_id.clone()).await;
+
+        assert!(matches!(response, IpcResponse::SessionStopped { .. }));
+        let authorization = app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("authorization retained for diagnostics");
+        assert_eq!(
+            authorization.authorization_state,
+            mrd_ipc::RemoteAuthorizationState::Revoked
+        );
+        assert_eq!(
+            authorization.failure.map(|failure| failure.code),
+            Some(RemoteReasonCode::GrantRevoked)
+        );
+        tokio::task::yield_now().await;
+        assert!(media_task.is_finished(), "authorization media must stop");
+    }
+
+    #[tokio::test]
     async fn stop_session_releases_active_control_input() {
         let app_state = Arc::new(AppState::new());
         app_state
@@ -1074,10 +2057,13 @@ mod tests {
             .control_input()
             .lock()
             .await
-            .handle_event(&mrd_ipc::ControlInputEvent::Key {
-                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
-                pressed: true,
-            })
+            .handle_session_event(
+                &session_id,
+                &mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
             .expect("key down");
 
         let response = stop_session(&app_state, session_id.clone()).await;
@@ -1122,10 +2108,13 @@ mod tests {
             .control_input()
             .lock()
             .await
-            .handle_event(&mrd_ipc::ControlInputEvent::Key {
-                key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
-                pressed: true,
-            })
+            .handle_session_event(
+                &session_id,
+                &mrd_ipc::ControlInputEvent::Key {
+                    key: mrd_ipc::ControlInputKey::VirtualKey { code: 0x41 },
+                    pressed: true,
+                },
+            )
             .expect("key down");
 
         let response =
@@ -1135,6 +2124,42 @@ mod tests {
         let snapshot = app_state.control_input().lock().await.snapshot(session_id);
         assert_eq!(snapshot.reliable.accepted_messages, 2);
         assert_eq!(snapshot.reliable.injected_messages, 2);
+    }
+
+    #[tokio::test]
+    async fn fail_session_terminalizes_authorization_only_session_and_terminates_media() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("authorization-only-fail".to_string());
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+        let media_task = tokio::spawn(std::future::pending::<()>());
+        app_state
+            .media_tasks
+            .lock()
+            .await
+            .register(session_id.clone(), media_task.abort_handle());
+
+        let response = fail_session(
+            &app_state,
+            session_id.clone(),
+            "route handshake failed".to_string(),
+        )
+        .await;
+
+        assert!(matches!(response, IpcResponse::SessionFailed { .. }));
+        let authorization = app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .expect("authorization retained for diagnostics");
+        assert_eq!(
+            authorization.authorization_state,
+            mrd_ipc::RemoteAuthorizationState::Revoked
+        );
+        let failure = authorization.failure.expect("terminal failure");
+        assert_eq!(failure.code, RemoteReasonCode::RouteLost);
+        assert_eq!(failure.message, "route handshake failed");
+        tokio::task::yield_now().await;
+        assert!(media_task.is_finished(), "authorization media must stop");
     }
 
     #[tokio::test]
@@ -1357,5 +2382,185 @@ mod tests {
         let stored = sessions.get(&session_id).expect("recovered session");
         assert_eq!(stored.lifecycle_state, SessionLifecycleState::Connecting);
         assert!(stored.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_session_rejects_secure_remote_session_bypass() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("secure-recover-session".to_string());
+        let _ = start_session(
+            &app_state,
+            session_id.clone(),
+            DeviceId("secure-peer".to_string()),
+            "quic".to_string(),
+        )
+        .await;
+        let _ = fail_session(&app_state, session_id.clone(), "route lost".to_string()).await;
+        begin_secure_outgoing_authorization(&app_state, session_id.clone()).await;
+
+        let response = recover_session(&app_state, session_id.clone()).await;
+
+        let IpcResponse::RemoteAccessError { failure, .. } = response else {
+            panic!("expected secure legacy bypass error");
+        };
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+        let sessions = app_state.sessions.lock().await;
+        assert!(matches!(
+            sessions
+                .get(&session_id)
+                .expect("legacy diagnostic projection retained")
+                .lifecycle_state,
+            SessionLifecycleState::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_trust_failures() {
+        let failure = map_lan_remote_session_error(
+            &anyhow::anyhow!("LAN peer is not authenticated and trusted"),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(failure.code, RemoteReasonCode::TrustRequired);
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_protocol_failures() {
+        let failure = map_lan_remote_session_error(
+            &anyhow::anyhow!("signed LAN bootstrap has unsupported protocol version"),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(failure.code, RemoteReasonCode::ProtocolDowngradeBlocked);
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_identity_failures() {
+        let failure = map_lan_remote_session_error(
+            &anyhow::anyhow!("LAN QUIC certificate fingerprint does not match signed bootstrap"),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(failure.code, RemoteReasonCode::IdentityMismatch);
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_identity_protocol_errors() {
+        for error in [
+            crate::lan_discovery::LanProtocolError::InvalidKeyBinding,
+            crate::lan_discovery::LanProtocolError::InvalidKeyEpoch,
+            crate::lan_discovery::LanProtocolError::InvalidSignature,
+            crate::lan_discovery::LanProtocolError::PeerBindingMismatch,
+        ] {
+            let failure = map_lan_remote_session_error(
+                &anyhow::Error::new(error),
+                &DeviceId("peer".to_string()),
+            );
+            assert_eq!(
+                failure.code,
+                RemoteReasonCode::IdentityMismatch,
+                "{} must be classified as an identity failure",
+                error
+            );
+        }
+
+        let certificate_failure = map_lan_remote_session_error(
+            &anyhow::Error::new(
+                crate::lan_discovery::LanProtocolError::CertificateFingerprintMismatch,
+            ),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(
+            certificate_failure.code,
+            RemoteReasonCode::CertificateBindingMismatch
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_start_lan_error_preserves_typed_certificate_failure() {
+        let app_state = Arc::new(AppState::new());
+        let session_id = SessionId("certificate-session".to_string());
+
+        let response = finish_start_lan_remote_session_error(
+            &app_state,
+            session_id.clone(),
+            &DeviceId("peer".to_string()),
+            anyhow::Error::new(
+                crate::lan_discovery::LanProtocolError::CertificateFingerprintMismatch,
+            ),
+        )
+        .await;
+
+        let IpcResponse::RemoteAccessError {
+            session_id: actual_session_id,
+            failure,
+            ..
+        } = response
+        else {
+            panic!("expected typed remote-access failure");
+        };
+        assert_eq!(actual_session_id, Some(session_id));
+        assert_eq!(failure.code, RemoteReasonCode::CertificateBindingMismatch);
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_nonce_protocol_error_as_replay() {
+        let error = crate::lan_discovery::LanProtocolError::InvalidNonce;
+        let failure =
+            map_lan_remote_session_error(&anyhow::Error::new(error), &DeviceId("peer".to_string()));
+        assert_eq!(failure.code, RemoteReasonCode::ReplayDetected);
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_remaining_protocol_errors_as_downgrade_blocked() {
+        for error in [
+            crate::lan_discovery::LanProtocolError::PayloadEncoding,
+            crate::lan_discovery::LanProtocolError::SigningFailed,
+            crate::lan_discovery::LanProtocolError::InvalidNamespace,
+            crate::lan_discovery::LanProtocolError::UnsupportedProtocol,
+            crate::lan_discovery::LanProtocolError::InvalidPayload,
+            crate::lan_discovery::LanProtocolError::InvalidLifetime,
+            crate::lan_discovery::LanProtocolError::NotYetValid,
+            crate::lan_discovery::LanProtocolError::Expired,
+            crate::lan_discovery::LanProtocolError::CapabilityMismatch,
+            crate::lan_discovery::LanProtocolError::InvalidBootstrap,
+        ] {
+            let failure = map_lan_remote_session_error(
+                &anyhow::Error::new(error),
+                &DeviceId("peer".to_string()),
+            );
+            assert_eq!(
+                failure.code,
+                RemoteReasonCode::ProtocolDowngradeBlocked,
+                "{} must be classified as a secure protocol failure",
+                error
+            );
+        }
+    }
+
+    #[test]
+    fn lan_error_mapping_classifies_media_profile_failures() {
+        let failure = map_lan_remote_session_error(
+            &anyhow::anyhow!("LAN peer does not advertise required media capabilities for av1"),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(failure.code, RemoteReasonCode::ProfileDowngraded);
+    }
+
+    #[test]
+    fn lan_error_mapping_distinguishes_authorization_timeout() {
+        let failure = map_lan_remote_session_error(
+            &anyhow::anyhow!("LAN authorization timed out waiting for local consent"),
+            &DeviceId("peer".to_string()),
+        );
+        assert_eq!(failure.code, RemoteReasonCode::AuthorizationTimeout);
+    }
+
+    #[test]
+    fn lan_error_mapping_keeps_route_timeout_and_unknown_io_unreachable() {
+        for error in [
+            anyhow::anyhow!("LAN remote request timed out"),
+            anyhow::anyhow!("failed to bind LAN remote request UDP socket"),
+        ] {
+            let failure = map_lan_remote_session_error(&error, &DeviceId("peer".to_string()));
+            assert_eq!(failure.code, RemoteReasonCode::LanUnreachable);
+        }
     }
 }

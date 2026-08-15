@@ -329,6 +329,47 @@ fn media_pipeline_registry_exposes_stage_metrics() {
 }
 
 #[test]
+fn media_pipeline_registry_exposes_authenticated_agent_render_boundary() {
+    let mut registry = MediaPipelineRegistry::default();
+    let session_id = SessionId("agent-render-metrics".into());
+    registry.set_agent_render_boundary(
+        session_id.clone(),
+        mrd_agent_ipc::RenderBoundaryMetrics {
+            context: mrd_agent_ipc::AgentEventContext {
+                registration_id: [1; 16],
+                registration_epoch: 1,
+                windows_session_id: 7,
+                desktop_epoch: 1,
+                sequence: 1,
+                observed_at_ms: 1,
+            },
+            resource_id: [2; 16],
+            session_id: session_id.0.clone(),
+            decoder_backend: "nvdec_d3d11_shared".into(),
+            enqueued_units: 100,
+            queue_replacements: 2,
+            decoded_frames: 98,
+            presented_frames: 97,
+        },
+    );
+
+    let snapshot = registry.snapshot(&session_id);
+    assert_eq!(
+        snapshot.active_renderer.as_deref(),
+        Some("session_agent_d3d11")
+    );
+    assert_eq!(
+        snapshot.active_decoder.as_deref(),
+        Some("nvdec_d3d11_shared")
+    );
+    assert_eq!(snapshot.render_presented_frames, 97);
+    assert_eq!(snapshot.render_queue_replacements, 2);
+    let boundary = snapshot.agent_render_boundary.expect("agent boundary");
+    assert_eq!(boundary.enqueued_units, 100);
+    assert_eq!(boundary.decoded_frames, 98);
+}
+
+#[test]
 fn media_pipeline_registry_removes_stable_clock_skew_from_relative_frame_age() {
     let mut registry = MediaPipelineRegistry::default();
     let session_id = SessionId("relative-frame-age-session".to_string());

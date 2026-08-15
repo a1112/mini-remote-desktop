@@ -375,6 +375,48 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
     $row | Add-Member -Force -NotePropertyName "requested_hdr_enabled" -NotePropertyValue $HdrEnabled
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_id" -NotePropertyValue $(if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null })
     $row | Add-Member -Force -NotePropertyName "requested_capture_source_kind" -NotePropertyValue $(if ($CaptureSourceKind.Trim()) { $CaptureSourceKind.Trim() } else { $null })
+
+    if ($ScenarioId -eq "cross.e2e.secure_remote_display") {
+      $qualityDir = Join-Path $OutputRoot "quality/secure-lan"
+      New-Item -ItemType Directory -Force -Path $qualityDir | Out-Null
+      $artifactPath = Join-Path $qualityDir "$($Profile.id).artifact.json"
+      $evaluationPath = Join-Path $qualityDir "$($Profile.id).evaluation.json"
+      $qualityVerdict = $null
+      $qualityExitCode = $null
+
+      try {
+        $artifact = Convert-SecureLanReportToQualityArtifact `
+          -Report $report `
+          -RunId "secure-lan-$GitCommit-$($Profile.id)"
+        Write-CanaryUtf8Json -InputObject $artifact -Path $artifactPath
+        Remove-Item -LiteralPath $evaluationPath -Force -ErrorAction SilentlyContinue
+
+        & cargo run -p mrd-quality-gate --bin mrd-quality-gate -- `
+          --artifact $artifactPath `
+          --policy $script:SecureLanPositivePolicyPath `
+          --output $evaluationPath
+        $qualityExitCode = $LASTEXITCODE
+
+        if (Test-Path -LiteralPath $evaluationPath -PathType Leaf) {
+          $qualityEvaluation = Get-Content -LiteralPath $evaluationPath -Raw | ConvertFrom-Json
+          $qualityVerdict = [string]$qualityEvaluation.verdict
+        }
+        if ($qualityExitCode -ne 0 -or $qualityVerdict -ne "PASS") {
+          $row.status = "failed"
+          $row.classification = "security_verification_failed"
+          $row.error_message = "Secure LAN quality policy did not pass (exit=$qualityExitCode, verdict=$qualityVerdict)"
+        }
+      } catch {
+        $row.status = "failed"
+        $row.classification = "security_verification_failed"
+        $row.error_message = "Secure LAN quality evidence failed: $($_.Exception.Message)"
+      }
+
+      $row | Add-Member -Force -NotePropertyName "secure_quality_artifact" -NotePropertyValue $artifactPath
+      $row | Add-Member -Force -NotePropertyName "secure_quality_evaluation" -NotePropertyValue $evaluationPath
+      $row | Add-Member -Force -NotePropertyName "secure_quality_verdict" -NotePropertyValue $qualityVerdict
+      $row | Add-Member -Force -NotePropertyName "secure_quality_exit_code" -NotePropertyValue $qualityExitCode
+    }
     $row
   } finally {
     Restore-EnvVars $savedEnv
@@ -385,8 +427,9 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
 }
 
 $repo = Resolve-RepoPath $RepoRoot
-$outputRoot = Join-Path $repo $OutputDir
+$outputRoot = Resolve-BenchmarkPath -RepoRoot $repo -Path $OutputDir
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
+$script:SecureLanPositivePolicyPath = Join-Path $repo "tests/quality-gates/policies/windows-secure-lan.v1.json"
 $gitCommit = (git -C $repo rev-parse --short=12 HEAD).Trim()
 $profiles = Get-PairedLanCanaryProfiles -DurationSecs $DurationSecs -BitrateMbps $BitrateMbps
 if ($ProfileId -and $ProfileId.Count -gt 0) {
@@ -404,6 +447,7 @@ if ($ProfileId -and $ProfileId.Count -gt 0) {
 
 $allowedScenarios = @(
   "cross.e2e.remote_display_smoke",
+  "cross.e2e.secure_remote_display",
   "cross.e2e.media_profile",
   "cross.e2e.input_control",
   "cross.fault.recovery"
@@ -420,6 +464,12 @@ if ($requestedScenarios.Count -eq 0) {
 $unknownScenarios = @($requestedScenarios | Where-Object { $allowedScenarios -notcontains $_ })
 if ($unknownScenarios.Count -gt 0) {
   throw "Unsupported paired LAN canary scenario(s): $($unknownScenarios -join ', ')"
+}
+if (
+  $requestedScenarios -contains "cross.e2e.secure_remote_display" -and
+  -not (Test-Path -LiteralPath $script:SecureLanPositivePolicyPath -PathType Leaf)
+) {
+  throw "Secure LAN positive policy not found: $script:SecureLanPositivePolicyPath"
 }
 
 if (-not $NoBuild) {
@@ -475,6 +525,9 @@ $crossReport | Add-Member -Force -NotePropertyName "codec_request" -NoteProperty
 $crossReport | Add-Member -Force -NotePropertyName "scenario_ids" -NotePropertyValue $requestedScenarios
 $crossReport | Add-Member -Force -NotePropertyName "render_max_fps_override" -NotePropertyValue $(if ($RenderMaxFps -gt 0) { $RenderMaxFps } else { $null })
 $comparisonRows = @(Compare-PairedLanCanaryRows -LocalRows $localRows -CrossRows $crossRows -RatioThreshold $RatioThreshold)
+$gate = Get-PairedLanCanaryGate -Rows (@($localRows) + @($crossRows)) -ComparisonRows $comparisonRows
+$localReport | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue $gate
+$crossReport | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue $gate
 
 Write-CanaryJsonAndMarkdown -Report $localReport -JsonPath (Join-Path $outputRoot "local-canary-report.json") -MarkdownPath (Join-Path $outputRoot "local-canary-report.md") -Title "Local Canary Report"
 Write-CanaryJsonAndMarkdown -Report $crossReport -JsonPath (Join-Path $outputRoot "cross-device-canary-report.json") -MarkdownPath (Join-Path $outputRoot "cross-device-canary-report.md") -Title "Cross-Device Canary Report"
@@ -482,3 +535,7 @@ ConvertTo-Json -InputObject $comparisonRows -Depth 16 | Set-Content -Path (Join-
 Write-PairedLanComparisonMarkdown -Rows $comparisonRows -MarkdownPath (Join-Path $outputRoot "matrix-comparison-report.md") -GitCommit $gitCommit
 
 Write-Host "Paired LAN canary reports written to $outputRoot"
+if (-not $gate.passed) {
+  Write-Error ("Paired LAN canary gate failed: " + (($gate.failures | ForEach-Object { "$($_.id):$($_.reason)" }) -join ", "))
+  exit 2
+}

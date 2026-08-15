@@ -1,16 +1,38 @@
 use mrd_proto::SessionId;
 use std::collections::HashMap;
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, Id};
 
 /// Runtime media tasks keyed by session.
 #[derive(Default)]
 pub struct MediaTaskRegistry {
     tasks: HashMap<SessionId, Vec<AbortHandle>>,
+    successful_registration_count: u64,
 }
 
 impl MediaTaskRegistry {
     pub fn register(&mut self, session_id: SessionId, abort_handle: AbortHandle) {
+        if abort_handle.is_finished() {
+            return;
+        }
         self.tasks.entry(session_id).or_default().push(abort_handle);
+        self.successful_registration_count = self.successful_registration_count.saturating_add(1);
+    }
+
+    pub fn successful_registration_count(&self) -> u64 {
+        self.successful_registration_count
+    }
+
+    pub fn forget_task(&mut self, session_id: &SessionId, task_id: Id) -> bool {
+        let Some(handles) = self.tasks.get_mut(session_id) else {
+            return false;
+        };
+        let original_len = handles.len();
+        handles.retain(|handle| handle.id() != task_id);
+        let removed = handles.len() != original_len;
+        if handles.is_empty() {
+            self.tasks.remove(session_id);
+        }
+        removed
     }
 
     pub fn abort_session(&mut self, session_id: &SessionId) -> usize {
@@ -48,5 +70,59 @@ mod tests {
 
         assert!(first.await.unwrap_err().is_cancelled());
         assert!(second.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn completed_tasks_are_not_registered_and_forget_task_preserves_other_handles() {
+        let session_id = SessionId("completed-media-session".to_string());
+        let mut registry = MediaTaskRegistry::default();
+        let already_finished = tokio::spawn(async {});
+        let already_finished_handle = already_finished.abort_handle();
+        already_finished.await.expect("second completed task");
+
+        registry.register(session_id.clone(), already_finished_handle);
+        assert_eq!(registry.active_count(&session_id), 0);
+
+        let forgotten = tokio::spawn(async { std::future::pending::<()>().await });
+        let retained = tokio::spawn(async { std::future::pending::<()>().await });
+        registry.register(session_id.clone(), forgotten.abort_handle());
+        registry.register(session_id.clone(), retained.abort_handle());
+        assert_eq!(registry.active_count(&session_id), 2);
+        assert!(registry.forget_task(&session_id, forgotten.id()));
+        assert_eq!(registry.active_count(&session_id), 1);
+        assert!(!forgotten.is_finished());
+        assert!(!retained.is_finished());
+
+        assert_eq!(registry.abort_session(&session_id), 1);
+        assert!(retained.await.unwrap_err().is_cancelled());
+
+        forgotten.abort();
+        assert!(forgotten.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn successful_registration_count_is_monotonic_after_forget_and_abort() {
+        let session_id = SessionId("registration-count-session".to_string());
+        let mut registry = MediaTaskRegistry::default();
+        let already_finished = tokio::spawn(async {});
+        let already_finished_handle = already_finished.abort_handle();
+        already_finished.await.expect("finished task");
+
+        registry.register(session_id.clone(), already_finished_handle);
+        assert_eq!(registry.successful_registration_count(), 0);
+
+        let forgotten = tokio::spawn(async { std::future::pending::<()>().await });
+        let aborted = tokio::spawn(async { std::future::pending::<()>().await });
+        registry.register(session_id.clone(), forgotten.abort_handle());
+        registry.register(session_id.clone(), aborted.abort_handle());
+        assert_eq!(registry.successful_registration_count(), 2);
+
+        assert!(registry.forget_task(&session_id, forgotten.id()));
+        assert_eq!(registry.abort_session(&session_id), 1);
+        assert_eq!(registry.successful_registration_count(), 2);
+
+        forgotten.abort();
+        assert!(forgotten.await.unwrap_err().is_cancelled());
+        assert!(aborted.await.unwrap_err().is_cancelled());
     }
 }

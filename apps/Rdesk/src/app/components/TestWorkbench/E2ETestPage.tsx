@@ -148,6 +148,10 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcRegisterDevice: commands.ipcRegisterDevice,
   ipcRefreshLanDiscovery: commands.ipcRefreshLanDiscovery,
   ipcStartLanRemoteSession: commands.ipcStartLanRemoteSession,
+  ipcRequestRemoteSession: commands.ipcRequestRemoteSession,
+  ipcGetRemoteSession: commands.ipcGetRemoteSession,
+  ipcGetRouteEvidence: commands.ipcGetRouteEvidence,
+  ipcListTrustedDevices: commands.ipcListTrustedDevices,
   ipcUpdateMediaProfile: commands.ipcUpdateMediaProfile,
   ipcConfigureMediaAdaptation: commands.ipcConfigureMediaAdaptation,
   ipcListRemoteCaptureSources: commands.ipcListRemoteCaptureSources,
@@ -158,6 +162,7 @@ const lanAutomationCommands: LanE2EAutomationCommands = {
   ipcStartReceiver: commands.ipcStartReceiver,
   openRemoteDisplayWindow: commands.openRemoteDisplayWindow,
   ipcSendControlInput: commands.ipcSendControlInput,
+  ipcGetAuditEventsV2: commands.ipcGetAuditEventsV2,
   crossE2EInjectFault: async (sessionId, faultPlan) => {
     const result = await commands.crossE2EInjectFault(
       sessionId,
@@ -445,6 +450,7 @@ export function E2ETestPage() {
             >
               <option value="cross.e2e.discovery">发现/配对预检</option>
               <option value="cross.e2e.remote_display_smoke">远程显示 Smoke</option>
+              <option value="cross.e2e.secure_remote_display">安全远程显示</option>
               <option value="cross.e2e.input_control">输入控制 ACK</option>
               <option value="cross.e2e.media_profile">媒体画像校验</option>
               <option value="cross.fault.recovery">故障恢复预检</option>
@@ -676,6 +682,8 @@ function formatCrossDeviceScenario(scenarioId: CrossDeviceScenarioId): string {
       return "发现/配对预检";
     case "cross.e2e.remote_display_smoke":
       return "远程显示 Smoke";
+    case "cross.e2e.secure_remote_display":
+      return "安全远程显示";
     case "cross.e2e.input_control":
       return "输入控制 ACK";
     case "cross.e2e.media_profile":
@@ -860,6 +868,7 @@ function parseCrossDeviceScenarioId(value: string | null): CrossDeviceScenarioId
     value === "lan.e2e.remote_display" ||
     value === "cross.e2e.discovery" ||
     value === "cross.e2e.remote_display_smoke" ||
+    value === "cross.e2e.secure_remote_display" ||
     value === "cross.e2e.input_control" ||
     value === "cross.e2e.media_profile" ||
     value === "cross.fault.recovery"

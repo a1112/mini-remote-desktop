@@ -9,7 +9,6 @@ use std::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const REMOTE_POWER_ACTIONS_ENABLED_ENV: &str = "MRD_ENABLE_REMOTE_POWER_ACTIONS";
 
 #[derive(Clone, Copy)]
 enum CapabilityProbeMode {
@@ -1663,27 +1662,12 @@ fn remote_power_control_status_from_env_lookup<E>(env_lookup: E) -> (CapabilityS
 where
     E: Fn(&str) -> Option<String>,
 {
-    let enabled = matches!(
-        env_lookup(REMOTE_POWER_ACTIONS_ENABLED_ENV)
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    );
-    if enabled {
-        (
-            CapabilityStatus::Available,
-            "Remote restart/shutdown executor is enabled for LAN peer control.".to_string(),
-        )
-    } else {
-        (
-            CapabilityStatus::Unsupported,
-            format!(
-                "Remote restart/shutdown executor is disabled. Set {REMOTE_POWER_ACTIONS_ENABLED_ENV}=1 on this peer to allow LAN remote power actions."
-            ),
-        )
-    }
+    let _legacy_environment_lookup = env_lookup;
+    (
+        CapabilityStatus::Unsupported,
+        "Legacy unsigned LAN remote power control is disabled; remote power requires signed authorization."
+            .to_string(),
+    )
 }
 
 fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
@@ -2361,16 +2345,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_power_control_capability_tracks_executor_opt_in() {
+    fn remote_power_control_capability_rejects_legacy_env_opt_in() {
         let disabled = remote_power_control_status_from_env_lookup(|_| None);
         assert_eq!(disabled.0, CapabilityStatus::Unsupported);
-        assert!(disabled.1.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS"));
+        assert!(disabled.1.contains("signed authorization"));
 
         let enabled = remote_power_control_status_from_env_lookup(|key| match key {
             "MRD_ENABLE_REMOTE_POWER_ACTIONS" => Some("yes".to_string()),
             _ => None,
         });
-        assert_eq!(enabled.0, CapabilityStatus::Available);
+        assert_eq!(enabled.0, CapabilityStatus::Unsupported);
+        assert_eq!(enabled.1, disabled.1);
     }
 
     #[test]
@@ -2387,7 +2372,7 @@ mod tests {
         assert!(remote_power
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("MRD_ENABLE_REMOTE_POWER_ACTIONS")));
+            .is_some_and(|reason| reason.contains("signed authorization")));
     }
 
     #[test]

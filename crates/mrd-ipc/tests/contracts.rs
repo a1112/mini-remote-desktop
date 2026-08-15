@@ -2,18 +2,18 @@
 // Verify serialization/deserialization of all IPC messages
 
 use mrd_ipc::{
-    AdaptiveMediaConfig, AttachedRenderSurface, AuditEvent, AuditLogQuery, CapabilityConstraint,
-    CapabilityConstraintStatus, CapabilityDomain, CapabilityItem, CapabilityPlatform,
-    CapabilityProfile, CapabilitySnapshot, CapabilityStatus, CaptureSource, CaptureSourceSelection,
-    ControlChannelLaneSnapshot, ControlChannelReliability, ControlChannelSnapshot,
-    ControlInputButton, ControlInputEvent, ControlInputKey, ControlInputLane,
-    CrossE2EFaultInjectionResult, DeviceIdentitySnapshot, DeviceInfo, DevicePreference,
-    DevicePreferenceUpdate, DirectoryList, FileEntry, FileEntryKind, FileTransferConflictPolicy,
-    FileTransferEntry, FileTransferProviderDescriptor, FileTransferProviderHandoffHint,
-    FileTransferStartRequest, FileTransferStatus, FileTransferTaskSnapshot, IpcRequest,
-    IpcResponse, MediaAdaptationSnapshot, MediaPipelineSnapshot, MediaProfile,
-    MediaProfileNegotiation, MediaSenderTransportSnapshot, MediaStageMetrics,
-    MediaTestImpairmentSnapshot, PairedDeviceIdentity, ScenarioEvaluation,
+    AdaptiveMediaConfig, AgentRenderBoundarySnapshot, AttachedRenderSurface, AuditEvent,
+    AuditLogQuery, CapabilityConstraint, CapabilityConstraintStatus, CapabilityDomain,
+    CapabilityItem, CapabilityPlatform, CapabilityProfile, CapabilitySnapshot, CapabilityStatus,
+    CaptureSource, CaptureSourceSelection, ControlChannelLaneSnapshot, ControlChannelReliability,
+    ControlChannelSnapshot, ControlInputButton, ControlInputEvent, ControlInputKey,
+    ControlInputLane, CrossE2EFaultInjectionResult, DeviceIdentitySnapshot, DeviceInfo,
+    DevicePreference, DevicePreferenceUpdate, DirectoryList, FileEntry, FileEntryKind,
+    FileTransferConflictPolicy, FileTransferEntry, FileTransferProviderDescriptor,
+    FileTransferProviderHandoffHint, FileTransferStartRequest, FileTransferStatus,
+    FileTransferTaskSnapshot, IpcRequest, IpcResponse, MediaAdaptationSnapshot,
+    MediaPipelineSnapshot, MediaProfile, MediaProfileNegotiation, MediaSenderTransportSnapshot,
+    MediaStageMetrics, MediaTestImpairmentSnapshot, PairedDeviceIdentity, ScenarioEvaluation,
     ScenarioEvaluationReason, ScenarioEvaluationStatus, SessionBootstrap, SessionRuntimeSnapshot,
     TelemetryArtifactRef, TelemetryBundle, TelemetryMetricSummary, TransportPolicyConfig,
     TransportPolicySnapshot,
@@ -1055,6 +1055,14 @@ fn serialize_deserialize_media_pipeline_snapshot_contract() {
             display_refresh_hz: Some(144),
             render_thread_priority: Some("highest".to_string()),
             render_waitable_timeouts: 1,
+            agent_render_boundary: Some(AgentRenderBoundarySnapshot {
+                resource_id: [7; 16],
+                decoder_backend: "nvdec_d3d11_shared".into(),
+                enqueued_units: 120,
+                queue_replacements: 1,
+                decoded_frames: 119,
+                presented_frames: 118,
+            }),
             reliable_hol_recoveries: 2,
             stage_metrics: vec![MediaStageMetrics {
                 stage: "decode".to_string(),
@@ -1311,5 +1319,637 @@ fn serialize_deserialize_all_request_types() {
         let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
 
         assert_eq!(request, deserialized);
+    }
+}
+
+use mrd_ipc::{
+    AuditEventMetadataV2, AuditEventPageV2, AuditEventV2, AuditEventsQueryV2, ConsentDecision,
+    ConsentResponse, DecimalU64, RemoteAccessMode, RemoteAuthorizationState, RemoteCursorState,
+    RemoteFailure, RemoteMediaState, RemotePermissionScope, RemotePresentationState,
+    RemoteReasonCode, RemoteRouteKind, RemoteRouteState, RemoteSessionEvent,
+    RemoteSessionEventEnvelope, RemoteSessionRequest, RemoteSessionRole, RemoteSessionSnapshot,
+    RouteCandidateEvidence, RouteCandidateState, RouteEvidence, SessionEventSubscription,
+    SessionEventSubscriptionQuery, SessionPermissionChange, TrustedDeviceApproval,
+    TrustedDeviceRotation, TrustedDeviceSnapshot, TrustedDeviceState, UnattendedAccessPolicy,
+    UnattendedAccessSnapshot,
+};
+
+fn du64(value: u64) -> DecimalU64 {
+    DecimalU64::new(value)
+}
+
+fn secure_remote_session_fixture() -> RemoteSessionSnapshot {
+    RemoteSessionSnapshot {
+        session_id: test_session_id(),
+        role: RemoteSessionRole::Controller,
+        peer_device_id: test_device_id(),
+        peer_key_id: "sha256:peer-key".to_string(),
+        access_mode: RemoteAccessMode::Attended,
+        authorization_state: RemoteAuthorizationState::AwaitingLocalConsent,
+        route_state: RemoteRouteState::Connecting,
+        route_kind: Some(RemoteRouteKind::LanQuic),
+        media_state: RemoteMediaState::Idle,
+        presentation_state: RemotePresentationState::IncomingApprovalRequired,
+        requested_scopes: vec![
+            RemotePermissionScope::ScreenView,
+            RemotePermissionScope::InputPointer,
+        ],
+        granted_scopes: Vec::new(),
+        policy_revision: du64(7),
+        failure: None,
+        created_at_ms: 1_700_000_000_000,
+        updated_at_ms: 1_700_000_000_100,
+        authorization_expires_at_ms: Some(1_700_000_030_000),
+    }
+}
+
+fn unattended_policy_fixture() -> UnattendedAccessPolicy {
+    UnattendedAccessPolicy {
+        trusted_devices_only: true,
+        allowed_peer_key_ids: vec!["sha256:peer-key".to_string()],
+        permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        expires_at_ms: Some(1_800_000_000_000),
+    }
+}
+
+fn trusted_device_fixture() -> TrustedDeviceSnapshot {
+    TrustedDeviceSnapshot {
+        peer_key_id: "sha256:peer-key".to_string(),
+        display_name: Some("Peer workstation".to_string()),
+        key_epoch: du64(2),
+        state: TrustedDeviceState::Trusted,
+        permission_ceiling: vec![RemotePermissionScope::ScreenView],
+        trust_revision: du64(9),
+        approved_at_ms: Some(1_700_000_000_000),
+        updated_at_ms: 1_700_000_000_100,
+    }
+}
+
+#[test]
+fn secure_remote_permission_and_reason_codes_have_stable_wire_values() {
+    let scopes = [
+        (RemotePermissionScope::ScreenView, "screen.view"),
+        (RemotePermissionScope::InputPointer, "input.pointer"),
+        (RemotePermissionScope::InputKeyboard, "input.keyboard"),
+        (RemotePermissionScope::ClipboardRead, "clipboard.read"),
+        (RemotePermissionScope::ClipboardWrite, "clipboard.write"),
+        (RemotePermissionScope::FileRead, "file.read"),
+        (RemotePermissionScope::FileWrite, "file.write"),
+        (RemotePermissionScope::AudioListen, "audio.listen"),
+        (RemotePermissionScope::AudioTalk, "audio.talk"),
+        (RemotePermissionScope::DisplaySwitch, "display.switch"),
+        (
+            RemotePermissionScope::DisplayMultiView,
+            "display.multi_view",
+        ),
+        (RemotePermissionScope::PowerRestart, "power.restart"),
+        (RemotePermissionScope::PowerShutdown, "power.shutdown"),
+        (RemotePermissionScope::TerminalOpen, "terminal.open"),
+        (
+            RemotePermissionScope::PrivacyBlockLocalInput,
+            "privacy.block_local_input",
+        ),
+        (
+            RemotePermissionScope::PrivacyBlankScreen,
+            "privacy.blank_screen",
+        ),
+        (
+            RemotePermissionScope::SecureDesktopView,
+            "secure_desktop.view",
+        ),
+        (
+            RemotePermissionScope::SecureDesktopControl,
+            "secure_desktop.control",
+        ),
+    ];
+    for (scope, expected) in scopes {
+        assert_eq!(
+            serde_json::to_value(scope).unwrap(),
+            serde_json::json!(expected)
+        );
+        assert_eq!(
+            serde_json::from_value::<RemotePermissionScope>(serde_json::json!(expected)).unwrap(),
+            scope
+        );
+    }
+
+    let reason_codes = [
+        (RemoteReasonCode::IdentityMismatch, "identity_mismatch"),
+        (
+            RemoteReasonCode::CertificateBindingMismatch,
+            "certificate_binding_mismatch",
+        ),
+        (RemoteReasonCode::TrustRequired, "trust_required"),
+        (RemoteReasonCode::ConsentDenied, "consent_denied"),
+        (RemoteReasonCode::CredentialInvalid, "credential_invalid"),
+        (RemoteReasonCode::CredentialLocked, "credential_locked"),
+        (
+            RemoteReasonCode::AuthorizationTimeout,
+            "authorization_timeout",
+        ),
+        (RemoteReasonCode::GrantExpired, "grant_expired"),
+        (RemoteReasonCode::GrantRevoked, "grant_revoked"),
+        (RemoteReasonCode::PolicyChanged, "policy_changed"),
+        (RemoteReasonCode::ReplayDetected, "replay_detected"),
+        (RemoteReasonCode::ScopeDenied, "scope_denied"),
+        (
+            RemoteReasonCode::ProtocolDowngradeBlocked,
+            "protocol_downgrade_blocked",
+        ),
+        (RemoteReasonCode::LanUnreachable, "lan_unreachable"),
+        (RemoteReasonCode::IceDirectFailed, "ice_direct_failed"),
+        (
+            RemoteReasonCode::TurnAllocationFailed,
+            "turn_allocation_failed",
+        ),
+        (RemoteReasonCode::RouteLost, "route_lost"),
+        (
+            RemoteReasonCode::RouteMigrationTimeout,
+            "route_migration_timeout",
+        ),
+        (RemoteReasonCode::EncoderUnavailable, "encoder_unavailable"),
+        (RemoteReasonCode::DecoderUnavailable, "decoder_unavailable"),
+        (RemoteReasonCode::CaptureSourceLost, "capture_source_lost"),
+        (RemoteReasonCode::ProfileDowngraded, "profile_downgraded"),
+        (
+            RemoteReasonCode::CongestionDownshift,
+            "congestion_downshift",
+        ),
+        (
+            RemoteReasonCode::RenderBudgetExceeded,
+            "render_budget_exceeded",
+        ),
+    ];
+    for (code, expected) in reason_codes {
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            serde_json::json!(expected)
+        );
+    }
+    assert!(serde_json::from_str::<RemoteReasonCode>("\"unknown_security_code\"").is_err());
+    assert_eq!(
+        serde_json::to_value(RemoteRouteKind::WebRtcDirect).unwrap(),
+        serde_json::json!("webrtc_direct")
+    );
+}
+
+#[test]
+fn secure_remote_requests_have_stable_tags_and_required_fields() {
+    let requests = vec![
+        (
+            IpcRequest::GetRemoteSession {
+                session_id: test_session_id(),
+            },
+            "GetRemoteSession",
+        ),
+        (
+            IpcRequest::RequestRemoteSession {
+                request: RemoteSessionRequest {
+                    session_id: test_session_id(),
+                    target_device_id: test_device_id(),
+                    access_mode: RemoteAccessMode::Attended,
+                    requested_scopes: vec![RemotePermissionScope::ScreenView],
+                    requested_profile: Some(test_media_profile()),
+                },
+            },
+            "RequestRemoteSession",
+        ),
+        (
+            IpcRequest::RespondToConsent {
+                response: ConsentResponse {
+                    session_id: test_session_id(),
+                    decision: ConsentDecision::Approve,
+                    approved_scopes: vec![RemotePermissionScope::ScreenView],
+                    expected_policy_revision: du64(7),
+                },
+            },
+            "RespondToConsent",
+        ),
+        (
+            IpcRequest::EnableUnattendedAccess {
+                policy: unattended_policy_fixture(),
+            },
+            "EnableUnattendedAccess",
+        ),
+        (
+            IpcRequest::DisableUnattendedAccess {
+                expected_policy_revision: du64(7),
+            },
+            "DisableUnattendedAccess",
+        ),
+        (
+            IpcRequest::RotateUnattendedAccess {
+                expected_policy_revision: du64(7),
+            },
+            "RotateUnattendedAccess",
+        ),
+        (
+            IpcRequest::ListTrustedDevices {
+                include_revoked: true,
+            },
+            "ListTrustedDevices",
+        ),
+        (
+            IpcRequest::ApproveTrustedDevice {
+                approval: TrustedDeviceApproval {
+                    peer_key_id: "sha256:peer-key".to_string(),
+                    key_epoch: du64(2),
+                    permission_ceiling: vec![RemotePermissionScope::ScreenView],
+                },
+            },
+            "ApproveTrustedDevice",
+        ),
+        (
+            IpcRequest::SuspendTrustedDevice {
+                peer_key_id: "sha256:peer-key".to_string(),
+                expected_trust_revision: du64(9),
+            },
+            "SuspendTrustedDevice",
+        ),
+        (
+            IpcRequest::RevokeTrustedDevice {
+                peer_key_id: "sha256:peer-key".to_string(),
+                expected_trust_revision: du64(9),
+            },
+            "RevokeTrustedDevice",
+        ),
+        (
+            IpcRequest::RotateTrustedDevice {
+                rotation: TrustedDeviceRotation {
+                    peer_key_id: "sha256:peer-key".to_string(),
+                    new_peer_key_id: "sha256:new-peer-key".to_string(),
+                    new_key_epoch: du64(3),
+                    expected_trust_revision: du64(9),
+                },
+            },
+            "RotateTrustedDevice",
+        ),
+        (
+            IpcRequest::ChangeSessionPermissions {
+                change: SessionPermissionChange {
+                    session_id: test_session_id(),
+                    requested_scopes: vec![RemotePermissionScope::ScreenView],
+                    expected_policy_revision: du64(7),
+                },
+            },
+            "ChangeSessionPermissions",
+        ),
+        (
+            IpcRequest::SubscribeSessionEvents {
+                query: SessionEventSubscriptionQuery {
+                    session_id: Some(test_session_id()),
+                    after_sequence: Some(du64(41)),
+                    limit: 32,
+                    wait_timeout_ms: 15_000,
+                },
+            },
+            "SubscribeSessionEvents",
+        ),
+        (
+            IpcRequest::GetRouteEvidence {
+                session_id: test_session_id(),
+            },
+            "GetRouteEvidence",
+        ),
+        (
+            IpcRequest::GetAuditEventsV2 {
+                query: AuditEventsQueryV2 {
+                    after_sequence: Some(du64(8)),
+                    limit: 50,
+                    session_id: Some(test_session_id()),
+                    action: Some("session.authorized".to_string()),
+                    outcome: Some("allowed".to_string()),
+                    peer_device_id: Some(test_device_id()),
+                },
+            },
+            "GetAuditEventsV2",
+        ),
+    ];
+
+    assert!(requests
+        .iter()
+        .all(|(request, _)| request.is_secure_remote()));
+    assert!(!IpcRequest::ListSessions.is_secure_remote());
+
+    for (request, expected_type) in requests {
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["type"], serde_json::json!(expected_type));
+        let encoded = serde_json::to_string(&value).unwrap();
+        for forbidden in [
+            "private_key",
+            "protected_blob",
+            "credential",
+            "proof",
+            "verifier",
+            "database_id",
+            "event_hash",
+        ] {
+            assert!(!encoded.contains(&format!("\"{forbidden}\"")));
+        }
+        assert_eq!(
+            serde_json::from_value::<IpcRequest>(value).unwrap(),
+            request
+        );
+    }
+}
+
+#[test]
+fn secure_remote_responses_and_events_round_trip_without_secret_material() {
+    let session = secure_remote_session_fixture();
+    let access = UnattendedAccessSnapshot {
+        enabled: true,
+        policy_revision: du64(7),
+        access_epoch: du64(3),
+        policy: unattended_policy_fixture(),
+        locked_until_ms: None,
+        updated_at_ms: 1_700_000_000_100,
+    };
+    let device = trusted_device_fixture();
+    let event = RemoteSessionEventEnvelope {
+        sequence: du64(42),
+        timestamp_ms: 1_700_000_000_200,
+        session_id: test_session_id(),
+        event: RemoteSessionEvent::PermissionsChanged {
+            granted_scopes: vec![RemotePermissionScope::ScreenView],
+            policy_revision: du64(8),
+        },
+    };
+    let subscription = SessionEventSubscription {
+        events: vec![event.clone()],
+        pending_sessions: Vec::new(),
+        next_after_sequence: Some(du64(42)),
+        cursor_state: RemoteCursorState::Current,
+        has_more: false,
+        poll_after_ms: 1_000,
+    };
+    let evidence = RouteEvidence {
+        session_id: test_session_id(),
+        route_state: RemoteRouteState::Connected,
+        selected_route: Some(RemoteRouteKind::LanQuic),
+        policy_revision: du64(8),
+        transport_fingerprint_sha256: Some("sha256:transport".to_string()),
+        candidates: vec![RouteCandidateEvidence {
+            route: RemoteRouteKind::LanQuic,
+            state: RouteCandidateState::Connected,
+            started_at_ms: Some(1_700_000_000_000),
+            completed_at_ms: Some(1_700_000_000_020),
+            round_trip_ms: Some(3),
+            failure: None,
+        }],
+        observed_at_ms: 1_700_000_000_200,
+    };
+    let page = AuditEventPageV2 {
+        events: vec![AuditEventV2 {
+            sequence: du64(9),
+            timestamp_ms: 1_700_000_000_000,
+            action: "session.authorized".to_string(),
+            outcome: "allowed".to_string(),
+            session_id: Some(test_session_id()),
+            actor_device_id: Some(DeviceId("local-device".to_string())),
+            peer_device_id: Some(test_device_id()),
+            peer_key_id: Some("sha256:peer-key".to_string()),
+            transport_kind: Some(RemoteRouteKind::LanQuic),
+            reason_code: None,
+            metadata: AuditEventMetadataV2 {
+                authorization_state: Some(RemoteAuthorizationState::Granted),
+                access_mode: Some(RemoteAccessMode::Attended),
+                route_state: Some(RemoteRouteState::Connected),
+                media_state: Some(RemoteMediaState::Streaming),
+                requested_scopes: vec![RemotePermissionScope::ScreenView],
+                granted_scopes: vec![RemotePermissionScope::ScreenView],
+                policy_revision: Some(du64(8)),
+                trust_revision: Some(du64(9)),
+            },
+        }],
+        next_after_sequence: Some(du64(9)),
+        cursor_state: RemoteCursorState::Current,
+        has_more: false,
+        chain_verified: true,
+    };
+    let failure = RemoteFailure {
+        code: RemoteReasonCode::TrustRequired,
+        message: "peer approval is required".to_string(),
+        suggested_action: Some("approve the peer key".to_string()),
+    };
+    let responses = vec![
+        (
+            IpcResponse::RemoteSession {
+                session: session.clone(),
+            },
+            "RemoteSession",
+        ),
+        (
+            IpcResponse::RemoteSessionRequested {
+                session: session.clone(),
+            },
+            "RemoteSessionRequested",
+        ),
+        (
+            IpcResponse::ConsentRecorded {
+                session: session.clone(),
+            },
+            "ConsentRecorded",
+        ),
+        (
+            IpcResponse::UnattendedAccessUpdated { access },
+            "UnattendedAccessUpdated",
+        ),
+        (
+            IpcResponse::TrustedDeviceList {
+                devices: vec![device.clone()],
+            },
+            "TrustedDeviceList",
+        ),
+        (
+            IpcResponse::TrustedDeviceUpdated { device },
+            "TrustedDeviceUpdated",
+        ),
+        (
+            IpcResponse::SessionPermissionsChanged {
+                session: session.clone(),
+            },
+            "SessionPermissionsChanged",
+        ),
+        (
+            IpcResponse::SessionEventsSubscribed { subscription },
+            "SessionEventsSubscribed",
+        ),
+        (
+            IpcResponse::SessionEvent {
+                event: event.clone(),
+            },
+            "SessionEvent",
+        ),
+        (IpcResponse::RouteEvidence { evidence }, "RouteEvidence"),
+        (IpcResponse::AuditEventsV2 { page }, "AuditEventsV2"),
+        (
+            IpcResponse::RemoteAccessError {
+                session_id: Some(test_session_id()),
+                peer_key_id: Some("sha256:peer-key".to_string()),
+                failure,
+            },
+            "RemoteAccessError",
+        ),
+    ];
+
+    for (response, expected_type) in responses {
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["type"], serde_json::json!(expected_type));
+        let encoded = serde_json::to_string(&value).unwrap().to_ascii_lowercase();
+        for forbidden in [
+            "private_key",
+            "protected_blob",
+            "credential",
+            "password",
+            "secret",
+            "proof",
+            "verifier",
+            "database_id",
+            "row_id",
+            "event_hash",
+            "hmac",
+        ] {
+            assert!(!encoded.contains(forbidden), "response exposed {forbidden}");
+        }
+        assert_eq!(
+            serde_json::from_value::<IpcResponse>(value).unwrap(),
+            response
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(event.event).unwrap()["kind"],
+        serde_json::json!("permissions_changed")
+    );
+}
+
+#[test]
+fn decimal_u64_is_canonical_and_lossless() {
+    let maximum = DecimalU64::new(u64::MAX);
+    assert_eq!(
+        serde_json::to_string(&maximum).unwrap(),
+        format!("\"{}\"", u64::MAX)
+    );
+    assert_eq!(
+        serde_json::from_str::<DecimalU64>(&format!("\"{}\"", u64::MAX)).unwrap(),
+        maximum
+    );
+
+    for invalid in ["-1", "+1", "01", "1e3", "18446744073709551616", ""] {
+        assert!(serde_json::from_str::<DecimalU64>(&format!("\"{invalid}\"")).is_err());
+    }
+    assert!(serde_json::from_str::<DecimalU64>("1").is_err());
+}
+
+#[test]
+fn all_domain_permission_scopes_have_exact_wire_projections() {
+    use mrd_session::PermissionScope as Domain;
+
+    let pairs = [
+        (Domain::ScreenView, RemotePermissionScope::ScreenView),
+        (Domain::InputPointer, RemotePermissionScope::InputPointer),
+        (Domain::InputKeyboard, RemotePermissionScope::InputKeyboard),
+        (Domain::ClipboardRead, RemotePermissionScope::ClipboardRead),
+        (
+            Domain::ClipboardWrite,
+            RemotePermissionScope::ClipboardWrite,
+        ),
+        (Domain::FileRead, RemotePermissionScope::FileRead),
+        (Domain::FileWrite, RemotePermissionScope::FileWrite),
+        (Domain::AudioListen, RemotePermissionScope::AudioListen),
+        (Domain::AudioTalk, RemotePermissionScope::AudioTalk),
+        (Domain::DisplaySwitch, RemotePermissionScope::DisplaySwitch),
+        (
+            Domain::DisplayMultiView,
+            RemotePermissionScope::DisplayMultiView,
+        ),
+        (Domain::PowerRestart, RemotePermissionScope::PowerRestart),
+        (Domain::PowerShutdown, RemotePermissionScope::PowerShutdown),
+        (Domain::TerminalOpen, RemotePermissionScope::TerminalOpen),
+        (
+            Domain::PrivacyBlockLocalInput,
+            RemotePermissionScope::PrivacyBlockLocalInput,
+        ),
+        (
+            Domain::PrivacyBlankScreen,
+            RemotePermissionScope::PrivacyBlankScreen,
+        ),
+        (
+            Domain::SecureDesktopView,
+            RemotePermissionScope::SecureDesktopView,
+        ),
+        (
+            Domain::SecureDesktopControl,
+            RemotePermissionScope::SecureDesktopControl,
+        ),
+    ];
+
+    for (domain, wire) in pairs {
+        assert_eq!(RemotePermissionScope::from(domain), wire);
+        assert_eq!(Domain::from(wire), domain);
+    }
+}
+
+#[test]
+fn remote_session_event_tags_are_exhaustive_and_stable() {
+    fn expected_kind(event: &RemoteSessionEvent) -> &'static str {
+        match event {
+            RemoteSessionEvent::ConsentRequested { .. } => "consent_requested",
+            RemoteSessionEvent::ConsentResolved { .. } => "consent_resolved",
+            RemoteSessionEvent::AuthorizationChanged { .. } => "authorization_changed",
+            RemoteSessionEvent::PermissionsChanged { .. } => "permissions_changed",
+            RemoteSessionEvent::TrustChanged { .. } => "trust_changed",
+            RemoteSessionEvent::RouteChanged { .. } => "route_changed",
+            RemoteSessionEvent::MediaChanged { .. } => "media_changed",
+            RemoteSessionEvent::SessionClosed { .. } => "session_closed",
+        }
+    }
+
+    let failure = RemoteFailure {
+        code: RemoteReasonCode::RouteLost,
+        message: "route was lost".to_string(),
+        suggested_action: Some("retry a policy-allowed route".to_string()),
+    };
+    let events = [
+        RemoteSessionEvent::ConsentRequested {
+            requested_scopes: vec![RemotePermissionScope::ScreenView],
+        },
+        RemoteSessionEvent::ConsentResolved {
+            decision: ConsentDecision::Approve,
+            approved_scopes: vec![RemotePermissionScope::ScreenView],
+        },
+        RemoteSessionEvent::AuthorizationChanged {
+            state: RemoteAuthorizationState::Granted,
+            failure: None,
+        },
+        RemoteSessionEvent::PermissionsChanged {
+            granted_scopes: vec![RemotePermissionScope::ScreenView],
+            policy_revision: du64(7),
+        },
+        RemoteSessionEvent::TrustChanged {
+            peer_key_id: "sha256:peer-key".to_string(),
+            state: TrustedDeviceState::Trusted,
+            trust_revision: du64(9),
+        },
+        RemoteSessionEvent::RouteChanged {
+            state: RemoteRouteState::Failed,
+            route: Some(RemoteRouteKind::WebRtcDirect),
+            failure: Some(failure.clone()),
+        },
+        RemoteSessionEvent::MediaChanged {
+            state: RemoteMediaState::Degraded,
+            failure: Some(failure.clone()),
+        },
+        RemoteSessionEvent::SessionClosed {
+            failure: Some(failure),
+        },
+    ];
+
+    for event in events {
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["kind"], serde_json::json!(expected_kind(&event)));
+        assert_eq!(
+            serde_json::from_value::<RemoteSessionEvent>(value).unwrap(),
+            event
+        );
     }
 }

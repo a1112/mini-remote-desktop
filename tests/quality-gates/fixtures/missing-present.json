@@ -1,0 +1,12 @@
+{
+  "schema_version": "remote-experience-run.v2",
+  "run_id": "run-missing-present",
+  "scenario": {"id": "windows.1080p60.direct", "required": true},
+  "route": {"requested": "direct", "selected": "direct", "candidate_pair": "host:1234-peer:5678"},
+  "media": {"requested_profile": "1080p60-h264", "selected_profile": "1080p60-h264", "profile_downgraded": false},
+  "present": {"visible_first_frame_ms": null, "input_to_photon_ms": [45.0], "fps_windows": [60.0], "freeze_count": 0, "stall_ms": []},
+  "resources": {"cpu_percent": [12.0], "gpu_percent": [24.0], "rss_bytes": [1000000], "vram_bytes": [2000000]},
+  "producer_status": "completed",
+  "gate_status": "PASS",
+  "audit_event_ids": ["audit-002"]
+}

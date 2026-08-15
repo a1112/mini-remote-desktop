@@ -63,7 +63,7 @@ nix = { version = "0.29", features = ["signal", "process", "socket"] }
 [dev-dependencies]
 openh264 = "0.8"
 mrd-application = { path = "../../../crates/mrd-application" }
-mrd-service = { path = "../../mrd-service" }
+mrd-service = { path = "../../mrd-service", features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
 mrd-capture-winrt = { path = "../../../crates/mrd-capture-winrt" }

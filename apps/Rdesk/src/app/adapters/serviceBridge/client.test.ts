@@ -67,8 +67,13 @@ describe('service bridge client', () => {
 
     const result = await invokeServiceBridgeIpc({ type: 'ShutdownService', mode: 'graceful' });
 
-    expect(result.ok).toBe(false);
-    expect(result.ok ? '' : result.error.message).toContain('E_WEB_BRIDGE_FORBIDDEN');
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'E_WEB_BRIDGE_FORBIDDEN',
+        message: 'ShutdownService is not available through the web bridge.',
+      },
+    });
   });
 
   it('treats an explicit endpoint override as configured for LAN browser mode', () => {

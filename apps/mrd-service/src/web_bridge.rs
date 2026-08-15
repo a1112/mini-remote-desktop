@@ -573,7 +573,6 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::ListRemoteDisplayModes { .. }
             | IpcRequest::SetRemoteDisplayMode { .. }
             | IpcRequest::RestoreRemoteDisplayMode { .. }
-            | IpcRequest::SendControlInput { .. }
             | IpcRequest::CrossE2EInjectFault { .. }
             | IpcRequest::StartReceiver { .. }
             | IpcRequest::SessionRuntimeSnapshot { .. }
@@ -877,8 +876,8 @@ mod tests {
     }
 
     #[test]
-    fn web_bridge_allows_control_input_requests() {
-        assert!(is_ipc_request_allowed(&IpcRequest::SendControlInput {
+    fn web_bridge_blocks_control_input_requests() {
+        assert!(!is_ipc_request_allowed(&IpcRequest::SendControlInput {
             session_id: mrd_proto::SessionId("control-session".to_string()),
             event: mrd_ipc::ControlInputEvent::MouseMove { x: 10, y: 20 },
         }));

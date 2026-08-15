@@ -1329,9 +1329,7 @@ impl TestOrchestrator {
                     break;
                 }
 
-                if !warmup_completed
-                    && now_ms().saturating_sub(monitor_started_at) >= warmup_ms
-                {
+                if !warmup_completed && now_ms().saturating_sub(monitor_started_at) >= warmup_ms {
                     let warmup_metrics = {
                         let owner = active_harness_run_id.lock().unwrap();
                         if owner.as_deref() != Some(run_id_clone.as_str()) {
@@ -1340,12 +1338,9 @@ impl TestOrchestrator {
                         harness.lock().unwrap().get_metrics()
                     };
                     if let Some(error) = warmup_metrics.error_message.clone() {
-                        let metrics = stop_owned_harness(
-                            &active_harness_run_id,
-                            &harness,
-                            &run_id_clone,
-                        )
-                        .unwrap_or(warmup_metrics);
+                        let metrics =
+                            stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                                .unwrap_or(warmup_metrics);
                         mark_run_failed(
                             &orchestrator_runs,
                             &orchestrator_events,
@@ -1371,11 +1366,8 @@ impl TestOrchestrator {
                         break;
                     }
 
-                    let restart_result = restart_owned_harness(
-                        &active_harness_run_id,
-                        &harness,
-                        &run_id_clone,
-                    );
+                    let restart_result =
+                        restart_owned_harness(&active_harness_run_id, &harness, &run_id_clone);
                     match restart_result {
                         Ok(true) => {
                             warmup_completed = true;
@@ -1396,12 +1388,9 @@ impl TestOrchestrator {
                         }
                         Ok(false) => break,
                         Err(error) => {
-                            let metrics = stop_owned_harness(
-                                &active_harness_run_id,
-                                &harness,
-                                &run_id_clone,
-                            )
-                            .unwrap_or_default();
+                            let metrics =
+                                stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                                    .unwrap_or_default();
                             mark_run_failed(
                                 &orchestrator_runs,
                                 &orchestrator_events,
@@ -1425,12 +1414,9 @@ impl TestOrchestrator {
                 };
 
                 if let Some(error) = metrics.error_message.clone() {
-                    let metrics = stop_owned_harness(
-                        &active_harness_run_id,
-                        &harness,
-                        &run_id_clone,
-                    )
-                    .unwrap_or(metrics);
+                    let metrics =
+                        stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                            .unwrap_or(metrics);
                     mark_run_failed(
                         &orchestrator_runs,
                         &orchestrator_events,
@@ -1569,11 +1555,9 @@ impl TestOrchestrator {
                 if warmup_completed
                     && now_ms().saturating_sub(measurement_started_at) >= duration_ms
                 {
-                    let Some(metrics) = stop_owned_harness(
-                        &active_harness_run_id,
-                        &harness,
-                        &run_id_clone,
-                    ) else {
+                    let Some(metrics) =
+                        stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                    else {
                         break;
                     };
                     if let Some(message) = metrics.error_message.clone().or_else(|| {
@@ -2952,8 +2936,7 @@ impl TestOrchestrator {
 
     /// Stop a running test
     pub fn stop_run(&self, run_id: &str) -> Result<()> {
-        let owned_metrics =
-            stop_owned_harness(&self.active_harness_run_id, &self.harness, run_id);
+        let owned_metrics = stop_owned_harness(&self.active_harness_run_id, &self.harness, run_id);
         let mut cancelled = false;
         {
             let mut runs = self.runs.lock().unwrap();
@@ -2975,13 +2958,7 @@ impl TestOrchestrator {
         }
 
         if cancelled {
-            self.record_stage_event(
-                run_id.to_string(),
-                "running",
-                "cancelled",
-                None,
-                None,
-            );
+            self.record_stage_event(run_id.to_string(), "running", "cancelled", None, None);
         }
         Ok(())
     }
@@ -3580,9 +3557,7 @@ fn validate_execution_config(config: &TestConfigData) -> Result<()> {
         anyhow::bail!("dynamic_resolution_enabled requires adaptive_media=true");
     }
     if config.adaptive_media == Some(true) || config.dynamic_resolution_enabled == Some(true) {
-        anyhow::bail!(
-            "adaptive media controls are supported only by cross-device LAN automation"
-        );
+        anyhow::bail!("adaptive media controls are supported only by cross-device LAN automation");
     }
     let duration_ms = config.duration_ms.unwrap_or(30_000);
     let warmup_ms = config.warmup_ms.unwrap_or(0);
@@ -4670,10 +4645,7 @@ fn stop_owned_harness(
     Some(metrics)
 }
 
-fn release_harness_ownership(
-    active_harness_run_id: &Arc<Mutex<Option<RunId>>>,
-    run_id: &str,
-) {
+fn release_harness_ownership(active_harness_run_id: &Arc<Mutex<Option<RunId>>>, run_id: &str) {
     let mut owner = active_harness_run_id.lock().unwrap();
     if owner.as_deref() == Some(run_id) {
         *owner = None;
@@ -5610,7 +5582,11 @@ mod tests {
         assert!(run.finished_at.is_some());
         assert!(run.summary.is_some());
         assert_eq!(
-            orchestrator.active_harness_run_id.lock().unwrap().as_deref(),
+            orchestrator
+                .active_harness_run_id
+                .lock()
+                .unwrap()
+                .as_deref(),
             None
         );
         assert!(orchestrator
@@ -5618,9 +5594,7 @@ mod tests {
             .lock()
             .unwrap()
             .get(&run_id)
-            .is_some_and(|events| events
-                .iter()
-                .any(|event| event.status == "cancelled")));
+            .is_some_and(|events| events.iter().any(|event| event.status == "cancelled")));
         let persisted = orchestrator
             .telemetry_store
             .list_runs(None)

@@ -552,6 +552,33 @@ function Invoke-LocalDualProcessProfile {
 
     $automationReport = Resolve-LanE2EAutomationReport -Report $report
     $row = Convert-CrossReportToCanaryRow -Profile $Profile -Report $automationReport -ReportPath $reportPath
+    $agentBoundary = $null
+    if ($automationReport.mediaPipelineSnapshot) {
+      $agentBoundary = $automationReport.mediaPipelineSnapshot.agent_render_boundary
+    }
+    $agentBoundaryFailures = @()
+    if (-not $agentBoundary) {
+      $agentBoundaryFailures += "agent_render_boundary_missing"
+    } else {
+      if ([int64]$agentBoundary.enqueued_units -le 0) { $agentBoundaryFailures += "agent_enqueued_units_zero" }
+      if ([int64]$agentBoundary.decoded_frames -le 0) { $agentBoundaryFailures += "agent_decoded_frames_zero" }
+      if ([int64]$agentBoundary.presented_frames -le 0) { $agentBoundaryFailures += "agent_presented_frames_zero" }
+      if ([int64]$agentBoundary.decoded_frames -gt [int64]$agentBoundary.enqueued_units) { $agentBoundaryFailures += "agent_decode_count_invalid" }
+      if ([int64]$agentBoundary.presented_frames -gt [int64]$agentBoundary.decoded_frames) { $agentBoundaryFailures += "agent_present_count_invalid" }
+    }
+    $agentBoundaryEvidence = [pscustomobject]@{
+      available = ($null -ne $agentBoundary)
+      decoder_backend = if ($agentBoundary) { [string]$agentBoundary.decoder_backend } else { $null }
+      fallback_mode = if ($agentBoundary -and ([string]$agentBoundary.decoder_backend -eq "h264_software")) { "software" } elseif ($agentBoundary) { "hardware" } else { $null }
+      enqueued_units = if ($agentBoundary) { [int64]$agentBoundary.enqueued_units } else { 0 }
+      queue_replacements = if ($agentBoundary) { [int64]$agentBoundary.queue_replacements } else { 0 }
+      decoded_frames = if ($agentBoundary) { [int64]$agentBoundary.decoded_frames } else { 0 }
+      presented_frames = if ($agentBoundary) { [int64]$agentBoundary.presented_frames } else { 0 }
+    }
+    $agentBoundaryGate = [pscustomobject]@{
+      passed = ($agentBoundaryFailures.Count -eq 0)
+      failures = @($agentBoundaryFailures)
+    }
     $serviceBoundary = New-LocalDualProcessServiceBoundaryEvidence `
       -Controller $controller `
       -Peer $peer `
@@ -563,10 +590,17 @@ function Invoke-LocalDualProcessProfile {
     $row | Add-Member -Force -NotePropertyName "chain" -NotePropertyValue "local_dual_process/dxgi/$($backends.encoder)/quic_datagram_media_v3_or_v2/$($backends.decoder)/d3d11_shared"
     $row | Add-Member -Force -NotePropertyName "service_boundary" -NotePropertyValue $serviceBoundary
     $row | Add-Member -Force -NotePropertyName "service_boundary_gate" -NotePropertyValue $serviceBoundary.gate
+    $row | Add-Member -Force -NotePropertyName "agent_render_boundary" -NotePropertyValue $agentBoundaryEvidence
+    $row | Add-Member -Force -NotePropertyName "agent_render_boundary_gate" -NotePropertyValue $agentBoundaryGate
     if (-not $serviceBoundary.gate.passed) {
       $row | Add-Member -Force -NotePropertyName "status" -NotePropertyValue "failed"
       $row | Add-Member -Force -NotePropertyName "classification" -NotePropertyValue "service_boundary_failed"
       $row | Add-Member -Force -NotePropertyName "error_message" -NotePropertyValue ("service boundary gate failed: {0}" -f (($serviceBoundary.gate.failures | ForEach-Object { [string]$_ }) -join ", "))
+    }
+    if (-not $agentBoundaryGate.passed) {
+      $row | Add-Member -Force -NotePropertyName "status" -NotePropertyValue "failed"
+      $row | Add-Member -Force -NotePropertyName "classification" -NotePropertyValue "agent_render_boundary_failed"
+      $row | Add-Member -Force -NotePropertyName "error_message" -NotePropertyValue ("agent render boundary gate failed: {0}" -f ($agentBoundaryGate.failures -join ", "))
     }
     $row | Add-Member -Force -NotePropertyName "controller_pipe" -NotePropertyValue $controllerPipe
     $row | Add-Member -Force -NotePropertyName "peer_pipe" -NotePropertyValue $peerPipe
@@ -698,6 +732,30 @@ $report | Add-Member -Force -NotePropertyName "service_boundary_gate" -NotePrope
   failure_count = $serviceBoundaryFailures.Count
   failures = @($serviceBoundaryFailures)
 })
+$agentBoundaryFailures = @(
+  $rows |
+    Where-Object { $_.agent_render_boundary_gate -and -not $_.agent_render_boundary_gate.passed } |
+    ForEach-Object {
+      [pscustomobject]@{
+        id = $_.id
+        failures = @($_.agent_render_boundary_gate.failures)
+        run_dir = $_.run_dir
+      }
+    }
+)
+$report | Add-Member -Force -NotePropertyName "agent_render_boundary_gate" -NotePropertyValue ([pscustomobject]@{
+  passed = ($agentBoundaryFailures.Count -eq 0)
+  failure_count = $agentBoundaryFailures.Count
+  failures = @($agentBoundaryFailures)
+})
+$localGateFailures = @($report.rows | Where-Object { $_.status -ne "completed" })
+$localGateFailures += @($report.service_boundary_gate.failures)
+$localGateFailures += @($report.agent_render_boundary_gate.failures)
+$report | Add-Member -Force -NotePropertyName "gate" -NotePropertyValue ([pscustomobject]@{
+  passed = ($localGateFailures.Count -eq 0)
+  verdict = if ($localGateFailures.Count -eq 0) { "PASS" } else { "PRODUCT_FAIL" }
+  failures = @($localGateFailures)
+})
 $report | Add-Member -Force -NotePropertyName "test_impairment_config" -NotePropertyValue $impairment
 $report | Add-Member -Force -NotePropertyName "capture_source_request" -NotePropertyValue ([pscustomobject]@{
   id = if ($CaptureSourceId.Trim()) { $CaptureSourceId.Trim() } else { $null }
@@ -784,3 +842,7 @@ if ($fixtureWarnings.Count -gt 0) {
 }
 
 Write-Host "Local dual-process LAN canary report written to $outputRoot"
+if (-not $report.gate.passed) {
+  Write-Error ("Local dual-process LAN canary gate failed with $($report.gate.failures.Count) failure(s)")
+  exit 2
+}

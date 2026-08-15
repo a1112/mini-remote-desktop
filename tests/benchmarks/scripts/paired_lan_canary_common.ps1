@@ -21,6 +21,18 @@ function Select-CanaryObjectPropertyValue {
   Select-CanaryValue $property.Value $Fallback
 }
 
+function Write-CanaryUtf8Json {
+  param(
+    [Parameter(Mandatory = $true)]$InputObject,
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int]$Depth = 16
+  )
+
+  $json = ConvertTo-Json -InputObject $InputObject -Depth $Depth
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText([System.IO.Path]::GetFullPath($Path), $json, $utf8NoBom)
+}
+
 function Select-CanarySenderSendStageValue {
   param($StageMap, $Fallback)
   $reliable = Select-CanaryObjectPropertyValue $StageMap "sender.send_reliable" $null
@@ -76,7 +88,10 @@ function Get-CrossCanaryFrameGateFailureReason {
   param($Report)
 
   $scenarioId = [string](Select-CanaryObjectPropertyValue $Report "scenarioId" "")
-  $requiresFrameGateEvidence = ($scenarioId -eq "cross.e2e.remote_display_smoke")
+  $requiresFrameGateEvidence = $scenarioId -in @(
+    "cross.e2e.remote_display_smoke",
+    "cross.e2e.secure_remote_display"
+  )
   $probe = Select-CanaryObjectPropertyValue $Report "probeSnapshot" $null
   $firstFrameTimeMs = Get-CanaryReportFirstFrameTimeMs -Report $Report
   $maxZeroFrameWindowAfterFirstFrameMs = Select-CanaryObjectPropertyValue $Report "maxZeroFrameWindowAfterFirstFrameMs" $null
@@ -181,6 +196,236 @@ function Test-LanE2EReportCleanupCompleted {
     }
   }
   $false
+}
+
+function Test-CanarySecureQuicRoute {
+  param($Route)
+
+  $normalized = ([string](Select-CanaryValue $Route "")).Trim().ToLowerInvariant()
+  $normalized -in @("quic", "lan_quic")
+}
+
+function Format-CanaryQualityProfile {
+  param(
+    $Profile,
+    [string]$Fallback = "unreported"
+  )
+
+  $width = [int](Select-CanaryObjectPropertyValue $Profile "width" 0)
+  $height = [int](Select-CanaryObjectPropertyValue $Profile "height" 0)
+  $fps = [int](Select-CanaryObjectPropertyValue $Profile "fps" 0)
+  $bitrateMbps = [int](Select-CanaryObjectPropertyValue $Profile "bitrate_mbps" 0)
+  $codec = ([string](Select-CanaryObjectPropertyValue $Profile "codec" "")).Trim().ToLowerInvariant()
+  if ($width -le 0 -or $height -le 0 -or $fps -le 0 -or $bitrateMbps -le 0 -or -not $codec) {
+    return $Fallback
+  }
+  "$($width)x$height@$fps-$codec-$($bitrateMbps)mbps"
+}
+
+function Get-CanaryQualitySelectedProfile {
+  param($Report)
+
+  $adaptation = Select-CanaryObjectPropertyValue $Report "mediaAdaptationSnapshot" $null
+  $selected = Select-CanaryObjectPropertyValue $adaptation "current_profile" $null
+  $pipeline = Select-CanaryObjectPropertyValue $Report "mediaPipelineSnapshot" $null
+  if ($null -eq $selected) {
+    $pipelineAdaptation = Select-CanaryObjectPropertyValue $pipeline "adaptation" $null
+    $selected = Select-CanaryObjectPropertyValue $pipelineAdaptation "current_profile" $null
+  }
+  if ($null -ne $selected) {
+    return $selected
+  }
+
+  $probe = Select-CanaryObjectPropertyValue $Report "probeSnapshot" $null
+  $width = [int](Select-CanaryObjectPropertyValue $probe "media_probe_width" 0)
+  $height = [int](Select-CanaryObjectPropertyValue $probe "media_probe_height" 0)
+  $fps = [int](Select-CanaryObjectPropertyValue $probe "media_probe_target_fps" 0)
+  $bitrateMbps = [int](Select-CanaryObjectPropertyValue $probe "media_probe_target_bitrate_mbps" 0)
+  $codec = ([string](Select-CanaryObjectPropertyValue $pipeline "active_codec" "")).Trim()
+  if ($width -le 0 -or $height -le 0 -or $fps -le 0 -or $bitrateMbps -le 0 -or -not $codec) {
+    return $null
+  }
+  [pscustomobject]@{
+    width = $width
+    height = $height
+    fps = $fps
+    bitrate_mbps = $bitrateMbps
+    codec = $codec
+  }
+}
+
+function Get-SecureLanPositiveGateFailureReason {
+  param($Report)
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  $scenarioId = [string](Select-CanaryObjectPropertyValue $Report "scenarioId" "")
+  if ($scenarioId -ne "cross.e2e.secure_remote_display") {
+    return $null
+  }
+
+  $evidence = Select-CanaryObjectPropertyValue $Report "secureSessionEvidence" $null
+  if ($null -eq $evidence) {
+    return "Secure session evidence was not reported"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "trustedIdentityVerified" $false)) {
+    return "Trusted peer identity was not verified"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "authorizationGranted" $false)) {
+    return "Consent or unattended authorization grant was not verified"
+  }
+
+  $authorizationBasis = ([string](Select-CanaryObjectPropertyValue $evidence "authorizationBasis" "")).Trim().ToLowerInvariant()
+  if ($authorizationBasis -notin @("consent", "unattended")) {
+    return "Authorization basis was not consent or unattended"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "scopeAuthorized" $false)) {
+    return "Granted scope did not authorize the secure operation"
+  }
+
+  $selectedRoute = ([string](Select-CanaryObjectPropertyValue $evidence "selectedRoute" "")).Trim()
+  if (-not (Test-CanarySecureQuicRoute -Route $selectedRoute)) {
+    return "Selected secure route was not QUIC"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "quicPeerAuthenticated" $false)) {
+    return "QUIC peer authentication was not verified"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "realFramesVerified" $false)) {
+    return "Remote frames were not verified as real data-plane frames"
+  }
+
+  $probe = Select-CanaryObjectPropertyValue $Report "probeSnapshot" $null
+  $decodedFrames = [int64](Select-CanaryValue (Select-CanaryObjectPropertyValue $probe "frames_decoded" 0) 0)
+  $sampleFramesDecoded = [int64](Select-CanaryObjectPropertyValue $Report "sampleFramesDecoded" 0)
+  if ($decodedFrames -le 0 -and $sampleFramesDecoded -le 0) {
+    return "Secure remote display decoded no frames"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "authorizedInputVerified" $false)) {
+    return "Authorized remote input was not verified"
+  }
+  $controlInputAck = Select-CanaryObjectPropertyValue $Report "controlInputAck" $null
+  if ([int64](Select-CanaryObjectPropertyValue $controlInputAck "event_count" 0) -le 0) {
+    return "No authorized remote input event was accepted"
+  }
+  if (-not [bool](Select-CanaryObjectPropertyValue $evidence "cleanupCompleted" $false)) {
+    return "Secure session cleanup evidence was not reported"
+  }
+  if (-not (Test-LanE2EReportCleanupCompleted -Report $Report)) {
+    return "Secure session cleanup stage did not complete"
+  }
+  if (@((Select-CanaryObjectPropertyValue $Report "auditEventIds" @())).Count -lt 1) {
+    return "Secure session audit evidence was not reported"
+  }
+
+  $null
+}
+
+function Convert-SecureLanReportToQualityArtifact {
+  param(
+    [Parameter(Mandatory = $true)]$Report,
+    [Parameter(Mandatory = $true)][string]$RunId
+  )
+
+  $Report = Resolve-LanE2EAutomationReport -Report $Report
+  if ([string](Select-CanaryObjectPropertyValue $Report "scenarioId" "") -ne "cross.e2e.secure_remote_display") {
+    throw "Only cross.e2e.secure_remote_display reports can become secure LAN quality artifacts"
+  }
+
+  $evidence = Select-CanaryObjectPropertyValue $Report "secureSessionEvidence" $null
+  $pipeline = Select-CanaryObjectPropertyValue $Report "mediaPipelineSnapshot" $null
+  $session = Select-CanaryObjectPropertyValue $Report "sessionSnapshot" $null
+  $controlInputAck = Select-CanaryObjectPropertyValue $Report "controlInputAck" $null
+  $presentedFrames = [int64](Select-CanaryObjectPropertyValue $Report "sampleRenderFramesPresented" 0)
+  if ($presentedFrames -le 0) {
+    $presentedFrames = [int64](Select-CanaryObjectPropertyValue $pipeline "render_presented_frames" 0)
+  }
+  $controlEvents = [int64](Select-CanaryObjectPropertyValue $controlInputAck "event_count" 0)
+  $senderTransport = Select-CanaryObjectPropertyValue $pipeline "sender_transport" $null
+  $datagramPacketsSent = [Math]::Max(0, [int64](Select-CanaryObjectPropertyValue $senderTransport "datagram_fragments_sent" 0))
+  $reliablePacketsSent = [Math]::Max(0, [int64](Select-CanaryObjectPropertyValue $senderTransport "reliable_fragments_sent" 0))
+  $mediaPacketsSent = $datagramPacketsSent + $reliablePacketsSent
+  $firstFrameTimeMs = Get-CanaryReportFirstFrameTimeMs -Report $Report
+  $maxZeroFrameWindowAfterFirstFrameMs = Select-CanaryObjectPropertyValue $Report "maxZeroFrameWindowAfterFirstFrameMs" $null
+  $freezeCount = if (
+    $null -ne $maxZeroFrameWindowAfterFirstFrameMs -and
+    [double]$maxZeroFrameWindowAfterFirstFrameMs -gt $script:CanaryMaxZeroFrameWindowAfterFirstFrameMs
+  ) { 1 } else { 0 }
+  $observedFps = [double](Select-CanaryObjectPropertyValue $Report "sampleObservedFps" 0)
+  $fpsWindows = @()
+  if ($observedFps -gt 0) {
+    $fpsWindows = @($observedFps)
+  }
+  $secureFailure = Get-SecureLanPositiveGateFailureReason -Report $Report
+  $authorizationBasis = ([string](Select-CanaryObjectPropertyValue $evidence "authorizationBasis" "")).Trim().ToLowerInvariant()
+  $controllerDeviceId = ([string](Select-CanaryObjectPropertyValue $Report "controllerDeviceId" "unknown-controller")).Trim()
+  $peer = Select-CanaryObjectPropertyValue $Report "peer" $null
+  $peerDeviceId = ([string](Select-CanaryObjectPropertyValue $peer "device_id" "unknown-peer")).Trim()
+  $requestedProfile = Select-CanaryObjectPropertyValue $Report "requestedProfile" $null
+  $selectedProfile = Get-CanaryQualitySelectedProfile -Report $Report
+  $requestedProfileId = Format-CanaryQualityProfile -Profile $requestedProfile
+  $selectedProfileId = Format-CanaryQualityProfile -Profile $selectedProfile
+  $probeStatus = ([string](Select-CanaryObjectPropertyValue (Select-CanaryObjectPropertyValue $Report "profileProbeResult" $null) "status" "")).Trim().ToLowerInvariant()
+  $failureReason = ([string](Select-CanaryObjectPropertyValue $Report "failureReason" "")).Trim().ToLowerInvariant()
+  $profileDowngraded = (
+    $probeStatus -eq "degraded" -or
+    $failureReason -in @("profile_downgraded", "media_profile_mismatch") -or
+    $requestedProfileId -eq "unreported" -or
+    $selectedProfileId -eq "unreported" -or
+    $requestedProfileId -ne $selectedProfileId
+  )
+
+  [pscustomobject]@{
+    schema_version = "remote-experience-run.v2"
+    run_id = $RunId
+    scenario = [pscustomobject]@{
+      id = "cross.e2e.secure_remote_display"
+      required = $true
+    }
+    route = [pscustomobject]@{
+      requested = "quic"
+      selected = if (Test-CanarySecureQuicRoute -Route (Select-CanaryObjectPropertyValue $evidence "selectedRoute" "")) { "quic" } else { [string](Select-CanaryObjectPropertyValue $evidence "selectedRoute" "") }
+      candidate_pair = "$controllerDeviceId`:$peerDeviceId"
+    }
+    media = [pscustomobject]@{
+      requested_profile = $requestedProfileId
+      selected_profile = $selectedProfileId
+      profile_downgraded = $profileDowngraded
+    }
+    present = [pscustomobject]@{
+      visible_first_frame_ms = $firstFrameTimeMs
+      input_to_photon_ms = @()
+      fps_windows = $fpsWindows
+      freeze_count = $freezeCount
+      stall_ms = @()
+    }
+    resources = [pscustomobject]@{
+      cpu_percent = @()
+      gpu_percent = @()
+      rss_bytes = @()
+      vram_bytes = @()
+    }
+    producer_status = [string](Select-CanaryObjectPropertyValue $Report "status" "failed")
+    gate_status = if ($secureFailure) { "PRODUCT_FAIL" } else { "PASS" }
+    audit_event_ids = @((Select-CanaryObjectPropertyValue $Report "auditEventIds" @()))
+    security = [pscustomobject]@{
+      attempt_kind = "authorized_session"
+      identity_state = if ([bool](Select-CanaryObjectPropertyValue $evidence "trustedIdentityVerified" $false)) { "trusted" } else { "unverified" }
+      authorization_outcome = if ([bool](Select-CanaryObjectPropertyValue $evidence "authorizationGranted" $false)) { "granted" } else { "denied" }
+      authorization_basis = $authorizationBasis
+      scope_authorized = [bool](Select-CanaryObjectPropertyValue $evidence "scopeAuthorized" $false)
+      quic_peer_authenticated = [bool](Select-CanaryObjectPropertyValue $evidence "quicPeerAuthenticated" $false)
+      control_input_authenticated = [bool](Select-CanaryObjectPropertyValue $evidence "authorizedInputVerified" $false)
+      rejected = $false
+      rejection_reason = "none"
+      cleanup_completed = [bool](Select-CanaryObjectPropertyValue $evidence "cleanupCompleted" $false)
+    }
+    side_effects = [pscustomobject]@{
+      sender_tasks_started = if ([bool](Select-CanaryObjectPropertyValue $session "sender_active" $false)) { 1 } else { 0 }
+      receiver_tasks_started = if ([bool](Select-CanaryObjectPropertyValue $session "receiver_active" $false)) { 1 } else { 0 }
+      media_packets_sent = $mediaPacketsSent
+      media_frames_presented = $presentedFrames
+      control_events_injected = $controlEvents
+    }
+  }
 }
 
 function Test-LocalDualProcessServiceBoundaryEvidence {
@@ -625,6 +870,8 @@ function Convert-CrossReportToCanaryRow {
     New-CanarySelectedProfile -Width $Profile.width -Height $Profile.height -Fps $Profile.fps -BitrateMbps $Profile.bitrate_mbps
   }
   $frameGateFailureReason = Get-CrossCanaryFrameGateFailureReason -Report $Report
+  $secureGateFailureReason = Get-SecureLanPositiveGateFailureReason -Report $Report
+  $secureEvidence = Select-CanaryObjectPropertyValue $Report "secureSessionEvidence" $null
   $baseClassification = Get-CrossCanaryClassification -Report $Report -Profile $Profile -SelectedProfile $selected
   $renderCoalesceRatio = [double](Get-CanaryRenderCoalesceRatio -Probe $probe -Pipeline $pipeline)
   $pacedRenderCoalescing = ($renderCoalesceRatio -gt $script:CanaryMaxRenderDropRatio) -and
@@ -667,6 +914,9 @@ function Convert-CrossReportToCanaryRow {
     chain = New-CanaryMediaChain -Mode "cross" -Codec $activeCodec
     status = $status
     classification = $classification
+    secure_verification_status = if ($Report.scenarioId -eq "cross.e2e.secure_remote_display") { if ($secureGateFailureReason) { "failed" } else { "verified" } } else { "not_required" }
+    secure_verification_failure = $secureGateFailureReason
+    secure_session_evidence = $secureEvidence
     fps_observed = [double](Select-CanaryValue (Select-CanaryValue $Report.sampleObservedFps $probe.current_fps) 0)
     selected_profile = $selected
     session_established = [bool]($Report.sessionSnapshot -and $Report.sessionSnapshot.state -ne "failed")
@@ -710,7 +960,7 @@ function Convert-CrossReportToCanaryRow {
     active_display_mode_source_id = Select-CanaryValue $activeDisplayMode.source_id $null
     active_display_refresh_hz = Select-CanaryValue $activeDisplayMode.refresh_hz $null
     raw_report_path = $ReportPath
-    error_message = Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue (Select-CanaryValue $displayLimitReason $frameGateFailureReason))
+    error_message = if ($secureGateFailureReason) { $secureGateFailureReason } else { Select-CanaryValue $Report.errorMessage (Select-CanaryValue $visualIntegrityIssue (Select-CanaryValue $displayLimitReason $frameGateFailureReason)) }
     visual_integrity_status = if ($visualIntegrityIssue) { "risk" } elseif ($pacedRenderCoalescing) { "paced" } else { "ok" }
     visual_integrity_message = $visualIntegrityIssue
     actual_capture_source_id = Select-CanaryValue $captureSource.id $null
@@ -744,6 +994,7 @@ function Get-CrossCanaryStatus {
     return "skipped"
   }
   if ($Classification -eq "visual_integrity_risk") { return "failed" }
+  if ($Classification -eq "security_verification_failed") { return "failed" }
   if ($Classification -eq "threshold_miss") { return "failed" }
   if ($Report.status -eq "completed") { return "completed" }
   if ($Report.status -eq "skipped") { return "skipped" }
@@ -756,6 +1007,10 @@ function Get-CrossCanaryClassification {
     [Parameter(Mandatory = $true)]$Profile,
     [Parameter(Mandatory = $true)]$SelectedProfile
   )
+
+  if (Get-SecureLanPositiveGateFailureReason -Report $Report) {
+    return "security_verification_failed"
+  }
 
   if (Get-CanaryDisplayRefreshLimitReason -Report $Report -Profile $Profile) {
     return "display_refresh_limited"
@@ -1201,6 +1456,30 @@ function New-PairedLanCanaryReport {
     skipped = @($Rows | Where-Object { $_.status -eq "skipped" }).Count
     failed = @($Rows | Where-Object { $_.status -ne "completed" -and $_.status -ne "skipped" }).Count
     rows = @($Rows)
+  }
+}
+
+function Get-PairedLanCanaryGate {
+  param(
+    [Parameter(Mandatory = $true)]$Rows,
+    [Parameter(Mandatory = $true)]$ComparisonRows
+  )
+
+  $failures = @()
+  foreach ($row in @($Rows)) {
+    if ($row.status -ne "completed") {
+      $failures += [pscustomobject]@{ id = $row.id; reason = "row_status_$($row.status)"; error = $row.error_message }
+    }
+  }
+  foreach ($row in @($ComparisonRows)) {
+    if ([bool](Select-CanaryValue $row.comparable $false) -and $row.status -ne "completed") {
+      $failures += [pscustomobject]@{ id = $row.id; reason = "comparison_status_$($row.status)"; error = $row.reason }
+    }
+  }
+  [pscustomobject]@{
+    passed = ($failures.Count -eq 0)
+    verdict = if ($failures.Count -eq 0) { "PASS" } else { "PRODUCT_FAIL" }
+    failures = @($failures)
   }
 }
 

@@ -6,7 +6,7 @@ use std::{
     ffi::c_void,
     io::ErrorKind,
     mem, thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -44,6 +44,7 @@ use windows::Win32::Graphics::Gdi::{
 const DXGI_SHARED_ACQUIRE_TIMEOUT_MS: u32 = 0;
 #[cfg(windows)]
 const DXGI_SHARED_TEXTURE_RING_SIZE: usize = 3;
+const DXGI_CPU_INITIAL_FRAME_WAIT: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY_ENV: &str = "MRD_DXGI_SHARED_CAPTURE_FLUSH_AFTER_COPY";
 
@@ -51,19 +52,64 @@ pub struct DxgiDesktopCapture {
     capturer: Capturer,
     width: usize,
     height: usize,
+    last_frame: Option<CapturedFrame>,
+    #[cfg(windows)]
+    source_left: i32,
+    #[cfg(windows)]
+    source_top: i32,
 }
 
 impl DxgiDesktopCapture {
+    /// Number of physical displays currently visible to the capture backend.
+    pub fn display_count() -> Result<usize, PipelineError> {
+        Display::all()
+            .map(|displays| displays.len())
+            .map_err(|error| PipelineError::message(format!("enumerate displays failed: {error}")))
+    }
+
     pub fn new_primary() -> Result<Self, PipelineError> {
         let display = Display::primary().map_err(|error| {
             PipelineError::message(format!("open primary display failed: {error}"))
         })?;
-        Self::new(display)
+        Self::new_for_display(display, Some(0))
+    }
+
+    /// Open one enumerated physical display by its product display index.
+    pub fn new_for_index(display_index: u32) -> Result<Self, PipelineError> {
+        let displays = Display::all().map_err(|error| {
+            PipelineError::message(format!("enumerate displays failed: {error}"))
+        })?;
+        let index = usize::try_from(display_index)
+            .map_err(|_| PipelineError::message("display index exceeds usize"))?;
+        let display = displays.into_iter().nth(index).ok_or_else(|| {
+            PipelineError::message(format!("display index {display_index} is unavailable"))
+        })?;
+        Self::new_for_display(display, Some(index))
     }
 
     pub fn new(display: Display) -> Result<Self, PipelineError> {
+        Self::new_for_display(display, None)
+    }
+
+    fn new_for_display(
+        display: Display,
+        display_index: Option<usize>,
+    ) -> Result<Self, PipelineError> {
         let width = display.width();
         let height = display.height();
+        #[cfg(windows)]
+        let (source_left, source_top) = {
+            let targets = enumerate_dxgi_output_targets().unwrap_or_default();
+            targets
+                .get(display_index.unwrap_or(usize::MAX))
+                .or_else(|| {
+                    targets
+                        .iter()
+                        .find(|target| target.width == width && target.height == height)
+                })
+                .map(|target| (target.left, target.top))
+                .unwrap_or((0, 0))
+        };
         let capturer = Capturer::new(display).map_err(|error| {
             PipelineError::message(format!("create dxgi capturer failed: {error}"))
         })?;
@@ -72,6 +118,11 @@ impl DxgiDesktopCapture {
             capturer,
             width,
             height,
+            last_frame: None,
+            #[cfg(windows)]
+            source_left,
+            #[cfg(windows)]
+            source_top,
         })
     }
 
@@ -86,26 +137,44 @@ impl DxgiDesktopCapture {
 
 impl FrameCapture for DxgiDesktopCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let initial_wait_started_at = Instant::now();
         loop {
             match self.capturer.frame() {
                 Ok(frame) => {
                     let packed = repack_bgra(frame.as_ref(), self.width, self.height)?;
-                    let timestamp_us = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_err(|error| {
-                            PipelineError::message(format!("system time failed: {error}"))
-                        })?
-                        .as_micros() as u64;
-
-                    return Ok(CapturedFrame::from_cpu(
+                    let captured = CapturedFrame::from_cpu(
                         self.width,
                         self.height,
                         FramePixelFormat::Bgra32,
-                        timestamp_us,
+                        now_us()?,
                         packed,
-                    ));
+                    );
+                    self.last_frame = Some(captured.clone());
+                    return Ok(captured);
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Some(last_frame) = self.last_frame.as_ref() {
+                        return Ok(refresh_cached_cpu_frame(last_frame, now_us()?));
+                    }
+                    #[cfg(windows)]
+                    if initial_wait_started_at.elapsed() >= DXGI_CPU_INITIAL_FRAME_WAIT {
+                        let captured = CapturedFrame::from_cpu(
+                            self.width,
+                            self.height,
+                            FramePixelFormat::Bgra32,
+                            now_us()?,
+                            capture_gdi_bgra_region(
+                                self.source_left,
+                                self.source_top,
+                                self.width,
+                                self.height,
+                                self.width,
+                                self.height,
+                            )?,
+                        );
+                        self.last_frame = Some(captured.clone());
+                        return Ok(captured);
+                    }
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => {
@@ -118,11 +187,18 @@ impl FrameCapture for DxgiDesktopCapture {
     }
 }
 
+fn refresh_cached_cpu_frame(frame: &CapturedFrame, timestamp_us: u64) -> CapturedFrame {
+    let mut refreshed = frame.clone();
+    refreshed.timestamp_us = timestamp_us;
+    refreshed
+}
+
 #[cfg(windows)]
 pub struct DxgiSharedTextureCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    duplication: IDXGIOutputDuplication,
+    output: IDXGIOutput1,
+    duplication: Option<IDXGIOutputDuplication>,
     shared_textures: Vec<SharedBgraTexture>,
     next_shared_texture_index: usize,
     last_shared_texture_index: Option<usize>,
@@ -243,7 +319,8 @@ impl DxgiSharedTextureCapture {
                 return Ok(Self {
                     device,
                     context,
-                    duplication,
+                    output: output1,
+                    duplication: Some(duplication),
                     shared_textures: Vec::new(),
                     next_shared_texture_index: 0,
                     last_shared_texture_index: None,
@@ -323,6 +400,47 @@ impl DxgiSharedTextureCapture {
         let shared = &self.shared_textures[index];
         Ok((shared.shared_handle, shared.texture.clone()))
     }
+
+    fn recover_duplication_after_access_lost(&mut self) -> Result<CapturedFrame, PipelineError> {
+        self.duplication.take();
+
+        let desc = unsafe { self.output.GetDesc() }.map_err(|error| {
+            PipelineError::message(format!(
+                "DXGI duplication access lost; output refresh failed: {error}"
+            ))
+        })?;
+        let rect = desc.DesktopCoordinates;
+        let source_width = rect.right.saturating_sub(rect.left) as usize;
+        let source_height = rect.bottom.saturating_sub(rect.top) as usize;
+        if source_width == 0 || source_height == 0 {
+            return Err(PipelineError::message(
+                "DXGI duplication access lost; refreshed output has zero dimensions",
+            ));
+        }
+
+        let (width, height) =
+            recovery_target_dimensions(self.width, self.height, source_width, source_height);
+        self.source_left = rect.left;
+        self.source_top = rect.top;
+        self.source_width = source_width;
+        self.source_height = source_height;
+        if self.width != width || self.height != height {
+            self.set_target_dimensions(width, height);
+        }
+
+        self.duplication = Some(
+            unsafe { self.output.DuplicateOutput(&self.device) }.map_err(|error| {
+                PipelineError::message(format!(
+                    "DXGI duplication access lost; recreation failed: {error}"
+                ))
+            })?,
+        );
+
+        if let Some(frame) = self.last_shared_frame()? {
+            return Ok(frame);
+        }
+        self.seed_shared_texture_from_gdi()
+    }
 }
 
 #[cfg(windows)]
@@ -332,10 +450,13 @@ impl FrameCapture for DxgiSharedTextureCapture {
     }
 
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let Some(duplication) = self.duplication.as_ref().cloned() else {
+            return self.recover_duplication_after_access_lost();
+        };
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource = None::<IDXGIResource>;
         let acquire = unsafe {
-            self.duplication.AcquireNextFrame(
+            duplication.AcquireNextFrame(
                 DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
                 &mut frame_info,
                 &mut desktop_resource,
@@ -345,7 +466,7 @@ impl FrameCapture for DxgiSharedTextureCapture {
         match acquire {
             Ok(()) => {
                 let result = self.copy_acquired_frame_to_shared(desktop_resource);
-                let _ = unsafe { self.duplication.ReleaseFrame() };
+                let _ = unsafe { duplication.ReleaseFrame() };
                 result
             }
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -355,13 +476,26 @@ impl FrameCapture for DxgiSharedTextureCapture {
                 self.seed_shared_texture_from_gdi()
             }
             Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
-                Err(PipelineError::message("DXGI duplication access lost"))
+                drop(duplication);
+                self.recover_duplication_after_access_lost()
             }
             Err(error) => Err(PipelineError::message(format!(
                 "AcquireNextFrame failed: {error}"
             ))),
         }
     }
+}
+
+fn recovery_target_dimensions(
+    target_width: usize,
+    target_height: usize,
+    source_width: usize,
+    source_height: usize,
+) -> (usize, usize) {
+    (
+        target_width.clamp(2, source_width.max(2)),
+        target_height.clamp(2, source_height.max(2)),
+    )
 }
 
 #[cfg(windows)]
@@ -749,8 +883,10 @@ fn dxgi_shared_capture_flush_after_copy_enabled_from_env_value(value: Option<&st
 mod tests {
     use super::{
         centered_crop_origin, dxgi_device_name_matches,
-        dxgi_shared_capture_flush_after_copy_enabled_from_env_value, repack_bgra,
+        dxgi_shared_capture_flush_after_copy_enabled_from_env_value, recovery_target_dimensions,
+        refresh_cached_cpu_frame, repack_bgra,
     };
+    use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
 
     #[test]
     fn repack_bgra_strips_padding_stride() {
@@ -785,6 +921,19 @@ mod tests {
     }
 
     #[test]
+    fn dxgi_recovery_preserves_target_dimensions_within_new_output_bounds() {
+        assert_eq!(
+            recovery_target_dimensions(2560, 1440, 3840, 2160),
+            (2560, 1440)
+        );
+        assert_eq!(
+            recovery_target_dimensions(2560, 1440, 1920, 1080),
+            (1920, 1080)
+        );
+        assert_eq!(recovery_target_dimensions(1, 1, 1920, 1080), (2, 2));
+    }
+
+    #[test]
     fn dxgi_shared_capture_flush_after_copy_defaults_off() {
         assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(None));
         assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("")));
@@ -806,6 +955,25 @@ mod tests {
         assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
             Some(" on ")
         ));
+    }
+
+    #[test]
+    fn cached_cpu_frame_refreshes_timestamp_without_copying_metadata() {
+        let cached = CapturedFrame::from_cpu(
+            2,
+            1,
+            FramePixelFormat::Bgra32,
+            10,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+        );
+
+        let refreshed = refresh_cached_cpu_frame(&cached, 20);
+
+        assert_eq!(refreshed.width, cached.width);
+        assert_eq!(refreshed.height, cached.height);
+        assert_eq!(refreshed.pixel_format, cached.pixel_format);
+        assert_eq!(refreshed.data, cached.data);
+        assert_eq!(refreshed.timestamp_us, 20);
     }
 }
 

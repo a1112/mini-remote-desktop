@@ -1,7 +1,7 @@
 use super::protocol::{
     LAN_INPUT_CONTROL_CAPABILITY, LAN_QUIC_MEDIA_V2_TRANSPORT, LAN_QUIC_MEDIA_V3_TRANSPORT,
     LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_QUIC_TRANSPORT_MUX_V1,
 };
 
 #[cfg(windows)]
@@ -49,7 +49,8 @@ pub(super) const LAN_DECODE_VIDEOTOOLBOX_HEVC_CAPABILITY: &str = "decode.videoto
 pub(super) const LAN_RENDER_MACOS_NATIVE_CAPABILITY: &str = "macos_native_render";
 
 pub(super) fn lan_media_capabilities() -> Vec<String> {
-    lan_media_capabilities_with_input_control(cfg!(windows))
+    // Task 19 re-enables this only with authenticated ControlEnvelopeV2.
+    lan_media_capabilities_with_input_control(false)
 }
 
 pub(super) fn lan_media_capabilities_with_input_control(
@@ -60,6 +61,7 @@ pub(super) fn lan_media_capabilities_with_input_control(
         LAN_QUIC_MEDIA_V3_TRANSPORT.to_string(),
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
+        LAN_QUIC_TRANSPORT_MUX_V1.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT.to_string(),
     ];
     #[cfg(windows)]

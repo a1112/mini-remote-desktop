@@ -38,13 +38,15 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     pub struct NvencAv1Encoder {
-        _device: ID3D11Device,
-        context: ID3D11DeviceContext,
-        texture: ID3D11Texture2D,
-        encoder: Encoder,
-        registered: RegisteredResource,
-        shared_input: Option<SharedInputResource>,
+        // Drop NVENC buffers/registrations before their D3D11 backing
+        // resources. Rust drops struct fields in declaration order.
         bitstream: BitStream,
+        shared_input: Option<SharedInputResource>,
+        registered: RegisteredResource,
+        encoder: Encoder,
+        texture: ID3D11Texture2D,
+        context: ID3D11DeviceContext,
+        _device: ID3D11Device,
         width: usize,
         height: usize,
         fps: u32,
@@ -57,8 +59,8 @@ mod imp {
         shared_handle: isize,
         width: u32,
         height: u32,
-        _texture: ID3D11Texture2D,
         registered: RegisteredResource,
+        _texture: ID3D11Texture2D,
     }
 
     impl NvencAv1Encoder {
@@ -545,6 +547,19 @@ mod imp {
                 is_keyframe: force_key,
                 bytes, // AV1 uses OBUs, no Annex-B conversion needed
             }])
+        }
+    }
+
+    impl Drop for NvencAv1Encoder {
+        fn drop(&mut self) {
+            // Make the D3D11 submission queue and the encoder session quiescent
+            // before registered resources are dropped in field order.
+            unsafe { self.context.Flush() };
+            let _ = self.registered.unmap();
+            if let Some(shared_input) = self.shared_input.as_mut() {
+                let _ = shared_input.registered.unmap();
+            }
+            let _ = self.encoder.end_encode();
         }
     }
 

@@ -51,13 +51,14 @@ impl OpenH264Encoder {
         };
 
         let mut config = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(openh264_usage_type())
             .max_frame_rate(FrameRate::from_hz(fps.max(1) as f32))
             .intra_frame_period(IntraFramePeriod::from_num_frames(fps.max(1)))
             .rate_control_mode(rate_control_mode)
             .complexity(Complexity::Low)
             .num_threads(openh264_thread_count())
-            .scene_change_detect(true)
+            .max_slice_len(openh264_max_slice_len())
+            .scene_change_detect(openh264_scene_change_detection())
             .adaptive_quantization(false)
             .background_detection(false)
             .skip_frames(bitrate.is_some());
@@ -164,9 +165,26 @@ fn validate_even_dimensions(width: usize, height: usize) -> Result<(), PipelineE
 }
 
 fn openh264_thread_count() -> u16 {
-    std::thread::available_parallelism()
-        .map(|count| count.get().clamp(1, 8) as u16)
-        .unwrap_or(1)
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    resolve_openh264_thread_count(available)
+}
+
+fn resolve_openh264_thread_count(available: usize) -> u16 {
+    available.clamp(1, 12) as u16
+}
+
+fn openh264_max_slice_len() -> u32 {
+    65_536
+}
+
+fn openh264_usage_type() -> UsageType {
+    UsageType::CameraVideoRealTime
+}
+
+fn openh264_scene_change_detection() -> bool {
+    false
 }
 
 fn i420_len(width: usize, height: usize) -> Result<usize, PipelineError> {
@@ -299,6 +317,11 @@ fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError
         )));
     }
 
+    if frame.pixel_format == FramePixelFormat::Bgra32 {
+        write_bgra_to_i420(&frame.data, frame.width, frame.height, out);
+        return Ok(());
+    }
+
     let y_size = frame.width * frame.height;
     let uv_size = y_size / 4;
     let (y_plane, uv_planes) = out.split_at_mut(y_size);
@@ -345,6 +368,41 @@ fn write_i420(frame: &CapturedFrame, out: &mut [u8]) -> Result<(), PipelineError
     }
 
     Ok(())
+}
+
+fn write_bgra_to_i420(data: &[u8], width: usize, height: usize, out: &mut [u8]) {
+    let y_size = width * height;
+    let uv_size = y_size / 4;
+    let (y_plane, uv_planes) = out.split_at_mut(y_size);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+
+    for block_y in (0..height).step_by(2) {
+        let top = &data[block_y * width * 4..(block_y + 1) * width * 4];
+        let bottom = &data[(block_y + 1) * width * 4..(block_y + 2) * width * 4];
+        let y_rows = &mut y_plane[block_y * width..(block_y + 2) * width];
+        let (top_y, bottom_y) = y_rows.split_at_mut(width);
+        let chroma_row = (block_y / 2) * (width / 2);
+
+        for (pair_x, (top_pair, bottom_pair)) in
+            top.chunks_exact(8).zip(bottom.chunks_exact(8)).enumerate()
+        {
+            let p00 = (top_pair[2], top_pair[1], top_pair[0]);
+            let p10 = (top_pair[6], top_pair[5], top_pair[4]);
+            let p01 = (bottom_pair[2], bottom_pair[1], bottom_pair[0]);
+            let p11 = (bottom_pair[6], bottom_pair[5], bottom_pair[4]);
+            let pixel_x = pair_x * 2;
+
+            top_y[pixel_x] = rgb_to_y(p00);
+            top_y[pixel_x + 1] = rgb_to_y(p10);
+            bottom_y[pixel_x] = rgb_to_y(p01);
+            bottom_y[pixel_x + 1] = rgb_to_y(p11);
+
+            let avg = average_rgb([p00, p10, p01, p11]);
+            let uv_index = chroma_row + pair_x;
+            u_plane[uv_index] = rgb_to_u(avg);
+            v_plane[uv_index] = rgb_to_v(avg);
+        }
+    }
 }
 
 fn read_rgb(frame: &CapturedFrame, x: usize, y: usize, bytes_per_pixel: usize) -> (u8, u8, u8) {
@@ -465,6 +523,172 @@ mod conversion_tests {
     use super::*;
 
     #[test]
+    #[ignore]
+    fn perf_openh264_2k_configuration_matrix() {
+        struct Variant {
+            name: &'static str,
+            encoder: Encoder,
+            samples_ms: Vec<f64>,
+        }
+
+        let width = 2560;
+        let height = 1440;
+        let definitions = [
+            ("single-auto", 0, None),
+            ("slice-1200-t4", 4, Some(1_200)),
+            ("slice-1200-t8", 8, Some(1_200)),
+            ("slice-1200-auto", 0, Some(1_200)),
+            ("slice-16k-t4", 4, Some(16_384)),
+            ("slice-64k-t4", 4, Some(65_536)),
+            ("slice-64k-t8", 8, Some(65_536)),
+            ("slice-64k-t12", 12, Some(65_536)),
+            ("slice-256k-t8", 8, Some(262_144)),
+        ];
+        let mut variants = definitions
+            .into_iter()
+            .map(|(name, threads, max_slice_len)| {
+                let mut config = EncoderConfig::new()
+                    .usage_type(UsageType::CameraVideoRealTime)
+                    .max_frame_rate(FrameRate::from_hz(30.0))
+                    .intra_frame_period(IntraFramePeriod::from_num_frames(30))
+                    .rate_control_mode(RateControlMode::Off)
+                    .complexity(Complexity::Low)
+                    .num_threads(threads)
+                    .scene_change_detect(false)
+                    .adaptive_quantization(false)
+                    .background_detection(false)
+                    .skip_frames(false);
+                if let Some(max_slice_len) = max_slice_len {
+                    config = config.max_slice_len(max_slice_len);
+                }
+                Variant {
+                    name,
+                    encoder: Encoder::with_api_config(OpenH264API::from_source(), config)
+                        .expect("create matrix encoder"),
+                    samples_ms: Vec::with_capacity(48),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut bgra = vec![0_u8; width * height * 4];
+        let mut i420 = vec![0_u8; i420_len(width, height).expect("i420 size")];
+
+        for frame_index in 0..48_usize {
+            for pixel in bgra.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[frame_index as u8, 64, 192, 255]);
+            }
+            write_bgra_to_i420(&bgra, width, height, &mut i420);
+            let y_size = width * height;
+            let uv_size = y_size / 4;
+            let yuv = YUVSlices::new(
+                (
+                    &i420[..y_size],
+                    &i420[y_size..y_size + uv_size],
+                    &i420[y_size + uv_size..],
+                ),
+                (width, height),
+                (width, width / 2, width / 2),
+            );
+            let start_variant = frame_index % variants.len();
+            for offset in 0..variants.len() {
+                let variant_index = (start_variant + offset) % variants.len();
+                let variant = &mut variants[variant_index];
+                if frame_index == 0 || frame_index == 30 {
+                    variant.encoder.force_intra_frame();
+                }
+                let started = std::time::Instant::now();
+                let bitstream = variant.encoder.encode(&yuv).expect("matrix encode");
+                let _bytes = bitstream.to_vec();
+                variant
+                    .samples_ms
+                    .push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+
+        for variant in &mut variants {
+            variant.samples_ms.sort_by(f64::total_cmp);
+            let p50 = variant.samples_ms[variant.samples_ms.len() / 2];
+            let p95 = variant.samples_ms
+                [(variant.samples_ms.len() * 95 / 100).min(variant.samples_ms.len() - 1)];
+            eprintln!("{} p50={p50:.3}ms p95={p95:.3}ms", variant.name);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_bgra_to_i420_reports_2k_latency_distribution() {
+        let width = 2560;
+        let height = 1440;
+        let data = vec![127_u8; width * height * 4];
+        let mut out = vec![0_u8; i420_len(width, height).expect("i420 size")];
+        let mut samples = Vec::with_capacity(120);
+
+        for _ in 0..120 {
+            let started = std::time::Instant::now();
+            write_bgra_to_i420(&data, width, height, &mut out);
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        let p50 = samples[samples.len() / 2];
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+
+        eprintln!("2K BGRA->I420 p50={p50:.3}ms p95={p95:.3}ms");
+    }
+
+    #[test]
+    fn optimized_bgra_conversion_matches_reference_planes() {
+        let pixels = [
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [255, 0, 0, 255],
+            [255, 255, 255, 255],
+            [16, 32, 64, 255],
+            [64, 32, 16, 255],
+            [10, 20, 30, 255],
+            [30, 20, 10, 255],
+            [90, 80, 70, 255],
+            [70, 80, 90, 255],
+            [1, 2, 3, 255],
+            [253, 252, 251, 255],
+            [40, 100, 200, 255],
+            [200, 100, 40, 255],
+            [128, 128, 128, 255],
+            [0, 0, 0, 255],
+        ];
+        let data = pixels.into_iter().flatten().collect::<Vec<_>>();
+        let frame = CapturedFrame::from_cpu(4, 4, FramePixelFormat::Bgra32, 0, data.clone());
+        let mut expected = vec![0; i420_len(4, 4).expect("i420 size")];
+        write_i420_reference(&frame, &mut expected);
+        let mut actual = vec![0; expected.len()];
+
+        write_bgra_to_i420(&data, 4, 4, &mut actual);
+
+        assert_eq!(actual, expected);
+    }
+
+    fn write_i420_reference(frame: &CapturedFrame, out: &mut [u8]) {
+        let y_size = frame.width * frame.height;
+        let uv_size = y_size / 4;
+        let (y_plane, uv_planes) = out.split_at_mut(y_size);
+        let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+        for block_y in (0..frame.height).step_by(2) {
+            for block_x in (0..frame.width).step_by(2) {
+                let p00 = read_rgb(frame, block_x, block_y, 4);
+                let p10 = read_rgb(frame, block_x + 1, block_y, 4);
+                let p01 = read_rgb(frame, block_x, block_y + 1, 4);
+                let p11 = read_rgb(frame, block_x + 1, block_y + 1, 4);
+                y_plane[block_y * frame.width + block_x] = rgb_to_y(p00);
+                y_plane[block_y * frame.width + block_x + 1] = rgb_to_y(p10);
+                y_plane[(block_y + 1) * frame.width + block_x] = rgb_to_y(p01);
+                y_plane[(block_y + 1) * frame.width + block_x + 1] = rgb_to_y(p11);
+                let avg = average_rgb([p00, p10, p01, p11]);
+                let uv_index = (block_y / 2) * (frame.width / 2) + block_x / 2;
+                u_plane[uv_index] = rgb_to_u(avg);
+                v_plane[uv_index] = rgb_to_v(avg);
+            }
+        }
+    }
+
+    #[test]
     fn bgra_to_i420_writes_expected_limited_range_planes() {
         let frame = CapturedFrame::from_cpu(
             2,
@@ -491,9 +715,11 @@ mod conversion_tests {
 mod tests {
     use super::{
         avcc_to_annex_b, encoded_access_units_from_bytes, looks_like_annex_b,
-        normalize_h264_bitstream,
+        normalize_h264_bitstream, openh264_max_slice_len, openh264_scene_change_detection,
+        openh264_usage_type, resolve_openh264_thread_count,
     };
     use mrd_pipeline_core::VideoCodec;
+    use openh264::encoder::UsageType;
 
     #[test]
     fn avcc_bitstream_is_converted_to_annex_b() {
@@ -513,5 +739,30 @@ mod tests {
         let access_units = encoded_access_units_from_bytes(VideoCodec::H264, 123, Vec::new());
 
         assert!(access_units.is_empty());
+    }
+
+    #[test]
+    fn desktop_encoder_uses_low_latency_camera_mode() {
+        assert!(matches!(
+            openh264_usage_type(),
+            UsageType::CameraVideoRealTime
+        ));
+    }
+
+    #[test]
+    fn desktop_encoder_caps_slice_workers_for_hybrid_cpus() {
+        assert_eq!(resolve_openh264_thread_count(20), 12);
+        assert_eq!(resolve_openh264_thread_count(4), 4);
+        assert_eq!(resolve_openh264_thread_count(1), 1);
+    }
+
+    #[test]
+    fn desktop_encoder_uses_parallel_64k_slices() {
+        assert_eq!(openh264_max_slice_len(), 65_536);
+    }
+
+    #[test]
+    fn desktop_encoder_skips_redundant_scene_scanning() {
+        assert!(!openh264_scene_change_detection());
     }
 }

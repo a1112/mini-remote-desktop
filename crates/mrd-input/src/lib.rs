@@ -31,6 +31,8 @@ pub enum InputError {
     Unavailable(String),
     #[error("invalid input event: {0}")]
     InvalidEvent(String),
+    #[error("input injection was blocked by Windows UIPI")]
+    UipiDenied,
     #[error("platform input injection failed: {0}")]
     Platform(String),
 }

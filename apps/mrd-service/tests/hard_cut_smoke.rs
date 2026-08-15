@@ -94,13 +94,22 @@ async fn service_evaluates_lan_profile_and_exposes_policy_identity_telemetry() {
         other => panic!("Expected ControlChannelSnapshot response, got {:?}", other),
     }
 
+    let expected_machine_key_id = server
+        .app_state()
+        .device_identities
+        .machine_key_id()
+        .expect("in-memory service state has a signing identity")
+        .to_string();
     let identity = server
         .handle_request(IpcRequest::GetDeviceIdentitySnapshot)
         .await;
     match identity {
         IpcResponse::DeviceIdentitySnapshot { snapshot } => {
             assert!(snapshot.consent_required);
-            assert!(snapshot.certificate_fingerprint.is_none());
+            assert_eq!(
+                snapshot.certificate_fingerprint.as_deref(),
+                Some(expected_machine_key_id.as_str())
+            );
         }
         other => panic!("Expected DeviceIdentitySnapshot response, got {:?}", other),
     }

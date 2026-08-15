@@ -329,6 +329,11 @@ pub fn default_tray() -> std::sync::Arc<std::sync::Mutex<dyn TrayPort + Send + S
     }
 }
 
+/// Machine services run in session zero and must never create interactive UI.
+pub fn service_tray() -> std::sync::Arc<std::sync::Mutex<dyn TrayPort + Send + Sync>> {
+    std::sync::Arc::new(std::sync::Mutex::new(NoOpTray::with_availability(false)))
+}
+
 /// Build a tray model from current state
 pub fn build_tray_model(
     is_healthy: bool,

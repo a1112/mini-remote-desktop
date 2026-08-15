@@ -7,7 +7,7 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LanAccessUnitCodec {
+pub(crate) enum LanAccessUnitCodec {
     H264,
     Hevc,
     Av1,
