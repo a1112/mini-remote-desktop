@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot "../../scripts/process_tree_common.ps1")
+
 function Get-ComponentMatrixUnsupportedReason {
   param(
     [Parameter(Mandatory = $true)]$Case,
@@ -26,13 +28,7 @@ function Stop-ComponentProcessTree {
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-ComponentProcessTree -ProcessId $child.ProcessId
-  }
-
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTreeCrossPlatform -ProcessId $ProcessId
 }
 
 function Invoke-ComponentMatrixCommand {
@@ -64,10 +60,9 @@ function Invoke-ComponentMatrixCommand {
 
   $completed = Wait-Job -Job $job -Timeout ([Math]::Max(1, $TimeoutSeconds))
   if ($null -eq $completed) {
-    $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-      Where-Object { $_.ParentProcessId -eq $job.ChildJobs[0].ProcessId })
-    foreach ($child in $childProcesses) {
-      Stop-ComponentProcessTree -ProcessId $child.ProcessId
+    $jobProcessId = $job.ChildJobs[0].ProcessId
+    if ($null -ne $jobProcessId) {
+      Stop-ComponentProcessTree -ProcessId $jobProcessId
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue

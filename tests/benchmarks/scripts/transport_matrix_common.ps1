@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot "../../scripts/process_tree_common.ps1")
+
 function Resolve-BenchmarkPath {
   param(
     [Parameter(Mandatory = $true)][string]$RepoRoot,
@@ -205,13 +207,7 @@ function Stop-TransportProcessTree {
     [int]$ProcessId
   )
 
-  $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.ParentProcessId -eq $ProcessId })
-  foreach ($child in $children) {
-    Stop-TransportProcessTree -ProcessId $child.ProcessId
-  }
-
-  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+  Stop-ProcessTreeCrossPlatform -ProcessId $ProcessId
 }
 
 function Invoke-TransportMatrixCommand {
@@ -296,11 +292,7 @@ function Invoke-TransportMatrixCommand {
   if ($null -eq $completed) {
     $jobProcessId = $job.ChildJobs[0].ProcessId
     if ($null -ne $jobProcessId) {
-      $childProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.ParentProcessId -eq $jobProcessId })
-      foreach ($child in $childProcesses) {
-        Stop-TransportProcessTree -ProcessId $child.ProcessId
-      }
+      Stop-TransportProcessTree -ProcessId $jobProcessId
     }
     Stop-Job -Job $job -ErrorAction SilentlyContinue
     Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
