@@ -277,8 +277,14 @@ function Invoke-TransportMatrixCommand {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     [void]$process.Start()
-    if (-not $process.HasExited) {
-      $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal
+    if (-not $process.HasExited -and
+      [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+      try {
+        $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::AboveNormal
+      } catch {
+        # Raising process priority is a Windows-only best effort. Hosted Linux
+        # runners reject the equivalent setter for unprivileged processes.
+      }
     }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()

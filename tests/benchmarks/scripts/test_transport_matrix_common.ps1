@@ -409,7 +409,12 @@ try {
   if ($exitCode.ExitCode -ne 7) { throw "Invoke-TransportMatrixCommand should return the native exit code" }
   if ($exitCode.TimedOut) { throw "Invoke-TransportMatrixCommand should not mark a completed command as timed out" }
   if ((Get-Content $stdout -Raw) -notmatch "stdout-ok") { throw "Invoke-TransportMatrixCommand should capture stdout" }
-  if ((Get-Content $stdout -Raw) -notmatch "AboveNormal") { throw "Invoke-TransportMatrixCommand should run benchmark commands above normal priority" }
+  if (
+    [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT -and
+    (Get-Content $stdout -Raw) -notmatch "AboveNormal"
+  ) {
+    throw "Invoke-TransportMatrixCommand should run benchmark commands above normal priority on Windows"
+  }
   if ((Get-Content $stderr -Raw) -notmatch "stderr-ok") { throw "Invoke-TransportMatrixCommand should capture stderr" }
 
   $timeoutResult = Invoke-TransportMatrixCommand `
