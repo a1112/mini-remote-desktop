@@ -54,6 +54,8 @@ def test_authenticated_request_returns_short_lived_session_scoped_credentials():
     assert payload["ttl_seconds"] == 300
     assert payload["username"] == f"{NOW + 300}:user-42:session-7"
     expected = base64.b64encode(
+        # Keep the expected wire-format vector aligned with TURN REST HMAC-SHA1.
+        # codeql[py/weak-sensitive-data-hashing]
         hmac.new(
             SECRET.encode(), payload["username"].encode(), hashlib.sha1
         ).digest()

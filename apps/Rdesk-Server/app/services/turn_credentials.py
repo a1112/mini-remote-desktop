@@ -71,6 +71,9 @@ class TurnCredentialService:
         )
         username = f"{expires_at}:{user_id}:{session_id}"
         credential = base64.b64encode(
+            # TURN REST temporary credentials use HMAC-SHA1 for coturn
+            # interoperability. This is a protocol MAC, not password hashing.
+            # codeql[py/weak-sensitive-data-hashing]
             hmac.new(self._auth_secret, username.encode("utf-8"), hashlib.sha1).digest()
         ).decode("ascii")
         return TurnCredential(
@@ -89,6 +92,9 @@ class TurnCredentialService:
         if expires_at <= (self._now() if now is None else now):
             return False
         expected = base64.b64encode(
+            # TURN REST temporary credentials use HMAC-SHA1 for coturn
+            # interoperability. This is a protocol MAC, not password hashing.
+            # codeql[py/weak-sensitive-data-hashing]
             hmac.new(self._auth_secret, username.encode("utf-8"), hashlib.sha1).digest()
         ).decode("ascii")
         return hmac.compare_digest(expected, credential)
