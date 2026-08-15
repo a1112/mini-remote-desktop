@@ -59,6 +59,37 @@ async fn quinn_loopback_pair_roundtrips_reliable_message() {
 }
 
 #[tokio::test]
+async fn quinn_loopback_pair_exposes_ordered_reliable_stream_ids() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+
+    pair.client
+        .send_reliable_message(Bytes::from_static(b"first"))
+        .await
+        .expect("send first reliable message");
+    pair.client
+        .send_reliable_message(Bytes::from_static(b"second"))
+        .await
+        .expect("send second reliable message");
+
+    let (first_stream_id, first) = pair
+        .server
+        .read_reliable_message_with_stream_id(64)
+        .await
+        .expect("read first reliable message");
+    let (second_stream_id, second) = pair
+        .server
+        .read_reliable_message_with_stream_id(64)
+        .await
+        .expect("read second reliable message");
+
+    assert_eq!(first, Bytes::from_static(b"first"));
+    assert_eq!(second, Bytes::from_static(b"second"));
+    assert_eq!(second_stream_id, first_stream_id + 1);
+}
+
+#[tokio::test]
 async fn quinn_loopback_pair_roundtrips_persistent_reliable_messages() {
     let pair = QuinnDatagramPair::loopback()
         .await
@@ -149,6 +180,70 @@ async fn stalled_bulk_stream_does_not_block_reliable_control() {
     assert_eq!(received, Bytes::from_static(b"interactive-control"));
 
     blocked_bulk.abort();
+}
+
+#[tokio::test]
+async fn persistent_reliable_stream_does_not_reset_while_idle() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+
+    pair.client
+        .send_reliable_message_persistent(Bytes::from_static(b"first"))
+        .await
+        .expect("send first persistent message");
+    assert_eq!(
+        pair.server
+            .read_reliable_message_persistent(64)
+            .await
+            .expect("read first persistent message"),
+        Bytes::from_static(b"first")
+    );
+
+    let server = pair.server.clone();
+    let idle_read = tokio::spawn(async move {
+        server
+            .read_reliable_message_persistent_with_timeout(64, Duration::from_millis(20))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    pair.client
+        .send_reliable_message_persistent(Bytes::from_static(b"recovered"))
+        .await
+        .expect("sender should retain an idle persistent stream");
+    let recovered = tokio::time::timeout(Duration::from_secs(1), idle_read)
+        .await
+        .expect("receiver timed out after idle persistent stream resumed")
+        .expect("idle read task failed")
+        .expect("receiver failed after idle persistent stream resumed");
+    assert_eq!(recovered, Bytes::from_static(b"recovered"));
+}
+
+#[tokio::test]
+async fn persistent_reliable_stream_applies_low_latency_backpressure() {
+    let pair = QuinnDatagramPair::loopback()
+        .await
+        .expect("initialize quinn loopback pair");
+    let payload = Bytes::from(vec![0x5a; 512 * 1024]);
+    let expected = payload.clone();
+    let client = pair.client.clone();
+    let send = tokio::spawn(async move { client.send_reliable_message_persistent(payload).await });
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !send.is_finished(),
+        "sender buffered more than the low-latency flow-control window"
+    );
+
+    let received = pair
+        .server
+        .read_reliable_message_persistent(1024 * 1024)
+        .await
+        .expect("read flow-controlled persistent message");
+    send.await
+        .expect("persistent send task failed")
+        .expect("persistent send failed after receiver drained data");
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]

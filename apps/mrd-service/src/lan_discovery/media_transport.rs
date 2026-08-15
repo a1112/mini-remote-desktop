@@ -59,10 +59,14 @@ pub(crate) fn select_reliable_media_send_mode(
 pub(crate) fn select_reliable_media_send_mode_for_profile(
     reliable_media_supported: bool,
     persistent_media_supported: bool,
+    persistent_media_60fps_supported: bool,
     profile: &MediaProfile,
 ) -> LanReliableMediaSendMode {
-    if reliable_media_supported
-        && profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS
+    if profile.fps <= 60 && persistent_media_supported && persistent_media_60fps_supported {
+        LanReliableMediaSendMode::Persistent
+    } else if reliable_media_supported
+        && (profile.fps <= 60
+            || profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_MIN_BITRATE_MBPS)
     {
         LanReliableMediaSendMode::PerMessage
     } else {
@@ -186,8 +190,9 @@ pub(crate) fn should_send_access_unit_as_reliable_frame(
 }
 
 fn should_default_to_reliable_whole_frame(profile: &MediaProfile) -> bool {
-    profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
-        && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS
+    profile.fps <= 60
+        || (profile.bitrate_mbps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_BITRATE_MBPS
+            && profile.fps >= LAN_QUIC_RELIABLE_WHOLE_FRAME_DEFAULT_MIN_FPS)
 }
 
 pub(crate) fn reliable_whole_frame_media_override() -> Option<bool> {

@@ -312,6 +312,9 @@ fn media_pipeline_registry_exposes_stage_metrics() {
             stage: "sender.encode".to_string(),
             p50_ms: Some(2.5),
             p95_ms: Some(4.5),
+            p99_ms: Some(5.0),
+            max_ms: Some(6.0),
+            sample_count: Some(20),
         }],
     );
 
@@ -364,6 +367,27 @@ fn media_pipeline_registry_exposes_authenticated_agent_render_boundary() {
     let boundary = snapshot.agent_render_boundary.expect("agent boundary");
     assert_eq!(boundary.enqueued_units, 100);
     assert_eq!(boundary.decoded_frames, 98);
+}
+
+#[test]
+fn media_pipeline_registry_removes_stable_clock_skew_from_relative_frame_age() {
+    let mut registry = MediaPipelineRegistry::default();
+    let session_id = SessionId("relative-frame-age-session".to_string());
+
+    registry.record_estimated_frame_age_ms(session_id.clone(), 1_600.0);
+    registry.record_estimated_frame_age_ms(session_id.clone(), 1_625.0);
+    registry.record_estimated_frame_age_ms(session_id.clone(), 1_590.0);
+    registry.record_estimated_frame_age_ms(session_id.clone(), 1_610.0);
+
+    let snapshot = registry.snapshot(&session_id);
+    let relative = snapshot
+        .stage_metrics
+        .iter()
+        .find(|metric| metric.stage == "receiver.relative_frame_age")
+        .expect("relative frame age metric");
+
+    assert_eq!(relative.max_ms, Some(25.0));
+    assert_eq!(relative.sample_count, Some(4));
 }
 
 #[test]

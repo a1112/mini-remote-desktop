@@ -11,6 +11,44 @@ import { resetTauriMock } from "./mocks/tauri";
 const animationFrameTimers = new Map<number, ReturnType<typeof setTimeout>>();
 let nextAnimationFrameId = 1;
 
+class MemoryStorage implements Storage {
+  private readonly values = new Map<string, string>();
+
+  get length() {
+    return this.values.size;
+  }
+
+  clear() {
+    this.values.clear();
+  }
+
+  getItem(key: string) {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number) {
+    return Array.from(this.values.keys())[index] ?? null;
+  }
+
+  removeItem(key: string) {
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string) {
+    this.values.set(key, String(value));
+  }
+}
+
+const testLocalStorage = new MemoryStorage();
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: testLocalStorage,
+});
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: testLocalStorage,
+});
+
 // Extend Vitest's expect with jest-dom matchers
 expect.extend(matchers);
 

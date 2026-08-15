@@ -1,6 +1,11 @@
 #![allow(missing_docs)]
 
-use crate::{authorization::AuthorizationState, media::MediaState, route::{RouteKind, RouteState}, SessionPlan};
+use crate::{
+    authorization::AuthorizationState,
+    media::MediaState,
+    route::{RouteKind, RouteState},
+    SessionPlan,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -39,22 +44,42 @@ impl RemoteSessionAggregate {
         }
     }
 
-    pub fn plan(&self) -> &SessionPlan { &self.plan }
-    pub fn authorization_state(&self) -> &AuthorizationState { &self.authorization }
-    pub fn route_state(&self) -> &RouteState { &self.route }
-    pub fn media_state(&self) -> &MediaState { &self.media }
-    pub fn granted_scopes(&self) -> &[String] { &self.granted_scopes }
-    pub fn last_failure(&self) -> Option<&str> { self.last_failure.as_deref() }
+    pub fn plan(&self) -> &SessionPlan {
+        &self.plan
+    }
+    pub fn authorization_state(&self) -> &AuthorizationState {
+        &self.authorization
+    }
+    pub fn route_state(&self) -> &RouteState {
+        &self.route
+    }
+    pub fn media_state(&self) -> &MediaState {
+        &self.media
+    }
+    pub fn granted_scopes(&self) -> &[String] {
+        &self.granted_scopes
+    }
+    pub fn last_failure(&self) -> Option<&str> {
+        self.last_failure.as_deref()
+    }
 
-    pub fn authorize(&mut self, scopes: Vec<String>, policy_revision: u64) -> Result<(), SessionTransitionError> {
-        if self.closed { return Err(SessionTransitionError::Closed); }
+    pub fn authorize(
+        &mut self,
+        scopes: Vec<String>,
+        policy_revision: u64,
+    ) -> Result<(), SessionTransitionError> {
+        if self.closed {
+            return Err(SessionTransitionError::Closed);
+        }
         self.granted_scopes = scopes;
         self.authorization = AuthorizationState::Granted { policy_revision };
         Ok(())
     }
 
     pub fn deny_authorization(&mut self, reason: impl Into<String>) {
-        self.authorization = AuthorizationState::Denied { reason: reason.into() };
+        self.authorization = AuthorizationState::Denied {
+            reason: reason.into(),
+        };
     }
 
     pub fn begin_route_migration(&mut self, kind: RouteKind) -> Result<(), SessionTransitionError> {
@@ -63,7 +88,10 @@ impl RemoteSessionAggregate {
         Ok(())
     }
 
-    pub fn complete_route_migration(&mut self, kind: RouteKind) -> Result<(), SessionTransitionError> {
+    pub fn complete_route_migration(
+        &mut self,
+        kind: RouteKind,
+    ) -> Result<(), SessionTransitionError> {
         if self.route != RouteState::Establishing(kind) {
             return Err(SessionTransitionError::RouteMigrationNotInProgress);
         }
@@ -89,10 +117,14 @@ impl RemoteSessionAggregate {
     }
 
     fn ensure_authorized(&self) -> Result<(), SessionTransitionError> {
-        if self.closed { return Err(SessionTransitionError::Closed); }
+        if self.closed {
+            return Err(SessionTransitionError::Closed);
+        }
         match self.authorization {
             AuthorizationState::Pending => Err(SessionTransitionError::AuthorizationRequired),
-            AuthorizationState::Denied { .. } | AuthorizationState::Revoked { .. } => Err(SessionTransitionError::AuthorizationDenied),
+            AuthorizationState::Denied { .. } | AuthorizationState::Revoked { .. } => {
+                Err(SessionTransitionError::AuthorizationDenied)
+            }
             AuthorizationState::Granted { .. } => Ok(()),
         }
     }

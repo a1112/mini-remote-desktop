@@ -10,7 +10,6 @@ dist/
 # Rust
 target/
 generated-images/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
@@ -48,6 +47,7 @@ client-qt/venv
 /artifacts/benchmarks/
 /artifacts/component-matrix/
 /artifacts/ffmpeg-perf/
+/artifacts/local-performance/
 /crates/mrd-decode/artifacts/
 /tests/benchmarks/tmp/
 /tests/component-matrix/tmp/

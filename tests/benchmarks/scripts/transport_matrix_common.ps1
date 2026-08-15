@@ -1,3 +1,26 @@
+function Resolve-BenchmarkPath {
+  param(
+    [Parameter(Mandatory = $true)][string]$RepoRoot,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  if ([System.IO.Path]::IsPathRooted($Path)) {
+    return [System.IO.Path]::GetFullPath($Path)
+  }
+  [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
+}
+
+function Get-TransportMatrixTimeoutSeconds {
+  param([Parameter(Mandatory = $true)]$Scenario)
+
+  $durationSeconds = if ($null -ne $Scenario.PSObject.Properties["duration_secs"]) {
+    [int]$Scenario.duration_secs
+  } else {
+    0
+  }
+  [Math]::Max(440, $durationSeconds + 420)
+}
+
 function Get-TransportMatrixCargoFeatureArgs {
   param(
     [string]$EncodeBackend = "",

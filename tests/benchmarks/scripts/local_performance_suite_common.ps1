@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "benchmark_host_capabilities.ps1")
 
 function Get-LocalPerformanceScenarioPaths {
   param([Parameter(Mandatory = $true)][string]$RepoRoot)
@@ -22,8 +23,19 @@ function Get-LocalPerformanceScenarioSupportReason {
   param(
     [Parameter(Mandatory = $true)]$Scenario,
     [Parameter(Mandatory = $true)][int]$ActiveDisplayCount,
-    [AllowEmptyCollection()][string[]]$AvailableCommands = $null
+    [AllowEmptyCollection()][string[]]$AvailableCommands = $null,
+    [AllowNull()]$VvcLibraryAvailable = $null,
+    [AllowNull()]$DxgiOutputAvailable = $null
   )
+
+  $captureBackend = if ($null -ne $Scenario.PSObject.Properties["capture_backend"]) {
+    [string]$Scenario.capture_backend
+  } else {
+    ""
+  }
+  if ($captureBackend -eq "dxgi" -and $null -ne $DxgiOutputAvailable -and -not [bool]$DxgiOutputAvailable) {
+    return "dxgi_output_unavailable"
+  }
 
   $sourceId = if ($null -ne $Scenario.PSObject.Properties["source_id"]) {
     [string]$Scenario.source_id
@@ -53,6 +65,16 @@ function Get-LocalPerformanceScenarioSupportReason {
       @($AvailableCommands) -contains "cmake"
     }
     if (-not $pkgConfigAvailable -or -not $cmakeAvailable) {
+      return "codec_dependency_unavailable"
+    }
+    $hasVvcLibrary = if ($null -ne $VvcLibraryAvailable) {
+      [bool]$VvcLibraryAvailable
+    } else {
+      $pkgConfigCommand = if ($env:PKG_CONFIG) { $env:PKG_CONFIG } else { "pkg-config" }
+      & $pkgConfigCommand --exists "libvvenc >= 1.13.0" 2>$null
+      $LASTEXITCODE -eq 0
+    }
+    if (-not $hasVvcLibrary) {
       return "codec_dependency_unavailable"
     }
   }
@@ -149,7 +171,8 @@ function ConvertTo-LocalPerformanceQuotedPath {
 function New-LocalPerformanceExecutionPlan {
   param(
     [Parameter(Mandatory = $true)][string]$RepoRoot,
-    [Parameter(Mandatory = $true)][string]$OutputRoot
+    [Parameter(Mandatory = $true)][string]$OutputRoot,
+    [AllowNull()]$DxgiOutputAvailable = $null
   )
 
   $componentScript = ConvertTo-LocalPerformanceQuotedPath (
@@ -170,6 +193,9 @@ function New-LocalPerformanceExecutionPlan {
 
   $plan = [System.Collections.Generic.List[object]]::new()
   $activeDisplayCount = Get-LocalPerformanceActiveDisplayCount
+  if ($null -eq $DxgiOutputAvailable) {
+    $DxgiOutputAvailable = Test-BenchmarkDxgiOutputAvailable -RepoRoot $RepoRoot
+  }
   $plan.Add([pscustomobject]@{
     phase = "component"
     case_id = "component-matrix"
@@ -188,7 +214,8 @@ function New-LocalPerformanceExecutionPlan {
     $scenario = Get-Content -LiteralPath $scenarioPath -Raw | ConvertFrom-Json
     $unsupportedReason = Get-LocalPerformanceScenarioSupportReason `
       -Scenario $scenario `
-      -ActiveDisplayCount $activeDisplayCount
+      -ActiveDisplayCount $activeDisplayCount `
+      -DxgiOutputAvailable $DxgiOutputAvailable
     $quotedScenario = ConvertTo-LocalPerformanceQuotedPath $scenarioPath
     $plan.Add([pscustomobject]@{
       phase = "transport"
@@ -203,6 +230,7 @@ function New-LocalPerformanceExecutionPlan {
     case_id = "all-local-profiles"
     command = "& powershell -ExecutionPolicy Bypass -File $canaryScript -OutputDir $canaryOutput -SkipCross"
     timeout_secs = 7200
+    unsupported_reason = if ([bool]$DxgiOutputAvailable) { $null } else { "dxgi_output_unavailable" }
   })
   @($plan)
 }

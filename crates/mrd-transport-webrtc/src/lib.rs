@@ -2072,6 +2072,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a working NVIDIA NVENC runtime"]
     fn nvenc_access_unit_survives_rtp_packetize_and_ingress_reassembly() {
         let Ok(mut encoder) = NvencH264Encoder::new(16, 16, 30) else {
             return;

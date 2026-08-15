@@ -1992,6 +1992,7 @@ mod remote_display_surface_input_tests {
                 announce_interval: Duration::from_millis(50),
                 peer_ttl: Duration::from_secs(5),
                 allow_unsigned_diagnostics: false,
+                broadcast_enabled: false,
             },
         ))
     }

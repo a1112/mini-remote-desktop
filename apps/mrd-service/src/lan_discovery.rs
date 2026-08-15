@@ -303,8 +303,9 @@ use protocol::{
     LAN_DISPLAY_MODE_CONTROL_TRANSPORT, LAN_INPUT_CONTROL_TRANSPORT,
     LAN_MEDIA_PROFILE_CONTROL_TRANSPORT, LAN_MEDIA_PROTOCOL_VERSION,
     LAN_QUIC_MEDIA_PROFILE_TRANSPORT, LAN_QUIC_MEDIA_TRANSPORT, LAN_QUIC_MEDIA_V2_TRANSPORT,
-    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT,
-    LAN_QUIC_RELIABLE_MEDIA_TRANSPORT, LAN_QUIC_TRANSPORT_MUX_V1,
+    LAN_QUIC_MEDIA_V3_TRANSPORT, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT,
+    LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT, LAN_QUIC_RELIABLE_MEDIA_TRANSPORT,
+    LAN_QUIC_TRANSPORT_MUX_V1,
 };
 #[cfg(test)]
 use protocol::{
@@ -358,6 +359,13 @@ const LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES: usize = 4 * 1024 * 1024;
 const LAN_RELIABLE_KEYFRAME_SEND_TASK_LIMIT: usize = 1;
 const LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY: Duration = Duration::from_millis(10);
 const LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// Only bounds an in-flight persistent-stream payload. Waiting for the next
+// frame header remains unbounded because an idle capture stream is not HOL.
+// Real 1080p keyframes can exceed 100 ms on a busy LAN, so keep enough margin
+// to avoid a reset/keyframe-request feedback loop while still bounding a
+// genuinely incomplete reliable frame.
+const LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT: Duration = Duration::from_millis(750);
+const LAN_QUIC_PER_MESSAGE_CONCURRENT_READS: usize = 8;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_BITRATE_MBPS: u32 = 80;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET_MIN_FPS: u32 = 120;
 const LAN_QUIC_DATAGRAM_SEND_BUDGET: Duration = Duration::from_millis(4);
@@ -369,6 +377,7 @@ const LAN_RENDER_PACING_DEFAULT_MIN_FPS: u32 = 120;
 const LAN_RENDER_PACING_DEFAULT_MAX_PENDING_FRAMES: usize = 3;
 const LAN_RENDER_PACING_MAX_PENDING_FRAMES_LIMIT: usize = 8;
 const LAN_MEDIA_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(20);
+const LAN_REMOTE_SESSION_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const LAN_CONTROL_INPUT_ACK_TIMEOUT: Duration = Duration::from_millis(250);
 const LAN_CONTROL_INPUT_REALTIME_ATTEMPTS: usize = 1;
 const LAN_CONTROL_INPUT_RELIABLE_ATTEMPTS: usize = 3;
@@ -730,7 +739,9 @@ impl LanDiscoveryState {
 
     fn probe_targets(&self, discovery_port: u16) -> Vec<SocketAddr> {
         let mut targets = Vec::with_capacity(self.config.probe_endpoints.len() + 1);
-        targets.push(SocketAddr::from(([255, 255, 255, 255], discovery_port)));
+        if self.config.broadcast_enabled {
+            targets.push(SocketAddr::from(([255, 255, 255, 255], discovery_port)));
+        }
         for endpoint in &self.config.probe_endpoints {
             if !targets.iter().any(|target| target == endpoint) {
                 targets.push(*endpoint);
@@ -1182,9 +1193,11 @@ pub async fn start_lan_discovery(app_state: Arc<AppState>) -> Result<()> {
             .await
             .with_context(|| format!("failed to bind LAN discovery UDP port {port}"))?,
     );
-    socket
-        .set_broadcast(true)
-        .context("failed to enable LAN discovery UDP broadcast")?;
+    if app_state.lan_discovery.config.broadcast_enabled {
+        socket
+            .set_broadcast(true)
+            .context("failed to enable LAN discovery UDP broadcast")?;
+    }
 
     app_state
         .lan_discovery
@@ -1421,12 +1434,20 @@ pub async fn request_lan_remote_session_authorized(
 
     let packet = LanDiscoveryPacket::SignedRemoteSessionRequest(signed_request.clone());
     let bytes = serde_json::to_vec(&packet)?;
-    socket.send(&bytes).await?;
+    let local_addr = socket
+        .local_addr()
+        .context("failed to inspect LAN remote request UDP socket")?;
+    socket.send(&bytes).await.with_context(|| {
+        format!("failed to send LAN remote request from {local_addr} to {target}")
+    })?;
 
     let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
-    let len = timeout(Duration::from_secs(35), socket.recv(&mut buffer))
+    let len = timeout(LAN_REMOTE_SESSION_ACK_TIMEOUT, socket.recv(&mut buffer))
         .await
-        .context("LAN remote request timed out")??;
+        .context("LAN remote request timed out")?
+        .with_context(|| {
+            format!("failed to receive LAN remote response on {local_addr} from {target}")
+        })?;
     let ack: LanDiscoveryPacket = serde_json::from_slice(&buffer[..len])?;
     match ack {
         LanDiscoveryPacket::SignedRemoteSessionBootstrap(bootstrap) => {
@@ -4176,6 +4197,7 @@ async fn build_announcement(
         LAN_QUIC_RELIABLE_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT.to_string(),
         LAN_QUIC_TRANSPORT_MUX_V1.to_string(),
+        LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT.to_string(),
         LAN_MEDIA_PROFILE_CONTROL_TRANSPORT.to_string(),
         LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT.to_string(),
         LAN_DISPLAY_MODE_CONTROL_TRANSPORT.to_string(),
@@ -4924,6 +4946,11 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
+    let persistent_media_60fps_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT);
     let media_v3_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -4950,6 +4977,7 @@ async fn send_quic_media_loop(
         let reliable_media_send_mode = select_reliable_media_send_mode_for_profile(
             reliable_media_supported,
             persistent_media_supported,
+            persistent_media_60fps_supported,
             &profile,
         );
         let max_datagram_size = lan_media_datagram_size(
@@ -5686,6 +5714,7 @@ async fn send_quic_media_loop(
                     ..LanSenderDatagramFrameReport::default()
                 };
                 let mut skip_unsent_datagram_frame = false;
+                let mut delayed_fragments = Vec::new();
                 for (fragment_index, fragment) in fragments.iter().enumerate() {
                     if !session_allows_media(&app_state, &session_id).await {
                         return Ok(());
@@ -5718,40 +5747,7 @@ async fn send_quic_media_loop(
                     if !decision.delay.is_zero() {
                         datagram_report.fragments_delayed =
                             datagram_report.fragments_delayed.saturating_add(1);
-                        let delayed_endpoint = endpoint.clone();
-                        let delayed_app_state = app_state.clone();
-                        let delayed_session_id = session_id.clone();
-                        let delayed_frame_id = frame_id;
-                        let delayed_fragment = fragment.clone();
-                        delayed_media_children.spawn(async move {
-                            let Some(send_result) = run_lan_media_operation_while_authorized(
-                                &delayed_app_state,
-                                &delayed_session_id,
-                                &delayed_endpoint,
-                                async {
-                                    tokio::time::sleep(decision.delay).await;
-                                    send_lan_media_datagram(
-                                        &delayed_endpoint,
-                                        delayed_fragment,
-                                        !best_effort_datagrams,
-                                        None,
-                                    )
-                                    .await
-                                },
-                            )
-                            .await
-                            else {
-                                return;
-                            };
-                            if let Err(error) = send_result {
-                                tracing::debug!(
-                                    %error,
-                                    session_id = %delayed_session_id.0,
-                                    frame_id = delayed_frame_id,
-                                    "delayed LAN QUIC media datagram send failed"
-                                );
-                            }
-                        });
+                        delayed_fragments.push((decision.delay, fragment_index, fragment.clone()));
                         continue;
                     }
                     if !session_allows_media(&app_state, &session_id).await {
@@ -5780,7 +5776,10 @@ async fn send_quic_media_loop(
                         Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
                             datagram_report.fragments_dropped_for_capacity = datagram_report
                                 .fragments_dropped_for_capacity
-                                .saturating_add((fragments.len() - fragment_index) as u64);
+                                .saturating_add(
+                                    (fragments.len() - fragment_index + delayed_fragments.len())
+                                        as u64,
+                                );
                             datagram_report.cut_short_for_capacity = true;
                             if !frame_send_started {
                                 skip_unsent_datagram_frame = true;
@@ -5794,6 +5793,62 @@ async fn send_quic_media_loop(
                             break;
                         }
                     }
+                }
+                if !skip_unsent_datagram_frame
+                    && send_result.is_ok()
+                    && !delayed_fragments.is_empty()
+                {
+                    delayed_fragments
+                        .sort_by_key(|(delay, fragment_index, _)| (*delay, *fragment_index));
+                    let delayed_endpoint = endpoint.clone();
+                    let delayed_app_state = app_state.clone();
+                    let delayed_session_id = session_id.clone();
+                    let delayed_frame_id = frame_id;
+                    delayed_media_children.spawn(async move {
+                        let delayed_send_started = Instant::now();
+                        for (delay, _, fragment) in delayed_fragments {
+                            let remaining_delay =
+                                delay.saturating_sub(delayed_send_started.elapsed());
+                            if !remaining_delay.is_zero() {
+                                tokio::time::sleep(remaining_delay).await;
+                            }
+                            let Some(send_result) = run_lan_media_operation_while_authorized(
+                                &delayed_app_state,
+                                &delayed_session_id,
+                                &delayed_endpoint,
+                                send_lan_media_datagram(
+                                    &delayed_endpoint,
+                                    fragment,
+                                    !best_effort_datagrams,
+                                    None,
+                                ),
+                            )
+                            .await
+                            else {
+                                break;
+                            };
+                            match send_result {
+                                Ok(LanDatagramSendOutcome::Sent) => {}
+                                Ok(LanDatagramSendOutcome::DroppedForCapacity) => {
+                                    tracing::debug!(
+                                        session_id = %delayed_session_id.0,
+                                        frame_id = delayed_frame_id,
+                                        "delayed LAN QUIC media frame cut short for capacity"
+                                    );
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::debug!(
+                                        %error,
+                                        session_id = %delayed_session_id.0,
+                                        frame_id = delayed_frame_id,
+                                        "delayed LAN QUIC media datagram send failed"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
                 sender_stats.record_datagram_frame(datagram_report);
                 sender_stats.record_elapsed("sender.send_datagram", datagram_send_started);
@@ -6035,12 +6090,20 @@ fn lan_capture_pump_drives_sender() -> bool {
 
 #[cfg(target_os = "macos")]
 fn lan_capture_pump_repeat_latest() -> bool {
-    env_bool_override(
+    lan_capture_pump_repeat_latest_from_env_value(
         std::env::var(LAN_CAPTURE_PUMP_REPEAT_LATEST_ENV)
             .ok()
             .as_deref(),
     )
-    .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn lan_capture_pump_repeat_latest_from_env_value(value: Option<&str>) -> bool {
+    // ScreenCaptureKit can deliver below the requested cadence when the source display
+    // refreshes slowly or its contents are mostly idle. Prefer a fresh frame during the
+    // short grace window, then repeat the latest retained CVPixelBuffer so the transport
+    // and renderer still keep the negotiated frame cadence.
+    env_bool_override(value).unwrap_or(true)
 }
 
 #[cfg(target_os = "macos")]
@@ -6345,6 +6408,11 @@ async fn receive_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT);
+    let persistent_reliable_media_60fps_supported = app_state
+        .peer_media_capabilities
+        .lock()
+        .await
+        .supports(&session_id, LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT);
     let per_message_reliable_media_supported = app_state
         .peer_media_capabilities
         .lock()
@@ -6357,45 +6425,119 @@ async fn receive_quic_media_loop(
         select_reliable_media_send_mode_for_profile(
             per_message_reliable_media_supported,
             persistent_reliable_media_supported,
+            persistent_reliable_media_60fps_supported,
             &initial_media_profile,
         )
     };
-    let (mut reliable_media_rx, _reliable_media_reader) =
-        if reliable_media_read_mode != LanReliableMediaSendMode::Disabled {
-            let (tx, rx) = tokio::sync::mpsc::channel(32);
-            let reliable_endpoint = endpoint.clone();
-            let reader = AbortOnDrop(tokio::spawn(async move {
-                loop {
-                    let result = match reliable_media_read_mode {
-                        LanReliableMediaSendMode::Disabled => break,
-                        LanReliableMediaSendMode::PerMessage => {
-                            reliable_endpoint
-                                .read_reliable_message(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                                .await
+    let (mut reliable_media_rx, _reliable_media_reader) = if reliable_media_read_mode
+        != LanReliableMediaSendMode::Disabled
+    {
+        // Keep only a short handoff queue. QUIC flow control provides the
+        // upstream backpressure; a 32-frame queue alone adds over 500 ms at
+        // 60 fps before the bounded render queues are even reached.
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let reliable_endpoint = endpoint.clone();
+        let reader = AbortOnDrop(tokio::spawn(async move {
+            if reliable_media_read_mode == LanReliableMediaSendMode::PerMessage {
+                let (first_stream_id, first_payload) = match reliable_endpoint
+                    .read_reliable_message_with_stream_id(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                    .await
+                {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string())).await;
+                        return;
+                    }
+                };
+                if tx.send(Ok(first_payload)).await.is_err() {
+                    return;
+                }
+
+                let mut next_stream_id = first_stream_id.saturating_add(1);
+                let mut completed = std::collections::BTreeMap::new();
+                let mut reads = tokio::task::JoinSet::new();
+                for _ in 0..LAN_QUIC_PER_MESSAGE_CONCURRENT_READS {
+                    let endpoint = reliable_endpoint.clone();
+                    reads.spawn(async move {
+                        endpoint
+                            .read_reliable_message_with_stream_id(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
+                            .await
+                    });
+                }
+                while let Some(joined) = reads.join_next().await {
+                    let (stream_id, payload) = match joined {
+                        Ok(Ok(message)) => message,
+                        Ok(Err(error)) => {
+                            let _ = tx.send(Err(error.to_string())).await;
+                            reads.abort_all();
+                            break;
                         }
-                        LanReliableMediaSendMode::Persistent => {
-                            reliable_endpoint
-                                .read_reliable_message_persistent(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
-                                .await
+                        Err(error) => {
+                            if error.is_cancelled() {
+                                break;
+                            }
+                            let _ = tx
+                                .send(Err(format!("reliable media read task failed: {error}")))
+                                .await;
+                            reads.abort_all();
+                            break;
                         }
                     };
-                    let should_retry = result.is_err();
-                    if tx
-                        .send(result.map_err(|error| error.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    completed.insert(stream_id, payload);
+
+                    while let Some(payload) = completed.remove(&next_stream_id) {
+                        if tx.send(Ok(payload)).await.is_err() {
+                            reads.abort_all();
+                            return;
+                        }
+                        next_stream_id = next_stream_id.saturating_add(1);
                     }
-                    if should_retry {
-                        tokio::time::sleep(LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY).await;
+
+                    while reads.len() + completed.len() < LAN_QUIC_PER_MESSAGE_CONCURRENT_READS {
+                        let endpoint = reliable_endpoint.clone();
+                        reads.spawn(async move {
+                            endpoint
+                                .read_reliable_message_with_stream_id(
+                                    LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                                )
+                                .await
+                        });
                     }
                 }
-            }));
-            (Some(rx), Some(reader))
-        } else {
-            (None, None)
-        };
+                return;
+            }
+            loop {
+                let result = match reliable_media_read_mode {
+                    LanReliableMediaSendMode::Disabled => break,
+                    LanReliableMediaSendMode::PerMessage => {
+                        unreachable!("per-message reliable media uses concurrent stream readers")
+                    }
+                    LanReliableMediaSendMode::Persistent => {
+                        reliable_endpoint
+                            .read_reliable_message_persistent_with_timeout(
+                                LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES,
+                                LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT,
+                            )
+                            .await
+                    }
+                };
+                let should_retry = result.is_err();
+                if tx
+                    .send(result.map_err(|error| error.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if should_retry {
+                    tokio::time::sleep(LAN_QUIC_RELIABLE_MEDIA_RETRY_DELAY).await;
+                }
+            }
+        }));
+        (Some(rx), Some(reader))
+    } else {
+        (None, None)
+    };
     let mut datagram_media_enabled = true;
     let mut mux_legacy_fragments = std::collections::VecDeque::new();
     let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
@@ -6487,6 +6629,17 @@ async fn receive_quic_media_loop(
                         match message {
                             Some(Ok(message)) => message,
                             Some(Err(error)) => {
+                                recover_persistent_media_hol_stall(
+                                    &app_state,
+                                    &session_id,
+                                    &endpoint,
+                                    transport_mux.as_deref(),
+                                    &error,
+                                    &mut receiver_stats,
+                                    &mut keyframe_request_sequence,
+                                    &mut last_keyframe_request_at,
+                                )
+                                .await;
                                 tracing::warn!(
                                     %error,
                                     session_id = %session_id.0,
@@ -6512,6 +6665,17 @@ async fn receive_quic_media_loop(
                 match timeout(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL, rx.recv()).await {
                     Ok(Some(Ok(message))) => message,
                     Ok(Some(Err(error))) => {
+                        recover_persistent_media_hol_stall(
+                            &app_state,
+                            &session_id,
+                            &endpoint,
+                            transport_mux.as_deref(),
+                            &error,
+                            &mut receiver_stats,
+                            &mut keyframe_request_sequence,
+                            &mut last_keyframe_request_at,
+                        )
+                        .await;
                         tracing::warn!(
                             %error,
                             session_id = %session_id.0,
@@ -6632,6 +6796,9 @@ async fn receive_quic_media_loop(
 
         if let Some(frame) = reassembled_frame {
             let ready_frames = frame_orderer.push(frame);
+            if frame_orderer.take_skipped_gap() {
+                decoder_waits_for_keyframe = true;
+            }
             receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
             for frame in ready_frames {
                 let mut envelope = match decode_lan_media_envelope(&frame.payload) {
@@ -7078,6 +7245,41 @@ async fn receive_quic_media_loop(
     }
 }
 
+async fn recover_persistent_media_hol_stall(
+    app_state: &Arc<AppState>,
+    session_id: &SessionId,
+    endpoint: &QuinnDatagramEndpoint,
+    transport_mux: Option<&QuicTransportMux>,
+    error: &str,
+    receiver_stats: &mut LanSenderStatsTracker,
+    keyframe_request_sequence: &mut u32,
+    last_keyframe_request_at: &mut Option<Instant>,
+) {
+    if !error.contains("persistent reliable HOL payload timeout") {
+        return;
+    }
+    receiver_stats.record_ms(
+        "receiver.reliable_hol_timeout",
+        LAN_QUIC_PERSISTENT_MEDIA_HOL_TIMEOUT.as_secs_f64() * 1000.0,
+    );
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .increment_reliable_hol_recoveries(session_id.clone(), 1);
+    let profile = selected_media_profile(app_state, session_id).await;
+    maybe_send_lan_keyframe_request(
+        endpoint,
+        transport_mux,
+        session_id,
+        &profile,
+        keyframe_request_sequence,
+        last_keyframe_request_at,
+        receiver_stats,
+    )
+    .await;
+}
+
 async fn flush_lan_receiver_stage_metrics(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
@@ -7173,6 +7375,18 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
     }
 
     let ready_frames = frame_orderer.push(frame);
+    if frame_orderer.take_skipped_gap() {
+        *decoder_waits_for_keyframe = true;
+        maybe_send_lan_keyframe_request(
+            endpoint,
+            session_id,
+            &profile,
+            keyframe_request_sequence,
+            last_keyframe_request_at,
+            receiver_stats,
+        )
+        .await;
+    }
     receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
     for ready_frame in ready_frames {
         if *decoder_waits_for_keyframe && !ready_frame.is_keyframe() {

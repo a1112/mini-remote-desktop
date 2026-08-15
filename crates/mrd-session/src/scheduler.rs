@@ -3,8 +3,11 @@
 //! The scheduler limits concurrent streaming sessions and keeps session-level
 //! resource metadata independent of concrete transport implementations.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{hash_map::Entry, HashMap};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -40,6 +43,8 @@ pub struct SessionResourceLimits {
 /// Session entry with scheduling metadata
 #[derive(Debug)]
 struct ScheduledSession {
+    /// Unique registration generation used to reject waiters from a removed session.
+    generation: u64,
     /// Current lifecycle state
     state: SessionLifecycleState,
     /// Session priority
@@ -53,9 +58,10 @@ struct ScheduledSession {
 }
 
 impl ScheduledSession {
-    fn new(_id: SessionId, priority: SessionPriority, limits: SessionResourceLimits) -> Self {
+    fn new(generation: u64, priority: SessionPriority, limits: SessionResourceLimits) -> Self {
         let now = std::time::Instant::now();
         Self {
+            generation,
             state: SessionLifecycleState::Created,
             priority,
             limits,
@@ -82,6 +88,8 @@ pub struct SessionScheduler {
     sessions: Arc<Mutex<HashMap<SessionId, ScheduledSession>>>,
     /// Semaphore for concurrent streaming sessions
     streaming_semaphore: Arc<Semaphore>,
+    /// Monotonically increasing token for each session registration.
+    next_session_generation: AtomicU64,
     /// Maximum concurrent streaming sessions
     max_concurrent_streams: usize,
     /// Session timeout for idle sessions
@@ -94,6 +102,7 @@ impl SessionScheduler {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             streaming_semaphore: Arc::new(Semaphore::new(max_concurrent_streams)),
+            next_session_generation: AtomicU64::new(0),
             max_concurrent_streams,
             idle_timeout,
         }
@@ -107,14 +116,14 @@ impl SessionScheduler {
         limits: SessionResourceLimits,
     ) -> Result<(), SessionSchedulerError> {
         let mut sessions = self.sessions.lock().await;
-        if sessions.contains_key(&session_id) {
-            return Err(SessionSchedulerError::SessionAlreadyExists);
+        match sessions.entry(session_id) {
+            Entry::Vacant(entry) => {
+                let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
+                entry.insert(ScheduledSession::new(generation, priority, limits));
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(SessionSchedulerError::SessionAlreadyExists),
         }
-        sessions.insert(
-            session_id.clone(),
-            ScheduledSession::new(session_id, priority, limits),
-        );
-        Ok(())
     }
 
     /// Unregister a session
@@ -137,14 +146,14 @@ impl SessionScheduler {
         &self,
         session_id: &SessionId,
     ) -> Result<StreamingPermit, SessionSchedulerError> {
-        // Check session exists and update activity
-        {
+        let generation = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(session_id)
                 .ok_or(SessionSchedulerError::SessionNotFound)?;
             session.touch();
-        }
+            session.generation
+        };
 
         // Acquire semaphore permit (this waits if max concurrent reached)
         // Convert to owned permit for storage
@@ -155,17 +164,21 @@ impl SessionScheduler {
             .await
             .map_err(|_| SessionSchedulerError::SchedulerClosed)?;
 
-        // Mark session as active
+        // The session could have been unregistered while this request waited for a
+        // semaphore permit. Revalidate its registration before handing out the permit.
         {
             let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.is_active = true;
-                session.state = SessionLifecycleState::Streaming;
-            }
+            let session = sessions
+                .get_mut(session_id)
+                .filter(|session| session.generation == generation)
+                .ok_or(SessionSchedulerError::SessionNotFound)?;
+            session.is_active = true;
+            session.state = SessionLifecycleState::Streaming;
         }
 
         Ok(StreamingPermit {
             session_id: session_id.clone(),
+            generation,
             sessions: self.sessions.clone(),
             permit,
         })
@@ -260,7 +273,7 @@ impl SessionScheduler {
 
     /// Get available streaming slots
     pub async fn available_slots(&self) -> usize {
-        self.max_concurrent_streams - self.streaming_count().await
+        self.streaming_semaphore.available_permits()
     }
 
     /// Prune idle sessions that have exceeded the timeout
@@ -290,7 +303,7 @@ impl SessionScheduler {
         SessionSchedulerStats {
             total_sessions: total_count,
             active_sessions: active_count,
-            available_slots: self.max_concurrent_streams.saturating_sub(active_count),
+            available_slots: self.streaming_semaphore.available_permits(),
             max_concurrent_streams: self.max_concurrent_streams,
         }
     }
@@ -299,6 +312,7 @@ impl SessionScheduler {
 /// Permit for streaming - releases semaphore when dropped
 pub struct StreamingPermit {
     session_id: SessionId,
+    generation: u64,
     sessions: Arc<Mutex<HashMap<SessionId, ScheduledSession>>>,
     #[allow(dead_code)]
     permit: OwnedSemaphorePermit,
@@ -317,7 +331,9 @@ impl Drop for StreamingPermit {
         // The OwnedSemaphorePermit will automatically release the semaphore permit
         if let Ok(mut sessions) = self.sessions.try_lock() {
             if let Some(session) = sessions.get_mut(&self.session_id) {
-                session.is_active = false;
+                if session.generation == self.generation {
+                    session.is_active = false;
+                }
             }
         }
     }
@@ -666,6 +682,82 @@ mod tests {
 
         let priority = scheduler.get_session_priority(&session_id).await;
         assert!(priority.is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_waiter_after_session_is_unregistered_and_replaced() {
+        let scheduler = Arc::new(SessionScheduler::new(1, Duration::from_secs(30)));
+        let holder_session = SessionId("holder-session".to_string());
+        let waiting_session = SessionId("waiting-session".to_string());
+
+        for session in [&holder_session, &waiting_session] {
+            scheduler
+                .register_session(
+                    session.clone(),
+                    SessionPriority::Normal,
+                    SessionResourceLimits::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let holder = scheduler
+            .acquire_streaming_permit(&holder_session)
+            .await
+            .unwrap();
+        {
+            let mut sessions = scheduler.sessions.lock().await;
+            sessions
+                .get_mut(&waiting_session)
+                .expect("registered waiting session")
+                .last_activity = std::time::Instant::now() - Duration::from_secs(1);
+        }
+        let waiter_scheduler = scheduler.clone();
+        let waiter_session = waiting_session.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_scheduler
+                .acquire_streaming_permit(&waiter_session)
+                .await
+        });
+
+        loop {
+            let waiter_started = scheduler
+                .sessions
+                .lock()
+                .await
+                .get(&waiting_session)
+                .expect("waiting session remains registered")
+                .last_activity
+                .elapsed()
+                < Duration::from_millis(100);
+            if waiter_started {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        scheduler
+            .unregister_session(&waiting_session)
+            .await
+            .unwrap();
+        scheduler
+            .register_session(
+                waiting_session.clone(),
+                SessionPriority::Normal,
+                SessionResourceLimits::default(),
+            )
+            .await
+            .unwrap();
+        drop(holder);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should wake")
+            .expect("waiter task should not panic");
+        assert!(matches!(
+            result,
+            Err(SessionSchedulerError::SessionNotFound)
+        ));
+        assert_eq!(scheduler.available_slots().await, 1);
     }
 
     #[tokio::test]

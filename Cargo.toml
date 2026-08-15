@@ -46,7 +46,6 @@ members = [
   "heartbeat-rs",
   "tests/capture-render-demo",
   "tests/integration",
-  "vendor/nvenc",
 ]
 resolver = "2"
 

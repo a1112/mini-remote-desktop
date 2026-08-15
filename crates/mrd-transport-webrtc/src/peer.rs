@@ -167,6 +167,10 @@ impl Drop for WebRtcPeerConnection {
 
 impl WebRtcPeerConnection {
     pub async fn new(config: PeerConnectionConfig) -> Result<Self, TransportError> {
+        // Workspace-wide builds can unify transitive Rustls features from
+        // unrelated applications, leaving both crypto providers enabled. Pick
+        // the repository's configured provider before WebRTC constructs DTLS.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let codec = config.preflight()?.clone();
         let mut media_engine = MediaEngine::default();
         media_engine

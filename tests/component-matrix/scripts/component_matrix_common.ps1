@@ -1,3 +1,17 @@
+function Get-ComponentMatrixUnsupportedReason {
+  param(
+    [Parameter(Mandatory = $true)]$Case,
+    [Parameter(Mandatory = $true)][bool]$DxgiOutputAvailable
+  )
+
+  $requiresDxgiOutput = $null -ne $Case.PSObject.Properties["requires_dxgi_output"] -and
+    [bool]$Case.requires_dxgi_output
+  if ($requiresDxgiOutput -and -not $DxgiOutputAvailable) {
+    return "dxgi_output_unavailable"
+  }
+  return $null
+}
+
 function Stop-ComponentProcessTree {
   param(
     [Parameter(Mandatory = $true)]

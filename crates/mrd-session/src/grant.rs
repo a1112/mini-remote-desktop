@@ -57,9 +57,15 @@ impl SessionGrant {
     }
 
     pub fn authorize(&self, scope: PermissionScope, now: u64) -> Result<(), GrantError> {
-        if now < self.issued_at { return Err(GrantError::NotYetValid); }
-        if now > self.expires_at { return Err(GrantError::Expired); }
-        if !self.scopes.contains(&scope) { return Err(GrantError::ScopeNotGranted); }
+        if now < self.issued_at {
+            return Err(GrantError::NotYetValid);
+        }
+        if now > self.expires_at {
+            return Err(GrantError::Expired);
+        }
+        if !self.scopes.contains(&scope) {
+            return Err(GrantError::ScopeNotGranted);
+        }
         Ok(())
     }
 }

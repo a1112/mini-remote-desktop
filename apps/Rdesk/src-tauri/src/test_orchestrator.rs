@@ -19,6 +19,7 @@ use mrd_render::{RenderFrame, RendererFactory};
 use mrd_test_telemetry as telemetry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,7 @@ pub enum RunStatus {
     Running,
     Completed,
     Failed,
+    Skipped,
     Cancelled,
 }
 
@@ -102,6 +104,8 @@ pub struct TestConfigData {
     pub color_mode: Option<ColorMode>,
     pub color_pipeline: Option<ColorPipeline>,
     pub transport_kind: Option<String>,
+    pub adaptive_media: Option<bool>,
+    pub dynamic_resolution_enabled: Option<bool>,
     pub resolution: Option<[usize; 2]>,
     pub fps: Option<u32>,
     pub bitrate: Option<u32>,
@@ -535,6 +539,7 @@ pub struct TestOrchestrator {
     telemetry_store: Arc<telemetry::TelemetryStore>,
     presets: Arc<Mutex<HashMap<String, TestPreset>>>,
     current_harness_chain: Arc<Mutex<Option<TestChain>>>,
+    active_harness_run_id: Arc<Mutex<Option<RunId>>>,
 }
 
 impl TestOrchestrator {
@@ -561,6 +566,7 @@ impl TestOrchestrator {
             telemetry_store: Arc::new(telemetry_store),
             presets: Arc::new(Mutex::new(HashMap::new())),
             current_harness_chain: Arc::new(Mutex::new(None)),
+            active_harness_run_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1160,6 +1166,7 @@ impl TestOrchestrator {
 
     /// Start a new test run
     pub fn start_run(&self, scenario_id: String, config: TestConfigData) -> Result<RunId> {
+        validate_execution_config(&config)?;
         validate_scenario_for_current_platform(&scenario_id, &config)?;
 
         if scenario_id == "single_window.local" {
@@ -1175,6 +1182,24 @@ impl TestOrchestrator {
         // Resolve the scenario before recording a run. Unsupported scenarios must
         // fail fast instead of leaving a phantom running record behind.
         let chain = self.scenario_to_chain(&scenario_id, &config)?;
+        let mut active_harness_run_id = self.active_harness_run_id.lock().unwrap();
+        if let Some(active_run_id) = active_harness_run_id.as_ref() {
+            let active_is_running = self
+                .runs
+                .lock()
+                .unwrap()
+                .get(active_run_id)
+                .map(|run| run.status == RunStatus::Running)
+                .unwrap_or(false);
+            if active_is_running {
+                anyhow::bail!(
+                    "Test run {} already owns the shared test harness; stop it before starting another run",
+                    active_run_id
+                );
+            }
+            *active_harness_run_id = None;
+        }
+
         let run_id = generate_run_id();
         let started_at = now_ms();
         let env_snapshot = self.get_capabilities()?;
@@ -1237,7 +1262,9 @@ impl TestOrchestrator {
             );
             anyhow::bail!(message);
         }
+        *active_harness_run_id = Some(run_id.clone());
         drop(harness);
+        drop(active_harness_run_id);
 
         self.record_stage_event(run_id.clone(), "initialize", "completed", None, None);
         self.record_stage_event(run_id.clone(), "running", "started", None, None);
@@ -1252,10 +1279,29 @@ impl TestOrchestrator {
         let orchestrator_metrics = self.run_metrics.clone();
         let telemetry_store = self.telemetry_store.clone();
         let harness = self.harness.clone();
+        let active_harness_run_id = self.active_harness_run_id.clone();
         let duration_ms = config.duration_ms.unwrap_or(30_000);
+        let warmup_ms = config.warmup_ms.unwrap_or(0);
 
         thread::spawn(move || {
-            let started_at = now_ms();
+            let monitor_started_at = now_ms();
+            let mut measurement_started_at = monitor_started_at;
+            let mut warmup_completed = warmup_ms == 0;
+            if !warmup_completed {
+                push_stage_event(
+                    &orchestrator_events,
+                    &telemetry_store,
+                    &run_id_clone,
+                    TestStageEvent {
+                        stage: "warmup".to_string(),
+                        status: "started".to_string(),
+                        timestamp: monitor_started_at,
+                        duration_ms: Some(warmup_ms),
+                        error: None,
+                    },
+                );
+            }
+
             loop {
                 thread::sleep(Duration::from_millis(500));
 
@@ -1283,17 +1329,94 @@ impl TestOrchestrator {
                     break;
                 }
 
-                let metrics = harness.lock().unwrap().get_metrics();
+                if !warmup_completed && now_ms().saturating_sub(monitor_started_at) >= warmup_ms {
+                    let warmup_metrics = {
+                        let owner = active_harness_run_id.lock().unwrap();
+                        if owner.as_deref() != Some(run_id_clone.as_str()) {
+                            break;
+                        }
+                        harness.lock().unwrap().get_metrics()
+                    };
+                    if let Some(error) = warmup_metrics.error_message.clone() {
+                        let metrics =
+                            stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                                .unwrap_or(warmup_metrics);
+                        mark_run_failed(
+                            &orchestrator_runs,
+                            &orchestrator_events,
+                            &telemetry_store,
+                            &run_id_clone,
+                            &metrics,
+                            "warmup_failure",
+                            error,
+                        );
+                        break;
+                    }
+                    if !warmup_metrics.is_running {
+                        release_harness_ownership(&active_harness_run_id, &run_id_clone);
+                        mark_run_failed(
+                            &orchestrator_runs,
+                            &orchestrator_events,
+                            &telemetry_store,
+                            &run_id_clone,
+                            &warmup_metrics,
+                            "warmup_stopped",
+                            "test harness stopped during warmup".to_string(),
+                        );
+                        break;
+                    }
+
+                    let restart_result =
+                        restart_owned_harness(&active_harness_run_id, &harness, &run_id_clone);
+                    match restart_result {
+                        Ok(true) => {
+                            warmup_completed = true;
+                            measurement_started_at = now_ms();
+                            push_stage_event(
+                                &orchestrator_events,
+                                &telemetry_store,
+                                &run_id_clone,
+                                TestStageEvent {
+                                    stage: "warmup".to_string(),
+                                    status: "completed".to_string(),
+                                    timestamp: measurement_started_at,
+                                    duration_ms: Some(warmup_ms),
+                                    error: None,
+                                },
+                            );
+                            continue;
+                        }
+                        Ok(false) => break,
+                        Err(error) => {
+                            let metrics =
+                                stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                                    .unwrap_or_default();
+                            mark_run_failed(
+                                &orchestrator_runs,
+                                &orchestrator_events,
+                                &telemetry_store,
+                                &run_id_clone,
+                                &metrics,
+                                "warmup_restart_failure",
+                                error.to_string(),
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                let metrics = {
+                    let owner = active_harness_run_id.lock().unwrap();
+                    if owner.as_deref() != Some(run_id_clone.as_str()) {
+                        break;
+                    }
+                    harness.lock().unwrap().get_metrics()
+                };
 
                 if let Some(error) = metrics.error_message.clone() {
-                    {
-                        let harness = harness.lock().unwrap();
-                        harness.request_stop();
-                    }
-                    let harness_for_stop = Arc::clone(&harness);
-                    thread::spawn(move || {
-                        let _ = harness_for_stop.lock().unwrap().stop();
-                    });
+                    let metrics =
+                        stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                            .unwrap_or(metrics);
                     mark_run_failed(
                         &orchestrator_runs,
                         &orchestrator_events,
@@ -1307,6 +1430,7 @@ impl TestOrchestrator {
                 }
 
                 if !metrics.is_running {
+                    release_harness_ownership(&active_harness_run_id, &run_id_clone);
                     let message = "test harness stopped before duration elapsed".to_string();
                     mark_run_failed(
                         &orchestrator_runs,
@@ -1320,7 +1444,7 @@ impl TestOrchestrator {
                     break;
                 }
 
-                {
+                if warmup_completed {
                     let mut series = orchestrator_metrics.lock().unwrap();
                     let run_series = series
                         .entry(run_id_clone.clone())
@@ -1428,11 +1552,13 @@ impl TestOrchestrator {
                     );
                 }
 
-                if now_ms().saturating_sub(started_at) >= duration_ms {
-                    let metrics = {
-                        let harness = harness.lock().unwrap();
-                        harness.request_stop();
-                        harness.get_metrics()
+                if warmup_completed
+                    && now_ms().saturating_sub(measurement_started_at) >= duration_ms
+                {
+                    let Some(metrics) =
+                        stop_owned_harness(&active_harness_run_id, &harness, &run_id_clone)
+                    else {
+                        break;
                     };
                     if let Some(message) = metrics.error_message.clone().or_else(|| {
                         (metrics.frame_count == 0).then(|| "No frames were produced".to_string())
@@ -1460,10 +1586,6 @@ impl TestOrchestrator {
                             persist_run_to_store(&telemetry_store, run);
                         }
                     }
-                    let harness_for_stop = Arc::clone(&harness);
-                    thread::spawn(move || {
-                        let _ = harness_for_stop.lock().unwrap().stop();
-                    });
                     break;
                 }
             }
@@ -1632,18 +1754,31 @@ impl TestOrchestrator {
                         &[telemetry_artifact_from_artifact(artifact)],
                     );
 
-                    if let Some(run) = runs.lock().unwrap().get_mut(&run_id_clone) {
-                        run.status = RunStatus::Completed;
-                        run.finished_at = Some(now_ms());
-                        run.summary = Some(TestRunSummary {
-                            total_duration_ms: now_ms().saturating_sub(run.started_at),
-                            capture_fps: Some(result.fps),
-                            observed_fps: Some(result.fps),
-                            total_latency_p95: Some(result.p95_frame_time_ms),
-                            frame_count: result.frames_presented,
-                            ..Default::default()
-                        });
-                        persist_run_to_store(&telemetry_store, run);
+                    let completed = {
+                        let mut runs = runs.lock().unwrap();
+                        if let Some(run) = runs.get_mut(&run_id_clone) {
+                            if run.status != RunStatus::Running {
+                                false
+                            } else {
+                                run.status = RunStatus::Completed;
+                                run.finished_at = Some(now_ms());
+                                run.summary = Some(TestRunSummary {
+                                    total_duration_ms: now_ms().saturating_sub(run.started_at),
+                                    capture_fps: Some(result.fps),
+                                    observed_fps: Some(result.fps),
+                                    total_latency_p95: Some(result.p95_frame_time_ms),
+                                    frame_count: result.frames_presented,
+                                    ..Default::default()
+                                });
+                                persist_run_to_store(&telemetry_store, run);
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !completed {
+                        return;
                     }
                     events
                         .lock()
@@ -1672,16 +1807,29 @@ impl TestOrchestrator {
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    if let Some(run) = runs.lock().unwrap().get_mut(&run_id_clone) {
-                        run.status = RunStatus::Failed;
-                        run.finished_at = Some(now_ms());
-                        run.summary = Some(TestRunSummary {
-                            total_duration_ms: now_ms().saturating_sub(run.started_at),
-                            error_message: Some(message.clone()),
-                            failure_reason: Some("runtime_failure".to_string()),
-                            ..Default::default()
-                        });
-                        persist_run_to_store(&telemetry_store, run);
+                    let failed = {
+                        let mut runs = runs.lock().unwrap();
+                        if let Some(run) = runs.get_mut(&run_id_clone) {
+                            if run.status != RunStatus::Running {
+                                false
+                            } else {
+                                run.status = RunStatus::Failed;
+                                run.finished_at = Some(now_ms());
+                                run.summary = Some(TestRunSummary {
+                                    total_duration_ms: now_ms().saturating_sub(run.started_at),
+                                    error_message: Some(message.clone()),
+                                    failure_reason: Some("runtime_failure".to_string()),
+                                    ..Default::default()
+                                });
+                                persist_run_to_store(&telemetry_store, run);
+                                true
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if !failed {
+                        return;
                     }
                     events
                         .lock()
@@ -2788,29 +2936,29 @@ impl TestOrchestrator {
 
     /// Stop a running test
     pub fn stop_run(&self, run_id: &str) -> Result<()> {
-        let mut should_stop_harness = false;
+        let owned_metrics = stop_owned_harness(&self.active_harness_run_id, &self.harness, run_id);
+        let mut cancelled = false;
         {
             let mut runs = self.runs.lock().unwrap();
             if let Some(run) = runs.get_mut(run_id) {
                 if run.status == RunStatus::Running {
-                    let metrics = {
-                        let harness = self.harness.lock().unwrap();
-                        harness.request_stop();
-                        harness.get_metrics()
-                    };
                     run.status = RunStatus::Cancelled;
                     run.finished_at = Some(now_ms());
-                    run.summary = Some(summary_from_metrics(run.started_at, &metrics));
-                    should_stop_harness = true;
+                    run.summary = Some(match owned_metrics.as_ref() {
+                        Some(metrics) => summary_from_metrics(run.started_at, metrics),
+                        None => TestRunSummary {
+                            total_duration_ms: now_ms().saturating_sub(run.started_at),
+                            ..Default::default()
+                        },
+                    });
+                    persist_run_to_store(&self.telemetry_store, run);
+                    cancelled = true;
                 }
             }
         }
 
-        if should_stop_harness {
-            let harness = Arc::clone(&self.harness);
-            thread::spawn(move || {
-                let _ = harness.lock().unwrap().stop();
-            });
+        if cancelled {
+            self.record_stage_event(run_id.to_string(), "running", "cancelled", None, None);
         }
         Ok(())
     }
@@ -2912,8 +3060,9 @@ impl TestOrchestrator {
             result.retain(|r| r.scenario_id == sid);
         }
         if let Some(s) = status {
-            if let Ok(run_status) = serde_json::from_str::<RunStatus>(&format!("\"{}\"", s)) {
-                result.retain(|r| r.status == run_status);
+            match serde_json::from_str::<RunStatus>(&format!("\"{}\"", s)) {
+                Ok(run_status) => result.retain(|r| r.status == run_status),
+                Err(_) => result.clear(),
             }
         }
 
@@ -3381,6 +3530,43 @@ fn renderer_supported_on_current_platform(renderer_type: &str) -> bool {
         || matches!(renderer_type, "linux") && cfg!(target_os = "linux")
 }
 
+fn validate_execution_config(config: &TestConfigData) -> Result<()> {
+    if let Some([width, height]) = config.resolution {
+        if width == 0 || height == 0 {
+            anyhow::bail!("resolution dimensions must both be greater than zero");
+        }
+    }
+    if config.fps == Some(0) {
+        anyhow::bail!("fps must be greater than zero");
+    }
+    if config.bitrate == Some(0) {
+        anyhow::bail!("bitrate must be greater than zero");
+    }
+    if config.duration_ms == Some(0) {
+        anyhow::bail!("duration_ms must be greater than zero");
+    }
+    if let Some(repeat_count) = config.repeat_count {
+        if repeat_count != 1 {
+            anyhow::bail!(
+                "repeat_count={} is not supported by a single test run; run the matrix or create separate runs instead",
+                repeat_count
+            );
+        }
+    }
+    if config.dynamic_resolution_enabled == Some(true) && config.adaptive_media != Some(true) {
+        anyhow::bail!("dynamic_resolution_enabled requires adaptive_media=true");
+    }
+    if config.adaptive_media == Some(true) || config.dynamic_resolution_enabled == Some(true) {
+        anyhow::bail!("adaptive media controls are supported only by cross-device LAN automation");
+    }
+    let duration_ms = config.duration_ms.unwrap_or(30_000);
+    let warmup_ms = config.warmup_ms.unwrap_or(0);
+    duration_ms
+        .checked_add(warmup_ms)
+        .ok_or_else(|| anyhow::anyhow!("warmup_ms + duration_ms exceeds the supported range"))?;
+    Ok(())
+}
+
 fn validate_scenario_for_current_platform(
     scenario_id: &str,
     config: &TestConfigData,
@@ -3557,12 +3743,23 @@ fn videotoolbox_decoder_enabled() -> bool {
     )
 }
 
+static RUN_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static PRESET_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 fn generate_run_id() -> String {
-    format!("run_{}", now_ms())
+    format!(
+        "run_{}_{}",
+        now_ms(),
+        RUN_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn generate_preset_id() -> String {
-    format!("preset_{}", now_ms())
+    format!(
+        "preset_{}_{}",
+        now_ms(),
+        PRESET_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn now_ms() -> u64 {
@@ -4233,7 +4430,7 @@ fn test_run_from_metadata(metadata: telemetry::TelemetryRunMetadata) -> TestRun 
             ))
         });
     let status = serde_json::from_str::<RunStatus>(&format!("\"{}\"", metadata.status))
-        .unwrap_or(RunStatus::Completed);
+        .unwrap_or(RunStatus::Failed);
     let run_mode = metadata
         .tags
         .iter()
@@ -4415,6 +4612,44 @@ fn append_metric_to_store(
 
 fn append_event_to_store(store: &telemetry::TelemetryStore, run_id: &str, event: &TestStageEvent) {
     let _ = store.append_event(run_id, &telemetry_event_from_stage_event(event.clone()));
+}
+
+fn restart_owned_harness(
+    active_harness_run_id: &Arc<Mutex<Option<RunId>>>,
+    harness: &Arc<Mutex<TestHarness>>,
+    run_id: &str,
+) -> Result<bool> {
+    let owner = active_harness_run_id.lock().unwrap();
+    if owner.as_deref() != Some(run_id) {
+        return Ok(false);
+    }
+    harness.lock().unwrap().start_replacing_existing()?;
+    Ok(true)
+}
+
+fn stop_owned_harness(
+    active_harness_run_id: &Arc<Mutex<Option<RunId>>>,
+    harness: &Arc<Mutex<TestHarness>>,
+    run_id: &str,
+) -> Option<HarnessMetrics> {
+    let mut owner = active_harness_run_id.lock().unwrap();
+    if owner.as_deref() != Some(run_id) {
+        return None;
+    }
+
+    let mut harness = harness.lock().unwrap();
+    harness.request_stop();
+    let metrics = harness.get_metrics();
+    let _ = harness.stop();
+    *owner = None;
+    Some(metrics)
+}
+
+fn release_harness_ownership(active_harness_run_id: &Arc<Mutex<Option<RunId>>>, run_id: &str) {
+    let mut owner = active_harness_run_id.lock().unwrap();
+    if owner.as_deref() == Some(run_id) {
+        *owner = None;
+    }
 }
 
 fn push_stage_event(
@@ -5277,6 +5512,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn validate_custom_matrix_allows_opengl_with_cpu_memory() {
         let config = TestConfigData {
@@ -5293,6 +5529,7 @@ mod tests {
             .expect("OpenGL CPU-backed matrix run should be supported");
     }
 
+    #[cfg(windows)]
     #[test]
     fn validate_custom_matrix_allows_opengl_with_d3d11_shared_hybrid_memory() {
         let config = TestConfigData {
@@ -5310,8 +5547,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_run_marks_run_cancelled_before_harness_join_completes() {
-        let orchestrator = TestOrchestrator::default();
+    fn stop_run_marks_and_persists_run_as_cancelled() {
+        let orchestrator = test_orchestrator_with_telemetry_store("stop-run-persists");
         let run_id = "run-stop-smoke".to_string();
         let started_at = now_ms();
         orchestrator.runs.lock().unwrap().insert(
@@ -5329,6 +5566,8 @@ mod tests {
                 classification: None,
             },
         );
+        *orchestrator.active_harness_run_id.lock().unwrap() = Some(run_id.clone());
+        orchestrator.persist_run_by_id(&run_id);
 
         orchestrator.stop_run(&run_id).expect("stop run");
 
@@ -5342,6 +5581,86 @@ mod tests {
         assert_eq!(run.status, RunStatus::Cancelled);
         assert!(run.finished_at.is_some());
         assert!(run.summary.is_some());
+        assert_eq!(
+            orchestrator
+                .active_harness_run_id
+                .lock()
+                .unwrap()
+                .as_deref(),
+            None
+        );
+        assert!(orchestrator
+            .run_events
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .is_some_and(|events| events.iter().any(|event| event.status == "cancelled")));
+        let persisted = orchestrator
+            .telemetry_store
+            .list_runs(None)
+            .expect("list persisted runs")
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .expect("persisted cancelled run");
+        assert_eq!(persisted.status, "cancelled");
+    }
+
+    #[test]
+    fn skipped_status_round_trips_and_filters() {
+        let orchestrator = test_orchestrator_with_telemetry_store("skipped-status");
+        let run_id = "run-skipped".to_string();
+        orchestrator
+            .record_external_run(ExternalTestRunRecord {
+                run_id: Some(run_id.clone()),
+                scenario_id: "cross.e2e.remote_display_smoke".to_string(),
+                run_mode: Some(RunMode::Matrix),
+                status: RunStatus::Skipped,
+                started_at: now_ms(),
+                finished_at: Some(now_ms()),
+                config_snapshot: TestConfigData::default(),
+                environment_snapshot: Some(test_env()),
+                summary: None,
+                classification: None,
+                events: Vec::new(),
+                artifacts: Vec::new(),
+            })
+            .expect("record skipped run");
+
+        let runs = orchestrator.list_runs(None, Some("skipped".to_string()), None);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, run_id);
+        assert_eq!(runs[0].status, RunStatus::Skipped);
+        assert!(orchestrator
+            .list_runs(None, Some("not-a-status".to_string()), None)
+            .is_empty());
+    }
+
+    #[test]
+    fn generated_run_ids_are_unique_even_within_one_millisecond() {
+        let first = generate_run_id();
+        let second = generate_run_id();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn execution_config_rejects_silent_noop_options() {
+        let adaptive = TestConfigData {
+            adaptive_media: Some(true),
+            ..Default::default()
+        };
+        assert!(validate_execution_config(&adaptive)
+            .expect_err("local adaptive media should be rejected")
+            .to_string()
+            .contains("cross-device"));
+
+        let repeated = TestConfigData {
+            repeat_count: Some(2),
+            ..Default::default()
+        };
+        assert!(validate_execution_config(&repeated)
+            .expect_err("repeat count should be explicit")
+            .to_string()
+            .contains("repeat_count"));
     }
 
     #[cfg(windows)]

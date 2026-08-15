@@ -1,4 +1,7 @@
-use crate::{chunking::{sha256_hex, FileChunk}, protocol::FileTransferManifest};
+use crate::{
+    chunking::{sha256_hex, FileChunk},
+    protocol::FileTransferManifest,
+};
 use std::path::Path;
 use thiserror::Error;
 
@@ -43,13 +46,21 @@ impl ResumeState {
     }
 
     /// Return the next byte offset required by the receiver.
-    pub fn next_offset(&self) -> u64 { self.expected_offset }
+    pub fn next_offset(&self) -> u64 {
+        self.expected_offset
+    }
 
     /// Return bytes accepted so far.
-    pub fn completed_bytes(&self) -> u64 { self.expected_offset }
+    pub fn completed_bytes(&self) -> u64 {
+        self.expected_offset
+    }
 
     /// Accept one verified, contiguous chunk.
-    pub fn accept_chunk(&mut self, chunk: &FileChunk, manifest: &FileTransferManifest) -> Result<u64, ResumeError> {
+    pub fn accept_chunk(
+        &mut self,
+        chunk: &FileChunk,
+        manifest: &FileTransferManifest,
+    ) -> Result<u64, ResumeError> {
         if self.transfer_id != manifest.transfer_id
             || self.file_sha256 != manifest.file_sha256
             || chunk.transfer_id != manifest.transfer_id
@@ -61,7 +72,12 @@ impl ResumeState {
     }
 
     /// Accept a contiguous offset/length pair after transport-level hash check.
-    pub fn accept_offset(&mut self, offset: u64, len: u64, manifest: &FileTransferManifest) -> Result<u64, ResumeError> {
+    pub fn accept_offset(
+        &mut self,
+        offset: u64,
+        len: u64,
+        manifest: &FileTransferManifest,
+    ) -> Result<u64, ResumeError> {
         if self.transfer_id != manifest.transfer_id || self.file_sha256 != manifest.file_sha256 {
             return Err(ResumeError::ManifestMismatch);
         }
@@ -81,7 +97,11 @@ impl ResumeState {
 }
 
 /// Verify a temporary file and atomically move it to the destination.
-pub fn atomic_commit(temp: &Path, destination: &Path, expected_sha256: &str) -> Result<(), ResumeError> {
+pub fn atomic_commit(
+    temp: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<(), ResumeError> {
     let bytes = std::fs::read(temp).map_err(|error| ResumeError::Commit(error.to_string()))?;
     if sha256_hex(&bytes) != expected_sha256 {
         return Err(ResumeError::FinalHashMismatch);
@@ -92,7 +112,8 @@ pub fn atomic_commit(temp: &Path, destination: &Path, expected_sha256: &str) -> 
     std::fs::create_dir_all(parent).map_err(|error| ResumeError::Commit(error.to_string()))?;
     #[cfg(windows)]
     if destination.exists() {
-        std::fs::remove_file(destination).map_err(|error| ResumeError::Commit(error.to_string()))?;
+        std::fs::remove_file(destination)
+            .map_err(|error| ResumeError::Commit(error.to_string()))?;
     }
     std::fs::rename(temp, destination).map_err(|error| ResumeError::Commit(error.to_string()))
 }

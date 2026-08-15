@@ -56,7 +56,6 @@ interface DecodeMetrics {
   decode_fps: number;
   decode_latency_p50_ms: number;
   decode_latency_p95_ms: number;
-  decode_latency_p99_ms: number;
   decoded_frames: number;
   decode_failures: number;
   dropped_frames: number;
@@ -544,7 +543,6 @@ export function DecodeTestPage() {
           decode_fps: result.value.decoded_fps ?? result.value.capture_fps,
           decode_latency_p50_ms: result.value.decode_latency_p50_ms || 0,
           decode_latency_p95_ms: result.value.decode_latency_p95_ms || 0,
-          decode_latency_p99_ms: (result.value.decode_latency_p95_ms || 0) * 1.2,
           decoded_frames: result.value.decoded_frames ?? result.value.frame_count,
           decode_failures: result.value.decode_failures ?? 0,
           dropped_frames: result.value.dropped_frames,
@@ -582,12 +580,14 @@ export function DecodeTestPage() {
   };
 
   const handleStop = async () => {
-    if (activeRunId) {
-      await commands.testStopRun(activeRunId);
-      setActiveRunId(null);
-    } else {
-      await commands.testHarnessStop();
+    const result = activeRunId
+      ? await commands.testStopRun(activeRunId)
+      : await commands.testHarnessStop();
+    if (!result.ok) {
+      setStartError(`停止测试失败：${result.error.message}`);
+      return;
     }
+    setActiveRunId(null);
     setIsRunning(false);
   };
 
@@ -811,7 +811,9 @@ export function DecodeTestPage() {
               <div className="space-y-3">
                 <PercentileBar label="P50" value={metrics.decode_latency_p50_ms} />
                 <PercentileBar label="P95" value={metrics.decode_latency_p95_ms} />
-                <PercentileBar label="P99" value={metrics.decode_latency_p99_ms} />
+                <p className="text-xs text-muted-foreground">
+                  P99 未由后端采集，因此不生成推算值。
+                </p>
               </div>
             </div>
 

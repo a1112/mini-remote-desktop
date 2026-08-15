@@ -1206,6 +1206,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
       avoidCaptureSourceId: "DISPLAY1",
+      captureSourceId: "display",
       requestedProfile: DEFAULT_REQUESTED_PROFILE,
     });
     expect(commands.ipcStopSession).toHaveBeenCalledWith("lan-e2e-test-session");
@@ -1279,6 +1280,7 @@ describe("runLanE2EAutomation", () => {
     expect(commands.openRemoteDisplayWindow).toHaveBeenCalledWith({
       sessionId: "lan-e2e-test-session",
       avoidCaptureSourceId: "DXGIShared:\\\\.\\DISPLAY3",
+      captureSourceId: "windows:display-shared:2",
       requestedProfile: DEFAULT_REQUESTED_PROFILE,
     });
   });
@@ -2499,6 +2501,7 @@ describe("runLanE2EAutomation", () => {
       minSampleDurationMs: 100,
       minDecodedFrames: 1,
       minFps: 50,
+      minRenderFps: 50,
       now: () => currentTime,
       createSessionId: () => "lan-e2e-test-session",
     });

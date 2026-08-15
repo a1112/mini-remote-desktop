@@ -320,6 +320,15 @@ pub struct RendererSnapshot {
     pub last_pixel_format: Option<RenderPixelFormat>,
 }
 
+/// A frame crossed the real platform presentation boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct RendererPresentEvent {
+    /// Renderer-local successful present ordinal.
+    pub ordinal: u64,
+    /// Process-monotonic time captured immediately after the present API succeeded.
+    pub presented_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
     WindowHandle(isize),
@@ -357,6 +366,10 @@ pub trait RendererInstance: Send {
         ))
     }
     fn snapshot(&self) -> RendererSnapshot;
+    /// Drain successful platform-present callbacks accumulated since the last call.
+    fn drain_present_events(&mut self) -> Vec<RendererPresentEvent> {
+        Vec::new()
+    }
 }
 
 pub type BoxedRenderer = Box<dyn RendererInstance>;

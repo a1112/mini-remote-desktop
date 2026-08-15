@@ -1,7 +1,8 @@
 use mrd_render::{
     d3d11_descriptor, BoxedRenderer, RenderError, RenderFrame, RenderPixelFormat, RenderTarget,
-    RendererDescriptor, RendererFactory, RendererInstance, RendererSnapshot,
+    RendererDescriptor, RendererFactory, RendererInstance, RendererPresentEvent, RendererSnapshot,
 };
+use std::collections::VecDeque;
 
 pub mod simd;
 
@@ -181,6 +182,7 @@ pub struct D3d11Renderer {
     last_width: usize,
     last_height: usize,
     last_pixel_format: Option<RenderPixelFormat>,
+    present_events: VecDeque<RendererPresentEvent>,
 }
 
 fn fit_viewport_rect(
@@ -263,6 +265,7 @@ impl D3d11Renderer {
                 last_width: 0,
                 last_height: 0,
                 last_pixel_format: None,
+                present_events: VecDeque::new(),
             })
         }
 
@@ -1530,6 +1533,13 @@ impl RendererInstance for D3d11Renderer {
             match present_status {
                 D3d11PresentStatus::Presented => {
                     self.presented_frame_count += 1;
+                    if self.present_events.len() == 64 {
+                        self.present_events.pop_front();
+                    }
+                    self.present_events.push_back(RendererPresentEvent {
+                        ordinal: self.presented_frame_count,
+                        presented_at: std::time::Instant::now(),
+                    });
                 }
                 D3d11PresentStatus::SkippedStillDrawing
                 | D3d11PresentStatus::SkippedFrameLatencyWait => {
@@ -1627,6 +1637,10 @@ impl RendererInstance for D3d11Renderer {
             last_height: self.last_height,
             last_pixel_format: self.last_pixel_format,
         }
+    }
+
+    fn drain_present_events(&mut self) -> Vec<RendererPresentEvent> {
+        self.present_events.drain(..).collect()
     }
 }
 
@@ -1899,7 +1913,10 @@ mod tests {
     #[test]
     fn d3d11_factory_reports_platform_error_off_windows() {
         let factory = D3d11RendererFactory;
-        let error = factory.create().expect_err("platform error");
+        let error = match factory.create() {
+            Ok(_) => panic!("expected platform error"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("Windows"));
     }

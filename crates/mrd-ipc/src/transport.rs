@@ -4,7 +4,7 @@
 // Unix: Unix Domain Sockets
 
 use anyhow::Result;
-use serde_json;
+use serde::Serialize;
 
 /// Default Windows named pipe used by `mrd-service`.
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\mrd-service";
@@ -127,6 +127,15 @@ async fn write_message<W: tokio::io::AsyncWriteExt + std::marker::Unpin>(
     Ok(())
 }
 
+async fn write_json_message<W, T>(writer: &mut W, message: &T) -> Result<()>
+where
+    W: tokio::io::AsyncWriteExt + std::marker::Unpin,
+    T: Serialize,
+{
+    let json = serde_json::to_vec(message)?;
+    write_message(writer, &json).await
+}
+
 // Unix server
 #[cfg(unix)]
 /// Unix domain socket IPC server.
@@ -234,8 +243,7 @@ pub struct IpcStream {
 impl IpcStream {
     /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
-        let json = serde_json::to_string(request)?;
-        write_message(&mut self.socket, json.as_bytes()).await
+        write_json_message(&mut self.socket, request).await
     }
 
     /// Receive an IPC response.
@@ -247,8 +255,7 @@ impl IpcStream {
 
     /// Send an IPC response.
     pub async fn send_response(&mut self, response: &crate::IpcResponse) -> Result<()> {
-        let json = serde_json::to_string(response)?;
-        write_message(&mut self.socket, json.as_bytes()).await
+        write_json_message(&mut self.socket, response).await
     }
 
     /// Receive an IPC request.
@@ -273,10 +280,9 @@ pub enum IpcStream {
 impl IpcStream {
     /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
-        let json = serde_json::to_string(request)?;
         match self {
-            IpcStream::Client(pipe) => write_message(pipe, json.as_bytes()).await,
-            IpcStream::Server(pipe) => write_message(pipe, json.as_bytes()).await,
+            IpcStream::Client(pipe) => write_json_message(pipe, request).await,
+            IpcStream::Server(pipe) => write_json_message(pipe, request).await,
         }
     }
 
@@ -292,10 +298,9 @@ impl IpcStream {
 
     /// Send an IPC response.
     pub async fn send_response(&mut self, response: &crate::IpcResponse) -> Result<()> {
-        let json = serde_json::to_string(response)?;
         match self {
-            IpcStream::Client(pipe) => write_message(pipe, json.as_bytes()).await,
-            IpcStream::Server(pipe) => write_message(pipe, json.as_bytes()).await,
+            IpcStream::Client(pipe) => write_json_message(pipe, response).await,
+            IpcStream::Server(pipe) => write_json_message(pipe, response).await,
         }
     }
 
@@ -313,13 +318,15 @@ impl IpcStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::IpcRequest;
+    use crate::{IpcRequest, IpcResponse};
 
     #[test]
     fn frame_format_is_valid() {
         let request = IpcRequest::ListDevices;
         let json = serde_json::to_string(&request).unwrap();
-        let len = json.len() as u32;
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let len = bytes.len() as u32;
+        assert_eq!(bytes, json.as_bytes());
         assert_eq!(len.to_le_bytes().len(), 4);
     }
 

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -1620,6 +1621,44 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+export function fitClientRectToRemoteFrame(
+  rect: Pick<DOMRect, "left" | "top" | "width" | "height">,
+  frameSize: { width: number; height: number }
+): { left: number; top: number; width: number; height: number } | null {
+  if (
+    !Number.isFinite(rect.left) ||
+    !Number.isFinite(rect.top) ||
+    !Number.isFinite(rect.width) ||
+    !Number.isFinite(rect.height) ||
+    !Number.isFinite(frameSize.width) ||
+    !Number.isFinite(frameSize.height) ||
+    rect.width <= 0 ||
+    rect.height <= 0 ||
+    frameSize.width <= 0 ||
+    frameSize.height <= 0
+  ) {
+    return null;
+  }
+
+  const frameAspect = frameSize.width / frameSize.height;
+  const rectAspect = rect.width / rect.height;
+  let width = rect.width;
+  let height = rect.height;
+
+  if (rectAspect > frameAspect) {
+    width = rect.height * frameAspect;
+  } else if (rectAspect < frameAspect) {
+    height = rect.width / frameAspect;
+  }
+
+  return {
+    left: rect.left + (rect.width - width) / 2,
+    top: rect.top + (rect.height - height) / 2,
+    width,
+    height,
+  };
+}
+
 export function mapClientPointToRemoteFrame(
   clientX: number,
   clientY: number,
@@ -1637,29 +1676,22 @@ export function mapClientPointToRemoteFrame(
     return null;
   }
 
-  const frameAspect = frameSize.width / frameSize.height;
-  const rectAspect = rect.width / rect.height;
-  let contentWidth = rect.width;
-  let contentHeight = rect.height;
-  let offsetX = 0;
-  let offsetY = 0;
+  const contentRect = fitClientRectToRemoteFrame(rect, frameSize);
+  if (!contentRect) return null;
 
-  if (rectAspect > frameAspect) {
-    contentWidth = rect.height * frameAspect;
-    offsetX = (rect.width - contentWidth) / 2;
-  } else if (rectAspect < frameAspect) {
-    contentHeight = rect.width / frameAspect;
-    offsetY = (rect.height - contentHeight) / 2;
-  }
-
-  const localX = clientX - rect.left - offsetX;
-  const localY = clientY - rect.top - offsetY;
-  if (localX < 0 || localY < 0 || localX > contentWidth || localY > contentHeight) {
+  const localX = clientX - contentRect.left;
+  const localY = clientY - contentRect.top;
+  if (
+    localX < 0 ||
+    localY < 0 ||
+    localX > contentRect.width ||
+    localY > contentRect.height
+  ) {
     return null;
   }
 
-  const relativeX = localX / contentWidth;
-  const relativeY = localY / contentHeight;
+  const relativeX = localX / contentRect.width;
+  const relativeY = localY / contentRect.height;
   return {
     x: clamp(Math.round(relativeX * frameSize.width), 0, frameSize.width - 1),
     y: clamp(Math.round(relativeY * frameSize.height), 0, frameSize.height - 1),
@@ -2303,6 +2335,7 @@ export function RemoteDisplayWindowPage() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
   const surfaceId = searchParams.get("surface") ?? "surface-1";
+  const renderShellRef = useRef<HTMLDivElement | null>(null);
   const renderAreaRef = useRef<HTMLDivElement | null>(null);
   const syncAnimationFrameRef = useRef<number | null>(null);
   const syncTimerIdsRef = useRef<number[]>([]);
@@ -2340,6 +2373,10 @@ export function RemoteDisplayWindowPage() {
   const [capabilities, setCapabilities] = useState<EnvironmentSnapshot | null>(null);
   const [nativeSurface, setNativeSurface] =
     useState<NativeRenderSurfaceSnapshot | null>(null);
+  const [renderAreaLayout, setRenderAreaLayout] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
   const [renderMode, setRenderMode] = useState<RenderMode>(() =>
     isTauriRuntime() && !isLocalPipelinePreviewSession(id ?? "local-preview")
       ? defaultNativeRenderMode()
@@ -2449,6 +2486,10 @@ export function RemoteDisplayWindowPage() {
   const requestedColorMode = useMemo(() => profileColorModeFromSearch(searchParams), [searchParams]);
   const requestedColorPipeline = useMemo(
     () => profileColorPipelineFromSearch(searchParams),
+    [searchParams]
+  );
+  const requestedCaptureSourceId = useMemo(
+    () => searchParams.get("captureSourceId")?.trim() || null,
     [searchParams]
   );
   const requestedEncoder = requestedCodec
@@ -2868,6 +2909,45 @@ export function RemoteDisplayWindowPage() {
     probeSnapshot?.media_probe_width,
     resolution,
   ]);
+  const remoteRenderAspectRatio = `${remoteInputFrameSize.width} / ${remoteInputFrameSize.height}`;
+
+  useLayoutEffect(() => {
+    const shell = renderShellRef.current;
+    if (!shell) return;
+
+    const updateLayout = () => {
+      const shellRect = shell.getBoundingClientRect();
+      const fitted = fitClientRectToRemoteFrame(
+        {
+          left: 0,
+          top: 0,
+          width: shellRect.width,
+          height: shellRect.height,
+        },
+        remoteInputFrameSize
+      );
+      if (!fitted) return;
+
+      setRenderAreaLayout((current) => {
+        if (
+          current &&
+          Math.abs(current.width - fitted.width) < 0.25 &&
+          Math.abs(current.height - fitted.height) < 0.25
+        ) {
+          return current;
+        }
+        return {
+          width: fitted.width,
+          height: fitted.height,
+        };
+      });
+    };
+
+    updateLayout();
+    const observer = new ResizeObserver(updateLayout);
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, [remoteInputFrameSize]);
 
   useEffect(() => {
     if (
@@ -4011,6 +4091,10 @@ export function RemoteDisplayWindowPage() {
     const enabled = isNative && nativeRenderAvailable;
     const visible = enabled && (options?.visible ?? !testSettingsOpen);
     const scale = nativeRendererType === "macos" ? 1 : window.devicePixelRatio || 1;
+    const fittedSurfaceRect = enabled
+      ? fitClientRectToRemoteFrame(rect, remoteInputFrameSize)
+      : null;
+    const surfaceRect = fittedSurfaceRect ?? rect;
     const controlFrameSize =
       remoteInputFrameSize.width > 0 && remoteInputFrameSize.height > 0
         ? {
@@ -4024,10 +4108,10 @@ export function RemoteDisplayWindowPage() {
       pointerControlEnabled,
       keyboardControlEnabled,
       rect: {
-        x: Math.round(rect.left * scale),
-        y: Math.round(rect.top * scale),
-        width: Math.round(rect.width * scale),
-        height: Math.round(rect.height * scale),
+        x: Math.round(surfaceRect.left * scale),
+        y: Math.round(surfaceRect.top * scale),
+        width: Math.round(surfaceRect.width * scale),
+        height: Math.round(surfaceRect.height * scale),
       },
       ...(controlFrameSize ? { controlFrameSize } : {}),
     };
@@ -5314,9 +5398,17 @@ export function RemoteDisplayWindowPage() {
     const nextSources = Array.isArray(sources) ? sources : [];
     setCaptureSources(nextSources);
 
-    const preferredSource = pickPreferredCaptureSource(nextSources);
+    const preferredSource = requestedCaptureSourceId
+      ? nextSources.find(
+          (source) => source.id.toLowerCase() === requestedCaptureSourceId.toLowerCase()
+        )
+      : pickPreferredCaptureSource(nextSources);
     if (!preferredSource) {
-      throw new Error("远端未发现可捕获的全屏/窗口源，无法启动接收");
+      throw new Error(
+        requestedCaptureSourceId
+          ? `远端未发现已选捕获源 ${requestedCaptureSourceId}，无法启动接收`
+          : "远端未发现可捕获的全屏/窗口源，无法启动接收"
+      );
     }
 
     const selection = await selectRemoteCaptureSource(sessionId, preferredSource.id);
@@ -5325,7 +5417,13 @@ export function RemoteDisplayWindowPage() {
       `默认捕获源（远端设备）: ${captureSourceKindLabel(selection.source.source_kind)} / ${selection.source.title}`
     );
     return selection;
-  }, [captureSourceSelection, captureSources, isLocalPipelinePreview, sessionId]);
+  }, [
+    captureSourceSelection,
+    captureSources,
+    isLocalPipelinePreview,
+    requestedCaptureSourceId,
+    sessionId,
+  ]);
 
   const handleStartRemoteReceiver = useCallback(async () => {
     setTestSettingsOpen(false);
@@ -5560,9 +5658,17 @@ export function RemoteDisplayWindowPage() {
 
         const nextSources = Array.isArray(sources) ? sources : [];
         setCaptureSources(nextSources);
-        const preferredSource = pickPreferredCaptureSource(nextSources);
+        const preferredSource = requestedCaptureSourceId
+          ? nextSources.find(
+              (source) => source.id.toLowerCase() === requestedCaptureSourceId.toLowerCase()
+            )
+          : pickPreferredCaptureSource(nextSources);
         if (!preferredSource) {
-          setTestMessage("远端未发现可捕获的全屏/窗口源");
+          setTestMessage(
+            requestedCaptureSourceId
+              ? `远端未发现已选捕获源 ${requestedCaptureSourceId}`
+              : "远端未发现可捕获的全屏/窗口源"
+          );
           return;
         }
 
@@ -5583,7 +5689,12 @@ export function RemoteDisplayWindowPage() {
     return () => {
       cancelled = true;
     };
-  }, [isLocalPipelinePreview, requireRemoteScreenAuthorization, sessionId]);
+  }, [
+    isLocalPipelinePreview,
+    requestedCaptureSourceId,
+    requireRemoteScreenAuthorization,
+    sessionId,
+  ]);
 
   const waitForLocalRunFinished = useCallback(
     async (runId: string, timeoutMs: number): Promise<TestRun | null> => {
@@ -7196,24 +7307,36 @@ export function RemoteDisplayWindowPage() {
       )}
 
       <div
-        ref={renderAreaRef}
-        data-testid="remote-render-area"
-        data-native-render-area="true"
-        tabIndex={controlInputEnabled ? 0 : -1}
-        onPointerMove={handleRemotePointerMove}
-        onPointerDown={handleRemotePointerDown}
-        onPointerUp={handleRemotePointerUp}
-        onPointerCancel={handleRemotePointerCancel}
-        onLostPointerCapture={handleRemoteLostPointerCapture}
-        onContextMenu={handleRemoteContextMenu}
-        onWheel={handleRemoteWheel}
-        onKeyDown={handleRemoteKeyDown}
-        onKeyUp={handleRemoteKeyUp}
-        onBlur={handleRemoteBlur}
-        className="relative min-h-0 flex-1 overflow-hidden bg-black"
-        style={{ touchAction: "none" }}
+        ref={renderShellRef}
+        data-testid="remote-render-shell"
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black"
       >
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,#172033_0,#05070a_58%,#000_100%)]" />
+        <div
+          ref={renderAreaRef}
+          data-testid="remote-render-area"
+          data-native-render-area="true"
+          data-frame-width={remoteInputFrameSize.width}
+          data-frame-height={remoteInputFrameSize.height}
+          tabIndex={controlInputEnabled ? 0 : -1}
+          onPointerMove={handleRemotePointerMove}
+          onPointerDown={handleRemotePointerDown}
+          onPointerUp={handleRemotePointerUp}
+          onPointerCancel={handleRemotePointerCancel}
+          onLostPointerCapture={handleRemoteLostPointerCapture}
+          onContextMenu={handleRemoteContextMenu}
+          onWheel={handleRemoteWheel}
+          onKeyDown={handleRemoteKeyDown}
+          onKeyUp={handleRemoteKeyUp}
+          onBlur={handleRemoteBlur}
+          className="relative h-full max-h-full max-w-full shrink-0 overflow-hidden bg-black"
+          style={{
+            aspectRatio: remoteRenderAspectRatio,
+            width: renderAreaLayout ? `${renderAreaLayout.width}px` : "100%",
+            height: renderAreaLayout ? `${renderAreaLayout.height}px` : "100%",
+            touchAction: "none",
+          }}
+        >
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,#172033_0,#05070a_58%,#000_100%)]" />
         {webPreviewUsesVideo && (
           <video
             ref={webPreviewVideoRef}
@@ -7465,6 +7588,7 @@ export function RemoteDisplayWindowPage() {
             {remoteAuthorizationError ?? lastError}
           </div>
         )}
+      </div>
       </div>
 
       <div className="flex h-10 shrink-0 items-center justify-between gap-3 border-t border-white/10 bg-[#0f1724] px-3 text-[11px] text-slate-400">

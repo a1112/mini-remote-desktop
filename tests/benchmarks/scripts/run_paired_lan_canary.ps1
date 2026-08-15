@@ -427,7 +427,7 @@ function Invoke-CrossCanaryProfile($Repo, $Profile, $OutputRoot, $TargetDeviceId
 }
 
 $repo = Resolve-RepoPath $RepoRoot
-$outputRoot = Join-Path $repo $OutputDir
+$outputRoot = Resolve-BenchmarkPath -RepoRoot $repo -Path $OutputDir
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 $script:SecureLanPositivePolicyPath = Join-Path $repo "tests/quality-gates/policies/windows-secure-lan.v1.json"
 $gitCommit = (git -C $repo rev-parse --short=12 HEAD).Trim()

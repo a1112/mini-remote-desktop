@@ -89,6 +89,7 @@ describe('Tauri Adapter Contract', () => {
         surfaceId: 'surface-1',
         preferredDisplaySourceId: null,
         avoidCaptureSourceId: null,
+        captureSourceId: null,
       });
       expect(mockInvoke).toHaveBeenNthCalledWith(2, 'list_remote_display_windows', {
         sessionId: 'session-1',
@@ -143,6 +144,7 @@ describe('Tauri Adapter Contract', () => {
         surfaceId: null,
         preferredDisplaySourceId: null,
         avoidCaptureSourceId: null,
+        captureSourceId: null,
         profileWidth: 2560,
         profileHeight: 1440,
         profileFps: 144,

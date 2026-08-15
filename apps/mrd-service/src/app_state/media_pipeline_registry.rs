@@ -54,6 +54,8 @@ struct MediaPipelineState {
     render_thread_priority: Option<String>,
     render_waitable_timeouts: u64,
     agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
+    reliable_hol_recoveries: u64,
+    estimated_frame_age_baseline_ms: Option<f64>,
     stage_samples: HashMap<String, VecDeque<f64>>,
     stage_summaries: HashMap<String, MediaStageMetrics>,
     test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -117,18 +119,7 @@ impl MediaPipelineRegistry {
 
     pub fn set_active_media_profile(&mut self, session_id: SessionId, profile: &MediaProfile) {
         let state = self.pipelines.entry(session_id).or_default();
-        state.active_codec = Some(profile.codec.clone());
-        state.active_codec_profile = profile.codec_profile.clone();
-        state.active_bit_depth = profile.bit_depth;
-        state.active_chroma_subsampling = profile.chroma_subsampling.clone();
-        state.active_pixel_format = profile.pixel_format.clone();
-        state.active_hdr_enabled = profile.hdr_enabled;
-        state.active_color_mode = profile.color_mode.clone();
-        state.active_color_pipeline = profile.color_pipeline.clone();
-        state.active_width = Some(profile.width);
-        state.active_height = Some(profile.height);
-        state.active_fps = Some(profile.fps);
-        state.active_bitrate_mbps = Some(profile.bitrate_mbps);
+        set_active_media_profile(state, profile);
     }
 
     pub fn record_active_media_sample(
@@ -139,11 +130,29 @@ impl MediaPipelineRegistry {
         height: u32,
         pixel_format: impl Into<String>,
     ) {
-        self.set_active_media_profile(session_id.clone(), profile);
         let state = self.pipelines.entry(session_id).or_default();
+        set_active_media_profile(state, profile);
         state.active_width = Some(width);
         state.active_height = Some(height);
         state.active_pixel_format = Some(pixel_format.into());
+    }
+
+    /// Record a decoded-frame sample and its format stage with one pipeline lookup.
+    pub fn record_decoded_media_sample(
+        &mut self,
+        session_id: SessionId,
+        profile: &MediaProfile,
+        width: u32,
+        height: u32,
+        pixel_format: &'static str,
+        format_stage: &'static str,
+    ) {
+        let state = self.pipelines.entry(session_id).or_default();
+        set_active_media_profile(state, profile);
+        state.active_width = Some(width);
+        state.active_height = Some(height);
+        set_active_string(&mut state.active_pixel_format, pixel_format);
+        record_static_stage_sample(state, format_stage, 1.0);
     }
 
     pub fn set_codec_fallback_reason(&mut self, session_id: SessionId, reason: Option<String>) {
@@ -233,6 +242,32 @@ impl MediaPipelineRegistry {
         state.render_waitable_timeouts = state.render_waitable_timeouts.saturating_add(count);
     }
 
+    pub fn increment_reliable_hol_recoveries(&mut self, session_id: SessionId, count: u64) {
+        let state = self.pipelines.entry(session_id).or_default();
+        state.reliable_hol_recoveries = state.reliable_hol_recoveries.saturating_add(count);
+    }
+
+    /// Records both the wall-clock frame-age estimate and its excess over the
+    /// best value observed in this session. The absolute estimate includes
+    /// sender/receiver clock skew; the relative value removes that stable
+    /// offset and is therefore the useful cross-device queue/jitter signal.
+    pub fn record_estimated_frame_age_ms(&mut self, session_id: SessionId, frame_age_ms: f64) {
+        if !frame_age_ms.is_finite() || frame_age_ms < 0.0 {
+            return;
+        }
+        let state = self.pipelines.entry(session_id).or_default();
+        let baseline_ms = state
+            .estimated_frame_age_baseline_ms
+            .map_or(frame_age_ms, |baseline| baseline.min(frame_age_ms));
+        state.estimated_frame_age_baseline_ms = Some(baseline_ms);
+        record_stage_sample(state, "receiver.estimated_frame_age", frame_age_ms);
+        record_stage_sample(
+            state,
+            "receiver.relative_frame_age",
+            (frame_age_ms - baseline_ms).max(0.0),
+        );
+    }
+
     pub fn record_stage_duration_ms(
         &mut self,
         session_id: SessionId,
@@ -242,17 +277,8 @@ impl MediaPipelineRegistry {
         if !duration_ms.is_finite() || duration_ms < 0.0 {
             return;
         }
-        let samples = self
-            .pipelines
-            .entry(session_id)
-            .or_default()
-            .stage_samples
-            .entry(stage.into())
-            .or_default();
-        samples.push_back(duration_ms);
-        while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
-            samples.pop_front();
-        }
+        let state = self.pipelines.entry(session_id).or_default();
+        record_stage_sample(state, stage, duration_ms);
     }
 
     pub fn set_stage_metrics(
@@ -390,6 +416,7 @@ impl MediaPipelineRegistry {
             render_thread_priority: state.and_then(|state| state.render_thread_priority.clone()),
             render_waitable_timeouts: state.map_or(0, |state| state.render_waitable_timeouts),
             agent_render_boundary: state.and_then(|state| state.agent_render_boundary.clone()),
+            reliable_hol_recoveries: state.map_or(0, |state| state.reliable_hol_recoveries),
             stage_metrics,
             test_impairment: state.and_then(|state| state.test_impairment.clone()),
             sender_transport: state
@@ -410,6 +437,62 @@ fn sender_packets_sent(snapshot: &MediaSenderTransportSnapshot) -> u64 {
         .saturating_add(snapshot.reliable_fragments_sent)
 }
 
+fn set_active_media_profile(state: &mut MediaPipelineState, profile: &MediaProfile) {
+    set_active_string(&mut state.active_codec, &profile.codec);
+    set_optional_string(&mut state.active_codec_profile, &profile.codec_profile);
+    state.active_bit_depth = profile.bit_depth;
+    set_optional_string(
+        &mut state.active_chroma_subsampling,
+        &profile.chroma_subsampling,
+    );
+    set_optional_string(&mut state.active_pixel_format, &profile.pixel_format);
+    state.active_hdr_enabled = profile.hdr_enabled;
+    set_optional_string(&mut state.active_color_mode, &profile.color_mode);
+    set_optional_string(&mut state.active_color_pipeline, &profile.color_pipeline);
+    state.active_width = Some(profile.width);
+    state.active_height = Some(profile.height);
+    state.active_fps = Some(profile.fps);
+    state.active_bitrate_mbps = Some(profile.bitrate_mbps);
+}
+
+fn set_active_string(destination: &mut Option<String>, value: &str) {
+    if destination.as_deref() != Some(value) {
+        *destination = Some(value.to_owned());
+    }
+}
+
+fn set_optional_string(destination: &mut Option<String>, value: &Option<String>) {
+    if destination.as_ref() != value.as_ref() {
+        *destination = value.clone();
+    }
+}
+
+fn record_stage_sample(state: &mut MediaPipelineState, stage: impl Into<String>, duration_ms: f64) {
+    let samples = state.stage_samples.entry(stage.into()).or_default();
+    samples.push_back(duration_ms);
+    while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
+        samples.pop_front();
+    }
+}
+
+fn record_static_stage_sample(
+    state: &mut MediaPipelineState,
+    stage: &'static str,
+    duration_ms: f64,
+) {
+    if let Some(samples) = state.stage_samples.get_mut(stage) {
+        samples.push_back(duration_ms);
+        while samples.len() > MEDIA_STAGE_SAMPLE_LIMIT {
+            samples.pop_front();
+        }
+        return;
+    }
+
+    state
+        .stage_samples
+        .insert(stage.to_owned(), VecDeque::from([duration_ms]));
+}
+
 fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMetrics> {
     let mut metrics = state.stage_summaries.clone();
     for (stage, samples) in &state.stage_samples {
@@ -419,6 +502,9 @@ fn media_pipeline_stage_metrics(state: &MediaPipelineState) -> Vec<MediaStageMet
                 stage: stage.clone(),
                 p50_ms: percentile(samples, 0.50),
                 p95_ms: percentile(samples, 0.95),
+                p99_ms: percentile(samples, 0.99),
+                max_ms: percentile(samples, 1.0),
+                sample_count: Some(samples.len().min(u32::MAX as usize) as u32),
             },
         );
     }
@@ -469,6 +555,51 @@ mod tests {
             .expect("sender capture metrics");
         assert_eq!(capture.p50_ms, Some(140.0));
         assert_eq!(capture.p95_ms, Some(247.0));
+        assert_eq!(capture.p99_ms, Some(257.0));
+        assert_eq!(capture.max_ms, Some(259.0));
+        assert_eq!(capture.sample_count, Some(240));
+    }
+
+    #[test]
+    fn decoded_samples_preserve_active_metadata_and_stage_metrics() {
+        let mut registry = MediaPipelineRegistry::default();
+        let session_id = SessionId("decoded-sample-session".to_string());
+        let profile = MediaProfile {
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            ..MediaProfile::default()
+        };
+
+        registry.record_decoded_media_sample(
+            session_id.clone(),
+            &profile,
+            1280,
+            720,
+            "cpu_nv12",
+            "receiver.format.cpu_nv12",
+        );
+        registry.record_decoded_media_sample(
+            session_id.clone(),
+            &profile,
+            1280,
+            720,
+            "cpu_nv12",
+            "receiver.format.cpu_nv12",
+        );
+
+        let snapshot = registry.snapshot(&session_id);
+        assert_eq!(snapshot.active_codec.as_deref(), Some("h264"));
+        assert_eq!(snapshot.active_pixel_format.as_deref(), Some("cpu_nv12"));
+        assert_eq!(snapshot.active_width, Some(1280));
+        assert_eq!(snapshot.active_height, Some(720));
+        let stage = snapshot
+            .stage_metrics
+            .iter()
+            .find(|stage| stage.stage == "receiver.format.cpu_nv12")
+            .expect("decoded format stage");
+        assert_eq!(stage.sample_count, Some(2));
+        assert_eq!(stage.p50_ms, Some(1.0));
     }
 
     #[test]

@@ -183,6 +183,12 @@ mod wire {
         pub p50_ms: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub p95_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub p99_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sample_count: Option<u32>,
     }
 
     /// Synthetic transport impairment settings and counters for test runs.
@@ -414,6 +420,10 @@ mod wire {
         /// Latest authenticated Session Agent render counters.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub agent_render_boundary: Option<AgentRenderBoundarySnapshot>,
+        /// Reliable media stream stalls that were bounded by resetting the
+        /// receive stream and requesting a fresh keyframe.
+        #[serde(default)]
+        pub reliable_hol_recoveries: u64,
         pub stage_metrics: Vec<MediaStageMetrics>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub test_impairment: Option<MediaTestImpairmentSnapshot>,
@@ -1159,6 +1169,105 @@ mod wire {
         /// Linked report/log artifacts.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub artifacts: Vec<TelemetryArtifactRef>,
+    }
+
+    /// Endpoint that owns one resource sample in a two-sided remote session.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ExperienceEndpointSide {
+        /// Controlled machine performing capture and encode.
+        Target,
+        /// Controlling machine performing decode and present.
+        Controller,
+    }
+
+    /// One monotonic, endpoint-scoped resource observation.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceResourceSample {
+        pub side: ExperienceEndpointSide,
+        pub monotonic_ms: f64,
+        pub cpu_usage_percent: f64,
+        pub rss_mb: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub gpu_usage_percent: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub vram_used_mb: Option<f64>,
+    }
+
+    impl ExperienceResourceSample {
+        /// Whether every supplied metric is finite and in its physical domain.
+        pub fn is_finite(&self) -> bool {
+            self.monotonic_ms.is_finite()
+                && self.monotonic_ms >= 0.0
+                && self.cpu_usage_percent.is_finite()
+                && (0.0..=100.0).contains(&self.cpu_usage_percent)
+                && self.rss_mb.is_finite()
+                && self.rss_mb >= 0.0
+                && self
+                    .gpu_usage_percent
+                    .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+                && self
+                    .vram_used_mb
+                    .is_none_or(|value| value.is_finite() && value >= 0.0)
+        }
+    }
+
+    /// Exact one-second visible-frame window.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceFpsWindow {
+        pub start_monotonic_ms: f64,
+        pub duration_ms: f64,
+        pub frame_count: u32,
+        pub fps: f64,
+    }
+
+    /// W3C-compatible freeze aggregation based on visible-frame gaps.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceFreezeMetrics {
+        pub freeze_count: u64,
+        pub total_freeze_duration_ms: f64,
+    }
+
+    /// Controller-monotonic input marker result.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceInputProbeResult {
+        pub probe_id: [u8; 16],
+        pub issued_monotonic_ms: f64,
+        pub presented_monotonic_ms: f64,
+        pub input_to_photon_ms: f64,
+        /// Always absent: cross-machine wall-clock values are not accepted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub target_wall_clock_ms: Option<u64>,
+    }
+
+    /// One media adaptation completed by the first successful present.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceAdaptationTransition {
+        pub transition_id: [u8; 16],
+        pub started_monotonic_ms: f64,
+        pub presented_monotonic_ms: f64,
+        pub transition_time_ms: f64,
+        pub present_stall_ms: f64,
+    }
+
+    /// Canonical end-to-end experience metrics derived only from monotonic events.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct ExperienceProbeSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub first_visible_frame_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub fps_windows: Vec<ExperienceFpsWindow>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub frame_intervals_ms: Vec<f64>,
+        pub stall_count: u64,
+        pub total_stall_duration_ms: f64,
+        pub freeze_metrics: ExperienceFreezeMetrics,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub input_probes: Vec<ExperienceInputProbeResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub resource_samples: Vec<ExperienceResourceSample>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub adaptation_transitions: Vec<ExperienceAdaptationTransition>,
     }
 
     /// Query used to retrieve service-owned audit events.

@@ -1,6 +1,6 @@
 #[cfg(target_os = "macos")]
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::c_int,
     hash::{Hash, Hasher},
     path::PathBuf,
@@ -72,6 +72,11 @@ const DEFAULT_SLOW_PRESENT_RESET_COOLDOWN_MS: u64 = 750;
 const DEFAULT_SLOW_PRESENT_RESET_FALLBACK_AFTER_RESETS: u32 = 2;
 #[cfg(target_os = "macos")]
 const DEFAULT_RENDER_PROXY_MAX_DRAWABLE_COUNT: u32 = 2;
+#[cfg(target_os = "macos")]
+// One frame may be in Metal while these two decoded frames wait. This keeps
+// the complete render path bounded to roughly three frames without dropping
+// compressed H.264/HEVC reference frames before VideoToolbox.
+const DEFAULT_RENDER_PROXY_QUEUE_CAPACITY: usize = 2;
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -122,7 +127,7 @@ struct RenderProxyRenderQueueInner {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct RenderProxyRenderQueueState {
-    pending: Option<RenderProxyQueuedFrame>,
+    pending: VecDeque<RenderProxyQueuedFrame>,
     stats: RenderProxyRenderStats,
     shutdown: bool,
 }
@@ -340,7 +345,11 @@ impl RenderProxyRenderQueue {
         if state.shutdown {
             return Err("macOS render proxy queue is shut down".to_string());
         }
-        let replaced = state.pending.replace(frame).is_some();
+        let replaced = push_render_proxy_frame_bounded(
+            &mut state.pending,
+            frame,
+            DEFAULT_RENDER_PROXY_QUEUE_CAPACITY,
+        );
         if replaced {
             state.stats.queue_replacements = state.stats.queue_replacements.saturating_add(1);
         }
@@ -380,7 +389,7 @@ impl RenderProxyRenderQueue {
                 return;
             };
             state.shutdown = true;
-            state.pending = None;
+            state.pending.clear();
             self.inner.ready.notify_all();
         }
         if let Ok(mut worker) = self.inner.worker.lock() {
@@ -430,11 +439,28 @@ fn take_next_render_proxy_frame(
         if state.shutdown {
             return None;
         }
-        if let Some(frame) = state.pending.take() {
+        if let Some(frame) = state.pending.pop_front() {
             return Some(frame);
         }
         state = inner.ready.wait(state).ok()?;
     }
+}
+
+#[cfg(target_os = "macos")]
+fn push_render_proxy_frame_bounded<T>(
+    pending: &mut VecDeque<T>,
+    frame: T,
+    capacity: usize,
+) -> bool {
+    let capacity = capacity.max(1);
+    let replaced = if pending.len() >= capacity {
+        pending.pop_front();
+        true
+    } else {
+        false
+    };
+    pending.push_back(frame);
+    replaced
 }
 
 #[cfg(target_os = "macos")]
@@ -1322,6 +1348,23 @@ impl Drop for RenderProxyRegistry {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_render_queue_preserves_two_frame_decode_bursts() {
+        let mut pending = VecDeque::new();
+
+        assert!(!push_render_proxy_frame_bounded(&mut pending, 1, 2));
+        assert!(!push_render_proxy_frame_bounded(&mut pending, 2, 2));
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn bounded_render_queue_drops_oldest_frame_when_saturated() {
+        let mut pending = VecDeque::from([1, 2]);
+
+        assert!(push_render_proxy_frame_bounded(&mut pending, 3, 2));
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![2, 3]);
+    }
 
     fn test_slow_present_config() -> RenderProxySlowPresentResetConfig {
         RenderProxySlowPresentResetConfig {

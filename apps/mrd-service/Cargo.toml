@@ -78,6 +78,7 @@ mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 [features]
 default = []
 browser-webrtc-preview = ["dep:webrtc"]
+test-support = []
 production-vvc-software-codec = [
   "dep:mrd-encode-vvenc",
   "mrd-decode/production-vvc-software-codec",

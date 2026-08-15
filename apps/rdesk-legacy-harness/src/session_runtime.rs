@@ -21,7 +21,7 @@ pub fn sync_session_runtime(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
 

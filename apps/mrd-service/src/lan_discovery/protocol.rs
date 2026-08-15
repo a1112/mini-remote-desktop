@@ -36,6 +36,8 @@ pub(super) const LAN_QUIC_MEDIA_V3_TRANSPORT: &str = "quic_datagram_media_v3";
 pub(super) const LAN_QUIC_RELIABLE_MEDIA_TRANSPORT: &str = "quic_stream_media_v2";
 pub(super) const LAN_QUIC_PERSISTENT_MEDIA_TRANSPORT: &str = "quic_stream_media_v3";
 pub(super) const LAN_QUIC_TRANSPORT_MUX_V1: &str = "quic_transport_mux_v1";
+pub(super) const LAN_QUIC_PERSISTENT_MEDIA_60FPS_TRANSPORT: &str =
+    "quic_stream_media_persistent_60fps_v1";
 pub(super) const LAN_MEDIA_PROFILE_CONTROL_TRANSPORT: &str = "media_profile_control_v1";
 pub(super) const LAN_CAPTURE_SOURCE_CONTROL_TRANSPORT: &str = "capture_source_control_v1";
 pub(super) const LAN_DISPLAY_MODE_CONTROL_TRANSPORT: &str = "display_mode_control_v1";

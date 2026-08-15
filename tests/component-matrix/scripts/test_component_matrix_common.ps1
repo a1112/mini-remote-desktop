@@ -15,6 +15,12 @@ function Assert-True($Condition, [string]$Message) {
   }
 }
 
+$dxgiCase = [pscustomobject]@{ requires_dxgi_output = $true }
+Assert-Equal (Get-ComponentMatrixUnsupportedReason -Case $dxgiCase -DxgiOutputAvailable $false) `
+  "dxgi_output_unavailable" "DXGI component case is skipped without an attached output"
+Assert-Equal (Get-ComponentMatrixUnsupportedReason -Case $dxgiCase -DxgiOutputAvailable $true) `
+  $null "DXGI component case remains runnable with an attached output"
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("mrd-component-common-{0}" -f ([guid]::NewGuid()))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {

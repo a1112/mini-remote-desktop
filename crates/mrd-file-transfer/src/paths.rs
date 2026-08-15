@@ -22,12 +22,16 @@ pub enum PathValidationError {
 pub fn validate_relative_path(path: &str) -> Result<String, PathValidationError> {
     let path = path.trim();
     if path.is_empty() || path.starts_with('/') || path.starts_with('\\') {
-        return Err(PathValidationError::Rejected("absolute or empty path".into()));
+        return Err(PathValidationError::Rejected(
+            "absolute or empty path".into(),
+        ));
     }
     let mut parts = Vec::new();
     for component in Path::new(path).components() {
         let Component::Normal(value) = component else {
-            return Err(PathValidationError::Rejected("parent or prefix component".into()));
+            return Err(PathValidationError::Rejected(
+                "parent or prefix component".into(),
+            ));
         };
         let value = value
             .to_str()
@@ -38,7 +42,9 @@ pub fn validate_relative_path(path: &str) -> Result<String, PathValidationError>
             || value.ends_with('.')
             || value.ends_with(' ')
             || value.contains(':')
-            || value.chars().any(|ch| ch.is_control() || "<>\"|?*".contains(ch))
+            || value
+                .chars()
+                .any(|ch| ch.is_control() || "<>\"|?*".contains(ch))
             || is_reserved_windows_name(value)
         {
             return Err(PathValidationError::Rejected(value.to_string()));
@@ -52,7 +58,11 @@ pub fn validate_relative_path(path: &str) -> Result<String, PathValidationError>
 }
 
 fn is_reserved_windows_name(value: &str) -> bool {
-    let stem = value.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
@@ -68,7 +78,11 @@ pub fn resolve_under_root(root: &Path, relative: &str) -> Result<PathBuf, PathVa
         .map_err(|error| PathValidationError::RootUnavailable(error.to_string()))?;
     let target = root.join(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
     let mut current = root.clone();
-    for component in target.strip_prefix(&root).expect("target starts at root").components() {
+    for component in target
+        .strip_prefix(&root)
+        .expect("target starts at root")
+        .components()
+    {
         let Component::Normal(component) = component else {
             return Err(PathValidationError::EscapesRoot);
         };

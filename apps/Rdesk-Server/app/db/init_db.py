@@ -1,25 +1,14 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.security import hash_password
 from app.models.device import Device, DeviceStatus
 from app.models.user import User
 
 
-async def seed_initial_data(session: AsyncSession) -> None:
-    user_exists = await session.scalar(select(User).limit(1))
-    if user_exists:
-        return
-
-    admin = User(
-        username="admin",
-        email="admin@rdesk.local",
-        password_hash=hash_password("admin123"),
-        role="admin",
-    )
-    session.add(admin)
-
-    devices = [
+def _demo_devices() -> list[Device]:
+    return [
         Device(
             name="办公室电脑",
             device_id="821456789",
@@ -54,5 +43,28 @@ async def seed_initial_data(session: AsyncSession) -> None:
             status=DeviceStatus(status="offline", ping=None, cpu=None, ram=None, disk=None, last_seen="2小时前"),
         ),
     ]
-    session.add_all(devices)
-    await session.commit()
+
+
+async def seed_initial_data(session: AsyncSession) -> None:
+    user_exists = await session.scalar(select(User).limit(1))
+
+    changed = False
+    if not user_exists and settings.initial_admin_username:
+        session.add(
+            User(
+                username=settings.initial_admin_username,
+                email=settings.initial_admin_email,
+                password_hash=hash_password(settings.initial_admin_password),
+                role="admin",
+            )
+        )
+        changed = True
+
+    if settings.seed_demo_data:
+        device_exists = await session.scalar(select(Device).limit(1))
+        if not device_exists:
+            session.add_all(_demo_devices())
+            changed = True
+
+    if changed:
+        await session.commit()

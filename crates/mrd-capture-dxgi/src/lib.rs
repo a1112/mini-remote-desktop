@@ -197,7 +197,8 @@ fn refresh_cached_cpu_frame(frame: &CapturedFrame, timestamp_us: u64) -> Capture
 pub struct DxgiSharedTextureCapture {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    duplication: IDXGIOutputDuplication,
+    output: IDXGIOutput1,
+    duplication: Option<IDXGIOutputDuplication>,
     shared_textures: Vec<SharedBgraTexture>,
     next_shared_texture_index: usize,
     last_shared_texture_index: Option<usize>,
@@ -318,7 +319,8 @@ impl DxgiSharedTextureCapture {
                 return Ok(Self {
                     device,
                     context,
-                    duplication,
+                    output: output1,
+                    duplication: Some(duplication),
                     shared_textures: Vec::new(),
                     next_shared_texture_index: 0,
                     last_shared_texture_index: None,
@@ -398,6 +400,47 @@ impl DxgiSharedTextureCapture {
         let shared = &self.shared_textures[index];
         Ok((shared.shared_handle, shared.texture.clone()))
     }
+
+    fn recover_duplication_after_access_lost(&mut self) -> Result<CapturedFrame, PipelineError> {
+        self.duplication.take();
+
+        let desc = unsafe { self.output.GetDesc() }.map_err(|error| {
+            PipelineError::message(format!(
+                "DXGI duplication access lost; output refresh failed: {error}"
+            ))
+        })?;
+        let rect = desc.DesktopCoordinates;
+        let source_width = rect.right.saturating_sub(rect.left) as usize;
+        let source_height = rect.bottom.saturating_sub(rect.top) as usize;
+        if source_width == 0 || source_height == 0 {
+            return Err(PipelineError::message(
+                "DXGI duplication access lost; refreshed output has zero dimensions",
+            ));
+        }
+
+        let (width, height) =
+            recovery_target_dimensions(self.width, self.height, source_width, source_height);
+        self.source_left = rect.left;
+        self.source_top = rect.top;
+        self.source_width = source_width;
+        self.source_height = source_height;
+        if self.width != width || self.height != height {
+            self.set_target_dimensions(width, height);
+        }
+
+        self.duplication = Some(
+            unsafe { self.output.DuplicateOutput(&self.device) }.map_err(|error| {
+                PipelineError::message(format!(
+                    "DXGI duplication access lost; recreation failed: {error}"
+                ))
+            })?,
+        );
+
+        if let Some(frame) = self.last_shared_frame()? {
+            return Ok(frame);
+        }
+        self.seed_shared_texture_from_gdi()
+    }
 }
 
 #[cfg(windows)]
@@ -407,10 +450,13 @@ impl FrameCapture for DxgiSharedTextureCapture {
     }
 
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let Some(duplication) = self.duplication.as_ref().cloned() else {
+            return self.recover_duplication_after_access_lost();
+        };
         let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut desktop_resource = None::<IDXGIResource>;
         let acquire = unsafe {
-            self.duplication.AcquireNextFrame(
+            duplication.AcquireNextFrame(
                 DXGI_SHARED_ACQUIRE_TIMEOUT_MS,
                 &mut frame_info,
                 &mut desktop_resource,
@@ -420,7 +466,7 @@ impl FrameCapture for DxgiSharedTextureCapture {
         match acquire {
             Ok(()) => {
                 let result = self.copy_acquired_frame_to_shared(desktop_resource);
-                let _ = unsafe { self.duplication.ReleaseFrame() };
+                let _ = unsafe { duplication.ReleaseFrame() };
                 result
             }
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -430,13 +476,26 @@ impl FrameCapture for DxgiSharedTextureCapture {
                 self.seed_shared_texture_from_gdi()
             }
             Err(error) if error.code() == DXGI_ERROR_ACCESS_LOST => {
-                Err(PipelineError::message("DXGI duplication access lost"))
+                drop(duplication);
+                self.recover_duplication_after_access_lost()
             }
             Err(error) => Err(PipelineError::message(format!(
                 "AcquireNextFrame failed: {error}"
             ))),
         }
     }
+}
+
+fn recovery_target_dimensions(
+    target_width: usize,
+    target_height: usize,
+    source_width: usize,
+    source_height: usize,
+) -> (usize, usize) {
+    (
+        target_width.clamp(2, source_width.max(2)),
+        target_height.clamp(2, source_height.max(2)),
+    )
 }
 
 #[cfg(windows)]
@@ -824,8 +883,8 @@ fn dxgi_shared_capture_flush_after_copy_enabled_from_env_value(value: Option<&st
 mod tests {
     use super::{
         centered_crop_origin, dxgi_device_name_matches,
-        dxgi_shared_capture_flush_after_copy_enabled_from_env_value, refresh_cached_cpu_frame,
-        repack_bgra,
+        dxgi_shared_capture_flush_after_copy_enabled_from_env_value, recovery_target_dimensions,
+        refresh_cached_cpu_frame, repack_bgra,
     };
     use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
 
@@ -859,6 +918,19 @@ mod tests {
 
         assert!(dxgi_device_name_matches(&raw, "\\\\.\\display2"));
         assert!(!dxgi_device_name_matches(&raw, "\\\\.\\DISPLAY1"));
+    }
+
+    #[test]
+    fn dxgi_recovery_preserves_target_dimensions_within_new_output_bounds() {
+        assert_eq!(
+            recovery_target_dimensions(2560, 1440, 3840, 2160),
+            (2560, 1440)
+        );
+        assert_eq!(
+            recovery_target_dimensions(2560, 1440, 1920, 1080),
+            (1920, 1080)
+        );
+        assert_eq!(recovery_target_dimensions(1, 1, 1920, 1080), (2, 2));
     }
 
     #[test]

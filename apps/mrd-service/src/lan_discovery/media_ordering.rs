@@ -21,6 +21,7 @@ pub(crate) struct LanMediaFrameOrderer<T = QuicAuFrame> {
     next_frame_id: Option<u32>,
     max_pending_frames: usize,
     pending: BTreeMap<u32, T>,
+    skipped_gap: bool,
 }
 
 impl<T: LanOrderedMediaFrame> LanMediaFrameOrderer<T> {
@@ -29,6 +30,7 @@ impl<T: LanOrderedMediaFrame> LanMediaFrameOrderer<T> {
             next_frame_id: None,
             max_pending_frames: max_pending_frames.max(1),
             pending: BTreeMap::new(),
+            skipped_gap: false,
         }
     }
 
@@ -47,11 +49,18 @@ impl<T: LanOrderedMediaFrame> LanMediaFrameOrderer<T> {
         let mut ready = self.drain_contiguous();
         if ready.is_empty() && self.pending.len() >= self.max_pending_frames {
             if let Some(next_frame_id) = self.pending.keys().next().copied() {
+                self.skipped_gap |= self
+                    .next_frame_id
+                    .is_some_and(|expected_frame_id| next_frame_id != expected_frame_id);
                 self.next_frame_id = Some(next_frame_id);
                 ready = self.drain_contiguous();
             }
         }
         ready
+    }
+
+    pub(crate) fn take_skipped_gap(&mut self) -> bool {
+        std::mem::take(&mut self.skipped_gap)
     }
 
     fn drain_contiguous(&mut self) -> Vec<T> {

@@ -10,6 +10,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "local_performance_suite_common.ps1")
+. (Join-Path $scriptDir "benchmark_execution_state.ps1")
 
 function Stop-LocalPerformanceProcessTree([int]$ProcessId) {
   $children = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -80,6 +81,11 @@ $plan = if ($PlanPath) {
 }
 Write-LocalPerformanceJson -InputObject $plan -Path (Join-Path $output "plan.json")
 
+$hostReadiness = Wait-BenchmarkHostQuiescent -MaxCpuLoadPercent 80 -TimeoutSeconds 30
+if (-not $hostReadiness.Ready) {
+  throw "benchmark host CPU remained saturated at $($hostReadiness.CpuLoadPercent)% (maximum 80%); stop competing workloads before running performance tests"
+}
+
 $executor = {
   param($Item)
 
@@ -135,7 +141,14 @@ exit `$childExitCode
   }
 }
 
-$rows = @(Invoke-LocalPerformancePlan -Plan $plan -Executor $executor)
+$executionStateHeld = Enable-BenchmarkExecutionState -DisplayRequired
+try {
+  $rows = @(Invoke-LocalPerformancePlan -Plan $plan -Executor $executor)
+} finally {
+  if ($executionStateHeld) {
+    Restore-BenchmarkExecutionState
+  }
+}
 $exitCode = Resolve-LocalPerformanceExitCode -Verdicts @($rows.verdict)
 $summary = [pscustomobject]@{
   schema_version = "mrd-local-performance-summary.v1"

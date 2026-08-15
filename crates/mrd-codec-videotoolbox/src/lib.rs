@@ -226,7 +226,7 @@ mod imp {
                 real_time: true,
                 maximize_power_efficiency: false,
                 allow_frame_reordering: false,
-                allow_temporal_compression: false,
+                allow_temporal_compression: true,
                 max_key_frame_interval: NonZeroU32::new(fps),
                 max_key_frame_interval_duration: None,
                 max_frame_delay_count: NonZeroU32::new(1),
@@ -2592,6 +2592,43 @@ mod imp {
             }
 
             panic!("VideoToolbox pixel buffer roundtrip did not produce a decoded frame");
+        }
+
+        #[test]
+        fn videotoolbox_h264_temporal_compression_emits_decodable_inter_frames() {
+            let mut encoder = VideoToolboxH264Encoder::new_with_bitrate(64, 64, 60, 1_000_000)
+                .expect("create videotoolbox encoder");
+            let mut decoder = VideoToolboxH264Decoder::new().expect("create videotoolbox decoder");
+            let mut encoded_frames = 0_usize;
+            let mut inter_frames = 0_usize;
+            let mut decoded_frames = 0_usize;
+
+            for index in 0..24_u64 {
+                let frame = CapturedFrame::from_cpu(
+                    64,
+                    64,
+                    FramePixelFormat::Bgra32,
+                    index * 16_667,
+                    synthetic_bgra(64, 64, index as u8),
+                );
+                let units = encoder.encode(&frame).expect("encode synthetic frame");
+                for unit in units {
+                    encoded_frames = encoded_frames.saturating_add(1);
+                    inter_frames = inter_frames.saturating_add(usize::from(!unit.is_keyframe));
+                    decoder
+                        .push_access_unit(&unit.bytes)
+                        .expect("decode synthetic access unit");
+                    decoded_frames =
+                        decoded_frames.saturating_add(decoder.drain_decoded_frames().len());
+                }
+            }
+
+            assert!(encoded_frames >= 10, "encoded only {encoded_frames} frames");
+            assert!(inter_frames > 0, "VideoToolbox emitted only keyframes");
+            assert!(
+                decoded_frames >= 10,
+                "decoded only {decoded_frames} temporally compressed frames"
+            );
         }
 
         #[test]

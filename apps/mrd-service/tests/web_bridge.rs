@@ -10,17 +10,21 @@ use mrd_service::{
 };
 
 #[test]
-fn localhost_web_bridge_does_not_require_token() {
-    let config =
-        WebBridgeConfig::new_for_test("127.0.0.1:9532".parse::<SocketAddr>().unwrap(), None)
-            .expect("localhost bridge config");
+fn localhost_web_bridge_requires_token() {
+    let bind = "127.0.0.1:9533".parse::<SocketAddr>().unwrap();
+    let error = WebBridgeConfig::new_for_test(bind, None)
+        .expect_err("localhost bridge without token must be rejected");
 
-    assert!(!config.requires_token());
+    assert!(error.to_string().contains("MRD_WEB_BRIDGE_TOKEN"));
+
+    let config = WebBridgeConfig::new_for_test(bind, Some("test-token".to_string()))
+        .expect("localhost bridge config with token");
+    assert!(config.requires_token());
 }
 
 #[test]
 fn lan_bound_web_bridge_requires_token() {
-    let error = WebBridgeConfig::new_for_test("0.0.0.0:9532".parse::<SocketAddr>().unwrap(), None)
+    let error = WebBridgeConfig::new_for_test("0.0.0.0:9533".parse::<SocketAddr>().unwrap(), None)
         .expect_err("LAN bridge without token must be rejected");
 
     assert!(error.to_string().contains("MRD_WEB_BRIDGE_TOKEN"));

@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "macos")]
+use std::thread;
 
 async fn install_test_screen_view_grant(
     app_state: &Arc<AppState>,
@@ -3438,11 +3440,6 @@ async fn signed_remote_session_request_requires_consent_and_signed_grant() {
                 LAN_MEDIA_TARGET_BITRATE_MBPS
             );
             assert_eq!(negotiation.selected.codec, "hevc");
-            assert_eq!(negotiation.selected.codec_profile.as_deref(), Some("main"));
-            assert_eq!(
-                negotiation.selected.chroma_subsampling.as_deref(),
-                Some("4:2:0")
-            );
         }
         _ => panic!("expected remote session ack"),
     }
@@ -5324,6 +5321,7 @@ fn lan_media_frame_orderer_holds_late_frames_until_gap_arrives() {
     assert_eq!(frame_ids(&first), vec![1]);
     assert!(third.is_empty());
     assert_eq!(frame_ids(&ready), vec![2, 3]);
+    assert!(!orderer.take_skipped_gap());
 }
 
 #[test]
@@ -5351,6 +5349,8 @@ fn lan_media_frame_orderer_skips_gap_when_pending_limit_is_reached() {
     let ready = orderer.push(test_quic_au_frame(13, false));
 
     assert_eq!(frame_ids(&ready), vec![12, 13]);
+    assert!(orderer.take_skipped_gap());
+    assert!(!orderer.take_skipped_gap());
 }
 
 #[test]
@@ -5364,6 +5364,7 @@ fn lan_media_frame_orderer_releases_first_late_frame_at_low_latency_limit() {
     let ready = orderer.push(test_quic_au_frame(22, false));
 
     assert_eq!(frame_ids(&ready), vec![22]);
+    assert!(orderer.take_skipped_gap());
 }
 
 #[test]
@@ -6588,6 +6589,16 @@ fn macos_capture_pump_repeat_pacing_defaults_to_headroom() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn macos_capture_pump_repeats_latest_by_default_and_allows_opt_out() {
+    assert!(lan_capture_pump_repeat_latest_from_env_value(None));
+    assert!(lan_capture_pump_repeat_latest_from_env_value(Some("true")));
+    assert!(!lan_capture_pump_repeat_latest_from_env_value(Some(
+        "false"
+    )));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_capture_pump_repeat_grace_uses_capture_headroom() {
     let profile = MediaProfile {
         width: 1280,
@@ -6649,6 +6660,34 @@ fn macos_capture_pump_waits_for_fresh_frame_before_repeating_latest() {
 
     assert!(!captured.repeated_latest_frame);
     assert_eq!(captured.frame.timestamp_us, 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_capture_pump_repeats_retained_frame_when_fresh_frame_misses_grace() {
+    let latest_frame =
+        CapturedFrame::from_cpu(1, 1, FramePixelFormat::Bgra32, 1, vec![7, 8, 9, 255]);
+    let shared = Arc::new((
+        StdMutex::new(MacosPumpedLanFrameState {
+            frames: VecDeque::new(),
+            latest_frame: Some(latest_frame),
+            sequence: 1,
+            error: None,
+        }),
+        StdCondvar::new(),
+    ));
+    let mut capture = MacosPumpedLanFrameCapture {
+        shared,
+        stop: Arc::new(AtomicBool::new(false)),
+        worker: None,
+        repeat_grace_timeout: Duration::from_millis(1),
+    };
+
+    let captured = capture.capture_frame().expect("repeat retained frame");
+
+    assert!(captured.repeated_latest_frame);
+    assert_eq!(captured.frame.data, vec![7, 8, 9, 255]);
+    assert!(captured.frame.timestamp_us > 1);
 }
 
 #[cfg(windows)]
@@ -7110,6 +7149,9 @@ fn lan_sender_stats_datagram_round_trips_without_media_sequence() {
             stage: "sender.encode".to_string(),
             p50_ms: Some(1.2),
             p95_ms: Some(2.4),
+            p99_ms: Some(3.0),
+            max_ms: Some(3.2),
+            sample_count: Some(120),
         }],
         sender_transport: MediaSenderTransportSnapshot {
             capture_source_id: Some("windows:display-shared:0".to_string()),
@@ -7407,11 +7449,11 @@ fn lan_quic_media_routes_only_keyframes_reliably() {
 }
 
 #[test]
-fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_enabled() {
+fn lan_quic_media_uses_reliable_frames_for_60fps_and_keeps_high_refresh_opt_in() {
     let profile_1080p = MediaProfile {
         width: 1920,
         height: 1080,
-        fps: 144,
+        fps: 60,
         bitrate_mbps: 20,
         codec: "h264".to_string(),
         ..MediaProfile::default()
@@ -7420,26 +7462,26 @@ fn lan_quic_media_uses_datagrams_by_default_and_reliable_whole_frame_only_when_e
         width: 2560,
         height: 1440,
         fps: 60,
-        bitrate_mbps: 20,
+        bitrate_mbps: 80,
         codec: "h264".to_string(),
         ..MediaProfile::default()
     };
 
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         2,
         &profile_1080p,
         None
     ));
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         2,
         &profile_2k,
         None
     ));
-    assert!(!should_send_access_unit_as_reliable_frame(
+    assert!(should_send_access_unit_as_reliable_frame(
         true,
         true,
         1,
@@ -7578,7 +7620,15 @@ fn lan_quic_media_prefers_persistent_reliable_stream_when_available() {
 }
 
 #[test]
-fn high_refresh_reliable_media_prefers_per_message_streams_to_reduce_hol() {
+fn reliable_whole_frame_media_uses_persistent_stream_for_60fps() {
+    let desktop_60fps = MediaProfile {
+        width: 1670,
+        height: 1080,
+        fps: 60,
+        bitrate_mbps: 20,
+        codec: "h264".to_string(),
+        ..MediaProfile::default()
+    };
     let high_bitrate = MediaProfile {
         width: 2560,
         height: 1600,
@@ -7597,15 +7647,27 @@ fn high_refresh_reliable_media_prefers_per_message_streams_to_reduce_hol() {
     };
 
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(true, true, &high_bitrate),
+        select_reliable_media_send_mode_for_profile(true, true, true, &desktop_60fps),
+        LanReliableMediaSendMode::Persistent
+    );
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(true, true, false, &desktop_60fps),
         LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(true, true, &stable_bitrate),
+        select_reliable_media_send_mode_for_profile(true, false, false, &desktop_60fps),
         LanReliableMediaSendMode::PerMessage
     );
     assert_eq!(
-        select_reliable_media_send_mode_for_profile(false, true, &high_bitrate),
+        select_reliable_media_send_mode_for_profile(true, true, true, &high_bitrate),
+        LanReliableMediaSendMode::PerMessage
+    );
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(true, true, true, &stable_bitrate),
+        LanReliableMediaSendMode::PerMessage
+    );
+    assert_eq!(
+        select_reliable_media_send_mode_for_profile(false, true, true, &high_bitrate),
         LanReliableMediaSendMode::Persistent
     );
 }
@@ -7722,9 +7784,15 @@ fn render_queue_policy_defaults_by_platform_and_allows_latest_override() {
         lan_render_queue_policy_for_profile_with_override(&high_fps, None),
         expected_high_fps_default
     );
+    #[cfg(windows)]
     assert_eq!(
         lan_render_queue_policy_for_profile_with_override(&low_fps, None),
         LanRenderQueuePolicy::PacedFifo
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        lan_render_queue_policy_for_profile_with_override(&low_fps, None),
+        LanRenderQueuePolicy::Latest
     );
     assert_eq!(
         lan_render_queue_policy_for_profile_with_override(

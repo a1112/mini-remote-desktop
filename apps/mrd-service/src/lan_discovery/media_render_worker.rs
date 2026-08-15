@@ -1,5 +1,7 @@
 #[cfg(target_os = "macos")]
 use super::discovery_identity::now_ms;
+#[cfg(target_os = "macos")]
+use super::macos_render_proxy_compressed_media_enabled_for_profile;
 #[cfg(any(windows, target_os = "macos"))]
 use super::media_frame_preparation::decoded_frame_to_render_frame;
 #[cfg(target_os = "macos")]
@@ -24,6 +26,8 @@ use super::media_timing::MediaTimerResolution;
 use super::selected_media_profile;
 #[cfg(any(windows, target_os = "macos"))]
 use super::time_utils::duration_as_millis;
+#[cfg(target_os = "macos")]
+use super::time_utils::now_us;
 #[cfg(target_os = "macos")]
 use crate::app_state::DecodedVideoFrameStats;
 #[cfg(any(windows, target_os = "macos"))]
@@ -224,6 +228,9 @@ pub(super) async fn render_lan_h264_access_unit_frame(
                 enqueue_gap_ms,
             );
         }
+        if let Some(frame_age_ms) = estimated_cross_device_frame_age_ms(timestamp_us) {
+            pipelines.record_estimated_frame_age_ms(session_id.clone(), frame_age_ms);
+        }
     }
 
     match enqueue {
@@ -332,6 +339,9 @@ pub(super) async fn render_lan_hevc_access_unit_frame(
                 enqueue_gap_ms,
             );
         }
+        if let Some(frame_age_ms) = estimated_cross_device_frame_age_ms(timestamp_us) {
+            pipelines.record_estimated_frame_age_ms(session_id.clone(), frame_age_ms);
+        }
     }
 
     match enqueue {
@@ -373,6 +383,15 @@ pub(super) async fn render_lan_hevc_access_unit_frame(
         now_ms(),
     );
     Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn estimated_cross_device_frame_age_ms(timestamp_us: u64) -> Option<f64> {
+    // Sender timestamps use wall clock. Keep the metric explicitly labelled as
+    // an estimate and reject implausible clock skew instead of reporting it as
+    // transport latency.
+    let age_us = now_us().checked_sub(timestamp_us)?;
+    (age_us <= 30_000_000).then_some(age_us as f64 / 1_000.0)
 }
 
 #[cfg(any(windows, target_os = "macos"))]

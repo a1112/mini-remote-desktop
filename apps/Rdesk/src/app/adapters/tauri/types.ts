@@ -1231,6 +1231,9 @@ export interface MediaStageMetrics {
   stage: string;
   p50_ms?: number | null;
   p95_ms?: number | null;
+  p99_ms?: number | null;
+  max_ms?: number | null;
+  sample_count?: number | null;
 }
 
 export interface MediaTestImpairmentSnapshot {
@@ -1383,6 +1386,7 @@ export interface MediaPipelineSnapshot {
   render_thread_priority?: string | null;
   render_waitable_timeouts?: number;
   agent_render_boundary?: AgentRenderBoundarySnapshot | null;
+  reliable_hol_recoveries?: number;
   stage_metrics: MediaStageMetrics[];
   test_impairment?: MediaTestImpairmentSnapshot | null;
   sender_transport?: MediaSenderTransportSnapshot | null;

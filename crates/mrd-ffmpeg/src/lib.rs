@@ -402,9 +402,19 @@ fn extract_zip_archive(archive_path: &Path, destination: &Path) -> Result<(), Ff
             message: error.to_string(),
         })?;
         output.flush().map_err(|error| FfmpegError::File {
-            path: output_path,
+            path: output_path.clone(),
             message: error.to_string(),
         })?;
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output_path, fs::Permissions::from_mode(mode)).map_err(
+                |error| FfmpegError::File {
+                    path: output_path.clone(),
+                    message: error.to_string(),
+                },
+            )?;
+        }
     }
     Ok(())
 }
@@ -501,8 +511,8 @@ fn resolve_tool(
     explicit_path: Option<&Path>,
     install_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(path) = explicit_path.filter(|path| path.is_file()) {
-        return Some(path.to_path_buf());
+    if let Some(path) = explicit_path {
+        return path.is_file().then(|| path.to_path_buf());
     }
 
     if let Some(install_dir) = install_dir {
@@ -510,6 +520,9 @@ fn resolve_tool(
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+        if install_dir.exists() {
+            return None;
         }
     }
 

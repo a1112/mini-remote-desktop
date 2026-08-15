@@ -1,6 +1,7 @@
 fn main() {
     emit_git_commit_env();
     add_macos_swift_runtime_rpaths();
+    embed_macos_info_plist();
 }
 
 fn emit_git_commit_env() {
@@ -105,4 +106,20 @@ fn add_macos_swift_runtime_rpaths() {
 
 fn emit_rpath(path: &str) {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
+}
+
+fn embed_macos_info_plist() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()),
+    );
+    let info_plist = manifest_dir.join("macos/Info.plist");
+    println!("cargo:rerun-if-changed={}", info_plist.display());
+    println!(
+        "cargo:rustc-link-arg-bin=mrd-service=-Wl,-sectcreate,__TEXT,__info_plist,{}",
+        info_plist.display()
+    );
 }

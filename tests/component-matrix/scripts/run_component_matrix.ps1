@@ -32,7 +32,8 @@ foreach ($casePath in $cases) {
 }
 
 if ($failures.Count -gt 0) {
-  throw "Component matrix failed: $($failures -join '; ')"
+  Write-Error "Component matrix failed: $($failures -join '; ')"
+  exit 2
 }
 
 Write-Output "Component matrix completed."

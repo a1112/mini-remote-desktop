@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -97,6 +97,42 @@ const serviceExe = join(profileDir, exeName);
 
 if (!existsSync(serviceExe)) {
   throw new Error(`mrd-service build completed, but ${serviceExe} was not found`);
+}
+
+if (process.platform === 'darwin') {
+  const serviceBundle = join(profileDir, 'MrdService.app');
+  const contentsDir = join(serviceBundle, 'Contents');
+  const executableDir = join(contentsDir, 'MacOS');
+  const bundledServiceExe = join(executableDir, exeName);
+  const sourceInfoPlist = join(workspaceRoot, 'apps', 'mrd-service', 'macos', 'Info.plist');
+
+  rmSync(serviceBundle, { recursive: true, force: true });
+  mkdirSync(executableDir, { recursive: true });
+  copyFileSync(sourceInfoPlist, join(contentsDir, 'Info.plist'));
+  copyFileSync(serviceExe, bundledServiceExe);
+  chmodSync(bundledServiceExe, 0o755);
+
+  const codesign = spawnSync(
+    'codesign',
+    [
+      '--force',
+      '--deep',
+      '--sign',
+      '-',
+      '--identifier',
+      'com.a1112.rdesk.service',
+      serviceBundle,
+    ],
+    { stdio: 'inherit' },
+  );
+  if (codesign.error) {
+    throw codesign.error;
+  }
+  if (codesign.status !== 0) {
+    throw new Error(`failed to ad-hoc sign ${serviceBundle}`);
+  }
+
+  console.log(`mrd-service macOS bundle ready: ${serviceBundle}`);
 }
 
 console.log(`mrd-service ready: ${serviceExe}`);

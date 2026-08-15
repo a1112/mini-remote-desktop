@@ -8,10 +8,25 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "component_matrix_common.ps1")
+. (Join-Path $scriptDir "../../benchmarks/scripts/benchmark_host_capabilities.ps1")
 
 $repo = (Resolve-Path $RepoRoot).Path
 $caseFile = Join-Path $repo $CasePath
 $case = Get-Content $caseFile -Raw | ConvertFrom-Json
+$requiresDxgiOutput = $null -ne $case.PSObject.Properties["requires_dxgi_output"] -and
+  [bool]$case.requires_dxgi_output
+$dxgiOutputAvailable = if ($requiresDxgiOutput) {
+  Test-BenchmarkDxgiOutputAvailable -RepoRoot $repo
+} else {
+  $true
+}
+$unsupportedReason = Get-ComponentMatrixUnsupportedReason `
+  -Case $case `
+  -DxgiOutputAvailable $dxgiOutputAvailable
+if ($unsupportedReason) {
+  Write-Output "Component case skipped: $($case.case_name) ($unsupportedReason)"
+  exit 0
+}
 $gitCommit = (git -C $repo rev-parse --short HEAD).Trim()
 $date = Get-Date -Format 'yyyy-MM-dd'
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -59,18 +74,22 @@ $summaryWritten = Invoke-ComponentMatrixSummaryIfAvailable `
 
 if ($result.ExitCode -ne 0) {
   if ($result.TimedOut) {
-    throw "component test timed out after ${TimeoutSeconds}s. See $stderrPath"
+    Write-Error "component test timed out after ${TimeoutSeconds}s. See $stderrPath"
+    exit 3
   }
-  throw "component test failed with exit code $($result.ExitCode). See $stderrPath"
+  Write-Error "component test failed with exit code $($result.ExitCode). See $stderrPath"
+  exit 2
 }
 
 if (-not $summaryWritten) {
-  throw "component test did not write result.json at $resultPath"
+  Write-Error "component test did not write result.json at $resultPath"
+  exit 2
 }
 
 $summary = Import-Csv (Join-Path $runDir 'summary.csv')
 if ($summary.passed -ne 'True') {
-  throw "component quality gate failed for $($case.case_name). See $runDir/summary.csv and reports/markdown-report.md"
+  Write-Error "component quality gate failed for $($case.case_name). See $runDir/summary.csv and reports/markdown-report.md"
+  exit 2
 }
 
 Write-Output "Component case completed."

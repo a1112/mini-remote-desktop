@@ -56,7 +56,7 @@ const WEB_PREVIEW_FRAME_UPDATE_INTERVAL: usize = 8;
 const ENCODED_ACCESS_UNIT_SUBSCRIBER_QUEUE_DEPTH: usize = 1;
 const NATIVE_RENDER_FRAME_TIMEOUT_MS: u64 = 2_000;
 const NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS: u64 = 750;
-const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 2_000;
+const HARNESS_STOP_JOIN_TIMEOUT_MS: u64 = 10_000;
 #[cfg(target_os = "linux")]
 const DEFAULT_LINUX_CAPTURE_START_TIMEOUT_MS: u64 = 30_000;
 const CAPTURE_NO_FRAME_TIMEOUT_MS: u64 = 2_500;
@@ -988,6 +988,7 @@ struct LatestRenderScheduler {
     shared: Arc<LatestRenderShared>,
     completions: mpsc::Receiver<AsyncRenderCompletion>,
     worker_done: mpsc::Receiver<()>,
+    returned_renderer: mpsc::Receiver<PipelineRenderer>,
     worker_finished: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -997,6 +998,7 @@ impl LatestRenderScheduler {
         let shared = Arc::new(LatestRenderShared::new());
         let (completion_tx, completions) = mpsc::channel();
         let (worker_done_tx, worker_done) = mpsc::channel();
+        let (returned_renderer_tx, returned_renderer) = mpsc::sync_channel(1);
         let worker_shared = Arc::clone(&shared);
         let worker_finished = Arc::new(AtomicBool::new(false));
         let worker_finished_thread = Arc::clone(&worker_finished);
@@ -1007,7 +1009,9 @@ impl LatestRenderScheduler {
         let worker = thread::Builder::new()
             .name("mrd-latest-render-scheduler".to_string())
             .spawn(move || {
-                run_latest_render_worker(renderer, worker_shared, worker_completion_tx);
+                let renderer =
+                    run_latest_render_worker(renderer, worker_shared, worker_completion_tx);
+                let _ = returned_renderer_tx.send(renderer);
                 worker_finished_thread.store(true, Ordering::Release);
                 drop(completion_tx);
                 let _ = worker_done_tx.send(());
@@ -1018,6 +1022,7 @@ impl LatestRenderScheduler {
             shared,
             completions,
             worker_done,
+            returned_renderer,
             worker_finished,
             worker: Some(worker),
         })
@@ -1048,24 +1053,35 @@ impl LatestRenderScheduler {
     fn is_finished(&self) -> bool {
         self.worker_finished.load(Ordering::Acquire)
     }
+
+    fn shutdown_and_take_renderer(&mut self) -> Result<Option<PipelineRenderer>> {
+        let Some(worker) = self.worker.take() else {
+            return Ok(None);
+        };
+        self.stop();
+        if !self.is_finished() {
+            self.worker_done
+                .recv_timeout(Duration::from_millis(HARNESS_STOP_JOIN_TIMEOUT_MS))
+                .map_err(|_| anyhow::anyhow!("latest render scheduler did not stop in time"))?;
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("latest render scheduler panicked"))?;
+        self.returned_renderer
+            .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS))
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("latest render scheduler did not return its renderer"))
+    }
 }
 
 impl Drop for LatestRenderScheduler {
     fn drop(&mut self) {
-        self.stop();
-        if !self.is_finished() {
-            let _ = self
-                .worker_done
-                .recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS));
-        }
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        let _ = self.shutdown_and_take_renderer();
     }
 }
 
 struct PipelineRenderer {
-    sender: mpsc::SyncSender<RenderCommand>,
+    sender: Option<mpsc::SyncSender<RenderCommand>>,
     render_thread: Option<thread::JoinHandle<()>>,
     render_done: Option<mpsc::Receiver<()>>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -1112,7 +1128,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
-                sender,
+                sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
                 last_error,
@@ -1147,7 +1163,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
-                sender,
+                sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
                 last_error,
@@ -1176,7 +1192,7 @@ impl PipelineRenderer {
             .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
         Ok(Self {
-            sender,
+            sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error,
@@ -1202,6 +1218,8 @@ impl PipelineRenderer {
 
         let (completion, done) = mpsc::sync_channel(1);
         self.sender
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native render thread is stopping"))?
             .send(RenderCommand::Frame(RenderJob { input, completion }))
             .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
         match done.recv_timeout(Duration::from_millis(NATIVE_RENDER_FRAME_TIMEOUT_MS)) {
@@ -1225,7 +1243,13 @@ impl PipelineRenderer {
 
 impl Drop for PipelineRenderer {
     fn drop(&mut self) {
-        let _ = self.sender.try_send(RenderCommand::Stop);
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.try_send(RenderCommand::Stop);
+            // A full bounded queue can reject the stop command. Disconnecting
+            // the final sender guarantees the render loop exits after any
+            // already queued frame instead of blocking forever on recv().
+            drop(sender);
+        }
         if let Some(done) = self.render_done.take() {
             let _ = done.recv_timeout(Duration::from_millis(NATIVE_RENDER_THREAD_STOP_TIMEOUT_MS));
         }
@@ -1240,13 +1264,13 @@ fn run_latest_render_worker(
     mut renderer: PipelineRenderer,
     shared: Arc<LatestRenderShared>,
     completions: mpsc::Sender<AsyncRenderCompletion>,
-) {
+) -> PipelineRenderer {
     loop {
         let input = {
             let mut slot = shared.slot.lock().unwrap();
             loop {
                 if slot.stopping {
-                    return;
+                    return renderer;
                 }
                 if let Some(input) = slot.take_next() {
                     break input;
@@ -1269,10 +1293,10 @@ fn run_latest_render_worker(
             })
             .is_err()
         {
-            return;
+            return renderer;
         }
         if failed {
-            return;
+            return renderer;
         }
     }
 }
@@ -2960,7 +2984,7 @@ impl TestHarness {
             None
         };
         let mut next_frame_at = Instant::now();
-        let render_scheduler = match state.renderer.take() {
+        let mut render_scheduler = match state.renderer.take() {
             Some(renderer) => match LatestRenderScheduler::new(renderer) {
                 Ok(scheduler) => Some(scheduler),
                 Err(error) => {
@@ -3301,7 +3325,7 @@ impl TestHarness {
             }
         }
 
-        if let Some(scheduler) = render_scheduler.as_ref() {
+        let retained_renderer = if let Some(scheduler) = render_scheduler.as_mut() {
             if let Err(error) = Self::stop_render_scheduler_and_drain(
                 scheduler,
                 &mut render_pacing,
@@ -3318,7 +3342,23 @@ impl TestHarness {
                 let mut m = metrics.lock().unwrap();
                 m.error_message = Some(error.to_string());
             }
-        }
+            match scheduler.shutdown_and_take_renderer() {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    let mut m = metrics.lock().unwrap();
+                    m.error_message = Some(error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // NVDEC shared-texture decoders borrow the renderer's D3D11 device.
+        // Destroy the decoder while the returned renderer still owns that
+        // device, then release the renderer and device last.
+        drop(state.decoder.take());
+        drop(retained_renderer);
 
         Self::update_metrics(
             &metrics,
@@ -6597,6 +6637,21 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_wait_allows_native_cleanup_beyond_two_seconds() {
+        let mut harness = TestHarness::new().expect("create harness");
+        harness.running.store(true, Ordering::Relaxed);
+        harness.thread_handle = Some(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(2_100));
+        }));
+
+        harness
+            .stop_and_wait()
+            .expect("native codec cleanup may exceed the legacy two-second budget");
+
+        assert!(!harness.stopping.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn pipeline_renderer_drop_waits_for_native_render_thread_cleanup() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let (render_done_tx, render_done_rx) = mpsc::channel();
@@ -6611,7 +6666,7 @@ mod tests {
             let _ = render_done_tx.send(());
         });
         let renderer = PipelineRenderer {
-            sender,
+            sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
             last_error: Arc::new(Mutex::new(None)),
@@ -6621,6 +6676,36 @@ mod tests {
         drop(renderer);
 
         assert!(cleanup_finished.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn pipeline_renderer_drop_disconnects_a_full_command_queue_before_join() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender
+            .send(RenderCommand::Stop)
+            .expect("fill render command queue");
+        let (render_done_tx, render_done_rx) = mpsc::channel();
+        let render_thread = thread::spawn(move || {
+            while receiver.recv().is_ok() {}
+            let _ = render_done_tx.send(());
+        });
+        let renderer = PipelineRenderer {
+            sender: Some(sender),
+            render_thread: Some(render_thread),
+            render_done: Some(render_done_rx),
+            last_error: Arc::new(Mutex::new(None)),
+            d3d11_device_ptr: None,
+        };
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            drop(renderer);
+            let _ = drop_done_tx.send(());
+        });
+
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("full render queue must not deadlock renderer drop");
     }
 
     #[test]

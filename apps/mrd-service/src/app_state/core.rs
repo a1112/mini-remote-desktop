@@ -388,14 +388,14 @@ impl AppState {
             .drain_session(session_id, limit)
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     pub fn new() -> Self {
         Self::with_tray(Arc::new(std::sync::Mutex::new(
             crate::shell::NoOpTray::new(),
         )))
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     pub fn with_tray(tray: TrayPortRef) -> Self {
         Self::with_tray_and_lan_discovery_config(
             tray,
@@ -403,7 +403,7 @@ impl AppState {
         )
     }
 
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
     pub fn with_tray_and_lan_discovery_config(
         tray: TrayPortRef,
         lan_discovery_config: crate::lan_discovery::LanDiscoveryConfig,

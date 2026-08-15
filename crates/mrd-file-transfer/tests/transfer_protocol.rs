@@ -37,13 +37,21 @@ fn chunks_are_bounded_and_hash_verified() {
 
 #[test]
 fn paths_reject_escape_alternate_stream_and_reserved_names() {
-    for path in ["../secret.txt", "nested/../../secret.txt", "report.txt:secret", "CON"] {
+    for path in [
+        "../secret.txt",
+        "nested/../../secret.txt",
+        "report.txt:secret",
+        "CON",
+    ] {
         assert!(matches!(
             validate_relative_path(path),
             Err(PathValidationError::Rejected(_))
         ));
     }
-    assert_eq!(validate_relative_path("nested/report.txt").unwrap(), "nested/report.txt");
+    assert_eq!(
+        validate_relative_path("nested/report.txt").unwrap(),
+        "nested/report.txt"
+    );
 }
 
 #[test]

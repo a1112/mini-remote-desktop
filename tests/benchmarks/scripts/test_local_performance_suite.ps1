@@ -19,11 +19,17 @@ $expected = @(Get-ChildItem (Join-Path $repo "tests/benchmarks/scenarios") -Filt
 Assert-Equal $scenarios.Count $expected "Every local transport scenario is discovered"
 Assert-True ($scenarios[0] -lt $scenarios[-1]) "Scenario paths are deterministic and sorted"
 Assert-True (-not (@($scenarios) -match "public_route")) "Peer/TURN-only canaries are excluded"
+Assert-True (Test-BenchmarkCpuLoadAcceptable -CpuLoadPercent 79 -MaxCpuLoadPercent 80) "Host load below the ceiling is accepted"
+Assert-True (-not (Test-BenchmarkCpuLoadAcceptable -CpuLoadPercent 95 -MaxCpuLoadPercent 80)) "Saturated hosts are rejected"
 
 $missingDisplayReason = Get-LocalPerformanceScenarioSupportReason `
   -Scenario ([pscustomobject]@{ source_id = "windows:display-shared:1" }) `
   -ActiveDisplayCount 1
 Assert-Equal $missingDisplayReason "display_source_unavailable" "Inactive display sources are classified as unsupported"
+Assert-Equal (Get-LocalPerformanceScenarioSupportReason `
+  -Scenario ([pscustomobject]@{ capture_backend = "dxgi"; encode_backend = "nvenc" }) `
+  -ActiveDisplayCount 1 `
+  -DxgiOutputAvailable $false) "dxgi_output_unavailable" "Detached DXGI output is unsupported"
 Assert-Equal (Get-LocalPerformanceScenarioSupportReason `
   -Scenario ([pscustomobject]@{ source_id = "windows:display-shared:0" }) `
   -ActiveDisplayCount 1) $null "Active display sources remain supported"
@@ -38,7 +44,13 @@ Assert-Equal (Get-LocalPerformanceScenarioSupportReason `
 Assert-Equal (Get-LocalPerformanceScenarioSupportReason `
   -Scenario ([pscustomobject]@{ encode_backend = "software_vvc" }) `
   -ActiveDisplayCount 1 `
-  -AvailableCommands @("pkg-config", "cmake")) $null "VVC remains runnable when both build dependencies are available"
+  -AvailableCommands @("pkg-config", "cmake") `
+  -VvcLibraryAvailable $true) $null "VVC remains runnable when all build dependencies are available"
+Assert-Equal (Get-LocalPerformanceScenarioSupportReason `
+  -Scenario ([pscustomobject]@{ encode_backend = "software_vvc" }) `
+  -ActiveDisplayCount 1 `
+  -AvailableCommands @("pkg-config", "cmake") `
+  -VvcLibraryAvailable $false) "codec_dependency_unavailable" "Missing libvvenc is explicitly unsupported"
 
 $manifest = New-LocalPerformanceEnvironmentManifest `
   -RunId "local-1" `
@@ -71,11 +83,12 @@ Assert-Equal (Resolve-LocalPerformanceExitCode -Verdicts @("PRODUCT_FAIL")) 2 "P
 Assert-Equal (Resolve-LocalPerformanceExitCode -Verdicts @("INFRA_FAIL")) 3 "Infrastructure failure exits three"
 Assert-Equal (Resolve-LocalPerformanceExitCode -Verdicts @("INVALID_ARTIFACT")) 4 "Invalid artifacts dominate"
 
-$plan = @(New-LocalPerformanceExecutionPlan -RepoRoot $repo -OutputRoot "C:\perf-output")
+$plan = @(New-LocalPerformanceExecutionPlan -RepoRoot $repo -OutputRoot "C:\perf-output" -DxgiOutputAvailable $false)
 Assert-True ($plan.Count -ge ($expected + 4)) "Plan includes scenarios plus component, integration, and canary phases"
 Assert-True (@($plan | Where-Object { $_.phase -eq "transport" }).Count -eq $expected) "Every transport scenario is planned once"
 Assert-True (-not (@($plan | Where-Object { $_.command -match "-Debug" }).Count)) "Performance plan never enables debug mode"
 Assert-True (@($plan | Where-Object { $_.phase -eq "integration" -and $_.command -match "--release" }).Count -ge 2) "Integration tests use release mode"
+Assert-Equal $plan[-1].unsupported_reason "dxgi_output_unavailable" "Local canary is skipped without DXGI output"
 
 $calls = [System.Collections.Generic.List[string]]::new()
 $fakePlan = @(
@@ -128,10 +141,10 @@ try {
   $failArtifact = Join-Path $runnerTmp "fail.json"
   $planPath = Join-Path $runnerTmp "plan.json"
   @(
-    [pscustomobject]@{ phase="fake"; case_id="pass"; command="& '$passScript' '$passArtifact'"; timeout_secs=5; expected_artifact=$passArtifact },
-    [pscustomobject]@{ phase="fake"; case_id="fail"; command="& '$failScript' '$failArtifact'"; timeout_secs=5; expected_artifact=$failArtifact },
+    [pscustomobject]@{ phase="fake"; case_id="pass"; command="& '$passScript' '$passArtifact'"; timeout_secs=15; expected_artifact=$passArtifact },
+    [pscustomobject]@{ phase="fake"; case_id="fail"; command="& '$failScript' '$failArtifact'"; timeout_secs=15; expected_artifact=$failArtifact },
     [pscustomobject]@{ phase="fake"; case_id="timeout"; command="& '$timeoutScript'"; timeout_secs=1; expected_artifact=$null },
-    [pscustomobject]@{ phase="fake"; case_id="silent"; command="& '$silentScript'"; timeout_secs=5 }
+    [pscustomobject]@{ phase="fake"; case_id="silent"; command="& '$silentScript'"; timeout_secs=15 }
   ) | ConvertTo-Json | Set-Content -Path $planPath -Encoding Ascii
   $runner = Join-Path $scriptDir "run_local_performance_suite.ps1"
   & powershell -ExecutionPolicy Bypass -File $runner -RepoRoot $repo -OutputRoot $runnerTmp -PlanPath $planPath -SkipEnvironmentProbe

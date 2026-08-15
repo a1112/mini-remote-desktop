@@ -227,7 +227,7 @@ function matrixStatusToRunStatus(status: "pending" | "running" | "completed" | "
     case "pending":
       return "queued" as const;
     case "skipped":
-      return "cancelled" as const;
+      return "skipped" as const;
     default:
       return status;
   }

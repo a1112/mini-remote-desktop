@@ -106,6 +106,18 @@ export interface E2EMetricSeriesRow {
   receiver_active?: boolean | null;
   first_frame_time_ms?: number | null;
   max_zero_frame_window_after_first_frame_ms?: number | null;
+  repeated_latest_frames?: number | null;
+  reliable_hol_recoveries?: number | null;
+  receive_stall?: boolean | null;
+  render_stall?: boolean | null;
+  receiver_message_wait_p99_ms?: number | null;
+  receiver_message_wait_max_ms?: number | null;
+  render_present_gap_p99_ms?: number | null;
+  render_present_gap_max_ms?: number | null;
+  estimated_frame_age_p99_ms?: number | null;
+  estimated_frame_age_max_ms?: number | null;
+  relative_frame_age_p99_ms?: number | null;
+  relative_frame_age_max_ms?: number | null;
 }
 
 export type MainlineE2EScriptClassification =
@@ -206,7 +218,7 @@ export function externalRunRecordFromLanE2EReport(
       report.status === "completed"
         ? "completed"
         : report.status === "skipped"
-          ? "cancelled"
+          ? "skipped"
           : "failed",
     started_at: report.startedAt,
     finished_at: report.finishedAt,
@@ -487,6 +499,37 @@ function selectedProfileFromLanE2EReport(
 }
 
 function metricSeriesFromLanE2EReport(report: LanE2EAutomationReport): E2EMetricSeriesRow[] {
+  if (report.metricSeries?.length) {
+    return report.metricSeries.map((sample) => ({
+      timestamp: sample.timestamp,
+      sample_duration_ms: sample.intervalMs,
+      frames_decoded: sample.framesDecoded,
+      frames_dropped: sample.framesDropped,
+      render_frames_presented: sample.renderFramesPresented,
+      observed_fps: nullableFinite(sample.observedFps),
+      observed_render_fps: nullableFinite(sample.observedRenderFps),
+      queue_depth: sample.queueDepth,
+      render_queue_replacements: sample.renderQueueReplacements,
+      render_present_skips: null,
+      receiver_active: report.sessionSnapshot?.receiver_active ?? null,
+      first_frame_time_ms: nullableFinite(report.firstFrameTimeMs),
+      max_zero_frame_window_after_first_frame_ms: nullableFinite(
+        report.maxZeroFrameWindowAfterFirstFrameMs
+      ),
+      repeated_latest_frames: sample.repeatedLatestFrames,
+      reliable_hol_recoveries: sample.reliableHolRecoveries,
+      receive_stall: sample.receiveStall,
+      render_stall: sample.renderStall,
+      receiver_message_wait_p99_ms: nullableFinite(sample.receiverMessageWaitP99Ms),
+      receiver_message_wait_max_ms: nullableFinite(sample.receiverMessageWaitMaxMs),
+      render_present_gap_p99_ms: nullableFinite(sample.renderPresentGapP99Ms),
+      render_present_gap_max_ms: nullableFinite(sample.renderPresentGapMaxMs),
+      estimated_frame_age_p99_ms: nullableFinite(sample.estimatedFrameAgeP99Ms),
+      estimated_frame_age_max_ms: nullableFinite(sample.estimatedFrameAgeMaxMs),
+      relative_frame_age_p99_ms: nullableFinite(sample.relativeFrameAgeP99Ms),
+      relative_frame_age_max_ms: nullableFinite(sample.relativeFrameAgeMaxMs),
+    }));
+  }
   return [
     {
       timestamp: report.finishedAt,
@@ -525,6 +568,18 @@ function metricsCsvFromRows(rows: E2EMetricSeriesRow[]): string {
     "receiver_active",
     "first_frame_time_ms",
     "max_zero_frame_window_after_first_frame_ms",
+    "repeated_latest_frames",
+    "reliable_hol_recoveries",
+    "receive_stall",
+    "render_stall",
+    "receiver_message_wait_p99_ms",
+    "receiver_message_wait_max_ms",
+    "render_present_gap_p99_ms",
+    "render_present_gap_max_ms",
+    "estimated_frame_age_p99_ms",
+    "estimated_frame_age_max_ms",
+    "relative_frame_age_p99_ms",
+    "relative_frame_age_max_ms",
   ];
   const lines = rows.map((row) =>
     [
@@ -541,6 +596,18 @@ function metricsCsvFromRows(rows: E2EMetricSeriesRow[]): string {
       row.receiver_active,
       row.first_frame_time_ms,
       row.max_zero_frame_window_after_first_frame_ms,
+      row.repeated_latest_frames,
+      row.reliable_hol_recoveries,
+      row.receive_stall,
+      row.render_stall,
+      row.receiver_message_wait_p99_ms,
+      row.receiver_message_wait_max_ms,
+      row.render_present_gap_p99_ms,
+      row.render_present_gap_max_ms,
+      row.estimated_frame_age_p99_ms,
+      row.estimated_frame_age_max_ms,
+      row.relative_frame_age_p99_ms,
+      row.relative_frame_age_max_ms,
     ].map(csvCell).join(",")
   );
   return `${headers.join(",")}\n${lines.join("\n")}\n`;

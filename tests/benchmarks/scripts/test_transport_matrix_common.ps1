@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "transport_matrix_common.ps1")
+. (Join-Path $scriptDir "benchmark_execution_state.ps1")
 $repoRoot = (Resolve-Path (Join-Path $scriptDir "..\..\..")).Path
 
 function Assert-ArrayEqual([object[]]$Actual, [object[]]$Expected, [string]$Message) {
@@ -25,6 +26,35 @@ function Assert-Throws([scriptblock]$Action, [string]$Pattern, [string]$Message)
     throw "$Message. Threw unexpected message: $($_.Exception.Message)"
   }
   throw "$Message. Expected an exception matching '$Pattern'"
+}
+
+if ((Get-BenchmarkExecutionStateFlags -DisplayRequired) -ne [uint32]2147483651) {
+  throw "Display-required benchmark execution state must keep both system and display awake"
+}
+if ((Get-BenchmarkExecutionStateFlags) -ne [uint32]2147483649) {
+  throw "Default benchmark execution state must keep the system awake"
+}
+
+$relativeScenario = Resolve-BenchmarkPath `
+  -RepoRoot $repoRoot `
+  -Path "tests/benchmarks/scenarios/quick.transport.json"
+$expectedRelativeScenario = [System.IO.Path]::GetFullPath(
+  (Join-Path $repoRoot "tests/benchmarks/scenarios/quick.transport.json")
+)
+if ($relativeScenario -ne $expectedRelativeScenario) {
+  throw "Relative benchmark paths must resolve under the repository root"
+}
+$absoluteOutput = [System.IO.Path]::GetFullPath(
+  (Join-Path ([System.IO.Path]::GetTempPath()) "mrd-benchmark-absolute")
+)
+if ((Resolve-BenchmarkPath -RepoRoot $repoRoot -Path $absoluteOutput) -ne $absoluteOutput) {
+  throw "Absolute benchmark paths must not be joined to the repository root"
+}
+if ((Get-TransportMatrixTimeoutSeconds -Scenario ([pscustomobject]@{ duration_secs = 20 })) -ne 440) {
+  throw "Quick transport timeout must retain a cold release-build allowance"
+}
+if ((Get-TransportMatrixTimeoutSeconds -Scenario ([pscustomobject]@{ duration_secs = 180 })) -ne 600) {
+  throw "Stress transport timeout must include scenario duration and build allowance"
 }
 
 $hevcArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "software_hevc"

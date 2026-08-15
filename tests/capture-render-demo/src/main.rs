@@ -130,8 +130,8 @@ fn run(options: DemoOptions) -> Result<()> {
     };
     use mrd_capture_macos::{enumerate_window_capture_targets, MacosScreenCapture};
     use mrd_pipeline_core::FrameCapture;
-    use mrd_render::{RenderTarget, RendererFactory};
-    use mrd_render_macos::MacosRendererFactory;
+    use mrd_render::{RenderTarget, RendererInstance};
+    use mrd_render_macos::MacosMetalRenderer;
     use std::{
         thread,
         time::{Duration, Instant},
@@ -168,8 +168,7 @@ fn run(options: DemoOptions) -> Result<()> {
         };
         capture.set_target_dimensions(options.width, options.height);
 
-        let mut renderer = MacosRendererFactory
-            .create()
+        let mut renderer = MacosMetalRenderer::new()
             .map_err(|error| anyhow!("create Metal renderer failed: {error}"))?;
         renderer
             .attach_target(RenderTarget::WindowHandle(ns_view as isize))
@@ -200,10 +199,16 @@ fn run(options: DemoOptions) -> Result<()> {
         while options.continuous || started.elapsed() < Duration::from_millis(options.duration_ms) {
             let frame_started = Instant::now();
             let frame = capture.capture_frame().context("capture frame")?;
-            let render_frame = captured_frame_into_render_frame(frame)?;
-            renderer
-                .upload_frame(render_frame)
-                .map_err(|error| anyhow!("upload frame to renderer failed: {error}"))?;
+            if let Some(pixel_buffer) = frame.macos_cv_pixel_buffer() {
+                renderer
+                    .upload_cv_pixel_buffer_nv12(frame.width, frame.height, pixel_buffer.as_ptr())
+                    .map_err(|error| anyhow!("upload CVPixelBuffer to renderer failed: {error}"))?;
+            } else {
+                let render_frame = captured_frame_into_render_frame(frame)?;
+                renderer
+                    .upload_frame(render_frame)
+                    .map_err(|error| anyhow!("upload frame to renderer failed: {error}"))?;
+            }
             frames = frames.saturating_add(1);
 
             if !pump_macos_events(app, window) {
@@ -298,8 +303,60 @@ fn captured_frame_into_render_frame(frame: CapturedFrame) -> Result<RenderFrame>
             Ok(RenderFrame::from_bgra32(frame.width, frame.height, bgra))
         }
         FramePixelFormat::Nv12 => {
-            bail!("capture-render-demo does not render CPU-backed NV12 frames directly")
+            if frame.width % 2 != 0 || frame.height % 2 != 0 {
+                bail!(
+                    "NV12 frame dimensions must be even, got {}x{}",
+                    frame.width,
+                    frame.height
+                );
+            }
+            let expected = expected_pixels
+                .checked_mul(3)
+                .and_then(|bytes| bytes.checked_div(2))
+                .ok_or_else(|| anyhow!("NV12 frame size overflow"))?;
+            if frame.data.len() != expected {
+                bail!(
+                    "NV12 frame byte length mismatch: expected {expected}, got {}",
+                    frame.data.len()
+                );
+            }
+            Ok(RenderFrame::from_nv12(
+                frame.width,
+                frame.height,
+                frame.data,
+                frame.width,
+            ))
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use mrd_render::{RenderFrameData, RenderPixelFormat};
+
+    #[test]
+    fn converts_tightly_packed_cpu_nv12_for_metal() {
+        let frame = CapturedFrame::from_cpu(4, 2, FramePixelFormat::Nv12, 1, vec![0; 12]);
+
+        let render_frame = captured_frame_into_render_frame(frame).expect("NV12 render frame");
+
+        assert_eq!(render_frame.pixel_format, RenderPixelFormat::Nv12);
+        assert!(matches!(
+            render_frame.data,
+            RenderFrameData::Nv12 { pitch: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_malformed_cpu_nv12() {
+        let frame = CapturedFrame::from_cpu(4, 2, FramePixelFormat::Nv12, 1, vec![0; 11]);
+
+        let error = captured_frame_into_render_frame(frame).expect_err("malformed NV12");
+
+        assert!(error
+            .to_string()
+            .contains("NV12 frame byte length mismatch"));
     }
 }
 
