@@ -88,7 +88,11 @@ impl AuthorizedControlFixture {
             .machine_key_id()
             .expect("target key id")
             .to_string();
-        let created_at_ms = now_ms();
+        // Keep all synthetic authorization transitions safely in the past. On
+        // a heavily loaded CI runner, the first event could otherwise be
+        // processed before the grant's synthetic `created_at + 3ms` issue
+        // time, making the test depend on scheduler timing.
+        let created_at_ms = now_ms().saturating_sub(1_000);
         let expires_at_ms = created_at_ms.saturating_add(60_000);
         let requested_scopes = vec![
             RemotePermissionScope::ScreenView,

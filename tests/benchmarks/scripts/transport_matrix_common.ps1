@@ -10,6 +10,14 @@ function Resolve-BenchmarkPath {
   [System.IO.Path]::GetFullPath((Join-Path $RepoRoot $Path))
 }
 
+function Get-CurrentPowerShellExecutable {
+  $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    throw "Unable to resolve the current PowerShell executable"
+  }
+  return $path
+}
+
 function Get-TransportMatrixTimeoutSeconds {
   param([Parameter(Mandatory = $true)]$Scenario)
 

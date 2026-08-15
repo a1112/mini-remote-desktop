@@ -7379,6 +7379,7 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
         *decoder_waits_for_keyframe = true;
         maybe_send_lan_keyframe_request(
             endpoint,
+            None,
             session_id,
             &profile,
             keyframe_request_sequence,

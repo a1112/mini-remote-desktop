@@ -12,6 +12,14 @@ function Get-ComponentMatrixUnsupportedReason {
   return $null
 }
 
+function Get-CurrentPowerShellExecutable {
+  $path = (Get-Process -Id $PID -ErrorAction Stop).Path
+  if ([string]::IsNullOrWhiteSpace($path)) {
+    throw "Unable to resolve the current PowerShell executable"
+  }
+  return $path
+}
+
 function Stop-ComponentProcessTree {
   param(
     [Parameter(Mandatory = $true)]
@@ -96,7 +104,7 @@ function Invoke-ComponentMatrixSummaryIfAvailable {
   if ($ThresholdPath) {
     $args += @("-ThresholdPath", $ThresholdPath)
   }
-  & powershell @args
+  & (Get-CurrentPowerShellExecutable) @args
   if ($LASTEXITCODE -ne 0) {
     throw "component summary failed with exit code $LASTEXITCODE for $RunDir"
   }
