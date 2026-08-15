@@ -774,7 +774,7 @@ async fn security_negative_certificate_substitution_emits_authoritative_evidence
 
     let responder_socket = target_socket.clone();
     let responder_identity = target.clone();
-    let responder = tokio::spawn(async move {
+    let mut responder = tokio::spawn(async move {
         let mut buffer = vec![0_u8; DISCOVERY_PACKET_BUFFER_BYTES];
         let (len, controller_addr) = responder_socket.recv_from(&mut buffer).await.unwrap();
         let LanDiscoveryPacket::SignedRemoteSessionRequest(request) =
@@ -871,10 +871,21 @@ async fn security_negative_certificate_substitution_emits_authoritative_evidence
             session_id: session_id.clone(),
             target_device_id: DeviceId("security-negative-target".to_string()),
             transport_kind: "quic".to_string(),
-            requested_profile: Some(MediaProfile::default()),
+            // Keep this security-negative test independent of host media
+            // capability preflight; Linux CI intentionally has no hardware
+            // encoder/decoder, but the certificate binding check is portable.
+            requested_profile: None,
         })
         .await;
-    responder.await.unwrap();
+    match timeout(Duration::from_secs(5), &mut responder).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("certificate substitution responder failed: {error}"),
+        Err(_) => {
+            responder.abort();
+            let _ = responder.await;
+            panic!("certificate substitution responder did not receive the request");
+        }
+    }
     assert!(matches!(
         response,
         IpcResponse::RemoteAccessError { ref failure, .. }
