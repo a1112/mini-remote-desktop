@@ -4385,12 +4385,33 @@ async fn target_sender_grant_expiry_closes_legacy_session_and_cleans_media() {
                 });
             let media_tasks_finished =
                 app_state.media_tasks.lock().await.active_count(&session_id) == 0;
+            let media_profiles_clean = app_state
+                .media_profiles
+                .lock()
+                .await
+                .get(&session_id)
+                .is_none();
+            let capture_sources_clean = app_state
+                .capture_sources
+                .lock()
+                .await
+                .get(&session_id)
+                .is_none();
+            let peer_media_capabilities_clean = app_state
+                .peer_media_capabilities
+                .lock()
+                .await
+                .get(&session_id)
+                .is_none();
             if authorization.as_ref().is_some_and(|snapshot| {
                 snapshot.authorization_state == mrd_ipc::RemoteAuthorizationState::Expired
                     && snapshot.failure.as_ref().map(|failure| failure.code)
                         == Some(mrd_ipc::RemoteReasonCode::GrantExpired)
             }) && legacy_closed
                 && media_tasks_finished
+                && media_profiles_clean
+                && capture_sources_clean
+                && peer_media_capabilities_clean
             {
                 break;
             }
