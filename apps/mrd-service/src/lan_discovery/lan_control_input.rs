@@ -2034,7 +2034,11 @@ mod authenticated_tests {
         let target_identity = target_state.device_identities.machine_identity();
         let session_id = SessionId("signed-control-retry".to_string());
         let grant_id = [0x72; 32];
-        let created_at_ms = super::super::now_ms();
+        // Keep the synthetic authorization timeline safely in the past. On a
+        // fast CI runner, the grant's `created_at + 3ms` issue time could
+        // otherwise still be in the future when the first input is sent,
+        // making the test depend on scheduler and platform timing.
+        let created_at_ms = super::super::now_ms().saturating_sub(1_000);
         let expires_at_ms = created_at_ms.saturating_add(60_000);
         install_control_authorization(
             &controller_state,
