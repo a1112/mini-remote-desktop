@@ -3338,6 +3338,20 @@ fn lan_authorization_capabilities() -> Vec<RemotePermissionScope> {
     lan_authorization_capabilities_with_input_control(false)
 }
 
+#[cfg(test)]
+fn test_lan_media_capabilities() -> Vec<String> {
+    let mut capabilities = lan_media_capabilities();
+    for capability in [
+        "encode.nvenc_hevc".to_string(),
+        LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
+    ] {
+        if !capabilities.iter().any(|existing| existing == &capability) {
+            capabilities.push(capability);
+        }
+    }
+    capabilities
+}
+
 fn lan_authorization_capabilities_with_input_control(
     input_control_available: bool,
 ) -> Vec<RemotePermissionScope> {

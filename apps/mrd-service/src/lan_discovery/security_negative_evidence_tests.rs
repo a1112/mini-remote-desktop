@@ -759,7 +759,7 @@ async fn security_negative_certificate_substitution_emits_authoritative_evidence
             ],
             service_build_id: Some(service_build_id()),
             media_protocol_version: Some(LAN_MEDIA_PROTOCOL_VERSION),
-            media_capabilities: lan_media_capabilities(),
+            media_capabilities: test_lan_media_capabilities(),
             mac_address: None,
             timestamp_ms: announced_at,
         },

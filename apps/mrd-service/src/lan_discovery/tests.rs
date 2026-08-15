@@ -3346,7 +3346,7 @@ async fn signed_remote_session_request_requires_consent_and_signed_grant() {
             transport_kind: "quic".to_string(),
             source_discovery_port: Some(21_116),
             source_endpoint: ack_socket.local_addr().unwrap(),
-            source_media_capabilities: lan_media_capabilities(),
+            source_media_capabilities: test_lan_media_capabilities(),
             requested_media_profile: Some(MediaProfile {
                 width: 3840,
                 height: 2160,
@@ -4195,7 +4195,7 @@ async fn remote_session_accept_is_prepared_without_starting_before_bootstrap_del
         DeviceId("controller-device".to_string()),
         "127.0.0.1".parse().unwrap(),
         "quic".to_string(),
-        lan_media_capabilities(),
+        test_lan_media_capabilities(),
         None,
     )
     .await;
@@ -4223,7 +4223,7 @@ async fn committed_target_session_times_out_and_cleans_resources_without_a_clien
         DeviceId("controller-device".to_string()),
         "127.0.0.1".parse().unwrap(),
         "quic".to_string(),
-        lan_media_capabilities(),
+        test_lan_media_capabilities(),
         None,
     )
     .await;
@@ -4288,7 +4288,7 @@ async fn target_sender_grant_expiry_closes_legacy_session_and_cleans_media() {
         "Target Device".to_string(),
     );
     let session_id = SessionId("target-grant-expiry".to_string());
-    let controller_media_capabilities = lan_media_capabilities()
+    let controller_media_capabilities = test_lan_media_capabilities()
         .into_iter()
         .filter(|capability| {
             capability != LAN_QUIC_RELIABLE_MEDIA_TRANSPORT
@@ -4650,7 +4650,7 @@ async fn wrong_controller_key_proof_never_starts_target_capture() {
         DeviceId("controller-device".to_string()),
         "127.0.0.1".parse().unwrap(),
         "quic".to_string(),
-        lan_media_capabilities(),
+        test_lan_media_capabilities(),
         None,
     )
     .await;
@@ -4752,7 +4752,7 @@ async fn target_commit_and_stop_are_atomic_across_media_registry_awaits() {
         DeviceId("controller-device".to_string()),
         "127.0.0.1".parse().unwrap(),
         "quic".to_string(),
-        lan_media_capabilities(),
+        test_lan_media_capabilities(),
         None,
     )
     .await;
@@ -4829,7 +4829,7 @@ async fn cancelled_target_commit_leaves_no_partially_published_media_state() {
         DeviceId("controller-device".to_string()),
         "127.0.0.1".parse().unwrap(),
         "quic".to_string(),
-        lan_media_capabilities(),
+        test_lan_media_capabilities(),
         None,
     )
     .await;
