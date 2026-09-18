@@ -33,7 +33,10 @@
     ],
     "security": {
       "csp": null,
-      "capabilities": ["default"]
+      "capabilities": [
+        "default",
+        "project-window-chrome"
+      ]
     }
   },
   "bundle": {

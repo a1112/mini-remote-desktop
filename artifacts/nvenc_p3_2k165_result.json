@@ -1,0 +1,42 @@
+{
+  "component": "Encode",
+  "backend": "nvenc",
+  "case_name": "nvenc_p3_2k165",
+  "sample_count": 300,
+  "duration_sec": 4.4643278,
+  "success_count": 300,
+  "failure_count": 0,
+  "throughput_fps": 67.19936649813214,
+  "latency_ms": {
+    "count": 300,
+    "bytes": 0,
+    "avg_ms": 11.377959666666662,
+    "p50_ms": 9.9532,
+    "p95_ms": 17.4253,
+    "p99_ms": 18.3204,
+    "max_ms": 19.3318,
+    "jitter_ms": 2.4552288552406996
+  },
+  "width": 2560,
+  "height": 1440,
+  "frame_bytes": null,
+  "success_ratio": 1.0,
+  "zero_copy_hit_ratio": null,
+  "access_unit_bytes": {
+    "mean": 6322.983333333334,
+    "p50": 1299.0,
+    "p95": 19503.0,
+    "p99": 126289.0,
+    "max": 137095.0
+  },
+  "written_bytes": {
+    "mean": 6322.983333333334,
+    "p50": 1299.0,
+    "p95": 19503.0,
+    "p99": 126289.0,
+    "max": 137095.0
+  },
+  "packets_per_sample": null,
+  "keyframe_ratio": 1.0,
+  "decoded_frame_bytes": null
+}

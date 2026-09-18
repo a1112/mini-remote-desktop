@@ -2,9 +2,15 @@
   "identifier": "default",
   "description": "Default capabilities for the main window",
   "remote": {
-    "urls": ["http://127.0.0.1:9531/*", "http://localhost:9531/*"]
+    "urls": [
+      "http://127.0.0.1:9531/*",
+      "http://localhost:9531/*"
+    ]
   },
-  "windows": ["main", "render-*"],
+  "windows": [
+    "main",
+    "render-*"
+  ],
   "permissions": [
     "core:window:allow-close",
     "core:window:allow-minimize",
@@ -19,6 +25,13 @@
     "core:window:allow-set-resizable",
     "core:window:allow-set-title",
     "core:window:allow-set-skip-taskbar",
-    "dialog:allow-message"
+    "dialog:allow-message",
+    "core:window:allow-is-decorated",
+    "core:window:allow-is-resizable",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-is-focused",
+    "core:window:allow-is-maximizable",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-start-resize-dragging"
   ]
 }

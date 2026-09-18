@@ -4584,7 +4584,7 @@ fn main() {
     let lan_e2e_autorun_pending_for_load = lan_e2e_autorun_pending.clone();
 
     // Build the app
-    tauri::Builder::default()
+    tauri::Builder::default().plugin(project_window_chrome::init())
         .manage(AppState {
             settings_path,
             service_manager,
@@ -4813,3 +4813,5 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+mod project_window_chrome;
