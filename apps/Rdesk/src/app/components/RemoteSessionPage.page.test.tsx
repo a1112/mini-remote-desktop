@@ -26,6 +26,7 @@ const mockCloseRemoteDisplayWindow = vi.hoisted(() => vi.fn());
 const mockGetSessionSnapshot = vi.hoisted(() => vi.fn());
 const mockGetProbeSnapshot = vi.hoisted(() => vi.fn());
 const mockStopSession = vi.hoisted(() => vi.fn());
+const mockMobileViewport = vi.hoisted(() => ({ value: false }));
 const mockGetDecodePolicy = vi.hoisted(() => vi.fn());
 const mockSetDecodePolicy = vi.hoisted(() => vi.fn());
 const mockFfmpegProbe = vi.hoisted(() => vi.fn());
@@ -52,6 +53,7 @@ vi.mock('./ThemeContext', () => ({
     setTheme: vi.fn(),
   }),
 }));
+vi.mock('./ui/use-mobile', () => ({ useIsMobile: () => mockMobileViewport.value }));
 
 // Mock Tauri window utils
 vi.mock('../utils/tauriWindow', () => ({
@@ -219,6 +221,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
     window.sessionStorage.clear();
     mockRouteState.id = 'test-device-1';
     mockRuntimeState.isTauri = true;
+    mockMobileViewport.value = false;
     mockListRemoteDisplayWindows.mockResolvedValue({ ok: true, value: [] });
     mockOpenRemoteDisplayWindow.mockResolvedValue({
       ok: true,
@@ -268,6 +271,23 @@ describe('RemoteSessionPage - Page Level Tests', () => {
   // ========================================================================
 
   describe('successful render', () => {
+    it('uses the phone session status view while approval is pending', async () => {
+      mockMobileViewport.value = true;
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+          observer.onSnapshot(remoteSnapshot('incoming_approval_required'));
+          return vi.fn();
+        },
+      );
+      render(<MemoryRouter initialEntries={['/session/test-device-1']}><RemoteSessionPage /></MemoryRouter>);
+      expect(await screen.findByRole('heading', { name: '远程会话' })).toBeInTheDocument();
+      expect(screen.getByText('等待目标设备确认')).toBeInTheDocument();
+      expect(screen.getByText('等待远程画面')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '鼠标' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: '结束' })).toBeEnabled();
+      await userEvent.setup().click(screen.getByRole('button', { name: '结束' }));
+      await waitFor(() => expect(mockStopSession).toHaveBeenCalledWith('test-device-1'));
+    });
     it('keeps acknowledged native sessions in an authenticating state until streaming', async () => {
       mockRuntimeState.isTauri = true;
       mockObserveRemoteSession.mockImplementation(

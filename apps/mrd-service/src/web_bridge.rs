@@ -157,7 +157,7 @@ pub async fn spawn_from_env(ipc_server: IpcServer) -> Result<Option<JoinHandle<R
 
     info!("mrd-service web bridge listening on {}", bind);
     Ok(Some(tokio::spawn(async move {
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
         Ok(())
     })))
 }
@@ -207,6 +207,7 @@ pub fn build_router(ipc_server: IpcServer, config: WebBridgeConfig) -> Router {
             resource_monitor: Arc::new(Mutex::new(ResourceMonitor::new())),
         })
         .layer(cors)
+        .merge(crate::mobile_gateway::router_from_env())
 }
 
 async fn index(State(state): State<WebBridgeState>) -> Html<String> {

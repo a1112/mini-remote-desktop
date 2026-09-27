@@ -28,6 +28,7 @@ Thumbs.db
 *.tmp
 *.temp
 *.png
+!apps/Rdesk/docs/design/rdesk-mobile-ui-concept-2026-09-26.png
 *.err
 *.o
 *.mp4

@@ -3,207 +3,58 @@ import { useNavigate } from "react-router";
 import {
   Monitor,
   Copy,
-  RefreshCw,
   ArrowRight,
   Clock,
-  Star,
-  Laptop,
-  Smartphone,
-  Server,
   ChevronRight,
-  Eye,
-  EyeOff,
-  Zap,
-  Globe,
-  Users,
   X,
   Check,
   Loader2,
-  ChevronDown,
   Pencil,
-  Clock as ClockIcon,
   AlertCircle,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
-import { useAccessPassword, REFRESH_OPTIONS } from "../services/accessPasswordService";
 import { useDeviceRegistration, deviceService } from "../services/deviceService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
-
-const recentConnections = [
-  {
-    id: "1",
-    name: "办公室电脑",
-    deviceId: "821 456 789",
-    os: "Windows 11",
-    icon: Monitor,
-    lastConnected: "刚刚",
-    status: "online",
-    location: "北京",
-    ping: 18,
-  },
-  {
-    id: "2",
-    name: "家用 MacBook",
-    deviceId: "334 902 115",
-    os: "macOS Sonoma",
-    icon: Laptop,
-    lastConnected: "2小时前",
-    status: "online",
-    location: "上海",
-    ping: 35,
-  },
-  {
-    id: "3",
-    name: "Linux 服务器",
-    deviceId: "567 234 891",
-    os: "Ubuntu 22.04",
-    icon: Server,
-    lastConnected: "昨天",
-    status: "offline",
-    location: "深圳",
-    ping: null,
-  },
-  {
-    id: "4",
-    name: "iPhone 15 Pro",
-    deviceId: "198 774 302",
-    os: "iOS 17",
-    icon: Smartphone,
-    lastConnected: "3天前",
-    status: "offline",
-    location: "广州",
-    ping: null,
-  },
-];
-
-const stats = [
-  { label: "本月连接", value: "47", icon: Zap, color: "text-blue-600", bg: "bg-blue-50", bgDark: "bg-blue-900/30" },
-  { label: "在线设备", value: "2", icon: Globe, color: "text-green-600", bg: "bg-green-50", bgDark: "bg-green-900/30" },
-  { label: "共享会话", value: "5", icon: Users, color: "text-purple-600", bg: "bg-purple-50", bgDark: "bg-purple-900/30" },
-];
+import { useDevices } from "./deviceData";
+import { useConnectionHistory } from "../services/connectionHistoryService";
 
 export function HomePage() {
   const { isDark } = useTheme();
   const navigate = useNavigate();
+  const { devices } = useDevices();
+  const history = useConnectionHistory();
+  const recentConnections = history
+    .filter((entry, index, entries) => entries.findIndex((item) => item.peerDeviceId === entry.peerDeviceId) === index)
+    .slice(0, 4)
+    .map((entry) => {
+      const device = devices.find((candidate) => candidate.deviceId === entry.peerDeviceId);
+      return {
+        id: device?.id ?? entry.peerDeviceId,
+        name: device?.name ?? entry.peerDeviceId,
+        deviceId: entry.peerDeviceId,
+        os: device?.os ?? "",
+        icon: device?.icon ?? Monitor,
+        status: device?.status,
+        lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
+      };
+    });
   const { deviceId: myDeviceId, deviceName: myDeviceName } = useDeviceRegistration();
-  const {
-    password: myPassword,
-    loading: passwordLoading,
-    refreshing: passwordRefreshing,
-    refreshMode,
-    refreshPassword,
-    updatePassword,
-    setRefreshMode,
-  } = useAccessPassword(myDeviceId);
-
   const [connectId, setConnectId] = useState("");
-  const [showMyPassword, setShowMyPassword] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [inviteCopied, setInviteCopied] = useState(false);
-  const [favorites] = useState(["1", "2"]);
   const [connectingDeviceId, setConnectingDeviceId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const connectionInFlightRef = useRef(false);
-
-  // 接入密码编辑状态
-  const [editingPassword, setEditingPassword] = useState(false);
-  const [editValue, setEditValue] = useState("");
-  const [passwordSaved, setPasswordSaved] = useState(false);
 
   // 设备名称编辑状态
   const [editingDeviceName, setEditingDeviceName] = useState(false);
   const [deviceNameEdit, setDeviceNameEdit] = useState("");
   const deviceInputRef = useRef<HTMLInputElement>(null);
 
-  // 刷新菜单状态
-  const [showRefreshMenu, setShowRefreshMenu] = useState(false);
-  const refreshMenuRef = useRef<HTMLDivElement>(null);
-
-  const inputRef = useRef<HTMLInputElement>(null);
-
   const handleCopy = () => {
-    const id = myDeviceId || "456 123 789";
-    navigator.clipboard.writeText(id.replace(/\s/g, ""));
+    if (!myDeviceId) return;
+    navigator.clipboard.writeText(myDeviceId.replace(/\s/g, ""));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
-
-  // 生成临时邀请码（类似ToDesk格式：8位字符，含下划线）
-  const generateInviteCode = (): string => {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    const parts = [
-      Array(8).fill(0).map(() => chars[Math.floor(Math.random() * chars.length)]).join(""),
-      Array(8).fill(0).map(() => chars[Math.floor(Math.random() * chars.length)]).join(""),
-    ];
-    return parts.join("_");
-  };
-
-  // 复制邀请信息
-  const handleCopyInvite = () => {
-    const inviteCode = generateInviteCode();
-    const inviteText = `${myDeviceName || "我的设备"}邀请您进行远程控制
-ToDesk设备代码:${myId.replace(/\s/g, "")}
-临时密码:${myPassword || ""}
-点击链接直接进行远程控制：
-https://wechat.todesk.com/invite-page?id=${inviteCode}`;
-
-    navigator.clipboard.writeText(inviteText);
-    setInviteCopied(true);
-    setTimeout(() => setInviteCopied(false), 2000);
-  };
-
-  // 开始编辑密码
-  const handleStartEdit = () => {
-    setEditingPassword(true);
-    setEditValue(myPassword || "");
-    setPasswordSaved(false);
-    setShowRefreshMenu(false);
-    setTimeout(() => inputRef.current?.focus(), 0);
-  };
-
-  // 确认编辑
-  const handleConfirmEdit = () => {
-    if (editValue.trim()) {
-      updatePassword(editValue.trim());
-      setEditingPassword(false);
-      setPasswordSaved(true);
-      setTimeout(() => setPasswordSaved(false), 2000);
-    }
-  };
-
-  // 取消编辑
-  const handleCancelEdit = () => {
-    setEditingPassword(false);
-    setEditValue("");
-  };
-
-  // 键盘事件处理
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      handleConfirmEdit();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      handleCancelEdit();
-    }
-  };
-
-  // 刷新密码
-  const handleRefreshPassword = async () => {
-    setShowRefreshMenu(false);
-    try {
-      await refreshPassword();
-      setPasswordSaved(true);
-      setTimeout(() => setPasswordSaved(false), 2000);
-    } catch (err) {
-      console.error("刷新密码失败:", err);
-    }
-  };
-
-  // 设置刷新模式
-  const handleSetRefreshMode = (mode: typeof REFRESH_OPTIONS[number]["key"]) => {
-    setRefreshMode(mode);
-    setShowRefreshMenu(false);
   };
 
   // 开始编辑设备名称
@@ -244,7 +95,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
 
   // 格式化设备 ID（每3位一组）
   const formatDeviceId = (id: string | null) => {
-    if (!id) return "456 123 789";
+    if (!id) return "设备 ID 未就绪";
     const cleaned = id.replace(/\s/g, "");
     if (cleaned.length === 9) {
       return `${cleaned.slice(0, 3)} ${cleaned.slice(3, 6)} ${cleaned.slice(6)}`;
@@ -254,30 +105,13 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
 
   const myId = formatDeviceId(myDeviceId);
 
-  // 自动聚焦输入框
+  // 自动聚焦设备名称输入框
   useEffect(() => {
-    if (editingPassword) {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
     if (editingDeviceName) {
       deviceInputRef.current?.focus();
       deviceInputRef.current?.select();
     }
-  }, [editingPassword, editingDeviceName]);
-
-  // 点击外部关闭刷新菜单
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (refreshMenuRef.current && !refreshMenuRef.current.contains(e.target as Node)) {
-        setShowRefreshMenu(false);
-      }
-    };
-    if (showRefreshMenu) {
-      document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
-    }
-  }, [showRefreshMenu]);
+  }, [editingDeviceName]);
 
   const launchSecureRemote = async (target: {
     id: string;
@@ -310,9 +144,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
 
   const handleConnect = () => {
     if (!connectId.trim()) return;
-    const found = recentConnections.find(
-      (d) => d.deviceId.replace(/\s/g, "") === connectId.replace(/\s/g, "")
-    );
+    const found = devices.find((device) => device.deviceId.replace(/\s/g, "") === connectId.replace(/\s/g, ""));
     if (found) {
       void launchSecureRemote(found);
     } else {
@@ -407,6 +239,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
               </div>
               <button
                 onClick={handleCopy}
+                disabled={!myDeviceId}
                 className={`p-1 rounded transition-colors ${copied
                     ? "text-green-600"
                     : isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"
@@ -417,119 +250,6 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
               </button>
             </div>
 
-            {/* Password */}
-            <div className={`p-3 rounded-lg border ${isDark ? "bg-[#2a2a2a] border-gray-600" : "bg-gray-50 border-gray-100"}`}>
-              <div className="flex items-center justify-between">
-                <span className={textTertiary} style={{ fontSize: 12 }}>接入密码</span>
-                <div className="flex items-center gap-1">
-                  {editingPassword ? (
-                    <>
-                      <button
-                        onClick={handleConfirmEdit}
-                        disabled={!editValue.trim()}
-                        className={`px-2 py-1 rounded text-xs font-medium transition-colors ${
-                          !editValue.trim()
-                            ? isDark
-                              ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-                              : "bg-gray-100 text-gray-400 cursor-not-allowed"
-                            : isDark
-                              ? "bg-blue-600 text-white hover:bg-blue-500"
-                              : "bg-blue-600 text-white hover:bg-blue-500"
-                        }`}
-                      >
-                        确认
-                      </button>
-                      <button
-                        onClick={handleCancelEdit}
-                        className={`px-2 py-1 rounded text-xs font-medium transition-colors border ${
-                          isDark
-                            ? "border-gray-600 text-gray-400 hover:bg-gray-700"
-                            : "border-gray-200 text-gray-500 hover:bg-gray-50"
-                        }`}
-                      >
-                        取消
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      {/* 复制邀请信息按钮 */}
-                      <button
-                        onClick={handleCopyInvite}
-                        className={`transition-colors ${inviteCopied
-                            ? "text-green-600"
-                            : isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"
-                        }`}
-                        title={inviteCopied ? "已复制邀请信息" : "复制邀请信息"}
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                      </button>
-
-                      {/* 编辑密码按钮 */}
-                      <button
-                        onClick={handleStartEdit}
-                        className={`transition-colors ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"}`}
-                        title="编辑密码"
-                      >
-                        <Pencil className="w-3.5 h-3.5" />
-                      </button>
-
-                      {/* 立即刷新按钮 */}
-                      <button
-                        onClick={handleRefreshPassword}
-                        disabled={passwordRefreshing}
-                        className={`transition-colors ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"}`}
-                        title="立即刷新"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${passwordRefreshing ? "animate-spin" : ""}`} />
-                      </button>
-
-                      {/* 显示/隐藏按钮 */}
-                      <button
-                        onClick={() => setShowMyPassword(!showMyPassword)}
-                        className={`transition-colors ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"}`}
-                      >
-                        {showMyPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      </button>
-
-                      {passwordSaved && (
-                        <span className="text-green-600 flex items-center gap-1" style={{ fontSize: 11 }}>
-                          <Check className="w-3 h-3" />
-                        </span>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {editingPassword ? (
-                <div className="mt-2">
-                  <input
-                    ref={inputRef}
-                    type="text"
-                    value={editValue}
-                    onChange={(e) => setEditValue(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    placeholder="输入接入密码"
-                    className={`w-full px-2 py-1.5 rounded-md border font-mono outline-none transition-colors ${
-                      isDark
-                        ? "bg-[#1a1a1a] border-blue-500 text-gray-200 placeholder-gray-500 focus:ring-1 focus:ring-blue-500"
-                        : "bg-white border-blue-400 text-gray-900 placeholder-gray-400 focus:ring-1 focus:ring-blue-400"
-                    }`}
-                    style={{ fontSize: 14 }}
-                  />
-                </div>
-              ) : (
-                <div className={`font-mono mt-2 text-center ${textBody}`} style={{ fontSize: 15 }}>
-                  {passwordLoading || passwordRefreshing ? (
-                    <span className={textTertiary}>加载中...</span>
-                  ) : showMyPassword ? (
-                    myPassword || "••••••••"
-                  ) : (
-                    "••••••••"
-                  )}
-                </div>
-              )}
-            </div>
           </div>
 
           {/* Connect card */}
@@ -545,7 +265,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                   type="text"
                   value={connectId}
                   onChange={(e) => setConnectId(e.target.value)}
-                  placeholder="例如：821 456 789"
+                  placeholder="输入远程设备 ID"
                   onKeyDown={(e) => e.key === "Enter" && handleConnect()}
                   className={`w-full px-3 py-2.5 rounded-lg border outline-none transition-all ${inputBg}`}
                   style={{ fontSize: 14 }}
@@ -598,7 +318,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
           <div className={`p-5 rounded-xl border h-full ${card}`}>
             <div className="flex items-center justify-between mb-4">
               <h3 className={textPrimary} style={{ fontSize: 15 }}>最近连接</h3>
-              <button className="flex items-center gap-1 text-blue-600 hover:text-blue-500 transition-colors" style={{ fontSize: 13 }}>
+              <button onClick={() => navigate("/connections")} className="flex items-center gap-1 text-blue-600 hover:text-blue-500 transition-colors" style={{ fontSize: 13 }}>
                 查看全部 <ChevronRight className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -606,7 +326,6 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
             <div className="space-y-2">
               {recentConnections.map((device) => {
                 const Icon = device.icon;
-                const isFav = favorites.includes(device.id);
                 return (
                   <div
                     key={device.id}
@@ -615,9 +334,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                         ? "bg-[#2a2a2a]/60 hover:bg-[#333] hover:border-gray-600"
                         : "bg-gray-50/60 hover:bg-gray-100 hover:border-gray-200"
                     }`}
-                    onClick={() =>
-                      device.status === "online" && void launchSecureRemote(device)
-                    }
+                    onClick={() => void launchSecureRemote(device)}
                   >
                     <div className={`relative w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
                       device.status === "online"
@@ -625,9 +342,9 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                         : isDark ? "bg-gray-800" : "bg-gray-100"
                     }`}>
                       <Icon className={`w-4.5 h-4.5 ${device.status === "online" ? "text-blue-600" : "text-gray-400"}`} style={{ width: 18, height: 18 }} />
-                      <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 ${
+                      {device.status && <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 ${
                         isDark ? "border-[#232323]" : "border-white"
-                      } ${device.status === "online" ? "bg-green-500" : "bg-gray-300"}`} />
+                      } ${device.status === "online" ? "bg-green-500" : "bg-gray-300"}`} />}
                     </div>
 
                     <div className="flex-1 min-w-0">
@@ -635,28 +352,16 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                         <span className={`font-medium truncate ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 14 }}>
                           {device.name}
                         </span>
-                        {isFav && <Star className="w-3 h-3 text-yellow-500 shrink-0 fill-yellow-500" />}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
                         <span className={`font-mono ${textTertiary}`} style={{ fontSize: 11 }}>{device.deviceId}</span>
-                        <span className={isDark ? "text-gray-600" : "text-gray-300"} style={{ fontSize: 11 }}>·</span>
-                        <span className={textTertiary} style={{ fontSize: 11 }}>{device.os}</span>
+                        {device.os && <span className={textTertiary} style={{ fontSize: 11 }}>· {device.os}</span>}
                       </div>
                     </div>
 
                     <div className="flex items-center gap-3 text-right">
-                      {device.ping !== null ? (
-                        <div className={`flex items-center gap-1 ${
-                          device.ping < 30 ? "text-green-600" : device.ping < 60 ? "text-yellow-600" : "text-red-500"
-                        }`} style={{ fontSize: 12 }}>
-                          <div className="w-1.5 h-1.5 rounded-full bg-current" />
-                          <span>{device.ping}ms</span>
-                        </div>
-                      ) : (
-                        <span className={textTertiary} style={{ fontSize: 12 }}>{device.lastConnected}</span>
-                      )}
-
-                      {device.status === "online" ? (
+                      <span className={textTertiary} style={{ fontSize: 12 }}>{device.lastConnected}</span>
+                      {(
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
@@ -671,13 +376,12 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
                           连接
                           <ArrowRight className="w-3 h-3" />
                         </button>
-                      ) : (
-                        <div className="w-16 opacity-0" />
                       )}
                     </div>
                   </div>
                 );
               })}
+              {recentConnections.length === 0 && <div className={`py-16 text-center text-sm ${textSecondary}`}>暂无真实连接记录</div>}
             </div>
 
             {/* Quick tips */}
@@ -688,7 +392,7 @@ https://wechat.todesk.com/invite-page?id=${inviteCode}`;
               <div>
                 <div className={isDark ? "text-blue-400" : "text-blue-700"} style={{ fontSize: 13 }}>提示</div>
                 <div className={`mt-0.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  点击在线设备可快速发起远程连接会话，离线设备将在上线后发送通知。
+                  连接记录仅在远程会话实际开始后显示。点击设备可以再次发起连接。
                 </div>
               </div>
             </div>

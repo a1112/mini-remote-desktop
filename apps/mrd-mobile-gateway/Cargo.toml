@@ -1,0 +1,17 @@
+[package]
+name = "mrd-mobile-gateway-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mrd-mobile-gateway"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+mrd-mobile-gateway = { path = "../../crates/mrd-mobile-gateway" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

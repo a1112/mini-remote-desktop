@@ -17,19 +17,6 @@ vi.mock("./ThemeContext", () => ({
   useTheme: () => ({ isDark: false }),
 }));
 
-vi.mock("../services/accessPasswordService", () => ({
-  REFRESH_OPTIONS: [],
-  useAccessPassword: () => ({
-    password: "TEST_ONLY_PASSWORD",
-    loading: false,
-    refreshing: false,
-    refreshMode: "manual",
-    refreshPassword: vi.fn(),
-    updatePassword: vi.fn(),
-    setRefreshMode: vi.fn(),
-  }),
-}));
-
 vi.mock("../services/deviceService", () => ({
   deviceService: { renameDevice: vi.fn() },
   useDeviceRegistration: () => ({
@@ -40,6 +27,23 @@ vi.mock("../services/deviceService", () => ({
 
 vi.mock("../services/remoteDisplayLauncher", () => ({
   launchRemoteDisplayForDevice: mocks.launchRemoteDisplayForDevice,
+}));
+
+vi.mock("./deviceData", () => ({
+  useDevices: () => ({
+    devices: [{
+      id: "device-1", name: "办公室电脑", deviceId: "821456789",
+      os: "Windows 11", icon: () => null, status: "online", isLocal: false,
+    }],
+    loading: false,
+  }),
+}));
+
+vi.mock("../services/connectionHistoryService", () => ({
+  useConnectionHistory: () => [{
+    sessionId: "previous-session", peerDeviceId: "821456789",
+    role: "controller", startedAt: 1_000, endedAt: 2_000,
+  }],
 }));
 
 describe("HomePage secure remote launch", () => {
@@ -81,7 +85,7 @@ describe("HomePage secure remote launch", () => {
     render(<HomePage />);
 
     await user.type(
-      screen.getByPlaceholderText("例如：821 456 789"),
+      screen.getByPlaceholderText("输入远程设备 ID"),
       "900 123 456",
     );
     await user.click(screen.getByRole("button", { name: "立即连接" }));

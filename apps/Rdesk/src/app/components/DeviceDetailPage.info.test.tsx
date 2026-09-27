@@ -240,6 +240,7 @@ describe("DeviceDetailPage info tab", () => {
   });
 
   it("renders service directory entries in the file transfer tab", async () => {
+    deviceDataMock.devices = [device({ isLocal: true })];
     render(
       <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
         <Routes>
@@ -255,9 +256,9 @@ describe("DeviceDetailPage info tab", () => {
     expect(tauriAdapterMock.ipcListDirectory).toHaveBeenCalledWith(null);
   });
 
-  it("starts a service-owned file transfer when a file is dropped onto another device pane", async () => {
+  it("does not invent a destination path when dropping a file onto a remote pane", async () => {
     deviceDataMock.devices = [
-      device(),
+      device({ isLocal: true }),
       device({
         id: "peer-device",
         deviceId: "peer-device",
@@ -283,9 +284,8 @@ describe("DeviceDetailPage info tab", () => {
     await user.click(screen.getAllByRole("button", { name: "添加设备" })[0]!);
     await user.click(screen.getByRole("button", { name: /Peer PC/ }));
 
-    await waitFor(() => {
-      expect(screen.getAllByText("service-report.txt").length).toBeGreaterThan(1);
-    });
+    expect(screen.getAllByText("service-report.txt")).toHaveLength(1);
+    expect(screen.getByText(/远程目录浏览尚未接入服务/)).toBeInTheDocument();
 
     const dragStore: Record<string, string> = {};
     const dataTransfer = {
@@ -300,23 +300,18 @@ describe("DeviceDetailPage info tab", () => {
     fireEvent.dragStart(screen.getAllByText("service-report.txt")[0]!, { dataTransfer });
     fireEvent.drop(screen.getAllByText("Peer PC")[0]!, { dataTransfer });
 
-    await waitFor(() => {
-      expect(tauriAdapterMock.ipcStartFileTransfer).toHaveBeenCalledWith({
-        source_device_id: "agent-device",
-        target_device_id: "peer-device",
-        entries: [
-          {
-            source_path: "C:\\Users\\tester\\service-report.txt",
-            file_name: "service-report.txt",
-            kind: "file",
-          },
-        ],
-        target_path: "C:\\Users\\tester",
-        conflict_policy: "rename",
-        transport_hint: "local",
-        provider_hint: "mrd-local",
-      });
-    });
+    expect(tauriAdapterMock.ipcStartFileTransfer).not.toHaveBeenCalled();
+  });
+
+  it("does not display local service files as a remote directory", async () => {
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes><Route path="/devices/:id" element={<DeviceDetailPage />} /></Routes>
+      </MemoryRouter>
+    );
+    await waitFor(() => expect(screen.getByText(/远程目录浏览尚未接入服务/)).toBeInTheDocument());
+    expect(screen.queryByText("service-report.txt")).not.toBeInTheDocument();
+    expect(tauriAdapterMock.ipcListDirectory).not.toHaveBeenCalled();
   });
 
   it("shows local and reserved file transfer providers in the file transfer tab", async () => {

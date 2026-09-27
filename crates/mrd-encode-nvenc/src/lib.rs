@@ -464,6 +464,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
             // Maximum speed optimizations:
             preset.preset_cfg.profile_guid = NV_ENC_H264_PROFILE_BASELINE_GUID;
+            preset.preset_cfg.set_h264_zero_reorder_delay();
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
             preset.preset_cfg.frame_interval_p = 1;

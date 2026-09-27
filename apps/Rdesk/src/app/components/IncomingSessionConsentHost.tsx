@@ -12,6 +12,7 @@ import type {
 } from "../adapters/tauri/types";
 import { IncomingSessionDialog } from "./IncomingSessionDialog";
 import { getTauriWindowLabel } from "../utils/tauriWindow";
+import { recordConnectionClosed, recordConnectionSnapshot } from "../services/connectionHistoryService";
 
 const EVENT_PAGE_SIZE = 64;
 const EVENT_WAIT_TIMEOUT_MS = 15_000;
@@ -99,6 +100,17 @@ export function IncomingSessionConsentHost() {
       for (const envelope of page.events) {
         if (stopped) {
           continue;
+        }
+        if (envelope.event.kind === "media_changed" && envelope.event.state === "streaming") {
+          try {
+            const current = await ipcGetRemoteSession(envelope.session_id);
+            if (!stopped && current.ok) recordConnectionSnapshot(current.value, envelope.timestamp_ms);
+          } catch {
+            // A failed history lookup must not block consent handling.
+          }
+        }
+        if (envelope.event.kind === "session_closed") {
+          recordConnectionClosed(envelope.session_id, envelope.timestamp_ms);
         }
         if (
           envelope.event.kind === "consent_resolved" ||

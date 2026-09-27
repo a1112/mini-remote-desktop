@@ -43,6 +43,7 @@ vi.mock("../routes", async () => {
 
 import App from "../App";
 import { IncomingSessionConsentHost } from "./IncomingSessionConsentHost";
+import { getConnectionHistory } from "../services/connectionHistoryService";
 
 function makeSession(
   overrides: Partial<RemoteSessionSnapshot> = {},
@@ -102,6 +103,7 @@ function deferred<T>() {
 
 describe("IncomingSessionConsentHost", () => {
   beforeEach(() => {
+    localStorage.clear();
     adapter.getRemoteSession.mockReset();
     adapter.respondToConsent.mockReset();
     adapter.showWindow.mockReset();
@@ -109,6 +111,34 @@ describe("IncomingSessionConsentHost", () => {
     windowApi.getLabel.mockReset();
     windowApi.getLabel.mockResolvedValue("main");
     adapter.showWindow.mockResolvedValue({ ok: true, value: undefined });
+  });
+
+  it("records an incoming connection only after the service reports streaming", async () => {
+    adapter.subscribeSessionEvents.mockResolvedValueOnce({
+      ok: true,
+      value: subscription({
+        events: [{
+          sequence: "1",
+          timestamp_ms: 10_000,
+          session_id: "session-1",
+          event: { kind: "media_changed", state: "streaming" },
+        }],
+      }),
+    });
+    adapter.getRemoteSession.mockResolvedValueOnce({
+      ok: true,
+      value: makeSession({
+        authorization_state: "granted",
+        media_state: "streaming",
+        presentation_state: "streaming",
+      }),
+    });
+
+    render(<IncomingSessionConsentHost />);
+    await waitFor(() => expect(getConnectionHistory()).toMatchObject([{
+      sessionId: "session-1", peerDeviceId: "device-living-room",
+      role: "agent", startedAt: 10_000,
+    }]));
   });
 
   afterEach(() => {

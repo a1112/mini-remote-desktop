@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rdesk · 本机视频验证</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui;background:#0b1326;color:#e7edff}body{margin:20px}
+h1{font-size:24px}button{padding:10px 18px;border:0;border-radius:8px;background:#456eee;color:white;cursor:pointer}
+#pattern{width:100%;height:130px}#screen{max-width:100%;max-height:52vh;background:#000}
+section{padding:14px;background:#15213a;border-radius:10px;margin:12px 0}
+#metrics{font:14px monospace;white-space:pre-wrap}#status{color:#8be4b3}small{color:#aebbd3}
+</style>
+<h1>本机实时视频验证</h1>
+<p>DXGI → NVENC H.264 → WebSocket → WebCodecs → 屏幕绘制</p>
+<button id="start">开始 30 秒测试</button> <button id="stop">断开</button>
+<span id="status">待连接</span>
+<p id="summary">分别测量接收、解码和实际绘制帧率</p>
+<section><small>动态测试图案（需要此窗口显示在被采集的主屏上）</small><canvas id="pattern" width="1200" height="130"></canvas></section>
+<section><canvas id="screen"></canvas></section>
+<section id="metrics">等待测试</section>
+<small>帧率按实际收到、解码输出、requestAnimationFrame 绘制分别计数。延迟仅适用于本机同一时钟；
+“画面变化次数”来自缩小后的帧像素，用于发现重复静态画面。此页不会向电脑发送鼠标或键盘事件。</small>
+<script>
+(() => {
+  const $ = id => document.getElementById(id), screen = $('screen');
+  const context = screen.getContext('2d', {alpha:false});
+  const sample = document.createElement('canvas'); sample.width=24;sample.height=16;
+  const pixels = sample.getContext('2d',{willReadFrequently:true});
+  let ws, decoder, pending, generation=0, needKey=true, lastSequence=0;
+  let stats, began=0, until=0, lastHash=null, codec='', configs=new Map();
+  let sourceFrames=0, result=null;
+  const pattern=$('pattern'), pg=pattern.getContext('2d',{alpha:false});
+  const empty = () => ({received:0,decoded:0,drawn:0,changed:0,discarded:0,errors:0,gaps:0,bytes:0,latency:[],decodeTime:[],intervals:[],lastDraw:0,maxQueue:0});
+  function stop() {
+    generation++; ws?.close();ws=null;
+    if(decoder && decoder.state!=='closed') decoder.close();decoder=null;
+    pending?.close();pending=null;configs.clear();
+  }
+  function report(final=false) {
+    if(!stats || !began)return;
+    const seconds=(Math.min(performance.now(),until)-began)/1000;
+    const percentiles=values => {
+      if(!values.length)return null; const a=[...values].sort((a,b)=>a-b);
+      return {p50:+a[Math.floor(a.length*.5)].toFixed(2),p95:+a[Math.min(a.length-1,Math.floor(a.length*.95))].toFixed(2)};
+    };
+    result={complete:final,seconds:+seconds.toFixed(2),resolution:[screen.width,screen.height],codec,
+      receive_fps:+(stats.received/seconds).toFixed(2),decode_fps:+(stats.decoded/seconds).toFixed(2),
+      draw_fps:+(stats.drawn/seconds).toFixed(2),visual_changes_per_second:+(stats.changed/seconds).toFixed(2),
+      bitrate_mbps:+(stats.bytes*8/seconds/1e6).toFixed(2),dropped_draws:stats.discarded,
+      decode_errors:stats.errors,sequence_gaps:stats.gaps,max_decode_queue:stats.maxQueue,
+      capture_to_draw_ms:percentiles(stats.latency),decode_ms:percentiles(stats.decodeTime),
+      draw_interval_ms:percentiles(stats.intervals)};
+    $('metrics').textContent=JSON.stringify(result,null,2);
+    $('summary').textContent='实际绘制 '+result.draw_fps+' FPS · 画面变化 '+result.visual_changes_per_second+
+      ' 次/秒 · 本机采集到绘制 P95 '+(result.capture_to_draw_ms?.p95??'—')+' ms · 解码错误 '+result.decode_errors;
+    if(final) {$('status').textContent='测试结束'; stop();}
+  }
+  const requestKey = () => { needKey=true;if(ws?.readyState===1)ws.send('{"type":"request_keyframe"}'); };
+  function spsCodec(data) {
+    for(let i=0;i+7<data.length;i++) {
+      if(data[i]===0 && data[i+1]===0) {
+        const start=data[i+2]===1?i+3:(data[i+2]===0&&data[i+3]===1?i+4:-1);
+        if(start>=0&&(data[start]&31)===7)return 'avc1.'+[...data.slice(start+1,start+4)].map(x=>x.toString(16).padStart(2,'0')).join('');
+      }
+    }
+    return null;
+  }
+  $('start').onclick=async () => {
+    stop();stats=empty();began=0;result=null;until=Infinity;needKey=true;lastSequence=0;lastHash=null;sourceFrames=0;codec='';
+    $('metrics').textContent='等待视频帧';$('summary').textContent='测试准备中';
+    const own=++generation;
+    if(!('VideoDecoder' in window)) {$('status').textContent='此浏览器不支持 WebCodecs，请使用本机 Chrome/Edge';return;}
+    $('status').textContent='正在连接';
+    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/mobile/desktop/video/ws');ws.binaryType='arraybuffer';
+    ws.onmessage=event=>{
+      if(own!==generation)return;
+      if(typeof event.data==='string'){
+        const m=JSON.parse(event.data);
+        if(m.type==='error'){$('status').textContent=m.message;stop();}
+        return;
+      }
+      try{
+        const a=new Uint8Array(event.data),view=new DataView(event.data);
+        if(a.length<12 || new TextDecoder().decode(a.slice(0,8))!=='MRDWC01\0')throw Error('无效视频包');
+        const n=view.getUint32(8,true);
+        if(n>8192 || 12+n>=a.length)throw Error('无效视频包长度');
+        const h=JSON.parse(new TextDecoder().decode(a.slice(12,12+n))),data=a.slice(12+n);
+        if(!began){began=performance.now();until=began+30000;}
+        stats.received++;stats.bytes+=a.length;
+        if(lastSequence&&h.sequence!==lastSequence+1){stats.gaps+=Math.max(0,h.sequence-lastSequence-1);requestKey();}
+        lastSequence=h.sequence;
+        if(needKey&&!h.keyframe)return;
+        if(!decoder){
+          codec=spsCodec(data)||h.codec;
+          screen.width=h.width;screen.height=h.height;
+          decoder=new VideoDecoder({
+            output:frame=>{
+              if(own!==generation){frame.close();return;}
+              stats.decoded++;
+              const meta=configs.get(frame.timestamp);configs.delete(frame.timestamp);
+              if(meta)stats.decodeTime.push(performance.now()-meta.received);
+              if(pending){pending.close();stats.discarded++;}
+              pending=frame;
+            },
+            error:error=>{stats.errors++;$('status').textContent='解码失败: '+error.message;stop();}
+          });
+          decoder.configure({codec,codedWidth:h.width,codedHeight:h.height,hardwareAcceleration:'prefer-hardware',optimizeForLatency:true});
+        }
+        if(decoder.decodeQueueSize>2){decoder.reset();decoder.configure({codec,codedWidth:h.width,codedHeight:h.height,hardwareAcceleration:'prefer-hardware',optimizeForLatency:true});configs.clear();requestKey();if(!h.keyframe)return;}
+        needKey=false;configs.set(h.timestamp_us,{received:performance.now()});
+        decoder.decode(new EncodedVideoChunk({type:h.keyframe?'key':'delta',timestamp:h.timestamp_us,data}));
+        stats.maxQueue=Math.max(stats.maxQueue,decoder.decodeQueueSize);
+        $('status').textContent='测试中';
+      }catch(error){stats.errors++;$('status').textContent=error.message;stop();}
+    };
+    ws.onerror=()=>{if(own===generation)$('status').textContent='连接失败';};
+    ws.onclose=()=>{if(own===generation){report(true);$('status').textContent='连接已断开';}};
+  };
+  $('stop').onclick=()=>{report(true);stop();$('status').textContent='已断开';};
+  function draw(now){
+    sourceFrames++;
+    pg.fillStyle='#132240';pg.fillRect(0,0,1200,130);
+    for(let x=0;x<1200;x+=30){pg.fillStyle='hsl('+((sourceFrames*4+x)%360)+' 90% 55%)';pg.fillRect(x,10+(x/30%3)*6,24,75);}
+    pg.fillStyle='white';pg.font='20px monospace';pg.fillText('SOURCE '+sourceFrames+'  '+new Date().toISOString(),12,118);
+    if(pending){
+      const frame=pending;pending=null;
+      context.drawImage(frame,0,0);
+      stats.drawn++;stats.latency.push(Date.now()-frame.timestamp/1000);
+      if(stats.lastDraw)stats.intervals.push(now-stats.lastDraw);stats.lastDraw=now;
+      pixels.drawImage(frame,0,0,24,16);const a=pixels.getImageData(0,0,24,16).data;
+      let hash=2166136261;for(let i=0;i<a.length;i+=4){hash=Math.imul(hash^a[i],16777619);hash=Math.imul(hash^a[i+1],16777619);}
+      if(hash!==lastHash){stats.changed++;lastHash=hash;}
+      frame.close();
+    }
+    if(began && now>=until && ws)report(true);
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+  setInterval(()=>{if(ws&&began)report(false);},1000);
+  if(new URLSearchParams(location.search).has('autostart'))$('start').click();
+})();
+</script>
+</html>

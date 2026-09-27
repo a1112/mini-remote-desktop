@@ -16,6 +16,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import { useAuth } from "./AuthContext";
 import { IpcSessionCard } from "./IpcSessionCard";
 import {
   ffmpegDownload,
@@ -114,6 +115,7 @@ interface SettingsModalProps {
 
 export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [active, setActive] = useState("general");
+  const { user, isLoggedIn } = useAuth();
   const { theme: globalTheme, setTheme: setGlobalTheme, isDark } = useTheme();
   const [visible, setVisible] = useState(false);
 
@@ -135,7 +137,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const [requirePassword, setRequirePassword] = useState(true);
   const [lockOnIdle, setLockOnIdle] = useState(true);
   const [idleTimeout, setIdleTimeout] = useState("5 分钟");
-  const [encryptionLevel, setEncryptionLevel] = useState("TLS 1.3");
 
   // Network
   const [proxy, setProxy] = useState(false);
@@ -426,28 +427,6 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     />
                   </SettingRow>
                 )}
-                <SettingRow label="加密协议" description="数据传输加密方式">
-                  <ModalSelect
-                    value={encryptionLevel}
-                    options={["TLS 1.3", "TLS 1.2", "AES-256"]}
-                    onChange={setEncryptionLevel}
-                  />
-                </SettingRow>
-                <div
-                  className={`p-3.5 rounded-xl border mt-2 ${
-                    isDark ? "bg-green-900/20 border-green-800" : "bg-green-50 border-green-200"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-1">
-                    <Shield className="w-3.5 h-3.5 text-green-600" />
-                    <span className={`font-medium ${isDark ? "text-green-400" : "text-green-700"}`} style={{ fontSize: 13 }}>
-                      安全状态良好
-                    </span>
-                  </div>
-                  <p className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 11 }}>
-                    当前使用 TLS 1.3 端对端加密，所有传输数据均受到保护。
-                  </p>
-                </div>
               </SettingsSection>
             )}
 
@@ -760,19 +739,9 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                   </div>
                   <div>
                     <div className={`font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 15 }}>
-                      当前用户
+                      {isLoggedIn ? user?.username || "当前用户" : "未登录"}
                     </div>
-                    <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 12 }}>
-                      user@example.com
-                    </div>
-                    <div
-                      className={`inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-full ${
-                        isDark ? "bg-blue-900/30 text-blue-400" : "bg-blue-50 text-blue-600"
-                      }`}
-                      style={{ fontSize: 10 }}
-                    >
-                      免费版
-                    </div>
+                    {user?.id && <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 12 }}>{user.id}</div>}
                   </div>
                 </div>
 

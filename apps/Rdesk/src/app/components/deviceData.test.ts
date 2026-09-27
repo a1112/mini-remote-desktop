@@ -113,6 +113,7 @@ describe("mergeDevices", () => {
     expect(lanDevice).toMatchObject({
       deviceId: "peer-device",
       status: "offline",
+      ping: null,
       macAddress: "AA:BB:CC:DD:EE:FF",
     });
   });

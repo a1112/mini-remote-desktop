@@ -2629,6 +2629,8 @@ dependencies = [
  "moxcms",
  "num-traits",
  "png 0.18.1",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3433,6 +3435,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "mrd-mobile-gateway"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "image",
+ "mrd-capture-dxgi",
+ "mrd-encode-nvenc",
+ "mrd-input",
+ "mrd-pipeline-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "mrd-mobile-gateway-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "mrd-mobile-gateway",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "mrd-observability"
 version = "0.1.0"
 dependencies = [
@@ -3599,6 +3631,7 @@ dependencies = [
  "mrd-identity",
  "mrd-input",
  "mrd-ipc",
+ "mrd-mobile-gateway",
  "mrd-pipeline-core",
  "mrd-proto",
  "mrd-relay-control",
@@ -8788,6 +8821,21 @@ checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
 dependencies = [
  "cc",
  "pkg-config",
+]
+
+[[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+
+[[package]]
+name = "zune-jpeg"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+dependencies = [
+ "zune-core",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 import { createBrowserRouter } from "react-router";
 import { Layout } from "./components/Layout";
 import { HomePage } from "./components/HomePage";
+import { ConnectionsPage } from "./components/ConnectionsPage";
 import { DevicesPage } from "./components/DevicesPage";
 import { DeviceDetailPage } from "./components/DeviceDetailPage";
 import { RemoteSessionPage } from "./components/RemoteSessionPage";
@@ -38,6 +39,7 @@ export const router = createBrowserRouter([
     Component: Layout,
     children: [
       { index: true, Component: HomePage },
+      { path: "connections", Component: ConnectionsPage },
       { path: "devices", Component: DevicesPage },
       { path: "devices/:id", Component: DeviceDetailPage },
       // Legacy test page (kept for backward compatibility)

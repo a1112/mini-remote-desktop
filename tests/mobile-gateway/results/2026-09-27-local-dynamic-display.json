@@ -1,0 +1,19 @@
+{
+  "scenario": "Primary-screen moving-source.ps1 → DXGI → NVENC → localhost WebSocket → WebCodecs → canvas, RTX 5060 Ti",
+  "complete": true,
+  "seconds": 30,
+  "resolution": [2560, 1440],
+  "codec": "avc1.42c033",
+  "receive_fps": 60.03,
+  "decode_fps": 60.03,
+  "draw_fps": 59.83,
+  "visual_changes_per_second": 59.83,
+  "bitrate_mbps": 15.46,
+  "dropped_draws": 6,
+  "decode_errors": 0,
+  "sequence_gaps": 0,
+  "max_decode_queue": 1,
+  "capture_to_draw_ms": {"p50": 25.08, "p95": 25.41},
+  "decode_ms": {"p50": 0.5, "p95": 0.7},
+  "draw_interval_ms": {"p50": 16.7, "p95": 16.8}
+}

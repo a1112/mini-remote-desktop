@@ -70,30 +70,7 @@ export function DeviceRegisterModal({
         setDeviceName(info.hostname);
         setStep("register");
       } else {
-        // 开发模式模拟数据
-        const mockInfo: HardwareInfo = {
-          motherboard_serial: "MOCK-" + Math.random().toString(36).substring(7),
-          hostname: "开发测试机",
-          os_type: "windows",
-          os_version: "Windows 11 Pro 23H2 Build 22631",
-          cpu_info: {
-            name: "Intel Core i7-12700K",
-            vendor_id: "GenuineIntel",
-            cores: 12,
-            max_frequency_mhz: 3500,
-          },
-          total_memory_mb: 32768,
-          gpu_info: [
-            {
-              name: "NVIDIA GeForce RTX 3060",
-              vendor: "NVIDIA",
-              memory_mb: 12288,
-            },
-          ],
-        };
-        setHardwareInfo(mockInfo);
-        setDeviceName(mockInfo.hostname);
-        setStep("register");
+        throw new Error("仅桌面客户端可以注册设备");
       }
     } catch (err) {
       setError(`获取硬件信息失败: ${err}`);
@@ -108,24 +85,13 @@ export function DeviceRegisterModal({
     setError(null);
 
     try {
-      let response: DeviceRegisterResponse;
-
-      if (window.__TAURI__) {
-        response = await window.__TAURI__.invoke<DeviceRegisterResponse>("register_device", {
+      if (!window.__TAURI__) throw new Error("仅桌面客户端可以注册设备");
+      const response = await window.__TAURI__.invoke<DeviceRegisterResponse>("register_device", {
           motherboard_serial: hardwareInfo.motherboard_serial,
           hostname: hardwareInfo.hostname,
           os_version: hardwareInfo.os_version,
           deviceName: deviceName || hardwareInfo.hostname,
         });
-      } else {
-        // 开发模式模拟注册
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-        response = {
-          device_id: "DEV-" + Math.random().toString(36).substring(7).toUpperCase(),
-          device_name: deviceName || hardwareInfo.hostname,
-          access_token: "mock-access-token-" + Math.random().toString(36).substring(7),
-        };
-      }
 
       setResult(response);
       setStep("success");
@@ -198,6 +164,9 @@ export function DeviceRegisterModal({
               <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-4" />
               <p className={textSecondary}>正在获取硬件信息...</p>
             </div>
+          )}
+          {step === "register" && !hardwareInfo && error && (
+            <div role="alert" className="text-sm text-red-500 py-8 text-center">{error}</div>
           )}
 
           {step === "register" && hardwareInfo && (

@@ -1,0 +1,19 @@
+{
+  "scenario": "Final gateway with reconnect fix; moving primary-screen fixture; RTX 5060 Ti; local WebCodecs canvas",
+  "complete": true,
+  "seconds": 30,
+  "resolution": [2560, 1440],
+  "codec": "avc1.42c033",
+  "receive_fps": 60.03,
+  "decode_fps": 60.03,
+  "draw_fps": 59.57,
+  "visual_changes_per_second": 59.53,
+  "bitrate_mbps": 15.81,
+  "dropped_draws": 14,
+  "decode_errors": 0,
+  "sequence_gaps": 0,
+  "max_decode_queue": 1,
+  "capture_to_draw_ms": {"p50": 21.59, "p95": 24.93},
+  "decode_ms": {"p50": 0.5, "p95": 0.9},
+  "draw_interval_ms": {"p50": 13.9, "p95": 20.9}
+}

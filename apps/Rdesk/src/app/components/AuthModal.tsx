@@ -242,7 +242,7 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
         className={`relative rounded-2xl border transition-all duration-200 overflow-hidden ${
           visible && open ? "scale-100" : "scale-95"
         } ${card}`}
-        style={{ width: 420 }}
+        style={{ width: "min(420px, calc(100vw - 32px))", maxHeight: "calc(100dvh - 32px)", overflowY: "auto" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Close button */}

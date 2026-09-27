@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rdesk · 控制手机</title>
+<style>
+  :root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#0b1326;color:#e7edff}
+  *{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;flex-direction:column}header{padding:18px 24px;background:#121d36;border-bottom:1px solid #2b3a58;display:flex;gap:18px;align-items:center;flex-wrap:wrap}h1{font-size:20px;margin:0}small{color:#9fb1d0}form{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-left:auto}input,button{font:inherit;border-radius:9px;padding:9px 13px}input{background:#0b1326;color:#fff;border:1px solid #43577e;min-width:210px}button{background:#4169e1;color:white;border:0;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}button.secondary{background:#263858}main{flex:1;display:grid;place-items:center;padding:18px}#stage{height:min(80vh,850px);aspect-ratio:9/19.5;max-width:100%;background:#05080f;border:1px solid #344667;border-radius:18px;overflow:hidden;display:grid;place-items:center;touch-action:none;position:relative}#screen{width:100%;height:100%;object-fit:contain;display:none;user-select:none;-webkit-user-drag:none}#empty{text-align:center;color:#aebddd;padding:20px}.toolbar{padding:12px 20px;background:#121d36;border-top:1px solid #2b3a58;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}#status{color:#89e1b1}
+</style>
+</head>
+<body>
+<header><div><h1>Rdesk · 控制手机</h1><small>手机需先批准屏幕采集并开启辅助功能</small></div><form id="form"><button id="connect">连接</button><button type="button" id="disconnect" class="secondary" disabled>断开</button></form><span id="status">未连接</span></header>
+<main><div id="stage"><img id="screen" alt="手机实时屏幕"><div id="empty">等待手机共享屏幕</div></div></main>
+<div class="toolbar"><button id="back" disabled>返回</button><button id="home" disabled>主页</button><input id="text" placeholder="输入手机文字" aria-label="输入手机文字"><button id="sendText" disabled>发送文字</button></div>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let socket, frameUrl, pointerStart;
+  const status = message => $('status').textContent = message;
+  const enabled = value => { for (const id of ['disconnect','back','home','sendText']) $(id).disabled = !value; $('connect').disabled = value; };
+  const clear = () => { $('screen').style.display='none'; $('empty').style.display='block'; if(frameUrl) URL.revokeObjectURL(frameUrl); frameUrl=null; };
+  const send = value => { if(socket?.readyState===WebSocket.OPEN) socket.send(JSON.stringify(value)); };
+  $('form').onsubmit = event => {
+    event.preventDefault(); if(socket) socket.close(); clear(); status('正在连接…');
+    socket = new WebSocket(`ws://${location.host}/mobile/phone/control/ws`); socket.binaryType='blob';
+    socket.onmessage = event => {
+      if(typeof event.data === 'string') {
+        let message; try {message=JSON.parse(event.data)} catch {return}
+        if(message.type==='ready'){ enabled(true);status('已连接，等待手机共享'); }
+        if(message.type==='offline'){ clear();status('手机已停止共享'); }
+        if(message.type==='error') status(message.message || '连接失败');
+      } else {
+        if(frameUrl) URL.revokeObjectURL(frameUrl);
+        frameUrl=URL.createObjectURL(event.data);$('screen').src=frameUrl;$('screen').style.display='block';$('empty').style.display='none';status('手机屏幕正在共享');
+      }
+    };
+    socket.onclose = () => {enabled(false);clear();status('连接已断开');};
+    socket.onerror = () => status('连接失败，请检查网关地址与防火墙');
+  };
+  $('disconnect').onclick = () => socket?.close();
+  $('back').onclick = () => send({type:'back'});
+  $('home').onclick = () => send({type:'home'});
+  $('sendText').onclick = () => { const text=$('text').value; if(text) send({type:'text',text}); $('text').value=''; };
+  const point = event => {
+    const img=$('screen'), rect=img.getBoundingClientRect();
+    if(!img.naturalWidth || !img.naturalHeight) return null;
+    const scale=Math.min(rect.width/img.naturalWidth,rect.height/img.naturalHeight);
+    const left=rect.left+(rect.width-img.naturalWidth*scale)/2,top=rect.top+(rect.height-img.naturalHeight*scale)/2;
+    const x=(event.clientX-left)/(img.naturalWidth*scale), y=(event.clientY-top)/(img.naturalHeight*scale);
+    return x>=0&&x<=1&&y>=0&&y<=1?{x,y}:null;
+  };
+  $('stage').onpointerdown = event => {pointerStart=point(event);$('stage').setPointerCapture(event.pointerId);};
+  $('stage').onpointerup = event => {const end=point(event);if(!pointerStart||!end)return;const dx=end.x-pointerStart.x,dy=end.y-pointerStart.y;if(Math.hypot(dx,dy)>0.03)send({type:'swipe',...pointerStart,endX:end.x,endY:end.y});else send({type:'tap',...end});pointerStart=null;};
+  $('stage').onpointercancel = () => pointerStart=null;
+  $('form').requestSubmit();
+})();
+</script>
+</body>
+</html>

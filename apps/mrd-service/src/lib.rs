@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
 pub mod media_adaptation;
+pub use mrd_mobile_gateway as mobile_gateway;
 pub mod relay;
 pub mod resource_monitor;
 pub mod security;

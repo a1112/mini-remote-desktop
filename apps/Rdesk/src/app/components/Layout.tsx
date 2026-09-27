@@ -9,6 +9,8 @@ import { useState } from "react";
 import { useTheme } from "./ThemeContext";
 import { DetailBarProvider } from "./DetailBarContext";
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
+import { MobileLayout } from "./MobileLayout";
+import { useIsMobile } from "./ui/use-mobile";
 
 export function Layout() {
   const [collapsed, setCollapsed] = useState(false);
@@ -17,10 +19,11 @@ export function Layout() {
   const [showTransfers, setShowTransfers] = useState(false);
   const [showAuth, setShowAuth] = useState(false);
   const { isDark } = useTheme();
+  const isMobile = useIsMobile();
 
   return (
     <DetailBarProvider>
-    <div
+    {isMobile ? <MobileLayout onOpenAuth={() => setShowAuth(true)} /> : <div
       className={`flex flex-col h-screen w-screen overflow-hidden rounded-lg border shadow-2xl ${
         isDark
           ? "dark bg-[#1a1a1a] text-gray-100 border-gray-700"
@@ -50,12 +53,11 @@ export function Layout() {
         </div>
       </div>
 
-      {/* Modals */}
-      <ConnectionsModal open={showConnections} onClose={() => setShowConnections(false)} />
-      <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
-      <TransferModal open={showTransfers} onClose={() => setShowTransfers(false)} />
-      <AuthModal open={showAuth} onClose={() => setShowAuth(false)} />
-    </div>
+    </div>}
+    <ConnectionsModal open={showConnections} onClose={() => setShowConnections(false)} />
+    <SettingsModal open={showSettings} onClose={() => setShowSettings(false)} />
+    <TransferModal open={showTransfers} onClose={() => setShowTransfers(false)} />
+    <AuthModal open={showAuth} onClose={() => setShowAuth(false)} />
     </DetailBarProvider>
   );
 }

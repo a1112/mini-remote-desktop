@@ -21,6 +21,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import { useAuth } from "./AuthContext";
 
 function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -81,6 +82,7 @@ const sections = [
 
 export function SettingsPage() {
   const [active, setActive] = useState("general");
+  const { user, isLoggedIn } = useAuth();
   const { theme: globalTheme, setTheme: setGlobalTheme, isDark } = useTheme();
 
   // Map theme mode to Chinese labels
@@ -99,7 +101,6 @@ export function SettingsPage() {
   const [lockOnIdle, setLockOnIdle] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
   const [idleTimeout, setIdleTimeout] = useState("5 分钟");
-  const [encryptionLevel, setEncryptionLevel] = useState("TLS 1.3");
 
   // Network
   const [proxy, setProxy] = useState(false);
@@ -185,18 +186,6 @@ export function SettingsPage() {
                 />
               </SettingRow>
             )}
-            <SettingRow label="加密协议" description="数据传输加密方式">
-              <Select value={encryptionLevel} options={["TLS 1.3", "TLS 1.2", "AES-256"]} onChange={setEncryptionLevel} />
-            </SettingRow>
-            <div className={`p-4 rounded-xl border mt-2 ${isDark ? "bg-green-900/20 border-green-800" : "bg-green-50 border-green-200"}`}>
-              <div className="flex items-center gap-2 mb-1">
-                <Shield className="w-4 h-4 text-green-600" />
-                <span className={`font-medium ${isDark ? "text-green-400" : "text-green-700"}`} style={{ fontSize: 14 }}>安全状态良好</span>
-              </div>
-              <p className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 12 }}>
-                当前使用 TLS 1.3 端对端加密，所有传输数据均受到保护。
-              </p>
-            </div>
           </SettingsSection>
         )}
 
@@ -283,11 +272,8 @@ export function SettingsPage() {
                 U
               </div>
               <div>
-                <div className={`font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>当前用户</div>
-                <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 13 }}>user@example.com</div>
-                <div className={`inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-full ${isDark ? "bg-blue-900/30 text-blue-400" : "bg-blue-50 text-blue-600"}`} style={{ fontSize: 11 }}>
-                  免费版
-                </div>
+                <div className={`font-medium ${isDark ? "text-gray-100" : "text-gray-900"}`} style={{ fontSize: 16 }}>{isLoggedIn ? user?.username || "当前用户" : "未登录"}</div>
+                {user?.id && <div className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 13 }}>{user.id}</div>}
               </div>
             </div>
 

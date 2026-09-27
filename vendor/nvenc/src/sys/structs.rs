@@ -494,6 +494,21 @@ pub struct NVencConfig {
 }
 
 impl NVencConfig {
+    /// Call only for H.264 configs. Advertise a one-frame DPB with no display reordering.
+    pub fn set_h264_zero_reorder_delay(&mut self) {
+        // SDK 13 NV_ENC_RC_PARAMS: enableLookahead=bit 5, zeroReorderDelay=bit 9.
+        self.frame_interval_p = 1;
+        self.rc_params.bit_fields.0 = (self.rc_params.bit_fields.0 & !(1 << 5)) | (1 << 9);
+        self.rc_params.look_ahead_depth = 0;
+        unsafe {
+            let h264 = &mut self.encode_codec_config.h264;
+            h264.h264_vui_parameters.bitstream_restriction_flag = 1;
+            h264.max_num_ref_frames = 1;
+            // SDK 13 NV_ENC_CONFIG_H264 repeatSPSPPS=bit 12.
+            h264.bitflags |= 1 << 12;
+        }
+    }
+
     pub fn set_hevc_main10_bit_depths(&mut self) {
         self.set_hevc_main10_bit_depths_with_input(NVencBitDepth::Depth10);
     }
@@ -606,6 +621,23 @@ mod tests {
         mem::{ManuallyDrop, MaybeUninit, offset_of, size_of},
         ptr,
     };
+
+    #[test]
+    fn h264_realtime_config_signals_zero_reordering() {
+        let mut config = unsafe { MaybeUninit::<NVencConfig>::zeroed().assume_init() };
+        config.rc_params.bit_fields.0 = (1 << 5) | 1;
+        config.rc_params.look_ahead_depth = 16;
+        config.set_h264_zero_reorder_delay();
+        assert_eq!(config.frame_interval_p, 1);
+        assert_ne!(config.rc_params.bit_fields.0 & (1 << 9), 0);
+        assert_eq!(config.rc_params.bit_fields.0 & (1 << 5), 0);
+        assert_eq!(config.rc_params.bit_fields.0 & 1, 1);
+        assert_eq!(config.rc_params.look_ahead_depth, 0);
+        let h264 = unsafe { &config.encode_codec_config.h264 };
+        assert_eq!(h264.h264_vui_parameters.bitstream_restriction_flag, 1);
+        assert_eq!(h264.max_num_ref_frames, 1);
+        assert_ne!(h264.bitflags & (1 << 12), 0);
+    }
 
     #[test]
     fn av1_config_matches_sdk_13_layout() {

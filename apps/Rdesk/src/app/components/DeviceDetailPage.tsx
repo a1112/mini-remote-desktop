@@ -120,42 +120,6 @@ export function remoteStartUnavailableReason(
   return null;
 }
 
-const remoteFiles = [
-  { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03" },
-  { name: "Downloads", type: "folder" as const, size: "—", modified: "2026-03-04" },
-  { name: "Desktop", type: "folder" as const, size: "—", modified: "2026-03-04" },
-  { name: "report_2026.pdf", type: "file" as const, size: "2.3 MB", modified: "2026-03-01" },
-  { name: "config.json", type: "file" as const, size: "12 KB", modified: "2026-02-28" },
-  { name: "backup.tar.gz", type: "file" as const, size: "890 MB", modified: "2026-02-27" },
-  { name: "screenshot.png", type: "file" as const, size: "4.1 MB", modified: "2026-03-04" },
-];
-
-const allRemoteFiles = [
-  { name: "Documents", type: "folder" as const, size: "—", modified: "2026-03-03", fileKind: "文件夹" },
-  { name: "Downloads", type: "folder" as const, size: "—", modified: "2026-03-04", fileKind: "文件夹" },
-  { name: "Desktop", type: "folder" as const, size: "—", modified: "2026-03-04", fileKind: "文件夹" },
-  { name: "Pictures", type: "folder" as const, size: "—", modified: "2026-03-02", fileKind: "文件夹" },
-  { name: "Music", type: "folder" as const, size: "—", modified: "2026-02-15", fileKind: "文件夹" },
-  { name: "Videos", type: "folder" as const, size: "—", modified: "2026-02-20", fileKind: "文件夹" },
-  { name: "report_2026.pdf", type: "file" as const, size: "2.3 MB", modified: "2026-03-01", fileKind: "PDF 文档" },
-  { name: "config.json", type: "file" as const, size: "12 KB", modified: "2026-02-28", fileKind: "JSON 文件" },
-  { name: "backup.tar.gz", type: "file" as const, size: "890 MB", modified: "2026-02-27", fileKind: "压缩包" },
-  { name: "screenshot.png", type: "file" as const, size: "4.1 MB", modified: "2026-03-04", fileKind: "PNG 图片" },
-  { name: "notes.txt", type: "file" as const, size: "4 KB", modified: "2026-03-04", fileKind: "文本文件" },
-  { name: "presentation.pptx", type: "file" as const, size: "18 MB", modified: "2026-03-03", fileKind: "演示文稿" },
-  { name: "database.sql", type: "file" as const, size: "156 KB", modified: "2026-02-25", fileKind: "SQL 文件" },
-  { name: "logo.jpg", type: "file" as const, size: "320 KB", modified: "2026-03-02", fileKind: "JPEG 图片" },
-];
-
-const localFiles = [
-  { name: "Projects", type: "folder" as const, size: "—", modified: "2026-03-04" },
-  { name: "Pictures", type: "folder" as const, size: "—", modified: "2026-03-03" },
-  { name: "Music", type: "folder" as const, size: "—", modified: "2026-02-20" },
-  { name: "presentation.pptx", type: "file" as const, size: "18 MB", modified: "2026-03-04" },
-  { name: "notes.txt", type: "file" as const, size: "4 KB", modified: "2026-03-04" },
-  { name: "dataset.csv", type: "file" as const, size: "56 MB", modified: "2026-03-02" },
-];
-
 export function DeviceDetailPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -338,7 +302,7 @@ export function DeviceDetailPage() {
       </div>
 
       {/* Performance monitoring footer */}
-      {isOnline && device.cpu !== null && (
+      {isOnline && (device.cpu !== null || device.ram !== null || device.disk !== null) && (
         <PerformanceFooter device={device} />
       )}
     </div>
@@ -621,7 +585,7 @@ function RemoteTab({ device }: { device: Device }) {
           {sessionStateLabel}
         </div>
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
-          {device.name} · {device.os} · 1920×1080
+          {device.name} · {device.os}
         </div>
       </div>
 
@@ -631,15 +595,6 @@ function RemoteTab({ device }: { device: Device }) {
           <StatusItem label="Size" value={frameSizeLabel} />
           <StatusItem label="FPS" value={fpsLabel} />
           <StatusItem label="Bitrate" value={bitrateLabel} />
-        </div>
-        <div className="hidden">
-          <StatusItem label="分辨率" value="1920×1080" />
-          <StatusItem label="帧率" value="60 fps" />
-          <StatusItem label="带宽" value="4.2 MB/s" />
-        </div>
-        <div className="flex items-center gap-1 text-green-400" style={{ fontSize: 11 }}>
-          <Lock className="w-3 h-3" />
-          TLS 1.3 加密
         </div>
       </div>
     </div>
@@ -819,20 +774,6 @@ function upsertFileTransferTask(
   return nextTransfers;
 }
 
-// Helper to get file system for a device
-function getDeviceFileSystems(deviceId: string, devices: Device[]): FileItem[] {
-  const dev = devices.find(d => d.id === deviceId);
-  if (dev?.id === "1") return allRemoteFiles;
-  return [
-    { name: "Documents", type: "folder", size: "—", modified: "2026-03-02", fileKind: "文件夹" },
-    { name: "Photos", type: "folder", size: "—", modified: "2026-03-01", fileKind: "文件夹" },
-    { name: "Downloads", type: "folder", size: "—", modified: "2026-03-03", fileKind: "文件夹" },
-    { name: "workspace.code", type: "file", size: "1.2 KB", modified: "2026-03-03", fileKind: "Code 文件" },
-    { name: "readme.md", type: "file", size: "8 KB", modified: "2026-02-28", fileKind: "Markdown" },
-    { name: "deploy.sh", type: "file", size: "2 KB", modified: "2026-03-01", fileKind: "Shell 脚本" },
-  ];
-}
-
 function FilePane({
   deviceId,
   side,
@@ -856,7 +797,7 @@ function FilePane({
   const dev = devices.find(d => d.id === deviceId);
   const devName = dev?.name ?? "未知设备";
   const contextMenuRef = useRef<HTMLDivElement>(null);
-  const [currentPath, setCurrentPath] = useState<string[]>([devName, "Users", "Admin"]);
+  const [currentPath, setCurrentPath] = useState<string[]>([devName]);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [viewMode, setViewMode] = useState<"list" | "grid">("list");
   const [searchQuery, setSearchQuery] = useState("");
@@ -870,6 +811,12 @@ function FilePane({
   const loadDirectory = useCallback(async (path: string | null) => {
     setServiceLoading(true);
     setServiceError(null);
+    if (!dev?.isLocal) {
+      setServiceFiles([]);
+      setServiceError("远程目录浏览尚未接入服务");
+      setServiceLoading(false);
+      return;
+    }
     const result = await ipcListDirectory(path);
     if (!result.ok) {
       setServiceError(result.error.message);
@@ -883,7 +830,7 @@ function FilePane({
     setCurrentPath(pathSegmentsFromDirectory(result.value.path, [devName]));
     setSelectedFiles(new Set());
     setServiceLoading(false);
-  }, [devName, onPathChange]);
+  }, [devName, dev?.isLocal, onPathChange]);
 
   useEffect(() => {
     setServiceFiles(null);
@@ -895,8 +842,7 @@ function FilePane({
     void loadDirectory(null);
   }, [devName, deviceId, loadDirectory, onPathChange]);
 
-  const fallbackFiles: FileItem[] = deviceId === "1" ? allRemoteFiles : getDeviceFileSystems(deviceId, devices);
-  const files: FileItem[] = (serviceFiles ?? fallbackFiles).filter(f =>
+  const files: FileItem[] = (serviceFiles ?? []).filter(f =>
     searchQuery ? f.name.toLowerCase().includes(searchQuery.toLowerCase()) : true
   );
 
@@ -986,7 +932,7 @@ function FilePane({
   return (
     <div className={`flex-1 flex flex-col min-w-0 relative ${dragOver ? (isDark ? "ring-2 ring-inset ring-blue-500/50" : "ring-2 ring-inset ring-blue-400/50") : ""}`}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }} onDrop={handlePaneDrop}>
-      {dragOver && (
+      {dragOver && servicePath && (
         <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none bg-blue-500/5">
           <div className={`px-4 py-2 rounded-lg border-2 border-dashed ${isDark ? "border-blue-500/40 bg-[#1e1e1e]/90 text-blue-400" : "border-blue-400/40 bg-white/90 text-blue-600"}`} style={{ fontSize: 13 }}>
             <Download style={{ width: 16, height: 16, display: "inline", marginRight: 6, verticalAlign: -3 }} />拖放到此处传输
@@ -1100,10 +1046,7 @@ function FilePane({
           <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 9 }}>{files.length} 个项目</span>
           {selectedFiles.size > 0 && <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 9 }}>已选择 {selectedFiles.size} 项</span>}
         </div>
-        <div className="flex items-center gap-1">
-          <Lock style={{ width: 8, height: 8 }} className="text-green-500" />
-          <span className="text-green-600" style={{ fontSize: 9 }}>E2E</span>
-        </div>
+        <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 9 }}>本机目录</span>
       </div>
       {contextMenuState && (
         <div ref={contextMenuRef} className={`fixed z-50 rounded-lg border shadow-lg py-1 min-w-[180px] ${isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"}`} style={{ left: contextMenuState.x, top: contextMenuState.y }}>
@@ -1113,7 +1056,7 @@ function FilePane({
                 <CtxItem icon={<FolderOpen style={{ width: 13, height: 13 }} />} label="打开" onClick={() => { handleDoubleClick({ name: contextMenuState.fileName, type: "folder", size: "", modified: "", fileKind: "" }); setContextMenuState(null); }} isDark={isDark} />
               )}
               <CtxItem icon={<Download style={{ width: 13, height: 13 }} />} label="下载到本地" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              {otherDeviceName && (
+              {otherDeviceName && targetPath && (
                 <CtxItem icon={<Send style={{ width: 13, height: 13 }} />} label={`发送到 ${otherDeviceName}`}
                   onClick={handleSendContextFileToOther} isDark={isDark} />
               )}
@@ -2054,100 +1997,15 @@ function InfoTab({ device }: { device: Device }) {
 /* ======================== Performance Monitoring Footer ======================== */
 function PerformanceFooter({ device }: { device: Device }) {
   const { isDark } = useTheme();
-  const [cpu, setCpu] = useState(device.cpu ?? 0);
-  const [ram, setRam] = useState(device.ram ?? 0);
-  const [disk] = useState(device.disk ?? 0);
-  const [netUp, setNetUp] = useState(2.4);
-  const [netDown, setNetDown] = useState(8.7);
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setCpu((v) => Math.max(5, Math.min(95, v + Math.floor(Math.random() * 9) - 4)));
-      setRam((v) => Math.max(30, Math.min(90, v + Math.floor(Math.random() * 5) - 2)));
-      setNetUp((v) => Math.max(0.5, Math.min(12, +(v + (Math.random() * 2 - 1)).toFixed(1))));
-      setNetDown((v) => Math.max(1, Math.min(25, +(v + (Math.random() * 3 - 1.5)).toFixed(1))));
-    }, 2000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const getBarColor = (value: number) => {
-    if (value > 85) return "bg-red-500";
-    if (value > 65) return "bg-yellow-500";
-    return "bg-green-500";
-  };
-
-  const getTextColor = (value: number) => {
-    if (value > 85) return isDark ? "text-red-400" : "text-red-500";
-    if (value > 65) return isDark ? "text-yellow-400" : "text-yellow-600";
-    return isDark ? "text-green-400" : "text-green-600";
-  };
-
-  return (
-    <div className={`shrink-0 flex items-center gap-6 px-5 py-1.5 border-t ${isDark ? "bg-[#1e1e1e] border-gray-700" : "bg-white border-gray-200"}`}>
-      {/* CPU */}
-      <div className="flex items-center gap-2">
-        <Cpu style={{ width: 12, height: 12 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-        <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 10 }}>CPU</span>
-        <div className={`w-16 h-1.5 rounded-full overflow-hidden ${isDark ? "bg-gray-700" : "bg-gray-200"}`}>
-          <div className={`h-full rounded-full transition-all duration-1000 ${getBarColor(cpu)}`} style={{ width: `${cpu}%` }} />
-        </div>
-        <span className={getTextColor(cpu)} style={{ fontSize: 10 }}>{cpu}%</span>
-      </div>
-
-      {/* RAM */}
-      <div className="flex items-center gap-2">
-        <MemoryStick style={{ width: 12, height: 12 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-        <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 10 }}>RAM</span>
-        <div className={`w-16 h-1.5 rounded-full overflow-hidden ${isDark ? "bg-gray-700" : "bg-gray-200"}`}>
-          <div className={`h-full rounded-full transition-all duration-1000 ${getBarColor(ram)}`} style={{ width: `${ram}%` }} />
-        </div>
-        <span className={getTextColor(ram)} style={{ fontSize: 10 }}>{ram}%</span>
-      </div>
-
-      {/* Disk */}
-      <div className="flex items-center gap-2">
-        <HardDrive style={{ width: 12, height: 12 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-        <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 10 }}>DISK</span>
-        <div className={`w-16 h-1.5 rounded-full overflow-hidden ${isDark ? "bg-gray-700" : "bg-gray-200"}`}>
-          <div className={`h-full rounded-full transition-all duration-1000 ${getBarColor(disk)}`} style={{ width: `${disk}%` }} />
-        </div>
-        <span className={getTextColor(disk)} style={{ fontSize: 10 }}>{disk}%</span>
-      </div>
-
-      {/* Separator */}
-      <div className={`h-3 w-px ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
-
-      {/* Network */}
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-1.5">
-          <Upload style={{ width: 10, height: 10 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 10 }}>{netUp} MB/s</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          <Download style={{ width: 10, height: 10 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-          <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 10 }}>{netDown} MB/s</span>
-        </div>
-      </div>
-
-      <div className="flex-1" />
-
-      {/* Ping */}
-      {device.ping !== null && (
-        <div className="flex items-center gap-1.5">
-          <Activity style={{ width: 11, height: 11 }} className={device.ping < 30 ? "text-green-500" : "text-yellow-500"} />
-          <span className={device.ping < 30 ? "text-green-600" : "text-yellow-600"} style={{ fontSize: 10 }}>{device.ping}ms</span>
-        </div>
-      )}
-
-      {/* TLS */}
-      <div className="flex items-center gap-1">
-        <Lock style={{ width: 10, height: 10 }} className="text-green-500" />
-        <span className="text-green-600" style={{ fontSize: 10 }}>TLS 1.3</span>
-      </div>
-    </div>
-  );
+  const metrics = [
+    { label: "CPU", value: device.cpu },
+    { label: "RAM", value: device.ram },
+    { label: "DISK", value: device.disk },
+  ].filter((metric) => metric.value !== null);
+  return <div className={isDark ? "shrink-0 flex gap-5 px-5 py-2 border-t border-gray-700 bg-[#1e1e1e]" : "shrink-0 flex gap-5 px-5 py-2 border-t border-gray-200 bg-white"}>
+    {metrics.map((metric) => <span key={metric.label} className="text-xs opacity-70">{metric.label} {metric.value}%</span>)}
+  </div>;
 }
-
 /* ======================== Shared sub-components ======================== */
 
 function ResourcePill({ label, value, color }: { label: string; value: number; color: string }) {

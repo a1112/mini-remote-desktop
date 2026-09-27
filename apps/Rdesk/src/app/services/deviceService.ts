@@ -82,6 +82,7 @@ class DeviceRegistrationService {
   }
 
   private async _initialize(): Promise<StoredDeviceInfo | null> {
+    if (!isTauriRuntime()) return null;
     const useServerRegistration = this.shouldUseServerRegistration();
 
     // 1. 检查本地存储
@@ -206,16 +207,8 @@ class DeviceRegistrationService {
     const tauri = typeof window !== "undefined" ? window.__TAURI__ : undefined;
     const isTauriAvailable = typeof tauri?.invoke === "function";
 
-    if (isTauriAvailable) {
-      try {
-        return await tauri.invoke<HardwareInfo>("get_hardware_info");
-      } catch (err) {
-        console.warn("[DeviceService] Tauri 调用失败，使用模拟数据:", err);
-        return this.getMockHardwareInfo();
-      }
-    }
-    // 开发模式模拟数据
-    return this.getMockHardwareInfo();
+    if (!isTauriAvailable) throw new Error("仅桌面客户端可以读取设备硬件信息");
+    return tauri.invoke<HardwareInfo>("get_hardware_info");
   }
 
   /**
@@ -273,7 +266,12 @@ class DeviceRegistrationService {
     try {
       const stored = localStorage.getItem(DEVICE_INFO_KEY);
       if (stored) {
-        return JSON.parse(stored);
+        const info = JSON.parse(stored) as StoredDeviceInfo;
+        if (info.motherboard_serial?.startsWith("MOCK-") || info.access_token?.startsWith("mock-")) {
+          this.clearStoredDeviceInfo();
+          return null;
+        }
+        return info;
       }
     } catch (err) {
       console.warn("[DeviceService] 读取本地存储失败:", err);
@@ -503,44 +501,6 @@ class DeviceRegistrationService {
     return this.initialize();
   }
 
-  /**
-   * 开发模式模拟硬件信息
-   */
-  private getMockHardwareInfo(): HardwareInfo {
-    const mockSerial = localStorage.getItem("mock_device_serial") ||
-      "MOCK-" + Math.random().toString(36).substring(2, 10).toUpperCase();
-    localStorage.setItem("mock_device_serial", mockSerial);
-
-    return {
-      motherboard_serial: mockSerial,
-      hostname: this.getBrowserFallbackHostname(),
-      os_type: "windows",
-      os_version: "Windows 11 Pro 23H2 Build 22631",
-      cpu_info: {
-        name: "Intel Core i7-12700K",
-        vendor_id: "GenuineIntel",
-        cores: 12,
-        max_frequency_mhz: 3500,
-      },
-      total_memory_mb: 32768,
-      gpu_info: [
-        {
-          name: "NVIDIA GeForce RTX 3060",
-          vendor: "NVIDIA",
-          memory_mb: 12288,
-        },
-      ],
-    };
-  }
-
-  private getBrowserFallbackHostname(): string {
-    const platform =
-      typeof navigator === "undefined"
-        ? ""
-        : ((navigator as any).userAgentData?.platform ?? navigator.platform ?? "");
-    const normalized = String(platform).trim();
-    return normalized ? `${normalized} device` : "Rdesk local device";
-  }
 }
 
 // 导出单例

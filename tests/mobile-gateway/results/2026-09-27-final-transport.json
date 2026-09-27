@@ -1,0 +1,24 @@
+{
+  "codec": "H264",
+  "duration_s": 7.85,
+  "frames": 472,
+  "receive_fps": 60.0,
+  "resolution": [
+    2560,
+    1440
+  ],
+  "mbps": 12.201,
+  "sequence_gaps": 0,
+  "capture_to_receive_ms": {
+    "p50": 17.33,
+    "p95": 18.13
+  },
+  "capture_call_ms": {
+    "p50": 0.13,
+    "p95": 0.23
+  },
+  "encode_call_ms": {
+    "p50": 0.33,
+    "p95": 0.52
+  }
+}

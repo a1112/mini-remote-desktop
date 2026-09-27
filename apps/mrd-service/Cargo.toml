@@ -31,6 +31,7 @@ mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-encode-vvenc = { path = "../../crates/mrd-encode-vvenc", optional = true }
 mrd-ffmpeg = { path = "../../crates/mrd-ffmpeg" }
 mrd-input = { path = "../../crates/mrd-input" }
+mrd-mobile-gateway = { path = "../../crates/mrd-mobile-gateway" }
 mrd-identity = { path = "../../crates/mrd-identity" }
 mrd-ipc = { path = "../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import type { RemoteRoutePreference } from "../adapters/tauri/types";
 import {
   X,
@@ -52,28 +52,10 @@ export function RemoteSessionModal({
 }: RemoteSessionModalProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [muted, setMuted] = useState(false);
-  const [latency, setLatency] = useState(24);
-  const [quality, setQuality] = useState(85);
-  const [elapsed, setElapsed] = useState(0);
   const [showControls, setShowControls] = useState(true);
   const [showToolbar, setShowToolbar] = useState(false);
   const [routePreference, setRoutePreference] =
     useState<RemoteRoutePreference>("auto");
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setElapsed((e) => e + 1);
-      setLatency((l) => Math.max(12, Math.min(60, l + Math.floor(Math.random() * 7) - 3)));
-      setQuality((q) => Math.max(70, Math.min(98, q + Math.floor(Math.random() * 5) - 2)));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  const formatTime = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = s % 60;
-    return `${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
-  };
 
   const handleRoutePreferenceChange = (
     nextRoutePreference: RemoteRoutePreference,
@@ -103,7 +85,6 @@ export function RemoteSessionModal({
           </div>
 
           <div className="flex-1 flex items-center justify-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
             <span className="text-gray-200 font-medium" style={{ fontSize: 13 }}>
               {device.name}
             </span>
@@ -113,17 +94,6 @@ export function RemoteSessionModal({
           </div>
 
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/10 text-gray-300" style={{ fontSize: 12 }}>
-              <Wifi className="w-3 h-3 text-green-400" />
-              <span>{latency}ms</span>
-            </div>
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-white/10 text-gray-300" style={{ fontSize: 12 }}>
-              <Monitor className="w-3 h-3 text-blue-400" />
-              <span>{quality}%</span>
-            </div>
-            <div className="px-2.5 py-1 rounded-md bg-white/10 text-gray-300" style={{ fontSize: 12 }}>
-              {formatTime(elapsed)}
-            </div>
             <button
               onClick={() => setIsFullscreen(!isFullscreen)}
               className="p-1.5 rounded-md hover:bg-white/10 text-gray-300 hover:text-white transition-colors"
@@ -187,25 +157,10 @@ export function RemoteSessionModal({
           <ToolbarBtn icon={<RefreshCw className="w-3.5 h-3.5" />} label="刷新" />
           <ToolbarBtn icon={<Power className="w-3.5 h-3.5" />} label="重启" danger />
           <div className="flex-1" />
-          <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-white/5 text-gray-300" style={{ fontSize: 11 }}>
-            <span>画质</span>
-            <div className="flex gap-0.5">
-              {[1,2,3,4,5].map((i) => (
-                <div key={i} className={`w-1 h-2.5 rounded-sm ${i <= Math.round(quality/20) ? "bg-blue-400" : "bg-white/15"}`} />
-              ))}
-            </div>
-          </div>
         </div>
 
         {/* Remote native surface placeholder */}
         <div className="flex-1 relative bg-[#1a1a2e] overflow-hidden cursor-crosshair select-none">
-          {/* Connection quality overlay */}
-          <div className="absolute top-3 right-3 flex flex-col gap-2 items-end">
-            <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
-              <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-              <span>连接稳定</span>
-            </div>
-          </div>
 
           {/* OS badge */}
           <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
@@ -216,13 +171,9 @@ export function RemoteSessionModal({
         {/* Status bar */}
         <div className="flex items-center justify-between px-4 py-2 bg-[#232340] border-t border-white/10 shrink-0">
           <div className="flex items-center gap-4">
-            <StatusItem label="分辨率" value="1920×1080" />
-            <StatusItem label="帧率" value="60 fps" />
-            <StatusItem label="带宽" value="4.2 MB/s" />
-          </div>
-          <div className="flex items-center gap-1 text-gray-400" style={{ fontSize: 11 }}>
-            <Lock className="w-3 h-3 text-green-400" />
-            <span className="text-green-400">TLS 1.3 加密</span>
+            <StatusItem label="分辨率" value="—" />
+            <StatusItem label="帧率" value="—" />
+            <StatusItem label="带宽" value="—" />
           </div>
         </div>
       </div>

@@ -60,4 +60,11 @@ describe("deviceService", () => {
       "MOCKUN3Q8K3Y"
     );
   });
+
+  it("does not create a device identity when hardware information is unavailable", async () => {
+    delete (window as any).__TAURI__;
+    const info = await deviceService.initialize();
+    expect(info).toBeNull();
+    expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
 });

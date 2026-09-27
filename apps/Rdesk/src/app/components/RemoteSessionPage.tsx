@@ -20,6 +20,8 @@ import {
   Signal,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import { useIsMobile } from "./ui/use-mobile";
+import { MobileSessionView } from "./MobileSessionView";
 import {
   ffmpegProbe,
   getDecodePolicy,
@@ -44,6 +46,7 @@ import {
   type ProbeSnapshot,
 } from "../services/ipcSessionService";
 import { observeRemoteSession } from "../services/remoteSessionStateService";
+import { recordConnectionSnapshot } from "../services/connectionHistoryService";
 import type {
   RemotePresentationState,
   RemoteSessionSnapshot,
@@ -172,6 +175,7 @@ export function RemoteSessionPage() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { isDark } = useTheme();
+  const isMobile = useIsMobile();
   const { devices, loading } = useDevices();
   const routeDevice = useDeviceById(id, devices);
   const webRemoteSession = id ? getWebRemoteSession(id) : null;
@@ -286,6 +290,7 @@ export function RemoteSessionPage() {
     setRemoteSessionError(null);
     return observeRemoteSession(id, {
       onSnapshot: (snapshot) => {
+        recordConnectionSnapshot(snapshot);
         setRemoteSessionSnapshot(snapshot);
         setRemoteSessionError(null);
       },
@@ -737,6 +742,29 @@ export function RemoteSessionPage() {
         </div>
       </div>
     );
+  }
+
+  if (isMobile) {
+    const failureMessage = unsupportedBrowserPeerSession
+      ? BROWSER_REMOTE_UNSUPPORTED_MESSAGE
+      : remoteSessionSnapshot?.failure?.message ?? remoteSessionError;
+    const status = unsupportedBrowserPeerSession
+      ? "会话不可用"
+      : isWebRemoteSession
+        ? webRtcMessage
+        : remotePresentationLabel(remoteSessionSnapshot?.presentation_state);
+    return <MobileSessionView
+      deviceName={device.name}
+      status={status}
+      awaitingApproval={remoteSessionSnapshot?.presentation_state === "incoming_approval_required"}
+      streaming={mediaConnected}
+      hasNativeDisplay={nativeStreaming && displayWindows.length > 0}
+      canOpenDisplay={Boolean(nativeStreaming)}
+      error={failureMessage ?? null}
+      suggestedAction={remoteSessionSnapshot?.failure?.suggested_action ?? null}
+      onDisconnect={handleDisconnect}
+      onOpenDisplay={() => void handlePopOutWindow()}
+    />;
   }
 
   if (!mediaConnected) {
@@ -1325,7 +1353,7 @@ export function RemoteSessionPage() {
 
         {/* Device info badge */}
         <div className="absolute bottom-3 left-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
-          {device.name} · {device.os} · {renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
+          {device.name} · {device.os}{renderSnapshot?.frame ? ` · ${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : ""}
         </div>
 
         <div className="absolute bottom-3 right-3 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-400" style={{ fontSize: 11 }}>
@@ -1340,7 +1368,7 @@ export function RemoteSessionPage() {
         <div className="flex items-center gap-4">
           <StatusItem
             label="分辨率"
-            value={renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "1920×1080"}
+            value={renderSnapshot?.frame ? `${renderSnapshot.frame.width}×${renderSnapshot.frame.height}` : "等待画面"}
           />
           <StatusItem
             label="帧率"
@@ -1350,10 +1378,6 @@ export function RemoteSessionPage() {
             label="解码"
             value={`${probeSnapshot?.frames_decoded ?? 0} frames`}
           />
-        </div>
-        <div className="flex items-center gap-1 text-green-400" style={{ fontSize: 11 }}>
-          <Lock style={{ width: 11, height: 11 }} />
-          TLS 1.3 加密
         </div>
       </div>
     </div>

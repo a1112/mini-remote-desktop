@@ -1,0 +1,21 @@
+[package]
+name = "mrd-mobile-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["ws"] }
+bytes.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+mrd-input = { path = "../mrd-input" }
+mrd-pipeline-core = { path = "../mrd-pipeline-core" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+mrd-capture-dxgi = { path = "../mrd-capture-dxgi" }
+mrd-encode-nvenc = { path = "../mrd-encode-nvenc" }
+windows = { version = "0.62", features = ["Win32_UI_Input_KeyboardAndMouse"] }
