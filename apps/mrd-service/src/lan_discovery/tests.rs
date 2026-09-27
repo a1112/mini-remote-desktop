@@ -1196,25 +1196,7 @@ async fn snapshot_exposes_lan_media_v3_peer_capabilities_with_v2_rollout_compati
     assert_eq!(peer.service_build_id.as_deref(), Some("build-a"));
     assert_eq!(peer.media_protocol_version, Some(3));
     #[cfg(windows)]
-    for capability in [
-        LAN_CAPTURE_DXGI_CAPABILITY,
-        LAN_ENCODE_NVENC_H264_CAPABILITY,
-        LAN_ENCODE_NVENC_HEVC_CAPABILITY,
-        LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
-        LAN_ENCODE_NVENC_AV1_CAPABILITY,
-        LAN_DECODE_NVDEC_CAPABILITY,
-        LAN_DECODE_NVDEC_HEVC_CAPABILITY,
-        LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
-        LAN_DECODE_NVDEC_AV1_CAPABILITY,
-        LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY,
-        LAN_MEDIA_HEVC_MAIN10_420_10BIT_CAPABILITY,
-        LAN_MEDIA_AV1_MAIN_420_8BIT_CAPABILITY,
-        LAN_MEDIA_COLOR_MODE_CAPABILITY,
-        LAN_RENDER_D3D11_NATIVE_CAPABILITY,
-        LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
-    ] {
-        assert!(peer.media_capabilities.contains(&capability.to_string()));
-    }
+    assert_eq!(peer.media_capabilities, lan_media_capabilities());
     #[cfg(target_os = "macos")]
     {
         for capability in [
@@ -4200,7 +4182,7 @@ async fn remote_session_accept_is_prepared_without_starting_before_bootstrap_del
     )
     .await;
 
-    assert!(result.accepted);
+    assert!(result.accepted, "{:?}", result.message);
     assert!(result.media.is_some());
     assert!(app_state.sessions.lock().await.get(&session_id).is_none());
     assert_eq!(
@@ -7013,7 +6995,7 @@ async fn lan_media_v3_frame_converts_to_receiver_envelope() {
         },
     );
 
-    let converted = quic_media_v3_frame_to_legacy_frame(
+    let converted = quic_media_v3_frame_to_received_frame(
         &app_state,
         &session_id,
         QuicMediaFrame {
@@ -7033,7 +7015,7 @@ async fn lan_media_v3_frame_converts_to_receiver_envelope() {
 
     assert_eq!(converted.frame_id, 42);
     assert!(converted.is_keyframe);
-    let envelope = decode_lan_media_envelope(&converted.payload).unwrap();
+    let envelope = converted.envelope;
     assert_eq!(envelope.payload_type, LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT);
     assert_eq!(envelope.codec, LAN_MEDIA_CODEC_H264);
     assert_eq!(envelope.sequence, 42);
@@ -7072,7 +7054,7 @@ async fn lan_media_v3_frame_converts_hevc_to_receiver_envelope() {
         },
     );
 
-    let converted = quic_media_v3_frame_to_legacy_frame(
+    let converted = quic_media_v3_frame_to_received_frame(
         &app_state,
         &session_id,
         QuicMediaFrame {
@@ -7090,7 +7072,7 @@ async fn lan_media_v3_frame_converts_hevc_to_receiver_envelope() {
     .unwrap()
     .expect("converted frame");
 
-    let envelope = decode_lan_media_envelope(&converted.payload).unwrap();
+    let envelope = converted.envelope;
     assert_eq!(envelope.payload_type, LAN_MEDIA_PAYLOAD_ACCESS_UNIT);
     assert_eq!(envelope.codec, LAN_MEDIA_CODEC_HEVC);
     assert_eq!(envelope.profile.codec, "hevc");
@@ -7128,7 +7110,7 @@ async fn lan_media_v3_profile_mismatch_is_transient_drop() {
         },
     );
 
-    let converted = quic_media_v3_frame_to_legacy_frame(
+    let converted = quic_media_v3_frame_to_received_frame(
         &app_state,
         &session_id,
         QuicMediaFrame {
@@ -7295,7 +7277,7 @@ fn lan_sender_stats_tracker_accumulates_transport_counters() {
 #[test]
 fn windows_lan_sender_uses_monitor_specific_backends_for_display_sources() {
     assert_eq!(
-        windows_lan_capture_backend("windows:display-shared:0", false),
+        windows_lan_capture_backend("windows:display-shared:0", true),
         WindowsLanCaptureBackend::DxgiShared
     );
     assert_eq!(
@@ -7338,7 +7320,7 @@ fn windows_lan_window_shared_capture_uses_cpu_texture_when_nvenc_h264_is_unavail
 #[test]
 fn windows_lan_capture_backend_keeps_dxgi_shared_for_display_shared_sources() {
     assert_eq!(
-        windows_lan_capture_backend("windows:display-shared:1", false),
+        windows_lan_capture_backend("windows:display-shared:1", true),
         WindowsLanCaptureBackend::DxgiShared
     );
 }
@@ -7352,7 +7334,7 @@ fn windows_lan_capture_backend_for_profile_keeps_shared_for_full_size_display() 
             2560,
             1440,
             &test_media_profile(2560, 1440),
-            false
+            true
         ),
         WindowsLanCaptureBackend::DxgiShared
     );
@@ -7367,7 +7349,7 @@ fn windows_lan_capture_backend_for_profile_keeps_shared_for_reduced_display() {
             2560,
             1440,
             &test_media_profile(1920, 1080),
-            false
+            true
         ),
         WindowsLanCaptureBackend::DxgiShared
     );

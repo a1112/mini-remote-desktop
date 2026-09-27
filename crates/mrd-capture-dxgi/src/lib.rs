@@ -881,11 +881,14 @@ fn dxgi_shared_capture_flush_after_copy_enabled() -> bool {
 
 #[cfg(any(windows, test))]
 fn dxgi_shared_capture_flush_after_copy_enabled_from_env_value(value: Option<&str>) -> bool {
-    value.map(str::trim).is_some_and(|value| {
-        value == "1"
-            || value.eq_ignore_ascii_case("true")
-            || value.eq_ignore_ascii_case("yes")
-            || value.eq_ignore_ascii_case("on")
+    // Capture and NVENC use different D3D11 devices. Submit the producer's
+    // writes before the consumer opens/reads the shared resource. Keep only an
+    // explicit diagnostic opt-out; an absent or misspelled setting stays safe.
+    !value.map(str::trim).is_some_and(|value| {
+        value == "0"
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("no")
+            || value.eq_ignore_ascii_case("off")
     })
 }
 
@@ -945,11 +948,23 @@ mod tests {
     }
 
     #[test]
-    fn dxgi_shared_capture_flush_after_copy_defaults_off() {
-        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(None));
-        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("")));
+    fn dxgi_shared_capture_flush_after_copy_defaults_on() {
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            None
+        ));
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some("")
+        ));
+        assert!(dxgi_shared_capture_flush_after_copy_enabled_from_env_value(
+            Some("invalid")
+        ));
+    }
+
+    #[test]
+    fn dxgi_shared_capture_flush_after_copy_can_be_explicitly_disabled() {
         assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("0")));
         assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some("false")));
+        assert!(!dxgi_shared_capture_flush_after_copy_enabled_from_env_value(Some(" OFF ")));
     }
 
     #[test]

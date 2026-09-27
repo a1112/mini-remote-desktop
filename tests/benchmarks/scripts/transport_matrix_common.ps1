@@ -80,7 +80,7 @@ function Get-TransportMatrixCargoTestArgs {
   if ($Release) {
     $args += "--release"
   }
-  $args += @("-p", "app")
+  $args += @("-p", "app", "--bin", "app")
   $args += Get-TransportMatrixCargoFeatureArgs -EncodeBackend $EncodeBackend -DecodeBackend $DecodeBackend
   $args += @("benchmark_run_writes_requested_artifacts", "--", "--nocapture")
   return $args

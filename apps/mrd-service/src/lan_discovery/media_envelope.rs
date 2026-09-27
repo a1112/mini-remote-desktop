@@ -23,6 +23,13 @@ pub(super) struct LanMediaEnvelope {
     pub(super) payload: Vec<u8>,
 }
 
+pub(super) fn validate_lan_media_profile(profile: &MediaProfile) -> Result<()> {
+    if profile.width == 0 || profile.height == 0 || profile.fps == 0 || profile.bitrate_mbps == 0 {
+        anyhow::bail!("LAN media envelope contains an invalid media profile");
+    }
+    Ok(())
+}
+
 pub(super) fn encode_lan_media_envelope(envelope: LanMediaEnvelope) -> Result<Vec<u8>> {
     let payload_len = u32::try_from(envelope.payload.len())
         .context("LAN media v2 envelope payload exceeds u32 length")?;
@@ -91,6 +98,7 @@ pub(super) fn decode_lan_media_envelope(frame: &[u8]) -> Result<LanMediaEnvelope
             base_profile,
         )?
     };
+    validate_lan_media_profile(&profile)?;
     Ok(LanMediaEnvelope {
         payload_type,
         codec,

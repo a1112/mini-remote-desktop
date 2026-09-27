@@ -106,7 +106,7 @@ pub(super) fn windows_lan_capture_backend(
     nvenc_h264_available: bool,
 ) -> WindowsLanCaptureBackend {
     let normalized = source_id.trim().to_ascii_lowercase();
-    if normalized.starts_with("windows:display-shared:") {
+    if normalized.starts_with("windows:display-shared:") && nvenc_h264_available {
         WindowsLanCaptureBackend::DxgiShared
     } else if normalized.starts_with("windows:window:")
         && windows_lan_window_capture_uses_shared_texture(nvenc_h264_available)
@@ -174,6 +174,15 @@ pub(super) fn is_windows_window_source_id(source_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn unavailable_gpu_encoder_selects_cpu_capture_for_shared_display_source() {
+        assert_eq!(
+            windows_lan_capture_backend("windows:display-shared:0", false),
+            WindowsLanCaptureBackend::Winrt,
+        );
+    }
 
     #[test]
     fn dynamic_window_fps_key_tracks_fps_separately_from_capture_config() {

@@ -200,7 +200,7 @@ where
         timestamp_us: u64,
         codec: MediaCodec,
         is_keyframe: bool,
-        payload: Vec<u8>,
+        payload: impl Into<Vec<u8>>,
     ) -> Result<PreparedAgentRender<B>, AgentRenderRouteError> {
         let route = self
             .routes
@@ -219,7 +219,7 @@ where
             timestamp_us,
             codec,
             is_keyframe,
-            payload,
+            payload: payload.into(),
         };
         if !unit.is_valid() {
             return Err(AgentRenderRouteError::InvalidUnit);
@@ -234,5 +234,49 @@ where
     /// Explicitly revoke one route and return its exact binding.
     pub fn remove(&mut self, session_id: &SessionId) -> Option<B> {
         self.routes.remove(session_id).map(|route| route.binding)
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    struct MustNotCopy;
+    impl From<MustNotCopy> for Vec<u8> {
+        fn from(_: MustNotCopy) -> Self {
+            panic!("an unavailable or rejected route must not allocate a payload")
+        }
+    }
+
+    #[test]
+    fn rejected_routes_do_not_copy_encoded_payloads() {
+        let mut registry = AgentRenderRouteRegistry::<()>::new(2).unwrap();
+        let session = SessionId("render-test".into());
+        assert!(matches!(
+            registry.prepare(&session, 1, 1, MediaCodec::H264, true, MustNotCopy),
+            Err(AgentRenderRouteError::MissingSession)
+        ));
+        registry.reserve(session.clone(), (), [1; 16]).unwrap();
+        assert!(matches!(
+            registry.prepare(&session, 1, 1, MediaCodec::H264, true, MustNotCopy),
+            Err(AgentRenderRouteError::PendingSession)
+        ));
+        registry.activate(&session);
+        let data = vec![1, 2, 3];
+        let address = data.as_ptr();
+        let (_, unit) = registry
+            .prepare(&session, 1, 1, MediaCodec::H264, true, data)
+            .unwrap()
+            .into_parts();
+        assert_eq!(unit.payload.as_ptr(), address);
+        assert!(matches!(
+            registry.prepare(&session, 1, 1, MediaCodec::H264, true, MustNotCopy),
+            Err(AgentRenderRouteError::NonMonotonicSequence)
+        ));
+        registry.remove(&session);
+        assert!(matches!(
+            registry.prepare(&session, 2, 1, MediaCodec::H264, true, MustNotCopy),
+            Err(AgentRenderRouteError::MissingSession)
+        ));
     }
 }

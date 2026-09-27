@@ -244,6 +244,47 @@ fn nvdec_decoder_can_emit_nv12_frame() {
     assert!(pitch >= 128);
     assert!(nv12.len() >= pitch * 128 * 3 / 2);
     assert!(frames[0].cpu_rgb24().is_none());
+    assert!(
+        nv12[0] < nv12[127 * pitch + 127],
+        "decoded luma must preserve the source gradient"
+    );
+    assert_eq!(
+        decoder.diagnostics().cpu_readback_frames,
+        frames.len() as u64
+    );
+    assert_eq!(decoder.diagnostics().cpu_readback_bytes, nv12.len() as u64);
+}
+
+#[test]
+#[cfg(windows)]
+fn nvdec_optional_shared_output_reports_gpu_copy_or_cpu_fallback() {
+    let mut decoder = match NvdecDecoder::new_with_output_mode(NvdecOutputMode::CpuNv12) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            eprintln!("SKIP optional shared hardware probe: {error}");
+            return;
+        }
+    };
+    decoder.enable_shared_texture(true);
+    decoder
+        .push_access_unit(&encoded_access_unit())
+        .expect("optional shared decode");
+    let frames = decoder.drain_decoded_frames();
+    assert!(!frames.is_empty());
+    let diagnostics = decoder.diagnostics();
+    if frames[0].is_shared_texture() {
+        assert!(frames[0].gpu_lease().is_some());
+        assert!(diagnostics.gpu_copy_bytes > 0);
+        assert_eq!(diagnostics.cpu_readback_bytes, 0);
+    } else {
+        let (nv12, pitch) = frames[0].cpu_nv12().expect("explicit NV12 fallback");
+        assert!(nv12[0] < nv12[127 * pitch + 127]);
+        assert_eq!(diagnostics.cpu_readback_frames, frames.len() as u64);
+        assert!(diagnostics.cpu_readback_bytes > 0);
+        assert!(diagnostics.shared_copy_failures > 0);
+        assert!(diagnostics.last_shared_copy_api.is_some());
+    }
+    eprintln!("optional shared hardware probe: gpu_copy_bytes={}, cpu_readback_bytes={}, shared_failure_api={:?}, shared_failure_code={:?}", diagnostics.gpu_copy_bytes, diagnostics.cpu_readback_bytes, diagnostics.last_shared_copy_api, diagnostics.last_shared_copy_code);
 }
 
 #[test]
@@ -295,22 +336,27 @@ fn nvdec_decoder_shared_texture_flag_emits_shared_frame() {
             return;
         }
     };
-    decoder.enable_shared_texture(true);
+    decoder.require_shared_texture();
 
     let access_unit = encoded_access_unit();
     decoder
         .push_access_unit(access_unit.as_slice())
-        .expect("first access unit should initialize shared output textures");
-    let _ = decoder.drain_decoded_frames();
-    decoder
-        .push_access_unit(access_unit.as_slice())
-        .expect("second access unit should traverse shared texture path");
+        .unwrap_or_else(|error| {
+            panic!(
+                "first access unit must produce shared output: {error}; diagnostics={:?}",
+                decoder.diagnostics()
+            )
+        });
 
     let frames = decoder.drain_decoded_frames();
     assert!(
         frames.iter().any(|frame| frame.is_shared_texture()),
-        "shared texture flag should emit D3D11 shared frames, got: {frames:?}"
+        "shared texture mode must emit the first frame; diagnostics={:?}",
+        decoder.diagnostics()
     );
+    assert_eq!(decoder.diagnostics().cpu_readback_frames, 0);
+    assert_eq!(decoder.diagnostics().cpu_readback_bytes, 0);
+    assert!(decoder.diagnostics().gpu_copy_bytes > 0);
 }
 
 #[test]

@@ -230,7 +230,7 @@ fn spawn_receivers(
             };
             if is_quic_media_v3_datagram(&payload) {
                 let raw_payload = payload.clone();
-                let Ok(Some(frame)) = media.push_datagram(&payload) else {
+                let Ok(Some(frame)) = media.push_datagram_owned(payload) else {
                     continue;
                 };
                 if frame.payload_type != QuicMediaPayloadType::AccessUnit {

@@ -1,8 +1,8 @@
 use super::discovery_identity::now_ms;
 use super::media_envelope::{
-    encode_lan_media_envelope, lan_media_codec_name, lan_media_profile_id, LanMediaEnvelope,
-    LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
-    LAN_MEDIA_PAYLOAD_PROBE_FRAME,
+    decode_lan_media_envelope, lan_media_codec_name, lan_media_profile_id,
+    validate_lan_media_profile, LanMediaEnvelope, LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264,
+    LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT, LAN_MEDIA_PAYLOAD_PROBE_FRAME,
 };
 use super::media_frame_preparation::{decoded_frame_format_stage, decoded_frame_pixel_format};
 use super::media_probe::decoded_video_probe_format;
@@ -21,6 +21,127 @@ use mrd_transport_quic_quinn::{
 };
 use std::sync::Arc;
 
+/// Complete receiver input. Mux and v3 frames already have metadata and must
+/// not be serialized, fragmented, then reassembled again inside this process.
+pub(super) struct LanReceivedMediaFrame {
+    pub(super) frame_id: u32,
+    pub(super) is_keyframe: bool,
+    pub(super) received_bytes: u64,
+    pub(super) envelope: LanMediaEnvelope,
+}
+
+impl super::media_ordering::LanOrderedMediaFrame for LanReceivedMediaFrame {
+    fn frame_id(&self) -> u32 {
+        self.frame_id
+    }
+}
+
+impl LanReceivedMediaFrame {
+    pub(super) fn from_legacy(frame: QuicAuFrame) -> Result<Self> {
+        Ok(Self {
+            frame_id: frame.frame_id,
+            is_keyframe: frame.is_keyframe,
+            received_bytes: frame.payload.len() as u64,
+            envelope: decode_lan_media_envelope(&frame.payload)?,
+        })
+    }
+
+    pub(super) fn from_transport(
+        unit: super::media_receiver::TransportVideoAccessUnit,
+        mut profile: MediaProfile,
+    ) -> Result<Self> {
+        profile.width = unit.width;
+        profile.height = unit.height;
+        validate_lan_media_profile(&profile)?;
+        Ok(Self {
+            frame_id: unit.sequence as u32,
+            is_keyframe: unit.is_keyframe,
+            received_bytes: unit.bytes.len() as u64,
+            envelope: LanMediaEnvelope {
+                payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+                codec: unit.codec.envelope_codec(),
+                sequence: unit.sequence,
+                timestamp_us: unit.timestamp_us,
+                profile,
+                payload: unit.bytes,
+            },
+        })
+    }
+}
+
+pub(super) enum LanReceiverInput {
+    Datagram(bytes::Bytes),
+    Frame(LanReceivedMediaFrame),
+}
+
+#[cfg(test)]
+mod received_frame_tests {
+    use super::super::media_access_unit::LanAccessUnitCodec;
+    use super::super::media_receiver::TransportVideoAccessUnit;
+    use super::*;
+
+    #[test]
+    fn complete_mux_frame_keeps_payload_allocation_through_ordering() {
+        let bytes = vec![0, 0, 0, 1, 0x65, 2, 3];
+        let address = bytes.as_ptr();
+        let frame = LanReceivedMediaFrame::from_transport(
+            TransportVideoAccessUnit {
+                sequence: 7,
+                codec: LanAccessUnitCodec::H264,
+                timestamp_us: 1234,
+                is_keyframe: true,
+                width: 1920,
+                height: 1080,
+                bytes,
+            },
+            MediaProfile {
+                fps: 60,
+                bitrate_mbps: 20,
+                ..MediaProfile::default()
+            },
+        )
+        .unwrap();
+        let mut orderer = super::super::media_ordering::LanMediaFrameOrderer::new(3);
+        let mut ready = orderer.push(frame);
+        assert_eq!(ready.len(), 1);
+        let frame = ready.pop().unwrap();
+        assert_eq!(frame.envelope.payload.as_ptr(), address);
+        assert_eq!(frame.envelope.sequence, 7);
+        assert_eq!(frame.envelope.timestamp_us, 1234);
+        assert_eq!(frame.envelope.profile.width, 1920);
+        assert_eq!(frame.received_bytes, 7);
+        assert!(frame.is_keyframe);
+    }
+
+    #[test]
+    fn complete_mux_frame_rejects_invalid_media_profile() {
+        for (width, height, fps, bitrate_mbps) in [
+            (0, 1080, 60, 20),
+            (1920, 0, 60, 20),
+            (1920, 1080, 0, 20),
+            (1920, 1080, 60, 0),
+        ] {
+            let result = LanReceivedMediaFrame::from_transport(
+                TransportVideoAccessUnit {
+                    sequence: 7,
+                    codec: LanAccessUnitCodec::H264,
+                    timestamp_us: 1234,
+                    is_keyframe: true,
+                    width,
+                    height,
+                    bytes: vec![1],
+                },
+                MediaProfile {
+                    fps,
+                    bitrate_mbps,
+                    ..MediaProfile::default()
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+}
+
 /// Migration rule: an installed Agent route is authoritative even on failure.
 pub(super) fn receiver_should_use_local_render_fallback(
     dispatch: crate::agent_runtime::AgentRenderDispatch,
@@ -28,12 +149,12 @@ pub(super) fn receiver_should_use_local_render_fallback(
     dispatch.allows_local_render_fallback()
 }
 
-pub(super) async fn quic_media_v3_frame_to_legacy_frame(
+pub(super) async fn quic_media_v3_frame_to_received_frame(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
     frame: QuicMediaFrame,
     reassembler_stats: QuicAuReassemblerStats,
-) -> Result<Option<QuicAuFrame>> {
+) -> Result<Option<LanReceivedMediaFrame>> {
     let profile = selected_media_profile(app_state, session_id).await;
     let expected_profile_id = lan_media_profile_id(&profile);
     if frame.profile_id != expected_profile_id {
@@ -83,21 +204,24 @@ pub(super) async fn quic_media_v3_frame_to_legacy_frame(
         envelope_profile.codec = lan_media_codec_name(codec).to_string();
         normalize_lan_media_profile(&mut envelope_profile);
     }
+    validate_lan_media_profile(&envelope_profile)?;
 
-    let envelope_payload = encode_lan_media_envelope(LanMediaEnvelope {
+    let is_keyframe = frame.is_keyframe();
+    let received_bytes = frame.payload.len() as u64;
+    let envelope = LanMediaEnvelope {
         payload_type,
         codec,
         sequence: u64::from(frame.frame_id),
         timestamp_us: frame.timestamp_us,
         profile: envelope_profile,
         payload: frame.payload.to_vec(),
-    })?;
+    };
 
-    Ok(Some(QuicAuFrame {
+    Ok(Some(LanReceivedMediaFrame {
         frame_id: frame.frame_id,
-        timestamp_us: frame.timestamp_us,
-        is_keyframe: frame.is_keyframe(),
-        payload: envelope_payload.into(),
+        is_keyframe,
+        received_bytes,
+        envelope,
     }))
 }
 

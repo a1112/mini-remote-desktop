@@ -210,10 +210,17 @@ $headers = @(
   'color_mode','color_pipeline',
   'nvdec_shared_copy_attempts','nvdec_shared_copy_successes','nvdec_shared_copy_failures',
   'nvdec_shared_copy_last_stage','nvdec_shared_copy_last_api','nvdec_shared_copy_last_error',
-  'failure_reason','run_skipped','run_passed'
+  'failure_reason','run_skipped','run_passed',
+  'zero_copy_requested','zero_copy_scope','observed_memory_path','memory_path_evidence'
 )
 $row = [pscustomobject]@{}
-foreach ($header in $headers) { $row | Add-Member -NotePropertyName $header -NotePropertyValue $summary.$header }
+foreach ($header in $headers) {
+  $value = $summary.$header
+  if ($header -eq 'memory_path_evidence' -and $null -ne $value) {
+    $value = $value | ConvertTo-Json -Depth 4 -Compress
+  }
+  $row | Add-Member -NotePropertyName $header -NotePropertyValue $value
+}
 $row | Export-Csv -Path $csvPath -NoTypeInformation -Encoding Ascii
 
 $report = @(
@@ -238,6 +245,8 @@ $report = @(
   "",
   "## Metrics",
   "",
+  "Zero-copy scope: observed CPU pixel-buffer transfers at capture/encode/decode/render boundaries. GPU-internal copies and encoded-bitstream copies are excluded. Empty values mean unknown; requested mode is not runtime evidence.",
+  "",
   "| Metric | Value |",
   "| --- | --- |",
   "| fps_observed | $($summary.fps_observed) |",
@@ -246,6 +255,10 @@ $report = @(
   "| encoded_fps | $($summary.encoded_fps) |",
   "| decoded_fps | $($summary.decoded_fps) |",
   "| zero_copy_enabled | $($summary.zero_copy_enabled) |",
+  "| zero_copy_requested | $($summary.zero_copy_requested) |",
+  "| zero_copy_scope | $($summary.zero_copy_scope) |",
+  "| observed_memory_path | $($summary.observed_memory_path) |",
+  "| memory_path_evidence | $($summary.memory_path_evidence | ConvertTo-Json -Depth 4 -Compress) |",
   "| total_bitstream_bytes | $($summary.total_bitstream_bytes) |",
   "| encode_total_p95_ms | $($summary.encode_total_p95_ms) |",
   "| send_write_p95_ms | $($summary.send_write_p95_ms) |",

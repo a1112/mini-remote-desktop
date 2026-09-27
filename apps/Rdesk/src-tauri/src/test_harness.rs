@@ -36,7 +36,8 @@ use mrd_encode_vvenc::VvencSoftwareEncoder;
 use mrd_observability::PipelineComparisonResult;
 use mrd_pipeline_core::{
     CapturedFrame, ColorMode, ColorPipeline, DecodedFrame, DecodedFrameData, EncodedAccessUnit,
-    FrameCapture, FramePixelFormat, PipelineError, VideoCodec, VideoDecoder, VideoEncoder,
+    FrameCapture, FrameMemoryKind, FramePixelFormat, PipelineError, VideoCodec, VideoDecoder,
+    VideoEncoder,
 };
 use mrd_render::{
     RenderFrame, RenderFrameData, RenderPixelFormat, RenderTarget, RendererFactory,
@@ -379,8 +380,120 @@ fn start_linux_capture_session(capture: &mut PipewireScreenCapture) -> Result<()
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservedFrameMemory {
+    Cpu,
+    Shared,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryPathObservation {
+    pub cpu_frames: u64,
+    pub shared_frames: u64,
+    pub unknown_frames: u64,
+}
+
+impl MemoryPathObservation {
+    fn record(&mut self, memory: ObservedFrameMemory) {
+        let count = match memory {
+            ObservedFrameMemory::Cpu => &mut self.cpu_frames,
+            ObservedFrameMemory::Shared => &mut self.shared_frames,
+            ObservedFrameMemory::Unknown => &mut self.unknown_frames,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
+/// Observed pixel-buffer boundaries, excluding GPU-internal and bitstream copies.
+/// A shared handle is evidence of a shared interface, not proof of strict zero-copy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryPathEvidence {
+    pub capture: MemoryPathObservation,
+    pub encode: MemoryPathObservation,
+    pub decode: MemoryPathObservation,
+    pub render: MemoryPathObservation,
+}
+
+impl MemoryPathEvidence {
+    fn stages(&self) -> [&MemoryPathObservation; 4] {
+        [&self.capture, &self.encode, &self.decode, &self.render]
+    }
+
+    pub fn zero_copy_enabled(&self) -> Option<bool> {
+        let stages = self.stages();
+        if stages.iter().any(|stage| stage.cpu_frames > 0) {
+            Some(false)
+        } else if stages
+            .iter()
+            .all(|stage| stage.shared_frames > 0 && stage.unknown_frames == 0)
+        {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    pub fn memory_path(&self) -> &'static str {
+        match self.zero_copy_enabled() {
+            Some(true) => "d3d11-shared",
+            Some(false) if self.stages().iter().any(|stage| stage.shared_frames > 0) => "mixed",
+            Some(false) => "cpu",
+            None => "unknown",
+        }
+    }
+}
+
+fn captured_frame_memory(frame: &CapturedFrame) -> ObservedFrameMemory {
+    if !frame.data.is_empty() {
+        return ObservedFrameMemory::Cpu;
+    }
+    #[cfg(windows)]
+    if frame
+        .d3d11_shared_bgra()
+        .is_some_and(|shared| shared.shared_handle != 0)
+    {
+        return ObservedFrameMemory::Shared;
+    }
+    ObservedFrameMemory::Unknown
+}
+
+fn encoded_input_memory(
+    frame: &CapturedFrame,
+    encoder_memory: FrameMemoryKind,
+) -> ObservedFrameMemory {
+    let memory = captured_frame_memory(frame);
+    if memory != ObservedFrameMemory::Shared {
+        return memory;
+    }
+    #[cfg(windows)]
+    if encoder_memory == FrameMemoryKind::D3D11SharedBgra {
+        return ObservedFrameMemory::Shared;
+    }
+    let _ = encoder_memory;
+    ObservedFrameMemory::Unknown
+}
+
+fn decoded_frame_memory(frame: &DecodedFrame) -> ObservedFrameMemory {
+    if frame.cpu_bytes().is_some_and(|bytes| !bytes.is_empty()) {
+        return ObservedFrameMemory::Cpu;
+    }
+    #[cfg(windows)]
+    if frame
+        .d3d11_shared_handles()
+        .is_some_and(|(y, uv)| y != 0 && uv != 0)
+    {
+        return ObservedFrameMemory::Shared;
+    }
+    ObservedFrameMemory::Unknown
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessMetrics {
+    #[serde(default)]
+    pub zero_copy_requested: Option<bool>,
+    #[serde(default)]
+    pub memory_path_evidence: MemoryPathEvidence,
     pub is_running: bool,
     pub capture_fps: f64,
     pub encoded_fps: f64,
@@ -505,6 +618,8 @@ impl HarnessMetrics {
 impl Default for HarnessMetrics {
     fn default() -> Self {
         Self {
+            zero_copy_requested: None,
+            memory_path_evidence: MemoryPathEvidence::default(),
             is_running: false,
             capture_fps: 0.0,
             encoded_fps: 0.0,
@@ -859,6 +974,7 @@ enum RenderInput {
 
 #[derive(Debug, Clone, Default)]
 struct RenderPacingCounters {
+    memory_path_evidence: MemoryPathEvidence,
     submitted_frames: u64,
     uploaded_frames: u64,
     presented_frames: u64,
@@ -902,6 +1018,7 @@ impl NvdecSharedCopyStats {
 
 #[derive(Debug, Clone)]
 struct RenderCompletion {
+    input_memory: ObservedFrameMemory,
     snapshot: RendererSnapshot,
     present_events: Vec<mrd_render::RendererPresentEvent>,
     upload_started_at: Instant,
@@ -910,12 +1027,15 @@ struct RenderCompletion {
 
 #[derive(Debug, Clone)]
 struct RenderUploadTiming {
+    input_memory: ObservedFrameMemory,
+    snapshot: RendererSnapshot,
     started_at: Instant,
     completed_at: Instant,
 }
 
 struct RenderJob {
     input: RenderInput,
+    shared_upload_without_cpu_transfer: bool,
     completion: mpsc::SyncSender<std::result::Result<RenderCompletion, String>>,
 }
 
@@ -1081,6 +1201,9 @@ impl Drop for LatestRenderScheduler {
 }
 
 struct PipelineRenderer {
+    /// Set only after constructing the concrete D3D11 implementation. Other
+    /// renderers can accept shared input while internally falling back to CPU.
+    shared_upload_without_cpu_transfer: bool,
     sender: Option<mpsc::SyncSender<RenderCommand>>,
     render_thread: Option<thread::JoinHandle<()>>,
     render_done: Option<mpsc::Receiver<()>>,
@@ -1129,6 +1252,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
+                shared_upload_without_cpu_transfer: true,
                 sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
@@ -1164,6 +1288,7 @@ impl PipelineRenderer {
                 .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
             return Ok(Self {
+                shared_upload_without_cpu_transfer: false,
                 sender: Some(sender),
                 render_thread: Some(render_thread),
                 render_done: Some(render_done_rx),
@@ -1193,6 +1318,7 @@ impl PipelineRenderer {
             .map_err(|error| anyhow::anyhow!("spawn render thread failed: {error}"))?;
 
         Ok(Self {
+            shared_upload_without_cpu_transfer: false,
             sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
@@ -1222,7 +1348,11 @@ impl PipelineRenderer {
         self.sender
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("native render thread is stopping"))?
-            .send(RenderCommand::Frame(RenderJob { input, completion }))
+            .send(RenderCommand::Frame(RenderJob {
+                input,
+                shared_upload_without_cpu_transfer: self.shared_upload_without_cpu_transfer,
+                completion,
+            }))
             .map_err(|_| anyhow::anyhow!("native render thread stopped"))?;
         match done.recv_timeout(Duration::from_millis(NATIVE_RENDER_FRAME_TIMEOUT_MS)) {
             Ok(Ok(completion)) => Ok(completion),
@@ -1578,24 +1708,51 @@ fn run_d3d11_render_loop(
 fn upload_render_input(
     renderer: &mut dyn RendererInstance,
     input: RenderInput,
+    shared_upload_without_cpu_transfer: bool,
 ) -> Result<RenderUploadTiming> {
+    let input_memory = match &input {
+        RenderInput::Captured(frame) => captured_frame_memory(frame),
+        RenderInput::Decoded(frame) => decoded_frame_memory(frame),
+    };
+    let input_memory =
+        if input_memory == ObservedFrameMemory::Shared && !shared_upload_without_cpu_transfer {
+            ObservedFrameMemory::Unknown
+        } else {
+            input_memory
+        };
     let frame = render_input_to_frame(input);
+    let presented_before = if input_memory == ObservedFrameMemory::Shared {
+        renderer.snapshot().presented_frame_count
+    } else {
+        0
+    };
     let started_at = Instant::now();
     renderer
         .upload_frame(frame)
         .map_err(|error| anyhow::anyhow!("upload frame to renderer failed: {error}"))?;
     let completed_at = Instant::now();
+    let snapshot = renderer.snapshot();
+    let input_memory = if input_memory == ObservedFrameMemory::Shared
+        && snapshot.presented_frame_count <= presented_before
+    {
+        ObservedFrameMemory::Unknown
+    } else {
+        input_memory
+    };
     Ok(RenderUploadTiming {
+        input_memory,
+        snapshot,
         started_at,
         completed_at,
     })
 }
 
 fn complete_render_job(renderer: &mut dyn RendererInstance, job: RenderJob) -> Result<()> {
-    match upload_render_input(renderer, job.input) {
+    match upload_render_input(renderer, job.input, job.shared_upload_without_cpu_transfer) {
         Ok(timing) => {
             let completion = RenderCompletion {
-                snapshot: renderer.snapshot(),
+                input_memory: timing.input_memory,
+                snapshot: timing.snapshot,
                 present_events: renderer.drain_present_events(),
                 upload_started_at: timing.started_at,
                 upload_completed_at: timing.completed_at,
@@ -1995,6 +2152,7 @@ impl TestHarness {
         {
             let mut m = metrics.lock().unwrap();
             *m = HarnessMetrics::default();
+            m.zero_copy_requested = config.zero_copy;
             m.is_running = true;
             m.color_mode = Some(resolved_color_mode(&config).as_str().to_string());
             m.color_pipeline = Some(
@@ -3062,6 +3220,10 @@ impl TestHarness {
                 }
             };
             last_capture_success = Instant::now();
+            render_pacing
+                .memory_path_evidence
+                .capture
+                .record(captured_frame_memory(&captured_frame));
             let capture_latency = capture_start.elapsed();
             let interactive_start = Instant::now();
 
@@ -3088,6 +3250,15 @@ impl TestHarness {
                 };
                 let encoded_unit_count = encoded_units.len();
                 encoded_units.retain(|unit| !unit.bytes.is_empty());
+                if !encoded_units.is_empty() {
+                    render_pacing
+                        .memory_path_evidence
+                        .encode
+                        .record(encoded_input_memory(
+                            frame_for_encode,
+                            encoder.input_memory_kind(),
+                        ));
+                }
                 dropped_frames += encoded_unit_count.saturating_sub(encoded_units.len());
                 encoded_units_total += encoded_units.len();
                 total_bitstream_bytes += encoded_units
@@ -3139,6 +3310,12 @@ impl TestHarness {
                             Ok(()) => {
                                 pushed_any = true;
                                 decoded_frames = decoder.drain_decoded_frames();
+                                for frame in &decoded_frames {
+                                    render_pacing
+                                        .memory_path_evidence
+                                        .decode
+                                        .record(decoded_frame_memory(frame));
+                                }
                                 decoded_frames_total += decoded_frames.len();
                                 if !decoded_frames.is_empty() {
                                     break;
@@ -3516,6 +3693,7 @@ impl TestHarness {
         m.render_draw_present_latency_p50_ms = p50_render_draw_present.as_secs_f64() * 1000.0;
         m.render_draw_present_latency_p95_ms = p95_render_draw_present.as_secs_f64() * 1000.0;
         m.render_submitted_frames = render_pacing.submitted_frames;
+        m.memory_path_evidence = render_pacing.memory_path_evidence;
         m.render_uploaded_frames = render_pacing.uploaded_frames;
         m.render_presented_frames = render_pacing.presented_frames;
         m.render_present_skipped_frames = render_pacing.present_skipped_frames;
@@ -3603,6 +3781,10 @@ impl TestHarness {
             drained += 1;
             match completion.result {
                 Ok(render_completion) => {
+                    render_pacing
+                        .memory_path_evidence
+                        .render
+                        .record(render_completion.input_memory);
                     let previous_snapshot = last_render_snapshot.clone();
                     Self::record_render_completion(
                         render_pacing,
@@ -3842,11 +4024,7 @@ impl TestHarness {
         let metrics = self.get_metrics();
         let (pipeline, codec) = comparison_labels(&self.chain);
         let transport = comparison_transport_label(&self.chain, self.config.transport.as_ref());
-        let memory_path = if self.config.zero_copy.unwrap_or(false) {
-            "d3d11-shared"
-        } else {
-            "cpu"
-        };
+        let memory_path = metrics.memory_path_evidence.memory_path();
         metrics.to_pipeline_comparison_result(pipeline, codec, memory_path, transport)
     }
 }
@@ -4269,6 +4447,7 @@ fn render_pixel_format_label(pixel_format: RenderPixelFormat) -> String {
         RenderPixelFormat::Rgb24 => "Rgb24",
         RenderPixelFormat::Bgra32 => "Bgra32",
         RenderPixelFormat::Nv12 => "Nv12",
+        RenderPixelFormat::P010 => "P010",
         #[cfg(windows)]
         RenderPixelFormat::D3D11SharedBgra => "D3D11SharedBgra",
         #[cfg(windows)]
@@ -4453,6 +4632,7 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
         mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             width: _,
             height: _,
         } => DecodedFrame::from_d3d11_shared_nv12(
@@ -4461,11 +4641,13 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
             0,
             shared_handle_y,
             shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease),
         #[cfg(windows)]
         mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedP010 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             width: _,
             height: _,
         } => DecodedFrame::from_d3d11_shared_p010(
@@ -4474,7 +4656,8 @@ fn nvdec_frame_to_decoded_frame(frame: mrd_decode_nvdec::NvdecDecodedFrame) -> D
             0,
             shared_handle_y,
             shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease),
     }
 }
 
@@ -4511,6 +4694,11 @@ fn render_input_to_preview_bgra(
         RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
             anyhow::bail!("NV12 render preview conversion is not implemented")
         }
+        RenderFrameData::P010 { data, pitch } => (
+            cpu_p010_to_bgra32(&data, frame.width, frame.height, pitch),
+            frame.width,
+            frame.height,
+        ),
         #[cfg(windows)]
         RenderFrameData::D3D11SharedBgra { .. } => {
             anyhow::bail!("D3D11 shared texture preview is not CPU-readable")
@@ -4558,24 +4746,28 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
         DecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => RenderFrame::from_d3d11_shared_nv12(
             frame.width,
             frame.height,
             *shared_handle_y,
             *shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease.clone()),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedP010 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => RenderFrame::from_d3d11_shared_p010(
             frame.width,
             frame.height,
             *shared_handle_y,
             *shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease.clone()),
     }
 }
 
@@ -5719,6 +5911,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingRenderer {
         uploaded: usize,
+        skipped_present_status: Option<&'static str>,
+        presented_before_skip: u64,
     }
 
     impl RendererInstance for RecordingRenderer {
@@ -5735,10 +5929,18 @@ mod tests {
             RendererSnapshot {
                 attached_to_target: true,
                 uploaded_frame_count: self.uploaded as u64,
-                presented_frame_count: self.uploaded as u64,
+                presented_frame_count: if self.skipped_present_status.is_some() {
+                    self.presented_before_skip
+                } else {
+                    self.uploaded as u64
+                },
                 present_skipped_count: 0,
                 render_queue_replacements: None,
-                last_present_status: Some("presented".to_string()),
+                last_present_status: Some(
+                    self.skipped_present_status
+                        .unwrap_or("presented")
+                        .to_string(),
+                ),
                 low_latency_frame_latency_target: None,
                 swap_chain_max_frame_latency: None,
                 swap_chain_allow_tearing: None,
@@ -5988,6 +6190,7 @@ mod tests {
             &mut renderer,
             RenderJob {
                 input,
+                shared_upload_without_cpu_transfer: false,
                 completion: completion_tx,
             },
         )
@@ -6409,6 +6612,238 @@ mod tests {
     }
 
     #[test]
+    fn zero_copy_requested_without_frames_reports_unknown_memory_path() {
+        let mut harness = TestHarness::new().unwrap();
+        harness.set_config(TestConfig {
+            zero_copy: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            harness.get_pipeline_comparison_result().memory_path,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn zero_copy_evidence_requires_all_four_observed_stages() {
+        let mut evidence = MemoryPathEvidence::default();
+        assert_eq!(evidence.zero_copy_enabled(), None);
+        evidence.capture.record(ObservedFrameMemory::Shared);
+        evidence.decode.record(ObservedFrameMemory::Shared);
+        evidence.render.record(ObservedFrameMemory::Shared);
+        assert_eq!(
+            evidence.zero_copy_enabled(),
+            None,
+            "encoder input is not evidenced"
+        );
+        evidence.encode.record(ObservedFrameMemory::Shared);
+        assert_eq!(evidence.zero_copy_enabled(), Some(true));
+        assert_eq!(evidence.memory_path(), "d3d11-shared");
+        evidence.encode.record(ObservedFrameMemory::Unknown);
+        assert_eq!(evidence.zero_copy_enabled(), None);
+    }
+
+    #[test]
+    fn zero_copy_evidence_never_hides_a_cpu_fallback() {
+        for stage in 0..4 {
+            let mut evidence = MemoryPathEvidence::default();
+            let stages = [
+                &mut evidence.capture,
+                &mut evidence.encode,
+                &mut evidence.decode,
+                &mut evidence.render,
+            ];
+            for (index, observation) in stages.into_iter().enumerate() {
+                observation.record(ObservedFrameMemory::Shared);
+                if index == stage {
+                    observation.record(ObservedFrameMemory::Cpu);
+                }
+            }
+            assert_eq!(evidence.zero_copy_enabled(), Some(false));
+            assert_eq!(evidence.memory_path(), "mixed");
+        }
+        let mut evidence = MemoryPathEvidence::default();
+        evidence.capture.record(ObservedFrameMemory::Cpu);
+        assert_eq!(evidence.memory_path(), "cpu");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_frame_evidence_checks_encoder_contract_and_actual_buffers() {
+        let frame = CapturedFrame::from_d3d11_shared_bgra(2, 2, 1, 77, 8);
+        assert_eq!(captured_frame_memory(&frame), ObservedFrameMemory::Shared);
+        assert_eq!(
+            encoded_input_memory(&frame, FrameMemoryKind::D3D11SharedBgra),
+            ObservedFrameMemory::Shared
+        );
+        assert_eq!(
+            encoded_input_memory(&frame, FrameMemoryKind::Cpu),
+            ObservedFrameMemory::Unknown
+        );
+        let cpu = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 1, vec![0; 16]);
+        assert_eq!(
+            encoded_input_memory(&cpu, FrameMemoryKind::D3D11SharedBgra),
+            ObservedFrameMemory::Cpu
+        );
+        let mut invalid = frame;
+        invalid.d3d11_shared_bgra.as_mut().unwrap().shared_handle = 0;
+        assert_eq!(
+            captured_frame_memory(&invalid),
+            ObservedFrameMemory::Unknown
+        );
+        let decoded = DecodedFrame::from_d3d11_shared_nv12(2, 2, 1, 77, 78);
+        assert_eq!(decoded_frame_memory(&decoded), ObservedFrameMemory::Shared);
+        let empty = DecodedFrame::from_cpu_rgb24(2, 2, 1, Vec::new());
+        assert_eq!(decoded_frame_memory(&empty), ObservedFrameMemory::Unknown);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_shared_frame_conversions_keep_gpu_lease_until_render_drop() {
+        for p010 in [false, true] {
+            let owner = Arc::new(());
+            let lease = mrd_pipeline_core::GpuFrameLease::from_arc(owner.clone());
+            let data = if p010 {
+                mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedP010 {
+                    shared_handle_y: 77,
+                    shared_handle_uv: 78,
+                    width: 2,
+                    height: 2,
+                    lease: Some(lease),
+                }
+            } else {
+                mrd_decode_nvdec::NvdecDecodedFrameData::D3D11SharedNv12 {
+                    shared_handle_y: 77,
+                    shared_handle_uv: 78,
+                    width: 2,
+                    height: 2,
+                    lease: Some(lease),
+                }
+            };
+            let decoded = nvdec_frame_to_decoded_frame(mrd_decode_nvdec::NvdecDecodedFrame {
+                width: 2,
+                height: 2,
+                data,
+            });
+            assert!(decoded.gpu_lease().is_some());
+            let rendered = decoded_frame_to_render_frame(&decoded);
+            assert!(rendered.gpu_lease().is_some());
+            drop(decoded);
+            assert!(Arc::strong_count(&owner) > 1);
+            drop(rendered);
+            assert_eq!(Arc::strong_count(&owner), 1);
+        }
+    }
+
+    #[test]
+    fn zero_copy_render_completion_records_the_uploaded_memory_path() {
+        let mut renderer = RecordingRenderer::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        complete_render_job(
+            &mut renderer,
+            RenderJob {
+                input: captured_render_input_with_marker(1),
+                shared_upload_without_cpu_transfer: false,
+                completion: tx,
+            },
+        )
+        .unwrap();
+        let completion = rx.recv().unwrap().unwrap();
+        assert_eq!(completion.input_memory, ObservedFrameMemory::Cpu);
+        assert_eq!(completion.snapshot.uploaded_frame_count, 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_shared_input_through_opaque_renderer_is_unknown() {
+        let mut renderer = RecordingRenderer::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        complete_render_job(
+            &mut renderer,
+            RenderJob {
+                input: RenderInput::Decoded(DecodedFrame::from_d3d11_shared_nv12(2, 2, 1, 77, 78)),
+                shared_upload_without_cpu_transfer: false,
+                completion: tx,
+            },
+        )
+        .unwrap();
+        let completion = rx.recv().unwrap().unwrap();
+        assert_eq!(completion.snapshot.uploaded_frame_count, 1);
+        assert_eq!(completion.input_memory, ObservedFrameMemory::Unknown);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_shared_upload_without_a_present_is_unknown() {
+        for status in ["no_target", "skipped_still_drawing", "skipped_waitable"] {
+            let mut renderer = RecordingRenderer {
+                skipped_present_status: Some(status),
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::sync_channel(1);
+            complete_render_job(
+                &mut renderer,
+                RenderJob {
+                    input: RenderInput::Decoded(DecodedFrame::from_d3d11_shared_nv12(
+                        2, 2, 1, 77, 78,
+                    )),
+                    shared_upload_without_cpu_transfer: true,
+                    completion: tx,
+                },
+            )
+            .unwrap();
+            let completion = rx.recv().unwrap().unwrap();
+            assert_eq!(completion.snapshot.uploaded_frame_count, 1);
+            assert_eq!(completion.snapshot.presented_frame_count, 0);
+            assert_eq!(
+                completion.input_memory,
+                ObservedFrameMemory::Unknown,
+                "{status}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_shared_upload_requires_a_new_present() {
+        let mut renderer = RecordingRenderer {
+            uploaded: 7,
+            skipped_present_status: Some("skipped_still_drawing"),
+            presented_before_skip: 7,
+        };
+        let timing = upload_render_input(
+            &mut renderer,
+            RenderInput::Decoded(DecodedFrame::from_d3d11_shared_nv12(2, 2, 1, 77, 78)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(timing.snapshot.presented_frame_count, 7);
+        assert_eq!(timing.input_memory, ObservedFrameMemory::Unknown);
+
+        renderer.skipped_present_status = None;
+        let timing = upload_render_input(
+            &mut renderer,
+            RenderInput::Decoded(DecodedFrame::from_d3d11_shared_nv12(2, 2, 1, 77, 78)),
+            true,
+        )
+        .unwrap();
+        assert_eq!(timing.input_memory, ObservedFrameMemory::Shared);
+    }
+
+    #[test]
+    fn zero_copy_metrics_deserialize_legacy_reports_as_unknown() {
+        let mut value = serde_json::to_value(HarnessMetrics::default()).unwrap();
+        value.as_object_mut().unwrap().remove("zero_copy_requested");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_path_evidence");
+        let metrics: HarnessMetrics = serde_json::from_value(value).unwrap();
+        assert_eq!(metrics.zero_copy_requested, None);
+        assert_eq!(metrics.memory_path_evidence.zero_copy_enabled(), None);
+    }
+
+    #[test]
     fn harness_metrics_export_prefers_decoded_fps_for_receiver_observed_fps() {
         let metrics = HarnessMetrics {
             capture_fps: 144.0,
@@ -6682,6 +7117,7 @@ mod tests {
             let _ = render_done_tx.send(());
         });
         let renderer = PipelineRenderer {
+            shared_upload_without_cpu_transfer: false,
             sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),
@@ -6707,6 +7143,7 @@ mod tests {
             let _ = render_done_tx.send(());
         });
         let renderer = PipelineRenderer {
+            shared_upload_without_cpu_transfer: false,
             sender: Some(sender),
             render_thread: Some(render_thread),
             render_done: Some(render_done_rx),

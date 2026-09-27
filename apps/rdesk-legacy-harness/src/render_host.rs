@@ -220,6 +220,7 @@ impl RenderHost {
                     mrd_render::RenderFrameData::Bgra32(data) => data.len(),
                     mrd_render::RenderFrameData::Nv12 { data, .. } => data.len(),
                     mrd_render::RenderFrameData::Nv12Bytes { data, .. } => data.len(),
+                    mrd_render::RenderFrameData::P010 { data, .. } => data.len(),
                     #[cfg(windows)]
                     mrd_render::RenderFrameData::D3D11SharedBgra { .. } => {
                         render_frame.width * render_frame.height * 4
@@ -357,24 +358,28 @@ fn decoded_frame_to_render_frame(frame: &DecodedFrame) -> RenderFrame {
         DecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => RenderFrame::from_d3d11_shared_nv12(
             frame.width,
             frame.height,
             *shared_handle_y,
             *shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease.clone()),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedP010 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => RenderFrame::from_d3d11_shared_p010(
             frame.width,
             frame.height,
             *shared_handle_y,
             *shared_handle_uv,
-        ),
+        )
+        .with_gpu_lease(lease.clone()),
     }
 }
 
@@ -391,6 +396,7 @@ fn renderer_snapshot_response(snapshot: RendererSnapshot) -> RendererSnapshotRes
             RenderPixelFormat::Rgb24 => "Rgb24".to_string(),
             RenderPixelFormat::Bgra32 => "Bgra32".to_string(),
             RenderPixelFormat::Nv12 => "Nv12".to_string(),
+            RenderPixelFormat::P010 => "P010".to_string(),
             #[cfg(windows)]
             RenderPixelFormat::D3D11SharedNv12 => "D3D11SharedNv12".to_string(),
             #[cfg(windows)]
@@ -407,6 +413,26 @@ mod tests {
     use crate::frame_sink::{DecodedFrameSink, DEFAULT_SOURCE_ID};
     use mrd_pipeline_core::DecodedFrame;
     use mrd_proto::SessionId;
+
+    #[test]
+    fn shared_frame_conversion_retains_gpu_lease_until_render_drop() {
+        for p010 in [false, true] {
+            let owner = std::sync::Arc::new(());
+            let lease = mrd_pipeline_core::GpuFrameLease::from_arc(owner.clone());
+            let decoded = if p010 {
+                DecodedFrame::from_d3d11_shared_p010(2, 2, 0, 77, 78)
+            } else {
+                DecodedFrame::from_d3d11_shared_nv12(2, 2, 0, 77, 78)
+            }
+            .with_gpu_lease(Some(lease));
+            let rendered = super::decoded_frame_to_render_frame(&decoded);
+            assert!(rendered.gpu_lease().is_some());
+            drop(decoded);
+            assert!(std::sync::Arc::strong_count(&owner) > 1);
+            drop(rendered);
+            assert_eq!(std::sync::Arc::strong_count(&owner), 1);
+        }
+    }
 
     #[test]
     fn attached_session_exposes_preview_snapshot() {

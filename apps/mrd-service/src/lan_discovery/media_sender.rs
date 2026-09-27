@@ -22,6 +22,15 @@ pub(super) struct LanSenderEncoder {
     pub(super) encoder: Box<dyn VideoEncoder + Send>,
 }
 
+impl LanSenderEncoder {
+    /// A software fallback needs newly captured CPU pixels, not the empty data
+    /// field of a frame that still belongs to the previous GPU capture path.
+    pub(super) fn requires_cpu_capture(&self, frame: &mrd_pipeline_core::CapturedFrame) -> bool {
+        self.encoder.input_memory_kind() == mrd_pipeline_core::FrameMemoryKind::Cpu
+            && !frame.is_cpu_backed()
+    }
+}
+
 /// Validated encoded payload received from the session agent boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentEncodedAccessUnit {
@@ -472,6 +481,21 @@ pub(super) fn preferred_lan_h264_encoder_backends() -> &'static [&'static str] {
 mod tests {
     use super::*;
     use mrd_agent_ipc::AgentEventContext;
+
+    #[test]
+    #[cfg(windows)]
+    fn software_encoder_requires_recapture_of_shared_pixels() {
+        use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
+        let encoder = LanSenderEncoder {
+            codec: LanAccessUnitCodec::H264,
+            backend: "openh264",
+            encoder: Box::new(OpenH264Encoder::new_with_bitrate(16, 16, 30, 100_000).unwrap()),
+        };
+        let shared = CapturedFrame::from_d3d11_shared_bgra(16, 16, 1, 123, 64);
+        assert!(encoder.requires_cpu_capture(&shared));
+        let cpu = CapturedFrame::from_cpu(16, 16, FramePixelFormat::Bgra32, 2, vec![0; 1024]);
+        assert!(!encoder.requires_cpu_capture(&cpu));
+    }
 
     #[test]
     fn hevc_sender_h264_fallback_requires_peer_h264_receiver_capability() {

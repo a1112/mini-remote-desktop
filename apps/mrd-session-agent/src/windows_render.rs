@@ -161,23 +161,27 @@ pub fn decoded_frame_to_render_frame(
         DecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => Ok(RenderFrame::from_d3d11_shared_nv12(
             width,
             height,
             shared_handle_y,
             shared_handle_uv,
-        )),
+        )
+        .with_gpu_lease(lease)),
         DecodedFrameData::D3D11SharedP010 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => Ok(RenderFrame::from_d3d11_shared_p010(
             width,
             height,
             shared_handle_y,
             shared_handle_uv,
-        )),
+        )
+        .with_gpu_lease(lease)),
         DecodedFrameData::CpuI420 {
             data,
             y_pitch,
@@ -187,8 +191,11 @@ pub fn decoded_frame_to_render_frame(
             height,
             i420_to_bgra(width, height, y_pitch, uv_pitch, &data)?,
         )),
-        DecodedFrameData::CpuNv12 { .. } | DecodedFrameData::CpuP010 { .. } => {
-            Err(FrameConversionError::CpuYuvRequiresConversion)
+        DecodedFrameData::CpuNv12 { data, pitch } => {
+            Ok(RenderFrame::from_nv12(width, height, data, pitch))
+        }
+        DecodedFrameData::CpuP010 { data, pitch } => {
+            Ok(RenderFrame::from_p010(width, height, data, pitch))
         }
     }
 }
@@ -254,6 +261,14 @@ pub trait RenderDecoderFactory: Clone + Send + Sync + 'static {
     fn is_available(&self) -> bool;
     /// Create a fresh decoder for one exact render resource.
     fn create(&self) -> Result<SelectedDecoder, PipelineError>;
+    /// Optionally recover a runtime decoder failure at a keyframe. Factories
+    /// without a fallback preserve their existing fail-closed behavior.
+    fn create_fallback(
+        &self,
+        _failed_backend: &str,
+    ) -> Result<Option<SelectedDecoder>, PipelineError> {
+        Ok(None)
+    }
 }
 
 /// Factory boundary for one native renderer per render worker.
@@ -286,6 +301,65 @@ impl RenderDecoderFactory for ProductionDecoderFactory {
     fn create(&self) -> Result<SelectedDecoder, PipelineError> {
         create_hybrid_h264_decoder()
     }
+
+    fn create_fallback(
+        &self,
+        failed_backend: &str,
+    ) -> Result<Option<SelectedDecoder>, PipelineError> {
+        let create = |backend| {
+            mrd_decode::create_decoder(backend).map(|decoder| SelectedDecoder { backend, decoder })
+        };
+        match failed_backend {
+            "nvdec_d3d11_shared" => create("nvdec")
+                .or_else(|_| create("h264_software"))
+                .map(Some),
+            "nvdec" => create("h264_software").map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn decode_with_keyframe_fallback<D: RenderDecoderFactory>(
+    selected: &mut SelectedDecoder,
+    factory: &D,
+    unit: &RenderAccessUnit,
+) -> Result<(), PipelineError> {
+    let mut failure = match selected.decoder.push_access_unit(&unit.payload) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !unit.is_keyframe {
+        return Err(failure);
+    }
+    let mut failed_backend = selected.backend();
+    // Production ordering is shared NVDEC -> CPU NVDEC -> software. Bound the
+    // retry count even when a custom factory accidentally returns a cycle.
+    for _ in 0..2 {
+        let Some(mut candidate) = factory.create_fallback(failed_backend).map_err(|error| {
+            PipelineError::Message(format!(
+                "decode failed: {failure}; fallback creation failed: {error}"
+            ))
+        })?
+        else {
+            return Err(failure);
+        };
+        match candidate.decoder.push_access_unit(&unit.payload) {
+            Ok(()) => {
+                // Success with no frames is valid buffering. Keep this decoder
+                // so the following interframe can complete its first output.
+                *selected = candidate;
+                return Ok(());
+            }
+            Err(error) => {
+                failure = PipelineError::Message(format!(
+                    "decode failed: {failure}; {} retry failed: {error}",
+                    candidate.backend()
+                ));
+                failed_backend = candidate.backend();
+            }
+        }
+    }
+    Err(failure)
 }
 
 /// Cached production D3D11 renderer factory.
@@ -326,7 +400,7 @@ struct RenderWorker {
     session_id: SessionId,
     queue: Arc<SharedRenderQueue>,
     failed: Arc<AtomicBool>,
-    decoder_backend: &'static str,
+    decoder_backend: Arc<Mutex<&'static str>>,
     metrics: Arc<RenderWorkerCounters>,
     join: Option<JoinHandle<()>>,
 }
@@ -408,7 +482,10 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> WindowsRenderAdapter<D, R
     pub fn metrics(&self, resource_id: &[u8; 16]) -> Option<RenderWorkerMetrics> {
         let worker = self.workers.get(resource_id)?;
         Some(RenderWorkerMetrics {
-            decoder_backend: worker.decoder_backend,
+            decoder_backend: *worker
+                .decoder_backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
             enqueued_units: worker.metrics.enqueued_units.load(Ordering::Acquire),
             queue_replacements: worker.metrics.queue_replacements.load(Ordering::Acquire),
             decoded_frames: worker.metrics.decoded_frames.load(Ordering::Acquire),
@@ -432,7 +509,11 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
             .map(|(resource_id, worker)| RenderAdapterMetrics {
                 resource_id: *resource_id,
                 session_id: worker.session_id.clone(),
-                decoder_backend: worker.decoder_backend.to_owned(),
+                decoder_backend: worker
+                    .decoder_backend
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .to_string(),
                 enqueued_units: worker.metrics.enqueued_units.load(Ordering::Acquire),
                 queue_replacements: worker.metrics.queue_replacements.load(Ordering::Acquire),
                 decoded_frames: worker.metrics.decoded_frames.load(Ordering::Acquire),
@@ -472,6 +553,8 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
         let thread_queue = Arc::clone(&shared);
         let thread_failed = Arc::clone(&failed);
         let thread_metrics = Arc::clone(&metrics);
+        let decoder_backend = Arc::new(Mutex::new("initializing"));
+        let thread_backend = decoder_backend.clone();
         let decoder_factory = self.decoder_factory.clone();
         let renderer_factory = self.renderer_factory.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -489,13 +572,15 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
                             Ok((selected, renderer))
                         })
                 });
-                let Ok((selected, mut renderer)) = initialized else {
+                let Ok((mut selected, mut renderer)) = initialized else {
                     thread_failed.store(true, Ordering::Release);
                     let _ = ready_tx.send(None);
                     return;
                 };
                 let backend = selected.backend();
-                let mut decoder = selected.into_decoder();
+                *thread_backend
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = backend;
                 if ready_tx.send(Some(backend)).is_err() {
                     return;
                 }
@@ -520,11 +605,16 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
                     let Some(unit) = unit else {
                         continue;
                     };
-                    if decoder.push_access_unit(&unit.payload).is_err() {
+                    if decode_with_keyframe_fallback(&mut selected, &decoder_factory, &unit)
+                        .is_err()
+                    {
                         thread_failed.store(true, Ordering::Release);
                         return;
                     }
-                    for frame in decoder.drain_decoded_frames() {
+                    *thread_backend
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = selected.backend();
+                    for frame in selected.decoder.drain_decoded_frames() {
                         thread_metrics.decoded_frames.fetch_add(1, Ordering::AcqRel);
                         let Ok(frame) = decoded_frame_to_render_frame(frame) else {
                             thread_failed.store(true, Ordering::Release);
@@ -543,7 +633,7 @@ impl<D: RenderDecoderFactory, R: AgentRendererFactory> RenderAdapter
         let Ok(join) = join else {
             return false;
         };
-        let Ok(Some(decoder_backend)) = ready_rx.recv() else {
+        let Ok(Some(_)) = ready_rx.recv() else {
             let _ = join.join();
             return false;
         };
@@ -664,6 +754,7 @@ mod tests {
             height: 2,
             timestamp_us: 9,
             data: DecodedFrameData::D3D11SharedNv12 {
+                lease: None,
                 shared_handle_y: 11,
                 shared_handle_uv: 12,
                 width: 4,
@@ -675,6 +766,7 @@ mod tests {
         assert!(matches!(
             converted.data,
             RenderFrameData::D3D11SharedNv12 {
+                lease: None,
                 shared_handle_y: 11,
                 shared_handle_uv: 12,
                 width: 4,
@@ -687,6 +779,7 @@ mod tests {
             height: 2,
             timestamp_us: 10,
             data: DecodedFrameData::D3D11SharedP010 {
+                lease: None,
                 shared_handle_y: 21,
                 shared_handle_uv: 22,
                 width: 4,
@@ -698,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_frame_conversion_converts_i420_and_rejects_other_cpu_yuv() {
+    fn decoded_frame_conversion_converts_i420_and_preserves_cpu_planar_yuv() {
         let i420 = DecodedFrame::from_cpu_i420(2, 2, 1, 2, 1, vec![16, 16, 16, 16, 128, 128]);
         let converted = super::decoded_frame_to_render_frame(i420).expect("I420 conversion");
         assert_eq!(
@@ -707,7 +800,14 @@ mod tests {
         );
 
         let nv12 = DecodedFrame::from_cpu_nv12(2, 2, 1, 2, vec![0; 6]);
-        assert!(super::decoded_frame_to_render_frame(nv12).is_err());
+        let converted = super::decoded_frame_to_render_frame(nv12).unwrap();
+        assert_eq!(converted.pixel_format, RenderPixelFormat::Nv12);
+        let bytes = vec![0; 12];
+        let address = bytes.as_ptr();
+        let p010 = DecodedFrame::from_cpu_p010(2, 2, 1, 4, bytes);
+        let converted = super::decoded_frame_to_render_frame(p010).unwrap();
+        assert_eq!(converted.pixel_format, RenderPixelFormat::P010);
+        assert_eq!(converted.as_p010().unwrap().0.as_ptr(), address);
     }
 
     struct EmptyDecoder;
@@ -867,6 +967,185 @@ mod tests {
         assert!(!adapter.stop(&resource_id, &SessionId("other".into())));
         assert!(adapter.stop(&resource_id, &session_id));
         assert!(!adapter.push_access_unit(resource, &unit(2, false)));
+    }
+
+    struct FailedDecoder;
+
+    impl VideoDecoder for FailedDecoder {
+        fn push_access_unit(&mut self, _: &[u8]) -> Result<(), PipelineError> {
+            Err(PipelineError::Message("interop failure".into()))
+        }
+        fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+            Vec::new()
+        }
+    }
+
+    struct BufferedDecoder {
+        first: bool,
+        frames: FrameDecoder,
+    }
+
+    impl VideoDecoder for BufferedDecoder {
+        fn push_access_unit(&mut self, payload: &[u8]) -> Result<(), PipelineError> {
+            if self.first {
+                self.first = false;
+                Ok(())
+            } else {
+                self.frames.push_access_unit(payload)
+            }
+        }
+        fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+            self.frames.drain_decoded_frames()
+        }
+    }
+
+    #[derive(Clone)]
+    struct RuntimeFallbackFactory {
+        mode: u8,
+        attempts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl super::RenderDecoderFactory for RuntimeFallbackFactory {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn create(&self) -> Result<super::SelectedDecoder, PipelineError> {
+            Ok(super::SelectedDecoder {
+                backend: "nvdec_d3d11_shared",
+                decoder: Box::new(FailedDecoder),
+            })
+        }
+        fn create_fallback(
+            &self,
+            failed_backend: &str,
+        ) -> Result<Option<super::SelectedDecoder>, PipelineError> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(failed_backend.to_owned());
+            if failed_backend != "nvdec_d3d11_shared" {
+                return Ok(None);
+            }
+            let decoder: Box<dyn VideoDecoder> = match self.mode {
+                0 => Box::new(FrameDecoder { frames: Vec::new() }),
+                1 => Box::new(BufferedDecoder {
+                    first: true,
+                    frames: FrameDecoder { frames: Vec::new() },
+                }),
+                _ => Box::new(FailedDecoder),
+            };
+            Ok(Some(super::SelectedDecoder {
+                backend: "h264_software",
+                decoder,
+            }))
+        }
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !predicate() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(predicate(), "worker condition did not become true");
+    }
+
+    #[test]
+    fn runtime_keyframe_failure_retries_same_unit_and_updates_backend() {
+        let observation = Arc::new((Mutex::new(RenderObservation::default()), Condvar::new()));
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut adapter = super::WindowsRenderAdapter::with_factories(
+            RuntimeFallbackFactory {
+                mode: 0,
+                attempts: attempts.clone(),
+            },
+            RecordingRendererFactory {
+                observation: observation.clone(),
+            },
+            2,
+        );
+        let (registry, session, id) = render_resource();
+        let resource = registry.get(&id).unwrap();
+        assert!(adapter.start(resource, &session));
+        let mut invalid = unit(7, true);
+        invalid.session_id = "wrong-session".into();
+        assert!(!adapter.push_access_unit(resource, &invalid));
+        invalid = unit(7, true);
+        invalid.resource_id = [8; 16];
+        assert!(!adapter.push_access_unit(resource, &invalid));
+        assert!(attempts.lock().unwrap().is_empty());
+        assert!(adapter.push_access_unit(resource, &unit(7, true)));
+        wait_until(|| observation.0.lock().unwrap().frames.len() == 1);
+        assert_eq!(
+            observation.0.lock().unwrap().frames[0].data,
+            RenderFrameData::Rgb24(vec![7, 2, 3])
+        );
+        assert_eq!(
+            adapter.metrics(&id).unwrap().decoder_backend,
+            "h264_software"
+        );
+        assert_eq!(*attempts.lock().unwrap(), ["nvdec_d3d11_shared"]);
+        assert!(adapter.stop(&id, &session));
+    }
+
+    #[test]
+    fn runtime_fallback_keeps_decoder_that_buffers_first_keyframe() {
+        let observation = Arc::new((Mutex::new(RenderObservation::default()), Condvar::new()));
+        let mut adapter = super::WindowsRenderAdapter::with_factories(
+            RuntimeFallbackFactory {
+                mode: 1,
+                attempts: Arc::new(Mutex::new(Vec::new())),
+            },
+            RecordingRendererFactory {
+                observation: observation.clone(),
+            },
+            2,
+        );
+        let (registry, session, id) = render_resource();
+        let resource = registry.get(&id).unwrap();
+        assert!(adapter.start(resource, &session));
+        assert!(adapter.push_access_unit(resource, &unit(1, true)));
+        wait_until(|| adapter.metrics(&id).unwrap().decoder_backend == "h264_software");
+        assert!(observation.0.lock().unwrap().frames.is_empty());
+        assert!(adapter.push_access_unit(resource, &unit(2, false)));
+        wait_until(|| observation.0.lock().unwrap().frames.len() == 1);
+        assert_eq!(
+            observation.0.lock().unwrap().frames[0].data,
+            RenderFrameData::Rgb24(vec![2, 2, 3])
+        );
+        assert!(adapter.stop(&id, &session));
+    }
+
+    #[test]
+    fn runtime_fallback_double_failure_and_nonkeyframe_failure_remain_closed() {
+        for keyframe in [true, false] {
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let mut adapter = super::WindowsRenderAdapter::with_factories(
+                RuntimeFallbackFactory {
+                    mode: 2,
+                    attempts: attempts.clone(),
+                },
+                RecordingRendererFactory {
+                    observation: Arc::new((
+                        Mutex::new(RenderObservation::default()),
+                        Condvar::new(),
+                    )),
+                },
+                2,
+            );
+            let (registry, session, id) = render_resource();
+            let resource = registry.get(&id).unwrap();
+            assert!(adapter.start(resource, &session));
+            assert!(adapter.push_access_unit(resource, &unit(1, keyframe)));
+            wait_until(|| {
+                adapter.workers[&id]
+                    .failed
+                    .load(std::sync::atomic::Ordering::Acquire)
+            });
+            assert!(!adapter.push_access_unit(resource, &unit(2, true)));
+            assert_eq!(attempts.lock().unwrap().is_empty(), !keyframe);
+            assert_eq!(adapter.metrics(&id).unwrap().presented_frames, 0);
+            assert!(adapter.stop(&id, &session));
+        }
     }
 
     #[test]

@@ -30,6 +30,36 @@ fn nvdec_d3d11_shared_descriptor_is_listed() {
 }
 
 #[test]
+fn nvdec_av1_shared_descriptor_is_listed() {
+    let descriptor = available_decoder_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.id == "nvdec_av1_d3d11_shared")
+        .expect("AV1 NVDEC shared descriptor");
+    assert!(descriptor
+        .output_formats
+        .contains(&PixelFormat::D3d11Texture));
+}
+
+#[test]
+fn cpu_nvdec_descriptors_advertise_their_actual_planar_outputs() {
+    for id in ["nvdec", "nvdec_hevc", "nvdec_av1"] {
+        let descriptor = available_decoder_descriptors()
+            .into_iter()
+            .find(|d| d.id == id)
+            .unwrap();
+        assert!(
+            descriptor.output_formats.contains(&PixelFormat::Nv12),
+            "{id}"
+        );
+    }
+    let descriptor = available_decoder_descriptors()
+        .into_iter()
+        .find(|d| d.id == "nvdec_hevc_main10")
+        .unwrap();
+    assert!(descriptor.output_formats.contains(&PixelFormat::P010));
+}
+
+#[test]
 fn create_nvdec_decoder_returns_explicit_result() {
     let result = create_decoder("nvdec");
     if probe_h264_available().is_ok() {

@@ -1543,6 +1543,11 @@ impl RendererInstance for MacosMetalRenderer {
             RenderFrameData::Nv12Bytes { data, pitch } => {
                 self.upload_nv12(width, height, data.as_ref(), pitch)?;
             }
+            RenderFrameData::P010 { .. } => {
+                return Err(RenderError::Message(
+                    "Metal renderer does not support CPU P010 yet".into(),
+                ));
+            }
             #[cfg(windows)]
             RenderFrameData::D3D11SharedNv12 { .. } | RenderFrameData::D3D11SharedP010 { .. } => {
                 return Err(RenderError::Message(

@@ -182,6 +182,11 @@ impl RendererInstance for OpenglRenderer {
     }
 
     fn upload_frame(&mut self, frame: RenderFrame) -> Result<(), RenderError> {
+        if frame.gpu_lease().is_some() {
+            return Err(RenderError::Message(
+                "OpenGL renderer does not yet support GPU frame completion leases".into(),
+            ));
+        }
         let original_pixel_format = frame.pixel_format;
 
         if frame.is_shared_texture() {

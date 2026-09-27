@@ -251,6 +251,11 @@ impl mrd_render::RendererInstance for MacosRenderProxyRenderer {
             RenderFrameData::Nv12Bytes { data, pitch } => {
                 (RenderProxyPixelFormat::Nv12, data, pitch)
             }
+            RenderFrameData::P010 { .. } => {
+                return Err(RenderError::Message(
+                    "render proxy does not support CPU P010 frames".to_string(),
+                ))
+            }
             #[cfg(windows)]
             RenderFrameData::D3D11SharedBgra { .. }
             | RenderFrameData::D3D11SharedNv12 { .. }

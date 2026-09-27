@@ -1,3 +1,4 @@
+pub use mrd_pipeline_core::GpuFrameLease;
 pub use mrd_pipeline_core::RuntimeStatus;
 
 use bytes::Bytes;
@@ -7,6 +8,8 @@ pub enum RenderPixelFormat {
     Rgb24,
     Bgra32,
     Nv12,
+    /// CPU P010/P016, uploaded as 16-bit Y and interleaved UV planes.
+    P010,
     /// D3D11 shared BGRA texture (zero-copy direct capture-render path)
     #[cfg(windows)]
     D3D11SharedBgra,
@@ -31,6 +34,8 @@ pub enum RenderFrameData {
     Nv12 { data: Vec<u8>, pitch: usize },
     /// CPU NV12 data backed by a shared byte buffer.
     Nv12Bytes { data: Bytes, pitch: usize },
+    /// CPU P010/P016 data; pitch is measured in bytes for both planes.
+    P010 { data: Vec<u8>, pitch: usize },
     /// D3D11 shared texture handle (zero-copy path)
     #[cfg(windows)]
     D3D11SharedBgra {
@@ -46,6 +51,7 @@ pub enum RenderFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
     /// D3D11 shared P010/P016 texture handle (zero-copy Main10 path)
     #[cfg(windows)]
@@ -54,6 +60,7 @@ pub enum RenderFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
 }
 
@@ -66,6 +73,27 @@ pub struct RenderFrame {
 }
 
 impl RenderFrame {
+    pub fn with_gpu_lease(mut self, lease: Option<GpuFrameLease>) -> Self {
+        match &mut self.data {
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { lease: stored, .. }
+            | RenderFrameData::D3D11SharedP010 { lease: stored, .. } => *stored = lease,
+            _ => {
+                let _ = lease;
+            }
+        }
+        self
+    }
+
+    pub fn gpu_lease(&self) -> Option<&GpuFrameLease> {
+        match &self.data {
+            #[cfg(windows)]
+            RenderFrameData::D3D11SharedNv12 { lease, .. }
+            | RenderFrameData::D3D11SharedP010 { lease, .. } => lease.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Create a frame from CPU RGB24 data
     pub fn from_rgb24(width: usize, height: usize, data: Vec<u8>) -> Self {
         Self {
@@ -103,6 +131,22 @@ impl RenderFrame {
             height,
             pixel_format: RenderPixelFormat::Nv12,
             data: RenderFrameData::Nv12Bytes { data, pitch },
+        }
+    }
+
+    pub fn from_p010(width: usize, height: usize, data: Vec<u8>, pitch: usize) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: RenderPixelFormat::P010,
+            data: RenderFrameData::P010 { data, pitch },
+        }
+    }
+
+    pub fn as_p010(&self) -> Option<(&[u8], usize)> {
+        match &self.data {
+            RenderFrameData::P010 { data, pitch } => Some((data.as_slice(), *pitch)),
+            _ => None,
         }
     }
 
@@ -144,6 +188,7 @@ impl RenderFrame {
                 shared_handle_uv,
                 width: width as u32,
                 height: height as u32,
+                lease: None,
             },
         }
     }
@@ -165,6 +210,7 @@ impl RenderFrame {
                 shared_handle_uv,
                 width: width as u32,
                 height: height as u32,
+                lease: None,
             },
         }
     }
@@ -382,6 +428,8 @@ pub trait RendererFactory: Send + Sync {
 const SUPPORTED_FORMATS: &[RenderPixelFormat] = &[
     RenderPixelFormat::Rgb24,
     RenderPixelFormat::Bgra32,
+    RenderPixelFormat::Nv12,
+    RenderPixelFormat::P010,
     #[cfg(windows)]
     RenderPixelFormat::D3D11SharedBgra,
     #[cfg(windows)]

@@ -48,7 +48,11 @@ pub(super) fn preferred_lan_receiver_decoder_candidates_from_preference(
         (LanAccessUnitCodec::Av1, "software" | "software_av1" | "av1_software") => {
             vec!["software_av1"]
         }
-        (LanAccessUnitCodec::Av1, "nvdec" | "nvdec_av1") => vec!["nvdec_av1"],
+        (
+            LanAccessUnitCodec::Av1,
+            "nvdec" | "nvdec_av1" | "nvdec_av1_d3d11_shared" | "d3d11_shared",
+        ) => vec!["nvdec_av1_d3d11_shared", "nvdec_av1"],
+        (LanAccessUnitCodec::Av1, "nvdec_cpu" | "nvdec_av1_cpu") => vec!["nvdec_av1"],
         _ => default_lan_receiver_decoder_candidates(codec).to_vec(),
     }
 }
@@ -95,7 +99,7 @@ pub(super) fn default_lan_receiver_decoder_candidates(
             "h264_software",
         ],
         LanAccessUnitCodec::Hevc => &["nvdec_hevc_d3d11_shared", "nvdec_hevc", "ffmpeg_hevc"],
-        LanAccessUnitCodec::Av1 => &["nvdec_av1", "software_av1"],
+        LanAccessUnitCodec::Av1 => &["nvdec_av1_d3d11_shared", "nvdec_av1", "software_av1"],
     }
 }
 
@@ -172,7 +176,7 @@ mod tests {
                 LanAccessUnitCodec::Av1,
                 "nvdec_av1"
             ),
-            vec!["nvdec_av1"]
+            vec!["nvdec_av1_d3d11_shared", "nvdec_av1"]
         );
     }
 

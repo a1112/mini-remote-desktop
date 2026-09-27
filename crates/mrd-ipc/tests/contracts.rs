@@ -1140,6 +1140,33 @@ fn media_sender_snapshot_serializes_window_dynamic_fps_fields() {
 }
 
 #[test]
+fn media_sender_snapshot_preserves_capture_freshness_without_inference() {
+    let mut wire = serde_json::to_value(MediaSenderTransportSnapshot::default()).unwrap();
+    wire["capture_frame_samples"] = 9.into();
+    wire["repeated_latest_frames"] = 4.into();
+    wire["capture_non_repeated_frames"] = 2.into();
+    wire["capture_freshness_unknown_frames"] = 3.into();
+
+    let snapshot: MediaSenderTransportSnapshot = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(snapshot).unwrap(), wire);
+}
+
+#[test]
+fn media_sender_snapshot_legacy_payload_does_not_infer_fresh_capture() {
+    let mut legacy = serde_json::to_value(MediaSenderTransportSnapshot::default()).unwrap();
+    let fields = legacy.as_object_mut().unwrap();
+    fields.remove("capture_non_repeated_frames");
+    fields.remove("capture_freshness_unknown_frames");
+    fields.insert("capture_frame_samples".into(), 100.into());
+    fields.insert("repeated_latest_frames".into(), 10.into());
+
+    let snapshot: MediaSenderTransportSnapshot = serde_json::from_value(legacy).unwrap();
+    let current = serde_json::to_value(snapshot).unwrap();
+    assert_eq!(current["capture_non_repeated_frames"], 0);
+    assert_eq!(current["capture_freshness_unknown_frames"], 0);
+}
+
+#[test]
 fn serialize_deserialize_media_adaptation_configured_response() {
     let response = IpcResponse::MediaAdaptationConfigured {
         session_id: test_session_id(),

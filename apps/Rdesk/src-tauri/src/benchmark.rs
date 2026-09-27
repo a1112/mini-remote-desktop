@@ -60,6 +60,15 @@ pub struct BenchmarkSummary {
     #[serde(default)]
     pub zero_copy_enabled: Option<bool>,
     #[serde(default)]
+    pub zero_copy_requested: Option<bool>,
+    /// Only pixel-buffer CPU transfers at measured boundaries, not GPU/bitstream copies.
+    #[serde(default)]
+    pub zero_copy_scope: Option<String>,
+    #[serde(default)]
+    pub observed_memory_path: Option<String>,
+    #[serde(default)]
+    pub memory_path_evidence: Option<crate::test_harness::MemoryPathEvidence>,
+    #[serde(default)]
     pub total_bitstream_bytes: Option<u64>,
     pub keyframes: u64,
     pub dropped_frames: u64,
@@ -400,6 +409,10 @@ impl BenchmarkSummary {
             encoded_fps: None,
             decoded_fps: None,
             zero_copy_enabled: None,
+            zero_copy_requested: None,
+            zero_copy_scope: Some("cpu_pixel_transfers".into()),
+            observed_memory_path: Some("unknown".into()),
+            memory_path_evidence: None,
             total_bitstream_bytes: None,
             keyframes: probe.keyframes,
             dropped_frames: probe.dropped_frames,
@@ -537,6 +550,10 @@ impl BenchmarkSummary {
             encoded_fps: None,
             decoded_fps: None,
             zero_copy_enabled: None,
+            zero_copy_requested: None,
+            zero_copy_scope: Some("cpu_pixel_transfers".into()),
+            observed_memory_path: Some("unknown".into()),
+            memory_path_evidence: None,
             total_bitstream_bytes: None,
             keyframes: sender_probe.keyframes.max(receiver_probe.keyframes),
             dropped_frames: sender_probe
@@ -699,6 +716,10 @@ impl BenchmarkSummary {
             "failure_reason",
             "run_skipped",
             "run_passed",
+            "zero_copy_requested",
+            "zero_copy_scope",
+            "observed_memory_path",
+            "memory_path_evidence",
         ]
     }
 
@@ -784,6 +805,17 @@ impl BenchmarkSummary {
             csv_escape_text(self.failure_reason.as_deref().unwrap_or_default()),
             self.run_skipped.to_string(),
             self.run_passed.to_string(),
+            option_bool(self.zero_copy_requested),
+            self.zero_copy_scope.clone().unwrap_or_default(),
+            self.observed_memory_path.clone().unwrap_or_default(),
+            self.memory_path_evidence
+                .as_ref()
+                .map(|evidence| {
+                    let json =
+                        serde_json::to_string(evidence).expect("serialize memory path counters");
+                    format!("\"{}\"", json.replace('"', "\"\""))
+                })
+                .unwrap_or_default(),
         ]
     }
 }
@@ -938,10 +970,16 @@ Duration: `{duration}s`\n\n\
 - Probe complete: `{probe_complete}`\n\
 - Failure reason: `{failure_reason}`\n\
 \n## Metrics\n\n\
+Zero-copy scope: observed CPU pixel-buffer transfers at capture/encode/decode/render boundaries. GPU-internal copies and encoded-bitstream copies are excluded. Empty values mean unknown; requested mode is not runtime evidence.\n\n\
 | Metric | Value |\n\
 | --- | --- |\n\
 | fps_observed | {fps_observed} |\n\
 | bitrate_kbps | {bitrate_kbps} |\n\
+| zero_copy_requested | {zero_copy_requested} |\n\
+| zero_copy_enabled | {zero_copy_enabled} |\n\
+| zero_copy_scope | {zero_copy_scope} |\n\
+| observed_memory_path | {observed_memory_path} |\n\
+| memory_path_evidence | {memory_path_evidence} |\n\
 | encode_total_p95_ms | {encode_p95} |\n\
 | send_write_p95_ms | {send_p95} |\n\
 | decode_total_p95_ms | {decode_p95} |\n\
@@ -1005,6 +1043,17 @@ Duration: `{duration}s`\n\n\
         failure_reason = summary.failure_reason.as_deref().unwrap_or_default(),
         fps_observed = summary.fps_observed,
         bitrate_kbps = summary.bitrate_kbps,
+        zero_copy_requested = option_bool(summary.zero_copy_requested),
+        zero_copy_enabled = option_bool(summary.zero_copy_enabled),
+        zero_copy_scope = summary.zero_copy_scope.as_deref().unwrap_or("unknown"),
+        observed_memory_path = summary.observed_memory_path.as_deref().unwrap_or("unknown"),
+        memory_path_evidence =
+            summary
+                .memory_path_evidence
+                .as_ref()
+                .map(|evidence| serde_json::to_string(evidence)
+                    .expect("serialize memory path counters"))
+                .unwrap_or_else(|| "unknown".into()),
         encode_p95 = option_f64(summary.encode_total_p95_ms),
         send_p95 = option_f64(summary.send_write_p95_ms),
         decode_p95 = option_f64(summary.decode_total_p95_ms),
@@ -1222,7 +1271,7 @@ mod tests {
             display_id: env_string("MRD_BENCH_DISPLAY_ID"),
             renderer: Some(parse_renderer_backend(&manifest.renderer_backend)),
             transport: Some(parse_transport_backend(&manifest.transport)),
-            zero_copy: Some(benchmark_zero_copy_enabled(manifest)),
+            zero_copy: Some(benchmark_zero_copy_requested(manifest)),
             pace_to_fps: Some(env_bool("MRD_BENCH_PACE_TO_FPS", false)),
             visual_preview: Some(false),
             ..Default::default()
@@ -1303,7 +1352,11 @@ mod tests {
             target_bitrate_kbps: configured_target_bitrate_kbps(),
             encoded_fps: nonzero_option(metrics.encoded_fps),
             decoded_fps: nonzero_option(metrics.decoded_fps),
-            zero_copy_enabled: Some(benchmark_zero_copy_enabled(manifest)),
+            zero_copy_enabled: metrics.memory_path_evidence.zero_copy_enabled(),
+            zero_copy_requested: metrics.zero_copy_requested,
+            zero_copy_scope: Some("cpu_pixel_transfers".into()),
+            observed_memory_path: Some(metrics.memory_path_evidence.memory_path().into()),
+            memory_path_evidence: Some(metrics.memory_path_evidence.clone()),
             total_bitstream_bytes: Some(metrics.total_bitstream_bytes as u64),
             keyframes: 0,
             dropped_frames: metrics.dropped_frames as u64,
@@ -1797,7 +1850,11 @@ mod tests {
             target_bitrate_kbps: configured_target_bitrate_kbps(),
             encoded_fps: None,
             decoded_fps: None,
-            zero_copy_enabled: Some(benchmark_zero_copy_enabled(manifest)),
+            zero_copy_enabled: None,
+            zero_copy_requested: Some(benchmark_zero_copy_requested(manifest)),
+            zero_copy_scope: Some("cpu_pixel_transfers".into()),
+            observed_memory_path: Some("unknown".into()),
+            memory_path_evidence: None,
             total_bitstream_bytes: Some(0),
             keyframes: 0,
             dropped_frames: 0,
@@ -1867,12 +1924,22 @@ mod tests {
         (summary, probe)
     }
 
-    fn benchmark_zero_copy_enabled(manifest: &BenchmarkManifest) -> bool {
+    fn benchmark_zero_copy_requested(manifest: &BenchmarkManifest) -> bool {
         matches!(
             manifest.decode_backend.as_str(),
             "nvdec" | "nvdec_av1" | "nvdec_hevc" | "nvdec_hevc_main10"
         ) && matches!(manifest.renderer_backend.as_str(), "d3d11" | "d3d11_shared")
             && matches!(manifest.capture_backend.as_str(), "dxgi" | "winrt")
+            && matches!(
+                manifest.encode_backend.as_str(),
+                "nvenc"
+                    | "nvenc_h264"
+                    | "nvenc_ll_p1"
+                    | "nvenc_hq_p5"
+                    | "nvenc_hevc"
+                    | "nvenc_hevc_main10"
+                    | "nvenc_av1"
+            )
     }
 
     fn parse_renderer_backend(value: &str) -> RendererType {
@@ -2524,8 +2591,8 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_enables_zero_copy_for_nvdec_d3d11_runs() {
-        let manifest = BenchmarkManifest {
+    fn benchmark_requests_zero_copy_for_nvenc_nvdec_d3d11_runs() {
+        let mut manifest = BenchmarkManifest {
             run_id: "quick-quic-20260308-abc123".into(),
             scenario: "quick.transport".into(),
             transport: "quic".into(),
@@ -2540,7 +2607,64 @@ mod tests {
             git_commit: "abc123".into(),
         };
 
-        assert!(benchmark_zero_copy_enabled(&manifest));
+        assert!(benchmark_zero_copy_requested(&manifest));
+        for encoder in ["nvenc_ll_p1", "nvenc_hq_p5"] {
+            manifest.encode_backend = encoder.into();
+            assert!(benchmark_zero_copy_requested(&manifest), "{encoder}");
+        }
+    }
+
+    #[test]
+    fn zero_copy_skipped_benchmark_has_no_observed_path() {
+        let manifest = BenchmarkManifest {
+            run_id: "skipped".into(),
+            scenario: "test".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "nvenc".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2,
+            height: 2,
+            fps: 30,
+            duration_secs: 1,
+            git_commit: "test".into(),
+        };
+        let (summary, _) = unsupported_benchmark_result(
+            &manifest,
+            &SessionId("skipped".into()),
+            "hardware unavailable".into(),
+        );
+        assert_eq!(summary.zero_copy_enabled, None);
+        assert_eq!(summary.zero_copy_requested, Some(true));
+        assert_eq!(summary.observed_memory_path.as_deref(), Some("unknown"));
+        assert!(summary.memory_path_evidence.is_none());
+        let value = serde_json::to_value(&summary).unwrap();
+        assert!(value["zero_copy_enabled"].is_null());
+        let column = BenchmarkSummary::csv_header()
+            .iter()
+            .position(|name| *name == "zero_copy_enabled")
+            .unwrap();
+        assert_eq!(summary.csv_row()[column], "");
+    }
+
+    #[test]
+    fn zero_copy_request_excludes_software_encoder() {
+        let manifest = BenchmarkManifest {
+            run_id: "software".into(),
+            scenario: "test".into(),
+            transport: "webrtc".into(),
+            capture_backend: "dxgi".into(),
+            encode_backend: "openh264".into(),
+            decode_backend: "nvdec".into(),
+            renderer_backend: "d3d11".into(),
+            width: 2,
+            height: 2,
+            fps: 30,
+            duration_secs: 1,
+            git_commit: "test".into(),
+        };
+        assert!(!benchmark_zero_copy_requested(&manifest));
     }
 
     #[test]
@@ -2602,6 +2726,10 @@ mod tests {
             encoded_fps: Some(30.0),
             decoded_fps: Some(29.5),
             zero_copy_enabled: Some(false),
+            zero_copy_requested: Some(false),
+            zero_copy_scope: Some("cpu_pixel_transfers".into()),
+            observed_memory_path: Some("cpu".into()),
+            memory_path_evidence: None,
             total_bitstream_bytes: Some(3_500_000),
             keyframes: 1,
             dropped_frames: 0,

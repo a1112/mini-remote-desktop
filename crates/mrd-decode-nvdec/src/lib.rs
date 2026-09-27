@@ -1,3 +1,4 @@
+pub use mrd_pipeline_core::GpuFrameLease;
 #[cfg(windows)]
 use std::ffi::{c_int, c_void};
 
@@ -19,6 +20,7 @@ pub enum NvdecDecodedFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
     /// D3D11 shared P010/P016 texture handles (zero-copy Main10 path)
     #[cfg(windows)]
@@ -27,6 +29,7 @@ pub enum NvdecDecodedFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
 }
 
@@ -38,6 +41,27 @@ pub struct NvdecDecodedFrame {
 }
 
 impl NvdecDecodedFrame {
+    pub fn with_gpu_lease(mut self, lease: Option<GpuFrameLease>) -> Self {
+        match &mut self.data {
+            #[cfg(windows)]
+            NvdecDecodedFrameData::D3D11SharedNv12 { lease: stored, .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { lease: stored, .. } => *stored = lease,
+            _ => {
+                let _ = lease;
+            }
+        }
+        self
+    }
+
+    pub fn gpu_lease(&self) -> Option<&GpuFrameLease> {
+        match &self.data {
+            #[cfg(windows)]
+            NvdecDecodedFrameData::D3D11SharedNv12 { lease, .. }
+            | NvdecDecodedFrameData::D3D11SharedP010 { lease, .. } => lease.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Create a decoded frame from CPU RGB24 data
     pub fn from_cpu_rgb24(width: usize, height: usize, data: Vec<u8>) -> Self {
         Self {
@@ -214,6 +238,13 @@ pub struct NvdecDiagnostics {
     pub shared_copy_attempts: usize,
     pub shared_copy_successes: usize,
     pub shared_copy_failures: usize,
+    /// Pixel bytes copied from CUDA decode surfaces into D3D11 textures.
+    pub gpu_copy_bytes: u64,
+    /// Completed GPU-to-host readbacks, including optional fallback frames.
+    pub cpu_readback_frames: u64,
+    pub cpu_readback_bytes: u64,
+    /// Display outputs dropped because all four GPU frame slots are leased.
+    pub shared_pool_backpressure_frames: u64,
     pub last_shared_copy_stage: Option<String>,
     pub last_shared_copy_api: Option<String>,
     pub last_shared_copy_code: Option<i32>,
@@ -296,7 +327,8 @@ impl NvdecDecoder {
     ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let session = imp::NvdecSession::new_for_codec(codec, output_mode)?;
+            let session = imp::NvdecSession::new_for_codec(codec, output_mode)
+                .map_err(|error| format!("nvdec {codec:?} initialization failed: {error}"))?;
             let runtime = NvdecRuntimeProbe {
                 backend: "windows-nvdec",
                 summary: "nvdec runtime libraries and core exports are present".to_string(),
@@ -447,7 +479,8 @@ impl NvdecDecoder {
             codec,
             output_mode,
             d3d11_device_ptr,
-        )?;
+        )
+        .map_err(|error| format!("nvdec {codec:?} initialization failed: {error}"))?;
         let runtime = NvdecRuntimeProbe {
             backend: "windows-nvdec",
             summary: "nvdec runtime libraries and core exports are present".to_string(),
@@ -479,6 +512,14 @@ impl NvdecDecoder {
     pub fn enable_shared_texture(&mut self, enable: bool) {
         self.enable_shared_texture = enable;
         self.session.enable_shared_texture(enable);
+    }
+
+    /// Require GPU-resident output. Interop failures return an error instead of
+    /// downloading pixels that a shared-texture consumer cannot use.
+    #[cfg(windows)]
+    pub fn require_shared_texture(&mut self) {
+        self.enable_shared_texture(true);
+        self.session.require_shared_texture();
     }
 
     pub fn runtime(&self) -> &NvdecRuntimeProbe {
@@ -624,7 +665,12 @@ fn probe_capability(
 ) -> Result<NvdecCapabilityProbe, String> {
     #[cfg(windows)]
     {
-        imp::probe_capability(codec, bit_depth_minus8, chroma_format)
+        imp::probe_capability(codec, bit_depth_minus8, chroma_format).map_err(|error| {
+            format!(
+                "nvdec {codec} {}-bit capability probe failed: {error}",
+                u16::from(bit_depth_minus8) + 8
+            )
+        })
     }
 
     #[cfg(not(windows))]
@@ -642,7 +688,7 @@ mod imp {
         c_int, c_void, NvdecCapabilityProbe, NvdecDecodedFrame, NvdecDecodedFrameData,
         NvdecDiagnostics, NvdecOutputMode,
     };
-    use std::{mem, ptr};
+    use std::{mem, ptr, sync::Arc};
     use windows::core::{Interface, PCSTR};
     use windows::Win32::Foundation::{FreeLibrary, HMODULE};
     use windows::Win32::Graphics::Direct3D11::{
@@ -659,6 +705,7 @@ mod imp {
 
     type CUresult = i32;
     type CUdevice = c_int;
+    type CuD3D11GetDeviceFn = unsafe extern "system" fn(*mut CUdevice, *mut c_void) -> CUresult;
     type CUcontext = *mut c_void;
     type CUstream = *mut c_void;
     type CUvideodecoder = *mut c_void;
@@ -798,7 +845,72 @@ mod imp {
         surface_kind: DecodedSurfaceKind,
     }
 
+    const SHARED_TEXTURE_POOL_LIMIT: usize = 4;
+
+    #[derive(Default)]
+    struct CudaRegistrationState {
+        mapped: bool,
+        poisoned: bool,
+    }
+
+    struct SharedTextureSlot {
+        texture: Arc<D3D11SharedTexture>,
+        cuda_resource_y: Option<CUgraphicsResource>,
+        cuda_resource_uv: Option<CUgraphicsResource>,
+        registration_state: CudaRegistrationState,
+    }
+
     impl D3D11SharedTexture {
+        fn new_for_cuda_device(
+            width: u32,
+            height: u32,
+            surface_kind: DecodedSurfaceKind,
+            cuda_device: CUdevice,
+            get_device: CuD3D11GetDeviceFn,
+        ) -> Result<Self, String> {
+            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+            let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+                .map_err(|error| format!("nvdec adapter enumeration failed: {error}"))?;
+            let mut index = 0;
+            while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+                index += 1;
+                let mut device_id = -1;
+                if unsafe { get_device(&mut device_id, adapter.as_raw()) } != CUDA_SUCCESS
+                    || device_id != cuda_device
+                {
+                    continue;
+                }
+                let mut device = None;
+                let mut context = None;
+                unsafe {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE::default(),
+                        windows::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG(0),
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                }
+                .map_err(|error| {
+                    format!("nvdec D3D11 device creation on CUDA adapter failed: {error}")
+                })?;
+                return Self::from_device(
+                    device.ok_or("missing D3D11 device")?,
+                    context.ok_or("missing D3D11 context")?,
+                    width,
+                    height,
+                    surface_kind,
+                );
+            }
+            Err(format!("nvdec shared-output adapter mismatch: no DXGI adapter matches CUDA device {cuda_device}"))
+        }
+
+        #[cfg(test)]
         fn new(width: u32, height: u32, surface_kind: DecodedSurfaceKind) -> Result<Self, String> {
             unsafe {
                 // Create D3D11 device
@@ -1140,10 +1252,11 @@ mod imp {
 
     impl LoadedModule {
         fn load(name: &'static [u8]) -> Result<Self, String> {
-            let module = unsafe { LoadLibraryA(PCSTR(name.as_ptr())) }.map_err(|_| {
+            let module = unsafe { LoadLibraryA(PCSTR(name.as_ptr())) }.map_err(|error| {
                 format!(
-                    "failed to load {}",
-                    String::from_utf8_lossy(&name[..name.len().saturating_sub(1)])
+                    "nvdec runtime load failed at LoadLibraryA({}): {error}; HRESULT=0x{:08X}",
+                    String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]),
+                    error.code().0 as u32,
                 )
             })?;
             Ok(Self(module))
@@ -1178,6 +1291,7 @@ mod imp {
         cu_init: CuInitFn,
         cu_device_get_count: CuDeviceGetCountFn,
         cu_device_get: CuDeviceGetFn,
+        cu_d3d11_get_device: Option<CuD3D11GetDeviceFn>,
         cu_ctx_create: CuCtxCreateFn,
         cu_ctx_destroy: CuCtxDestroyFn,
         cu_ctx_push_current: CuCtxPushCurrentFn,
@@ -1201,6 +1315,7 @@ mod imp {
                 cu_init: module.load_symbol(b"cuInit\0".as_ref())?,
                 cu_device_get_count: module.load_symbol(b"cuDeviceGetCount\0".as_ref())?,
                 cu_device_get: module.load_symbol(b"cuDeviceGet\0".as_ref())?,
+                cu_d3d11_get_device: module.load_symbol(b"cuD3D11GetDevice\0".as_ref()).ok(),
                 cu_ctx_create: module.load_symbol(b"cuCtxCreate_v2\0".as_ref())?,
                 cu_ctx_destroy: module.load_symbol(b"cuCtxDestroy_v2\0".as_ref())?,
                 cu_ctx_push_current: module.load_symbol(b"cuCtxPushCurrent_v2\0".as_ref())?,
@@ -1233,6 +1348,45 @@ mod imp {
     struct CudaContextGuard<'a> {
         cuda: &'a CudaApi,
         active: bool,
+    }
+
+    struct OwnedCudaContext {
+        context: CUcontext,
+        destroy: CuCtxDestroyFn,
+    }
+
+    impl OwnedCudaContext {
+        fn create(cuda: &CudaApi, device: CUdevice) -> Result<Self, String> {
+            let mut context = ptr::null_mut();
+            unsafe {
+                cuda_ok(
+                    cuda,
+                    (cuda.cu_ctx_create)(&mut context, 0, device),
+                    "context",
+                    "cuCtxCreate_v2",
+                )?;
+            }
+            Ok(Self {
+                context,
+                destroy: cuda.cu_ctx_destroy,
+            })
+        }
+
+        fn release(mut self) -> CUcontext {
+            let context = self.context;
+            self.context = ptr::null_mut();
+            context
+        }
+    }
+
+    impl Drop for OwnedCudaContext {
+        fn drop(&mut self) {
+            if !self.context.is_null() {
+                unsafe {
+                    (self.destroy)(self.context);
+                }
+            }
+        }
     }
 
     impl<'a> CudaContextGuard<'a> {
@@ -1311,9 +1465,6 @@ mod imp {
         parser: CUvideoparser,
         parser_codec: i32,
         callback_state: Box<CallbackState>,
-        shared_texture: Option<D3D11SharedTexture>,
-        external_d3d11_device_ptr: Option<*mut c_void>,
-        enable_shared_texture: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1402,11 +1553,14 @@ mod imp {
         // Registered CUDA graphics resources for D3D11 textures
         cuda_resource_y: Option<CUgraphicsResource>,
         cuda_resource_uv: Option<CUgraphicsResource>,
+        cuda_registration_state: CudaRegistrationState,
         // D3D11 texture pointers for CUDA registration (set when shared texture is enabled)
         d3d11_y_texture_ptr: Option<*mut c_void>,
         d3d11_uv_texture_ptr: Option<*mut c_void>,
         // CUDA context for GPU operations
         cuda_context: CUcontext,
+        cuda_device: CUdevice,
+        cu_d3d11_get_device: Option<CuD3D11GetDeviceFn>,
         decoder: CUvideodecoder,
         decoder_config: Option<DecoderConfig>,
         sequence_width: u32,
@@ -1417,6 +1571,9 @@ mod imp {
         frames: Vec<NvdecDecodedFrame>,
         // Shared texture support (when enabled, outputs D3D11SharedNv12 frames)
         use_shared_texture: bool,
+        require_shared_texture: bool,
+        shared_texture_pool: Vec<SharedTextureSlot>,
+        external_d3d11_device_ptr: Option<*mut c_void>,
         shared_texture_y: Option<isize>,
         shared_texture_uv: Option<isize>,
     }
@@ -1466,22 +1623,6 @@ mod imp {
                 return Err("cuDeviceGetCount reported no CUDA devices".to_string());
             }
 
-            if let Some(get_caps) = cuvid.cuvid_get_decoder_caps {
-                let mut caps = CUVIDDECODECAPS {
-                    eCodecType: parser_codec,
-                    eChromaFormat: CUDA_VIDEO_CHROMA_420,
-                    nBitDepthMinus8: initial_probe_bit_depth,
-                    ..Default::default()
-                };
-                let caps_result = unsafe { get_caps(&mut caps) };
-                if caps_result == CUDA_SUCCESS && caps.bIsSupported == 0 {
-                    return Err(format!(
-                        "cuvidGetDecoderCaps reported {} NVDEC unsupported",
-                        describe_codec(parser_codec)
-                    ));
-                }
-            }
-
             let mut device = 0;
             unsafe {
                 cuda_ok(
@@ -1492,14 +1633,51 @@ mod imp {
                 )?;
             }
 
-            let mut context = ptr::null_mut();
-            unsafe {
-                cuda_ok(
-                    &cuda,
-                    (cuda.cu_ctx_create)(&mut context, 0, device),
-                    "init",
-                    "cuCtxCreate_v2",
-                )?;
+            if let Some(device_ptr) = external_d3d11_device_ptr {
+                let get_device = cuda
+                    .cu_d3d11_get_device
+                    .ok_or("nvdec shared-output adapter query cuD3D11GetDevice is unavailable")?;
+                let d3d_device = unsafe { ID3D11Device::from_raw_borrowed(&device_ptr) }
+                    .ok_or("nvdec external D3D11 device pointer is invalid")?;
+                let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice =
+                    d3d_device.cast().map_err(|error| {
+                        format!("nvdec external device adapter query failed: {error}")
+                    })?;
+                let adapter = unsafe { dxgi.GetAdapter() }.map_err(|error| {
+                    format!("nvdec external device adapter query failed: {error}")
+                })?;
+                unsafe {
+                    cuda_ok(
+                        &cuda,
+                        get_device(&mut device, adapter.as_raw()),
+                        "adapter",
+                        "cuD3D11GetDevice",
+                    )?;
+                }
+            }
+            let owned_context = OwnedCudaContext::create(&cuda, device)?;
+            let context = owned_context.context;
+            // Context creation makes this context current. Pop it on every exit
+            // path, restoring the caller's context before moving to another thread.
+            let init_context_guard = CudaContextGuard {
+                cuda: &cuda,
+                active: true,
+            };
+            if let Some(get_caps) = cuvid.cuvid_get_decoder_caps {
+                let mut caps = CUVIDDECODECAPS {
+                    eCodecType: parser_codec,
+                    eChromaFormat: CUDA_VIDEO_CHROMA_420,
+                    nBitDepthMinus8: initial_probe_bit_depth,
+                    ..Default::default()
+                };
+                let caps_result = unsafe { get_caps(&mut caps) };
+                cuda_ok(&cuda, caps_result, "capability", "cuvidGetDecoderCaps")?;
+                if caps.bIsSupported == 0 {
+                    return Err(format!(
+                        "cuvidGetDecoderCaps reported {} NVDEC unsupported",
+                        describe_codec(parser_codec)
+                    ));
+                }
             }
 
             let mut callback_state = Box::new(CallbackState {
@@ -1524,11 +1702,14 @@ mod imp {
                 // Registered CUDA resources (initialized when shared texture is created)
                 cuda_resource_y: None,
                 cuda_resource_uv: None,
+                cuda_registration_state: CudaRegistrationState::default(),
                 // D3D11 texture pointers (set when shared texture is enabled)
                 d3d11_y_texture_ptr: None,
                 d3d11_uv_texture_ptr: None,
                 // CUDA context for GPU operations
                 cuda_context: context,
+                cuda_device: device,
+                cu_d3d11_get_device: cuda.cu_d3d11_get_device,
                 decoder: ptr::null_mut(),
                 decoder_config: None,
                 sequence_width: 0,
@@ -1538,6 +1719,9 @@ mod imp {
                 last_error: None,
                 frames: Vec::new(),
                 use_shared_texture: false,
+                require_shared_texture: false,
+                shared_texture_pool: Vec::new(),
+                external_d3d11_device_ptr,
                 shared_texture_y: None,
                 shared_texture_uv: None,
             });
@@ -1568,6 +1752,8 @@ mod imp {
                 )?;
             }
 
+            drop(init_context_guard);
+            let context = owned_context.release();
             Ok(Self {
                 _cuda: cuda,
                 _cuvid: cuvid,
@@ -1575,23 +1761,21 @@ mod imp {
                 parser,
                 parser_codec,
                 callback_state,
-                shared_texture: None,
-                external_d3d11_device_ptr,
-                enable_shared_texture: false, // Disabled by default
             })
         }
 
         /// Enable or disable D3D11 shared texture output
         #[allow(dead_code)]
         pub fn enable_shared_texture(&mut self, enable: bool) {
-            self.enable_shared_texture = enable;
             self.callback_state.use_shared_texture = enable;
-
-            // If enabling and shared texture doesn't exist, create it
-            if enable && self.shared_texture.is_none() {
-                // Create shared texture when we know the video dimensions
-                // This will happen during the first decode callback
+            if !enable {
+                self.callback_state.require_shared_texture = false;
             }
+        }
+
+        pub fn require_shared_texture(&mut self) {
+            self.callback_state.use_shared_texture = true;
+            self.callback_state.require_shared_texture = true;
         }
 
         pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<(), String> {
@@ -1646,18 +1830,13 @@ mod imp {
 
             let _context_guard = CudaContextGuard::push(&self._cuda, self.context)?;
 
-            unsafe {
-                cuda_ok(
-                    &self._cuda,
-                    (self._cuvid.cuvid_parse_video_data)(self.parser, &mut packet),
-                    "parse",
-                    "cuvidParseVideoData",
-                )?;
-            }
-
+            let parse_result =
+                unsafe { (self._cuvid.cuvid_parse_video_data)(self.parser, &mut packet) };
             if let Some(error) = self.callback_state.last_error.take() {
+                self.callback_state.frames.clear();
                 return Err(error);
             }
+            cuda_ok(&self._cuda, parse_result, "parse", "cuvidParseVideoData")?;
 
             if self.callback_state.sequence_width == 0 || self.callback_state.sequence_height == 0 {
                 return Err(
@@ -1671,67 +1850,6 @@ mod imp {
                     "nvdec decode failed at callback-state: parser completed without decode activity"
                         .to_string(),
                 );
-            }
-
-            // Create or recreate shared texture if needed. NVDEC can reconfigure
-            // after a display-mode/profile change; stale shared textures force
-            // the hot path back through CPU NV12.
-            if self.enable_shared_texture {
-                let (width, height) = self.callback_state.output_dimensions_u32();
-                if width > 0 && height > 0 {
-                    let surface_kind = self
-                        .callback_state
-                        .decoder_config
-                        .as_ref()
-                        .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
-                        .unwrap_or(DecodedSurfaceKind::Nv12);
-                    let needs_texture = self
-                        .shared_texture
-                        .as_ref()
-                        .map(|texture| {
-                            texture.width != width
-                                || texture.height != height
-                                || texture.surface_kind != surface_kind
-                        })
-                        .unwrap_or(true);
-                    if !needs_texture {
-                        return Ok(());
-                    }
-
-                    self.callback_state.clear_shared_texture_registration();
-                    self.shared_texture = None;
-                    let texture_result = if let Some(device_ptr) = self.external_d3d11_device_ptr {
-                        unsafe {
-                            D3D11SharedTexture::new_with_device_ptr(
-                                width,
-                                height,
-                                surface_kind,
-                                device_ptr,
-                            )
-                        }
-                    } else {
-                        D3D11SharedTexture::new(width, height, surface_kind)
-                    };
-                    match texture_result {
-                        Ok(texture) => {
-                            self.callback_state.shared_texture_y = Some(texture.shared_handle_y);
-                            self.callback_state.shared_texture_uv = Some(texture.shared_handle_uv);
-                            // Set D3D11 texture pointers for CUDA-D3D11 interop
-                            self.callback_state.d3d11_y_texture_ptr = Some(texture.y_texture_ptr());
-                            self.callback_state.d3d11_uv_texture_ptr =
-                                Some(texture.uv_texture_ptr());
-                            self.shared_texture = Some(texture);
-                        }
-                        Err(e) => {
-                            // Fall back to CPU path if shared texture creation fails
-                            eprintln!(
-                                "Failed to create shared texture: {e}, falling back to CPU path"
-                            );
-                            self.enable_shared_texture = false;
-                            self.callback_state.use_shared_texture = false;
-                        }
-                    }
-                }
             }
 
             Ok(())
@@ -1770,6 +1888,242 @@ mod imp {
     }
 
     impl CallbackState {
+        fn create_shared_texture(&self) -> Result<D3D11SharedTexture, String> {
+            let (width, height) = self.output_dimensions_u32();
+            let kind = self
+                .decoder_config
+                .as_ref()
+                .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+                .unwrap_or(DecodedSurfaceKind::Nv12);
+            if let Some(slot) = self.shared_texture_pool.first() {
+                // Keep one matching D3D11 device across slots and resizes. Only
+                // texture storage and its CUDA registration need replacement.
+                D3D11SharedTexture::from_device(
+                    slot.texture.device.clone(),
+                    slot.texture.context.clone(),
+                    width,
+                    height,
+                    kind,
+                )
+            } else if let Some(device_ptr) = self.external_d3d11_device_ptr {
+                unsafe { D3D11SharedTexture::new_with_device_ptr(width, height, kind, device_ptr) }
+            } else {
+                let get_device = self
+                    .cu_d3d11_get_device
+                    .ok_or("nvdec shared-output adapter query cuD3D11GetDevice is unavailable")?;
+                D3D11SharedTexture::new_for_cuda_device(
+                    width,
+                    height,
+                    kind,
+                    self.cuda_device,
+                    get_device,
+                )
+            }
+            .map_err(|error| format!("nvdec shared-output resource initialization failed: {error}"))
+        }
+
+        // Allocate before the first display callback. Later format changes are
+        // handled by replacing only unleased slots, preserving old frame data.
+        fn ensure_shared_texture(&mut self) -> Result<(), String> {
+            if self.use_shared_texture && self.shared_texture_pool.is_empty() {
+                self.shared_texture_pool.push(SharedTextureSlot {
+                    texture: Arc::new(self.create_shared_texture()?),
+                    cuda_resource_y: None,
+                    cuda_resource_uv: None,
+                    registration_state: CudaRegistrationState::default(),
+                });
+            }
+            Ok(())
+        }
+
+        fn acquire_shared_slot(&mut self) -> Result<Option<usize>, String> {
+            if self
+                .shared_texture_pool
+                .iter()
+                .any(|slot| slot.registration_state.poisoned)
+            {
+                return Err(
+                    "nvdec shared output storage is quarantined after CUDA cleanup failure".into(),
+                );
+            }
+            let (width, height) = self.output_dimensions_u32();
+            let kind = self
+                .decoder_config
+                .as_ref()
+                .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
+                .unwrap_or(DecodedSurfaceKind::Nv12);
+            let matches = |slot: &SharedTextureSlot| {
+                slot.texture.width == width
+                    && slot.texture.height == height
+                    && slot.texture.surface_kind == kind
+            };
+            let ready = |slot: &SharedTextureSlot| {
+                !slot.registration_state.mapped
+                    && !slot.registration_state.poisoned
+                    && Arc::strong_count(&slot.texture) == 1
+            };
+            let index = if let Some(index) = self
+                .shared_texture_pool
+                .iter()
+                .position(|slot| ready(slot) && matches(slot))
+            {
+                index
+            } else if let Some(index) = self.shared_texture_pool.iter().position(ready) {
+                let texture = Arc::new(self.create_shared_texture()?);
+                self.select_shared_slot(index);
+                let released = self.unregister_current_shared_resources();
+                self.restore_shared_slot(index);
+                if !released {
+                    return Err(
+                        "nvdec shared output storage is quarantined after CUDA unregister failure"
+                            .into(),
+                    );
+                }
+                self.shared_texture_pool[index] = SharedTextureSlot {
+                    texture,
+                    cuda_resource_y: None,
+                    cuda_resource_uv: None,
+                    registration_state: CudaRegistrationState::default(),
+                };
+                index
+            } else if self.shared_texture_pool.len() < SHARED_TEXTURE_POOL_LIMIT {
+                self.shared_texture_pool.push(SharedTextureSlot {
+                    texture: Arc::new(self.create_shared_texture()?),
+                    cuda_resource_y: None,
+                    cuda_resource_uv: None,
+                    registration_state: CudaRegistrationState::default(),
+                });
+                self.shared_texture_pool.len() - 1
+            } else {
+                self.diagnostics.shared_pool_backpressure_frames = self
+                    .diagnostics
+                    .shared_pool_backpressure_frames
+                    .saturating_add(1);
+                return Ok(None);
+            };
+            self.select_shared_slot(index);
+            Ok(Some(index))
+        }
+
+        fn select_shared_slot(&mut self, index: usize) {
+            let slot = &mut self.shared_texture_pool[index];
+            self.cuda_resource_y = slot.cuda_resource_y.take();
+            self.cuda_resource_uv = slot.cuda_resource_uv.take();
+            self.cuda_registration_state = mem::take(&mut slot.registration_state);
+            self.d3d11_y_texture_ptr = Some(slot.texture.y_texture_ptr());
+            self.d3d11_uv_texture_ptr = Some(slot.texture.uv_texture_ptr());
+            self.shared_texture_y = Some(slot.texture.shared_handle_y);
+            self.shared_texture_uv = Some(slot.texture.shared_handle_uv);
+        }
+
+        fn restore_shared_slot(&mut self, index: usize) {
+            let slot = &mut self.shared_texture_pool[index];
+            slot.cuda_resource_y = self.cuda_resource_y.take();
+            slot.cuda_resource_uv = self.cuda_resource_uv.take();
+            slot.registration_state = mem::take(&mut self.cuda_registration_state);
+        }
+
+        fn unmap_current_shared_resources(&mut self) -> bool {
+            if !self.cuda_registration_state.mapped {
+                return true;
+            }
+            let Some(unmap) = self.cu_graphics_unmap_resources else {
+                self.cuda_registration_state.poisoned = true;
+                return false;
+            };
+            let (Some(y), Some(uv)) = (self.cuda_resource_y, self.cuda_resource_uv) else {
+                self.cuda_registration_state.poisoned = true;
+                self.record_shared_copy_failure_text(
+                    "unmap",
+                    "cuGraphicsUnmapResources",
+                    "mapped resource ownership is incomplete; storage retained",
+                );
+                return false;
+            };
+            let mut resources = [y, uv];
+            let result = unsafe { unmap(2, resources.as_mut_ptr(), ptr::null_mut()) };
+            if result != CUDA_SUCCESS {
+                self.cuda_registration_state.poisoned = true;
+                self.record_shared_copy_failure_code(
+                    "unmap",
+                    "cuGraphicsUnmapResources",
+                    result,
+                    None,
+                );
+                return false;
+            }
+            self.cuda_registration_state.mapped = false;
+            true
+        }
+
+        fn unregister_current_shared_resources(&mut self) -> bool {
+            if self.cuda_registration_state.mapped {
+                self.cuda_registration_state.poisoned = true;
+                return false;
+            }
+            for (resource, is_y) in [(self.cuda_resource_y, true), (self.cuda_resource_uv, false)] {
+                let Some(resource) = resource else {
+                    continue;
+                };
+                let Some(unregister) = self.cu_graphics_unregister_resource else {
+                    self.cuda_registration_state.poisoned = true;
+                    self.record_shared_copy_failure_text(
+                        "unregister",
+                        "cuGraphicsUnregisterResource",
+                        "CUDA unregister function unavailable; storage retained",
+                    );
+                    return false;
+                };
+                let result = unsafe { unregister(resource) };
+                if result != CUDA_SUCCESS {
+                    self.cuda_registration_state.poisoned = true;
+                    self.record_shared_copy_failure_code(
+                        "unregister",
+                        "cuGraphicsUnregisterResource",
+                        result,
+                        None,
+                    );
+                    return false;
+                }
+                if is_y {
+                    self.cuda_resource_y = None;
+                } else {
+                    self.cuda_resource_uv = None;
+                }
+            }
+            true
+        }
+
+        fn reject_required_shared_fallback(&mut self) -> bool {
+            if !self.require_shared_texture {
+                return false;
+            }
+            let error = format!(
+                "nvdec {} required shared output failed at {} ({}, code {}): {}; CPU readback disabled",
+                self.diagnostics.last_support_codec.as_deref().unwrap_or("unknown-codec"),
+                self.diagnostics
+                    .last_shared_copy_stage
+                    .as_deref()
+                    .unwrap_or("shared-output"),
+                self.diagnostics
+                    .last_shared_copy_api
+                    .as_deref()
+                    .unwrap_or("D3D11/CUDA interop"),
+                self.diagnostics.last_shared_copy_code.map(|code| code.to_string()).unwrap_or_else(|| "unavailable".into()),
+                self.diagnostics
+                    .last_shared_copy_error_description
+                    .as_deref()
+                    .unwrap_or("shared texture unavailable")
+            );
+            self.diagnostics.last_stage = Some("shared-output".into());
+            self.diagnostics.last_api = self.diagnostics.last_shared_copy_api.clone();
+            self.diagnostics.last_code = self.diagnostics.last_shared_copy_code;
+            self.diagnostics.last_error_name = self.diagnostics.last_shared_copy_error_name.clone();
+            self.diagnostics.last_error_description = Some(error.clone());
+            self.last_error = Some(error);
+            true
+        }
+
         fn clear_access_unit_state(&mut self) {
             self.last_error = None;
             self.diagnostics.last_stage = None;
@@ -1793,16 +2147,14 @@ mod imp {
         }
 
         fn clear_shared_texture_registration(&mut self) {
-            if let Some(unregister) = self.cu_graphics_unregister_resource {
-                if let Some(resource) = self.cuda_resource_y.take() {
-                    let _ = unsafe { unregister(resource) };
+            for index in 0..self.shared_texture_pool.len() {
+                self.select_shared_slot(index);
+                if self.unmap_current_shared_resources() {
+                    self.unregister_current_shared_resources();
                 }
-                if let Some(resource) = self.cuda_resource_uv.take() {
-                    let _ = unsafe { unregister(resource) };
-                }
-            } else {
-                self.cuda_resource_y = None;
-                self.cuda_resource_uv = None;
+                // If cleanup fails, retain both the registration and COM owner
+                // until the enclosing session destroys its CUDA context.
+                self.restore_shared_slot(index);
             }
             self.d3d11_y_texture_ptr = None;
             self.d3d11_uv_texture_ptr = None;
@@ -1954,7 +2306,7 @@ mod imp {
         /// Attempt GPU zero-copy from CUDA decoded frame to D3D11 shared texture
         /// Returns true if successful, false if fallback to CPU path is needed
         #[allow(clippy::too_many_arguments)]
-        fn try_gpu_zero_copy(
+        fn try_copy_to_shared_textures(
             &mut self,
             _cuda_context: CUcontext,
             d3d11_y_texture: *mut c_void,
@@ -1977,7 +2329,7 @@ mod imp {
                     return false;
                 }
             };
-            let unregister_fn = match self.cu_graphics_unregister_resource {
+            let _unregister_fn = match self.cu_graphics_unregister_resource {
                 Some(f) => f,
                 None => {
                     self.record_shared_copy_failure_text(
@@ -1999,7 +2351,7 @@ mod imp {
                     return false;
                 }
             };
-            let unmap_fn = match self.cu_graphics_unmap_resources {
+            let _unmap_fn = match self.cu_graphics_unmap_resources {
                 Some(f) => f,
                 None => {
                     self.record_shared_copy_failure_text(
@@ -2065,16 +2417,13 @@ mod imp {
                     )
                 };
                 if result != CUDA_SUCCESS {
-                    // Cleanup Y resource on failure
-                    if let Some(res) = self.cuda_resource_y.take() {
-                        let _ = unsafe { unregister_fn(res) };
-                    }
                     self.record_shared_copy_failure_code(
                         "register",
                         "cuGraphicsD3D11RegisterResource:UV",
                         result,
                         None,
                     );
+                    self.unregister_current_shared_resources();
                     return false;
                 }
                 self.cuda_resource_uv = Some(resource_uv);
@@ -2088,6 +2437,7 @@ mod imp {
             // Map resources for CUDA access
             let map_result = unsafe { map_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
             if map_result != CUDA_SUCCESS {
+                self.cuda_registration_state.poisoned = true;
                 self.record_shared_copy_failure_code(
                     "map",
                     "cuGraphicsMapResources",
@@ -2096,18 +2446,19 @@ mod imp {
                 );
                 return false;
             }
+            self.cuda_registration_state.mapped = true;
 
             let mut y_array: CUarray = ptr::null_mut();
             let y_array_result =
                 unsafe { get_array_fn(&mut y_array, self.cuda_resource_y.unwrap(), 0, 0) };
             if y_array_result != CUDA_SUCCESS {
-                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 self.record_shared_copy_failure_code(
                     "array",
                     "cuGraphicsSubResourceGetMappedArray:Y",
                     y_array_result,
                     None,
                 );
+                self.unmap_current_shared_resources();
                 return false;
             }
 
@@ -2115,13 +2466,13 @@ mod imp {
             let uv_array_result =
                 unsafe { get_array_fn(&mut uv_array, self.cuda_resource_uv.unwrap(), 0, 0) };
             if uv_array_result != CUDA_SUCCESS {
-                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 self.record_shared_copy_failure_code(
                     "array",
                     "cuGraphicsSubResourceGetMappedArray:UV",
                     uv_array_result,
                     None,
                 );
+                self.unmap_current_shared_resources();
                 return false;
             }
 
@@ -2145,8 +2496,8 @@ mod imp {
             };
             let copy_result = unsafe { copy_fn(&copy_y) };
             if copy_result != CUDA_SUCCESS {
-                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 self.record_shared_copy_failure_code("copy", "cuMemcpy2D_v2:Y", copy_result, None);
+                self.unmap_current_shared_resources();
                 return false;
             }
 
@@ -2170,29 +2521,27 @@ mod imp {
             };
             let copy_result_uv = unsafe { copy_fn(&copy_uv) };
             if copy_result_uv != CUDA_SUCCESS {
-                unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
                 self.record_shared_copy_failure_code(
                     "copy",
                     "cuMemcpy2D_v2:UV",
                     copy_result_uv,
                     None,
                 );
+                self.unmap_current_shared_resources();
                 return false;
             }
 
             // Unmap resources
-            let unmap_result = unsafe { unmap_fn(2, resources.as_mut_ptr(), ptr::null_mut()) };
-            if unmap_result != CUDA_SUCCESS {
-                self.record_shared_copy_failure_code(
-                    "unmap",
-                    "cuGraphicsUnmapResources",
-                    unmap_result,
-                    None,
-                );
+            if !self.unmap_current_shared_resources() {
                 return false;
             }
 
             self.diagnostics.record_shared_copy_success();
+            self.diagnostics.gpu_copy_bytes = self.diagnostics.gpu_copy_bytes.saturating_add(
+                (width as u64)
+                    * (height as u64 + (height / 2) as u64)
+                    * surface_kind.bytes_per_sample() as u64,
+            );
             true
         }
     }
@@ -2394,6 +2743,20 @@ mod imp {
             },
         }
 
+        if let Err(error) = state.ensure_shared_texture() {
+            state.diagnostics.record_shared_copy_failure(
+                "resource",
+                "CreateTexture2D",
+                None,
+                None,
+                Some(error),
+            );
+            if state.reject_required_shared_fallback() {
+                return 0;
+            }
+            // Optional GPU output may fall back to the requested CPU format.
+            state.use_shared_texture = false;
+        }
         next_sequence.min_decode_surfaces.max(1) as c_int
     }
 
@@ -2452,6 +2815,34 @@ mod imp {
             return 1;
         }
 
+        let shared_slot = if state.use_shared_texture {
+            match state.acquire_shared_slot() {
+                Ok(Some(index)) => Some(index),
+                Ok(None) => return 1,
+                Err(error) => {
+                    if !state
+                        .shared_texture_pool
+                        .iter()
+                        .any(|slot| slot.registration_state.poisoned)
+                    {
+                        state.diagnostics.record_shared_copy_failure(
+                            "resource",
+                            "CreateTexture2D",
+                            None,
+                            None,
+                            Some(error),
+                        );
+                    }
+                    if state.reject_required_shared_fallback() {
+                        return 0;
+                    }
+                    state.use_shared_texture = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut dev_ptr = 0_u64;
         let mut pitch = 0_u32;
         let mut proc_params = CUVIDPROCPARAMS {
@@ -2482,6 +2873,9 @@ mod imp {
             )
         };
         if map_result != CUDA_SUCCESS {
+            if let Some(index) = shared_slot {
+                state.restore_shared_slot(index);
+            }
             state.record_failure("map", "cuvidMapVideoFrame64", map_result, None);
             return 0;
         }
@@ -2493,14 +2887,13 @@ mod imp {
             .map(|config| DecodedSurfaceKind::from_bit_depth(config.bit_depth_minus8))
             .unwrap_or(DecodedSurfaceKind::Nv12);
 
-        // Try GPU zero-copy if shared texture mode is enabled
+        // Copy GPU planes directly into shared storage without CPU readback.
         let gpu_copy_success = if state.use_shared_texture {
             state.diagnostics.record_shared_copy_attempt();
             if let (Some(d3d11_y), Some(d3d11_uv)) =
                 (state.d3d11_y_texture_ptr, state.d3d11_uv_texture_ptr)
             {
-                // Attempt GPU zero-copy from CUDA to D3D11
-                state.try_gpu_zero_copy(
+                state.try_copy_to_shared_textures(
                     state.cuda_context,
                     d3d11_y,
                     d3d11_uv,
@@ -2522,24 +2915,42 @@ mod imp {
             false
         };
 
+        if let Some(index) = shared_slot {
+            state.restore_shared_slot(index);
+        }
+
+        if (!gpu_copy_success
+            || state.shared_texture_y.is_none()
+            || state.shared_texture_uv.is_none())
+            && state.reject_required_shared_fallback()
+        {
+            let _ = unsafe { (state.cuvid_unmap_video_frame)(state.decoder, dev_ptr) };
+            return 0;
+        }
+
         // Output based on copy result
         if gpu_copy_success {
-            // GPU zero-copy succeeded - output shared texture frame
+            // GPU plane copies succeeded; publish storage with its reuse lease.
             if let (Some(shared_y), Some(shared_uv)) =
                 (state.shared_texture_y, state.shared_texture_uv)
             {
+                let lease = shared_slot.map(|index| {
+                    super::GpuFrameLease::from_arc(state.shared_texture_pool[index].texture.clone())
+                });
                 let data = match surface_kind {
                     DecodedSurfaceKind::Nv12 => NvdecDecodedFrameData::D3D11SharedNv12 {
                         shared_handle_y: shared_y,
                         shared_handle_uv: shared_uv,
                         width: width as u32,
                         height: height as u32,
+                        lease,
                     },
                     DecodedSurfaceKind::P010 => NvdecDecodedFrameData::D3D11SharedP010 {
                         shared_handle_y: shared_y,
                         shared_handle_uv: shared_uv,
                         width: width as u32,
                         height: height as u32,
+                        lease,
                     },
                 };
                 state.frames.push(NvdecDecodedFrame {
@@ -2568,7 +2979,7 @@ mod imp {
                 }
             }
         } else {
-            // GPU zero-copy not available or failed - use CPU path
+            // Optional shared output was unavailable or failed; record CPU readback.
             let y_plane_bytes = pitch as usize * height;
             let uv_plane_bytes = pitch as usize * (height / 2);
             let total = y_plane_bytes + uv_plane_bytes;
@@ -2601,6 +3012,12 @@ mod imp {
         surface: Vec<u8>,
         surface_kind: DecodedSurfaceKind,
     ) {
+        state.diagnostics.cpu_readback_frames =
+            state.diagnostics.cpu_readback_frames.saturating_add(1);
+        state.diagnostics.cpu_readback_bytes = state
+            .diagnostics
+            .cpu_readback_bytes
+            .saturating_add(surface.len() as u64);
         match (state.output_mode, surface_kind) {
             (NvdecOutputMode::CpuRgb24, DecodedSurfaceKind::Nv12) => {
                 let rgb = nv12_to_rgb(&surface, width, height, pitch);
@@ -3002,8 +3419,8 @@ mod imp {
                 }
             }
             NvdecCodec::Av1 => {
-                // AV1 decode support requires Ada Lovelace or newer GPU
-                // Let capability probing determine if it's available
+                // Runtime capabilities determine hardware support. This path
+                // currently exposes 8-bit AV1 output only.
                 if request.bit_depth_minus8 > 0 {
                     return NvdecSupportDecision::Unsupported("10-bit not wired yet");
                 }
@@ -3042,6 +3459,21 @@ mod imp {
             return Err("cuDeviceGetCount reported no CUDA devices".to_string());
         }
 
+        let mut device = 0;
+        unsafe {
+            cuda_ok(
+                &cuda,
+                (cuda.cu_device_get)(&mut device, 0),
+                "capability",
+                "cuDeviceGet",
+            )?;
+        }
+        let owned_context = OwnedCudaContext::create(&cuda, device)?;
+        let _context_guard = CudaContextGuard {
+            cuda: &cuda,
+            active: true,
+        };
+        let _ = &owned_context;
         let wired_decision = evaluate_support(request.to_support_request());
         if let Some(get_caps) = cuvid.cuvid_get_decoder_caps {
             let mut caps = CUVIDDECODECAPS {
@@ -3056,11 +3488,8 @@ mod imp {
                     codec: request.codec_name().to_string(),
                     bit_depth_minus8: request.bit_depth_minus8,
                     chroma_format: request.chroma_format,
-                    runtime_supported: true,
-                    runtime_reason: format!(
-                        "{} cuvidGetDecoderCaps returned an error; treating runtime support as unknown because decoder creation handles this probe as non-fatal",
-                        request.probe_label()
-                    ),
+                    runtime_supported: false,
+                    runtime_reason: format!("{} runtime capability is unverified: cuvidGetDecoderCaps returned CUDA code {result}", request.probe_label()),
                     wired_supported: matches!(wired_decision, NvdecSupportDecision::Supported),
                     wired_reason: support_reason(wired_decision).to_string(),
                 });
@@ -3285,6 +3714,16 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn missing_runtime_library_reports_load_stage_and_os_error() {
+            let error = super::LoadedModule::load(b"mrd_nonexistent_nvdec_test.dll\0")
+                .err()
+                .expect("missing DLL must fail");
+            assert!(error.contains("mrd_nonexistent_nvdec_test.dll"));
+            assert!(error.contains("LoadLibrary"), "{error}");
+            assert!(error.contains("HRESULT"), "{error}");
+        }
+
         use super::{
             decoder_output_dimensions, evaluate_support, DecodedSurfaceKind, DecoderConfig,
             NvdecCapabilityRequest, NvdecCodec, NvdecSupportDecision, NvdecSupportRequest,
@@ -3292,6 +3731,345 @@ mod imp {
             CUDA_VIDEO_CODEC_H264, CUDA_VIDEO_CODEC_HEVC, CUDA_VIDEO_SURFACE_P016,
             CUVID_PARSER_ANNEXB,
         };
+
+        unsafe extern "system" fn test_create_decoder(
+            out: *mut super::CUvideodecoder,
+            _: *mut super::CUVIDDECODECREATEINFO,
+        ) -> i32 {
+            unsafe {
+                *out = std::ptr::dangling_mut::<std::ffi::c_void>();
+            }
+            0
+        }
+        unsafe extern "system" fn test_destroy_decoder(_: super::CUvideodecoder) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_decode_picture(
+            _: super::CUvideodecoder,
+            _: *mut super::CUVIDPICPARAMS,
+        ) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_map(
+            _: super::CUvideodecoder,
+            _: i32,
+            out: *mut u64,
+            pitch: *mut u32,
+            _: *mut super::CUVIDPROCPARAMS,
+        ) -> i32 {
+            unsafe {
+                *out = 1;
+                *pitch = 128;
+            }
+            0
+        }
+        unsafe extern "system" fn test_unmap(_: super::CUvideodecoder, _: u64) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_readback(
+            out: *mut std::ffi::c_void,
+            _: u64,
+            len: usize,
+        ) -> i32 {
+            unsafe {
+                std::ptr::write_bytes(out.cast::<u8>(), 128, len);
+            }
+            0
+        }
+        fn test_state() -> super::CallbackState {
+            use super::{ptr, NvdecDiagnostics};
+            super::CallbackState {
+                cuvid_create_decoder: test_create_decoder,
+                cuvid_destroy_decoder: test_destroy_decoder,
+                cuvid_decode_picture: test_decode_picture,
+                cuvid_get_decode_status: None,
+                cuvid_reconfigure_decoder: None,
+                cuvid_map_video_frame: test_map,
+                cuvid_unmap_video_frame: test_unmap,
+                cu_get_error_name: None,
+                cu_get_error_string: None,
+                cu_memcpy_dtoh: test_readback,
+                // CUDA-D3D11 interop functions
+                cu_graphics_d3d11_register_resource: None,
+                cu_graphics_unregister_resource: None,
+                cu_graphics_map_resources: None,
+                cu_graphics_unmap_resources: None,
+                cu_graphics_sub_resource_get_mapped_array: None,
+                cu_memcpy_2d: None,
+                // Registered CUDA resources (initialized when shared texture is created)
+                cuda_resource_y: None,
+                cuda_resource_uv: None,
+                cuda_registration_state: super::CudaRegistrationState::default(),
+                // D3D11 texture pointers (set when shared texture is enabled)
+                d3d11_y_texture_ptr: None,
+                d3d11_uv_texture_ptr: None,
+                // CUDA context for GPU operations
+                cuda_context: ptr::null_mut(),
+                cuda_device: 0,
+                cu_d3d11_get_device: None,
+                decoder: ptr::null_mut(),
+                decoder_config: Some(baseline_config()),
+                sequence_width: 128,
+                sequence_height: 128,
+                diagnostics: NvdecDiagnostics::default(),
+                output_mode: super::NvdecOutputMode::CpuNv12,
+                last_error: None,
+                frames: Vec::new(),
+                use_shared_texture: false,
+                require_shared_texture: false,
+                shared_texture_pool: Vec::new(),
+                external_d3d11_device_ptr: None,
+                shared_texture_y: None,
+                shared_texture_uv: None,
+            }
+        }
+
+        unsafe extern "system" fn test_register(
+            out: *mut super::CUgraphicsResource,
+            resource: *mut std::ffi::c_void,
+            _: u32,
+        ) -> i32 {
+            unsafe {
+                *out = resource;
+            }
+            0
+        }
+        unsafe extern "system" fn test_graphics_map(
+            _: i32,
+            _: *mut super::CUgraphicsResource,
+            _: super::CUstream,
+        ) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_graphics_unmap_failure(
+            _: i32,
+            _: *mut super::CUgraphicsResource,
+            _: super::CUstream,
+        ) -> i32 {
+            999
+        }
+        unsafe extern "system" fn test_unregister(_: super::CUgraphicsResource) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_unregister_failure(_: super::CUgraphicsResource) -> i32 {
+            999
+        }
+        unsafe extern "system" fn test_array(
+            out: *mut super::CUarray,
+            resource: super::CUgraphicsResource,
+            _: u32,
+            _: u32,
+        ) -> i32 {
+            unsafe {
+                *out = resource;
+            }
+            0
+        }
+        unsafe extern "system" fn test_copy_2d(_: *const super::CUDA_MEMCPY2D) -> i32 {
+            0
+        }
+        unsafe extern "system" fn test_copy_2d_failure(_: *const super::CUDA_MEMCPY2D) -> i32 {
+            1
+        }
+
+        #[test]
+        fn shared_cleanup_failure_quarantines_storage_before_next_frame_or_resize() {
+            use windows::core::Interface;
+            for copy_failure in [false, true] {
+                let texture =
+                    super::D3D11SharedTexture::new(128, 128, DecodedSurfaceKind::Nv12).unwrap();
+                let mut state = test_state();
+                state.external_d3d11_device_ptr = Some(texture.device.as_raw());
+                state.use_shared_texture = true;
+                state.require_shared_texture = true;
+                state.cu_graphics_d3d11_register_resource = Some(test_register);
+                state.cu_graphics_unregister_resource = Some(test_unregister);
+                state.cu_graphics_map_resources = Some(test_graphics_map);
+                state.cu_graphics_unmap_resources = Some(test_graphics_unmap_failure);
+                state.cu_graphics_sub_resource_get_mapped_array = Some(test_array);
+                state.cu_memcpy_2d = Some(if copy_failure {
+                    test_copy_2d_failure
+                } else {
+                    test_copy_2d
+                });
+                let mut display = super::CUVIDPARSERDISPINFO {
+                    picture_index: 0,
+                    progressive_frame: 1,
+                    top_field_first: 0,
+                    repeat_first_field: 0,
+                    timestamp: 0,
+                };
+                assert_eq!(
+                    unsafe {
+                        super::display_callback(
+                            (&mut state as *mut super::CallbackState).cast(),
+                            &mut display,
+                        )
+                    },
+                    0
+                );
+                let original = state.shared_texture_pool[0].texture.y_texture.as_raw();
+                assert!(
+                    state.acquire_shared_slot().is_err(),
+                    "unmap failure must not return storage to the writable pool"
+                );
+                state.decoder_config.as_mut().unwrap().display_width = 256;
+                assert!(state.acquire_shared_slot().is_err());
+                assert_eq!(
+                    state.shared_texture_pool[0].texture.y_texture.as_raw(),
+                    original
+                );
+                assert!(state.frames.is_empty());
+                assert_eq!(state.diagnostics.cpu_readback_bytes, 0);
+                state.clear_shared_texture_registration();
+                let slot = &state.shared_texture_pool[0];
+                assert!(slot.registration_state.mapped && slot.registration_state.poisoned);
+                assert!(slot.cuda_resource_y.is_some() && slot.cuda_resource_uv.is_some());
+                state.decoder_config.as_mut().unwrap().display_width = 128;
+                state.require_shared_texture = false;
+                assert_eq!(
+                    unsafe {
+                        super::display_callback(
+                            (&mut state as *mut super::CallbackState).cast(),
+                            &mut display,
+                        )
+                    },
+                    1
+                );
+                assert_eq!(state.diagnostics.cpu_readback_frames, 1);
+                assert_eq!(state.shared_texture_pool.len(), 1);
+                assert!(!state.use_shared_texture);
+            }
+        }
+
+        #[test]
+        fn shared_cleanup_unregister_failure_preserves_old_slot_on_resize() {
+            use windows::core::Interface;
+            let texture =
+                super::D3D11SharedTexture::new(128, 128, DecodedSurfaceKind::Nv12).unwrap();
+            let mut state = test_state();
+            state.external_d3d11_device_ptr = Some(texture.device.as_raw());
+            state.use_shared_texture = true;
+            state.ensure_shared_texture().unwrap();
+            let original = state.shared_texture_pool[0].texture.y_texture.as_raw();
+            state.shared_texture_pool[0].cuda_resource_y = Some(original);
+            state.cu_graphics_unregister_resource = Some(test_unregister_failure);
+            state.decoder_config.as_mut().unwrap().display_width = 256;
+            assert!(
+                state.acquire_shared_slot().is_err(),
+                "failed unregister must retain the original COM owner and registration"
+            );
+            assert_eq!(
+                state.shared_texture_pool[0].texture.y_texture.as_raw(),
+                original
+            );
+            assert!(state.shared_texture_pool[0].cuda_resource_y.is_some());
+        }
+
+        #[test]
+        fn required_shared_failure_does_not_download_or_emit_cpu_pixels() {
+            let texture =
+                super::D3D11SharedTexture::new(128, 128, DecodedSurfaceKind::Nv12).unwrap();
+            let mut state = test_state();
+            use windows::core::Interface;
+            state.external_d3d11_device_ptr = Some(texture.device.as_raw());
+            state.use_shared_texture = true;
+            state.require_shared_texture = true;
+            let mut display = super::CUVIDPARSERDISPINFO {
+                picture_index: 0,
+                progressive_frame: 1,
+                top_field_first: 0,
+                repeat_first_field: 0,
+                timestamp: 0,
+            };
+            let result = unsafe {
+                super::display_callback(
+                    (&mut state as *mut super::CallbackState).cast(),
+                    &mut display,
+                )
+            };
+            assert_eq!(result, 0);
+            assert!(state.frames.is_empty());
+            assert_eq!(state.diagnostics.cpu_readback_bytes, 0);
+            assert!(state
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("CPU readback disabled"));
+            state.require_shared_texture = false;
+            state.last_error = None;
+            assert_eq!(
+                unsafe {
+                    super::display_callback(
+                        (&mut state as *mut super::CallbackState).cast(),
+                        &mut display,
+                    )
+                },
+                1
+            );
+            assert_eq!(state.diagnostics.cpu_readback_frames, 1);
+            assert_eq!(state.frames.len(), 1);
+        }
+
+        #[test]
+        fn shared_pool_is_bounded_and_replaces_only_unleased_slots_on_resize() {
+            use windows::core::Interface;
+            let device =
+                super::D3D11SharedTexture::new(128, 128, DecodedSurfaceKind::Nv12).unwrap();
+            let mut state = test_state();
+            state.external_d3d11_device_ptr = Some(device.device.as_raw());
+            state.use_shared_texture = true;
+            state.require_shared_texture = true;
+            state.ensure_shared_texture().unwrap();
+            let mut leases = Vec::new();
+            for index in 0..super::SHARED_TEXTURE_POOL_LIMIT {
+                assert_eq!(state.acquire_shared_slot().unwrap(), Some(index));
+                leases.push(super::super::GpuFrameLease::from_arc(
+                    state.shared_texture_pool[index].texture.clone(),
+                ));
+            }
+            assert_eq!(state.acquire_shared_slot().unwrap(), None);
+            assert_eq!(state.shared_texture_pool.len(), 4);
+            assert_eq!(state.diagnostics.shared_pool_backpressure_frames, 1);
+            assert_eq!(state.diagnostics.cpu_readback_bytes, 0);
+            assert!(
+                state.last_error.is_none(),
+                "pool backpressure is not a decoder error"
+            );
+            state.decoder_config.as_mut().unwrap().display_width = 256;
+            assert_eq!(state.acquire_shared_slot().unwrap(), None);
+            leases.remove(0);
+            assert_eq!(state.acquire_shared_slot().unwrap(), Some(0));
+            assert_eq!(state.shared_texture_pool[0].texture.width, 256);
+            assert!(state.shared_texture_pool[1..]
+                .iter()
+                .all(|slot| slot.texture.width == 128));
+            let retained_handle = state.shared_texture_pool[1].texture.shared_handle_y;
+            let device_ptr = state.shared_texture_pool[0].texture.device.as_raw();
+            assert!(state
+                .shared_texture_pool
+                .iter()
+                .all(|slot| slot.texture.device.as_raw() == device_ptr));
+            drop(state);
+            assert_eq!(
+                leases.len(),
+                3,
+                "frame leases remain valid after decoder state drop"
+            );
+            let mut retained_texture: Option<super::ID3D11Texture2D> = None;
+            unsafe {
+                device
+                    .device
+                    .OpenSharedResource(
+                        windows::Win32::Foundation::HANDLE(
+                            retained_handle as *mut core::ffi::c_void,
+                        ),
+                        &mut retained_texture,
+                    )
+                    .expect("leased legacy handle must remain valid after decoder pool drop");
+            }
+            assert!(retained_texture.is_some());
+        }
 
         fn baseline_sequence() -> SequenceFormat {
             SequenceFormat {

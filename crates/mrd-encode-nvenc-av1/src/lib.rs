@@ -1,6 +1,6 @@
 //! NVENC AV1 encoder implementation
 //!
-//! This encoder uses NVIDIA's AV1 encoding hardware (available on Ampere and newer GPUs).
+//! This encoder requires a GPU and driver that expose NVENC AV1 encoding support.
 //! AV1 provides better compression efficiency than H.264 at the same quality.
 
 #[cfg(not(windows))]
@@ -26,6 +26,7 @@ mod imp {
         NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
+    use std::borrow::Cow;
     use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
@@ -38,6 +39,14 @@ mod imp {
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     pub struct NvencAv1Encoder {
+        native: RetainedOnFailure<NativeResources>,
+        width: usize,
+        height: usize,
+        fps: u32,
+        frame_index: usize,
+    }
+
+    struct NativeResources {
         // Drop NVENC buffers/registrations before their D3D11 backing
         // resources. Rust drops struct fields in declaration order.
         bitstream: BitStream,
@@ -47,10 +56,6 @@ mod imp {
         texture: ID3D11Texture2D,
         context: ID3D11DeviceContext,
         _device: ID3D11Device,
-        width: usize,
-        height: usize,
-        fps: u32,
-        frame_index: usize,
     }
 
     unsafe impl Send for NvencAv1Encoder {}
@@ -61,6 +66,282 @@ mod imp {
         height: u32,
         registered: RegisteredResource,
         _texture: ID3D11Texture2D,
+    }
+
+    struct RetainedOnFailure<T> {
+        resource: Option<T>,
+        pending: bool,
+    }
+
+    impl<T> RetainedOnFailure<T> {
+        fn new(resource: T) -> Self {
+            Self {
+                resource: Some(resource),
+                pending: false,
+            }
+        }
+
+        fn ensure_idle(&self) -> Result<(), PipelineError> {
+            if self.pending {
+                return Err(PipelineError::message(
+                    "previous NVENC AV1 input has not completed",
+                ));
+            }
+            Ok(())
+        }
+
+        fn idle_mut(&mut self) -> Result<&mut T, PipelineError> {
+            self.ensure_idle()?;
+            Ok(self.resource.as_mut().expect("active AV1 resources"))
+        }
+
+        fn run<O>(
+            &mut self,
+            action: impl FnOnce(&mut T) -> anyhow::Result<O>,
+        ) -> anyhow::Result<O> {
+            self.ensure_idle()?;
+            self.pending = true;
+            let output = action(self.resource.as_mut().expect("active AV1 resources"))?;
+            self.pending = false;
+            Ok(output)
+        }
+    }
+
+    impl<T> Drop for RetainedOnFailure<T> {
+        fn drop(&mut self) {
+            if self.pending {
+                // No successful completion is known. Preserve the entire native
+                // owner, including its encoder Arc and both input textures.
+                if let Some(unfinished) = self.resource.take() {
+                    std::mem::forget(unfinished);
+                }
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "NVENC AV1 failed before completion; native resources retained until process exit");
+            }
+        }
+    }
+
+    fn complete_av1_output<O, E>(
+        lock_copy_unlock: impl FnOnce() -> Result<O, E>,
+        unmap: impl FnOnce() -> Result<(), E>,
+    ) -> Result<O, E> {
+        let output = lock_copy_unlock()?;
+        unmap()?;
+        Ok(output)
+    }
+
+    fn prepare_cpu_input<E>(
+        unmap: impl FnOnce() -> Result<(), E>,
+        upload: impl FnOnce(),
+    ) -> Result<(), E> {
+        unmap()?;
+        upload();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod lifecycle_tests {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct NativeOwner(Arc<AtomicUsize>);
+        impl Drop for NativeOwner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn initial_mapping_is_released_before_cpu_upload() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            prepare_cpu_input(
+                || {
+                    calls.borrow_mut().push("unmap");
+                    Ok::<_, &str>(())
+                },
+                || calls.borrow_mut().push("upload"),
+            )
+            .unwrap();
+            assert_eq!(*calls.borrow(), ["unmap", "upload"]);
+        }
+
+        #[test]
+        fn initial_unmap_failure_prevents_upload_and_retains_native_owner() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut owner = RetainedOnFailure::new(NativeOwner(drops.clone()));
+            let uploaded = std::cell::Cell::new(false);
+            assert!(owner
+                .run(|_| prepare_cpu_input(
+                    || Err(anyhow!("initial unmap failed")),
+                    || uploaded.set(true)
+                ))
+                .is_err());
+            assert!(!uploaded.get());
+            assert!(owner.ensure_idle().is_err());
+            drop(owner);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn submission_or_completion_failure_poison_and_retain_native_owner() {
+            for phase in ["submit", "lock", "unlock", "unmap"] {
+                let drops = Arc::new(AtomicUsize::new(0));
+                let mut state = RetainedOnFailure::new(NativeOwner(drops.clone()));
+                assert!(state.run::<()>(|_| Err(anyhow!("{phase} failed"))).is_err());
+                assert!(state.ensure_idle().is_err());
+                assert!(state.idle_mut().is_err());
+                assert!(state.run(|_| Ok(())).is_err());
+                drop(state);
+                assert_eq!(drops.load(Ordering::SeqCst), 0, "{phase}");
+            }
+        }
+
+        #[test]
+        fn successful_completion_reuses_and_releases_native_owner() {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut state = RetainedOnFailure::new(NativeOwner(drops.clone()));
+            state.run(|_| Ok(())).unwrap();
+            state.run(|_| Ok(())).unwrap();
+            assert!(state.idle_mut().is_ok());
+            drop(state);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn output_unlock_precedes_input_unmap() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let bytes = complete_av1_output(
+                || {
+                    calls.borrow_mut().extend(["lock", "copy", "unlock"]);
+                    Ok::<_, &str>(vec![1])
+                },
+                || {
+                    calls.borrow_mut().push("unmap");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(bytes, [1]);
+            assert_eq!(*calls.borrow(), ["lock", "copy", "unlock", "unmap"]);
+        }
+
+        #[test]
+        fn failed_lock_or_unlock_does_not_unmap_input() {
+            let unmapped = std::cell::Cell::new(false);
+            assert_eq!(
+                complete_av1_output(
+                    || Err::<(), _>("unlock failed"),
+                    || {
+                        unmapped.set(true);
+                        Ok(())
+                    }
+                ),
+                Err("unlock failed")
+            );
+            assert!(!unmapped.get());
+        }
+
+        #[test]
+        fn failed_unmap_is_reported_to_resource_owner() {
+            assert_eq!(
+                complete_av1_output(|| Ok(()), || Err("unmap failed")),
+                Err("unmap failed")
+            );
+        }
+
+        #[test]
+        fn cpu_bgra_borrows_frame_storage() {
+            let frame = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 0, vec![7; 16]);
+            let bgra = to_bgra(&frame).unwrap();
+            assert_eq!(bgra.as_ptr(), frame.data.as_ptr());
+        }
+
+        #[test]
+        fn cpu_bgra_rejects_truncated_input() {
+            let frame = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 0, vec![7; 15]);
+            assert!(to_bgra(&frame).is_err());
+        }
+
+        #[test]
+        #[ignore = "requires a working NVIDIA AV1 encoder and runtime"]
+        fn strict_av1_cpu_bgra_encodes_repeated_frames() {
+            let mut encoder =
+                NvencAv1Encoder::new(1280, 720, 60).expect("AV1 encoder must initialize");
+            for index in 0..3 {
+                let frame = CapturedFrame::from_cpu(
+                    1280,
+                    720,
+                    FramePixelFormat::Bgra32,
+                    index,
+                    vec![(index * 24) as u8; 1280 * 720 * 4],
+                );
+                let output = encoder.encode(&frame).expect("CPU AV1 frame encode");
+                assert_eq!(output.len(), 1);
+                assert!(!output[0].bytes.is_empty());
+                assert_eq!(output[0].timestamp_us, index);
+                assert_eq!(output[0].codec, VideoCodec::Av1);
+            }
+        }
+
+        #[test]
+        #[ignore = "requires a working NVIDIA AV1 encoder and shared D3D11 runtime"]
+        fn strict_av1_shared_bgra_encodes_repeated_frames() {
+            use windows::core::Interface;
+            use windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_SHARED;
+            use windows::Win32::Graphics::Dxgi::IDXGIResource;
+            let (device, context) = create_d3d11_device().expect("capture D3D11 device");
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: 1280,
+                Height: 720,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.unwrap();
+            let texture = texture.unwrap();
+            let dxgi: IDXGIResource = texture.cast().unwrap();
+            let handle = unsafe { dxgi.GetSharedHandle() }.unwrap();
+            let mut encoder =
+                NvencAv1Encoder::new(1280, 720, 60).expect("AV1 encoder must initialize");
+            for index in 0..4 {
+                let pixels = vec![(index * 24) as u8; 1280 * 720 * 4];
+                unsafe {
+                    context.UpdateSubresource(
+                        &texture,
+                        0,
+                        None,
+                        pixels.as_ptr().cast(),
+                        1280 * 4,
+                        0,
+                    );
+                    context.Flush();
+                }
+                let frame = CapturedFrame::from_d3d11_shared_bgra(
+                    1280,
+                    720,
+                    index,
+                    handle.0 as isize,
+                    1280 * 4,
+                );
+                let output = encoder.encode(&frame).expect("shared AV1 frame encode");
+                assert_eq!(output.len(), 1);
+                assert!(!output[0].bytes.is_empty());
+                assert_eq!(output[0].timestamp_us, index);
+                assert_eq!(output[0].codec, VideoCodec::Av1);
+            }
+        }
     }
 
     impl NvencAv1Encoder {
@@ -192,13 +473,15 @@ mod imp {
             })?;
 
             Ok(Self {
-                _device: device,
-                context,
-                texture,
-                encoder,
-                registered,
-                shared_input: None,
-                bitstream,
+                native: RetainedOnFailure::new(NativeResources {
+                    _device: device,
+                    context,
+                    texture,
+                    encoder,
+                    registered,
+                    shared_input: None,
+                    bitstream,
+                }),
                 width,
                 height,
                 fps,
@@ -278,13 +561,15 @@ mod imp {
             })?;
 
             Ok(Self {
-                _device: device,
-                context,
-                texture,
-                encoder,
-                registered,
-                shared_input: None,
-                bitstream,
+                native: RetainedOnFailure::new(NativeResources {
+                    _device: device,
+                    context,
+                    texture,
+                    encoder,
+                    registered,
+                    shared_input: None,
+                    bitstream,
+                }),
                 width,
                 height,
                 fps,
@@ -355,13 +640,15 @@ mod imp {
             })?;
 
             Ok(Self {
-                _device: device,
-                context,
-                texture,
-                encoder,
-                registered,
-                shared_input: None,
-                bitstream,
+                native: RetainedOnFailure::new(NativeResources {
+                    _device: device,
+                    context,
+                    texture,
+                    encoder,
+                    registered,
+                    shared_input: None,
+                    bitstream,
+                }),
                 width,
                 height,
                 fps,
@@ -411,18 +698,22 @@ mod imp {
 
             let force_key =
                 self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize * 2);
-            let shared_input = self
-                .shared_input
-                .as_ref()
-                .ok_or_else(|| PipelineError::message("missing shared input resource"))?;
-            let bytes = encode_picture(
-                &mut self.encoder,
-                &self.bitstream,
-                &shared_input.registered,
-                self.frame_index,
-                force_key,
-            )
-            .map_err(|error| PipelineError::message(error.to_string()))?;
+            let bytes = self
+                .native
+                .run(|native| {
+                    let shared_input = native
+                        .shared_input
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("missing shared input resource"))?;
+                    encode_picture(
+                        &mut native.encoder,
+                        &native.bitstream,
+                        &mut shared_input.registered,
+                        self.frame_index,
+                        force_key,
+                    )
+                })
+                .map_err(|error| PipelineError::message(error.to_string()))?;
             self.frame_index += 1;
 
             Ok(vec![EncodedAccessUnit {
@@ -437,7 +728,8 @@ mod imp {
             &mut self,
             shared: &D3D11SharedBgraFrame,
         ) -> Result<(), PipelineError> {
-            let needs_new = self
+            let native = self.native.idle_mut()?;
+            let needs_new = native
                 .shared_input
                 .as_ref()
                 .map(|input| {
@@ -457,7 +749,7 @@ mod imp {
 
             let mut texture = None::<ID3D11Texture2D>;
             unsafe {
-                self._device.OpenSharedResource(
+                native._device.OpenSharedResource(
                     HANDLE(shared.shared_handle as *mut core::ffi::c_void),
                     &mut texture,
                 )
@@ -470,7 +762,7 @@ mod imp {
             let texture =
                 texture.ok_or_else(|| PipelineError::message("missing opened shared texture"))?;
 
-            let registered = self
+            let registered = native
                 .encoder
                 .register_resource_dx11(&texture, NVencBufferFormat::ARGB, shared.row_pitch)
                 .map_err(|error| {
@@ -479,7 +771,7 @@ mod imp {
                     ))
                 })?;
 
-            self.shared_input = Some(SharedInputResource {
+            native.shared_input = Some(SharedInputResource {
                 shared_handle: shared.shared_handle,
                 width: shared.width,
                 height: shared.height,
@@ -500,6 +792,7 @@ mod imp {
             &mut self,
             frame: &CapturedFrame,
         ) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+            self.native.ensure_idle()?;
             if frame.width != self.width || frame.height != self.height {
                 return Err(PipelineError::message(format!(
                     "frame size mismatch: expected {}x{}, got {}x{}",
@@ -517,28 +810,40 @@ mod imp {
                 .ok_or_else(|| PipelineError::message("row pitch overflow"))?
                 as u32;
 
-            unsafe {
-                self.context.UpdateSubresource(
-                    &self.texture,
-                    0,
-                    None,
-                    bgra.as_ptr() as *const core::ffi::c_void,
-                    row_pitch,
-                    0,
-                );
-            }
-
             // AV1 uses key frames instead of IDR frames
             let force_key =
                 self.frame_index == 0 || self.frame_index.is_multiple_of(self.fps as usize * 2);
-            let bytes = encode_picture(
-                &mut self.encoder,
-                &self.bitstream,
-                &self.registered,
-                self.frame_index,
-                force_key,
-            )
-            .map_err(|error| PipelineError::message(error.to_string()))?;
+            let bytes = self
+                .native
+                .run(|native| {
+                    // Native registration starts mapped. Unmap before the first
+                    // upload, and map again only after all graphics writes.
+                    prepare_cpu_input(
+                        || {
+                            native.registered.unmap().map_err(|error| {
+                                anyhow!("NVENC AV1 unmap before upload failed: {error:?}")
+                            })
+                        },
+                        || unsafe {
+                            native.context.UpdateSubresource(
+                                &native.texture,
+                                0,
+                                None,
+                                bgra.as_ptr() as *const core::ffi::c_void,
+                                row_pitch,
+                                0,
+                            );
+                        },
+                    )?;
+                    encode_picture(
+                        &mut native.encoder,
+                        &native.bitstream,
+                        &mut native.registered,
+                        self.frame_index,
+                        force_key,
+                    )
+                })
+                .map_err(|error| PipelineError::message(error.to_string()))?;
             self.frame_index += 1;
 
             Ok(vec![EncodedAccessUnit {
@@ -550,16 +855,16 @@ mod imp {
         }
     }
 
-    impl Drop for NvencAv1Encoder {
+    impl Drop for NativeResources {
         fn drop(&mut self) {
             // Make the D3D11 submission queue and the encoder session quiescent
             // before registered resources are dropped in field order.
             unsafe { self.context.Flush() };
+            let _ = self.encoder.end_encode();
             let _ = self.registered.unmap();
             if let Some(shared_input) = self.shared_input.as_mut() {
                 let _ = shared_input.registered.unmap();
             }
-            let _ = self.encoder.end_encode();
         }
     }
 
@@ -689,10 +994,13 @@ mod imp {
     fn encode_picture(
         encoder: &mut Encoder,
         bitstream: &BitStream,
-        registered: &RegisteredResource,
+        registered: &mut RegisteredResource,
         frame_index: usize,
         force_key: bool,
     ) -> anyhow::Result<Vec<u8>> {
+        registered
+            .map()
+            .map_err(|error| anyhow!("NVENC AV1 map input failed: {error:?}"))?;
         let encode_pic_flags = if force_key {
             NVencPicFlags::ForceIDR as u32 | NVencPicFlags::OutputSpspps as u32
         } else {
@@ -715,47 +1023,64 @@ mod imp {
                 None,
             )
             .map_err(|error| anyhow!("NVENC encode_picture failed: {error:?}"))?;
-        let lock = bitstream
-            .try_lock(true)
-            .map_err(|error| anyhow!("NVENC bitstream lock failed: {error:?}"))?;
-        Ok(lock.as_slice().to_vec())
+        complete_av1_output(
+            || {
+                let lock = bitstream
+                    .try_lock(true)
+                    .map_err(|error| anyhow!("NVENC bitstream lock failed: {error:?}"))?;
+                let bytes = lock.as_slice().to_vec();
+                lock.unlock()
+                    .map_err(|error| anyhow!("NVENC bitstream unlock failed: {error:?}"))?;
+                Ok(bytes)
+            },
+            || {
+                registered
+                    .unmap()
+                    .map_err(|error| anyhow!("NVENC AV1 unmap input failed: {error:?}"))
+            },
+        )
     }
 
-    fn to_bgra(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
-        let expected_len = frame
+    fn to_bgra(frame: &CapturedFrame) -> Result<Cow<'_, [u8]>, PipelineError> {
+        let pixels = frame
             .width
             .checked_mul(frame.height)
-            .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| PipelineError::message("frame size overflow"))?;
-
-        let bgra = match frame.pixel_format {
-            FramePixelFormat::Bgra32 => frame.data.clone(),
+        let expected_output_len = pixels
+            .checked_mul(4)
+            .ok_or_else(|| PipelineError::message("BGRA output size overflow"))?;
+        let expected_input_len = match frame.pixel_format {
+            FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => Some(expected_output_len),
+            FramePixelFormat::Rgb24 => pixels.checked_mul(3),
+            FramePixelFormat::Nv12 => nv12_len(frame.width, frame.height),
+        }
+        .ok_or_else(|| {
+            PipelineError::message("frame buffer size overflow or odd NV12 dimensions")
+        })?;
+        if frame.data.len() != expected_input_len {
+            return Err(PipelineError::message(format!(
+                "frame bytes mismatch: expected {expected_input_len}, got {}",
+                frame.data.len()
+            )));
+        }
+        match frame.pixel_format {
+            FramePixelFormat::Bgra32 => Ok(Cow::Borrowed(&frame.data)),
             FramePixelFormat::Rgba32 => {
-                let mut bgra = vec![0_u8; expected_len];
-                for i in (0..expected_len).step_by(4) {
-                    bgra[i] = frame.data[i + 2]; // R -> B
-                    bgra[i + 1] = frame.data[i + 1]; // G
-                    bgra[i + 2] = frame.data[i]; // B -> R
-                    bgra[i + 3] = frame.data[i + 3]; // A
+                let mut bgra = Vec::with_capacity(expected_output_len);
+                for pixel in frame.data.chunks_exact(4) {
+                    bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
                 }
-                bgra
+                Ok(Cow::Owned(bgra))
             }
             FramePixelFormat::Rgb24 => {
-                let mut bgra = vec![0_u8; expected_len];
-                for i in 0..frame.data.len() / 3 {
-                    let src_offset = i * 3;
-                    let dst_offset = i * 4;
-                    bgra[dst_offset] = frame.data[src_offset + 2]; // R -> B
-                    bgra[dst_offset + 1] = frame.data[src_offset + 1]; // G
-                    bgra[dst_offset + 2] = frame.data[src_offset]; // B -> R
-                    bgra[dst_offset + 3] = 255; // A
+                let mut bgra = Vec::with_capacity(expected_output_len);
+                for pixel in frame.data.chunks_exact(3) {
+                    bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
                 }
-                bgra
+                Ok(Cow::Owned(bgra))
             }
-            FramePixelFormat::Nv12 => nv12_to_bgra(frame, expected_len)?,
-        };
-
-        Ok(bgra)
+            FramePixelFormat::Nv12 => nv12_to_bgra(frame, expected_output_len).map(Cow::Owned),
+        }
     }
 
     fn nv12_len(width: usize, height: usize) -> Option<usize> {

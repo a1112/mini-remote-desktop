@@ -79,13 +79,13 @@ $noneArgs = Get-TransportMatrixCargoFeatureArgs -DecodeBackend "nvdec"
 Assert-ArrayEqual $noneArgs @() "Hardware decode matrix does not enable software codec features"
 
 $releaseCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "nvenc_av1" -DecodeBackend "nvdec_av1"
-Assert-ArrayEqual $releaseCargoArgs @("test", "--release", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should default to release cargo tests"
+Assert-ArrayEqual $releaseCargoArgs @("test", "--release", "-p", "app", "--bin", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should target the app binary and default to release cargo tests"
 
 $debugCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "nvenc_av1" -DecodeBackend "nvdec_av1" -Release:$false
-Assert-ArrayEqual $debugCargoArgs @("test", "-p", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should allow debug cargo tests for local debugging"
+Assert-ArrayEqual $debugCargoArgs @("test", "-p", "app", "--bin", "app", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmarks should allow focused debug cargo tests for local debugging"
 
 $vvcCargoArgs = Get-TransportMatrixCargoTestArgs -EncodeBackend "software_vvc" -DecodeBackend "software_vvc"
-Assert-ArrayEqual $vvcCargoArgs @("test", "--release", "-p", "app", "--features", "production-vvc-software-codec", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmark cargo args should preserve codec feature flags"
+Assert-ArrayEqual $vvcCargoArgs @("test", "--release", "-p", "app", "--bin", "app", "--features", "production-vvc-software-codec", "benchmark_run_writes_requested_artifacts", "--", "--nocapture") "Transport benchmark cargo args should preserve codec feature flags"
 
 $explicitAv1Mode = Get-TransportMatrixAv1Mode -Scenario ([pscustomobject]@{ encode_backend = "nvenc_av1"; av1_mode = "ultra_low_latency"; fps = 144 })
 if ($explicitAv1Mode -ne "ultra_low_latency") { throw "transport matrix should preserve explicit AV1 mode" }
@@ -478,6 +478,15 @@ try {
     encoded_fps = 143.9
     decoded_fps = 143.5
     zero_copy_enabled = $true
+    zero_copy_requested = $true
+    zero_copy_scope = "cpu_pixel_transfers"
+    observed_memory_path = "d3d11-shared"
+    memory_path_evidence = @{
+      capture = @{ cpu_frames = 0; shared_frames = 2800; unknown_frames = 0 }
+      encode = @{ cpu_frames = 0; shared_frames = 2800; unknown_frames = 0 }
+      decode = @{ cpu_frames = 0; shared_frames = 2800; unknown_frames = 0 }
+      render = @{ cpu_frames = 0; shared_frames = 2800; unknown_frames = 0 }
+    }
     total_bitstream_bytes = 75000000
     keyframes = 0
     dropped_frames = 0
@@ -564,6 +573,11 @@ database or disk is full
   if ($csv.encoded_fps -ne "143.9") { throw "summary CSV must include encoded FPS" }
   if ($csv.decoded_fps -ne "143.5") { throw "summary CSV must include decoded FPS" }
   if ($csv.zero_copy_enabled -ne "True") { throw "summary CSV must include zero-copy status" }
+  if ($csv.zero_copy_requested -ne "True") { throw "summary CSV must distinguish requested zero-copy mode" }
+  if ($csv.observed_memory_path -ne "d3d11-shared") { throw "summary CSV must include observed memory path" }
+  if ($csv.zero_copy_scope -ne "cpu_pixel_transfers") { throw "summary CSV must define the measured copy scope" }
+  $memoryEvidence = $csv.memory_path_evidence | ConvertFrom-Json
+  if ($memoryEvidence.encode.shared_frames -ne 2800) { throw "summary CSV must preserve structured encoder memory evidence" }
   if ($csv.total_bitstream_bytes -ne "75000000") { throw "summary CSV must include bitstream byte count" }
   if ($csv.render_queue_replacements -ne "7") { throw "summary CSV must include render queue replacements" }
   if ($csv.render_stale_frame_drops -ne "7") { throw "summary CSV must include render stale frame drops" }
@@ -592,6 +606,8 @@ database or disk is full
   if ($report -notmatch "target_bitrate_kbps \\| 120000") { throw "markdown report must include target bitrate" }
   if ($report -notmatch "encoded_fps \\| 143.9") { throw "markdown report must include encoded FPS" }
   if ($report -notmatch "zero_copy_enabled \\| True") { throw "markdown report must include zero-copy status" }
+  if ($report -notmatch 'zero_copy_scope \\| cpu_pixel_transfers') { throw "markdown report must explain zero-copy scope" }
+  if ($report -notmatch 'GPU-internal copies') { throw "markdown report must explain unmeasured copies" }
   if ($report -notmatch "total_bitstream_bytes \\| 75000000") { throw "markdown report must include bitstream bytes" }
   if ($report -notmatch "swap_chain_max_frame_latency \\| 1") { throw "markdown report must include swapchain max frame latency" }
   if ($report -notmatch "swap_chain_allow_tearing \\| True") { throw "markdown report must include swapchain tearing policy" }

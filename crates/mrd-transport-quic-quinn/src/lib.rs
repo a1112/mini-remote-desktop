@@ -732,17 +732,34 @@ pub struct QuicAuFragment {
 
 impl QuicAuFragment {
     pub fn encode(&self) -> Bytes {
-        let mut buffer = BytesMut::with_capacity(QUIC_AU_FRAGMENT_HEADER_LEN + self.payload.len());
+        self.encode_with_payload(&self.payload)
+    }
+
+    fn encode_with_payload(&self, payload: &[u8]) -> Bytes {
+        let mut buffer = BytesMut::with_capacity(QUIC_AU_FRAGMENT_HEADER_LEN + payload.len());
         buffer.put_u32_le(self.frame_id);
         buffer.put_u64_le(self.timestamp_us);
         buffer.put_u8(u8::from(self.is_keyframe));
         buffer.put_u16_le(self.fragment_index);
         buffer.put_u16_le(self.fragment_count);
-        buffer.extend_from_slice(&self.payload);
+        buffer.extend_from_slice(payload);
         buffer.freeze()
     }
 
     pub fn decode(datagram: &[u8]) -> Result<Self, QuinnTransportError> {
+        let mut fragment = Self::decode_header(datagram)?;
+        fragment.payload = Bytes::copy_from_slice(&datagram[QUIC_AU_FRAGMENT_HEADER_LEN..]);
+        Ok(fragment)
+    }
+
+    /// Decode a datagram while retaining its payload allocation.
+    pub fn decode_owned(datagram: Bytes) -> Result<Self, QuinnTransportError> {
+        let mut fragment = Self::decode_header(&datagram)?;
+        fragment.payload = datagram.slice(QUIC_AU_FRAGMENT_HEADER_LEN..);
+        Ok(fragment)
+    }
+
+    fn decode_header(datagram: &[u8]) -> Result<Self, QuinnTransportError> {
         if datagram.len() < QUIC_AU_FRAGMENT_HEADER_LEN {
             return Err(QuinnTransportError::Message("datagram too small".into()));
         }
@@ -768,7 +785,7 @@ impl QuicAuFragment {
             is_keyframe,
             fragment_index,
             fragment_count,
-            payload: Bytes::copy_from_slice(bytes),
+            payload: Bytes::new(),
         })
     }
 }
@@ -802,9 +819,9 @@ pub fn fragment_access_unit(
                 is_keyframe,
                 fragment_index: fragment_index as u16,
                 fragment_count: fragment_count as u16,
-                payload: Bytes::copy_from_slice(chunk),
+                payload: Bytes::new(),
             }
-            .encode(),
+            .encode_with_payload(chunk),
         );
     }
     if fragments.is_empty() {
@@ -913,8 +930,11 @@ pub struct QuicMediaFragment {
 
 impl QuicMediaFragment {
     pub fn encode(&self) -> Bytes {
-        let mut buffer =
-            BytesMut::with_capacity(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + self.payload.len());
+        self.encode_with_payload(&self.payload)
+    }
+
+    fn encode_with_payload(&self, payload: &[u8]) -> Bytes {
+        let mut buffer = BytesMut::with_capacity(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN + payload.len());
         buffer.put_u32_le(QUIC_MEDIA_V3_MAGIC);
         buffer.put_u8(QUIC_MEDIA_V3_VERSION);
         buffer.put_u8(self.payload_type as u8);
@@ -925,12 +945,25 @@ impl QuicMediaFragment {
         buffer.put_u64_le(self.timestamp_us);
         buffer.put_u16_le(self.fragment_index);
         buffer.put_u16_le(self.fragment_count);
-        buffer.put_u32_le(self.payload.len() as u32);
-        buffer.extend_from_slice(&self.payload);
+        buffer.put_u32_le(payload.len() as u32);
+        buffer.extend_from_slice(payload);
         buffer.freeze()
     }
 
     pub fn decode(datagram: &[u8]) -> Result<Self, QuinnTransportError> {
+        let mut fragment = Self::decode_header(datagram)?;
+        fragment.payload = Bytes::copy_from_slice(&datagram[QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN..]);
+        Ok(fragment)
+    }
+
+    /// Decode a datagram while retaining its payload allocation.
+    pub fn decode_owned(datagram: Bytes) -> Result<Self, QuinnTransportError> {
+        let mut fragment = Self::decode_header(&datagram)?;
+        fragment.payload = datagram.slice(QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN..);
+        Ok(fragment)
+    }
+
+    fn decode_header(datagram: &[u8]) -> Result<Self, QuinnTransportError> {
         if datagram.len() < QUIC_MEDIA_V3_FRAGMENT_HEADER_LEN {
             return Err(QuinnTransportError::Message(
                 "media v3 datagram too small".into(),
@@ -982,7 +1015,7 @@ impl QuicMediaFragment {
             flags,
             fragment_index,
             fragment_count,
-            payload: Bytes::copy_from_slice(bytes),
+            payload: Bytes::new(),
         })
     }
 }
@@ -1028,9 +1061,9 @@ pub fn fragment_media_payload_v3(
                 flags,
                 fragment_index: fragment_index as u16,
                 fragment_count: fragment_count as u16,
-                payload: Bytes::copy_from_slice(chunk),
+                payload: Bytes::new(),
             }
-            .encode(),
+            .encode_with_payload(chunk),
         );
     }
     if fragments.is_empty() {
@@ -1114,9 +1147,24 @@ impl QuicMediaReassembler {
         &mut self,
         datagram: &[u8],
     ) -> Result<Option<QuicMediaFrame>, QuinnTransportError> {
+        self.push_fragment(QuicMediaFragment::decode(datagram))
+    }
+
+    /// Retain incoming datagram storage until multi-fragment reassembly is needed.
+    pub fn push_datagram_owned(
+        &mut self,
+        datagram: Bytes,
+    ) -> Result<Option<QuicMediaFrame>, QuinnTransportError> {
+        self.push_fragment(QuicMediaFragment::decode_owned(datagram))
+    }
+
+    fn push_fragment(
+        &mut self,
+        fragment: Result<QuicMediaFragment, QuinnTransportError>,
+    ) -> Result<Option<QuicMediaFrame>, QuinnTransportError> {
         let now = Instant::now();
         self.prune_expired_at(now);
-        let fragment = match QuicMediaFragment::decode(datagram) {
+        let fragment = match fragment {
             Ok(fragment) => fragment,
             Err(error) => {
                 self.stats.rejected_fragments = self.stats.rejected_fragments.saturating_add(1);
@@ -1203,18 +1251,29 @@ impl QuicMediaReassembler {
             .pending
             .remove(&fragment.frame_id)
             .expect("pending media frame exists");
-        let total_len = completed
-            .fragments
-            .values()
-            .map(|chunk| chunk.len())
-            .sum::<usize>();
-        let mut payload = BytesMut::with_capacity(total_len);
-        for index in 0..completed.fragment_count {
-            let chunk = completed.fragments.get(&index).ok_or_else(|| {
-                QuinnTransportError::Message("missing media v3 fragment during reassembly".into())
-            })?;
-            payload.extend_from_slice(chunk);
-        }
+        let payload = if completed.fragment_count == 1 {
+            completed
+                .fragments
+                .into_values()
+                .next()
+                .expect("completed single media fragment")
+        } else {
+            let total_len = completed
+                .fragments
+                .values()
+                .map(|chunk| chunk.len())
+                .sum::<usize>();
+            let mut payload = BytesMut::with_capacity(total_len);
+            for index in 0..completed.fragment_count {
+                let chunk = completed.fragments.get(&index).ok_or_else(|| {
+                    QuinnTransportError::Message(
+                        "missing media v3 fragment during reassembly".into(),
+                    )
+                })?;
+                payload.extend_from_slice(chunk);
+            }
+            payload.freeze()
+        };
         self.stats.completed_frames = self.stats.completed_frames.saturating_add(1);
         Ok(Some(QuicMediaFrame {
             payload_type: completed.payload_type,
@@ -1223,7 +1282,7 @@ impl QuicMediaReassembler {
             frame_id: fragment.frame_id,
             timestamp_us: completed.timestamp_us,
             flags: completed.flags,
-            payload: payload.freeze(),
+            payload,
         }))
     }
 
@@ -1364,9 +1423,24 @@ impl QuicAuReassembler {
         &mut self,
         datagram: &[u8],
     ) -> Result<Option<QuicAuFrame>, QuinnTransportError> {
+        self.push_fragment(QuicAuFragment::decode(datagram))
+    }
+
+    /// Retain incoming datagram storage until multi-fragment reassembly is needed.
+    pub fn push_datagram_owned(
+        &mut self,
+        datagram: Bytes,
+    ) -> Result<Option<QuicAuFrame>, QuinnTransportError> {
+        self.push_fragment(QuicAuFragment::decode_owned(datagram))
+    }
+
+    fn push_fragment(
+        &mut self,
+        fragment: Result<QuicAuFragment, QuinnTransportError>,
+    ) -> Result<Option<QuicAuFrame>, QuinnTransportError> {
         let now = Instant::now();
         self.prune_expired_at(now);
-        let fragment = QuicAuFragment::decode(datagram)?;
+        let fragment = fragment?;
         {
             let entry = self
                 .pending
@@ -1429,24 +1503,33 @@ impl QuicAuReassembler {
             .pending
             .remove(&fragment.frame_id)
             .expect("pending frame exists");
-        let total_len = completed
-            .fragments
-            .values()
-            .map(|chunk| chunk.len())
-            .sum::<usize>();
-        let mut payload = BytesMut::with_capacity(total_len);
-        for index in 0..completed.fragment_count {
-            let chunk = completed.fragments.get(&index).ok_or_else(|| {
-                QuinnTransportError::Message("missing fragment during reassembly".into())
-            })?;
-            payload.extend_from_slice(chunk);
-        }
+        let payload = if completed.fragment_count == 1 {
+            completed
+                .fragments
+                .into_values()
+                .next()
+                .expect("completed single legacy fragment")
+        } else {
+            let total_len = completed
+                .fragments
+                .values()
+                .map(|chunk| chunk.len())
+                .sum::<usize>();
+            let mut payload = BytesMut::with_capacity(total_len);
+            for index in 0..completed.fragment_count {
+                let chunk = completed.fragments.get(&index).ok_or_else(|| {
+                    QuinnTransportError::Message("missing fragment during reassembly".into())
+                })?;
+                payload.extend_from_slice(chunk);
+            }
+            payload.freeze()
+        };
         self.stats.completed_frames = self.stats.completed_frames.saturating_add(1);
         Ok(Some(QuicAuFrame {
             frame_id: fragment.frame_id,
             timestamp_us: completed.timestamp_us,
             is_keyframe: completed.is_keyframe,
-            payload: payload.freeze(),
+            payload,
         }))
     }
 

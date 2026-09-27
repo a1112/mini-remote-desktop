@@ -3314,6 +3314,7 @@ dependencies = [
 name = "mrd-decode-nvdec"
 version = "0.1.0"
 dependencies = [
+ "mrd-pipeline-core",
  "openh264",
  "windows 0.62.2",
 ]

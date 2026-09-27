@@ -92,13 +92,6 @@ pub(super) fn renderer_snapshot_waitable_delta(
     }
 }
 
-pub(super) fn decode_h264_desktop_frame(
-    decoder: &mut dyn VideoDecoder,
-    payload: &[u8],
-) -> Result<Vec<DecodedFrame>> {
-    decode_lan_desktop_frame(LanAccessUnitCodec::H264, decoder, payload)
-}
-
 pub(super) fn decode_lan_desktop_frame(
     codec: LanAccessUnitCodec,
     decoder: &mut dyn VideoDecoder,

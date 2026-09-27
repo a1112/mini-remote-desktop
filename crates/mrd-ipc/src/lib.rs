@@ -238,6 +238,14 @@ mod wire {
         pub frames_completed: u64,
         #[serde(default)]
         pub repeated_latest_frames: u64,
+        /// Outputs known not to be cached repeats; pointer-only acquisitions
+        /// can still be included. This is not a unique-desktop-update count.
+        #[serde(default)]
+        pub capture_non_repeated_frames: u64,
+        /// Outputs whose backend does not report freshness. Legacy payloads
+        /// default to zero; never infer fresh frames by subtracting repeats.
+        #[serde(default)]
+        pub capture_freshness_unknown_frames: u64,
         #[serde(default)]
         pub capture_frame_samples: u64,
         #[serde(default)]

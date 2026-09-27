@@ -906,16 +906,8 @@ fn add_memory_capabilities(
         "CPU memory",
     );
     let (status, reason) = if matches!(platform, CapabilityPlatform::Windows) {
-        let (status, reason) = match probe_mode {
-            CapabilityProbeMode::Runtime => probe_d3d11_render_status(platform),
-            CapabilityProbeMode::Static => static_windows_runtime_status("D3D11 shared texture"),
-        };
-        (
-            status,
-            Some(format!(
-                "D3D11 shared texture follows D3D11 runtime probe: {reason}"
-            )),
-        )
+        let (status, reason) = d3d11_shared_status(probe_mode);
+        (status, Some(reason))
     } else {
         (
             CapabilityStatus::Unimplemented,
@@ -927,10 +919,136 @@ fn add_memory_capabilities(
         platform,
         CapabilityDomain::Memory,
         "memory.d3d11_shared",
-        "D3D11 shared texture",
+        "D3D11 BGRA resource sharing",
         status,
         reason.as_deref(),
     );
+    items.last_mut().expect("shared memory capability").detail = Some(
+        "Tests BGRA shared-resource creation and opening on two D3D11 devices on the same adapter. Does not validate NVDEC/CUDA interop, planar texture sharing, frame synchronization, or end-to-end zero-copy."
+            .to_string(),
+    );
+}
+
+fn d3d11_shared_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, String) {
+    if matches!(probe_mode, CapabilityProbeMode::Static) {
+        return (
+            CapabilityStatus::Unknown,
+            "D3D11 BGRA resource sharing has not been probed; device creation alone is insufficient."
+                .to_string(),
+        );
+    }
+    #[cfg(windows)]
+    {
+        static RESULT: OnceLock<(CapabilityStatus, String)> = OnceLock::new();
+        RESULT
+            .get_or_init(|| classify_d3d11_shared_probe(probe_d3d11_bgra_resource_sharing()))
+            .clone()
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            CapabilityStatus::Unimplemented,
+            "D3D11 BGRA resource sharing probe is only compiled on Windows.".to_string(),
+        )
+    }
+}
+
+fn classify_d3d11_shared_probe(result: Result<String, String>) -> (CapabilityStatus, String) {
+    match result {
+        Ok(evidence) => (
+            CapabilityStatus::Available,
+            format!("D3D11 BGRA cross-device shared-resource open succeeded: {evidence}."),
+        ),
+        Err(error) => (
+            CapabilityStatus::Unsupported,
+            format!("D3D11 BGRA resource sharing probe failed: {error}"),
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn probe_d3d11_bgra_resource_sharing() -> Result<String, String> {
+    use windows::core::Interface as _;
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+        D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED,
+        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIDevice, IDXGIResource};
+
+    let create_device = |adapter: Option<&IDXGIAdapter>| -> Result<ID3D11Device, String> {
+        let mut device = None;
+        unsafe {
+            D3D11CreateDevice(
+                adapter,
+                if adapter.is_some() {
+                    D3D_DRIVER_TYPE_UNKNOWN
+                } else {
+                    D3D_DRIVER_TYPE_HARDWARE
+                },
+                windows::Win32::Foundation::HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| format!("D3D11CreateDevice: {error}"))?;
+        device.ok_or_else(|| "D3D11CreateDevice returned no device".to_string())
+    };
+    let producer = create_device(None)?;
+    let dxgi_device: IDXGIDevice = producer
+        .cast()
+        .map_err(|error| format!("IDXGIDevice: {error}"))?;
+    let adapter =
+        unsafe { dxgi_device.GetAdapter() }.map_err(|error| format!("GetAdapter: {error}"))?;
+    let adapter_desc = unsafe { adapter.GetDesc() }.map_err(|error| format!("GetDesc: {error}"))?;
+    let consumer = create_device(Some(&adapter))?;
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: 64,
+        Height: 64,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+        ..Default::default()
+    };
+    let mut texture = None;
+    unsafe { producer.CreateTexture2D(&desc, None, Some(&mut texture)) }
+        .map_err(|error| format!("CreateTexture2D(shared BGRA): {error}"))?;
+    let texture = texture.ok_or_else(|| "CreateTexture2D returned no texture".to_string())?;
+    let resource: IDXGIResource = texture
+        .cast()
+        .map_err(|error| format!("IDXGIResource: {error}"))?;
+    // Legacy shared handles belong to the resource; they must not be CloseHandle'd.
+    let handle = unsafe { resource.GetSharedHandle() }
+        .map_err(|error| format!("GetSharedHandle: {error}"))?;
+    let mut opened = None::<ID3D11Texture2D>;
+    unsafe { consumer.OpenSharedResource(handle, &mut opened) }
+        .map_err(|error| format!("OpenSharedResource(shared BGRA): {error}"))?;
+    let opened = opened.ok_or_else(|| "OpenSharedResource returned no texture".to_string())?;
+    let mut opened_desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { opened.GetDesc(&mut opened_desc) };
+    if opened_desc.Width != desc.Width
+        || opened_desc.Height != desc.Height
+        || opened_desc.Format != desc.Format
+    {
+        return Err("OpenSharedResource returned a mismatched BGRA texture".to_string());
+    }
+    Ok(format!(
+        "adapter LUID {}:{}",
+        adapter_desc.AdapterLuid.HighPart, adapter_desc.AdapterLuid.LowPart
+    ))
 }
 
 fn static_nvenc_status(platform: &CapabilityPlatform, label: &str) -> (CapabilityStatus, String) {
@@ -2203,6 +2321,46 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d3d11_shared_static_status_requires_an_actual_sharing_probe() {
+        let mut capabilities = Vec::new();
+        add_memory_capabilities(
+            &mut capabilities,
+            &CapabilityPlatform::Windows,
+            CapabilityProbeMode::Static,
+        );
+        let shared = capabilities
+            .iter()
+            .find(|item| item.id == "memory.d3d11_shared")
+            .unwrap();
+        assert_eq!(shared.status, CapabilityStatus::Unknown);
+        assert!(shared
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("NVDEC"));
+    }
+
+    #[test]
+    fn d3d11_shared_status_requires_successful_cross_device_open() {
+        let success = classify_d3d11_shared_probe(Ok("adapter LUID 1:2".to_string()));
+        assert_eq!(success.0, CapabilityStatus::Available);
+        assert!(success.1.contains("BGRA"));
+        assert!(success.1.contains("adapter LUID 1:2"));
+        let failure = classify_d3d11_shared_probe(Err("OpenSharedResource failed".to_string()));
+        assert_eq!(failure.0, CapabilityStatus::Unsupported);
+        assert!(failure.1.contains("OpenSharedResource failed"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires a working D3D11 hardware device with BGRA resource sharing"]
+    fn d3d11_shared_actual_bgra_resource_open() {
+        let evidence =
+            probe_d3d11_bgra_resource_sharing().expect("D3D11 BGRA cross-device sharing");
+        assert!(evidence.contains("LUID"));
+    }
 
     #[test]
     fn snapshot_includes_platform_domains_and_profiles() {

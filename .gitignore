@@ -48,6 +48,7 @@ client-qt/venv
 /artifacts/component-matrix/
 /artifacts/ffmpeg-perf/
 /artifacts/local-performance/
+/artifacts/local-zero-copy/
 /crates/mrd-decode/artifacts/
 /tests/benchmarks/tmp/
 /tests/component-matrix/tmp/

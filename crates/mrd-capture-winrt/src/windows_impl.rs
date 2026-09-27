@@ -76,6 +76,7 @@ pub struct WinrtCapture {
     closed: Arc<AtomicBool>,
     output_memory_kind: FrameMemoryKind,
     shared_texture: Option<SharedBgraTexture>,
+    staging_texture: StagingTextureCache,
     last_frame: Option<CapturedFrame>,
     source_width: usize,
     source_height: usize,
@@ -112,6 +113,40 @@ struct SharedBgraTexture {
     shared_handle: isize,
     width: u32,
     height: u32,
+}
+
+#[derive(Default)]
+struct StagingTextureCache {
+    texture: Option<(D3D11_TEXTURE2D_DESC, ID3D11Texture2D)>,
+}
+
+impl StagingTextureCache {
+    fn get_or_create(
+        &mut self,
+        device: &ID3D11Device,
+        source_desc: D3D11_TEXTURE2D_DESC,
+    ) -> Result<ID3D11Texture2D, PipelineError> {
+        let mut staging_desc = source_desc;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.BindFlags = 0;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        staging_desc.MiscFlags = 0;
+
+        if let Some((cached_desc, texture)) = &self.texture {
+            if *cached_desc == staging_desc {
+                return Ok(texture.clone());
+            }
+        }
+
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }.map_err(
+            |error| PipelineError::message(format!("create staging texture failed: {error:?}")),
+        )?;
+        let staging = staging
+            .ok_or_else(|| PipelineError::message("create staging texture returned no texture"))?;
+        self.texture = Some((staging_desc, staging.clone()));
+        Ok(staging)
+    }
 }
 
 /// Visible top-level window that can be used as a WinRT capture target.
@@ -204,6 +239,7 @@ impl WinrtCapture {
     /// Switch the capture output to a D3D11 shared BGRA texture.
     pub fn with_shared_texture_output(mut self) -> Self {
         self.output_memory_kind = FrameMemoryKind::D3D11SharedBgra;
+        self.staging_texture = StagingTextureCache::default();
         self.refresh_output_dimensions_for_source();
         self.shared_texture = None;
         self
@@ -235,6 +271,7 @@ impl WinrtCapture {
             closed: Arc::new(AtomicBool::new(false)),
             output_memory_kind: FrameMemoryKind::Cpu,
             shared_texture: None,
+            staging_texture: StagingTextureCache::default(),
             last_frame: None,
             source_width: width,
             source_height: height,
@@ -509,6 +546,7 @@ impl WinrtCapture {
         self.direct3d_device = None;
         self.shared_texture = None;
         self.last_frame = None;
+        self.staging_texture = StagingTextureCache::default();
         Ok(())
     }
 
@@ -635,20 +673,7 @@ impl WinrtCapture {
             return self.frame_to_shared_texture_frame(&texture, width, height);
         }
 
-        let mut staging_desc = desc;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.BindFlags = 0;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        staging_desc.MiscFlags = 0;
-
-        let mut staging = None::<ID3D11Texture2D>;
-        unsafe {
-            self.device
-                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-        }
-        .map_err(|e| PipelineError::message(format!("create staging texture failed: {e:?}")))?;
-        let staging = staging
-            .ok_or_else(|| PipelineError::message("create staging texture returned no texture"))?;
+        let staging = self.staging_texture.get_or_create(&self.device, desc)?;
 
         let source_resource: ID3D11Resource = texture.cast().map_err(|e| {
             PipelineError::message(format!("cast source texture to resource failed: {e:?}"))
@@ -1277,6 +1302,70 @@ fn dxgi_device_name_matches(raw: &[u16], requested: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn staging_test_device() -> ID3D11Device {
+        let mut device = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+        }
+        .expect("Windows software D3D11 device");
+        device.expect("D3D11 device")
+    }
+
+    fn staging_test_desc() -> D3D11_TEXTURE2D_DESC {
+        D3D11_TEXTURE2D_DESC {
+            Width: 16,
+            Height: 16,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn staging_texture_reuses_compatible_resource() {
+        let device = staging_test_device();
+        let mut cache = StagingTextureCache::default();
+        let first = cache.get_or_create(&device, staging_test_desc()).unwrap();
+        let second = cache.get_or_create(&device, staging_test_desc()).unwrap();
+        assert_eq!(first.as_raw(), second.as_raw());
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { second.GetDesc(&mut desc) };
+        assert_eq!(desc.Usage, D3D11_USAGE_STAGING);
+        assert_eq!(desc.CPUAccessFlags, D3D11_CPU_ACCESS_READ.0 as u32);
+        assert_eq!(desc.BindFlags, 0);
+    }
+
+    #[test]
+    fn staging_texture_replaces_resource_after_size_or_format_change() {
+        let device = staging_test_device();
+        let mut cache = StagingTextureCache::default();
+        let mut desc = staging_test_desc();
+        let first = cache.get_or_create(&device, desc).unwrap();
+        desc.Width = 32;
+        let resized = cache.get_or_create(&device, desc).unwrap();
+        assert_ne!(first.as_raw(), resized.as_raw());
+        desc.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        let reformatted = cache.get_or_create(&device, desc).unwrap();
+        assert_ne!(resized.as_raw(), reformatted.as_raw());
+    }
 
     #[test]
     #[ignore]

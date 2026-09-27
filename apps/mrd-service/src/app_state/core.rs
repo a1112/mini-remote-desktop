@@ -295,7 +295,7 @@ impl AppState {
         timestamp_us: u64,
         codec: mrd_agent_ipc::MediaCodec,
         is_keyframe: bool,
-        payload: Vec<u8>,
+        payload: impl Into<Vec<u8>>,
     ) -> crate::agent_runtime::AgentRenderDispatch {
         let prepared = match self.agent_render_routes.lock().await.prepare(
             session_id,

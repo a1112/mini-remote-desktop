@@ -127,14 +127,6 @@ use media_capabilities::{
     LAN_ENCODE_VIDEOTOOLBOX_H264_CAPABILITY, LAN_ENCODE_VIDEOTOOLBOX_HEVC_CAPABILITY,
     LAN_RENDER_MACOS_NATIVE_CAPABILITY,
 };
-#[cfg(all(test, windows))]
-use media_capabilities::{
-    LAN_CAPTURE_DXGI_CAPABILITY, LAN_DECODE_NVDEC_AV1_CAPABILITY, LAN_DECODE_NVDEC_CAPABILITY,
-    LAN_DECODE_NVDEC_HEVC_CAPABILITY, LAN_DECODE_NVDEC_HEVC_MAIN10_CAPABILITY,
-    LAN_ENCODE_NVENC_AV1_CAPABILITY, LAN_ENCODE_NVENC_H264_CAPABILITY,
-    LAN_ENCODE_NVENC_HEVC_CAPABILITY, LAN_ENCODE_NVENC_HEVC_MAIN10_CAPABILITY,
-    LAN_RENDER_D3D11_NATIVE_CAPABILITY, LAN_RENDER_D3D11_SHARED_NV12_CAPABILITY,
-};
 #[cfg(test)]
 use media_capture_config::window_capture_source_error;
 #[cfg(all(test, windows))]
@@ -151,10 +143,10 @@ use media_capture_config::{
     WindowsLanCaptureBackend,
 };
 #[cfg(test)]
-use media_envelope::LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT;
+use media_envelope::{decode_lan_media_envelope, LAN_MEDIA_PAYLOAD_H264_ACCESS_UNIT};
 use media_envelope::{
-    decode_lan_media_envelope, encode_lan_media_envelope, lan_media_profile_id, LanMediaEnvelope,
-    LAN_MEDIA_CODEC_AV1, LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
+    encode_lan_media_envelope, lan_media_profile_id, LanMediaEnvelope, LAN_MEDIA_CODEC_AV1,
+    LAN_MEDIA_CODEC_H264, LAN_MEDIA_CODEC_HEVC, LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
     LAN_MEDIA_PAYLOAD_PROBE_FRAME,
 };
 use media_error_policy::{
@@ -207,7 +199,7 @@ use media_receiver::decode_lan_desktop_frame;
 use media_receiver_decoder::create_lan_video_decoder;
 use media_receiver_decoder::{
     create_lan_receiver_decoder, create_lan_receiver_decoder_with_preference,
-    try_decode_h264_keyframe_with_fallback,
+    try_decode_keyframe_with_fallback,
 };
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use media_receiver_decoder_candidates::default_lan_receiver_decoder_candidates;
@@ -216,8 +208,8 @@ use media_receiver_decoder_candidates::preferred_lan_receiver_decoder_candidates
 #[cfg(test)]
 use media_receiver_decoder_candidates::prioritize_lan_receiver_decoder_candidates;
 use media_receiver_runtime::{
-    quic_media_v3_frame_to_legacy_frame, receiver_should_use_local_render_fallback,
-    record_lan_decoded_frames,
+    quic_media_v3_frame_to_received_frame, receiver_should_use_local_render_fallback,
+    record_lan_decoded_frames, LanReceivedMediaFrame, LanReceiverInput,
 };
 #[cfg(test)]
 use media_render_policy::{
@@ -3387,8 +3379,12 @@ fn lan_authorization_capabilities() -> Vec<RemotePermissionScope> {
 #[cfg(test)]
 fn test_lan_media_capabilities() -> Vec<String> {
     let mut capabilities = lan_media_capabilities();
+    // Protocol/lifecycle fixtures model a peer that supports HEVC in both
+    // directions; their consent and cleanup assertions must not depend on
+    // the test host's installed decoder drivers.
     for capability in [
         "encode.nvenc_hevc".to_string(),
+        "decode.ffmpeg_hevc".to_string(),
         LAN_MEDIA_HEVC_MAIN_420_8BIT_CAPABILITY.to_string(),
     ] {
         if !capabilities.iter().any(|existing| existing == &capability) {
@@ -5393,6 +5389,42 @@ async fn send_quic_media_loop(
                     }
                 }
 
+                if encoder
+                    .as_ref()
+                    .is_some_and(|encoder| encoder.requires_cpu_capture(&frame))
+                {
+                    let cpu_capture = create_software_frame_capture(&source_id, &profile)
+                        .await
+                        .and_then(|capture| LanSenderFrameCapture::new(capture, &profile));
+                    match cpu_capture {
+                        Ok(next_capture) => {
+                            capture = Some(next_capture);
+                            pending_keyframe_request = true;
+                            sender_stats.record_ms("sender.capture_cpu_fallback", 1.0);
+                            tracing::info!(
+                                session_id = %session_id.0,
+                                source_id = %source_id,
+                                "LAN software encoder switched to CPU capture"
+                            );
+                        }
+                        Err(error) => {
+                            handle_media_sender_frame_error(
+                                &app_state,
+                                &session_id,
+                                &source_id,
+                                &mut consecutive_frame_errors,
+                                format!(
+                                    "failed to create CPU capture for software encoder: {error:#}"
+                                ),
+                                is_windows_window_source_id(&source_id),
+                            )
+                            .await?;
+                        }
+                    }
+                    // Re-capture from the new source; the current frame has no CPU pixels.
+                    continue;
+                }
+
                 if pending_keyframe_request {
                     if let Some(encoder) = encoder.as_mut() {
                         encoder.encoder.request_keyframe();
@@ -6441,8 +6473,9 @@ async fn receive_quic_media_loop(
     let mut media_v3_reassembler = QuicMediaReassembler::new(lan_media_reassembler_config())
         .with_max_frame_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
         .with_max_total_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES * 4);
-    let mut frame_orderer =
-        LanMediaFrameOrderer::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
+    let mut frame_orderer = LanMediaFrameOrderer::<LanReceivedMediaFrame>::new(
+        LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES,
+    );
     #[cfg(target_os = "macos")]
     let mut media_v3_frame_orderer =
         LanMediaFrameOrderer::<QuicMediaFrame>::new(LAN_MEDIA_RECEIVER_REORDER_MAX_PENDING_FRAMES);
@@ -6599,7 +6632,6 @@ async fn receive_quic_media_loop(
         (None, None)
     };
     let mut datagram_media_enabled = true;
-    let mut mux_legacy_fragments = std::collections::VecDeque::new();
     let mut receiver_stats = LanSenderStatsTracker::new(Instant::now());
     let mut keyframe_request_sequence = 0_u32;
     let mut last_keyframe_request_at = None;
@@ -6618,9 +6650,7 @@ async fn receive_quic_media_loop(
             return Ok(());
         }
         let read_started = Instant::now();
-        let media_message = if let Some(fragment) = mux_legacy_fragments.pop_front() {
-            fragment
-        } else if let Some(mux) = transport_mux.as_ref() {
+        let receiver_input = if let Some(mux) = transport_mux.as_ref() {
             tokio::select! {
                 video = mux.recv(TransportLane::Video) => {
                     let envelope = match video.context("LAN transport mux video receive failed")? {
@@ -6629,37 +6659,27 @@ async fn receive_quic_media_loop(
                     };
                     let unit = media_receiver::transport_video_access_unit(&session_id, envelope)
                         .context("invalid LAN transport mux video envelope")?;
-                    let mut profile = lan_runtime_media_profile(
+                    let profile = lan_runtime_media_profile(
                         &selected_media_profile(&app_state, &session_id).await,
                         unit.codec,
                     );
-                    profile.width = unit.width;
-                    profile.height = unit.height;
-                    let media_payload = encode_lan_media_envelope(LanMediaEnvelope {
-                        payload_type: LAN_MEDIA_PAYLOAD_ACCESS_UNIT,
-                        codec: unit.codec.envelope_codec(),
-                        sequence: unit.sequence,
-                        timestamp_us: unit.timestamp_us,
-                        profile,
-                        payload: unit.bytes,
-                    })?;
-                    let mut fragments = fragment_access_unit(
-                        unit.sequence as u32,
-                        unit.timestamp_us,
-                        unit.is_keyframe,
-                        &media_payload,
-                        mux.max_datagram_size().unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES),
-                    )?;
-                    let first = fragments
-                        .first()
-                        .cloned()
-                        .context("transport mux produced no compatibility fragment")?;
-                    mux_legacy_fragments.extend(fragments.drain(1..));
-                    first
+                    let received_bytes = unit.bytes.len() as u64;
+                    match LanReceivedMediaFrame::from_transport(unit, profile) {
+                        Ok(frame) => LanReceiverInput::Frame(frame),
+                        Err(error) => {
+                            app_state.probes.lock().await.record_probe_drop(
+                                &session_id,
+                                received_bytes,
+                                now_ms(),
+                                format!("invalid LAN transport media profile: {error}"),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 legacy = mux.recv_passthrough_datagram() => {
                     match legacy {
-                        Some(message) => message,
+                        Some(message) => LanReceiverInput::Datagram(message),
                         None => anyhow::bail!("LAN transport mux passthrough closed"),
                     }
                 }
@@ -6667,195 +6687,227 @@ async fn receive_quic_media_loop(
                     continue;
                 }
             }
-        } else if let Some(rx) = reliable_media_rx.as_mut() {
-            if datagram_media_enabled {
-                let datagram_endpoint = endpoint.clone();
-                tokio::select! {
-                    result = datagram_endpoint.read_datagram() => {
-                        match result {
-                            Ok(message) => message,
-                            Err(error) => {
-                                datagram_media_enabled = false;
-                                tracing::warn!(
-                                    %error,
-                                    session_id = %session_id.0,
-                                    "LAN QUIC datagram media reader disabled while reliable media remains active"
-                                );
-                                continue;
+        } else {
+            LanReceiverInput::Datagram(if let Some(rx) = reliable_media_rx.as_mut() {
+                if datagram_media_enabled {
+                    let datagram_endpoint = endpoint.clone();
+                    tokio::select! {
+                        result = datagram_endpoint.read_datagram() => {
+                            match result {
+                                Ok(message) => message,
+                                Err(error) => {
+                                    datagram_media_enabled = false;
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id.0,
+                                        "LAN QUIC datagram media reader disabled while reliable media remains active"
+                                    );
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    message = rx.recv() => {
-                        match message {
-                            Some(Ok(message)) => message,
-                            Some(Err(error)) => {
-                                recover_persistent_media_hol_stall(
-                                    &app_state,
-                                    &session_id,
-                                    &endpoint,
-                                    transport_mux.as_deref(),
-                                    &error,
-                                    LanHolRecoveryState {
-                                        receiver_stats: &mut receiver_stats,
-                                        keyframe_request_sequence: &mut keyframe_request_sequence,
-                                        last_keyframe_request_at: &mut last_keyframe_request_at,
-                                    },
-                                )
-                                .await;
-                                tracing::warn!(
-                                    %error,
-                                    session_id = %session_id.0,
-                                    "LAN QUIC reliable media reader retrying"
-                                );
-                                continue;
-                            }
-                            None => {
-                                reliable_media_rx = None;
-                                tracing::warn!(
-                                    session_id = %session_id.0,
-                                    "LAN QUIC reliable media reader stopped"
-                                );
-                                continue;
+                        message = rx.recv() => {
+                            match message {
+                                Some(Ok(message)) => message,
+                                Some(Err(error)) => {
+                                    recover_persistent_media_hol_stall(
+                                        &app_state,
+                                        &session_id,
+                                        &endpoint,
+                                        transport_mux.as_deref(),
+                                        &error,
+                                        LanHolRecoveryState {
+                                            receiver_stats: &mut receiver_stats,
+                                            keyframe_request_sequence: &mut keyframe_request_sequence,
+                                            last_keyframe_request_at: &mut last_keyframe_request_at,
+                                        },
+                                    )
+                                    .await;
+                                    tracing::warn!(
+                                        %error,
+                                        session_id = %session_id.0,
+                                        "LAN QUIC reliable media reader retrying"
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    reliable_media_rx = None;
+                                    tracing::warn!(
+                                        session_id = %session_id.0,
+                                        "LAN QUIC reliable media reader stopped"
+                                    );
+                                    continue;
+                                }
                             }
                         }
+                        _ = tokio::time::sleep(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL) => {
+                            continue;
+                        }
                     }
-                    _ = tokio::time::sleep(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL) => {
-                        continue;
+                } else {
+                    match timeout(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL, rx.recv()).await {
+                        Ok(Some(Ok(message))) => message,
+                        Ok(Some(Err(error))) => {
+                            recover_persistent_media_hol_stall(
+                                &app_state,
+                                &session_id,
+                                &endpoint,
+                                transport_mux.as_deref(),
+                                &error,
+                                LanHolRecoveryState {
+                                    receiver_stats: &mut receiver_stats,
+                                    keyframe_request_sequence: &mut keyframe_request_sequence,
+                                    last_keyframe_request_at: &mut last_keyframe_request_at,
+                                },
+                            )
+                            .await;
+                            tracing::warn!(
+                                %error,
+                                session_id = %session_id.0,
+                                "LAN QUIC reliable media reader retrying"
+                            );
+                            continue;
+                        }
+                        Ok(None) => {
+                            reliable_media_rx = None;
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "LAN QUIC reliable media reader stopped"
+                            );
+                            continue;
+                        }
+                        Err(_) => {
+                            continue;
+                        }
                     }
                 }
             } else {
-                match timeout(LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL, rx.recv()).await {
-                    Ok(Some(Ok(message))) => message,
-                    Ok(Some(Err(error))) => {
-                        recover_persistent_media_hol_stall(
-                            &app_state,
-                            &session_id,
-                            &endpoint,
-                            transport_mux.as_deref(),
-                            &error,
-                            LanHolRecoveryState {
-                                receiver_stats: &mut receiver_stats,
-                                keyframe_request_sequence: &mut keyframe_request_sequence,
-                                last_keyframe_request_at: &mut last_keyframe_request_at,
-                            },
-                        )
-                        .await;
-                        tracing::warn!(
-                            %error,
-                            session_id = %session_id.0,
-                            "LAN QUIC reliable media reader retrying"
-                        );
-                        continue;
-                    }
-                    Ok(None) => {
-                        reliable_media_rx = None;
-                        tracing::warn!(
-                            session_id = %session_id.0,
-                            "LAN QUIC reliable media reader stopped"
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        continue;
-                    }
+                match timeout(
+                    LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL,
+                    endpoint.read_datagram(),
+                )
+                .await
+                {
+                    Ok(result) => result.context("failed to read LAN QUIC media datagram")?,
+                    Err(_) => continue,
                 }
-            }
-        } else {
-            match timeout(
-                LAN_MEDIA_AUTHORIZATION_POLL_INTERVAL,
-                endpoint.read_datagram(),
-            )
-            .await
-            {
-                Ok(result) => result.context("failed to read LAN QUIC media datagram")?,
-                Err(_) => continue,
-            }
+            })
         };
         receiver_stats.record_elapsed("receiver.read", read_started);
         receiver_stats.record_elapsed("receiver.message_wait", read_started);
         if !session_allows_media(&app_state, &session_id).await {
             return Ok(());
         }
-        match decode_lan_sender_stats_datagram(&media_message) {
-            Ok(Some(stats)) => {
-                let mut pipelines = app_state.media_pipelines.lock().await;
-                pipelines.set_stage_metrics(session_id.clone(), stats.metrics);
-                pipelines.set_test_impairment(session_id.clone(), stats.test_impairment);
-                pipelines.set_sender_transport(session_id.clone(), stats.sender_transport);
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                app_state.probes.lock().await.record_probe_drop(
-                    &session_id,
-                    media_message.len() as u64,
-                    now_ms(),
-                    format!("failed to decode LAN sender stats datagram: {error}"),
-                );
-                continue;
-            }
-        }
-        let reassemble_started = Instant::now();
-        let reassembled_frame = if is_quic_media_v3_datagram(&media_message) {
-            let reassembled_v3_frame = media_v3_reassembler
-                .push_datagram(&media_message)
-                .context("failed to reassemble LAN QUIC media v3 frame")?;
-            receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
-            let Some(frame) = reassembled_v3_frame else {
-                continue;
-            };
-
-            #[cfg(target_os = "macos")]
-            if quic_media_v3_compressed_direct_render_candidate(&frame)
-                && macos_render_proxy_compressed_media_surface_available(&app_state, &session_id)
-                    .await
-            {
-                let proxy_forward_started = Instant::now();
-                if render_lan_quic_media_v3_compressed_access_unit_frame(
-                    &app_state,
-                    &session_id,
-                    &mut media_v3_frame_orderer,
-                    frame.clone(),
-                    media_v3_reassembler.stats(),
-                    &mut receiver_stats,
-                    &mut consecutive_decode_errors,
-                    &mut decoder_waits_for_keyframe,
-                    &endpoint,
-                    &mut keyframe_request_sequence,
-                    &mut last_keyframe_request_at,
-                )
-                .await
-                {
-                    let proxy_forward_ms = duration_as_millis(proxy_forward_started.elapsed());
-                    receiver_stats.record_ms("receiver.proxy_forward", proxy_forward_ms);
-                    app_state
-                        .media_pipelines
-                        .lock()
-                        .await
-                        .record_stage_duration_ms(
-                            session_id.clone(),
-                            "receiver.proxy_forward_direct_v3",
-                            proxy_forward_ms,
+        let reassembled_frame = match receiver_input {
+            LanReceiverInput::Frame(frame) => Some(frame),
+            LanReceiverInput::Datagram(media_message) => {
+                match decode_lan_sender_stats_datagram(&media_message) {
+                    Ok(Some(stats)) => {
+                        let mut pipelines = app_state.media_pipelines.lock().await;
+                        pipelines.set_stage_metrics(session_id.clone(), stats.metrics);
+                        pipelines.set_test_impairment(session_id.clone(), stats.test_impairment);
+                        pipelines.set_sender_transport(session_id.clone(), stats.sender_transport);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        app_state.probes.lock().await.record_probe_drop(
+                            &session_id,
+                            media_message.len() as u64,
+                            now_ms(),
+                            format!("failed to decode LAN sender stats datagram: {error}"),
                         );
-                    flush_lan_receiver_stage_metrics(&app_state, &session_id, &mut receiver_stats)
-                        .await;
-                    continue;
+                        continue;
+                    }
+                }
+                let reassemble_started = Instant::now();
+                if is_quic_media_v3_datagram(&media_message) {
+                    let reassembled_v3_frame = media_v3_reassembler
+                        .push_datagram_owned(media_message)
+                        .context("failed to reassemble LAN QUIC media v3 frame")?;
+                    receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
+                    let Some(frame) = reassembled_v3_frame else {
+                        continue;
+                    };
+
+                    #[cfg(target_os = "macos")]
+                    if quic_media_v3_compressed_direct_render_candidate(&frame)
+                        && macos_render_proxy_compressed_media_surface_available(
+                            &app_state,
+                            &session_id,
+                        )
+                        .await
+                    {
+                        let proxy_forward_started = Instant::now();
+                        if render_lan_quic_media_v3_compressed_access_unit_frame(
+                            &app_state,
+                            &session_id,
+                            &mut media_v3_frame_orderer,
+                            frame.clone(),
+                            media_v3_reassembler.stats(),
+                            &mut receiver_stats,
+                            &mut consecutive_decode_errors,
+                            &mut decoder_waits_for_keyframe,
+                            &endpoint,
+                            &mut keyframe_request_sequence,
+                            &mut last_keyframe_request_at,
+                        )
+                        .await
+                        {
+                            let proxy_forward_ms =
+                                duration_as_millis(proxy_forward_started.elapsed());
+                            receiver_stats.record_ms("receiver.proxy_forward", proxy_forward_ms);
+                            app_state
+                                .media_pipelines
+                                .lock()
+                                .await
+                                .record_stage_duration_ms(
+                                    session_id.clone(),
+                                    "receiver.proxy_forward_direct_v3",
+                                    proxy_forward_ms,
+                                );
+                            flush_lan_receiver_stage_metrics(
+                                &app_state,
+                                &session_id,
+                                &mut receiver_stats,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+
+                    quic_media_v3_frame_to_received_frame(
+                        &app_state,
+                        &session_id,
+                        frame,
+                        media_v3_reassembler.stats(),
+                    )
+                    .await?
+                } else {
+                    let reassembled_frame = reassembler
+                        .push_datagram_owned(media_message)
+                        .context("failed to reassemble LAN QUIC media v2 frame")?;
+                    receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
+                    match reassembled_frame {
+                        Some(frame) => {
+                            let received_bytes = frame.payload.len() as u64;
+                            match LanReceivedMediaFrame::from_legacy(frame) {
+                                Ok(frame) => Some(frame),
+                                Err(error) => {
+                                    app_state.probes.lock().await.record_probe_drop(
+                                        &session_id,
+                                        received_bytes,
+                                        now_ms(),
+                                        format!("invalid LAN media v2 envelope: {error}"),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    }
                 }
             }
-
-            quic_media_v3_frame_to_legacy_frame(
-                &app_state,
-                &session_id,
-                frame,
-                media_v3_reassembler.stats(),
-            )
-            .await?
-        } else {
-            let reassembled_frame = reassembler
-                .push_datagram(&media_message)
-                .context("failed to reassemble LAN QUIC media v2 frame")?;
-            receiver_stats.record_elapsed("receiver.reassemble", reassemble_started);
-            reassembled_frame
         };
 
         if let Some(frame) = reassembled_frame {
@@ -6865,18 +6917,7 @@ async fn receive_quic_media_loop(
             }
             receiver_stats.record_ms("receiver.ready_frames", ready_frames.len() as f64);
             for frame in ready_frames {
-                let mut envelope = match decode_lan_media_envelope(&frame.payload) {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        app_state.probes.lock().await.record_probe_drop(
-                            &session_id,
-                            frame.payload.len() as u64,
-                            now_ms(),
-                            format!("invalid LAN media v2 envelope: {error}"),
-                        );
-                        continue;
-                    }
-                };
+                let mut envelope = frame.envelope;
 
                 match envelope.payload_type {
                     LAN_MEDIA_PAYLOAD_ACCESS_UNIT => {
@@ -6886,7 +6927,7 @@ async fn receive_quic_media_loop(
                                 Err(error) => {
                                     app_state.probes.lock().await.record_probe_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                         format!("{error:#}"),
                                     );
@@ -6914,7 +6955,7 @@ async fn receive_quic_media_loop(
                             Err(error) => {
                                 app_state.probes.lock().await.record_probe_drop(
                                     &session_id,
-                                    frame.payload.len() as u64,
+                                    frame.received_bytes,
                                     now_ms(),
                                     format!("invalid transport video envelope: {error:#}"),
                                 );
@@ -6951,7 +6992,7 @@ async fn receive_quic_media_loop(
                                 Err(error) => {
                                     app_state.probes.lock().await.record_probe_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                         format!("{error:#}"),
                                     );
@@ -6963,7 +7004,7 @@ async fn receive_quic_media_loop(
                         if decoder_waits_for_keyframe && !frame.is_keyframe {
                             app_state.probes.lock().await.record_transient_frame_drop(
                                 &session_id,
-                                frame.payload.len() as u64,
+                                frame.received_bytes,
                                 now_ms(),
                             );
                             maybe_send_lan_keyframe_request(
@@ -6992,7 +7033,7 @@ async fn receive_quic_media_loop(
                                 envelope.timestamp_us,
                                 agent_codec,
                                 frame.is_keyframe,
-                                envelope.payload.clone(),
+                                envelope.payload.as_slice(),
                             )
                             .await;
                         if !receiver_should_use_local_render_fallback(agent_dispatch) {
@@ -7009,7 +7050,7 @@ async fn receive_quic_media_loop(
                                     decoder_waits_for_keyframe = true;
                                     app_state.probes.lock().await.record_probe_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                         "session-agent render route rejected encoded access unit",
                                     );
@@ -7085,7 +7126,7 @@ async fn receive_quic_media_loop(
                                     );
                                     app_state.probes.lock().await.record_transient_frame_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                     );
                                     maybe_send_lan_keyframe_request(
@@ -7116,7 +7157,7 @@ async fn receive_quic_media_loop(
                                     );
                                     app_state.probes.lock().await.record_probe_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                         format!(
                                             "failed to forward LAN {} access unit to macOS render proxy: {error:#}",
@@ -7135,16 +7176,18 @@ async fn receive_quic_media_loop(
                             decoder.decoder.as_mut(),
                             &envelope.payload,
                         ) {
-                            Ok(decoded_frames) if !decoded_frames.is_empty() => {
+                            Ok(decoded_frames) => {
                                 receiver_stats.record_elapsed("receiver.decode", decode_started);
                                 consecutive_decode_errors = 0;
+                                // An accepted keyframe may be buffered before output.
+                                // Keep feeding later access units so it can complete.
                                 decoder_waits_for_keyframe = false;
                                 let record_started = Instant::now();
                                 record_lan_decoded_frames(
                                     &app_state,
                                     &session_id,
                                     decoded_frames,
-                                    frame.payload.len() as u64,
+                                    frame.received_bytes,
                                     envelope.sequence,
                                     envelope.timestamp_us,
                                     &envelope.profile,
@@ -7153,17 +7196,13 @@ async fn receive_quic_media_loop(
                                 .await;
                                 receiver_stats.record_elapsed("receiver.record", record_started);
                             }
-                            Ok(_) => {
-                                receiver_stats.record_elapsed("receiver.decode", decode_started);
-                            }
                             Err(error) => {
                                 receiver_stats.record_elapsed("receiver.decode", decode_started);
-                                let error = if frame.is_keyframe
-                                    && frame_codec == LanAccessUnitCodec::H264
-                                {
-                                    match try_decode_h264_keyframe_with_fallback(
+                                let error = if frame.is_keyframe {
+                                    match try_decode_keyframe_with_fallback(
                                         &app_state,
                                         &session_id,
+                                        frame_codec,
                                         decoder.backend,
                                         &envelope.payload,
                                         &error,
@@ -7179,7 +7218,7 @@ async fn receive_quic_media_loop(
                                                 &app_state,
                                                 &session_id,
                                                 decoded_frames,
-                                                frame.payload.len() as u64,
+                                                frame.received_bytes,
                                                 envelope.sequence,
                                                 envelope.timestamp_us,
                                                 &envelope.profile,
@@ -7229,7 +7268,7 @@ async fn receive_quic_media_loop(
                                 if frame.is_keyframe {
                                     app_state.probes.lock().await.record_probe_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                         message,
                                     );
@@ -7248,7 +7287,7 @@ async fn receive_quic_media_loop(
                                 } else {
                                     app_state.probes.lock().await.record_transient_frame_drop(
                                         &session_id,
-                                        frame.payload.len() as u64,
+                                        frame.received_bytes,
                                         now_ms(),
                                     );
                                     if consecutive_decode_errors
@@ -7289,7 +7328,7 @@ async fn receive_quic_media_loop(
                             Err(error) => {
                                 app_state.probes.lock().await.record_probe_drop(
                                     &session_id,
-                                    frame.payload.len() as u64,
+                                    frame.received_bytes,
                                     now_ms(),
                                     format!("failed to decode LAN media v2 probe frame: {error}"),
                                 );
@@ -7298,7 +7337,7 @@ async fn receive_quic_media_loop(
                     }
                     payload_type => app_state.probes.lock().await.record_probe_drop(
                         &session_id,
-                        frame.payload.len() as u64,
+                        frame.received_bytes,
                         now_ms(),
                         format!("unsupported LAN media v2 payload type: {payload_type}"),
                     ),

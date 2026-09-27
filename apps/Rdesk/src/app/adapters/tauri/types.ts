@@ -1321,6 +1321,8 @@ export interface MediaAdaptationSnapshot {
 export interface MediaSenderTransportSnapshot {
   frames_completed?: number;
   repeated_latest_frames?: number;
+  capture_non_repeated_frames?: number;
+  capture_freshness_unknown_frames?: number;
   capture_frame_samples?: number;
   capture_cpu_frames?: number;
   capture_macos_cv_pixel_buffer_frames?: number;

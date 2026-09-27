@@ -52,6 +52,20 @@
     "encoded_fps": { "type": ["number", "null"] },
     "decoded_fps": { "type": ["number", "null"] },
     "zero_copy_enabled": { "type": ["boolean", "null"] },
+    "zero_copy_requested": { "type": ["boolean", "null"] },
+    "zero_copy_scope": { "type": ["string", "null"], "enum": ["cpu_pixel_transfers", null] },
+    "observed_memory_path": { "type": ["string", "null"], "enum": ["unknown", "cpu", "mixed", "d3d11-shared", null] },
+    "memory_path_evidence": {
+      "type": ["object", "null"],
+      "properties": {
+        "capture": { "$ref": "#/$defs/memoryObservation" },
+        "encode": { "$ref": "#/$defs/memoryObservation" },
+        "decode": { "$ref": "#/$defs/memoryObservation" },
+        "render": { "$ref": "#/$defs/memoryObservation" }
+      },
+      "required": ["capture", "encode", "decode", "render"],
+      "additionalProperties": false
+    },
     "total_bitstream_bytes": { "type": ["integer", "null"], "minimum": 0 },
     "keyframes": { "type": "integer", "minimum": 0 },
     "dropped_frames": { "type": "integer", "minimum": 0 },
@@ -111,5 +125,17 @@
     "run_skipped": { "type": "boolean" },
     "run_passed": { "type": "boolean" }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "memoryObservation": {
+      "type": "object",
+      "properties": {
+        "cpu_frames": { "type": "integer", "minimum": 0 },
+        "shared_frames": { "type": "integer", "minimum": 0 },
+        "unknown_frames": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["cpu_frames", "shared_frames", "unknown_frames"],
+      "additionalProperties": false
+    }
+  }
 }

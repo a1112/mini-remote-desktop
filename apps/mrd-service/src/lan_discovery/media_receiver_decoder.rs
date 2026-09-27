@@ -1,6 +1,6 @@
 use super::media_access_unit::LanAccessUnitCodec;
 use super::media_profile::lan_runtime_media_profile;
-use super::media_receiver::decode_h264_desktop_frame;
+use super::media_receiver::decode_lan_desktop_frame;
 use super::media_receiver_decoder_candidates::{
     lan_receiver_decoder_candidates, preferred_lan_receiver_decoder_candidates,
 };
@@ -87,55 +87,70 @@ pub(super) async fn create_lan_receiver_decoder_with_preference(
     )
 }
 
-pub(super) async fn try_decode_h264_keyframe_with_fallback(
+pub(super) async fn try_decode_keyframe_with_fallback(
     app_state: &Arc<AppState>,
     session_id: &SessionId,
+    codec: LanAccessUnitCodec,
     failed_backend: &'static str,
     payload: &[u8],
     primary_error: &anyhow::Error,
 ) -> Result<(LanReceiverDecoder, Vec<DecodedFrame>)> {
-    let mut errors = vec![format!("{failed_backend}: {primary_error:#}")];
-    for backend in preferred_lan_receiver_decoder_candidates(LanAccessUnitCodec::H264)
-        .into_iter()
-        .filter(|backend| *backend != failed_backend)
-    {
-        let mut decoder = match create_lan_video_decoder(backend) {
+    let result = decode_keyframe_with_candidates(
+        codec,
+        preferred_lan_receiver_decoder_candidates(codec)
+            .into_iter()
+            .filter(|backend| *backend != failed_backend),
+        payload,
+        create_lan_video_decoder,
+    )
+    .map_err(|error| anyhow::anyhow!("{failed_backend}: {primary_error:#} | {error:#}"))?;
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .set_active_decoder(session_id.clone(), result.0.backend);
+    tracing::warn!(
+        session_id = %session_id.0,
+        failed_backend,
+        fallback_backend = result.0.backend,
+        primary_error = %primary_error,
+        "LAN media receiver switched decoder after keyframe decode failure"
+    );
+    Ok(result)
+}
+
+fn decode_keyframe_with_candidates(
+    codec: LanAccessUnitCodec,
+    candidates: impl IntoIterator<Item = &'static str>,
+    payload: &[u8],
+    mut create: impl FnMut(&'static str) -> Result<Box<dyn VideoDecoder>>,
+) -> Result<(LanReceiverDecoder, Vec<DecodedFrame>)> {
+    let mut errors = Vec::new();
+    for backend in candidates {
+        let mut decoder = match create(backend) {
             Ok(decoder) => decoder,
             Err(error) => {
                 errors.push(format!("{backend}: create failed: {error}"));
                 continue;
             }
         };
-        match decode_h264_desktop_frame(decoder.as_mut(), payload) {
-            Ok(decoded_frames) if !decoded_frames.is_empty() => {
-                app_state
-                    .media_pipelines
-                    .lock()
-                    .await
-                    .set_active_decoder(session_id.clone(), backend);
-                tracing::warn!(
-                    session_id = %session_id.0,
-                    failed_backend,
-                    fallback_backend = backend,
-                    primary_error = %primary_error,
-                    "LAN media receiver switched decoder after keyframe decode failure"
-                );
+        match decode_lan_desktop_frame(codec, decoder.as_mut(), payload) {
+            Ok(frames) => {
                 return Ok((
                     LanReceiverDecoder {
-                        codec: LanAccessUnitCodec::H264,
+                        codec,
                         backend,
                         decoder,
                     },
-                    decoded_frames,
+                    frames,
                 ));
             }
-            Ok(_) => errors.push(format!("{backend}: decoded no frames")),
             Err(error) => errors.push(format!("{backend}: {error:#}")),
         }
     }
-
     anyhow::bail!(
-        "all LAN H.264 receiver decoders failed for keyframe: {}",
+        "all LAN {} receiver decoders failed for keyframe: {}",
+        codec.display_name(),
         errors.join(" | ")
     )
 }
@@ -156,4 +171,85 @@ pub(super) fn create_lan_video_decoder(backend: &str) -> Result<Box<dyn VideoDec
     }
 
     mrd_decode::create_decoder(backend).map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use mrd_pipeline_core::PipelineError;
+
+    struct FallbackDecoder {
+        frames: Vec<DecodedFrame>,
+    }
+    impl VideoDecoder for FallbackDecoder {
+        fn push_access_unit(&mut self, payload: &[u8]) -> std::result::Result<(), PipelineError> {
+            assert_eq!(payload, b"keyframe");
+            self.frames
+                .push(DecodedFrame::from_cpu_rgb24(1, 1, 1, vec![1, 2, 3]));
+            Ok(())
+        }
+        fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+            std::mem::take(&mut self.frames)
+        }
+    }
+
+    #[test]
+    fn keyframe_fallback_preserves_h264_hevc_and_av1_codec() {
+        for codec in [
+            LanAccessUnitCodec::H264,
+            LanAccessUnitCodec::Hevc,
+            LanAccessUnitCodec::Av1,
+        ] {
+            let mut attempts = Vec::new();
+            let (selected, frames) =
+                decode_keyframe_with_candidates(codec, ["shared", "cpu"], b"keyframe", |backend| {
+                    attempts.push(backend);
+                    if backend == "shared" {
+                        anyhow::bail!("interop unavailable")
+                    }
+                    Ok(Box::new(FallbackDecoder { frames: Vec::new() }))
+                })
+                .unwrap();
+            assert_eq!(attempts, ["shared", "cpu"]);
+            assert_eq!(selected.codec, codec);
+            assert_eq!(selected.backend, "cpu");
+            assert_eq!(frames.len(), 1);
+        }
+    }
+
+    #[test]
+    fn keyframe_fallback_keeps_decoder_that_buffers_its_first_frame() {
+        struct BufferedDecoder {
+            accepted: usize,
+        }
+        impl VideoDecoder for BufferedDecoder {
+            fn push_access_unit(&mut self, _: &[u8]) -> std::result::Result<(), PipelineError> {
+                self.accepted += 1;
+                Ok(())
+            }
+            fn drain_decoded_frames(&mut self) -> Vec<DecodedFrame> {
+                if self.accepted >= 2 {
+                    vec![DecodedFrame::from_cpu_rgb24(1, 1, 1, vec![1, 2, 3])]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        for codec in [
+            LanAccessUnitCodec::H264,
+            LanAccessUnitCodec::Hevc,
+            LanAccessUnitCodec::Av1,
+        ] {
+            let (mut selected, frames) =
+                decode_keyframe_with_candidates(codec, ["buffered"], b"keyframe", |_| {
+                    Ok(Box::new(BufferedDecoder { accepted: 0 }))
+                })
+                .expect("accepting an access unit does not require immediate output");
+            assert!(frames.is_empty());
+            assert_eq!(selected.codec, codec);
+            let next = decode_lan_desktop_frame(codec, selected.decoder.as_mut(), b"next").unwrap();
+            assert_eq!(next.len(), 1);
+        }
+    }
 }

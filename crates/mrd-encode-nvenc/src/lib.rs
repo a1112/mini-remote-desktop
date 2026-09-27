@@ -31,8 +31,8 @@ mod imp {
         NV_ENC_PRESET_P6_GUID,
     };
     use nvenc::sys::structs::Guid;
-    use std::collections::VecDeque;
-    use windows::core::Interface;
+    use std::{borrow::Cow, collections::VecDeque, time::Duration};
+    use windows::core::{Interface, BOOL};
     use windows::Win32::Foundation::{HANDLE, HMODULE};
     use windows::Win32::Graphics::Direct3D::{
         D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
@@ -40,10 +40,11 @@ mod imp {
     };
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, ID3D11ClassLinkage, ID3D11Device, ID3D11DeviceContext,
-        ID3D11PixelShader, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
-        ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_RENDER_TARGET,
-        D3D11_BIND_SHADER_RESOURCE, D3D11_COMPARISON_NEVER, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+        ID3D11PixelShader, ID3D11Query, ID3D11RenderTargetView, ID3D11Resource, ID3D11SamplerState,
+        ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+        D3D11_ASYNC_GETDATA_DONOTFLUSH, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+        D3D11_COMPARISON_NEVER, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D11_QUERY_DESC, D3D11_QUERY_EVENT, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
         D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_VIEWPORT,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
@@ -113,12 +114,11 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // unregistered while the backing D3D11 textures/device are still live.
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
         shared_encode_slots: Vec<SharedEncodeSlot>,
-        bitstream: BitStream,
-        registered: RegisteredResource,
+        cpu_encode_slot: PendingEncodeResource<SharedEncodeSlot>,
         encoder: Encoder,
         shared_inputs: Vec<SharedInputResource>,
         color_transform_pipeline: Option<ColorTransformPipeline>,
-        texture: ID3D11Texture2D,
+        input_copy_completion: SharedInputCopyCompletion,
         context: ID3D11DeviceContext,
         _device: ID3D11Device,
         width: usize,
@@ -136,12 +136,11 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // before the D3D11 resources backing their registrations.
         pending_shared_encodes: VecDeque<PendingSharedEncode>,
         shared_encode_slots: Vec<SharedEncodeSlot>,
-        bitstream: BitStream,
-        registered: RegisteredResource,
+        cpu_encode_slot: PendingEncodeResource<SharedEncodeSlot>,
         encoder: Encoder,
         shared_inputs: Vec<SharedInputResource>,
         color_transform_pipeline: Option<ColorTransformPipeline>,
-        texture: ID3D11Texture2D,
+        input_copy_completion: SharedInputCopyCompletion,
         context: ID3D11DeviceContext,
         _device: ID3D11Device,
         width: usize,
@@ -187,6 +186,157 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         slot: SharedEncodeSlot,
         timestamp_us: u64,
         is_keyframe: bool,
+    }
+
+    struct PendingEncodeResource<T> {
+        resource: Option<T>,
+        pending: bool,
+    }
+
+    impl<T> PendingEncodeResource<T> {
+        fn new(resource: T) -> Self {
+            Self {
+                resource: Some(resource),
+                pending: false,
+            }
+        }
+
+        fn idle_resource(&self) -> Result<&T, PipelineError> {
+            if self.pending {
+                return Err(PipelineError::message(
+                    "previous CPU NVENC input has not completed",
+                ));
+            }
+            Ok(self.resource.as_ref().expect("active CPU encode resource"))
+        }
+
+        fn begin(&mut self) -> Result<&mut T, PipelineError> {
+            self.idle_resource()?;
+            // Retain the resource even when submission fails: the driver may
+            // have accepted work before reporting a fatal error.
+            self.pending = true;
+            Ok(self.resource.as_mut().expect("active CPU encode resource"))
+        }
+
+        fn complete<O, E>(
+            &mut self,
+            complete: impl FnOnce(&mut T) -> Result<O, E>,
+        ) -> Result<O, E> {
+            let output = complete(self.resource.as_mut().expect("active CPU encode resource"))?;
+            self.pending = false;
+            Ok(output)
+        }
+
+        fn prepare_for_upload(
+            &mut self,
+            unmap: impl FnOnce(&mut T) -> Result<(), PipelineError>,
+        ) -> Result<(), PipelineError> {
+            // Registration initially maps the resource. Graphics writes must
+            // precede the next map; retain ownership if the initial unmap fails.
+            self.begin()?;
+            self.complete(unmap)
+        }
+    }
+
+    fn prepare_resource_for_graphics<T>(
+        resource: T,
+        unmap: impl FnOnce(&mut T) -> Result<(), PipelineError>,
+    ) -> Result<T, PipelineError> {
+        let mut guarded = PendingEncodeResource::new(resource);
+        guarded.prepare_for_upload(unmap)?;
+        Ok(guarded.resource.take().expect("idle graphics resource"))
+    }
+
+    fn unmap_slot_for_graphics(slot: &mut SharedEncodeSlot) -> Result<(), PipelineError> {
+        slot.registered.unmap().map_err(|error| {
+            PipelineError::message(format!(
+                "NVENC unmap before graphics write failed: {error:?}"
+            ))
+        })
+    }
+
+    impl<T> Drop for PendingEncodeResource<T> {
+        fn drop(&mut self) {
+            if self.pending {
+                // A synchronous encode only remains pending after an error.
+                // Keep its encoder Arc, input texture and bitstream alive rather
+                // than attempting native teardown with completion unknown.
+                if let Some(unfinished) = self.resource.take() {
+                    std::mem::forget(unfinished);
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct SharedInputCopyCompletion {
+        query: Option<ID3D11Query>,
+    }
+
+    impl SharedInputCopyCompletion {
+        fn wait(
+            &mut self,
+            device: &ID3D11Device,
+            context: &ID3D11DeviceContext,
+        ) -> Result<(), PipelineError> {
+            if self.query.is_none() {
+                let desc = D3D11_QUERY_DESC {
+                    Query: D3D11_QUERY_EVENT,
+                    MiscFlags: 0,
+                };
+                unsafe { device.CreateQuery(&desc, Some(&mut self.query)) }.map_err(|error| {
+                    PipelineError::message(format!(
+                        "create shared input completion query failed: {error}"
+                    ))
+                })?;
+            }
+            let query = self
+                .query
+                .as_ref()
+                .ok_or_else(|| PipelineError::message("missing shared input completion query"))?;
+            unsafe {
+                context.End(query);
+                context.Flush();
+            }
+            wait_for_shared_input_read(
+                || {
+                    let mut complete = BOOL(0);
+                    unsafe {
+                        context.GetData(
+                            query,
+                            Some((&mut complete as *mut BOOL).cast()),
+                            std::mem::size_of::<BOOL>() as u32,
+                            D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                        )
+                    }
+                    .map_err(|error| {
+                        PipelineError::message(format!(
+                            "shared input GPU copy completion failed: {error}"
+                        ))
+                    })?;
+                    Ok(complete.as_bool())
+                },
+                Duration::from_secs(2),
+            )
+        }
+    }
+
+    fn wait_for_shared_input_read(
+        mut poll: impl FnMut() -> Result<bool, PipelineError>,
+        timeout: Duration,
+    ) -> Result<(), PipelineError> {
+        let started = std::time::Instant::now();
+        loop {
+            if poll()? {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(PipelineError::message(
+                    "shared input GPU copy completion timed out",
+                ));
+            }
+            std::thread::yield_now();
+        }
     }
 
     struct SharedInputBinding {
@@ -349,14 +499,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Self {
                 _device: device,
                 context,
-                texture,
                 encoder,
-                registered,
+                cpu_encode_slot: PendingEncodeResource::new(SharedEncodeSlot {
+                    bitstream,
+                    registered,
+                    texture,
+                    render_target_view: None,
+                }),
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 color_transform_pipeline: None,
-                bitstream,
+                input_copy_completion: SharedInputCopyCompletion::default(),
                 width,
                 height,
                 fps,
@@ -433,14 +587,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Self {
                 _device: device,
                 context,
-                texture,
                 encoder,
-                registered,
+                cpu_encode_slot: PendingEncodeResource::new(SharedEncodeSlot {
+                    bitstream,
+                    registered,
+                    texture,
+                    render_target_view: None,
+                }),
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 color_transform_pipeline: None,
-                bitstream,
+                input_copy_completion: SharedInputCopyCompletion::default(),
                 width,
                 height,
                 fps,
@@ -542,14 +700,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Self {
                 _device: device,
                 context,
-                texture,
                 encoder,
-                registered,
+                cpu_encode_slot: PendingEncodeResource::new(SharedEncodeSlot {
+                    bitstream,
+                    registered,
+                    texture,
+                    render_target_view: None,
+                }),
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 color_transform_pipeline: None,
-                bitstream,
+                input_copy_completion: SharedInputCopyCompletion::default(),
                 width,
                 height,
                 fps,
@@ -620,14 +782,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Self {
                 _device: device,
                 context,
-                texture,
                 encoder,
-                registered,
+                cpu_encode_slot: PendingEncodeResource::new(SharedEncodeSlot {
+                    bitstream,
+                    registered,
+                    texture,
+                    render_target_view: None,
+                }),
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 color_transform_pipeline: None,
-                bitstream,
+                input_copy_completion: SharedInputCopyCompletion::default(),
                 width,
                 height,
                 fps,
@@ -667,30 +833,41 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 }
             }
 
-            let mut slot = self
+            let slot = self
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC encode slot"))?;
+            let slot = prepare_resource_for_graphics(slot, unmap_slot_for_graphics)?;
             self.copy_or_transform_shared_bgra_to_texture(&source, &slot)?;
+            // The caller can reuse its capture texture as soon as encode returns
+            // (WinRT uses a single texture). Finish our read before that handoff;
+            // the independent slot can then remain in flight inside NVENC.
+            self.input_copy_completion
+                .wait(&self._device, &self.context)?;
 
             let force_idr =
                 h264_should_force_keyframe(self.frame_index, self.fps, self.force_next_keyframe);
-            submit_encode_picture(
-                &mut self.encoder,
-                &slot.bitstream,
-                &mut slot.registered,
-                self.frame_index,
-                force_idr,
-                NVencBufferFormat::ARGB,
+            submit_pending_encode(
+                &mut self.pending_shared_encodes,
+                PendingSharedEncode {
+                    slot,
+                    timestamp_us: frame.timestamp_us,
+                    is_keyframe: force_idr,
+                },
+                |pending| {
+                    submit_encode_picture(
+                        &mut self.encoder,
+                        &pending.slot.bitstream,
+                        &mut pending.slot.registered,
+                        self.frame_index,
+                        force_idr,
+                        NVencBufferFormat::ARGB,
+                    )
+                },
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.force_next_keyframe = false;
             self.frame_index += 1;
-            self.pending_shared_encodes.push_back(PendingSharedEncode {
-                slot,
-                timestamp_us: frame.timestamp_us,
-                is_keyframe: force_idr,
-            });
 
             if self.pending_shared_encodes.len() >= H264_SHARED_ASYNC_SLOT_COUNT {
                 if let Some(access_unit) = self.complete_oldest_shared_encode()? {
@@ -750,14 +927,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         fn complete_oldest_shared_encode(
             &mut self,
         ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
-            let Some(mut pending) = self.pending_shared_encodes.pop_front() else {
+            let completed = complete_pending_encode(&mut self.pending_shared_encodes, |pending| {
+                lock_and_unmap_bitstream(&pending.slot.bitstream, &mut pending.slot.registered)
+                    .map_err(|error| PipelineError::message(error.to_string()))
+            })?;
+            let Some((pending, bytes)) = completed else {
                 return Ok(None);
             };
-            pending.slot.registered.unmap().map_err(|error| {
-                PipelineError::message(format!("NVENC unmap input failed: {error:?}"))
-            })?;
-            let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
-                .map_err(|error| PipelineError::message(error.to_string()))?;
             let access_unit = EncodedAccessUnit {
                 codec: VideoCodec::H264,
                 timestamp_us: pending.timestamp_us,
@@ -768,16 +944,20 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Some(access_unit))
         }
 
-        fn drain_pending_shared_encodes_for_shutdown(&mut self) {
-            while !self.pending_shared_encodes.is_empty() {
-                if self.complete_oldest_shared_encode().is_err() {
-                    break;
-                }
-            }
+        fn drain_pending_shared_encodes_for_shutdown(&mut self) -> Result<(), PipelineError> {
+            drain_pending_encodes_for_shutdown(&mut self.pending_shared_encodes, |pending| {
+                lock_and_unmap_bitstream(&pending.slot.bitstream, &mut pending.slot.registered)
+                    .map(|_| ())
+                    .map_err(|error| PipelineError::message(error.to_string()))
+            })
         }
 
         fn unmap_registered_resources_for_shutdown(&mut self) {
-            let _ = self.registered.unmap();
+            if self.cpu_encode_slot.pending {
+                // This synchronous path only remains pending after a failure.
+                // Do not enter another possibly blocking native lock in Drop.
+                eprintln!("NVENC CPU encode failed before completion; native resources retained until process exit");
+            }
             for slot in &mut self.shared_encode_slots {
                 let _ = slot.registered.unmap();
             }
@@ -1147,14 +1327,18 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Self {
                 _device: device,
                 context,
-                texture,
                 encoder,
-                registered,
+                cpu_encode_slot: PendingEncodeResource::new(SharedEncodeSlot {
+                    bitstream,
+                    registered,
+                    texture,
+                    render_target_view: None,
+                }),
                 shared_inputs: Vec::new(),
                 shared_encode_slots: Vec::new(),
                 pending_shared_encodes: VecDeque::new(),
                 color_transform_pipeline: None,
-                bitstream,
+                input_copy_completion: SharedInputCopyCompletion::default(),
                 width,
                 height,
                 fps,
@@ -1185,30 +1369,39 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 }
             }
 
-            let mut slot = self
+            let slot = self
                 .shared_encode_slots
                 .pop()
                 .ok_or_else(|| PipelineError::message("missing shared NVENC HEVC encode slot"))?;
+            let slot = prepare_resource_for_graphics(slot, unmap_slot_for_graphics)?;
             self.copy_or_transform_shared_bgra_to_texture(&source, &slot)?;
+            // Match H264's source lifetime contract before asynchronous encoding.
+            self.input_copy_completion
+                .wait(&self._device, &self.context)?;
 
             let keyframe_interval = hevc_remote_desktop_keyframe_interval(self.fps);
             let force_idr =
                 self.frame_index == 0 || self.frame_index.is_multiple_of(keyframe_interval);
-            submit_encode_picture(
-                &mut self.encoder,
-                &slot.bitstream,
-                &mut slot.registered,
-                self.frame_index,
-                force_idr,
-                NVencBufferFormat::ARGB,
+            submit_pending_encode(
+                &mut self.pending_shared_encodes,
+                PendingSharedEncode {
+                    slot,
+                    timestamp_us: frame.timestamp_us,
+                    is_keyframe: force_idr,
+                },
+                |pending| {
+                    submit_encode_picture(
+                        &mut self.encoder,
+                        &pending.slot.bitstream,
+                        &mut pending.slot.registered,
+                        self.frame_index,
+                        force_idr,
+                        NVencBufferFormat::ARGB,
+                    )
+                },
             )
             .map_err(|error| PipelineError::message(error.to_string()))?;
             self.frame_index += 1;
-            self.pending_shared_encodes.push_back(PendingSharedEncode {
-                slot,
-                timestamp_us: frame.timestamp_us,
-                is_keyframe: force_idr,
-            });
 
             if self.pending_shared_encodes.len() >= HEVC_SHARED_ASYNC_SLOT_COUNT {
                 if let Some(access_unit) = self.complete_oldest_shared_encode()? {
@@ -1268,14 +1461,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         fn complete_oldest_shared_encode(
             &mut self,
         ) -> Result<Option<EncodedAccessUnit>, PipelineError> {
-            let Some(mut pending) = self.pending_shared_encodes.pop_front() else {
+            let completed = complete_pending_encode(&mut self.pending_shared_encodes, |pending| {
+                lock_and_unmap_bitstream(&pending.slot.bitstream, &mut pending.slot.registered)
+                    .map_err(|error| PipelineError::message(error.to_string()))
+            })?;
+            let Some((pending, bytes)) = completed else {
                 return Ok(None);
             };
-            pending.slot.registered.unmap().map_err(|error| {
-                PipelineError::message(format!("NVENC unmap input failed: {error:?}"))
-            })?;
-            let bytes = lock_bitstream_bytes(&pending.slot.bitstream)
-                .map_err(|error| PipelineError::message(error.to_string()))?;
             if self.main10 {
                 validate_hevc_main10_bitstream(&bytes)?;
             }
@@ -1289,16 +1481,20 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             Ok(Some(access_unit))
         }
 
-        fn drain_pending_shared_encodes_for_shutdown(&mut self) {
-            while !self.pending_shared_encodes.is_empty() {
-                if self.complete_oldest_shared_encode().is_err() {
-                    break;
-                }
-            }
+        fn drain_pending_shared_encodes_for_shutdown(&mut self) -> Result<(), PipelineError> {
+            drain_pending_encodes_for_shutdown(&mut self.pending_shared_encodes, |pending| {
+                lock_and_unmap_bitstream(&pending.slot.bitstream, &mut pending.slot.registered)
+                    .map(|_| ())
+                    .map_err(|error| PipelineError::message(error.to_string()))
+            })
         }
 
         fn unmap_registered_resources_for_shutdown(&mut self) {
-            let _ = self.registered.unmap();
+            if self.cpu_encode_slot.pending {
+                // This synchronous path only remains pending after a failure.
+                // Do not enter another possibly blocking native lock in Drop.
+                eprintln!("NVENC CPU encode failed before completion; native resources retained until process exit");
+            }
             for slot in &mut self.shared_encode_slots {
                 let _ = slot.registered.unmap();
             }
@@ -1482,9 +1678,11 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 .ok_or_else(|| PipelineError::message("row pitch overflow"))?
                 as u32;
 
+            self.cpu_encode_slot
+                .prepare_for_upload(unmap_slot_for_graphics)?;
             unsafe {
                 self.context.UpdateSubresource(
-                    &self.texture,
+                    &self.cpu_encode_slot.idle_resource()?.texture,
                     0,
                     None,
                     bgra.as_ptr() as *const core::ffi::c_void,
@@ -1497,8 +1695,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 h264_should_force_keyframe(self.frame_index, self.fps, self.force_next_keyframe);
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
-                &self.bitstream,
-                &mut self.registered,
+                &mut self.cpu_encode_slot,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -1546,11 +1743,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             }
 
             let upload = to_bgra(frame)?;
-            let (upload_data, row_pitch) = (upload.as_slice(), (self.width * 4) as u32);
+            let (upload_data, row_pitch) = (upload.as_ref(), (self.width * 4) as u32);
 
+            self.cpu_encode_slot
+                .prepare_for_upload(unmap_slot_for_graphics)?;
             unsafe {
                 self.context.UpdateSubresource(
-                    &self.texture,
+                    &self.cpu_encode_slot.idle_resource()?.texture,
                     0,
                     None,
                     upload_data.as_ptr() as *const core::ffi::c_void,
@@ -1564,8 +1763,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 self.frame_index == 0 || self.frame_index.is_multiple_of(keyframe_interval);
             let bytes = encode_picture_with_sps_pps(
                 &mut self.encoder,
-                &self.bitstream,
-                &mut self.registered,
+                &mut self.cpu_encode_slot,
                 self.frame_index,
                 force_idr,
                 NVencBufferFormat::ARGB,
@@ -1589,21 +1787,25 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         fn drop(&mut self) {
             // The shared path has asynchronous NVENC submissions.  Do not
             // unregister their D3D11 textures while a bitstream is still in
-            // flight: flush D3D work, wait for every pending slot through the
-            // NVENC lock, then close the encode stream before field teardown.
+            // flight: submit D3D work and EOS, then wait for pending outputs
+            // before unmapping their inputs and releasing native resources.
             unsafe { self.context.Flush() };
-            self.drain_pending_shared_encodes_for_shutdown();
-            self.unmap_registered_resources_for_shutdown();
             let _ = self.encoder.end_encode();
+            if let Err(error) = self.drain_pending_shared_encodes_for_shutdown() {
+                eprintln!("NVENC H264 shutdown output completion failed; unfinished native resources retained until process exit: {error}");
+            }
+            self.unmap_registered_resources_for_shutdown();
         }
     }
 
     impl Drop for NvencHevcEncoder {
         fn drop(&mut self) {
             unsafe { self.context.Flush() };
-            self.drain_pending_shared_encodes_for_shutdown();
-            self.unmap_registered_resources_for_shutdown();
             let _ = self.encoder.end_encode();
+            if let Err(error) = self.drain_pending_shared_encodes_for_shutdown() {
+                eprintln!("NVENC HEVC shutdown output completion failed; unfinished native resources retained until process exit: {error}");
+            }
+            self.unmap_registered_resources_for_shutdown();
         }
     }
 
@@ -1652,6 +1854,387 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     #[allow(clippy::items_after_test_module)]
     mod tests {
         use super::*;
+
+        struct TrackedCpuSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Drop for TrackedCpuSlot {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn initial_mapping_is_released_before_first_cpu_upload() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let mut input = PendingEncodeResource::new(());
+            input
+                .prepare_for_upload(|_| {
+                    calls.borrow_mut().push("unmap");
+                    Ok(())
+                })
+                .unwrap();
+            input.idle_resource().unwrap();
+            calls.borrow_mut().push("upload");
+            assert_eq!(*calls.borrow(), ["unmap", "upload"]);
+        }
+
+        #[test]
+        fn initial_cpu_unmap_failure_retains_slot_and_prevents_upload() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut input = PendingEncodeResource::new(TrackedCpuSlot(drops.clone()));
+            assert!(input
+                .prepare_for_upload(|_| Err(PipelineError::message("unmap failed")))
+                .is_err());
+            assert!(input.idle_resource().is_err());
+            drop(input);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn initial_shared_slot_unmap_failure_retains_slot_before_gpu_copy() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let result = prepare_resource_for_graphics(TrackedCpuSlot(drops.clone()), |_| {
+                Err(PipelineError::message("initial unmap failed"))
+            });
+            assert!(result.is_err());
+            drop(result);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn cpu_submission_failure_retains_native_slot_and_rejects_overwrite() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut input = PendingEncodeResource::new(TrackedCpuSlot(drops.clone()));
+            input.begin().unwrap();
+            // A submission error leaves acceptance by the native driver unknown.
+            assert!(input.idle_resource().is_err());
+            assert!(input.begin().is_err());
+            drop(input);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn cpu_completion_failure_retains_native_slot_and_rejects_overwrite() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut input = PendingEncodeResource::new(TrackedCpuSlot(drops.clone()));
+            input.begin().unwrap();
+            assert_eq!(
+                input.complete(|_| Err::<(), _>("device removed")),
+                Err("device removed")
+            );
+            assert!(input.idle_resource().is_err());
+            drop(input);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn cpu_completed_slot_is_reusable_and_releases_normally() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut input = PendingEncodeResource::new(TrackedCpuSlot(drops.clone()));
+            input.begin().unwrap();
+            assert_eq!(input.complete(|_| Ok::<_, &str>(7)), Ok(7));
+            assert!(input.idle_resource().is_ok());
+            input.begin().unwrap();
+            assert_eq!(input.complete(|_| Ok::<_, &str>(())), Ok(()));
+            drop(input);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn shared_submission_failure_retains_slot_in_pending_queue() {
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut pending = VecDeque::new();
+            assert_eq!(
+                submit_pending_encode(&mut pending, TrackedCpuSlot(drops.clone()), |_| {
+                    Err::<(), _>("submission failed")
+                }),
+                Err("submission failed")
+            );
+            assert_eq!(pending.len(), 1);
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let _ = drain_pending_encodes_for_shutdown(&mut pending, |_| Err("completion failed"));
+            assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn shared_input_wait_retains_source_until_gpu_read_completes() {
+            let mut polls = 0;
+            wait_for_shared_input_read(
+                || {
+                    polls += 1;
+                    Ok(polls == 3)
+                },
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert_eq!(polls, 3);
+        }
+
+        #[test]
+        fn shared_input_wait_reports_timeout_instead_of_releasing_pending_source() {
+            let error = wait_for_shared_input_read(|| Ok(false), Duration::ZERO).unwrap_err();
+            assert!(error.to_string().contains("timed out"));
+        }
+
+        #[test]
+        fn shared_input_wait_propagates_device_failure() {
+            let error = wait_for_shared_input_read(
+                || Err(PipelineError::message("device removed")),
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("device removed"));
+        }
+
+        #[test]
+        fn shared_input_completion_query_finishes_copy_and_is_reused() {
+            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+            let mut device = None;
+            let mut context = None;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    D3D_DRIVER_TYPE_WARP,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )
+            }
+            .unwrap();
+            let device = device.unwrap();
+            let context = context.unwrap();
+            let source = create_encode_texture(&device, 16, 16).unwrap();
+            let target = create_encode_texture(&device, 16, 16).unwrap();
+            let mut completion = SharedInputCopyCompletion::default();
+            unsafe {
+                context.CopyResource(&target, &source);
+            }
+            completion.wait(&device, &context).unwrap();
+            let query = completion.query.as_ref().unwrap().clone();
+            let mut completed = BOOL(0);
+            unsafe {
+                context.GetData(
+                    &query,
+                    Some((&mut completed as *mut BOOL).cast()),
+                    std::mem::size_of::<BOOL>() as u32,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                )
+            }
+            .unwrap();
+            assert!(completed.as_bool());
+            unsafe {
+                context.CopyResource(&target, &source);
+            }
+            completion.wait(&device, &context).unwrap();
+            assert_eq!(query.as_raw(), completion.query.as_ref().unwrap().as_raw());
+        }
+
+        #[test]
+        fn output_completion_precedes_input_unmap() {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let bytes = complete_encode_output(
+                || {
+                    calls.borrow_mut().push("lock");
+                    Ok::<_, &str>(vec![1])
+                },
+                || {
+                    calls.borrow_mut().push("unmap");
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(bytes, vec![1]);
+            assert_eq!(*calls.borrow(), vec!["lock", "unmap"]);
+        }
+
+        #[test]
+        fn failed_output_lock_keeps_input_mapped() {
+            let unmapped = std::cell::Cell::new(false);
+            let result = complete_encode_output(
+                || Err::<Vec<u8>, _>("lock failed"),
+                || {
+                    unmapped.set(true);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err("lock failed"));
+            assert!(!unmapped.get());
+        }
+
+        #[test]
+        fn failed_completion_preserves_oldest_pending_slot_for_retry() {
+            let mut pending = VecDeque::from([7, 8]);
+            let result = complete_pending_encode(&mut pending, |_| Err::<Vec<u8>, _>("not ready"));
+            assert_eq!(result, Err("not ready"));
+            assert_eq!(pending, VecDeque::from([7, 8]));
+            let result = complete_pending_encode(&mut pending, |_| Ok::<_, &str>(vec![1]));
+            assert_eq!(result, Ok(Some((7, vec![1]))));
+            assert_eq!(pending, VecDeque::from([8]));
+        }
+
+        #[test]
+        fn failed_unmap_does_not_recycle_pending_slot() {
+            let mut pending = VecDeque::from([7]);
+            let result = complete_pending_encode(&mut pending, |_| {
+                complete_encode_output(|| Ok(vec![1]), || Err("unmap failed"))
+            });
+            assert_eq!(result, Err("unmap failed"));
+            assert_eq!(pending, VecDeque::from([7]));
+        }
+
+        #[test]
+        fn permanent_shutdown_failure_retains_unfinished_native_resources() {
+            struct NativeSlot {
+                ready: bool,
+                drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            }
+            impl Drop for NativeSlot {
+                fn drop(&mut self) {
+                    self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut pending: VecDeque<_> = [true, false, false]
+                .into_iter()
+                .map(|ready| NativeSlot {
+                    ready,
+                    drops: drops.clone(),
+                })
+                .collect();
+            let result = drain_pending_encodes_for_shutdown(&mut pending, |slot| {
+                if slot.ready {
+                    Ok(())
+                } else {
+                    Err("device stopped completing output")
+                }
+            });
+            assert_eq!(result, Err("device stopped completing output"));
+            drop(pending);
+            assert_eq!(
+                drops.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "only the completed native slot may be destroyed"
+            );
+        }
+
+        #[test]
+        fn cpu_bgra_input_borrows_existing_frame_storage() {
+            let frame = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 0, vec![7; 16]);
+            let bgra = to_bgra(&frame).expect("valid BGRA frame");
+            assert_eq!(bgra.as_ptr(), frame.data.as_ptr());
+            assert_eq!(&bgra[..], frame.data.as_slice());
+        }
+
+        #[test]
+        fn cpu_bgra_input_rejects_truncated_storage() {
+            let frame = CapturedFrame::from_cpu(2, 2, FramePixelFormat::Bgra32, 0, vec![7; 15]);
+            assert!(to_bgra(&frame).is_err());
+        }
+
+        #[test]
+        #[ignore = "requires a working NVIDIA NVENC runtime and hardware"]
+        fn cpu_bgra_h264_encodes_and_reuses_slot() {
+            let mut encoder = NvencH264Encoder::new(1280, 720, 60)
+                .expect("NVENC H264 hardware encoder must initialize for this strict probe");
+            for index in 0..3 {
+                let frame = CapturedFrame::from_cpu(
+                    1280,
+                    720,
+                    FramePixelFormat::Bgra32,
+                    index,
+                    vec![(index * 24) as u8; 1280 * 720 * 4],
+                );
+                let output = encoder.encode(&frame).expect("CPU BGRA NVENC encoding");
+                assert_eq!(output.len(), 1);
+                assert!(!output[0].bytes.is_empty());
+                assert_eq!(output[0].timestamp_us, index);
+                assert_eq!(output[0].is_keyframe, index == 0);
+                assert!(encoder.cpu_encode_slot.idle_resource().is_ok());
+            }
+        }
+
+        #[test]
+        #[ignore = "requires a working NVIDIA NVENC runtime and hardware"]
+        fn shared_bgra_h264_encodes_and_recycles_slots() {
+            shared_bgra_h264_smoke(false);
+        }
+
+        #[test]
+        #[ignore = "requires a working NVIDIA NVENC runtime and hardware"]
+        fn shared_bgra_h264_max_speed_encodes_and_recycles_slots() {
+            shared_bgra_h264_smoke(true);
+        }
+
+        fn shared_bgra_h264_smoke(max_speed: bool) {
+            use windows::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_SHARED;
+            use windows::Win32::Graphics::Dxgi::IDXGIResource;
+
+            const WIDTH: usize = 1280;
+            const HEIGHT: usize = 720;
+            let (device, context) = create_d3d11_device().expect("capture D3D11 device");
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: WIDTH as u32,
+                Height: HEIGHT as u32,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+                ..Default::default()
+            };
+            let mut texture = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+                .expect("shared capture texture");
+            let texture = texture.expect("capture texture");
+            let dxgi: IDXGIResource = texture.cast().unwrap();
+            let handle = unsafe { dxgi.GetSharedHandle() }.unwrap();
+            let mut encoder = if max_speed {
+                NvencH264Encoder::new_max_speed(WIDTH, HEIGHT, 60)
+            } else {
+                NvencH264Encoder::new(WIDTH, HEIGHT, 60)
+            }
+            .expect("NVENC H264 hardware encoder must initialize for this strict probe");
+            let mut output = Vec::new();
+            for index in 0..8_u64 {
+                let pixels = vec![(index * 24) as u8; WIDTH * HEIGHT * 4];
+                unsafe {
+                    context.UpdateSubresource(
+                        &texture,
+                        0,
+                        None,
+                        pixels.as_ptr().cast(),
+                        (WIDTH * 4) as u32,
+                        0,
+                    );
+                    context.Flush();
+                }
+                let frame = CapturedFrame::from_d3d11_shared_bgra(
+                    WIDTH,
+                    HEIGHT,
+                    index * 16_667,
+                    handle.0 as isize,
+                    (WIDTH * 4) as u32,
+                );
+                output.extend(encoder.encode(&frame).expect("encode shared BGRA frame"));
+            }
+            assert_eq!(output.len(), 8 - (H264_SHARED_ASYNC_SLOT_COUNT - 1));
+            for (index, access_unit) in output.iter().enumerate() {
+                assert_eq!(access_unit.timestamp_us, index as u64 * 16_667);
+                assert!(!access_unit.bytes.is_empty());
+                assert_eq!(access_unit.codec, VideoCodec::H264);
+            }
+            assert!(output[0].is_keyframe);
+            drop(encoder); // Also exercises pending output completion during shutdown.
+        }
 
         #[test]
         fn hevc_shared_encode_queue_has_tail_latency_headroom() {
@@ -1967,24 +2550,93 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
     fn encode_picture_with_sps_pps(
         encoder: &mut Encoder,
-        bitstream: &BitStream,
-        registered: &mut RegisteredResource,
+        input: &mut PendingEncodeResource<SharedEncodeSlot>,
         frame_index: usize,
         force_idr: bool,
         buffer_format: NVencBufferFormat,
     ) -> anyhow::Result<Vec<u8>> {
+        let slot = input.begin()?;
         submit_encode_picture(
             encoder,
-            bitstream,
-            registered,
+            &slot.bitstream,
+            &mut slot.registered,
             frame_index,
             force_idr,
             buffer_format,
         )?;
-        registered
-            .unmap()
-            .map_err(|error| anyhow!("NVENC unmap input failed: {error:?}"))?;
-        lock_bitstream_bytes(bitstream)
+        input.complete(|slot| lock_and_unmap_bitstream(&slot.bitstream, &mut slot.registered))
+    }
+
+    fn submit_pending_encode<T, E>(
+        pending: &mut VecDeque<T>,
+        input: T,
+        submit: impl FnOnce(&mut T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        pending.push_back(input);
+        // Native submission may fail after accepting work. Take ownership
+        // before crossing that boundary so error propagation cannot drop it.
+        submit(pending.back_mut().expect("new pending encode"))
+    }
+
+    fn complete_pending_encode<T, O, E>(
+        pending: &mut VecDeque<T>,
+        complete: impl FnOnce(&mut T) -> Result<O, E>,
+    ) -> Result<Option<(T, O)>, E> {
+        let Some(oldest) = pending.front_mut() else {
+            return Ok(None);
+        };
+        // Keep the slot owned by the queue on either lock or unmap failure.
+        // Dropping it early could unregister an input still used by NVENC.
+        let output = complete(oldest)?;
+        let oldest = pending.pop_front().expect("completed pending encode");
+        Ok(Some((oldest, output)))
+    }
+
+    fn drain_pending_encodes_for_shutdown<T, E>(
+        pending: &mut VecDeque<T>,
+        mut complete: impl FnMut(&mut T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        loop {
+            match complete_pending_encode(pending, &mut complete) {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(error) => {
+                    // Completion is unknown. Each slot owns its registered input,
+                    // texture and an Arc to the encoder. Retain that ownership
+                    // until process exit rather than invoking unsafe native
+                    // teardown on resources which may still be in flight.
+                    for unfinished in pending.drain(..) {
+                        std::mem::forget(unfinished);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn complete_encode_output<O, E>(
+        lock: impl FnOnce() -> Result<O, E>,
+        unmap: impl FnOnce() -> Result<(), E>,
+    ) -> Result<O, E> {
+        // SDK 13 NvEncUnmapInputResource requires a successful bitstream lock
+        // for the work submitted with this input before the mapping is released.
+        let output = lock()?;
+        unmap()?;
+        Ok(output)
+    }
+
+    fn lock_and_unmap_bitstream(
+        bitstream: &BitStream,
+        registered: &mut RegisteredResource,
+    ) -> anyhow::Result<Vec<u8>> {
+        complete_encode_output(
+            || lock_bitstream_bytes(bitstream),
+            || {
+                registered
+                    .unmap()
+                    .map_err(|error| anyhow!("NVENC unmap input failed: {error:?}"))
+            },
+        )
     }
 
     fn submit_encode_picture(
@@ -2027,7 +2679,10 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         let lock = bitstream
             .try_lock(true)
             .map_err(|error| anyhow!("NVENC bitstream lock failed: {error:?}"))?;
-        Ok(lock.as_slice().to_vec())
+        let bytes = lock.as_slice().to_vec();
+        lock.unlock()
+            .map_err(|error| anyhow!("NVENC bitstream unlock failed: {error:?}"))?;
+        Ok(bytes)
     }
 
     fn normalize_annexb_au(buf: Vec<u8>) -> Vec<u8> {
@@ -2250,7 +2905,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         }
     }
 
-    fn to_bgra(frame: &CapturedFrame) -> Result<Vec<u8>, PipelineError> {
+    fn to_bgra(frame: &CapturedFrame) -> Result<Cow<'_, [u8]>, PipelineError> {
         let expected_len = frame
             .width
             .checked_mul(frame.height)
@@ -2269,7 +2924,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         }
 
         match frame.pixel_format {
-            FramePixelFormat::Bgra32 => Ok(frame.data.clone()),
+            FramePixelFormat::Bgra32 => Ok(Cow::Borrowed(&frame.data)),
             FramePixelFormat::Rgba32 => {
                 let mut bgra = Vec::with_capacity(frame.data.len());
                 for chunk in frame.data.as_chunks::<4>().0 {
@@ -2278,7 +2933,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                     bgra.push(chunk[0]);
                     bgra.push(chunk[3]);
                 }
-                Ok(bgra)
+                Ok(Cow::Owned(bgra))
             }
             FramePixelFormat::Rgb24 => {
                 let mut bgra = Vec::with_capacity(frame.width * frame.height * 4);
@@ -2288,9 +2943,9 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                     bgra.push(chunk[0]);
                     bgra.push(255);
                 }
-                Ok(bgra)
+                Ok(Cow::Owned(bgra))
             }
-            FramePixelFormat::Nv12 => nv12_to_bgra(frame),
+            FramePixelFormat::Nv12 => nv12_to_bgra(frame).map(Cow::Owned),
         }
     }
 

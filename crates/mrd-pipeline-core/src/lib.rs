@@ -2,6 +2,35 @@ use mrd_proto::SessionId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Keeps GPU frame storage alive until every consumer has completed its GPU
+/// work. Renderers must retain this lease through a completion fence/query,
+/// not merely until commands have been submitted.
+#[derive(Clone)]
+pub struct GpuFrameLease(std::sync::Arc<dyn std::any::Any + Send + Sync>);
+
+impl GpuFrameLease {
+    pub fn from_arc<T: std::any::Any + Send + Sync>(owner: std::sync::Arc<T>) -> Self {
+        Self(owner)
+    }
+}
+
+impl std::fmt::Debug for GpuFrameLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("GpuFrameLease")
+            .field(&std::sync::Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
+impl PartialEq for GpuFrameLease {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for GpuFrameLease {}
+
 pub mod encoder_config;
 pub use encoder_config::{ColorMode, ColorPipeline};
 
@@ -261,6 +290,7 @@ pub enum DecodedFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
     /// D3D11 shared P010/P016 texture handles (zero-copy Main10 path)
     #[cfg(windows)]
@@ -269,6 +299,7 @@ pub enum DecodedFrameData {
         shared_handle_uv: isize,
         width: u32,
         height: u32,
+        lease: Option<GpuFrameLease>,
     },
 }
 
@@ -282,6 +313,27 @@ pub struct DecodedFrame {
 }
 
 impl DecodedFrame {
+    pub fn with_gpu_lease(mut self, lease: Option<GpuFrameLease>) -> Self {
+        match &mut self.data {
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { lease: stored, .. }
+            | DecodedFrameData::D3D11SharedP010 { lease: stored, .. } => *stored = lease,
+            _ => {
+                let _ = lease;
+            }
+        }
+        self
+    }
+
+    pub fn gpu_lease(&self) -> Option<&GpuFrameLease> {
+        match &self.data {
+            #[cfg(windows)]
+            DecodedFrameData::D3D11SharedNv12 { lease, .. }
+            | DecodedFrameData::D3D11SharedP010 { lease, .. } => lease.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Create a decoded frame from CPU RGB24 data
     pub fn from_cpu_rgb24(width: usize, height: usize, timestamp_us: u64, data: Vec<u8>) -> Self {
         Self {
@@ -373,6 +425,7 @@ impl DecodedFrame {
                 shared_handle_uv,
                 width: width as u32,
                 height: height as u32,
+                lease: None,
             },
         }
     }
@@ -395,6 +448,7 @@ impl DecodedFrame {
                 shared_handle_uv,
                 width: width as u32,
                 height: height as u32,
+                lease: None,
             },
         }
     }

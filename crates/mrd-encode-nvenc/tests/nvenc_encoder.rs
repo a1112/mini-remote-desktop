@@ -312,6 +312,49 @@ fn nvenc_hevc_main10_720p_access_unit_signals_10_bit_sps() {
 }
 
 #[cfg(windows)]
+#[test]
+#[ignore = "requires a working NVIDIA HEVC encoder and runtime"]
+fn strict_hevc_main_cpu_720p_encodes_repeated_frames() {
+    let encoder = NvencHevcEncoder::new_main(1280, 720, 30)
+        .expect("HEVC Main hardware encoder must initialize");
+    assert_strict_hevc_cpu_frames(encoder, 8);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires a working NVIDIA HEVC Main10 encoder and runtime"]
+fn strict_hevc_main10_cpu_720p_encodes_repeated_frames() {
+    let encoder = NvencHevcEncoder::new_main10_with_bitrate(1280, 720, 30, 12_000_000)
+        .expect("HEVC Main10 hardware encoder must initialize");
+    assert_strict_hevc_cpu_frames(encoder, 10);
+}
+
+#[cfg(windows)]
+fn assert_strict_hevc_cpu_frames(mut encoder: NvencHevcEncoder, bit_depth: u8) {
+    for index in 0..3 {
+        let frame = CapturedFrame::from_cpu(
+            1280,
+            720,
+            FramePixelFormat::Bgra32,
+            index,
+            vec![0x60 + index as u8; 1280 * 720 * 4],
+        );
+        let output = encoder.encode(&frame).expect("strict HEVC frame encode");
+        assert_eq!(output.len(), 1);
+        let access_unit = &output[0];
+        assert_eq!(access_unit.codec, VideoCodec::Hevc);
+        assert!(!access_unit.bytes.is_empty());
+        assert_eq!(access_unit.timestamp_us, index);
+        if index == 0 {
+            assert_eq!(
+                extract_hevc_sps_luma_bit_depth(&access_unit.bytes).expect("HEVC SPS"),
+                bit_depth,
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
 fn extract_sps_profile_idc(access_unit: &[u8]) -> Option<u8> {
     let mut offset = 0usize;
     while let Some((start, start_len)) = find_h264_start_code(access_unit, offset) {

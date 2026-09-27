@@ -4,6 +4,8 @@ use mrd_render::{
 };
 use std::collections::VecDeque;
 
+#[cfg(windows)]
+mod gpu_completion;
 pub mod simd;
 
 #[cfg(windows)]
@@ -47,6 +49,17 @@ struct SharedNv12Pipeline {
 struct SharedNv12SrvCache {
     y_handle: isize,
     uv_handle: isize,
+    y_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    uv_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+}
+
+#[cfg(windows)]
+struct CpuPlanarTextures {
+    width: usize,
+    height: usize,
+    bytes_per_sample: usize,
+    y: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    uv: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
     y_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
     uv_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
 }
@@ -146,7 +159,9 @@ float4 main(PsIn input) : SV_TARGET {
 "#;
 
 #[cfg(windows)]
-const SHARED_NV12_SRV_CACHE_LIMIT: usize = 32;
+// The decoder has four reusable GPU slots. Keep the import cache equally small
+// so historical resolutions do not pin another 32 full-size plane pairs.
+const SHARED_NV12_SRV_CACHE_LIMIT: usize = 4;
 #[cfg(windows)]
 const SHARED_BGRA_RESOURCE_CACHE_LIMIT: usize = 16;
 #[cfg(windows)]
@@ -165,6 +180,14 @@ pub struct D3d11Renderer {
     shared_nv12_pipeline: Option<SharedNv12Pipeline>,
     #[cfg(windows)]
     shared_nv12_srv_cache: Vec<SharedNv12SrvCache>,
+    #[cfg(windows)]
+    cpu_planar_textures: Option<CpuPlanarTextures>,
+    #[cfg(windows)]
+    target_window: Option<isize>,
+    #[cfg(windows)]
+    shared_adapter_selected: bool,
+    #[cfg(windows)]
+    gpu_completion: Option<gpu_completion::GpuCompletionTracker>,
     #[cfg(windows)]
     shared_bgra_resource_cache: Vec<SharedBgraResourceCache>,
     attached_to_target: bool,
@@ -220,7 +243,25 @@ impl D3d11Renderer {
     pub fn new() -> Result<Self, RenderError> {
         #[cfg(windows)]
         {
-            use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+            Self::new_for_adapter(None)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Err(RenderError::Message(
+                "d3d11 renderer only supports Windows".into(),
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn new_for_adapter(
+        adapter: Option<windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+    ) -> Result<Self, RenderError> {
+        {
+            use windows::Win32::Graphics::Direct3D::{
+                D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN,
+            };
             use windows::Win32::Graphics::Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
@@ -231,8 +272,12 @@ impl D3d11Renderer {
 
             unsafe {
                 D3D11CreateDevice(
-                    None,
-                    D3D_DRIVER_TYPE_HARDWARE,
+                    adapter.as_ref(),
+                    if adapter.is_some() {
+                        D3D_DRIVER_TYPE_UNKNOWN
+                    } else {
+                        D3D_DRIVER_TYPE_HARDWARE
+                    },
                     None,
                     D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                     None,
@@ -254,6 +299,10 @@ impl D3d11Renderer {
                 surface: None,
                 shared_nv12_pipeline: None,
                 shared_nv12_srv_cache: Vec::new(),
+                cpu_planar_textures: None,
+                target_window: None,
+                shared_adapter_selected: false,
+                gpu_completion: None,
                 shared_bgra_resource_cache: Vec::new(),
                 attached_to_target: false,
                 uploaded_frame_count: 0,
@@ -739,7 +788,9 @@ impl D3d11Renderer {
         let data = match &frame.data {
             RenderFrameData::Rgb24(data) => data,
             RenderFrameData::Bgra32(data) => data,
-            RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
+            RenderFrameData::Nv12 { .. }
+            | RenderFrameData::Nv12Bytes { .. }
+            | RenderFrameData::P010 { .. } => {
                 return [0.05, 0.05, 0.05, 1.0];
             }
             #[cfg(windows)]
@@ -1150,6 +1201,72 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn ensure_shared_adapter(&mut self, shared_handle: isize) -> Result<(), RenderError> {
+        if self
+            .shared_nv12_srv_cache
+            .iter()
+            .any(|entry| entry.y_handle == shared_handle)
+            || self
+                .shared_bgra_resource_cache
+                .iter()
+                .any(|entry| entry.shared_handle == shared_handle)
+        {
+            return Ok(());
+        }
+        if self.open_shared_texture(shared_handle).is_ok() {
+            self.shared_adapter_selected = true;
+            return Ok(());
+        }
+        if self.shared_adapter_selected {
+            return Err(RenderError::Message("shared D3D11 resource is invalid or belongs to a different adapter than this renderer".into()));
+        }
+        // Permit only one adapter-search pass, including a failed first import.
+        self.shared_adapter_selected = true;
+        // Legacy GetSharedHandle resources do not carry an NT handle for
+        // GetSharedResourceAdapterLuid. Probe each local adapter once by opening
+        // the resource, then keep the selected device for this render session.
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|error| {
+            RenderError::Message(format!(
+                "enumerate shared-resource adapters failed: {error}"
+            ))
+        })?;
+        let mut index = 0;
+        while let Ok(adapter) = unsafe { factory.EnumAdapters(index) } {
+            index += 1;
+            let Ok(candidate) = Self::new_for_adapter(Some(adapter)) else {
+                continue;
+            };
+            if candidate.open_shared_texture(shared_handle).is_err() {
+                continue;
+            }
+            // Release the old context's bindings as well as our COM fields,
+            // allowing the same HWND to receive a swap chain on the new device.
+            // Submitted commands remain protected by their completion leases.
+            unsafe {
+                self.context.ClearState();
+                self.context.Flush();
+            }
+            self.surface = None;
+            self.shared_nv12_srv_cache.clear();
+            self.shared_bgra_resource_cache.clear();
+            self.shared_nv12_pipeline = None;
+            self.cpu_planar_textures = None;
+            self.gpu_completion = None;
+            self.context = candidate.context;
+            self.device = candidate.device;
+            self.shared_adapter_selected = true;
+            if let Some(window) = self.target_window {
+                self.surface = self.attach_window_surface(window)?;
+            }
+            return Ok(());
+        }
+        Err(RenderError::Message(
+            "no local D3D11 adapter can open the shared resource".into(),
+        ))
+    }
+
+    #[cfg(windows)]
     fn open_shared_texture(
         &self,
         shared_handle: isize,
@@ -1340,17 +1457,137 @@ impl D3d11Renderer {
     }
 
     #[cfg(windows)]
+    fn upload_cpu_planar_frame(
+        &mut self,
+        frame: &RenderFrame,
+    ) -> Result<
+        (
+            windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+            windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+        ),
+        RenderError,
+    > {
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let (data, pitch, bytes_per_sample) = if let Some((data, pitch)) = frame.as_nv12() {
+            (data, pitch, 1usize)
+        } else if let Some((data, pitch)) = frame.as_p010() {
+            (data, pitch, 2usize)
+        } else {
+            return Err(RenderError::Message(
+                "expected CPU NV12 or P010 planes".into(),
+            ));
+        };
+        let layout = planar_upload_layout(
+            frame.width,
+            frame.height,
+            pitch,
+            bytes_per_sample,
+            data.len(),
+        )?;
+        let needs_texture = self
+            .cpu_planar_textures
+            .as_ref()
+            .map(|cache| {
+                cache.width != frame.width
+                    || cache.height != frame.height
+                    || cache.bytes_per_sample != bytes_per_sample
+            })
+            .unwrap_or(true);
+        if needs_texture {
+            let formats = if bytes_per_sample == 1 {
+                (DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM)
+            } else {
+                (DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R16G16_UNORM)
+            };
+            let create_plane = |width,
+                                height,
+                                format|
+             -> Result<
+                (ID3D11Texture2D, ID3D11ShaderResourceView),
+                RenderError,
+            > {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: width,
+                    Height: height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    CPUAccessFlags: 0,
+                    MiscFlags: 0,
+                };
+                let mut texture = None;
+                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut texture)) }.map_err(
+                    |error| {
+                        RenderError::Message(format!("create CPU YUV upload plane failed: {error}"))
+                    },
+                )?;
+                let texture = texture
+                    .ok_or_else(|| RenderError::Message("missing CPU YUV upload texture".into()))?;
+                let mut view = None;
+                unsafe {
+                    self.device
+                        .CreateShaderResourceView(&texture, None, Some(&mut view))
+                }
+                .map_err(|error| {
+                    RenderError::Message(format!("create CPU YUV plane view failed: {error}"))
+                })?;
+                Ok((
+                    texture,
+                    view.ok_or_else(|| RenderError::Message("missing CPU YUV plane view".into()))?,
+                ))
+            };
+            let (y, y_srv) = create_plane(layout.width, layout.height, formats.0)?;
+            let (uv, uv_srv) = create_plane(layout.chroma_width, layout.chroma_height, formats.1)?;
+            self.cpu_planar_textures = Some(CpuPlanarTextures {
+                width: frame.width,
+                height: frame.height,
+                bytes_per_sample,
+                y,
+                uv,
+                y_srv,
+                uv_srv,
+            });
+        }
+        let cache = self
+            .cpu_planar_textures
+            .as_ref()
+            .expect("planar upload textures initialized");
+        // UpdateSubresource copies directly from the decoder's pitched planes;
+        // no packed intermediate buffer or CPU YUV-to-RGB conversion is needed.
+        unsafe {
+            self.context.UpdateSubresource(
+                &cache.y,
+                0,
+                None,
+                data.as_ptr().cast(),
+                layout.pitch,
+                0,
+            );
+            self.context.UpdateSubresource(
+                &cache.uv,
+                0,
+                None,
+                data[layout.uv_offset..].as_ptr().cast(),
+                layout.pitch,
+                0,
+            );
+        }
+        Ok((cache.y_srv.clone(), cache.uv_srv.clone()))
+    }
+
+    #[cfg(windows)]
     fn present_shared_texture_frame(
         &mut self,
         frame: &RenderFrame,
     ) -> Result<D3d11PresentStatus, RenderError> {
         use mrd_render::RenderFrameData;
-        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderResourceView, D3D11_VIEWPORT};
-
-        let Some(surface) = self.surface.as_ref() else {
-            return Ok(D3d11PresentStatus::NoTarget);
-        };
 
         let (shared_handle_y, shared_handle_uv) = match &frame.data {
             RenderFrameData::D3D11SharedNv12 {
@@ -1358,12 +1595,14 @@ impl D3d11Renderer {
                 shared_handle_uv,
                 width: _,
                 height: _,
+                ..
             }
             | RenderFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
                 width: _,
                 height: _,
+                ..
             } => (*shared_handle_y, *shared_handle_uv),
             _ => {
                 return Err(RenderError::Message(
@@ -1372,14 +1611,58 @@ impl D3d11Renderer {
             }
         };
 
+        let started = std::time::Instant::now();
+        let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
+        self.last_render_shared_resource_ms = Some(Self::duration_ms(started.elapsed()));
+        self.present_planar_srvs(frame, y_srv, uv_srv)
+    }
+
+    #[cfg(windows)]
+    fn present_planar_srvs(
+        &mut self,
+        frame: &RenderFrame,
+        y_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+        uv_srv: windows::Win32::Graphics::Direct3D11::ID3D11ShaderResourceView,
+    ) -> Result<D3d11PresentStatus, RenderError> {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderResourceView, D3D11_VIEWPORT};
+        let Some(surface) = self.surface.as_ref() else {
+            return Ok(D3d11PresentStatus::NoTarget);
+        };
+        let completion_query = if frame.gpu_lease().is_some() {
+            use windows::Win32::Graphics::Direct3D11::{D3D11_QUERY_DESC, D3D11_QUERY_EVENT};
+            if self.gpu_completion.is_none() {
+                self.gpu_completion = Some(gpu_completion::GpuCompletionTracker::new(
+                    &self.device,
+                    &self.context,
+                )?);
+            }
+            if !self.gpu_completion.as_ref().unwrap().can_submit()? {
+                return Ok(D3d11PresentStatus::SkippedStillDrawing);
+            }
+            let mut query = None;
+            unsafe {
+                self.device.CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                )
+            }
+            .map_err(|error| {
+                RenderError::Message(format!("create GPU frame completion query failed: {error}"))
+            })?;
+            Some(query.ok_or_else(|| RenderError::Message("missing GPU completion query".into()))?)
+        } else {
+            None
+        };
         let surface_width = surface.width;
         let surface_height = surface.height;
         let render_target_view = surface.render_target_view.clone();
         let swap_chain = surface.swap_chain.clone();
         let allow_tearing = surface.allow_tearing;
         let present_mode = surface.present_mode;
-        let shared_started = std::time::Instant::now();
-        let (y_srv, uv_srv) = self.shared_nv12_srvs(shared_handle_y, shared_handle_uv)?;
         let (vertex_shader, pixel_shader, sampler) = {
             let pipeline = self.ensure_shared_nv12_pipeline()?;
             (
@@ -1388,7 +1671,6 @@ impl D3d11Renderer {
                 pipeline.sampler.clone(),
             )
         };
-        self.last_render_shared_resource_ms = Some(Self::duration_ms(shared_started.elapsed()));
 
         let (viewport_x, viewport_y, viewport_width, viewport_height) =
             fit_viewport_rect(surface_width, surface_height, frame.width, frame.height);
@@ -1428,10 +1710,71 @@ impl D3d11Renderer {
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&empty_srvs));
         }
+        if let (Some(query), Some(lease)) = (completion_query, frame.gpu_lease()) {
+            unsafe {
+                self.context.End(&query);
+                self.context.Flush();
+            }
+            self.gpu_completion
+                .as_ref()
+                .unwrap()
+                .submit(query, lease.clone());
+        }
         let present_status = Self::present_swap_chain(&swap_chain, allow_tearing, present_mode)?;
         self.last_render_draw_present_ms = Some(Self::duration_ms(draw_started.elapsed()));
         Ok(present_status)
     }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct PlanarUploadLayout {
+    width: u32,
+    height: u32,
+    chroma_width: u32,
+    chroma_height: u32,
+    pitch: u32,
+    uv_offset: usize,
+}
+
+#[cfg(any(windows, test))]
+fn planar_upload_layout(
+    width: usize,
+    height: usize,
+    pitch: usize,
+    bytes_per_sample: usize,
+    len: usize,
+) -> Result<PlanarUploadLayout, RenderError> {
+    let invalid =
+        || RenderError::Message("invalid CPU NV12/P010 dimensions, pitch, or plane length".into());
+    if width == 0 || height == 0 || !matches!(bytes_per_sample, 1 | 2) {
+        return Err(invalid());
+    }
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let row_bytes = chroma_width
+        .checked_mul(2)
+        .and_then(|n| n.checked_mul(bytes_per_sample))
+        .ok_or_else(invalid)?;
+    if pitch < row_bytes || pitch % bytes_per_sample != 0 {
+        return Err(invalid());
+    }
+    let uv_offset = pitch.checked_mul(height).ok_or_else(invalid)?;
+    let required = pitch
+        .checked_mul(chroma_height)
+        .and_then(|n| n.checked_add(uv_offset))
+        .ok_or_else(invalid)?;
+    if len < required {
+        return Err(invalid());
+    }
+    Ok(PlanarUploadLayout {
+        width: width.try_into().map_err(|_| invalid())?,
+        height: height.try_into().map_err(|_| invalid())?,
+        chroma_width: chroma_width.try_into().map_err(|_| invalid())?,
+        chroma_height: chroma_height.try_into().map_err(|_| invalid())?,
+        pitch: pitch.try_into().map_err(|_| invalid())?,
+        uv_offset,
+    })
 }
 
 #[cfg(windows)]
@@ -1459,6 +1802,7 @@ impl RendererInstance for D3d11Renderer {
         {
             self.surface = match target {
                 RenderTarget::WindowHandle(window_handle) => {
+                    self.target_window = Some(window_handle);
                     self.attach_window_surface(window_handle)?
                 }
             };
@@ -1481,6 +1825,11 @@ impl RendererInstance for D3d11Renderer {
         {
             use mrd_render::RenderFrameData;
             self.reset_last_render_breakdown();
+            if self.surface.is_some() {
+                if let Some(handle) = frame.shared_handle() {
+                    self.ensure_shared_adapter(handle)?;
+                }
+            }
             let prepare_started = std::time::Instant::now();
             let waitable_skip = self.prepare_waitable_frame_latency()?;
             self.last_render_prepare_wait_ms = Some(Self::duration_ms(prepare_started.elapsed()));
@@ -1513,10 +1862,14 @@ impl RendererInstance for D3d11Renderer {
                         self.record_draw_present(|renderer| renderer.present_clear_frame(&frame))?
                     }
                 }
-                RenderFrameData::Nv12 { .. } | RenderFrameData::Nv12Bytes { .. } => {
-                    return Err(RenderError::Message(
-                        "D3D11 renderer does not accept CPU NV12 frame data".to_string(),
-                    ));
+                RenderFrameData::Nv12 { .. }
+                | RenderFrameData::Nv12Bytes { .. }
+                | RenderFrameData::P010 { .. } => {
+                    let started = std::time::Instant::now();
+                    let (y_srv, uv_srv) = self.upload_cpu_planar_frame(&frame)?;
+                    self.last_render_shared_resource_ms =
+                        Some(Self::duration_ms(started.elapsed()));
+                    self.present_planar_srvs(&frame, y_srv, uv_srv)?
                 }
                 #[cfg(windows)]
                 RenderFrameData::D3D11SharedBgra { .. } => {
@@ -1654,6 +2007,181 @@ impl RendererInstance for D3d11Renderer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn planar_upload_rejects_short_overflowing_or_misaligned_planes() {
+        use super::planar_upload_layout;
+        assert!(planar_upload_layout(4, 4, 3, 1, 24).is_err());
+        assert!(planar_upload_layout(4, 4, 8, 1, 47).is_err());
+        assert!(planar_upload_layout(4, 4, 9, 2, 54).is_err());
+        assert!(planar_upload_layout(usize::MAX, 4, 8, 2, 48).is_err());
+        assert!(planar_upload_layout(4, 0, 8, 2, 0).is_err());
+        let layout = planar_upload_layout(3, 3, 4, 1, 20).expect("odd display dimensions");
+        assert_eq!(
+            (layout.chroma_width, layout.chroma_height, layout.uv_offset),
+            (2, 2, 12)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_planar_upload_reuses_texture_and_preserves_p010_words() {
+        use mrd_render::{RenderFrame, RendererInstance};
+        use windows::core::Interface;
+        let mut renderer = super::D3d11Renderer::new().expect("D3D11 device");
+        let input = (0..24u16)
+            .flat_map(|n| (n << 6).to_le_bytes())
+            .collect::<Vec<_>>();
+        renderer
+            .upload_frame(RenderFrame::from_p010(4, 4, input.clone(), 8))
+            .unwrap();
+        let first = renderer.cpu_planar_textures.as_ref().unwrap().y.clone();
+        renderer
+            .upload_frame(RenderFrame::from_p010(4, 4, input.clone(), 8))
+            .unwrap();
+        let cache = renderer.cpu_planar_textures.as_ref().unwrap();
+        assert_eq!(
+            first.as_raw(),
+            cache.y.as_raw(),
+            "reuse stable-size upload textures"
+        );
+        assert_eq!(read_plane(&renderer, &cache.y, 8, 4), input[..32]);
+        assert_eq!(read_plane(&renderer, &cache.uv, 8, 2), input[32..]);
+        renderer
+            .upload_frame(RenderFrame::from_nv12(4, 4, vec![128; 24], 4))
+            .unwrap();
+        assert_eq!(
+            renderer
+                .cpu_planar_textures
+                .as_ref()
+                .unwrap()
+                .bytes_per_sample,
+            1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_adapter_selection_opens_real_texture_and_preserves_content() {
+        use windows::core::{ComInterface, Interface};
+        use windows::Win32::Graphics::{
+            Direct3D11::*,
+            Dxgi::Common::*,
+            Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIResource},
+        };
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+        let producer = super::D3d11Renderer::new_for_adapter(Some(
+            unsafe { factory.EnumAdapters(0) }.unwrap(),
+        ))
+        .unwrap();
+        // Start on a different adapter when this host has one. Single-adapter
+        // hosts still verify actual shared resource contents and cached SRVs.
+        let mut consumer =
+            super::D3d11Renderer::new_for_adapter(unsafe { factory.EnumAdapters(1) }.ok())
+                .or_else(|_| super::D3d11Renderer::new())
+                .unwrap();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 4,
+            Height: 4,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            ..Default::default()
+        };
+        let bytes = (0..16u16)
+            .flat_map(|n| (n << 6).to_le_bytes())
+            .collect::<Vec<_>>();
+        let initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bytes.as_ptr().cast(),
+            SysMemPitch: 8,
+            SysMemSlicePitch: 32,
+        };
+        let mut texture = None;
+        unsafe {
+            producer
+                .device
+                .CreateTexture2D(&desc, Some(&initial), Some(&mut texture))
+        }
+        .unwrap();
+        let texture = texture.unwrap();
+        let resource: IDXGIResource = texture.cast().unwrap();
+        let handle = unsafe { resource.GetSharedHandle() }.unwrap().0;
+        assert_eq!(read_plane(&producer, &texture, 8, 4), bytes);
+        consumer.ensure_shared_adapter(handle).unwrap();
+        let opened = consumer.open_shared_texture(handle).unwrap();
+        assert_eq!(read_plane(&consumer, &opened, 8, 4), bytes);
+        let first = consumer.shared_nv12_srvs(handle, handle).unwrap().0;
+        let cached = consumer.shared_nv12_srvs(handle, handle).unwrap().0;
+        assert_eq!(first.as_raw(), cached.as_raw());
+        assert_eq!(consumer.shared_nv12_srv_cache.len(), 1);
+        assert!(consumer.shared_adapter_selected);
+    }
+
+    #[cfg(windows)]
+    fn read_plane(
+        renderer: &super::D3d11Renderer,
+        texture: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        row_bytes: usize,
+        height: usize,
+    ) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D11::*;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut desc);
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let mut staging = None;
+        unsafe {
+            renderer
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap();
+        }
+        let staging = staging.unwrap();
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            renderer.context.CopyResource(&staging, texture);
+            renderer
+                .context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+        }
+        let mut data = Vec::new();
+        for row in 0..height {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
+                    row_bytes,
+                )
+            };
+            data.extend_from_slice(bytes);
+        }
+        unsafe {
+            renderer.context.Unmap(&staging, 0);
+        }
+        data
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_nv12_fallback_accepts_padded_planes() {
+        use mrd_render::{RenderFrame, RendererInstance};
+        let mut renderer = super::D3d11Renderer::new().expect("D3D11 device");
+        let frame = RenderFrame::from_nv12(4, 4, vec![128; 8 * 6], 8);
+        renderer
+            .upload_frame(frame)
+            .expect("CPU NV12 fallback must be renderable");
+    }
+
     use super::{fit_viewport_rect, D3d11RendererFactory};
     #[cfg(windows)]
     use super::{

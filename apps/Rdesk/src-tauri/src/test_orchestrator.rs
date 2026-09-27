@@ -2630,24 +2630,28 @@ impl TestOrchestrator {
             DecodedFrameData::D3D11SharedNv12 {
                 shared_handle_y,
                 shared_handle_uv,
+                lease,
                 ..
             } => RenderFrame::from_d3d11_shared_nv12(
                 frame.width,
                 frame.height,
                 *shared_handle_y,
                 *shared_handle_uv,
-            ),
+            )
+            .with_gpu_lease(lease.clone()),
             #[cfg(windows)]
             DecodedFrameData::D3D11SharedP010 {
                 shared_handle_y,
                 shared_handle_uv,
+                lease,
                 ..
             } => RenderFrame::from_d3d11_shared_p010(
                 frame.width,
                 frame.height,
                 *shared_handle_y,
                 *shared_handle_uv,
-            ),
+            )
+            .with_gpu_lease(lease.clone()),
         }
     }
 
@@ -4773,6 +4777,27 @@ fn compute_aggregation(samples: &[MetricDataPoint]) -> MetricAggregation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn zero_copy_shared_frame_conversion_retains_gpu_lease_until_render_drop() {
+        for p010 in [false, true] {
+            let owner = Arc::new(());
+            let lease = mrd_pipeline_core::GpuFrameLease::from_arc(owner.clone());
+            let decoded = if p010 {
+                DecodedFrame::from_d3d11_shared_p010(2, 2, 0, 77, 78)
+            } else {
+                DecodedFrame::from_d3d11_shared_nv12(2, 2, 0, 77, 78)
+            }
+            .with_gpu_lease(Some(lease));
+            let rendered = TestOrchestrator::decoded_frame_to_render_frame(&decoded);
+            assert!(rendered.gpu_lease().is_some());
+            drop(decoded);
+            assert!(Arc::strong_count(&owner) > 1);
+            drop(rendered);
+            assert_eq!(Arc::strong_count(&owner), 1);
+        }
+    }
 
     fn test_orchestrator_with_telemetry_store(name: &str) -> TestOrchestrator {
         let root = std::env::temp_dir().join(format!(

@@ -400,31 +400,57 @@ pub(super) fn decoded_frame_to_render_frame(frame: DecodedFrame) -> Result<Rende
                 rgb24,
             ))
         }
-        DecodedFrameData::CpuP010 { .. } => {
-            anyhow::bail!("CPU P010 decoded frames are not supported by the native renderer yet")
+        DecodedFrameData::CpuP010 { data, pitch } => {
+            let row_bytes = frame
+                .width
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("decoded P010 row byte size overflow"))?;
+            let expected_len = frame
+                .height
+                .checked_add(frame.height.div_ceil(2))
+                .and_then(|rows| rows.checked_mul(pitch))
+                .ok_or_else(|| anyhow::anyhow!("decoded P010 byte size overflow"))?;
+            if frame.width == 0
+                || frame.height == 0
+                || pitch < row_bytes
+                || pitch % 2 != 0
+                || data.len() < expected_len
+            {
+                anyhow::bail!("decoded P010 render frame has invalid plane storage");
+            }
+            Ok(RenderFrame::from_p010(
+                frame.width,
+                frame.height,
+                data,
+                pitch,
+            ))
         }
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedNv12 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => Ok(RenderFrame::from_d3d11_shared_nv12(
             frame.width,
             frame.height,
             shared_handle_y,
             shared_handle_uv,
-        )),
+        )
+        .with_gpu_lease(lease)),
         #[cfg(windows)]
         DecodedFrameData::D3D11SharedP010 {
             shared_handle_y,
             shared_handle_uv,
+            lease,
             ..
         } => Ok(RenderFrame::from_d3d11_shared_p010(
             frame.width,
             frame.height,
             shared_handle_y,
             shared_handle_uv,
-        )),
+        )
+        .with_gpu_lease(lease)),
     }
 }
 
@@ -591,5 +617,27 @@ mod tests {
                 pitch: 2
             }
         );
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn p010_render_conversion_preserves_padded_storage_without_copy() {
+        let data = vec![0; 24];
+        let address = data.as_ptr();
+        let frame = DecodedFrame::from_cpu_p010(2, 2, 1, 8, data);
+        let render = decoded_frame_to_render_frame(frame).unwrap();
+        let (data, pitch) = render.as_p010().unwrap();
+        assert_eq!(pitch, 8);
+        assert_eq!(data.as_ptr(), address);
+        assert_eq!(data.len(), 24);
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "macos"))]
+    fn p010_render_conversion_rejects_truncated_or_unaligned_planes() {
+        for (pitch, length) in [(2, 12), (5, 15), (8, 23)] {
+            let frame = DecodedFrame::from_cpu_p010(2, 2, 1, pitch, vec![0; length]);
+            assert!(decoded_frame_to_render_frame(frame).is_err());
+        }
     }
 }
