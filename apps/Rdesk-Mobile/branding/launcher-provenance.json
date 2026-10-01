@@ -1,0 +1,51 @@
+{
+  "source": "branding/launcher-source.png",
+  "source_sha256": "84a76a25267aa92a21178ac511ad725959a4481c721878da22f50224f27a1b53",
+  "status": "B optical-v2 candidate; Android/device and cross-platform release acceptance pending",
+  "source_size_px": [
+    1254,
+    1254
+  ],
+  "source_alpha_bbox_px": [
+    110,
+    85,
+    1147,
+    1150
+  ],
+  "pillow_version": "12.3.0",
+  "resampling": "LANCZOS",
+  "png_compress_level": 9,
+  "adaptive_layer_dp": 108,
+  "adaptive_symbol_max_span_dp": 51,
+  "legacy_canvas_dp": 48,
+  "legacy_symbol_max_span_dp": 34,
+  "background": "#F8FAFC",
+  "monochrome": "white RGB with identical foreground alpha; system applies tint",
+  "outputs": {
+    "drawable-hdpi/ic_launcher_foreground.png": "ad58d24c18e547da929b324031a72e2ee03dfa6b9b1674b401c0061239a8403e",
+    "drawable-hdpi/ic_launcher_monochrome.png": "85112867570e0ccd07725d89dfabdd8ebcc0c1d870d0e549b1d52928ef6420d5",
+    "drawable-mdpi/ic_launcher_foreground.png": "bd297bfe7b132f4eb12e21831cd3319c6fc7a802da2f7265e3d6fcc9604f20a6",
+    "drawable-mdpi/ic_launcher_monochrome.png": "98c854cfe5a42aa003537bad9902d800c6a33061c0faae3ea424c4adf0571cec",
+    "drawable-xhdpi/ic_launcher_foreground.png": "0221f3260621e07c27671c9e9a197f525161ec47765f3b206d97f9a8c0e45b2a",
+    "drawable-xhdpi/ic_launcher_monochrome.png": "404113065c15ff6d6144f972b048c3f931afaeabbd8801317c7098045dfdbba4",
+    "drawable-xxhdpi/ic_launcher_foreground.png": "6ce081975d64c9e0250eab120fb68fb95ece65515a1d3ab7f0fe636d83f9b7b5",
+    "drawable-xxhdpi/ic_launcher_monochrome.png": "72a5417c830a186f3b449539164a4cda245cac3e199fd6829ec7040d734ef6fe",
+    "drawable-xxxhdpi/ic_launcher_foreground.png": "a8ebf1e1eb31a1651b05b5a1dcd60c760855e021711980240f0b719ea2017f53",
+    "drawable-xxxhdpi/ic_launcher_monochrome.png": "0ce62769d528eae43665ba96a99933664019425b68d910d2f0a1ae54601e756d",
+    "mipmap-anydpi-v26/ic_launcher.xml": "32715ff646f6b9fef7c321138e4a14556c4a1f98a87b06070b56f41643dad718",
+    "mipmap-anydpi-v26/ic_launcher_round.xml": "32715ff646f6b9fef7c321138e4a14556c4a1f98a87b06070b56f41643dad718",
+    "mipmap-anydpi-v33/ic_launcher.xml": "bbaf996b7b1356da55819d20c1920c34e20b1288fe7cec441aefeda5ea53d24a",
+    "mipmap-anydpi-v33/ic_launcher_round.xml": "bbaf996b7b1356da55819d20c1920c34e20b1288fe7cec441aefeda5ea53d24a",
+    "mipmap-hdpi/ic_launcher.png": "6c3efe4f1f89047cc1ef1c877e0cc7ad97a2d63aa0825d1f6415f3b66b6fd31a",
+    "mipmap-hdpi/ic_launcher_round.png": "232980574517f2feeef9e72f2405a71f2ebe9b40ff8ee6fcacc9b1c3cc6de44a",
+    "mipmap-mdpi/ic_launcher.png": "b510591c8e44cd34852e0bcf86089ea6fad01bef54e10669573d304988c162e3",
+    "mipmap-mdpi/ic_launcher_round.png": "bca732142b9e03e785aa3bc12dc58ebdedd063776d72a2756f4dcedbbf68d2c8",
+    "mipmap-xhdpi/ic_launcher.png": "9223e143f214c3e14e0209b3e2b68eaa6982cce1746fac89d84afd3e14874533",
+    "mipmap-xhdpi/ic_launcher_round.png": "06a91eff2c6e860e3eb3d9d4c08b02d40dd25bcb8fa20ca106338f3119263889",
+    "mipmap-xxhdpi/ic_launcher.png": "f6ccd7db6522706cc9ef10d34a4754583331d5d8e23f3824e5dd6ba596d9dd4f",
+    "mipmap-xxhdpi/ic_launcher_round.png": "f7fe2d3cac0f84fd1d9e09f6d2ae46a2ec8d50ebd5fd60e223a77b96f0fe35a2",
+    "mipmap-xxxhdpi/ic_launcher.png": "476c7c0c335d5049f036e79999fc0644936273ee2b4f09f01cccafb37c8094fd",
+    "mipmap-xxxhdpi/ic_launcher_round.png": "30df09db32daa0097db8eaa34e521729b2544d1c4c174c4f8ba277a3a1a99adf",
+    "values/launcher_colors.xml": "1c1f0f61d2b01586f6c2d4941fcef417f510711c1ad755bf1a5653d39173613f"
+  }
+}
