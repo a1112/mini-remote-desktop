@@ -953,6 +953,7 @@ fn d3d11_shared_status(probe_mode: CapabilityProbeMode) -> (CapabilityStatus, St
     }
 }
 
+#[cfg(any(windows, test))]
 fn classify_d3d11_shared_probe(result: Result<String, String>) -> (CapabilityStatus, String) {
     match result {
         Ok(evidence) => (
