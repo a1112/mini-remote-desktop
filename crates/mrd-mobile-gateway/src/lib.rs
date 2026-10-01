@@ -15,18 +15,22 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+#[cfg(any(windows, test))]
 use serde::Deserialize;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     env,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
-use tracing::{info, warn};
+#[cfg(windows)]
+use tokio::sync::mpsc;
+use tokio::sync::{broadcast, watch, Mutex};
+use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 
 #[cfg(windows)]
 mod video;
@@ -43,6 +47,7 @@ struct MobileState {
     phone_publisher_active: Arc<Mutex<bool>>,
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DesktopControl {
@@ -321,7 +326,6 @@ async fn desktop_session(mut socket: WebSocket) {
                 "{\"type\":\"error\",\"message\":\"Windows capture is required\"}".into(),
             ))
             .await;
-        return;
     }
     #[cfg(windows)]
     desktop_session_windows(socket, false).await;
@@ -490,6 +494,7 @@ fn encode_desktop_jpeg(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+#[cfg(any(windows, test))]
 fn is_valid_desktop_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 512 && !value.chars().any(|character| character == '\0')
 }
@@ -596,6 +601,36 @@ mod tests {
         assert!(matches!(message, DesktopControl::Text { value } if value == "你好"));
         assert!(is_valid_desktop_text("你好"));
         assert!(!is_valid_desktop_text(&"a".repeat(513)));
+    }
+
+    #[test]
+    fn mobile_gateway_deserializes_desktop_control_fields() {
+        let parse = |text| serde_json::from_str::<DesktopControl>(text).unwrap();
+        assert!(matches!(
+            parse(r#"{"type":"pointer","x":0.25,"y":0.75,"action":"down"}"#),
+            DesktopControl::Pointer { x, y, action }
+                if map_pointer(x, y, 5, 5) == Ok((1, 3)) && action == "down"
+        ));
+        let DesktopControl::Wheel { delta } = parse(r#"{"type":"wheel","delta":-120}"#) else {
+            panic!("expected wheel control");
+        };
+        assert_eq!(delta, -120);
+        let DesktopControl::Key { code, pressed } =
+            parse(r#"{"type":"key","code":65,"pressed":true}"#)
+        else {
+            panic!("expected key control");
+        };
+        assert_eq!(code, 65);
+        assert!(pressed);
+        let DesktopControl::Ping { sent_us } = parse(r#"{"type":"ping","sent_us":123}"#) else {
+            panic!("expected ping control");
+        };
+        assert_eq!(sent_us, 123);
+        assert!(matches!(
+            parse(r#"{"type":"request_keyframe"}"#),
+            DesktopControl::RequestKeyframe
+        ));
+        assert!(matches!(parse(r#"{"type":"stop"}"#), DesktopControl::Stop));
     }
 
     #[test]
