@@ -11,7 +11,20 @@ import threading
 
 
 EXPECTED_SERVICE = "realtime-server"
-EXPECTED_PROTOCOL_VERSION = 1
+# Registration/migration uses v2; initial session negotiation uses v3.
+REQUIRED_PROTOCOL_VERSIONS = frozenset({2, 3})
+
+
+def _supports_required_protocols(payload: dict[str, object]) -> bool:
+    primary = payload.get("protocol_version")
+    supported = payload.get("supported_protocol_versions")
+    return (
+        type(primary) is int
+        and isinstance(supported, list)
+        and all(type(version) is int for version in supported)
+        and primary in supported
+        and REQUIRED_PROTOCOL_VERSIONS.issubset(supported)
+    )
 
 
 class ProcessHandle(Protocol):
@@ -69,7 +82,7 @@ class RealtimeSidecarManager:
                         isinstance(payload, dict)
                         and payload.get("status") == "ok"
                         and payload.get("service") == EXPECTED_SERVICE
-                        and payload.get("protocol_version") == EXPECTED_PROTOCOL_VERSION
+                        and _supports_required_protocols(payload)
                     ):
                         reachable = True
                         health_status = "ok"

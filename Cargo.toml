@@ -44,6 +44,7 @@ members = [
   "crates/mrd-buffer-pool",
   "crates/mrd-hardware",
   "crates/mrd-identity",
+  "crates/mrd-device-registration",
   "crates/mrd-quality-gate",
   "crates/mrd-file-transfer",
   "crates/mrd-relay-control",

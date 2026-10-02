@@ -21,6 +21,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ring.workspace = true
+base64 = "0.22"
+serde_json.workspace = true
+zeroize.workspace = true
 
 [[bin]]
 name = "realtime-server"

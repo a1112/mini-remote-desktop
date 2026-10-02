@@ -31,6 +31,7 @@ use app_settings::{
     default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
 };
 use device_info::HardwareInfo;
+use mrd_device_registration::{DeviceRegistrationRequest, DeviceRegistrationResponse};
 use mrd_pipeline_core::VideoCodec;
 use mrd_proto::SessionId;
 use remote_display_surface::{
@@ -42,7 +43,6 @@ use render_window_registry::{
 };
 use resource_monitor::{ResourceMonitor, SystemResourceSnapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -121,14 +121,6 @@ struct AppState {
     render_proxy: std::sync::Arc<render_proxy::RenderProxyRegistry>,
     // Local browser WebRTC preview host for the remote display window Web mode.
     webrtc_host: std::sync::Arc<tokio::sync::Mutex<webrtc_host::WebrtcHost>>,
-}
-
-/// 设备注册响应
-#[derive(Debug, Serialize, Deserialize)]
-struct DeviceRegistrationResponse {
-    device_id: String,
-    device_name: String,
-    access_token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3253,55 +3245,33 @@ async fn register_device(
     hostname: String,
     os_version: String,
     device_name: Option<String>,
+    enrollment_token: Option<String>,
+    device_token: Option<String>,
+    api_base: Option<String>,
+    cpu_info: Option<String>,
+    total_memory_mb: Option<u64>,
+    gpu_info: Option<String>,
 ) -> Result<DeviceRegistrationResponse, String> {
-    // 构建注册请求
-    let client = reqwest::Client::new();
-    let mut payload = HashMap::new();
-    payload.insert("motherboard_serial", motherboard_serial);
-    payload.insert("hostname", hostname);
-    payload.insert("os_version", os_version);
-
-    if let Some(name) = device_name {
-        payload.insert("device_name", name);
-    }
-
-    // 调用后端 API
-    let response = client
-        .post("http://127.0.0.1:9530/api/v1/devices/register")
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("连接服务器失败: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "未知错误".to_string());
-        return Err(format!("注册失败 ({}): {}", status, error_text));
-    }
-
-    response
-        .json::<DeviceRegistrationResponse>()
-        .await
-        .map_err(|e| format!("解析响应失败: {}", e))
-}
-
-/// Tauri 命令：检查设备是否已注册
-#[tauri::command]
-async fn check_device_registration(motherboard_serial: String) -> Result<bool, String> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!(
-            "http://127.0.0.1:9530/api/v1/devices/check/{}",
-            motherboard_serial
-        ))
-        .send()
-        .await
-        .map_err(|e| format!("连接服务器失败: {}", e))?;
-
-    Ok(response.status().is_success())
+    let api_base = std::env::var("RDESK_SERVER_URL")
+        .ok()
+        .or(api_base)
+        .unwrap_or_else(|| "http://127.0.0.1:9530/api/v1".to_owned());
+    mrd_device_registration::register_device(
+        &api_base,
+        &DeviceRegistrationRequest {
+            motherboard_serial,
+            hostname,
+            os_version,
+            device_name,
+            cpu_info,
+            total_memory_mb,
+            gpu_info,
+        },
+        enrollment_token.as_deref(),
+        device_token.as_deref(),
+    )
+    .await
+    .map_err(str::to_owned)
 }
 
 fn parse_decode_policy(value: &str) -> Result<DecodePolicy, String> {
@@ -4774,7 +4744,6 @@ fn main() {
             ipc_start_receiver,
             // Legacy commands
             register_device,
-            check_device_registration,
             webrtc_session_list_via_ipc,
             // Shell / Lifecycle commands (Phase 2-6: service owns lifecycle)
             shell_ui_attached,

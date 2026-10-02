@@ -1,9 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIpcRegisterDevice = vi.hoisted(() => vi.fn());
+const mockRegisterDevice = vi.hoisted(() => vi.fn());
 
 vi.mock("../adapters/tauri", () => ({
   ipcRegisterDevice: mockIpcRegisterDevice,
+  registerDevice: mockRegisterDevice,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -31,11 +33,131 @@ describe("deviceService", () => {
     localStorage.clear();
     mockIpcRegisterDevice.mockReset();
     mockIpcRegisterDevice.mockResolvedValue({ ok: true, value: "registered" });
+    mockRegisterDevice.mockReset();
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
     (window as any).__TAURI__ = {
       invoke: vi.fn().mockResolvedValue(hardwareInfo),
     };
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  const serverInfo = {
+    device_id: "123456789",
+    device_name: "My server device",
+    access_token: "device-token",
+    motherboard_serial: hardwareInfo.motherboard_serial,
+    registered_at: "2026-05-03T00:00:00.000Z",
+  };
+
+  it("refreshes stored server devices with device authorization instead of a serial lookup", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: { ...serverInfo, access_token: "renewed-token" } });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    const info = await deviceService.initialize();
+
+    expect(mockRegisterDevice).toHaveBeenCalledWith(expect.objectContaining({
+      motherboardSerial: hardwareInfo.motherboard_serial,
+      deviceToken: "device-token",
+    }));
+    expect(info?.access_token).toBe("renewed-token");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves server identity and credentials when authenticated refresh is unavailable", async () => {
+    vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(true);
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: false, error: { message: "连接服务器失败，请稍后重试" } });
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+
+    const info = await deviceService.initialize();
+
+    expect(info).toEqual(serverInfo);
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!)).toEqual(serverInfo);
+  });
+
+  it("does not report LAN registration as success when server enrollment is required", async () => {
+    vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(true);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("unauthorized", { status: 401 }));
+
+    expect(await deviceService.initialize()).toBeNull();
+    expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+    expect(mockRegisterDevice).not.toHaveBeenCalled();
+  });
+
+  it("enrolls explicitly and stores only the returned device credentials", async () => {
+    const enrollmentToken = "a".repeat(43);
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: serverInfo });
+
+    const info = await (deviceService as any).enroll(enrollmentToken, "Office PC");
+
+    expect(info.device_id).toBe(serverInfo.device_id);
+    expect(mockRegisterDevice).toHaveBeenCalledWith(expect.objectContaining({
+      enrollmentToken,
+      deviceName: "Office PC",
+      cpuInfo: JSON.stringify(hardwareInfo.cpu_info),
+      totalMemoryMb: hardwareInfo.total_memory_mb,
+      gpuInfo: JSON.stringify(hardwareInfo.gpu_info),
+    }));
+    expect(localStorage.getItem("rdesk_device_info")).not.toContain(enrollmentToken);
+    expect(mockIpcRegisterDevice).toHaveBeenCalledWith(serverInfo.device_id, serverInfo.device_name);
+  });
+
+  it("recovers an expired server credential through authenticated refresh without enrollment", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: { ...serverInfo, access_token: "refreshed-token" } });
+    const info = await (deviceService as any).recoverDeviceCredential("admin.rotated.token");
+    expect(mockRegisterDevice).toHaveBeenCalledWith(expect.objectContaining({ deviceToken: "admin.rotated.token" }));
+    expect(mockRegisterDevice.mock.calls[0]?.[0]?.enrollmentToken).toBeUndefined();
+    expect(info.device_id).toBe(serverInfo.device_id);
+    expect(info.access_token).toBe("refreshed-token");
+  });
+
+  it("waits for pending LAN initialization before persisting a server enrollment", async () => {
+    let resolveHardware!: (value: typeof hardwareInfo) => void;
+    (window.__TAURI__!.invoke as any).mockImplementationOnce(() => new Promise((resolve) => { resolveHardware = resolve; }));
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: serverInfo });
+    const initializing = deviceService.initialize();
+    const enrolling = deviceService.enroll("a".repeat(43));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mockRegisterDevice).not.toHaveBeenCalled();
+    resolveHardware(hardwareInfo);
+    await Promise.all([initializing, enrolling]);
+    expect(deviceService.getDeviceId()).toBe(serverInfo.device_id);
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!).access_token).toBe(serverInfo.access_token);
+  });
+
+  it("rejects a recovered credential that would replace an existing server identity", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: { ...serverInfo, device_id: "another-device" } });
+    await expect((deviceService as any).recoverDeviceCredential("admin.rotated.token")).rejects.toThrow("设备身份不匹配");
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!)).toEqual(serverInfo);
+  });
+
+  it("preserves the old server credential when credential recovery is rejected", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: false, error: { message: "设备凭据已失效，请向管理员申请更新设备凭据" } });
+    await expect(deviceService.recoverDeviceCredential("expired.device.token")).rejects.toThrow("更新设备凭据");
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!)).toEqual(serverInfo);
+  });
+
+  it("upgrades a local LAN identity using its administrator-issued server credential", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify({ ...serverInfo, device_id: "lan-local", access_token: "local-p2p" }));
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: serverInfo });
+    expect((await deviceService.recoverDeviceCredential("admin.rotated.token")).device_id).toBe(serverInfo.device_id);
+  });
+
+  it("keeps server credentials during an unsuccessful explicit retry", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(true);
+    mockRegisterDevice.mockResolvedValue({ ok: false, error: { message: "设备认证已失效，请重新登记" } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("forbidden", { status: 403 }));
+
+    await deviceService.reregister();
+
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!)).toEqual(serverInfo);
   });
 
   it("refreshes a stale local-only display name from the Tauri computer hostname", async () => {

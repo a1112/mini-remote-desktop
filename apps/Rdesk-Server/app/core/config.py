@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     jwt_future_iat_skew_seconds: int = 60
     device_jwt_audience: str = ""
     device_jwt_expire_minutes: int = 60
+    signaling_jwt_audience: str = "rdesk-signaling"
+    signaling_jwt_ttl_seconds: int = 3600
     device_enrollment_token_pepper: SecretStr = SecretStr("")
     device_serial_pepper: SecretStr = SecretStr("")
     device_enrollment_ttl_seconds: int = 300

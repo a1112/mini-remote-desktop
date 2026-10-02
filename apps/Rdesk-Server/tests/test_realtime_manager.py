@@ -1,3 +1,4 @@
+import json
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -5,6 +6,18 @@ from threading import Barrier, BrokenBarrierError, Lock
 from unittest.mock import MagicMock, patch
 
 from app.services.realtime_manager import RealtimeSidecarManager
+
+
+REALTIME_HEALTH_PAYLOAD = (
+    Path(__file__).resolve().parents[2]
+    / "realtime-server/tests/fixtures/health.json"
+).read_bytes()
+
+
+def _health_payload(**overrides: object) -> bytes:
+    payload = json.loads(REALTIME_HEALTH_PAYLOAD)
+    payload.update(overrides)
+    return json.dumps(payload).encode("utf-8")
 
 
 def _health_response(payload: bytes) -> MagicMock:
@@ -25,20 +38,29 @@ class RealtimeManagerTests(unittest.TestCase):
         )
 
     @patch("app.services.realtime_manager.urlopen")
-    def test_accepts_expected_service_and_protocol(self, urlopen: MagicMock) -> None:
-        urlopen.return_value = _health_response(
-            b'{"status":"ok","service":"realtime-server","protocol_version":1}'
-        )
+    def test_accepts_health_payload_emitted_by_realtime_server(
+        self, urlopen: MagicMock
+    ) -> None:
+        urlopen.return_value = _health_response(REALTIME_HEALTH_PAYLOAD)
         status = self.manager().status()
         self.assertTrue(status.reachable)
         self.assertEqual(status.status, "ok")
+
+    @patch("app.services.realtime_manager.urlopen")
+    def test_accepts_newer_primary_version_with_required_protocols(
+        self, urlopen: MagicMock
+    ) -> None:
+        urlopen.return_value = _health_response(
+            _health_payload(protocol_version=4, supported_protocol_versions=[2, 3, 4])
+        )
+        self.assertTrue(self.manager().status().reachable)
 
     @patch("app.services.realtime_manager.urlopen")
     def test_rejects_health_response_from_wrong_local_service(
         self, urlopen: MagicMock
     ) -> None:
         urlopen.return_value = _health_response(
-            b'{"status":"ok","service":"mrd-service","protocol_version":1}'
+            _health_payload(service="mrd-service")
         )
         status = self.manager().status()
         self.assertFalse(status.reachable)
@@ -46,12 +68,31 @@ class RealtimeManagerTests(unittest.TestCase):
 
     @patch("app.services.realtime_manager.urlopen")
     def test_rejects_incompatible_protocol_version(self, urlopen: MagicMock) -> None:
+        for overrides in [
+            {"protocol_version": 1, "supported_protocol_versions": [1]},
+            {"protocol_version": 2, "supported_protocol_versions": [2]},
+            {"protocol_version": 3, "supported_protocol_versions": [3]},
+            {"protocol_version": 4, "supported_protocol_versions": [2, 3]},
+            {"protocol_version": True, "supported_protocol_versions": [True, 2, 3]},
+            {"supported_protocol_versions": ["2", "3"]},
+            {"supported_protocol_versions": [2, 3, True]},
+            {"supported_protocol_versions": "2,3"},
+            {"supported_protocol_versions": None},
+        ]:
+            with self.subTest(overrides=overrides):
+                urlopen.return_value = _health_response(_health_payload(**overrides))
+                status = self.manager().status()
+                self.assertFalse(status.reachable)
+                self.assertEqual(status.status, "unexpected-service")
+
+    @patch("app.services.realtime_manager.urlopen")
+    def test_rejects_health_without_advertised_protocols(
+        self, urlopen: MagicMock
+    ) -> None:
         urlopen.return_value = _health_response(
-            b'{"status":"ok","service":"realtime-server","protocol_version":2}'
+            b'{"status":"ok","service":"realtime-server","protocol_version":3}'
         )
-        status = self.manager().status()
-        self.assertFalse(status.reachable)
-        self.assertEqual(status.status, "unexpected-service")
+        self.assertFalse(self.manager().status().reachable)
 
     @patch("app.services.realtime_manager.urlopen")
     def test_rejects_non_object_health_payload(self, urlopen: MagicMock) -> None:
@@ -64,9 +105,7 @@ class RealtimeManagerTests(unittest.TestCase):
     def test_concurrent_starts_spawn_at_most_one_process(
         self, urlopen: MagicMock
     ) -> None:
-        urlopen.return_value = _health_response(
-            b'{"status":"ok","service":"realtime-server","protocol_version":1}'
-        )
+        urlopen.return_value = _health_response(REALTIME_HEALTH_PAYLOAD)
         rendezvous = Barrier(2)
         calls: list[object] = []
         calls_lock = Lock()

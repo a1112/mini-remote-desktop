@@ -1,10 +1,21 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from app.core.security import get_current_user_optional
+from app.core.security import get_current_user_optional, get_current_device
+from app.models.device import Device
 from app.models.user import User
+from app.schemas.realtime import SignalingCredentialRequest, SignalingCredentialResponse
 from app.services.realtime_manager import RealtimeSidecarManager
+from app.services.signaling_credentials import issue_signaling_credential
 
 router = APIRouter(prefix="/realtime", tags=["realtime"])
+
+
+@router.post("/device-credentials", response_model=SignalingCredentialResponse)
+async def signaling_device_credentials(
+    payload: SignalingCredentialRequest,
+    current_device: Device = Depends(get_current_device),
+) -> SignalingCredentialResponse:
+    return issue_signaling_credential(current_device, payload)
 
 
 def _manager(request: Request) -> RealtimeSidecarManager:

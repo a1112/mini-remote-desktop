@@ -2,14 +2,12 @@ import { useState, useEffect } from "react";
 import {
   X,
   Monitor,
-  Cpu,
-  HardDrive,
-  MemoryStick,
   CheckCircle,
   AlertCircle,
   Loader2,
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
+import { deviceService } from "../services/deviceService";
 
 interface HardwareInfo {
   motherboard_serial: string;
@@ -51,12 +49,22 @@ export function DeviceRegisterModal({
   const [step, setStep] = useState<"loading" | "register" | "success">("loading");
   const [hardwareInfo, setHardwareInfo] = useState<HardwareInfo | null>(null);
   const [deviceName, setDeviceName] = useState("");
+  const [enrollmentToken, setEnrollmentToken] = useState("");
+  const [credentialMode, setCredentialMode] = useState<"enroll" | "recover">("enroll");
+  const validCredential = credentialMode === "enroll"
+    ? /^[A-Za-z0-9_-]{43}$/.test(enrollmentToken.trim())
+    : /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(enrollmentToken.trim());
   const [error, setError] = useState<string | null>(null);
   const [registering, setRegistering] = useState(false);
   const [result, setResult] = useState<DeviceRegisterResponse | null>(null);
 
   // 获取硬件信息
   useEffect(() => {
+    setEnrollmentToken("");
+    setCredentialMode("enroll");
+    setError(null);
+    setResult(null);
+    setStep("loading");
     if (isOpen) {
       fetchHardwareInfo();
     }
@@ -79,20 +87,16 @@ export function DeviceRegisterModal({
   };
 
   const handleRegister = async () => {
-    if (!hardwareInfo) return;
+    if (!hardwareInfo || !validCredential) return;
 
     setRegistering(true);
     setError(null);
 
     try {
-      if (!window.__TAURI__) throw new Error("仅桌面客户端可以注册设备");
-      const response = await window.__TAURI__.invoke<DeviceRegisterResponse>("register_device", {
-          motherboard_serial: hardwareInfo.motherboard_serial,
-          hostname: hardwareInfo.hostname,
-          os_version: hardwareInfo.os_version,
-          deviceName: deviceName || hardwareInfo.hostname,
-        });
-
+      const response = credentialMode === "enroll"
+        ? await deviceService.enroll(enrollmentToken.trim(), deviceName || hardwareInfo.hostname)
+        : await deviceService.recoverDeviceCredential(enrollmentToken.trim());
+      setEnrollmentToken("");
       setResult(response);
       setStep("success");
 
@@ -110,6 +114,7 @@ export function DeviceRegisterModal({
     setStep("loading");
     setHardwareInfo(null);
     setDeviceName("");
+    setEnrollmentToken("");
     setError(null);
     setResult(null);
     onClose();
@@ -232,6 +237,27 @@ export function DeviceRegisterModal({
                 />
               </div>
 
+              <div>
+                <div className={`flex gap-4 mb-4 text-sm ${textPrimary}`}>
+                  <label><input type="radio" name="device-credential-mode" checked={credentialMode === "enroll"} onChange={() => { setCredentialMode("enroll"); setEnrollmentToken(""); }} /> 登记新设备</label>
+                  <label><input type="radio" name="device-credential-mode" checked={credentialMode === "recover"} onChange={() => { setCredentialMode("recover"); setEnrollmentToken(""); }} /> 更新设备凭据</label>
+                </div>
+                <label htmlFor="device-enrollment-token" className={`block text-sm font-medium mb-2 ${textPrimary}`}>
+                  {credentialMode === "enroll" ? "设备登记码" : "新设备凭据"}
+                </label>
+                <input
+                  id="device-enrollment-token"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={enrollmentToken}
+                  onChange={(e) => setEnrollmentToken(e.target.value)}
+                  placeholder={credentialMode === "enroll" ? "输入管理员提供的一次性登记码" : "输入管理员换发的新设备凭据"}
+                  className={`w-full px-4 py-3 rounded-lg border ${inputBg} focus:outline-none focus:ring-2 focus:ring-blue-500`}
+                />
+                <p className={`mt-2 text-sm ${textSecondary}`}>{credentialMode === "enroll" ? "请向服务器管理员获取 43 位登记码，登记成功后即失效。" : "设备已登记但凭据过期时，请向管理员申请换发凭据，更新后保留原设备码。"}</p>
+              </div>
+
               {/* Error Message */}
               {error && (
                 <div className={`flex items-start gap-3 p-4 rounded-lg ${
@@ -245,9 +271,9 @@ export function DeviceRegisterModal({
               {/* Register Button */}
               <button
                 onClick={handleRegister}
-                disabled={registering || !deviceName.trim()}
+                disabled={registering || !deviceName.trim() || !validCredential}
                 className={`w-full py-3 rounded-lg font-medium transition-colors ${
-                  registering || !deviceName.trim()
+                  registering || !deviceName.trim() || !validCredential
                     ? buttonDisabled
                     : buttonPrimary
                 }`}
@@ -258,7 +284,7 @@ export function DeviceRegisterModal({
                     注册中...
                   </span>
                 ) : (
-                  "注册设备"
+                  credentialMode === "enroll" ? "注册设备" : "更新设备凭据"
                 )}
               </button>
             </div>

@@ -1,6 +1,7 @@
 //! Service-owned authenticated realtime signaling runtime.
 
 mod config;
+mod credentials;
 mod event_mapper;
 mod runtime;
 

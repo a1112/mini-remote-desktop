@@ -21,6 +21,7 @@ base64 = "0.22"
 bytes = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mrd-proto = { path = "../../../crates/mrd-proto" }
+mrd-device-registration = { path = "../../../crates/mrd-device-registration" }
 mrd-session = { path = "../../../crates/mrd-session" }
 mrd-ipc = { path = "../../../crates/mrd-ipc" }
 mrd-pipeline-core = { path = "../../../crates/mrd-pipeline-core" }

@@ -7,6 +7,8 @@ import { HomePage } from "./HomePage";
 const mocks = vi.hoisted(() => ({
   launchRemoteDisplayForDevice: vi.fn(),
   navigate: vi.fn(),
+  enrollmentRequired: false,
+  refreshRegistration: vi.fn(),
 }));
 
 vi.mock("react-router", () => ({
@@ -22,7 +24,14 @@ vi.mock("../services/deviceService", () => ({
   useDeviceRegistration: () => ({
     deviceId: "local-device",
     deviceName: "Local PC",
+    registrationError: mocks.enrollmentRequired ? "需要设备登记码，请向服务器管理员获取一次性登记码后注册" : null,
+    refresh: mocks.refreshRegistration,
   }),
+}));
+
+vi.mock("./DeviceRegisterModal", () => ({
+  DeviceRegisterModal: ({ isOpen, onSuccess }: { isOpen: boolean; onSuccess: () => void }) =>
+    isOpen ? <button onClick={() => onSuccess()}>提交设备登记码</button> : null,
 }));
 
 vi.mock("../services/remoteDisplayLauncher", () => ({
@@ -49,11 +58,22 @@ vi.mock("../services/connectionHistoryService", () => ({
 describe("HomePage secure remote launch", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.enrollmentRequired = false;
     mocks.launchRemoteDisplayForDevice.mockResolvedValue({
       sessionId: "secure-session",
       windowLabel: null,
       mode: "route",
     });
+  });
+
+  it("offers reachable server enrollment and refreshes the displayed identity after success", async () => {
+    mocks.enrollmentRequired = true;
+    const user = userEvent.setup();
+    render(<HomePage />);
+    expect(screen.getByText(/需要设备登记码/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "登记到服务器" }));
+    await user.click(screen.getByRole("button", { name: "提交设备登记码" }));
+    expect(mocks.refreshRegistration).toHaveBeenCalled();
   });
 
   it("requests an authenticated Auto session for a known recent device", async () => {

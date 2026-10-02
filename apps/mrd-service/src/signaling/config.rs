@@ -16,6 +16,7 @@ pub struct SignalingConfig {
     device_name: String,
     role: BackendRole,
     backend_device_token: Zeroizing<String>,
+    credential_endpoint: Option<Url>,
     server_device_id: DeviceId,
     trusted_server_key_id: Option<String>,
     connect_timeout: Duration,
@@ -32,6 +33,7 @@ impl fmt::Debug for SignalingConfig {
             .field("device_name", &self.device_name)
             .field("role", &self.role)
             .field("backend_device_token", &"REDACTED")
+            .field("credential_exchange", &self.credential_endpoint.is_some())
             .field("server_device_id", &self.server_device_id)
             .field("trusted_server_key_id", &self.trusted_server_key_id)
             .field("connect_timeout", &self.connect_timeout)
@@ -93,6 +95,7 @@ impl SignalingConfig {
             device_name: device_name.to_owned(),
             role,
             backend_device_token: Zeroizing::new(backend_device_token.to_owned()),
+            credential_endpoint: None,
             server_device_id,
             trusted_server_key_id: trusted_server_key_id.map(|key| key.to_ascii_lowercase()),
             connect_timeout,
@@ -109,7 +112,7 @@ impl SignalingConfig {
         let Some(endpoint) = env_optional("MRD_SIGNAL_URL") else {
             return Ok(None);
         };
-        let mut token = env_required("MRD_SIGNAL_DEVICE_TOKEN")?;
+        let token = Zeroizing::new(env_required("MRD_SIGNAL_DEVICE_TOKEN")?);
         let server_device_id = DeviceId(
             env_optional("MRD_SIGNAL_SERVER_DEVICE_ID").unwrap_or_else(|| "signal-server".into()),
         );
@@ -141,7 +144,7 @@ impl SignalingConfig {
             100,
             300_000,
         )?;
-        let result = Self::new(
+        let mut config = Self::new(
             &endpoint,
             device_id,
             device_name,
@@ -152,10 +155,44 @@ impl SignalingConfig {
             connect_timeout,
             initial_reconnect,
             max_reconnect,
-        )
-        .map(Some);
-        token.zeroize();
-        result
+        )?;
+        if let Some(endpoint) = env_optional("MRD_SIGNAL_AUTH_URL") {
+            config = config.with_credential_endpoint(&endpoint)?;
+        } else if let Some(base_url) = env_optional("MRD_WAN_SESSION_API_URL") {
+            config = config.with_backend_api_url(&base_url)?;
+        }
+        Ok(Some(config))
+    }
+
+    /// Exchange the configured device JWT for a credential bound to this connection's
+    /// machine key and role. Without this option, explicit constructors accept an
+    /// already issued signaling credential for tests and managed provisioning.
+    pub fn with_credential_endpoint(
+        mut self,
+        endpoint: &str,
+    ) -> Result<Self, SignalingConfigError> {
+        let endpoint = Url::parse(endpoint).map_err(|_| SignalingConfigError::InvalidEndpoint)?;
+        validate_credential_endpoint(&endpoint)?;
+        self.credential_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
+    /// Derive the credential route from the same API root used by WAN sessions,
+    /// for example `https://api.example/api/v1`.
+    pub fn with_backend_api_url(self, base_url: &str) -> Result<Self, SignalingConfigError> {
+        let mut base = Url::parse(base_url).map_err(|_| SignalingConfigError::InvalidEndpoint)?;
+        validate_credential_endpoint(&base)?;
+        if !base.path().ends_with('/') {
+            base.set_path(&format!("{}/", base.path()));
+        }
+        let endpoint = base
+            .join("realtime/device-credentials")
+            .map_err(|_| SignalingConfigError::InvalidEndpoint)?;
+        self.with_credential_endpoint(endpoint.as_str())
+    }
+
+    pub(crate) fn credential_endpoint(&self) -> Option<&Url> {
+        self.credential_endpoint.as_ref()
     }
 
     pub(crate) fn endpoint(&self) -> &Url {
@@ -216,6 +253,24 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), SignalingConfigError> {
     }
 }
 
+fn validate_credential_endpoint(endpoint: &Url) -> Result<(), SignalingConfigError> {
+    if endpoint.as_str().len() > 2_048
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(SignalingConfigError::InvalidEndpoint);
+    }
+    match endpoint.scheme() {
+        "https" => Ok(()),
+        "http" if endpoint.host_str().is_some_and(is_loopback_host) => Ok(()),
+        "http" => Err(SignalingConfigError::InsecureEndpoint),
+        _ => Err(SignalingConfigError::InvalidEndpoint),
+    }
+}
+
 fn is_loopback_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost")
         || host == "127.0.0.1"
@@ -258,7 +313,7 @@ pub enum SignalingConfigError {
     Missing(&'static str),
     #[error("signaling endpoint is invalid")]
     InvalidEndpoint,
-    #[error("unencrypted signaling is allowed only on loopback")]
+    #[error("unencrypted signaling or credential exchange is allowed only on loopback")]
     InsecureEndpoint,
     #[error("signaling role is invalid")]
     InvalidRole,
@@ -266,4 +321,96 @@ pub enum SignalingConfigError {
     InvalidValue,
     #[error("signaling environment variable is invalid: {0}")]
     InvalidEnvironment(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    struct RestoreEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl RestoreEnvironment {
+        fn save(names: &[&'static str]) -> Self {
+            Self(
+                names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn environment_rejects_unsafe_credential_endpoints() {
+        let _guard = ENVIRONMENT.lock().unwrap();
+        let names = [
+            "MRD_SIGNAL_URL",
+            "MRD_SIGNAL_DEVICE_TOKEN",
+            "MRD_SIGNAL_AUTH_URL",
+        ];
+        let _restore = RestoreEnvironment::save(&names);
+        std::env::set_var("MRD_SIGNAL_URL", "wss://signal.example/ws");
+        std::env::set_var("MRD_SIGNAL_DEVICE_TOKEN", "device-token");
+        for endpoint in [
+            "http://api.example/api/v1/realtime/device-credentials",
+            "https://api.example/api/v1/realtime/device-credentials?token=secret",
+            "https://user:secret@api.example/api/v1/realtime/device-credentials",
+        ] {
+            std::env::set_var("MRD_SIGNAL_AUTH_URL", endpoint);
+            let result = SignalingConfig::from_env(DeviceId("device-1".into()), "Workstation");
+            assert!(result.is_err(), "unsafe credential URL must fail closed");
+        }
+    }
+
+    #[test]
+    fn environment_derives_credential_endpoint_and_honors_explicit_override() {
+        let _guard = ENVIRONMENT.lock().unwrap();
+        let names = [
+            "MRD_SIGNAL_URL",
+            "MRD_SIGNAL_DEVICE_TOKEN",
+            "MRD_SIGNAL_AUTH_URL",
+            "MRD_WAN_SESSION_API_URL",
+        ];
+        let _restore = RestoreEnvironment::save(&names);
+        std::env::set_var("MRD_SIGNAL_URL", "wss://signal.example/ws");
+        std::env::set_var("MRD_SIGNAL_DEVICE_TOKEN", "device-token");
+        std::env::remove_var("MRD_SIGNAL_AUTH_URL");
+        for root in ["https://api.example/api/v1", "https://api.example/api/v1/"] {
+            std::env::set_var("MRD_WAN_SESSION_API_URL", root);
+            let config = SignalingConfig::from_env(DeviceId("device-1".into()), "Workstation")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                config.credential_endpoint().unwrap().as_str(),
+                "https://api.example/api/v1/realtime/device-credentials"
+            );
+            assert!(!format!("{config:?}").contains("api.example"));
+            assert!(!format!("{config:?}").contains("device-token"));
+        }
+        std::env::set_var(
+            "MRD_SIGNAL_AUTH_URL",
+            "http://127.0.0.1:9530/custom/credentials",
+        );
+        let config = SignalingConfig::from_env(DeviceId("device-1".into()), "Workstation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            config.credential_endpoint().unwrap().as_str(),
+            "http://127.0.0.1:9530/custom/credentials"
+        );
+    }
 }

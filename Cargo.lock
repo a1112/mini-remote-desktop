@@ -114,6 +114,7 @@ dependencies = [
  "mrd-codec-videotoolbox",
  "mrd-decode",
  "mrd-decode-nvdec",
+ "mrd-device-registration",
  "mrd-encode-nvenc",
  "mrd-encode-nvenc-av1",
  "mrd-encode-openh264",
@@ -3322,6 +3323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mrd-device-registration"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "mrd-encode-nvenc"
 version = "0.1.0"
 dependencies = [
@@ -4981,6 +4991,7 @@ name = "realtime-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "futures-util",
  "mrd-identity",
  "mrd-proto",
@@ -4988,10 +4999,12 @@ dependencies = [
  "mrd-signal-proto",
  "ring",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

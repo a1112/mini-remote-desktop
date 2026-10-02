@@ -1097,6 +1097,8 @@ describe('Tauri Adapter Contract', () => {
         motherboardSerial: 'sn-123',
         hostname: 'my-pc',
         osVersion: 'Windows 11',
+        enrollmentToken: 'a'.repeat(43),
+        apiBase: 'https://example.com/api/v1',
       });
 
       expect(mockInvoke).toHaveBeenCalledWith('register_device', {
@@ -1104,19 +1106,15 @@ describe('Tauri Adapter Contract', () => {
         hostname: 'my-pc',
         osVersion: 'Windows 11',
         deviceName: undefined,
+        enrollmentToken: 'a'.repeat(43),
+        deviceToken: undefined,
+        cpuInfo: undefined,
+        totalMemoryMb: undefined,
+        gpuInfo: undefined,
+        apiBase: 'https://example.com/api/v1',
       });
     });
 
-    it('check_device_registration calls correct command with args', async () => {
-      const mockInvoke = getMockInvoke();
-      mockInvoke.mockResolvedValue(true);
-
-      await adapter.checkDeviceRegistration('sn-123');
-
-      expect(mockInvoke).toHaveBeenCalledWith('check_device_registration', {
-        motherboardSerial: 'sn-123',
-      });
-    });
   });
 
   /**

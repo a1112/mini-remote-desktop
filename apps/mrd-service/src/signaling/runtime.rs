@@ -1105,6 +1105,16 @@ impl SignalingRuntimeCore {
         challenge: ServerChallenge,
         now_ms: u64,
     ) -> Result<SignalEnvelope, SignalingRuntimeError> {
+        let token = zeroize::Zeroizing::new(self.config.backend_device_token().to_owned());
+        self.build_registration_with_token(challenge, now_ms, &token)
+    }
+
+    fn build_registration_with_token(
+        &mut self,
+        challenge: ServerChallenge,
+        now_ms: u64,
+        credential: &str,
+    ) -> Result<SignalEnvelope, SignalingRuntimeError> {
         if now_ms < challenge.issued_at_ms
             || now_ms >= challenge.expires_at_ms
             || challenge
@@ -1120,7 +1130,7 @@ impl SignalingRuntimeCore {
             claims: self.next_claims(self.config.server_device_id().clone(), now_ms)?,
             role: self.config.role(),
             device_name: self.config.device_name().to_owned(),
-            backend_device_token: self.config.backend_device_token().to_owned(),
+            backend_device_token: credential.to_owned(),
             challenge_id: challenge.challenge_id,
             challenge_nonce: challenge.challenge_nonce,
         };
@@ -1944,6 +1954,13 @@ async fn run_connection(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
+    let credential = tokio::select! {
+        _ = &mut *shutdown => return ConnectionExit::Shutdown,
+        result = super::credentials::acquire_credential(core.config(), &core.identity) => match result {
+            Ok(credential) => credential,
+            Err(error) => return ConnectionExit::Failed(error),
+        },
+    };
     let endpoint = core.config().endpoint().as_str().to_owned();
     let connected = tokio::select! {
         _ = &mut *shutdown => return ConnectionExit::Shutdown,
@@ -1966,10 +1983,11 @@ async fn run_connection(
             Err(error) => return ConnectionExit::Failed(error),
         };
     let now_ms = unix_time_ms();
-    let registration = match core.build_registration(challenge, now_ms) {
+    let registration = match core.build_registration_with_token(challenge, now_ms, &credential) {
         Ok(value) => value,
         Err(error) => return ConnectionExit::Failed(error),
     };
+    drop(credential);
     if let Err(error) = send_envelope(&mut writer, registration).await {
         return ConnectionExit::Failed(error);
     }
@@ -2164,7 +2182,7 @@ where
         .map_err(Into::into)
 }
 
-fn unix_time_ms() -> u64 {
+pub(super) fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -2188,6 +2206,12 @@ pub enum SignalingRuntimeError {
     Transport,
     #[error("signaling payload serialization failed")]
     Serialize,
+    #[error("signaling credential service is unavailable")]
+    CredentialsUnavailable,
+    #[error("signaling credential response is invalid")]
+    CredentialsInvalid,
+    #[error("signaling credential exchange timed out")]
+    CredentialsTimeout,
     #[error("signaling challenge is invalid or expired")]
     InvalidChallenge,
     #[error("signaling server identity does not match configuration")]
@@ -2261,6 +2285,9 @@ impl SignalingRuntimeError {
             Self::Client => "signaling_codec",
             Self::Transport => "signaling_transport",
             Self::Serialize => "signaling_serialize",
+            Self::CredentialsUnavailable => "signaling_credentials_unavailable",
+            Self::CredentialsInvalid => "signaling_credentials_invalid",
+            Self::CredentialsTimeout => "signaling_credentials_timeout",
             Self::InvalidChallenge => "signaling_invalid_challenge",
             Self::ServerIdentityMismatch => "signaling_server_identity_mismatch",
             Self::PeerIdentityChanged => "signaling_peer_identity_changed",

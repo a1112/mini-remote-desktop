@@ -17,6 +17,7 @@ use mrd_signal_client::{
 };
 use mrd_signal_proto::{
     AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
+    SIGNAL_PROTOCOL_V2, SIGNAL_PROTOCOL_V3,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Serialize;
@@ -44,7 +45,7 @@ impl ServerRuntimeConfig {
     pub fn from_env() -> Result<Self, ServerConfigError> {
         let deployed = env_bool("MRD_REALTIME_DEPLOYED", false)?;
         let bind_addr: SocketAddr = std::env::var("MRD_REALTIME_BIND")
-            .unwrap_or_else(|_| "127.0.0.1:9532".into())
+            .unwrap_or_else(|_| "127.0.0.1:9542".into())
             .parse()
             .map_err(|_| ServerConfigError::Invalid("MRD_REALTIME_BIND"))?;
         let tls_terminated = env_bool("MRD_REALTIME_TLS_TERMINATED", false)?;
@@ -189,6 +190,8 @@ impl RealtimeAppState {
 struct HealthResponse {
     status: &'static str,
     service: &'static str,
+    protocol_version: u16,
+    supported_protocol_versions: [u16; 2],
     authenticated_presence: usize,
     authorized_routes: usize,
 }
@@ -205,6 +208,8 @@ async fn health(State(state): State<RealtimeAppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         service: "realtime-server",
+        protocol_version: SIGNAL_PROTOCOL_V3,
+        supported_protocol_versions: [SIGNAL_PROTOCOL_V2, SIGNAL_PROTOCOL_V3],
         authenticated_presence: core.presence_count(),
         authorized_routes: core.route_count(),
     })
@@ -385,6 +390,84 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_emits_shared_backend_contract() {
+        let config = ServerRuntimeConfig {
+            bind_addr: "127.0.0.1:9542".parse().unwrap(),
+            secure_websocket_required: false,
+            max_message_bytes: MAX_SIGNAL_MESSAGE_BYTES,
+            outbound_queue_capacity: 64,
+            prune_interval: Duration::from_secs(10),
+            core: CoreConfig {
+                server_device_id: DeviceId("signal-server".into()),
+                challenge_ttl_ms: 10_000,
+                presence_ttl_ms: 30_000,
+                route_ttl_ms: 120_000,
+                max_connections: 10_000,
+                max_messages_per_window: 256,
+                rate_window_ms: 1_000,
+            },
+        };
+        let core = RealtimeCore::new(config.core.clone(), Arc::new(crate::RejectAllBackendTokens))
+            .unwrap();
+        let response = health(State(RealtimeAppState::new(core, config)))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4_096)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            include_str!("../tests/fixtures/health.json").trim()
+        );
+    }
+
+    fn assert_configured_bind_in_isolated_process(override_bind: Option<&str>, expected: &str) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("ws::tests::configured_bind_probe")
+            .env("MRD_TEST_EXPECTED_BIND", expected);
+        for (name, _) in std::env::vars().filter(|(name, _)| name.starts_with("MRD_REALTIME_")) {
+            command.env_remove(name);
+        }
+        if let Some(bind) = override_bind {
+            command.env("MRD_REALTIME_BIND", bind);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "configuration probe failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn configured_bind_probe() {
+        let Ok(expected) = std::env::var("MRD_TEST_EXPECTED_BIND") else {
+            return;
+        };
+        assert_eq!(
+            ServerRuntimeConfig::from_env()
+                .unwrap()
+                .bind_addr
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn default_bind_matches_backend_health_port() {
+        assert_configured_bind_in_isolated_process(None, "127.0.0.1:9542");
+    }
+
+    #[test]
+    fn explicit_bind_is_preserved() {
+        assert_configured_bind_in_isolated_process(Some("127.0.0.1:19542"), "127.0.0.1:19542");
+    }
 
     #[test]
     fn deployed_config_requires_tls_termination_and_loopback() {

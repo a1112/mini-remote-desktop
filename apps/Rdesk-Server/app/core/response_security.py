@@ -9,6 +9,7 @@ _SENSITIVE_PATH_PREFIXES = (
     "/api/v1/devices",
     "/api/v1/relays",
     "/api/v1/turn/credentials",
+    "/api/v1/realtime/device-credentials",
 )
 
 

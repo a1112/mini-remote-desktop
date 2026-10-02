@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backend_token;
 pub mod presence;
 pub mod routes;
 pub mod ws;
@@ -20,6 +21,7 @@ use thiserror::Error;
 pub use auth::{
     BackendTokenError, BackendTokenVerifier, RejectAllBackendTokens, VerifiedBackendToken,
 };
+pub use backend_token::{BackendTokenConfigError, JwtBackendTokenVerifier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionId([u8; 16]);

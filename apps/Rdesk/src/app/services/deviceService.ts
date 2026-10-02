@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { ipcRegisterDevice } from "../adapters/tauri";
+import { ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 
 interface HardwareInfo {
@@ -58,7 +58,7 @@ const DEVICE_REGISTRATION_MODE = (
  */
 class DeviceRegistrationService {
   private deviceInfo: StoredDeviceInfo | null = null;
-  private initializing = false;
+  private registrationError: string | null = null;
   private initPromise: Promise<StoredDeviceInfo | null> | null = null;
 
   /**
@@ -84,67 +84,84 @@ class DeviceRegistrationService {
   private async _initialize(): Promise<StoredDeviceInfo | null> {
     if (!isTauriRuntime()) return null;
     const useServerRegistration = this.shouldUseServerRegistration();
-
-    // 1. 检查本地存储
+    this.registrationError = null;
     const stored = this.getStoredDeviceInfo();
-    if (stored) {
-      console.log("[DeviceService] 找到本地设备信息:", stored.device_id);
-
-      if (!useServerRegistration || this.isLocalOnlyDevice(stored)) {
+    if (stored && !this.isLocalOnlyDevice(stored)) {
+      // A failed refresh must never destroy a server-assigned identity.
+      this.deviceInfo = stored;
+      try {
+        const hardwareInfo = await this.getHardwareInfo();
+        const registration = await this.registerDevice(hardwareInfo, { deviceToken: stored.access_token }, stored.device_name);
+        if (registration.device_id !== stored.device_id) {
+          throw new Error("服务器返回的设备身份不匹配，请联系管理员");
+        }
+        return this.saveServerDeviceInfo(hardwareInfo, registration, stored.registered_at);
+      } catch (error) {
+        this.registrationError = error instanceof Error ? error.message : "设备刷新失败，请稍后重试";
+        void this.syncWithLocalService(stored);
+        return stored;
+      }
+    }
+    if (useServerRegistration) {
+      this.registrationError = "需要设备登记码，请向服务器管理员获取一次性登记码后注册";
+      return null;
+    }
+    try {
+      if (stored) {
         const refreshed = await this.refreshStoredLocalDeviceInfo(stored);
         this.deviceInfo = refreshed;
         void this.syncWithLocalService(refreshed);
         return refreshed;
       }
-
-      this.deviceInfo = stored;
-      void this.syncWithLocalService(stored);
-
-      // 验证设备是否仍然有效
-      try {
-        await this.verifyDevice(stored.motherboard_serial);
-        console.log("[DeviceService] 设备验证成功");
-        return stored;
-      } catch (err) {
-        console.warn("[DeviceService] 设备验证失败，需要重新注册:", err);
-        // 验证失败，清除本地存储
-        this.clearStoredDeviceInfo();
-      }
-    }
-
-    // 2. 获取硬件信息并注册
-    try {
       const hardwareInfo = await this.getHardwareInfo();
-      if (!useServerRegistration) {
-        return this.saveLocalDeviceInfo(hardwareInfo);
-      }
-
-      const registration = await this.registerDevice(hardwareInfo);
-
-      const deviceInfo: StoredDeviceInfo = {
-        device_id: registration.device_id,
-        device_name: registration.device_name,
-        access_token: registration.access_token,
-        motherboard_serial: hardwareInfo.motherboard_serial,
-        registered_at: new Date().toISOString(),
-      };
-
-      this.saveDeviceInfo(deviceInfo);
-      this.deviceInfo = deviceInfo;
-      void this.syncWithLocalService(deviceInfo);
-
-      console.log("[DeviceService] 设备注册成功:", deviceInfo.device_id);
-      return deviceInfo;
-    } catch (err) {
-      try {
-        const hardwareInfo = await this.getHardwareInfo();
-        return this.saveLocalDeviceInfo(hardwareInfo);
-      } catch (fallbackErr) {
-        console.error("[DeviceService] LAN fallback registration failed:", fallbackErr);
-      }
-      console.error("[DeviceService] 设备注册失败:", err);
+      return this.saveLocalDeviceInfo(hardwareInfo);
+    } catch {
+      this.registrationError = "无法读取设备硬件信息，请在桌面客户端重试";
       return null;
     }
+  }
+
+  /** One-time enrollment is supplied by the user and never persisted. */
+  async enroll(enrollmentToken: string, deviceName?: string): Promise<StoredDeviceInfo> {
+    if (this.initPromise) await this.initPromise;
+    if (!/^[A-Za-z0-9_-]{43}$/.test(enrollmentToken.trim())) {
+      throw new Error("请输入管理员提供的有效设备登记码（43 位）");
+    }
+    const hardwareInfo = await this.getHardwareInfo();
+    const registration = await this.registerDevice(hardwareInfo, { enrollmentToken: enrollmentToken.trim() }, deviceName);
+    this.registrationError = null;
+    return this.saveServerDeviceInfo(hardwareInfo, registration);
+  }
+
+  async recoverDeviceCredential(deviceToken: string): Promise<StoredDeviceInfo> {
+    if (this.initPromise) await this.initPromise;
+    if (!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(deviceToken.trim())) {
+      throw new Error("请输入管理员换发的新设备凭据");
+    }
+    const stored = this.getStoredDeviceInfo();
+    const hardwareInfo = await this.getHardwareInfo();
+    const registration = await this.registerDevice(hardwareInfo, { deviceToken: deviceToken.trim() }, stored?.device_name);
+    if (stored && !this.isLocalOnlyDevice(stored) && stored.device_id !== registration.device_id) {
+      throw new Error("服务器返回的设备身份不匹配，请联系管理员");
+    }
+    this.registrationError = null;
+    return this.saveServerDeviceInfo(hardwareInfo, registration, stored?.registered_at);
+  }
+
+  private saveServerDeviceInfo(hardwareInfo: HardwareInfo, registration: DeviceRegistrationResponse, registeredAt?: string): StoredDeviceInfo {
+    const info: StoredDeviceInfo = {
+      ...registration,
+      motherboard_serial: hardwareInfo.motherboard_serial,
+      registered_at: registeredAt ?? new Date().toISOString(),
+    };
+    this.saveDeviceInfo(info);
+    this.deviceInfo = info;
+    void this.syncWithLocalService(info);
+    return info;
+  }
+
+  getRegistrationError(): string | null {
+    return this.registrationError;
   }
 
   private shouldUseServerRegistration(): boolean {
@@ -215,48 +232,23 @@ class DeviceRegistrationService {
    * 注册设备到服务器
    */
   private async registerDevice(
-    hardwareInfo: HardwareInfo
+    hardwareInfo: HardwareInfo,
+    credentials: { enrollmentToken?: string; deviceToken?: string },
+    deviceName?: string
   ): Promise<DeviceRegistrationResponse> {
-    const payload = {
-      motherboard_serial: hardwareInfo.motherboard_serial,
+    const result = await registerDeviceCommand({
+      motherboardSerial: hardwareInfo.motherboard_serial,
       hostname: hardwareInfo.hostname,
-      os_version: hardwareInfo.os_version,
-      device_name: hardwareInfo.hostname,
-      cpu_info: JSON.stringify(hardwareInfo.cpu_info),
-      total_memory_mb: hardwareInfo.total_memory_mb,
-      gpu_info: JSON.stringify(hardwareInfo.gpu_info),
-    };
-
-    const response = await fetch(`${API_BASE}/devices/register`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
+      osVersion: hardwareInfo.os_version,
+      cpuInfo: JSON.stringify(hardwareInfo.cpu_info),
+      totalMemoryMb: hardwareInfo.total_memory_mb,
+      gpuInfo: JSON.stringify(hardwareInfo.gpu_info),
+      deviceName: deviceName || hardwareInfo.hostname,
+      apiBase: (import.meta as any).env?.VITE_RDESK_SERVER_URL,
+      ...credentials,
     });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`注册失败: ${error}`);
-    }
-
-    return await response.json();
-  }
-
-  /**
-   * 验证设备是否已注册
-   */
-  private async verifyDevice(motherboardSerial: string): Promise<boolean> {
-    const response = await fetch(
-      `${API_BASE}/devices/check/${motherboardSerial}`
-    );
-
-    if (!response.ok) {
-      throw new Error("设备验证失败");
-    }
-
-    const data = await response.json();
-    return data.registered === true;
+    if (!result.ok) throw new Error(result.error.message);
+    return result.value;
   }
 
   /**
@@ -496,8 +488,6 @@ class DeviceRegistrationService {
    * 强制重新注册设备
    */
   async reregister(): Promise<StoredDeviceInfo | null> {
-    this.clearStoredDeviceInfo();
-    this.deviceInfo = null;
     return this.initialize();
   }
 
@@ -512,14 +502,18 @@ export function useDeviceRegistration() {
   const [deviceName, setDeviceName] = useState<string | null>(null);
   const [isRegistered, setIsRegistered] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [registrationError, setRegistrationError] = useState<string | null>(null);
+
+  const updateInfo = (info: StoredDeviceInfo | null) => {
+    setDeviceId(info?.device_id ?? null);
+    setDeviceName(info?.device_name ?? null);
+    setIsRegistered(Boolean(info));
+    setRegistrationError(deviceService.getRegistrationError());
+  };
 
   useEffect(() => {
     deviceService.initialize().then((info) => {
-      if (info) {
-        setDeviceId(info.device_id);
-        setDeviceName(info.device_name);
-        setIsRegistered(true);
-      }
+      updateInfo(info);
       setIsLoading(false);
     });
   }, []);
@@ -529,6 +523,8 @@ export function useDeviceRegistration() {
     deviceName,
     isRegistered,
     isLoading,
+    registrationError,
+    refresh: () => updateInfo(deviceService.getDeviceInfo()),
     getAccessToken: () => deviceService.getAccessToken(),
     reregister: () => deviceService.reregister(),
   };

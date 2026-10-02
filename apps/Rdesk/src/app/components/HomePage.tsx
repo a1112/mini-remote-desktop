@@ -17,6 +17,7 @@ import { useDeviceRegistration, deviceService } from "../services/deviceService"
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
 import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
+import { DeviceRegisterModal } from "./DeviceRegisterModal";
 
 export function HomePage() {
   const { isDark } = useTheme();
@@ -38,7 +39,8 @@ export function HomePage() {
         lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
       };
     });
-  const { deviceId: myDeviceId, deviceName: myDeviceName } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh } = useDeviceRegistration();
+  const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
   const [copied, setCopied] = useState(false);
   const [connectingDeviceId, setConnectingDeviceId] = useState<string | null>(null);
@@ -172,6 +174,11 @@ export function HomePage() {
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
+      <DeviceRegisterModal
+        isOpen={registrationOpen}
+        onClose={() => setRegistrationOpen(false)}
+        onSuccess={() => refresh()}
+      />
       <div className="grid grid-cols-5 gap-6">
         {/* Left: ID + Connect */}
         <div className="col-span-2 space-y-5">
@@ -249,7 +256,10 @@ export function HomePage() {
                 <Copy className="w-3.5 h-3.5" />
               </button>
             </div>
-
+            {registrationError && <p role="alert" className="mb-3 text-sm text-amber-600">{registrationError}</p>}
+            <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
+              登记到服务器
+            </button>
           </div>
 
           {/* Connect card */}

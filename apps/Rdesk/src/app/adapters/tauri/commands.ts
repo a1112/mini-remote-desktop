@@ -1634,23 +1634,24 @@ export async function registerDevice(params: {
   hostname: string;
   osVersion: string;
   deviceName?: string;
+  enrollmentToken?: string;
+  deviceToken?: string;
+  apiBase?: string;
+  cpuInfo?: string;
+  totalMemoryMb?: number;
+  gpuInfo?: string;
 }): Promise<AdapterResult<DeviceRegistrationResponse>> {
   return invokeAdapter<DeviceRegistrationResponse>('register_device', {
     motherboardSerial: params.motherboardSerial,
     hostname: params.hostname,
     osVersion: params.osVersion,
     deviceName: params.deviceName,
-  });
-}
-
-/**
- * Check if device is registered via HTTP
- */
-export async function checkDeviceRegistration(
-  motherboardSerial: string
-): Promise<AdapterResult<boolean>> {
-  return invokeAdapter<boolean>('check_device_registration', {
-    motherboardSerial,
+    enrollmentToken: params.enrollmentToken,
+    deviceToken: params.deviceToken,
+    apiBase: params.apiBase,
+    cpuInfo: params.cpuInfo,
+    totalMemoryMb: params.totalMemoryMb,
+    gpuInfo: params.gpuInfo,
   });
 }
 
