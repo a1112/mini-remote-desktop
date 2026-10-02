@@ -1756,7 +1756,7 @@ fn planar_upload_layout(
         .checked_mul(2)
         .and_then(|n| n.checked_mul(bytes_per_sample))
         .ok_or_else(invalid)?;
-    if pitch < row_bytes || pitch % bytes_per_sample != 0 {
+    if pitch < row_bytes || !pitch.is_multiple_of(bytes_per_sample) {
         return Err(invalid());
     }
     let uv_offset = pitch.checked_mul(height).ok_or_else(invalid)?;
@@ -2020,6 +2020,22 @@ mod tests {
             (layout.chroma_width, layout.chroma_height, layout.uv_offset),
             (2, 2, 12)
         );
+    }
+
+    #[test]
+    fn planar_upload_preserves_sample_alignment_validation() {
+        use super::planar_upload_layout;
+        // NV12 supports odd byte pitches; P010 requires whole 16-bit samples.
+        for (pitch, bytes_per_sample, len) in [(5, 1, 30), (8, 2, 48), (10, 2, 60)] {
+            let layout = planar_upload_layout(4, 4, pitch, bytes_per_sample, len)
+                .expect("valid sample-aligned pitch");
+            assert_eq!(layout.pitch as usize, pitch);
+            assert_eq!(layout.uv_offset, pitch * 4);
+        }
+        assert!(planar_upload_layout(4, 4, 9, 2, 54).is_err());
+        assert!(planar_upload_layout(4, 4, 0, 2, 0).is_err());
+        assert!(planar_upload_layout(4, 4, 8, 0, 48).is_err());
+        assert!(planar_upload_layout(4, 4, 12, 3, 72).is_err());
     }
 
     #[cfg(windows)]

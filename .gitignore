@@ -63,3 +63,8 @@ client-qt/venv
 # Track committed Tauri app icons
 !apps/Rdesk/src-tauri/icons/
 !apps/Rdesk/src-tauri/icons/**/*.png
+
+# Track native Rdesk Mobile launcher source and generated density resources
+!apps/Rdesk-Mobile/branding/launcher-source.png
+!apps/Rdesk-Mobile/app/src/main/res/mipmap-*/*.png
+!apps/Rdesk-Mobile/app/src/main/res/drawable-*/*.png
