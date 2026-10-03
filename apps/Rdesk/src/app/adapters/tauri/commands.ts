@@ -11,6 +11,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   AdapterResult,
+  AutostartStatus,
   ClientDiagnostics,
   DeviceInfo,
   DevicePreference,
@@ -551,6 +552,11 @@ export async function serviceDidBootstrap(): Promise<AdapterResult<boolean>> {
   return invokeAdapter<boolean>('service_did_bootstrap');
 }
 
+/** Confirm that the background service has finished stopping. */
+export async function serviceWaitForStopped(timeoutSecs: number): Promise<AdapterResult<boolean>> {
+  return invokeAdapter<boolean>('service_wait_for_stopped', { timeoutSecs });
+}
+
 /**
  * Get the shell-owned service/UI status snapshot via IPC.
  */
@@ -561,6 +567,19 @@ export async function shellGetStatus(): Promise<AdapterResult<ShellStatusSnapsho
     { type: 'GetShellStatus' },
     responseField<ShellStatusSnapshot>('status')
   );
+}
+
+/** Read the operating system's actual background service startup configuration. */
+export async function shellGetAutostartStatus(): Promise<AdapterResult<AutostartStatus>> {
+  return invokeAdapter<AutostartStatus>('shell_get_autostart_status');
+}
+
+export async function shellSetAutostart(enabled: boolean): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('shell_set_autostart', { enabled });
+}
+
+export async function shellQuitUiAndStopService(): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('shell_quit_ui_and_stop_service');
 }
 
 /**

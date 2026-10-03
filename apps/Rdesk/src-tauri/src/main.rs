@@ -205,7 +205,7 @@ async fn get_system_resource_snapshot(
 async fn query_service_pid() -> Option<u32> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let mut client = mrd_ipc::client::IpcClient::new();
+    let mut client = mrd_ipc::client::IpcClient::management();
     match client.send_request(IpcRequest::ServiceHealth).await {
         Ok(IpcResponse::ServiceHealth { status }) => status.pid,
         _ => None,
@@ -2128,6 +2128,15 @@ async fn service_wait_for_healthy(
     .map_err(|e| e.to_string())?
 }
 
+/// Confirm that service shutdown has completed before restarting or exiting.
+#[tauri::command]
+async fn service_wait_for_stopped(
+    state: tauri::State<'_, AppState>,
+    timeout_secs: u64,
+) -> Result<bool, String> {
+    state.service_manager.wait_for_stopped(timeout_secs).await.map_err(|error| format!("{error:#}"))
+}
+
 /// Check if this instance bootstrapped the service
 #[tauri::command]
 async fn service_did_bootstrap(state: tauri::State<'_, AppState>) -> Result<bool, String> {
@@ -2202,7 +2211,7 @@ async fn shell_ui_detached(reason: String) -> Result<(), String> {
 async fn shell_get_status() -> Result<mrd_ipc::ShellStatusSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let mut client = mrd_ipc::client::IpcClient::new();
+    let mut client = mrd_ipc::client::IpcClient::management();
     let response = client
         .send_request(IpcRequest::GetShellStatus)
         .await
@@ -2215,11 +2224,35 @@ async fn shell_get_status() -> Result<mrd_ipc::ShellStatusSnapshot, String> {
     }
 }
 
-/// Request service shutdown (Phase 2: returns error until fully implemented)
-#[tauri::command]
-async fn shell_shutdown_service(mode: String) -> Result<(), String> {
-    use mrd_ipc::{IpcRequest, IpcResponse};
+#[derive(Serialize)]
+struct AutostartStatus {
+    enabled: bool,
+    supported: bool,
+}
 
+#[tauri::command]
+async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
+    let mut client = mrd_ipc::client::IpcClient::management();
+    match client.send_request(mrd_ipc::IpcRequest::GetAutostartStatus).await.map_err(|error| error.to_string())? {
+        mrd_ipc::IpcResponse::AutostartStatus { enabled, supported } => Ok(AutostartStatus { enabled, supported }),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("Unexpected autostart status response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
+    let mut client = mrd_ipc::client::IpcClient::management();
+    match client.send_request(mrd_ipc::IpcRequest::SetAutostart { enabled }).await.map_err(|error| error.to_string())? {
+        mrd_ipc::IpcResponse::Ack => Ok(()),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("Unexpected autostart configuration response".to_string()),
+    }
+}
+
+/// Request service-owned shutdown and report rejection to the caller.
+#[tauri::command]
+async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
     let shutdown_mode = match mode.as_str() {
         "graceful" => mrd_ipc::ShutdownMode::Graceful,
         "force" => mrd_ipc::ShutdownMode::Force,
@@ -2227,19 +2260,7 @@ async fn shell_shutdown_service(mode: String) -> Result<(), String> {
         _ => return Err(format!("Unknown shutdown mode: {}", mode)),
     };
 
-    let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client
-        .send_request(IpcRequest::ShutdownService {
-            mode: shutdown_mode,
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-    match response {
-        IpcResponse::Ack => Ok(()),
-        IpcResponse::Error { code, message } => Err(format!("{}: {}", code, message)),
-        _ => Err("Unexpected response".to_string()),
-    }
+    state.service_manager.request_shutdown(shutdown_mode).await.map_err(|error| format!("{error:#}"))
 }
 
 /// Quit UI and stop service (explicit user action)
@@ -2247,33 +2268,9 @@ async fn shell_shutdown_service(mode: String) -> Result<(), String> {
 /// Phase 6: This now uses IPC ShutdownService instead of directly stopping
 /// the service process. Rdesk no longer owns service lifecycle.
 #[tauri::command]
-async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle) -> Result<(), String> {
-    // Notify service that UI is detaching
-    let _ = shell_ui_detached("user_quit".to_string()).await;
-
-    // Stop all active sessions via IPC
-    use mrd_ipc::{IpcRequest, IpcResponse};
-    let mut client = mrd_ipc::client::IpcClient::new();
-    if let Ok(IpcResponse::SessionList { sessions }) =
-        client.send_request(IpcRequest::ListSessions).await
-    {
-        for session_info in sessions {
-            let _ = client
-                .send_request(IpcRequest::StopSession {
-                    session_id: session_info.session_id,
-                })
-                .await;
-        }
-    }
-
-    // Request service shutdown via IPC (Phase 6: service owns lifecycle)
-    let _ = client
-        .send_request(IpcRequest::ShutdownService {
-            mode: mrd_ipc::ShutdownMode::Graceful,
-        })
-        .await;
-
-    // Exit the UI application
+async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.service_manager.shutdown_and_wait(mrd_ipc::ShutdownMode::Graceful, 30).await
+        .map_err(|error| format!("{error:#}"))?;
     request_app_exit(&app_handle, "user_quit");
     Ok(())
 }
@@ -3155,7 +3152,7 @@ async fn ipc_peer_capability_snapshot(
 async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let mut client = mrd_ipc::client::IpcClient::new();
+    let mut client = mrd_ipc::client::IpcClient::management();
     let response = client
         .send_request(IpcRequest::ServiceHealth)
         .await
@@ -4648,15 +4645,15 @@ fn main() {
                     }
 
                     // Wait for service to be healthy (max 30 seconds)
-                    if let Err(e) = service_mgr.wait_for_healthy(30).await {
-                        eprintln!("mrd-service health check failed: {}", e);
-                    } else {
-                        println!("mrd-service is ready");
-
-                        // Register UI presence with service
-                        if let Err(e) = shell_ui_attached().await {
-                            eprintln!("Failed to register UI presence: {}", e);
+                    match service_mgr.wait_for_healthy(30).await {
+                        Ok(true) => {
+                            println!("mrd-service is ready");
+                            if let Err(e) = shell_ui_attached().await {
+                                eprintln!("Failed to register UI presence: {}", e);
+                            }
                         }
+                        Ok(false) => eprintln!("mrd-service did not become ready within 30 seconds"),
+                        Err(e) => eprintln!("mrd-service health check failed: {e:#}"),
                     }
                 });
             });
@@ -4699,6 +4696,7 @@ fn main() {
             // Bootstrap commands (Phase 6: bootstrap-only behavior)
             service_bootstrap_if_needed,
             service_wait_for_healthy,
+            service_wait_for_stopped,
             service_did_bootstrap,
             // IPC-based commands (all session control goes through mrd-service)
             ipc_register_device,
@@ -4749,6 +4747,8 @@ fn main() {
             shell_ui_attached,
             shell_ui_detached,
             shell_get_status,
+            shell_get_autostart_status,
+            shell_set_autostart,
             shell_shutdown_service,
             shell_quit_ui_and_stop_service,
             // Test harness commands

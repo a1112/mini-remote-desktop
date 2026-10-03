@@ -2,7 +2,6 @@ use crate::{
     app_state::AppState,
     shell::{AutostartPortRef, UiLaunchRequest, UiLaunchResult, UiLauncherPortRef},
 };
-use mrd_application::ports::SessionLifecycleState;
 use mrd_ipc::{IpcResponse, OpenUiReason, ShutdownMode, UiDetachReason, UiOpenStatus};
 use std::{path::PathBuf, sync::Arc};
 
@@ -115,13 +114,8 @@ pub async fn ui_detached(
 
 /// Return current service shell status.
 pub async fn shell_status(app_state: &Arc<AppState>) -> IpcResponse {
+    let active_session_count = crate::shutdown::active_session_count(app_state).await;
     let shell = app_state.shell.lock().await;
-    let sessions = app_state.sessions.lock().await;
-    let active_session_count = sessions
-        .list_all()
-        .into_iter()
-        .filter(|session| session.lifecycle_state != SessionLifecycleState::Closed)
-        .count();
     IpcResponse::ShellStatus {
         status: mrd_ipc::ShellStatusSnapshot {
             service_pid: std::process::id(),
@@ -141,24 +135,40 @@ pub async fn set_autostart(
     enabled: bool,
 ) -> IpcResponse {
     tracing::info!("SetAutostart: enabled={}", enabled);
-    let result = {
-        let autostart = autostart.lock().unwrap();
-        let supported = autostart.is_supported();
-        let set_result = autostart.set_enabled(enabled);
-        (supported, set_result)
-    };
+    let result = (|| -> anyhow::Result<Option<bool>> {
+        let autostart = autostart.lock().map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
+        if !autostart.is_supported() {
+            return Ok(None);
+        }
+        autostart.set_enabled(enabled)?;
+        Ok(Some(autostart.is_enabled()?))
+    })();
 
     match result {
-        (supported, Ok(())) => {
-            let mut shell = app_state.shell.lock().await;
-            shell.autostart_enabled = if supported { Some(enabled) } else { None };
-            IpcResponse::Ack
+        Ok(Some(actual)) => {
+            app_state.shell.lock().await.autostart_enabled = Some(actual);
+            if actual == enabled {
+                IpcResponse::Ack
+            } else {
+                IpcResponse::Error {
+                    code: "E500".to_string(),
+                    message: "Autostart configuration does not match the requested state".to_string(),
+                }
+            }
         }
-        (_supported, Err(error)) => {
-            tracing::error!("SetAutostart failed: {}", error);
+        Ok(None) => {
+            app_state.shell.lock().await.autostart_enabled = None;
+            IpcResponse::Error {
+                code: "E501".to_string(),
+                message: "Autostart is not supported; install the background service first".to_string(),
+            }
+        }
+        Err(error) => {
+            app_state.shell.lock().await.autostart_enabled = None;
+            tracing::error!("SetAutostart failed: {error:#}");
             IpcResponse::Error {
                 code: "E500".to_string(),
-                message: error.to_string(),
+                message: format!("{error:#}"),
             }
         }
     }
@@ -166,23 +176,43 @@ pub async fn set_autostart(
 
 /// Return the current autostart state from the configured platform port.
 pub fn autostart_status(autostart: &AutostartPortRef) -> IpcResponse {
-    let autostart = autostart.lock().unwrap();
-    let enabled = autostart.is_enabled().unwrap_or(false);
-    let supported = autostart.is_supported();
-    IpcResponse::AutostartStatus { enabled, supported }
+    match read_autostart_state(autostart) {
+        Ok(Some(enabled)) => IpcResponse::AutostartStatus { enabled, supported: true },
+        Ok(None) => IpcResponse::AutostartStatus { enabled: false, supported: false },
+        Err(error) => IpcResponse::Error {
+            code: "E500".to_string(),
+            message: format!("{error:#}"),
+        },
+    }
 }
 
-/// Acknowledge shutdown requests with the current not-implemented contract.
-pub fn shutdown_service(mode: ShutdownMode) -> IpcResponse {
+fn read_autostart_state(autostart: &AutostartPortRef) -> anyhow::Result<Option<bool>> {
+    let autostart = autostart.lock().map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
+    if autostart.is_supported() {
+        autostart.is_enabled().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Refresh the shell snapshot from platform configuration instead of UI state.
+pub async fn refresh_autostart_state(
+    app_state: &Arc<AppState>,
+    autostart: &AutostartPortRef,
+) -> anyhow::Result<Option<bool>> {
+    let result = read_autostart_state(autostart);
+    app_state.shell.lock().await.autostart_enabled = result.as_ref().ok().copied().flatten();
+    result
+}
+
+/// Queue a runtime-owned shutdown; the local connection flushes Ack before exit.
+pub fn shutdown_service(app_state: &Arc<AppState>, mode: ShutdownMode) -> IpcResponse {
     tracing::info!("ShutdownService requested: mode={:?}", mode);
-    match mode {
-        ShutdownMode::Force => IpcResponse::Error {
-            code: "E501".to_string(),
-            message: "Force shutdown not yet implemented".to_string(),
-        },
-        ShutdownMode::Graceful | ShutdownMode::AfterSessions => IpcResponse::Error {
-            code: "E501".to_string(),
-            message: "Service shutdown not yet implemented".to_string(),
+    match app_state.shutdown.request(mode) {
+        Ok(()) => IpcResponse::Ack,
+        Err(error) => IpcResponse::Error {
+            code: "E_SERVICE_SHUTDOWN_UNAVAILABLE".to_string(),
+            message: error.to_string(),
         },
     }
 }

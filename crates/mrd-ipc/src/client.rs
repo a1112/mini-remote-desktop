@@ -63,6 +63,7 @@ pub struct IpcClient {
 
     /// Target endpoint for the service connection.
     endpoint: IpcEndpoint,
+    management: bool,
 }
 
 impl IpcClient {
@@ -72,6 +73,34 @@ impl IpcClient {
             ReconnectConfig::default(),
             IpcEndpoint::service_from_env_or_default(),
         )
+    }
+
+    /// Create a client for the narrow service management endpoint.
+    pub fn management() -> Self {
+        Self::management_with_config(ReconnectConfig::default())
+    }
+
+    /// Create a management client with bounded/custom reconnection behavior.
+    pub fn management_with_config(config: ReconnectConfig) -> Self {
+        Self::management_with_config_and_endpoint(
+            config,
+            IpcEndpoint::management_from_env_or_default(),
+        )
+    }
+
+    /// Create a management client for an explicit endpoint.
+    pub fn management_with_endpoint(endpoint: IpcEndpoint) -> Self {
+        Self::management_with_config_and_endpoint(ReconnectConfig::default(), endpoint)
+    }
+
+    /// Create a management client with an explicit endpoint and reconnection policy.
+    pub fn management_with_config_and_endpoint(
+        config: ReconnectConfig,
+        endpoint: IpcEndpoint,
+    ) -> Self {
+        let mut client = Self::with_config_and_endpoint(config, endpoint);
+        client.management = true;
+        client
     }
 
     /// Create a new IPC client that connects to a custom endpoint.
@@ -91,6 +120,7 @@ impl IpcClient {
             state: ConnectionState::Disconnected,
             reconnect_config: config,
             endpoint,
+            management: false,
         }
     }
 
@@ -112,7 +142,7 @@ impl IpcClient {
     async fn connect_once(&mut self) -> Result<()> {
         self.state = ConnectionState::Connecting;
 
-        match crate::transport::IpcClient::connect_with_endpoint(&self.endpoint).await {
+        match self.connect_transport().await {
             Ok(stream) => {
                 self.stream = Some(stream);
                 self.state = ConnectionState::Connected;
@@ -122,6 +152,14 @@ impl IpcClient {
                 self.state = ConnectionState::Disconnected;
                 Err(e)
             }
+        }
+    }
+
+    async fn connect_transport(&self) -> Result<crate::transport::IpcStream> {
+        if self.management {
+            crate::transport::IpcClient::connect_management_with_endpoint(&self.endpoint).await
+        } else {
+            crate::transport::IpcClient::connect_with_endpoint(&self.endpoint).await
         }
     }
 
@@ -140,7 +178,7 @@ impl IpcClient {
         let mut delay = self.reconnect_config.initial_backoff;
 
         loop {
-            match crate::transport::IpcClient::connect_with_endpoint(&self.endpoint).await {
+            match self.connect_transport().await {
                 Ok(stream) => {
                     self.stream = Some(stream);
                     self.state = ConnectionState::Connected;

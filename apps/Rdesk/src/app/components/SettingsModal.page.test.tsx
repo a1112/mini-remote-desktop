@@ -73,6 +73,8 @@ describe('SettingsModal - Page Level Tests', () => {
   const mockSettingsCommands = (mockInvoke: ReturnType<typeof getMockInvoke>) => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'shell_get_status') return Promise.resolve(runningStatus);
+      if (cmd === 'shell_get_autostart_status') return Promise.resolve({ enabled: true, supported: true });
+      if (cmd === 'shell_set_autostart') return Promise.resolve(undefined);
       if (cmd === 'decode_policy') return Promise.resolve({ decode_policy: 'auto' });
       if (cmd === 'set_decode_policy') return Promise.resolve({ decode_policy: 'nvdec' });
       if (cmd === 'ffmpeg_probe') return Promise.resolve(ffmpegProbe);

@@ -1178,6 +1178,12 @@ async fn handle_initial_event(
     local_identity: Arc<mrd_identity::DeviceIdentity>,
     event: VerifiedSignalingEvent,
 ) {
+    let _admission = if matches!(&event.signal, AuthenticatedSessionSignal::SessionIntentV3 { .. }) {
+        match app_state.shutdown.admit() {
+            Ok(permit) => Some(permit),
+            Err(_) => return,
+        }
+    } else { None };
     let session_id = event.signal.session_id().clone();
     let result = if matches!(
         &event.signal,

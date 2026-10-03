@@ -62,7 +62,7 @@ pub fn telemetry_bundle(run_id: String, session_id: Option<SessionId>) -> IpcRes
 
 /// Return the basic service liveness contract used by UI/service probes.
 pub fn service_health(app_state: &AppState) -> IpcResponse {
-    let healthy = app_state.security_is_healthy();
+    let healthy = app_state.security_is_healthy() && !app_state.shutdown.is_requested();
     IpcResponse::ServiceHealth {
         status: ServiceStatus {
             running: true,

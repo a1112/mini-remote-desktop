@@ -13,12 +13,12 @@
 import * as tauriAdapter from '../adapters/tauri';
 import type {
   AdapterResult,
+  AutostartStatus,
   AppSettings,
   DecodePolicy,
   DecodePolicyResponse,
   FfmpegInstallResult,
   FfmpegProbeResult,
-  ShutdownMode,
   ShellStatusSnapshot,
 } from '../adapters/tauri';
 
@@ -60,8 +60,7 @@ function isServiceUnavailable(message: string): boolean {
     normalized.includes('connection refused') ||
     normalized.includes('cannot find the file') ||
     normalized.includes('no such file') ||
-    normalized.includes('pipe') ||
-    normalized.includes('os error 2')
+    /\bos error 2\b/.test(normalized)
   );
 }
 
@@ -104,6 +103,23 @@ export const waitForServiceHealthy = async (
   return unwrapAdapterResult(result);
 };
 
+export const waitForServiceStopped = async (timeoutSecs: number): Promise<boolean> => {
+  return unwrapAdapterResult(await tauriAdapter.serviceWaitForStopped(timeoutSecs));
+};
+
+export const getServiceAutostart = async (): Promise<AutostartStatus> => {
+  return unwrapAdapterResult(await tauriAdapter.shellGetAutostartStatus());
+};
+
+export const setServiceAutostart = async (enabled: boolean): Promise<AutostartStatus> => {
+  unwrapAdapterResult(await tauriAdapter.shellSetAutostart(enabled));
+  return getServiceAutostart();
+};
+
+export const quitUiAndStopService = async (): Promise<void> => {
+  unwrapAdapterResult(await tauriAdapter.shellQuitUiAndStopService());
+};
+
 /**
  * Check if this instance bootstrapped the service
  */
@@ -117,12 +133,21 @@ export const didBootstrapService = async (): Promise<boolean> => {
 // ============================================================================
 
 /** @deprecated Use bootstrapServiceIfNeeded instead */
-export const startService = bootstrapServiceIfNeeded;
+export const startService = async (): Promise<boolean> => {
+  await bootstrapServiceIfNeeded();
+  if (!await waitForServiceHealthy(30)) {
+    throw new ServiceError('后台服务未在规定时间内就绪');
+  }
+  return true;
+};
 
 /** @deprecated Service is no longer owned by Rdesk - use shell_shutdown_service IPC command */
 export const stopService = async (): Promise<boolean> => {
   const result = await tauriAdapter.shellShutdownService('graceful');
   unwrapAdapterResult(result);
+  if (!await waitForServiceStopped(30)) {
+    throw new ServiceError('后台服务未在规定时间内停止');
+  }
   return true;
 };
 
@@ -171,12 +196,8 @@ export const getServicePid = async (): Promise<number | null> => {
 
 /** @deprecated Service restart is no longer owned by Rdesk */
 export const serviceRestart = async (): Promise<boolean> => {
-  const stopResult = await tauriAdapter.shellShutdownService('graceful' as ShutdownMode);
-  unwrapAdapterResult(stopResult);
-
-  const started = await bootstrapServiceIfNeeded();
-  await waitForServiceHealthy(10).catch(() => false);
-  return started;
+  await stopService();
+  return startService();
 };
 
 /** @deprecated Service guard is no longer needed - mrd-service manages its own lifecycle */

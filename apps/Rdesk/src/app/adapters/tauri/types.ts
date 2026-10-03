@@ -605,6 +605,11 @@ export interface ServicePidResponse {
 
 export type ShutdownMode = "graceful" | "force" | "after_sessions";
 
+export interface AutostartStatus {
+  enabled: boolean;
+  supported: boolean;
+}
+
 export interface ShellStatusSnapshot {
   service_pid: number;
   ui_pid: number | null;

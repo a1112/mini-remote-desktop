@@ -13,6 +13,11 @@ pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\mrd-service";
 pub const SERVICE_SOCKET_PATH: &str = "/tmp/mrd-service.sock";
 /// Environment variable that overrides the service IPC endpoint.
 pub const SERVICE_ENDPOINT_ENV: &str = "MRD_SERVICE_IPC_ENDPOINT";
+/// Environment variable that overrides only the narrow service management endpoint.
+pub const MANAGEMENT_ENDPOINT_ENV: &str = "MRD_SERVICE_MANAGEMENT_IPC_ENDPOINT";
+
+#[cfg(windows)]
+mod windows_management;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -79,6 +84,27 @@ impl IpcEndpoint {
             .unwrap_or_else(Self::default_service)
     }
 
+    /// Dedicated endpoint derived from the core service endpoint.
+    pub fn management_for_service(service: Self) -> Self {
+        match service {
+            #[cfg(windows)]
+            Self::NamedPipe(path) => Self::NamedPipe(format!("{path}-management")),
+            #[cfg(unix)]
+            Self::UnixSocket(path) => {
+                let stem = path.strip_suffix(".sock").unwrap_or(&path);
+                Self::UnixSocket(format!("{stem}-management.sock"))
+            }
+        }
+    }
+
+    /// Resolve the dedicated service management endpoint.
+    pub fn management_from_env_or_default() -> Self {
+        std::env::var(MANAGEMENT_ENDPOINT_ENV)
+            .ok()
+            .and_then(|value| Self::from_env_value(&value))
+            .unwrap_or_else(|| Self::management_for_service(Self::service_from_env_or_default()))
+    }
+
     #[cfg(windows)]
     fn pipe_name(&self) -> &str {
         match self {
@@ -141,6 +167,7 @@ where
 /// Unix domain socket IPC server.
 pub struct IpcServer {
     listener: UnixListener,
+    management_socket: Option<(String, u64, u64)>,
 }
 
 #[cfg(unix)]
@@ -155,7 +182,49 @@ impl IpcServer {
         let socket_path = endpoint.socket_path();
         let _ = std::fs::remove_file(socket_path);
         let listener = UnixListener::bind(socket_path)?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            management_socket: None,
+        })
+    }
+
+    /// Bind a dedicated owner-only management socket without replacing an existing endpoint.
+    pub async fn bind_management_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        anyhow::ensure!(
+            endpoint != IpcEndpoint::service_from_env_or_default(),
+            "Management IPC must use a distinct endpoint"
+        );
+        let path = endpoint.socket_path();
+        if let Ok(existing) = std::fs::symlink_metadata(path) {
+            anyhow::ensure!(
+                existing.file_type().is_socket() && existing.uid() == unsafe { libc::geteuid() },
+                "Management IPC endpoint exists and is not an owned socket"
+            );
+            match UnixStream::connect(path).await {
+                Ok(_) => anyhow::bail!("Management IPC endpoint already has an active listener"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(error) => return Err(error.into()),
+            }
+            if let Ok(current) = std::fs::symlink_metadata(path) {
+                anyhow::ensure!(
+                    current.dev() == existing.dev() && current.ino() == existing.ino(),
+                    "Management IPC endpoint changed during stale-socket recovery"
+                );
+                std::fs::remove_file(path)?;
+            }
+        }
+        let listener = UnixListener::bind(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        Ok(Self {
+            listener,
+            management_socket: Some((path.to_owned(), metadata.dev(), metadata.ino())),
+        })
     }
 
     /// Accept a single IPC stream from a client.
@@ -165,11 +234,30 @@ impl IpcServer {
     }
 }
 
+#[cfg(unix)]
+impl Drop for IpcServer {
+    fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if let Some((path, device, inode)) = &self.management_socket {
+            if let Ok(current) = std::fs::symlink_metadata(path) {
+                if current.file_type().is_socket()
+                    && current.dev() == *device
+                    && current.ino() == *inode
+                {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
 // Windows server
 #[cfg(windows)]
 /// Windows named-pipe IPC server.
 pub struct IpcServer {
     endpoint: IpcEndpoint,
+    management_sddl: Option<String>,
+    first_instance: tokio::sync::Mutex<Option<tokio::net::windows::named_pipe::NamedPipeServer>>,
 }
 
 #[cfg(windows)]
@@ -181,14 +269,41 @@ impl IpcServer {
 
     /// Bind a custom Windows named-pipe endpoint.
     pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            management_sddl: None,
+            first_instance: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// Reserve a local-only first pipe instance with a narrow interactive-user ACL.
+    pub async fn bind_management_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        anyhow::ensure!(
+            endpoint != IpcEndpoint::service_from_env_or_default(),
+            "Management IPC must use a distinct endpoint"
+        );
+        windows_management::validate_local_pipe_name(endpoint.pipe_name())?;
+        let management_sddl = windows_management::management_sddl_for_current_process()?;
+        let first = windows_management::create_pipe(endpoint.pipe_name(), true, &management_sddl)?;
+        Ok(Self {
+            endpoint,
+            management_sddl: Some(management_sddl),
+            first_instance: tokio::sync::Mutex::new(Some(first)),
+        })
     }
 
     /// Accept a single IPC stream from a client.
     pub async fn accept(&self) -> Result<IpcStream> {
-        let server = ServerOptions::new()
-            .first_pipe_instance(false)
-            .create(self.endpoint.pipe_name())?;
+        let server = if let Some(sddl) = &self.management_sddl {
+            match self.first_instance.lock().await.take() {
+                Some(first) => first,
+                None => windows_management::create_pipe(self.endpoint.pipe_name(), false, sddl)?,
+            }
+        } else {
+            ServerOptions::new()
+                .first_pipe_instance(false)
+                .create(self.endpoint.pipe_name())?
+        };
         server.connect().await?;
         Ok(IpcStream::Server(server))
     }
@@ -211,6 +326,11 @@ impl IpcClient {
         let socket = UnixStream::connect(endpoint.socket_path()).await?;
         Ok(IpcStream { socket })
     }
+
+    /// Connect to the dedicated local management socket.
+    pub async fn connect_management_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
+        Self::connect_with_endpoint(endpoint).await
+    }
 }
 
 // Windows client
@@ -229,6 +349,13 @@ impl IpcClient {
     pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
         let pipe = ClientOptions::new().open(endpoint.pipe_name())?;
         Ok(IpcStream::Client(pipe))
+    }
+
+    /// Connect using data-only rights, without pipe-instance creation permission.
+    pub async fn connect_management_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
+        Ok(IpcStream::Client(windows_management::connect_client(
+            endpoint.pipe_name(),
+        )?))
     }
 }
 
@@ -359,6 +486,21 @@ mod tests {
         assert!(IpcEndpoint::from_env_value("  ").is_none());
     }
 
+    #[test]
+    fn management_endpoint_is_distinct_from_custom_core_endpoint() {
+        #[cfg(windows)]
+        let (core, expected) = (
+            IpcEndpoint::named_pipe(r"\\.\pipe\custom-core"),
+            IpcEndpoint::named_pipe(r"\\.\pipe\custom-core-management"),
+        );
+        #[cfg(unix)]
+        let (core, expected) = (
+            IpcEndpoint::unix_socket("/tmp/custom-core.sock"),
+            IpcEndpoint::unix_socket("/tmp/custom-core-management.sock"),
+        );
+        assert_eq!(IpcEndpoint::management_for_service(core), expected);
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn unix_socket_ipc_roundtrip() -> Result<()> {
@@ -385,5 +527,67 @@ mod tests {
 
         server_handle.await??;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_management_socket_can_restart_and_recover_an_owned_stale_socket() {
+        let path = format!(
+            "/tmp/mrd-management-restart-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let first = IpcServer::bind_management_with_endpoint(endpoint.clone())
+            .await
+            .unwrap();
+        assert!(IpcServer::bind_management_with_endpoint(endpoint.clone())
+            .await
+            .is_err());
+        drop(first);
+        assert!(!std::path::Path::new(&path).exists());
+        let second = IpcServer::bind_management_with_endpoint(endpoint.clone())
+            .await
+            .unwrap();
+        drop(second);
+        let stale = UnixListener::bind(&path).unwrap();
+        drop(stale);
+        let recovered = IpcServer::bind_management_with_endpoint(endpoint)
+            .await
+            .unwrap();
+        drop(recovered);
+        assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_management_socket_never_replaces_regular_files_or_symlinks() {
+        let path = format!(
+            "/tmp/mrd-management-file-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::fs::write(&path, "preserve").unwrap();
+        assert!(
+            IpcServer::bind_management_with_endpoint(IpcEndpoint::unix_socket(&path))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "preserve");
+        let link = format!("{path}-link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(
+            IpcServer::bind_management_with_endpoint(IpcEndpoint::unix_socket(&link))
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }

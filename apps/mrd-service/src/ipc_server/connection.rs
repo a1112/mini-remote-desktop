@@ -8,8 +8,19 @@ impl IpcServer {
         loop {
             match stream.recv_request().await {
                 Ok(request) => {
+                    let shutdown_mode = match &request {
+                        mrd_ipc::IpcRequest::ShutdownService { mode } => Some(mode.clone()),
+                        _ => None,
+                    };
                     let response = self.handle_request(request).await;
-                    if let Err(e) = stream.send_response(&response).await {
+                    let sent = stream.send_response(&response).await;
+                    if matches!(response, mrd_ipc::IpcResponse::Ack) {
+                        if let Some(mode) = shutdown_mode {
+                            // A disappeared requester must not strand accepted shutdown.
+                            self.app_state.shutdown.acknowledge(mode);
+                        }
+                    }
+                    if let Err(e) = sent {
                         eprintln!("Failed to send IPC response: {}", e);
                         break;
                     }

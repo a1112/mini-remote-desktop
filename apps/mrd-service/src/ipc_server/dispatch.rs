@@ -15,6 +15,24 @@ pub(super) async fn dispatch_request(server: &IpcServer, request: IpcRequest) ->
 
 impl IpcServer {
     async fn dispatch_request_inner(&self, request: IpcRequest) -> IpcResponse {
+        if self.management_only && !management_request_is_allowed(&request) {
+            return IpcResponse::Error {
+                code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
+                message: "This endpoint accepts only service health, shell status, autostart and shutdown commands".to_owned(),
+            };
+        }
+        let _admission = if matches!(&request,
+            IpcRequest::StartSession { .. } | IpcRequest::StartLanRemoteSession { .. }
+            | IpcRequest::AcceptSession { .. } | IpcRequest::RequestRemoteSession { .. }
+            | IpcRequest::RecoverSession { .. }
+        ) {
+            match self.app_state.shutdown.admit() {
+                Ok(permit) => Some(permit),
+                Err(error) => return IpcResponse::Error {
+                    code: "E_SERVICE_SHUTTING_DOWN".to_owned(), message: error.to_string(),
+                },
+            }
+        } else { None };
         let mut security_unhealthy = !self.app_state.security_is_healthy();
         if security_unhealthy && !allowed_when_security_unhealthy(&request) {
             return security_store_unavailable_response();
@@ -755,7 +773,10 @@ impl IpcServer {
                 shell_handlers::ui_detached(&self.app_state, pid, reason).await
             }
 
-            IpcRequest::GetShellStatus => shell_handlers::shell_status(&self.app_state).await,
+            IpcRequest::GetShellStatus => {
+                let _ = shell_handlers::refresh_autostart_state(&self.app_state, &self.autostart).await;
+                shell_handlers::shell_status(&self.app_state).await
+            },
 
             IpcRequest::SetAutostart { enabled } => {
                 shell_handlers::set_autostart(&self.app_state, &self.autostart, enabled).await
@@ -763,9 +784,16 @@ impl IpcServer {
 
             IpcRequest::GetAutostartStatus => shell_handlers::autostart_status(&self.autostart),
 
-            IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(mode),
+            IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(&self.app_state, mode),
         }
     }
+}
+
+fn management_request_is_allowed(request: &IpcRequest) -> bool {
+    matches!(request,
+        IpcRequest::ServiceHealth | IpcRequest::GetShellStatus | IpcRequest::SetAutostart { .. }
+        | IpcRequest::GetAutostartStatus | IpcRequest::ShutdownService { .. }
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

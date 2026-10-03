@@ -11,14 +11,33 @@ const WINDOWS_IPC_ACCEPT_BACKLOG: usize = 32;
 impl IpcServer {
     /// Run the IPC server (accepts connections in a loop)
     pub async fn run(&self) -> anyhow::Result<()> {
-        #[cfg(windows)]
-        let server =
-            Arc::new(transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?);
+        self.run_inner(None).await
+    }
 
-        #[cfg(not(windows))]
-        let server = transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?;
+    /// Announce startup only after endpoint binding succeeds.
+    pub async fn run_with_ready(
+        &self,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        self.run_inner(Some(ready)).await
+    }
+
+    async fn run_inner(
+        &self,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<()> {
+        let server = if self.management_only {
+            transport::IpcServer::bind_management_with_endpoint(self.endpoint.clone()).await?
+        } else {
+            transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?
+        };
+        #[cfg(windows)]
+        let server = Arc::new(server);
 
         tracing::info!("IPC server listening");
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
 
         #[cfg(windows)]
         {
@@ -54,17 +73,10 @@ impl IpcServer {
 
         #[cfg(not(windows))]
         {
-            let app_state = self.app_state.clone();
-            let ui_launcher = self.ui_launcher.clone();
             loop {
                 match server.accept().await {
                     Ok(stream) => {
-                        let server_clone = IpcServer {
-                            app_state: app_state.clone(),
-                            endpoint: self.endpoint.clone(),
-                            ui_launcher: ui_launcher.clone(),
-                            autostart: crate::shell::default_autostart("mrd-service"),
-                        };
+                        let server_clone = self.clone();
                         tokio::spawn(async move {
                             if let Err(e) = server_clone.handle_connection(stream).await {
                                 eprintln!("IPC connection error: {}", e);

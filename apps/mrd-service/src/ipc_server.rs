@@ -24,9 +24,34 @@ pub struct IpcServer {
     endpoint: transport::IpcEndpoint,
     ui_launcher: UiLauncherPortRef,
     autostart: AutostartPortRef,
+    management_only: bool,
 }
 
 impl IpcServer {
+    /// Dedicated local endpoint restricted to service lifecycle management.
+    pub fn new_management(app_state: Arc<AppState>) -> Self {
+        Self::new_management_with_endpoint(
+            app_state,
+            transport::IpcEndpoint::management_from_env_or_default(),
+        )
+    }
+
+    /// Management server with an explicit endpoint for isolated deployments.
+    pub fn new_management_with_endpoint(
+        app_state: Arc<AppState>,
+        endpoint: transport::IpcEndpoint,
+    ) -> Self {
+        let mut server = Self::new_with_endpoint(app_state, endpoint);
+        server.management_only = true;
+        server
+    }
+
+    /// Supply a platform autostart adapter for the server and its cloned workers.
+    pub fn with_autostart(mut self, autostart: AutostartPortRef) -> Self {
+        self.autostart = autostart;
+        self
+    }
+
     pub fn new(app_state: Arc<AppState>) -> Self {
         Self::new_with_endpoint(
             app_state,
@@ -40,6 +65,7 @@ impl IpcServer {
             endpoint,
             ui_launcher: crate::shell::default_ui_launcher(),
             autostart: crate::shell::default_autostart("mrd-service"),
+            management_only: false,
         }
     }
 
@@ -53,6 +79,7 @@ impl IpcServer {
             endpoint,
             ui_launcher,
             autostart: crate::shell::default_autostart("mrd-service"),
+            management_only: false,
         }
     }
 

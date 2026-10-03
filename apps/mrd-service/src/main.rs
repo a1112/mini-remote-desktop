@@ -54,10 +54,12 @@ fn main() -> Result<()> {
     }
 
     info!("mrd-service starting in foreground console mode");
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run_service(RunMode::Console, None, StatusReporter::Console))
+        .build()?;
+    let result = runtime.block_on(run_service(RunMode::Console, None, StatusReporter::Console));
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
 }
 
 fn initialize_logging() {
@@ -233,23 +235,57 @@ async fn run_service(
     };
 
     let ipc_server = IpcServer::new(Arc::clone(&app_state));
+    let management_server = IpcServer::new_management(Arc::clone(&app_state));
+    let _shutdown_runtime = app_state.shutdown.bind_runtime()?;
     let web_bridge_task = web_bridge::spawn_from_env(ipc_server.clone()).await?;
-    let mut ipc_task = Box::pin(ipc_server.run());
+    let web_abort = web_bridge_task
+        .as_ref()
+        .map(tokio::task::JoinHandle::abort_handle);
+    let (ipc_ready, ipc_ready_rx) = tokio::sync::oneshot::channel();
+    let (management_ready, management_ready_rx) = tokio::sync::oneshot::channel();
+    let mut ipc_task = Box::pin(ipc_server.run_with_ready(ipc_ready));
+    let mut management_task = Box::pin(management_server.run_with_ready(management_ready));
     let mut web_task = Box::pin(web_bridge::wait_for_task(web_bridge_task));
     let mut agent_reconcile = tokio::time::interval(std::time::Duration::from_secs(5));
     agent_reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut wan_session_expiry = tokio::time::interval(std::time::Duration::from_secs(1));
     wan_session_expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let startup = async {
+        ipc_ready_rx
+            .await
+            .context("IPC startup failed before readiness")?;
+        management_ready_rx
+            .await
+            .context("Management IPC startup failed before readiness")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::select! {
+        result = startup => result?,
+        result = &mut ipc_task => return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("IPC stopped during startup"))),
+        result = &mut management_task => return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("Management IPC stopped during startup"))),
+    }
     reporter.running()?;
     info!("mrd-service running");
 
     let mut runtime_error = None;
+    let mut management_available = true;
+    let mut shutdown_mode = mrd_ipc::ShutdownMode::Graceful;
     let shutdown_reason = loop {
         tokio::select! {
+            requested_mode = mrd_service::shutdown::wait_for_shutdown(&app_state) => {
+                shutdown_mode = requested_mode;
+                let _ = lifecycle.apply(LifecycleControl::Stop);
+                break StopReason::ServiceShutdown;
+            }
             result = &mut ipc_task => {
                 if let Err(error) = result {
                     runtime_error = Some(error.context("IPC server stopped"));
                 }
+                break StopReason::ServiceShutdown;
+            }
+            result = &mut management_task => {
+                management_available = false;
+                runtime_error = Some(result.err().unwrap_or_else(|| anyhow::anyhow!("management IPC stopped")));
                 break StopReason::ServiceShutdown;
             }
             result = &mut web_task => {
@@ -269,44 +305,106 @@ async fn run_service(
                         break StopReason::ServiceShutdown;
                     }
                     RuntimeControl::SessionChange(change) => {
-                        handle_session_change(&mut lifecycle, agents.as_mut(), change).await;
+                        tokio::select! {
+                            _ = handle_session_change(&mut lifecycle, agents.as_mut(), change) => {},
+                            requested_mode = mrd_service::shutdown::wait_for_shutdown(&app_state) => {
+                                shutdown_mode = requested_mode;
+                                break StopReason::ServiceShutdown;
+                            }
+                        }
                     }
                 }
             }
             _ = agent_reconcile.tick(), if agents.is_some() => {
                 if let Some(supervisor) = agents.as_mut() {
-                    supervisor.reconcile().await;
+                    tokio::select! {
+                        _ = supervisor.reconcile() => {},
+                        requested_mode = mrd_service::shutdown::wait_for_shutdown(&app_state) => {
+                            shutdown_mode = requested_mode;
+                            break StopReason::ServiceShutdown;
+                        }
+                    }
                 }
             }
             _ = wan_session_expiry.tick(), if app_state.wan_session_coordinator().is_some() => {
-                let _ = mrd_service::wan_session::service::expire_due_wan_sessions(&app_state).await;
+                tokio::select! {
+                    _ = mrd_service::wan_session::service::expire_due_wan_sessions(&app_state) => {},
+                    requested_mode = mrd_service::shutdown::wait_for_shutdown(&app_state) => {
+                        shutdown_mode = requested_mode;
+                        break StopReason::ServiceShutdown;
+                    }
+                }
             }
         }
     };
 
     reporter.stop_pending()?;
+    // SCM/console stop must close the same admission fence as local IPC stop.
+    let _ = app_state.shutdown.request(shutdown_mode.clone());
     drop(ipc_task);
     drop(web_task);
-    if let Some(wan_session_task) = wan_session_task {
-        wan_session_task.shutdown().await;
+    if let Some(abort) = web_abort {
+        abort.abort();
     }
-    if let Some(relay_responder) = relay_responder {
-        relay_responder.shutdown().await;
-    }
-    if let Some(signaling_task) = signaling_task {
-        signaling_task.shutdown().await;
-    }
-    if let Err(error) = app_state.webrtc_host.shutdown().await {
-        runtime_error.get_or_insert_with(|| error.into());
-    }
-    if let Some(supervisor) = agents.as_mut() {
-        if let Err(error) = supervisor.stop_all(shutdown_reason).await {
+    let cleanup = async {
+        let sessions_to_close = app_state.sessions.lock().await.list_all();
+        for session in sessions_to_close {
+            let response =
+                mrd_service::handlers::session::stop_session(&app_state, session.session_id).await;
+            if let mrd_ipc::IpcResponse::Error { message, .. } = response {
+                runtime_error.get_or_insert_with(|| anyhow::anyhow!(message));
+            }
+        }
+        if let Some(wan_session_task) = wan_session_task {
+            wan_session_task.shutdown().await;
+        }
+        if let Some(relay_responder) = relay_responder {
+            relay_responder.shutdown().await;
+        }
+        if let Some(signaling_task) = signaling_task {
+            signaling_task.shutdown().await;
+        }
+        if let Err(error) = app_state.webrtc_host.shutdown().await {
             runtime_error.get_or_insert_with(|| error.into());
         }
+        if let Some(supervisor) = agents.as_mut() {
+            if let Err(error) = supervisor.stop_all(shutdown_reason).await {
+                runtime_error.get_or_insert_with(|| error.into());
+            }
+        }
+    };
+    let mut cleanup = Box::pin(tokio::time::timeout(
+        mrd_service::shutdown::cleanup_timeout(&shutdown_mode),
+        cleanup,
+    ));
+    let cleanup_timed_out = loop {
+        tokio::select! {
+            result = &mut cleanup => break result.is_err(),
+            // Keep lifecycle IPC reachable until resource cleanup is finished.
+            result = &mut management_task, if management_available => {
+                warn!("Management IPC stopped during cleanup: {result:?}");
+                break (&mut cleanup).await.is_err();
+            }
+            _ = app_state.shutdown.changed() => {
+                if shutdown_mode != mrd_ipc::ShutdownMode::Force && app_state.shutdown.ready_mode_at_epoch(usize::MAX, app_state.shutdown.admission_epoch()) == Some(mrd_ipc::ShutdownMode::Force) {
+                    break true;
+                }
+            }
+        }
+    };
+    drop(cleanup);
+    if cleanup_timed_out {
+        runtime_error.get_or_insert_with(|| anyhow::anyhow!("service cleanup deadline exceeded"));
+        warn!("Service cleanup deadline exceeded; terminating remaining runtime tasks");
     }
+    drop(agents);
+    drop(management_task);
     let _ = tray.lock().unwrap().shutdown();
     reporter.stopped()?;
-    info!("mrd-service stopped cleanly");
+    info!(
+        cleanup_succeeded = runtime_error.is_none(),
+        "mrd-service stopped"
+    );
     runtime_error.map_or(Ok(()), Err)
 }
 
@@ -506,14 +604,15 @@ mod scm_host {
         };
         let status = service_control_handler::register(SERVICE_NAME, handler)?;
         set_status(&status, ServiceState::StartPending, 1)?;
-        let result = tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()?
-            .block_on(run_service(
-                RunMode::WindowsService,
-                Some(control_rx),
-                StatusReporter::Scm(status),
-            ));
+            .build()?;
+        let result = runtime.block_on(run_service(
+            RunMode::WindowsService,
+            Some(control_rx),
+            StatusReporter::Scm(status),
+        ));
+        runtime.shutdown_timeout(Duration::from_secs(2));
         if result.is_err() {
             let _ = set_status(&status, ServiceState::Stopped, 0);
         }

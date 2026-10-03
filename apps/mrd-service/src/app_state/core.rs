@@ -32,6 +32,8 @@ use tokio::sync::Mutex;
 /// - Shell/UI lifecycle state
 /// - Tray port (Phase 4)
 pub struct AppState {
+    /// Runtime shutdown owner and admission fence, independent of UI lifetime.
+    pub shutdown: Arc<crate::shutdown::ShutdownCoordinator>,
     /// Authenticated interactive-session agent registrations.
     pub agent_registry: Arc<crate::agent_runtime::AgentRegistry>,
     /// Session registry - single source of truth for all sessions
@@ -475,6 +477,7 @@ impl AppState {
     ) -> Self {
         Self {
             agent_registry: Arc::new(crate::agent_runtime::AgentRegistry::default()),
+            shutdown: Arc::new(crate::shutdown::ShutdownCoordinator::default()),
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             signaling_status: Arc::new(crate::signaling::SignalingStatus::default()),

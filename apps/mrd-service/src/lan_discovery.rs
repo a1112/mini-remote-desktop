@@ -2583,6 +2583,7 @@ async fn handle_signed_remote_session_request(
     request: SignedLanSessionRequest,
     addr: SocketAddr,
 ) -> Result<()> {
+    let _admission = app_state.shutdown.admit()?;
     let received_at_ms = now_ms();
     let local_key_id = app_state
         .device_identities

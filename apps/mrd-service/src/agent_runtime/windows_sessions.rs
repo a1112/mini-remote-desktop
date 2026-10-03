@@ -145,6 +145,15 @@ struct ManagedAgent {
 // closed from a Tokio worker other than the launching thread.
 unsafe impl Send for ManagedAgent {}
 
+impl Drop for ManagedAgent {
+    fn drop(&mut self) {
+        self.connection_task.abort();
+        if !process_has_exited(&self.process) {
+            let _ = unsafe { TerminateProcess(*self.process, 1) };
+        }
+    }
+}
+
 impl WindowsSessionAgentSupervisor {
     pub fn new(
         registry: Arc<AgentRegistry>,
@@ -275,14 +284,14 @@ impl WindowsSessionAgentSupervisor {
             })
             .collect();
         for session_id in stale {
-            if let Some(managed) = self.agents.remove(&session_id) {
+            if let Some(mut managed) = self.agents.remove(&session_id) {
                 if !process_has_exited(&managed.process) {
                     let _ = unsafe { TerminateProcess(*managed.process, 1) };
                 }
                 if !managed.connection_task.is_finished() {
                     managed.connection_task.abort();
                 }
-                let _ = managed.connection_task.await;
+                let _ = (&mut managed.connection_task).await;
                 tracing::warn!(session_id, "restarting failed Session Agent generation");
             }
         }
@@ -302,7 +311,7 @@ impl WindowsSessionAgentSupervisor {
         reason: StopReason,
     ) -> Result<(), WindowsSessionAgentError> {
         self.desired_sessions.remove(&session_id);
-        let Some(managed) = self.agents.remove(&session_id) else {
+        let Some(mut managed) = self.agents.remove(&session_id) else {
             return Ok(());
         };
         if let Some(active) = self.registry.active_for_session_at(session_id, now_ms()?) {
@@ -315,11 +324,11 @@ impl WindowsSessionAgentSupervisor {
                 }),
             );
         }
-        wait_or_terminate(&managed.process, AGENT_STOP_TIMEOUT)?;
+        wait_or_terminate(&managed.process, AGENT_STOP_TIMEOUT).await?;
         if !managed.connection_task.is_finished() {
             managed.connection_task.abort();
         }
-        let _ = managed.connection_task.await;
+        let _ = (&mut managed.connection_task).await;
         tracing::info!(
             session_id,
             process_id = managed.process_id,
@@ -464,19 +473,26 @@ async fn bootstrap_and_serve(
     Ok(())
 }
 
-fn wait_or_terminate(
+async fn wait_or_terminate(
     process: &Owned<HANDLE>,
     timeout: Duration,
 ) -> Result<(), WindowsSessionAgentError> {
-    let timeout_ms = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-    match unsafe { WaitForSingleObject(**process, timeout_ms) } {
-        WAIT_OBJECT_0 => Ok(()),
-        WAIT_TIMEOUT => {
-            unsafe { TerminateProcess(**process, 1)? };
-            let _ = unsafe { WaitForSingleObject(**process, 2_000) };
-            Ok(())
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut terminated = false;
+    loop {
+        match unsafe { WaitForSingleObject(**process, 0) } {
+            WAIT_OBJECT_0 => return Ok(()),
+            WAIT_TIMEOUT if tokio::time::Instant::now() >= deadline => {
+                if terminated {
+                    return Ok(());
+                }
+                unsafe { TerminateProcess(**process, 1)? };
+                terminated = true;
+            }
+            WAIT_TIMEOUT => {}
+            _ => return Err(windows::core::Error::from_thread().into()),
         }
-        _ => Err(windows::core::Error::from_thread().into()),
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -518,6 +534,71 @@ fn wide_nul(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use windows::Win32::System::RemoteDesktop::WTSDisconnected;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_exit_wait_can_be_cancelled_by_service_cleanup_deadline() {
+        let event = unsafe {
+            Owned::new(
+                windows::Win32::System::Threading::CreateEventW(None, true, false, None).unwrap(),
+            )
+        };
+        let wait = wait_or_terminate(&event, Duration::from_secs(1));
+        assert!(tokio::time::timeout(Duration::from_millis(50), wait)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_agent_owner_terminates_process_and_connection_task() {
+        use std::os::windows::process::CommandExt;
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        struct ChildCleanup(std::process::Child);
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        let mut child = ChildCleanup(child);
+        let process = unsafe {
+            Owned::new(
+                OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, false, child.0.id()).unwrap(),
+            )
+        };
+        let connection_task =
+            tokio::spawn(std::future::pending::<Result<(), WindowsSessionAgentError>>());
+        let connection_abort = connection_task.abort_handle();
+        let managed = ManagedAgent {
+            process,
+            process_id: child.0.id(),
+            connection_task,
+        };
+        drop(managed);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while child.0.try_wait().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            child.0.try_wait().unwrap().is_some(),
+            "cancelled service left its Agent alive"
+        );
+        assert!(
+            connection_abort.is_finished(),
+            "cancelled service left its connection task alive"
+        );
+    }
 
     #[test]
     fn active_session_filter_rejects_session_zero() {

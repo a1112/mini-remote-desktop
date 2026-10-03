@@ -67,6 +67,7 @@ mrd-application = { path = "../../../crates/mrd-application" }
 mrd-service = { path = "../../mrd-service", features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
 mrd-capture-winrt = { path = "../../../crates/mrd-capture-winrt" }
 mrd-encode-nvenc-av1 = { path = "../../../crates/mrd-encode-nvenc-av1" }
 winreg = "0.52"
@@ -80,6 +81,7 @@ windows = { version = "0.52", features = [
   "Win32_Graphics_Gdi",
   "Win32_Graphics_OpenGL",
   "Win32_System_LibraryLoader",
+  "Win32_System_Threading",
   "Win32_UI_Input",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",

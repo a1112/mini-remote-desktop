@@ -300,6 +300,17 @@ describe('Tauri Adapter Contract', () => {
       });
     });
 
+    it('background service settings and confirmed termination use registered native commands', async () => {
+      const mockInvoke = getMockInvoke();
+      mockInvoke.mockResolvedValue({ enabled: true, supported: true });
+      await adapter.shellGetAutostartStatus();
+      await adapter.shellSetAutostart(false);
+      await adapter.serviceWaitForStopped(30);
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'shell_get_autostart_status', undefined);
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'shell_set_autostart', { enabled: false });
+      expect(mockInvoke).toHaveBeenNthCalledWith(3, 'service_wait_for_stopped', { timeoutSecs: 30 });
+    });
+
     it('deprecated lifecycle wrappers return errors instead of calling removed commands', async () => {
       const mockInvoke = getMockInvoke();
       mockInvoke.mockResolvedValue(true);

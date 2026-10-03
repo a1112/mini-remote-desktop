@@ -14,6 +14,10 @@ use std::path::PathBuf;
 pub mod macos;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(windows)]
+mod windows_autostart;
+#[cfg(windows)]
+pub use windows_autostart::WindowsAutostart;
 
 // ============================================================================
 // UI Launcher (Phase 3)
@@ -407,7 +411,7 @@ pub fn build_tray_model(
 /// Port for autostart operations
 ///
 /// Abstracts platform-specific autostart mechanisms.
-/// - Windows: Registry Run key (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)
+/// - Windows: Startup configuration of the installed SCM service
 /// - macOS: LaunchAgent or login item
 /// - Linux: XDG autostart desktop entry or systemd user service
 pub trait AutostartPort: Send + Sync {
@@ -422,60 +426,6 @@ pub trait AutostartPort: Send + Sync {
 
     /// Get the autostart entry name/identifier
     fn get_entry_name(&self) -> &str;
-}
-
-/// Windows autostart implementation using Registry
-#[cfg(windows)]
-pub struct WindowsAutostart {
-    entry_name: String,
-    executable_path: Option<PathBuf>,
-}
-
-#[cfg(windows)]
-impl WindowsAutostart {
-    pub fn new(entry_name: impl Into<String>) -> Self {
-        Self {
-            entry_name: entry_name.into(),
-            executable_path: None,
-        }
-    }
-
-    pub fn with_path(entry_name: impl Into<String>, executable_path: PathBuf) -> Self {
-        Self {
-            entry_name: entry_name.into(),
-            executable_path: Some(executable_path),
-        }
-    }
-
-    /// Get the Run key path for the current user
-    fn get_run_key_path() -> String {
-        r"Software\Microsoft\Windows\CurrentVersion\Run".to_string()
-    }
-}
-
-#[cfg(windows)]
-impl AutostartPort for WindowsAutostart {
-    fn is_enabled(&self) -> anyhow::Result<bool> {
-        // Phase 5: Placeholder - would read from Windows Registry
-        // using winreg crate or win32 API
-        tracing::info!("WindowsAutostart::is_enabled - placeholder");
-        Ok(false)
-    }
-
-    fn set_enabled(&self, enabled: bool) -> anyhow::Result<()> {
-        tracing::info!("WindowsAutostart::set_enabled: {} - placeholder", enabled);
-        // Phase 5: Placeholder - would write to Windows Registry
-        // HKCU\Software\Microsoft\Windows\CurrentVersion\Run
-        Ok(())
-    }
-
-    fn is_supported(&self) -> bool {
-        true
-    }
-
-    fn get_entry_name(&self) -> &str {
-        &self.entry_name
-    }
 }
 
 /// No-op autostart implementation for platforms without support

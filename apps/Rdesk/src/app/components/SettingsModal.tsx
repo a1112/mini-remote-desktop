@@ -23,6 +23,9 @@ import {
   ffmpegProbe,
   ffmpegResetGoldenSettings,
   getDecodePolicy,
+  getServiceAutostart,
+  setServiceAutostart,
+  quitUiAndStopService,
   setDecodePolicy,
   serviceHealthCheck,
   serviceRestart,
@@ -34,6 +37,7 @@ import {
   type DecoderPolicy,
   type FfmpegProbeResult,
 } from "../services/serviceLifecycleService";
+import type { AutostartStatus } from "../adapters/tauri";
 
 /**
  * Service status type (matches mrd-service lifecycle)
@@ -53,11 +57,21 @@ const decoderPolicyOptions: Array<{ value: DecoderPolicy; label: string }> = [
   { value: "nvdec", label: "nvdec" },
 ];
 
-function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) => void }) {
+function Toggle({ value, onChange, disabled = false, label }: {
+  value: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  label?: string;
+}) {
   return (
     <button
+      type="button"
+      role={label ? "switch" : undefined}
+      aria-label={label}
+      aria-checked={label ? value : undefined}
+      disabled={disabled}
       onClick={() => onChange(!value)}
-      className={`relative rounded-full transition-colors ${value ? "bg-blue-600" : "bg-gray-300"}`}
+      className={`relative rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${value ? "bg-blue-600" : "bg-gray-300"}`}
       style={{ height: 22, width: 40 }}
     >
       <div
@@ -128,7 +142,11 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
   const themeLabel = themeMap[globalTheme] || "浅色";
 
   // General
-  const [autoStart, setAutoStart] = useState(true);
+  const [autostartStatus, setAutostartStatus] = useState<AutostartStatus | null>(null);
+  const [autostartLoading, setAutostartLoading] = useState(true);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
+  const [quitLoading, setQuitLoading] = useState(false);
+  const [quitError, setQuitError] = useState<string | null>(null);
   const [minimizeToTray, setMinimizeToTray] = useState(true);
   const [language, setLanguage] = useState("简体中文");
 
@@ -187,6 +205,48 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
     if (!open) return;
     void refreshServiceStatus();
   }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    setAutostartLoading(true);
+    setAutostartError(null);
+    void getServiceAutostart().then((status) => {
+      if (active) setAutostartStatus(status);
+    }).catch((error) => {
+      if (active) {
+        setAutostartStatus(null);
+        setAutostartError(error instanceof Error ? error.message : "读取开机启动配置失败");
+      }
+    }).finally(() => {
+      if (active) setAutostartLoading(false);
+    });
+    return () => { active = false; };
+  }, [open]);
+
+  const updateAutostart = async (enabled: boolean) => {
+    setAutostartLoading(true);
+    setAutostartError(null);
+    try {
+      setAutostartStatus(await setServiceAutostart(enabled));
+    } catch (error) {
+      setAutostartError(error instanceof Error ? error.message : "保存开机启动配置失败");
+    } finally {
+      setAutostartLoading(false);
+    }
+  };
+
+  const quitAndStop = async () => {
+    setQuitLoading(true);
+    setQuitError(null);
+    try {
+      await quitUiAndStopService();
+    } catch (error) {
+      setQuitError(error instanceof Error ? error.message : "停止后台服务失败");
+    } finally {
+      setQuitLoading(false);
+    }
+  };
 
   const refreshServiceStatus = async () => {
     setServiceLoading(true);
@@ -388,9 +448,17 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
           <div className="flex-1 p-6 overflow-y-auto">
             {active === "general" && (
               <SettingsSection title="通用设置">
-                <SettingRow label="开机自动启动" description="系统启动时自动运行 RemoteDesk">
-                  <Toggle value={autoStart} onChange={setAutoStart} />
+                <SettingRow label="开机自动启动" description="系统启动时运行后台服务，未打开窗口也可接受连接">
+                  <Toggle
+                    label="后台服务开机启动"
+                    value={autostartStatus?.enabled ?? false}
+                    disabled={autostartLoading || !autostartStatus?.supported || quitLoading}
+                    onChange={(enabled) => void updateAutostart(enabled)}
+                  />
                 </SettingRow>
+                {autostartLoading && <p className={textSecondary} style={{ fontSize: 12 }}>正在读取或保存开机启动配置…</p>}
+                {autostartStatus?.supported === false && <p className={textSecondary} style={{ fontSize: 12 }}>当前运行方式不支持开机启动，请先安装后台服务。</p>}
+                {autostartError && <p role="alert" className="text-red-500" style={{ fontSize: 12 }}>{autostartError}</p>}
                 <SettingRow label="最小化到托盘" description="关闭窗口时最小化而非退出">
                   <Toggle value={minimizeToTray} onChange={setMinimizeToTray} />
                 </SettingRow>
@@ -404,6 +472,12 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
                     onChange={(v) => setGlobalTheme(reverseThemeMap[v] || "light")}
                   />
                 </SettingRow>
+                <SettingRow label="退出并停止后台服务" description="结束当前远程连接，确认服务停止后退出窗口">
+                  <ActionButton isDark={isDark} disabled={quitLoading || serviceLoading || autostartLoading} onClick={() => void quitAndStop()}>
+                    {quitLoading ? "正在停止…" : "退出并停止后台服务"}
+                  </ActionButton>
+                </SettingRow>
+                {quitError && <p role="alert" className="text-red-500" style={{ fontSize: 12 }}>{quitError}</p>}
               </SettingsSection>
             )}
 
