@@ -85,10 +85,9 @@ async fn run_service(
     initialize_application_state(&app_state, &tray).await;
 
     let issuer = Arc::new(new_execute_grant_issuer()?);
-    app_state
-        .agent_registry
-        .invalidate_all()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // AppState owns a fresh, empty registry; the new issuer invalidates grants
+    // from earlier service processes. invalidate_all permanently closes admission
+    // and is reserved for terminal security failures, not ordinary startup.
     let agent_server = Arc::new(AgentServer::new(Arc::clone(&app_state.agent_registry)));
     app_state.bind_agent_media_server(Arc::clone(&agent_server));
     let mut agents = if mode == RunMode::WindowsService {

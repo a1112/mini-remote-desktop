@@ -28,9 +28,10 @@ function Assert-Administrator {
 
 function Invoke-Sc {
     param([Parameter(Mandatory)][string[]]$Arguments)
-    & "$env:SystemRoot\System32\sc.exe" @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe failed ($LASTEXITCODE): $($Arguments -join ' ')"
+    $result = Invoke-MrdNativeCommand -FilePath "$env:SystemRoot\System32\sc.exe" -Arguments $Arguments
+    if ($result.Stdout) { $result.Stdout -split '\r?\n' | Where-Object { $_ } | Write-Output }
+    if ($result.ExitCode -ne 0) {
+        throw "sc.exe failed ($($result.ExitCode)): $($Arguments -join ' ')"
     }
 }
 
@@ -118,15 +119,15 @@ if ($PSCmdlet.ShouldProcess($serviceName, "Install or update background service 
     } -Configure {
         if ($existing) {
             # Updating must preserve the user's autostart setting and service account.
-            Invoke-Sc @('config', $serviceName, "binPath= $binaryPath", 'DisplayName= Mini Remote Desktop Service')
+            Invoke-Sc @('config', $serviceName, 'binPath=', $binaryPath, 'DisplayName=', 'Mini Remote Desktop Service')
         } else {
-            Invoke-Sc @('create', $serviceName, "binPath= $binaryPath", 'type= own', 'start= auto', 'obj= LocalSystem', 'DisplayName= Mini Remote Desktop Service')
+            Invoke-Sc @('create', $serviceName, 'binPath=', $binaryPath, 'type=', 'own', 'start=', 'auto', 'obj=', 'LocalSystem', 'DisplayName=', 'Mini Remote Desktop Service')
             $upgradeState.CreatedService = $true
         }
         Invoke-Sc @('sidtype', $serviceName, 'unrestricted')
-        Invoke-Sc @('failure', $serviceName, 'reset= 86400', 'actions= restart/5000/restart/15000/none/0')
+        Invoke-Sc @('failure', $serviceName, 'reset=', '86400', 'actions=', 'restart/5000/restart/15000/none/0')
         Invoke-Sc @('failureflag', $serviceName, '1')
-        Invoke-Sc @('preshutdown', $serviceName, '30000')
+        Set-MrdServicePreshutdownTimeout -ServiceName $serviceName -Milliseconds 30000
         Invoke-Sc @('description', $serviceName, 'Mini Remote Desktop machine service and interactive Session Agent supervisor')
         $oldSddl = Get-ServiceSddl
         $newSddl = Add-MrdInteractiveServiceStartPermission -Sddl $oldSddl
@@ -150,7 +151,7 @@ if ($PSCmdlet.ShouldProcess($serviceName, "Install or update background service 
         }
         if ($existing -and $existingConfig) {
             $oldStartType = switch ($existingConfig.StartMode) { 'Auto' { 'auto' }; 'Manual' { 'demand' }; 'Disabled' { 'disabled' }; default { throw "Unknown original startup mode: $($existingConfig.StartMode)" } }
-            Invoke-Sc @('config', $serviceName, "binPath= $($existingConfig.PathName)", "start= $oldStartType")
+            Invoke-Sc @('config', $serviceName, 'binPath=', $existingConfig.PathName, 'start=', $oldStartType)
             if ($upgradeState.OldSddl) { Invoke-Sc @('sdset', $serviceName, $upgradeState.OldSddl) }
             if ($wasRunning) {
                 Start-Service -Name $serviceName

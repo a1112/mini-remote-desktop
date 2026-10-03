@@ -368,6 +368,9 @@ fn launch_process_in_session(
     let mut raw_token = HANDLE::default();
     unsafe { WTSQueryUserToken(session_id, &mut raw_token)? };
     let token = unsafe { Owned::new(raw_token) };
+    // Grant before process creation: the Agent checks its parent immediately.
+    super::windows_pipe::allow_service_identity_query_for_token(&token)
+        .map_err(|error| WindowsSessionAgentError::Pipe(error.to_string()))?;
     let mut environment: *mut c_void = std::ptr::null_mut();
     unsafe { CreateEnvironmentBlock(&mut environment, Some(*token), false)? };
     let environment = EnvironmentBlock(environment);

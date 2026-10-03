@@ -17,14 +17,16 @@ use windows::{
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SDDL_REVISION_1,
+                GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
+                GRANT_ACCESS, SDDL_REVISION_1, SE_KERNEL_OBJECT, TRUSTEE_IS_SID,
+                TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
             },
             CheckTokenMembership, CreateWellKnownSid, GetLengthSid, GetTokenInformation,
             IsValidSecurityDescriptor, IsValidSid, RevertToSelf, SecurityAnonymous,
             TokenImpersonationLevel, TokenLogonSid, TokenSessionId, TokenUser, WinAnonymousSid,
-            WinInteractiveSid, WinNetworkSid, WinRemoteLogonIdSid, PSECURITY_DESCRIPTOR, PSID,
-            SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
-            TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
+            WinInteractiveSid, WinNetworkSid, WinRemoteLogonIdSid, ACL, DACL_SECURITY_INFORMATION,
+            PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
+            SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
         },
         System::{
             Pipes::{
@@ -44,6 +46,69 @@ const MAX_PIPE_NAME_BYTES: usize = 512;
 const MAX_TOKEN_INFORMATION_BYTES: usize = 64 * 1024;
 const SECURITY_MAX_SID_SIZE: usize = 68;
 const AGENT_PIPE_ACCESS_MASK: u32 = 0x0010_0183;
+
+/// Let the launched logon verify the service PID and creation time before bootstrap.
+/// Preserve the service DACL and grant only limited process metadata queries.
+pub(super) fn allow_service_identity_query_for_token(
+    token: &Owned<HANDLE>,
+) -> Result<(), WindowsAgentPipeError> {
+    let logon_sid = token_logon_sid(token)?;
+    let process = unsafe { GetCurrentProcess() };
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let mut existing_dacl: *mut ACL = ptr::null_mut();
+    unsafe {
+        GetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(&mut existing_dacl),
+            None,
+            Some(&mut descriptor),
+        )
+        .ok()?;
+    }
+    if descriptor.0.is_null() {
+        return Err(WindowsAgentPipeError::InvalidTokenInformation);
+    }
+    // SAFETY: GetSecurityInfo returned LocalAlloc-owned memory containing the DACL.
+    let _descriptor = unsafe { Owned::new(HLOCAL(descriptor.0)) };
+    if existing_dacl.is_null() {
+        return Err(WindowsAgentPipeError::InvalidTokenInformation);
+    }
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: PROCESS_QUERY_LIMITED_INFORMATION.0,
+        grfAccessMode: GRANT_ACCESS,
+        Trustee: TRUSTEE_W {
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: PWSTR(logon_sid.as_ptr().cast_mut().cast()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut new_dacl: *mut ACL = ptr::null_mut();
+    unsafe { SetEntriesInAclW(Some(&[entry]), Some(existing_dacl), &mut new_dacl).ok()? };
+    if new_dacl.is_null() {
+        return Err(WindowsAgentPipeError::InvalidTokenInformation);
+    }
+    // SAFETY: SetEntriesInAclW returned LocalAlloc-owned memory.
+    let _new_dacl = unsafe { Owned::new(HLOCAL(new_dacl.cast())) };
+    unsafe {
+        SetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_dacl),
+            None,
+        )
+        .ok()?;
+    }
+    Ok(())
+}
 
 /// Failures creating a protected pipe or verifying its connected peer.
 #[derive(Debug, Error)]

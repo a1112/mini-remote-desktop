@@ -66,7 +66,49 @@ function Test-RollbackFailureIsVisible {
     }
 }
 
-$tests = @('Test-InteractiveGrant', 'Test-MinimalGrantBeforeInheritedAcl', 'Test-UpgradeOrdering', 'Test-UpgradeRollback', 'Test-RollbackFailureIsVisible')
+function Test-NativeArgumentsRoundTrip {
+    $fixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ('mrd-native-argv-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
+    try {
+        $fixtureSource = Join-Path $fixtureDirectory 'Arguments.cs'
+        $fixtureExecutable = Join-Path $fixtureDirectory 'Arguments.exe'
+        @'
+using System;
+using System.Text;
+class Arguments {
+    public static void Main(string[] args) {
+        foreach (string arg in args) Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(arg)));
+    }
+}
+'@ | Set-Content -LiteralPath $fixtureSource -Encoding UTF8
+        $compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        & $compiler /nologo /target:exe ("/out:$fixtureExecutable") $fixtureSource
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot compile native argument fixture' }
+        $expected = @('config', 'MiniRemoteDesktop', 'binPath=', '"C:\Program Files\MiniRemoteDesktop\mrd-service.exe" --service', 'DisplayName=', 'Mini Remote Desktop Service', '', 'C:\trailing\', 'quoted\"value')
+        $result = Invoke-MrdNativeCommand -FilePath $fixtureExecutable -Arguments $expected
+        Assert-Equal $result.ExitCode 0 'Native fixture must exit successfully'
+        $actual = @($result.Stdout -split '\r?\n' | Select-Object -SkipLast 1)
+        Assert-Equal $actual.Count $expected.Count 'Native option/value boundaries must be preserved'
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($actual[$index]))
+            Assert-Equal $decoded $expected[$index] "Native argument $index must survive Windows command-line parsing"
+        }
+    } finally {
+        # Delete only the freshly created fixture under the resolved system temp directory.
+        $resolvedFixture = [IO.Path]::GetFullPath($fixtureDirectory)
+        $resolvedTemp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedFixture.StartsWith($resolvedTemp, [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture cleanup is outside temp' }
+        Remove-Item -LiteralPath $resolvedFixture -Recurse -Force
+    }
+}
+
+function Test-PreshutdownQueryUsesServiceApi {
+    # EventLog is a standard Windows service; this probe changes no configuration.
+    $timeout = Get-MrdServicePreshutdownTimeout -ServiceName 'EventLog'
+    Assert-Equal ($timeout -is [uint32]) $true 'Service API must return a typed timeout'
+}
+
+$tests = @('Test-InteractiveGrant', 'Test-MinimalGrantBeforeInheritedAcl', 'Test-UpgradeOrdering', 'Test-UpgradeRollback', 'Test-RollbackFailureIsVisible', 'Test-NativeArgumentsRoundTrip', 'Test-PreshutdownQueryUsesServiceApi')
 $failures = 0
 foreach ($test in $tests) {
     try { & $test; Write-Output "PASS $test" }
