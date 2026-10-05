@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { join, resolve } from 'node:path';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 
 const smoke = await import('./smoke-macos-service.mjs').catch((error) => error);
@@ -49,4 +51,52 @@ test('UI contents are derived from the outer Rdesk bundle, with standalone servi
   assert.equal(derive(service), join(bundle, 'Contents'));
   assert.throws(() => derive(join(bundle, 'Contents', 'MacOS', 'mrd-service')));
   assert.throws(() => derive(join(bundle, 'Contents', 'Resources', 'MrdService.app', 'Contents', 'MacOS', 'app')));
+});
+
+test('prepared window helper requires an owner-only directory and regular executable owned by the runner', () => {
+  const verify = contract('assertPreparedWindowHelperMetadata');
+  const directory = { uid: 501, mode: 0o40700, isDirectory: () => true };
+  const executable = { uid: 501, mode: 0o100700, isFile: () => true };
+  assert.doesNotThrow(() => verify(executable, directory, 501));
+  for (const changed of [
+    { ...directory, uid: 502 },
+    { ...directory, mode: 0o40755 },
+    { ...directory, isDirectory: () => false },
+  ]) assert.throws(() => verify(executable, changed, 501));
+  for (const changed of [
+    { ...executable, uid: 502 },
+    { ...executable, mode: 0o100755 },
+    { ...executable, mode: 0o100600 },
+    { ...executable, isFile: () => false },
+  ]) assert.throws(() => verify(changed, directory, 501));
+});
+
+function privateFixture(testContext) {
+  const root = mkdtempSync(join(tmpdir(), 'mrd-prepared-helper-test-'));
+  testContext.after(() => {
+    assert.equal(dirname(root), resolve(tmpdir()));
+    assert.match(basename(root), /^mrd-prepared-helper-test-/);
+    rmSync(root, { recursive: true, force: true });
+  });
+  return root;
+}
+
+test('missing or implicit prepared helper paths are rejected before the service can start', (context) => {
+  const verify = contract('validatePreparedWindowHelper');
+  const root = privateFixture(context);
+  assert.throws(() => verify(undefined, 501));
+  assert.throws(() => verify('', 501));
+  assert.throws(() => verify('window-check', 501));
+  assert.throws(() => verify(join(root, 'window-check'), 501), { code: 'ENOENT' });
+});
+
+test('a symlinked prepared helper directory is rejected', (context) => {
+  const verify = contract('validatePreparedWindowHelper');
+  const root = privateFixture(context);
+  const realDirectory = join(root, 'real');
+  mkdirSync(realDirectory, { mode: 0o700 });
+  writeFileSync(join(realDirectory, 'window-check'), 'fixture', { mode: 0o700 });
+  const linkDirectory = join(root, 'linked');
+  symlinkSync(realDirectory, linkDirectory, 'junction');
+  assert.throws(() => verify(join(linkDirectory, 'window-check'), 501), /regular directory/);
 });

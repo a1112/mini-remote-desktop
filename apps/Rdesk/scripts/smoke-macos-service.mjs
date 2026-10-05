@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { lstatSync, mkdtempSync, rmSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { connect } from 'node:net';
-import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 const runFile = promisify(execFile);
@@ -34,6 +33,24 @@ export function assertOwnedChildAlive(child, label) {
   assert.equal(child.signalCode, null, `${label} terminated before readiness`);
 }
 
+export function assertPreparedWindowHelperMetadata(executable, directory, ownerUid) {
+  assert.ok(Number.isSafeInteger(ownerUid) && ownerUid >= 0, 'Invalid helper owner UID');
+  assert.equal(directory.isDirectory(), true, 'Helper directory must be a regular directory');
+  assert.equal(directory.uid, ownerUid, 'Helper directory belongs to another user');
+  assert.equal(directory.mode & 0o777, 0o700, 'Helper directory must be owner-only');
+  assert.equal(executable.isFile(), true, 'Prepared helper must be a regular file');
+  assert.equal(executable.uid, ownerUid, 'Prepared helper belongs to another user');
+  assert.equal(executable.mode & 0o777, 0o700, 'Prepared helper must be owner-only and executable');
+}
+
+export function validatePreparedWindowHelper(path, ownerUid) {
+  assert.ok(typeof path === 'string' && path.length > 0 && isAbsolute(path),
+    'An explicit absolute prepared window helper path is required');
+  const windowHelper = resolve(path);
+  assertPreparedWindowHelperMetadata(lstatSync(windowHelper), lstatSync(dirname(windowHelper)), ownerUid);
+  return windowHelper;
+}
+
 export function bundledUIContents(executable) {
   executable = resolve(executable);
   const serviceBundle = resolve(dirname(executable), '../..');
@@ -48,7 +65,7 @@ export function bundledUIContents(executable) {
   return join(bundle, 'Contents');
 }
 
-async function verifyBundledUI(executable, servicePid, management) {
+async function verifyBundledUI(executable, servicePid, management, windowHelper) {
   const uiContents = bundledUIContents(executable);
   const { stdout } = await runFile('/usr/libexec/PlistBuddy', [
     '-c', 'Print :CFBundleExecutable', join(uiContents, 'Info.plist'),
@@ -58,22 +75,12 @@ async function verifyBundledUI(executable, servicePid, management) {
   const uiExecutable = join(uiContents, 'MacOS', executableName);
   assert.equal(lstatSync(uiExecutable).isFile(), true);
 
-  const helperDirectory = mkdtempSync(join(tmpdir(), 'mrd-ui-window-smoke-'));
-  const helperMetadata = lstatSync(helperDirectory);
-  assert.equal(helperMetadata.uid, process.geteuid());
-  assert.equal(helperMetadata.mode & 0o777, 0o700);
-  const windowHelper = join(helperDirectory, 'window-check');
+  validatePreparedWindowHelper(windowHelper, process.geteuid());
   let child;
   let exited;
   const logs = [];
   let logBytes = 0;
   try {
-    // Reads window metadata only. It does not request screen capture, inject
-    // input, automate another app, or change any macOS privacy permission.
-    await runFile('/usr/bin/xcrun', [
-      'swiftc', join(dirname(fileURLToPath(import.meta.url)), 'smoke-macos-ui-window.swift'),
-      '-o', windowHelper,
-    ], { timeout: 30_000, maxBuffer: 64 * 1024 });
     child = spawn(uiExecutable, [], { stdio: ['ignore', 'pipe', 'pipe'] });
     exited = new Promise((resolveExit) => {
       child.once('error', (error) => resolveExit({ error }));
@@ -133,7 +140,6 @@ async function verifyBundledUI(executable, servicePid, management) {
       }
       assert.ok(child.exitCode !== null || child.signalCode !== null, 'Owned UI process did not exit during cleanup');
     }
-    rmSync(helperDirectory, { recursive: true, force: true });
   }
   console.log('Native macOS bundled UI: exact PID registration and visible layer-zero window passed.');
 }
@@ -168,7 +174,7 @@ function request(path, message) {
   });
 }
 
-async function verifyOneStart(executable, verifyUI = false) {
+async function verifyOneStart(executable, windowHelper) {
   const endpoint = `/tmp/mrd-service-${process.geteuid()}/service.sock`;
   const management = endpoint.replace(/\.sock$/, '-management.sock');
   const child = spawn(executable, [], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -206,7 +212,7 @@ async function verifyOneStart(executable, verifyUI = false) {
     assert.equal(identity.snapshot.consent_required, true);
     const status = await request(management, { type: 'GetPublicServerStatus' });
     assert.equal(status.type, 'PublicServerStatus');
-    if (verifyUI) await verifyBundledUI(executable, child.pid, management);
+    if (windowHelper) await verifyBundledUI(executable, child.pid, management, windowHelper);
     const stopped = await request(management, { type: 'ShutdownService', mode: 'graceful' });
     assert.equal(stopped.type, 'Ack');
     const result = await Promise.race([exited, sleep(15_000, undefined, { ref: false }).then(() => { throw new Error('Service stop deadline exceeded'); })]);
@@ -230,8 +236,9 @@ async function verifyOneStart(executable, verifyUI = false) {
 async function runSmoke() {
   if (process.platform !== 'darwin') throw new Error('Native macOS runtime verification is required.');
   const executable = resolve(process.argv[2] ?? '');
+  const windowHelper = validatePreparedWindowHelper(process.argv[3], process.geteuid());
   const first = await verifyOneStart(executable);
-  const second = await verifyOneStart(executable, true);
+  const second = await verifyOneStart(executable, windowHelper);
   assert.ok(second === first, 'Protected machine identity changed after service restart');
   console.log('Native macOS service: healthy IPC, owner-only sockets, protected identity persistence, and graceful restart passed.');
 }

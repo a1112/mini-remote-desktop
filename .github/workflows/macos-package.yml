@@ -56,16 +56,44 @@ jobs:
       - name: Install frontend dependencies
         working-directory: apps/Rdesk
         run: pnpm install --frozen-lockfile
-      - name: Verify production bundle layout contract
-        run: node --test apps/Rdesk/scripts/verify-macos-bundle.test.mjs
+      - name: Verify production bundle and native smoke contracts
+        run: node --test apps/Rdesk/scripts/verify-macos-bundle.test.mjs apps/Rdesk/scripts/smoke-macos-service.test.mjs
       - name: Verify registration and protected storage
         run: cargo test --locked -p mrd-device-registration -p mrd-store-sqlite -p mrd-ipc
       - name: Verify real AppKit viewport input routing
         run: cargo run --locked --manifest-path tests/macos-native-surface-proof/Cargo.toml
+      - name: Prepare native UI window smoke helper
+        id: ui_window_helper
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_directory="$(mktemp -d "$RUNNER_TEMP/mrd-ui-window-smoke.XXXXXX")"
+          module_cache="$helper_directory/module-cache"
+          helper_executable="$helper_directory/window-check"
+          mkdir -m 700 "$module_cache"
+          started_seconds=$SECONDS
+          printf 'Native window helper cold compile started: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf 'Native window helper output: %s\n' "$helper_executable"
+          set +e
+          /usr/bin/time -p /usr/bin/xcrun swiftc \
+            apps/Rdesk/scripts/smoke-macos-ui-window.swift \
+            -module-cache-path "$module_cache" -o "$helper_executable"
+          compile_status=$?
+          set -e
+          printf 'Native window helper cold compile finished: elapsed=%ss exit=%s\n' \
+            "$((SECONDS - started_seconds))" "$compile_status"
+          if [ "$compile_status" -ne 0 ]; then exit "$compile_status"; fi
+          chmod 700 "$helper_executable"
+          node --input-type=module -e 'import { validatePreparedWindowHelper } from "./apps/Rdesk/scripts/smoke-macos-service.mjs"; validatePreparedWindowHelper(process.argv[1], process.geteuid());' "$helper_executable"
+          /usr/bin/file "$helper_executable"
+          printf 'helper=%s\n' "$helper_executable" >> "$GITHUB_OUTPUT"
       - name: Build client and embedded resident service
         run: bash scripts/packaging/build_macos_client.sh
       - name: Verify real native service startup and restart
         shell: bash
+        env:
+          MRD_WINDOW_HELPER: ${{ steps.ui_window_helper.outputs.helper }}
         run: |
           set -euo pipefail
           original_keychain=$(security default-keychain -d user | sed 's/^ *"//;s/" *$//')
@@ -77,7 +105,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$smoke_keychain"
           security default-keychain -d user -s "$smoke_keychain"
           unset keychain_password
-          node apps/Rdesk/scripts/smoke-macos-service.mjs target/release/bundle/macos/Rdesk.app/Contents/Resources/MrdService.app/Contents/MacOS/mrd-service
+          node apps/Rdesk/scripts/smoke-macos-service.mjs target/release/bundle/macos/Rdesk.app/Contents/Resources/MrdService.app/Contents/MacOS/mrd-service "$MRD_WINDOW_HELPER"
       - name: Upload downloadable client
         uses: actions/upload-artifact@v4
         with:
