@@ -652,10 +652,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn unix_socket_ipc_roundtrip() -> Result<()> {
-        use tokio::time::{sleep, Duration};
-
-        let server_handle = tokio::spawn(async {
-            let server = IpcServer::bind().await?;
+        let directory = private_test_directory("roundtrip");
+        let endpoint = IpcEndpoint::unix_socket(directory.join("service.sock").to_string_lossy());
+        let server = IpcServer::bind_with_endpoint(endpoint.clone()).await?;
+        let server_handle = tokio::spawn(async move {
             let mut stream = server.accept().await?;
 
             let request = stream.recv_request().await?;
@@ -666,14 +666,14 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
 
-        sleep(Duration::from_millis(100)).await;
-
-        let mut stream = IpcClient::connect().await?;
+        let mut stream = IpcClient::connect_with_endpoint(&endpoint).await?;
         stream.send_request(&IpcRequest::ListDevices).await?;
         let response = stream.recv_response().await?;
         assert!(matches!(response, IpcResponse::DeviceList { .. }));
 
+        drop(stream);
         server_handle.await??;
+        std::fs::remove_dir(directory)?;
         Ok(())
     }
 
@@ -740,25 +740,41 @@ mod tests {
 
     #[cfg(unix)]
     fn private_test_directory(name: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::DirBuilderExt;
-        let path = std::env::temp_dir().join(format!(
-            "mrd-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .unwrap();
+        use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+        // macOS temp_dir() uses a long /var/folders path. mkdtemp atomically
+        // creates a fresh 0700 directory under short /tmp without env overrides.
+        let mut template = std::ffi::CString::new(format!("/tmp/mrd-{name}-XXXXXX"))
+            .unwrap()
+            .into_bytes_with_nul();
+        let created = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
+        assert!(
+            !created.is_null(),
+            "private IPC fixture directory creation failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let path = std::path::PathBuf::from(
+            unsafe { std::ffi::CStr::from_ptr(created) }
+                .to_str()
+                .unwrap(),
+        );
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert!(
+            path.join("management.sock-link")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                < 104
+        );
         path
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_management_socket_can_restart_and_recover_an_owned_stale_socket() {
+        use std::os::unix::fs::PermissionsExt;
         let directory = private_test_directory("management-restart");
         let path = directory
             .join("management.sock")
@@ -778,6 +794,7 @@ mod tests {
             .unwrap();
         drop(second);
         let stale = UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         drop(stale);
         let recovered = IpcServer::bind_management_with_endpoint(endpoint)
             .await
