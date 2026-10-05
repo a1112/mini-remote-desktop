@@ -21,7 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         None => RealtimeCore::new(config.core.clone(), Arc::new(token_verifier))?,
     };
-    let state = RealtimeAppState::new(core, config.clone());
+    let state =
+        RealtimeAppState::new(core, config.clone()).with_presence_authorization_from_env()?;
     let _pruner = state.spawn_pruner();
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;

@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState } from "react";
-import { ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
+import { ipcBindPublicDevice, ipcUnbindPublicDevice, ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
 import { DEFAULT_PUBLIC_API_URL, DEVICE_REGISTRATION_MODE, SERVER_API_URL } from "./serverConfig";
 
@@ -56,6 +56,7 @@ const API_BASE = SERVER_API_URL;
 class DeviceRegistrationService {
   private deviceInfo: StoredDeviceInfo | null = null;
   private registrationError: string | null = null;
+  private bindingError: string | null = null;
   private initPromise: Promise<StoredDeviceInfo | null> | null = null;
 
   /**
@@ -130,7 +131,9 @@ class DeviceRegistrationService {
     const hardwareInfo = await this.getHardwareInfo();
     const registration = await this.registerDevice(hardwareInfo, { enrollmentToken: enrollmentToken.trim() }, deviceName);
     this.registrationError = null;
-    return this.saveServerDeviceInfo(hardwareInfo, registration);
+    const info = this.saveServerDeviceInfo(hardwareInfo, registration);
+    await this.bindManagedDeviceIfLoggedIn();
+    return info;
   }
 
   async recoverDeviceCredential(deviceToken: string): Promise<StoredDeviceInfo> {
@@ -145,7 +148,9 @@ class DeviceRegistrationService {
       throw new Error("服务器返回的设备身份不匹配，请联系管理员");
     }
     this.registrationError = null;
-    return this.saveServerDeviceInfo(hardwareInfo, registration, stored?.registered_at);
+    const info = this.saveServerDeviceInfo(hardwareInfo, registration, stored?.registered_at);
+    await this.bindManagedDeviceIfLoggedIn();
+    return info;
   }
 
   private saveServerDeviceInfo(hardwareInfo: HardwareInfo, registration: DeviceRegistrationResponse, registeredAt?: string): StoredDeviceInfo {
@@ -183,6 +188,7 @@ class DeviceRegistrationService {
       };
       this.saveDeviceInfo(info);
       this.deviceInfo = info;
+      await this.bindManagedDeviceIfLoggedIn();
       return info;
     } catch {
       this.registrationError = "无法读取本机设备登记状态，请确认后台服务已启动后重试";
@@ -193,7 +199,18 @@ class DeviceRegistrationService {
   }
 
   getRegistrationError(): string | null {
-    return this.registrationError;
+    return this.registrationError ?? this.bindingError;
+  }
+
+  private recordBindingError(message: string | null): void {
+    this.bindingError = message;
+    window.dispatchEvent(new Event("rdesk:device-binding-changed"));
+  }
+
+  private async bindManagedDeviceIfLoggedIn(): Promise<void> {
+    if (this.deviceInfo?.access_token === SERVICE_MANAGED_TOKEN && this.getUserAccessToken()) {
+      await this.bindDevice("");
+    }
   }
 
   private shouldUseServerRegistration(): boolean {
@@ -373,9 +390,23 @@ class DeviceRegistrationService {
     kickedUser?: { user_id: string; kicked_at: string } | null;
     isNewBinding?: boolean;
   }> {
+    if (!this.deviceInfo && this.initPromise) await this.initPromise;
     if (!this.deviceInfo) {
-      console.warn("[DeviceService] 设备未注册，无法绑定");
-      return { success: false, message: "设备未注册" };
+      return { success: false, message: "登记设备后将自动绑定当前登录账户" };
+    }
+    if (this.deviceInfo.access_token === SERVICE_MANAGED_TOKEN || this.shouldUseServiceManagedRegistration()) {
+      const userToken = this.getUserAccessToken();
+      if (!userToken) return { success: false, message: "请先登录再绑定本机设备" };
+      try {
+        const result = await ipcBindPublicDevice(userToken);
+        const message = result.ok ? "本机设备已绑定当前账户" : result.error.message;
+        this.recordBindingError(result.ok ? null : message);
+        return { success: result.ok, message };
+      } catch {
+        const message = "无法绑定本机设备，请确认后台服务已启动后重试";
+        this.recordBindingError(message);
+        return { success: false, message };
+      }
     }
 
     try {
@@ -385,6 +416,7 @@ class DeviceRegistrationService {
         headers: {
           "Content-Type": "application/json",
           ...(userToken ? { "Authorization": `Bearer ${userToken}` } : {}),
+          "X-Rdesk-Device-Authorization": `Bearer ${this.deviceInfo.access_token}`,
         },
         body: JSON.stringify({
           device_id: this.deviceInfo.device_id,
@@ -393,16 +425,12 @@ class DeviceRegistrationService {
       });
 
       if (!response.ok) {
-        const error = await response.text();
-        console.error("[DeviceService] 绑定失败:", error);
-        return { success: false, message: `绑定失败: ${error}` };
+        return { success: false, message: "设备绑定失败，请重新登录后重试" };
       }
 
       const data = await response.json();
-      console.log("[DeviceService] 设备绑定成功:", data);
       return data;
-    } catch (e) {
-      console.error("[DeviceService] 绑定请求失败:", e);
+    } catch {
       return { success: false, message: "网络错误" };
     }
   }
@@ -448,10 +476,27 @@ class DeviceRegistrationService {
    * @returns 解绑结果
    */
   async unbindDevice(userId: string, deviceId?: string): Promise<boolean> {
+    if (!this.deviceInfo && this.initPromise) await this.initPromise;
     const targetDeviceId = deviceId ?? this.deviceInfo?.device_id;
     if (!targetDeviceId) {
       console.warn("[DeviceService] 设备未注册，无法解绑");
       return false;
+    }
+    if (this.deviceInfo?.access_token === SERVICE_MANAGED_TOKEN || this.shouldUseServiceManagedRegistration()) {
+      if (targetDeviceId !== this.deviceInfo?.device_id) {
+        this.recordBindingError("后台服务只允许解绑当前本机设备");
+        return false;
+      }
+      const userToken = this.getUserAccessToken();
+      if (!userToken) return false;
+      try {
+        const result = await ipcUnbindPublicDevice(userToken);
+        this.recordBindingError(result.ok ? null : result.error.message);
+        return result.ok;
+      } catch {
+        this.recordBindingError("无法解绑本机设备，请确认后台服务已启动后重试");
+        return false;
+      }
     }
 
     try {
@@ -461,6 +506,7 @@ class DeviceRegistrationService {
         headers: {
           "Content-Type": "application/json",
           ...(userToken ? { "Authorization": `Bearer ${userToken}` } : {}),
+          ...(targetDeviceId === this.deviceInfo?.device_id ? { "X-Rdesk-Device-Authorization": `Bearer ${this.deviceInfo.access_token}` } : {}),
         },
         body: JSON.stringify({
           device_id: targetDeviceId,
@@ -469,14 +515,11 @@ class DeviceRegistrationService {
       });
 
       if (!response.ok) {
-        console.error("[DeviceService] 解绑失败:", await response.text());
         return false;
       }
 
-      console.log("[DeviceService] 设备解绑成功");
       return true;
-    } catch (e) {
-      console.error("[DeviceService] 解绑请求失败:", e);
+    } catch {
       return false;
     }
   }
@@ -545,10 +588,13 @@ export function useDeviceRegistration() {
   };
 
   useEffect(() => {
+    const onBindingChanged = () => updateInfo(deviceService.getDeviceInfo());
+    window.addEventListener("rdesk:device-binding-changed", onBindingChanged);
     deviceService.initialize().then((info) => {
       updateInfo(info);
       setIsLoading(false);
     });
+    return () => window.removeEventListener("rdesk:device-binding-changed", onBindingChanged);
   }, []);
 
   return {

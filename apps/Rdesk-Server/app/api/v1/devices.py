@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
     DeviceRefreshIdentity,
+    DeviceAuthSnapshot,
     capture_device_auth_snapshot,
     create_device_access_token,
     create_device_refresh_token,
@@ -48,6 +49,7 @@ from app.services.device_enrollment import (
     DeviceEnrollmentService,
     device_serial_digest,
 )
+from app.services.realtime_presence import DevicePresence, query_realtime_presence
 
 router = APIRouter(
     prefix="/devices",
@@ -78,6 +80,14 @@ def _to_out(device: Device) -> DeviceOut:
         favorite=device.favorite,
         is_bound=device.is_bound,
     )
+
+
+def _with_presence(device: DeviceOut, presence: DevicePresence) -> DeviceOut:
+    seen = presence.last_seen_ms
+    last_seen = "离线" if seen is None else datetime.fromtimestamp(
+        seen // 1000, UTC
+    ).replace(microsecond=(seen % 1000) * 1000).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return device.model_copy(update={"status": "online" if presence.online else "offline", "last_seen": last_seen})
 
 
 @router.post(
@@ -309,12 +319,14 @@ async def bind_device(
 
     将设备与用户账户绑定，绑定后只有该用户可以访问此设备。
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     device, _ = await bind_device_owner(
         db,
         device_id=payload.device_id,
         current_user=current_user,
         now=datetime.now(UTC),
+        authenticated=authenticated,
     )
     await _commit(db)
 
@@ -351,6 +363,9 @@ async def list_devices(
             and item.tenant_id == current_user.tenant_id
         ]
     result = [_to_out(item) for item in rows]
+    presence = await query_realtime_presence([item.device_id for item in rows])
+    if presence is not None:
+        result = [_with_presence(item, presence.get(item.device_id, DevicePresence())) for item in result]
     if status:
         result = [item for item in result if item.status == status]
     return result
@@ -383,7 +398,9 @@ async def get_device(
         )
     ):
         raise HTTPException(status_code=404, detail="Device not found")
-    return _to_out(device)
+    result = _to_out(device)
+    presence = await query_realtime_presence([device.device_id])
+    return result if presence is None else _with_presence(result, presence.get(device.device_id, DevicePresence()))
 
 
 @router.post(
@@ -402,17 +419,19 @@ async def auto_bind_device(
 
     逻辑：
     1. 如果设备未绑定(is_bound=False)：直接绑定当前用户
-    2. 如果设备已被其他用户绑定：强制迁移到当前用户
+    2. 如果设备已被其他用户绑定：拒绝迁移
     3. 如果设备已被当前用户绑定：更新绑定时间（续期）
 
     返回：绑定状态、被踢出的用户信息（如有）
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     _, is_new_binding = await bind_device_owner(
         db,
         device_id=payload.device_id,
         current_user=current_user,
         now=datetime.now(UTC),
+        authenticated=authenticated,
     )
     await _commit(db)
 
@@ -438,6 +457,7 @@ async def unbind_device(
     1. 验证设备确实绑定到该用户
     2. 解除绑定（is_bound=False, bound_user_id=None, bound_at=None）
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     device = await db.scalar(
         select(Device)
@@ -446,8 +466,7 @@ async def unbind_device(
         .execution_options(populate_existing=True)
     )
 
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+    _require_fresh_device_auth(device, authenticated)
 
     if not device.is_bound and device.bound_user_id is None:
         # 设备未绑定，直接返回成功（幂等）
@@ -481,6 +500,7 @@ async def bind_device_owner(
     device_id: str,
     current_user: object,
     now: datetime,
+    authenticated: DeviceAuthSnapshot | None = None,
 ) -> tuple[Device, bool]:
     user_id = getattr(current_user, "id", None)
     tenant_id = getattr(current_user, "tenant_id", None)
@@ -500,6 +520,8 @@ async def bind_device_owner(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    if authenticated is not None:
+        _require_fresh_device_auth(device, authenticated)
     if device is None:
         raise HTTPException(status_code=404, detail="Device not found")
     if device.is_bound or device.bound_user_id is not None:
@@ -529,6 +551,16 @@ def _require_matching_device(device: Device, requested_device_id: str) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid device authentication credentials",
         )
+
+
+def _require_fresh_device_auth(device: Device | None, authenticated: DeviceAuthSnapshot) -> None:
+    if (device is None or device.id != authenticated.row_id
+        or device.device_id != authenticated.device_id
+        or device.tenant_id != authenticated.tenant_id
+        or type(device.auth_version) is not int or device.auth_version < 1
+        or device.auth_version != authenticated.auth_version
+        or device.auth_revoked_at is not None or authenticated.auth_revoked_at is not None):
+        raise HTTPException(status_code=401, detail="Invalid device authentication credentials")
 
 
 async def _commit(db: AsyncSession) -> None:

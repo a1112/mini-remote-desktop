@@ -30,6 +30,17 @@ async fn ordinary_uninstalled_process_is_denied_before_any_product_command() {
     // pipe caller executable because this test lives in a build directory.
     for request in [
         IpcRequest::RuntimeSnapshot,
+        IpcRequest::GetPublicDeviceBindingProtocol,
+        IpcRequest::BindPublicDevice {
+            protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                .unwrap(),
+        },
+        IpcRequest::UnbindPublicDevice {
+            protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                .unwrap(),
+        },
         IpcRequest::UiAttached {
             pid: std::process::id(),
             executable_path: Some(r"C:\Program Files\MiniRemoteDesktop\Rdesk.exe".into()),
@@ -66,6 +77,68 @@ async fn ordinary_uninstalled_process_is_denied_before_any_product_command() {
         .await
         .get(&mrd_proto::SessionId("unauthorized".into()))
         .is_none());
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn interactive_management_pipe_cannot_proxy_device_binding() {
+    let endpoint = IpcEndpoint::named_pipe(format!(
+        r"\\.\pipe\binding-management-deny-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let state = Arc::new(AppState::new());
+    let server = IpcServer::new_management_with_endpoint(state, endpoint.clone());
+    let (ready, announced) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move { server.run_with_ready(ready).await });
+    tokio::time::timeout(Duration::from_secs(3), announced)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut client = IpcClient::management_with_config_and_endpoint(
+        ReconnectConfig {
+            enabled: false,
+            ..Default::default()
+        },
+        endpoint,
+    );
+    assert!(matches!(
+        client
+            .send_request_no_reconnect(IpcRequest::GetPublicDeviceBindingProtocol)
+            .await
+            .unwrap(),
+        IpcResponse::PublicDeviceBindingProtocol {
+            protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR
+        }
+    ));
+    for request in [
+        IpcRequest::BindPublicDevice {
+            protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                .unwrap(),
+        },
+        IpcRequest::UnbindPublicDevice {
+            protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                .unwrap(),
+        },
+    ] {
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.send_request_no_reconnect(request),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(response, IpcResponse::Error { ref code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED")
+        );
+        assert!(!format!("{response:?}").contains("user.access.token"));
+    }
     task.abort();
     let _ = task.await;
 }

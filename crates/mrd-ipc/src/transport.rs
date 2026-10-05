@@ -159,7 +159,7 @@ use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOpti
 
 async fn read_message<R: tokio::io::AsyncReadExt + std::marker::Unpin>(
     reader: &mut R,
-) -> Result<Vec<u8>> {
+) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes) as usize;
@@ -168,7 +168,7 @@ async fn read_message<R: tokio::io::AsyncReadExt + std::marker::Unpin>(
         anyhow::bail!("IPC message too large: {} bytes", len);
     }
 
-    let mut buf = vec![0u8; len];
+    let mut buf = zeroize::Zeroizing::new(vec![0u8; len]);
     reader.read_exact(&mut buf).await?;
     Ok(buf)
 }
@@ -189,7 +189,10 @@ where
     W: tokio::io::AsyncWriteExt + std::marker::Unpin,
     T: Serialize,
 {
-    let json = serde_json::to_vec(message)?;
+    // Requests can carry ephemeral enrollment or user credentials. Erase their
+    // serialized copies on successful writes, errors and async cancellation.
+    let mut json = zeroize::Zeroizing::new(Vec::new());
+    serde_json::to_writer(&mut *json, message)?;
     write_message(writer, &json).await
 }
 
@@ -540,7 +543,7 @@ impl IpcStream {
             size > 0 && size <= 64 * 1024,
             "Product IPC frame exceeds the request budget"
         );
-        let mut payload = vec![0_u8; size];
+        let mut payload = zeroize::Zeroizing::new(vec![0_u8; size]);
         pipe.read_exact(&mut payload).await?;
         Ok(serde_json::from_slice(&payload)?)
     }

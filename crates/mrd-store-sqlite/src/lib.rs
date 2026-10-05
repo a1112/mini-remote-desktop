@@ -121,6 +121,14 @@ impl PersistentStore {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         let observed_version = migrations::schema_version(&connection)?;
+        let observed_version = if !is_new && observed_version == 0 {
+            // A concurrent opener can see the file before its creator commits
+            // the sealed schema. Read only until that commit: this opener must
+            // never bootstrap an existing empty or damaged database itself.
+            wait_for_original_store_birth(&connection)?
+        } else {
+            observed_version
+        };
         if observed_version > integrity::STORE_FORMAT_VERSION {
             return Err(StoreError::UnsupportedSchema(observed_version));
         }
@@ -166,6 +174,36 @@ impl PersistentStore {
     }
 }
 
+fn wait_for_original_store_birth(connection: &Connection) -> Result<u32, StoreError> {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(StoreError::StoreIntegrity);
+        }
+        connection.busy_timeout(remaining.min(Duration::from_millis(50)))?;
+        match migrations::schema_version(connection) {
+            Ok(version) if version != 0 => {
+                connection.busy_timeout(Duration::from_secs(5))?;
+                return Ok(version);
+            }
+            Ok(_) => {}
+            Err(StoreError::Database(rusqlite::Error::SqliteFailure(error, _)))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(10)),
+        );
+    }
+}
+
 fn verify_store_snapshot_connection(
     connection: &Connection,
     protector: &dyn SecretProtector,
@@ -182,7 +220,7 @@ fn verify_store_snapshot_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::SecretBytes;
+    use super::*;
     use zeroize::ZeroizeOnDrop;
 
     fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
@@ -190,5 +228,72 @@ mod tests {
     #[test]
     fn secret_bytes_have_a_compiler_resistant_zeroize_drop_contract() {
         assert_zeroize_on_drop::<SecretBytes>();
+    }
+
+    fn pending_birth_path() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mrd-pending-birth-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn opener_waits_for_original_creator_without_initializing_an_existing_file() {
+        use std::{sync::mpsc, time::Duration};
+        let path = pending_birth_path();
+        let protector: Arc<dyn SecretProtector> =
+            Arc::new(AeadSecretProtector::from_key([73; 32]).unwrap());
+        let (sender, receiver) = mpsc::channel();
+        let pending_path = path.clone();
+        let pending_protector = protector.clone();
+        let pending = std::thread::spawn(move || {
+            sender
+                .send(PersistentStore::open(pending_path, pending_protector).map(drop))
+                .unwrap();
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        // The original file creator completes the same sealed transaction used
+        // by open. The observer has no permission to bootstrap this file itself.
+        let mut connection = Connection::open(&path).unwrap();
+        migrations::configure(&connection).unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        migrations::create_schema(&transaction).unwrap();
+        integrity::bootstrap_store(&transaction, protector.as_ref()).unwrap();
+        transaction.commit().unwrap();
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .is_ok());
+        pending.join().unwrap();
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn existing_empty_file_is_never_bootstrapped_by_a_waiting_opener() {
+        let path = pending_birth_path();
+        let protector: Arc<dyn SecretProtector> =
+            Arc::new(AeadSecretProtector::from_key([74; 32]).unwrap());
+        assert!(matches!(
+            PersistentStore::open(&path, protector),
+            Err(StoreError::StoreIntegrity)
+        ));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(path).unwrap();
     }
 }

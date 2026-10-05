@@ -22,6 +22,24 @@ The user has authorized completing implementation, replacing the installed local
 
 ## Verification and rollback
 
+Live acceptance also found two disconnected paths: the legacy device list
+returns a static offline database field, and account binding sends only the
+user bearer even though the API correctly requires the device bearer too.
+Complete these without weakening ownership: the resident service binds/unbinds
+only its own registered device using a caller-supplied user token and its
+protected device token. WebView code never obtains the device token. The backend
+keeps fresh revocation/tenant/ownership checks under the device lock.
+
+For inventory presence, add a bounded private realtime snapshot query. A new
+32-byte secret is shared only between the API and realtime services; the
+authorization header is a domain-separated HMAC, never either JWT signing key.
+The API requests only device codes already authorized for the current inventory
+viewer. The loopback endpoint checks authenticated presence, backend token
+expiry and heartbeat TTL against a fresh clock. Limit requests to 128 codes and
+responses to a bounded schema, reject unknown/excessively stale data, and fail
+closed on connection errors. NGINX denies the internal route from the public
+prefix. Do not persist or invent online state from a successful HTTPS request.
+
 The live acceptance additionally exposed first-WSS Rustls provider ambiguity and
 an 80 ms clock difference. WSS now selects the configured crypto provider before
 first use and monitors its process owner. Transport receivers defer a future

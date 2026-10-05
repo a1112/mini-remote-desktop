@@ -782,9 +782,9 @@ impl AgentCaptureProfile {
     /// Bound CPU allocation and encoder work before creating a desktop resource.
     pub fn is_valid(&self) -> bool {
         (2..=7680).contains(&self.width)
-            && self.width % 2 == 0
+            && self.width.is_multiple_of(2)
             && (2..=4320).contains(&self.height)
-            && self.height % 2 == 0
+            && self.height.is_multiple_of(2)
             && (1..=120).contains(&self.fps)
             && (64_000..=100_000_000).contains(&self.bitrate_bps)
     }

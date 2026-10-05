@@ -3,11 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mockIpcRegisterDevice = vi.hoisted(() => vi.fn());
 const mockRegisterDevice = vi.hoisted(() => vi.fn());
 const mockPublicStatus = vi.hoisted(() => vi.fn());
+const mockBindPublicDevice = vi.hoisted(() => vi.fn());
+const mockUnbindPublicDevice = vi.hoisted(() => vi.fn());
 
 vi.mock("../adapters/tauri", () => ({
   ipcRegisterDevice: mockIpcRegisterDevice,
   registerDevice: mockRegisterDevice,
   ipcPublicServerStatus: mockPublicStatus,
+  ipcBindPublicDevice: mockBindPublicDevice,
+  ipcUnbindPublicDevice: mockUnbindPublicDevice,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -41,6 +45,7 @@ describe("deviceService", () => {
     vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(false);
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
+    (deviceService as any).bindingError = null;
     (window as any).__TAURI__ = {
       invoke: vi.fn().mockResolvedValue(hardwareInfo),
     };
@@ -215,8 +220,11 @@ describe("service-managed public device identity", () => {
     mockIpcRegisterDevice.mockResolvedValue({ ok: true, value: "registered" });
     mockRegisterDevice.mockReset();
     mockPublicStatus.mockReset().mockResolvedValue({ ok: true, value: registeredStatus });
+    mockBindPublicDevice.mockReset().mockResolvedValue({ ok: true });
+    mockUnbindPublicDevice.mockReset().mockResolvedValue({ ok: true });
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
+    (deviceService as any).bindingError = null;
     (window as any).__TAURI__ = { invoke: vi.fn().mockResolvedValue(hardwareInfo) };
   });
   afterEach(() => vi.restoreAllMocks());
@@ -254,5 +262,49 @@ describe("service-managed public device identity", () => {
     localStorage.setItem("rdesk_device_info", JSON.stringify({ device_id: "0123456789", device_name: "Office PC", access_token: "service-managed", motherboard_serial: "service-managed", registered_at: "old" }));
     await deviceService.initialize();
     expect(mockRegisterDevice).not.toHaveBeenCalled();
+  });
+
+  it("binds an existing device on login using only the user credential over native IPC", async () => {
+    await deviceService.initialize();
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    expect((await deviceService.bindDevice("user-1")).success).toBe(true);
+    expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("binds after restoration when the user logged in before initialization", async () => {
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    await deviceService.initialize();
+    expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
+    expect(localStorage.getItem("rdesk_device_info")).not.toContain("user.access.token");
+  });
+
+  it.each(["enroll", "recoverDeviceCredential"] as const)("binds after %s when already logged in", async (operation) => {
+    mockPublicStatus.mockResolvedValue({ ok: true, value: { ...registeredStatus, device_registered: false } });
+    await deviceService.initialize();
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: { device_id: registeredStatus.device_id, device_name: "Office PC", access_token: "service-managed" } });
+    await deviceService[operation](operation === "enroll" ? "a".repeat(43) : "device.rotated.token");
+    expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
+  });
+
+  it("unbinds only the current resident device through native IPC", async () => {
+    await deviceService.initialize();
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    expect(await deviceService.unbindDevice("user-1", "another-device")).toBe(false);
+    expect(mockUnbindPublicDevice).not.toHaveBeenCalled();
+    expect(await deviceService.unbindDevice("user-1")).toBe(true);
+    expect(mockUnbindPublicDevice).toHaveBeenCalledWith("user.access.token");
+  });
+
+  it("preserves registration and exposes a readable binding failure without storing credentials", async () => {
+    await deviceService.initialize();
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    mockBindPublicDevice.mockResolvedValue({ ok: false, error: { message: "登录已过期，请重新登录后重试" } });
+    expect((await deviceService.bindDevice("user-1")).success).toBe(false);
+    expect(deviceService.getRegistrationError()).toContain("登录已过期");
+    expect(deviceService.getDeviceId()).toBe(registeredStatus.device_id);
+    expect(localStorage.getItem("rdesk_device_info")).not.toContain("user.access.token");
   });
 });

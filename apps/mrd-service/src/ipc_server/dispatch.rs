@@ -31,6 +31,8 @@ impl IpcServer {
             &request,
             IpcRequest::EnrollPublicDevice { .. }
                 | IpcRequest::RecoverPublicDevice { .. }
+                | IpcRequest::BindPublicDevice { .. }
+                | IpcRequest::UnbindPublicDevice { .. }
                 | IpcRequest::StartSession { .. }
                 | IpcRequest::StartLanRemoteSession { .. }
                 | IpcRequest::AcceptSession { .. }
@@ -63,6 +65,35 @@ impl IpcServer {
             }
         }
         match request {
+            IpcRequest::GetPublicDeviceBindingProtocol => {
+                IpcResponse::PublicDeviceBindingProtocol {
+                    protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                }
+            }
+            IpcRequest::BindPublicDevice {
+                protocol_minor,
+                user_token,
+            } => binding_response(
+                crate::public_connection::change_device_binding(
+                    &self.app_state.public_connection,
+                    protocol_minor,
+                    user_token,
+                    true,
+                )
+                .await,
+            ),
+            IpcRequest::UnbindPublicDevice {
+                protocol_minor,
+                user_token,
+            } => binding_response(
+                crate::public_connection::change_device_binding(
+                    &self.app_state.public_connection,
+                    protocol_minor,
+                    user_token,
+                    false,
+                )
+                .await,
+            ),
             IpcRequest::GetPublicServerStatus => IpcResponse::PublicServerStatus {
                 status: self
                     .app_state
@@ -854,9 +885,20 @@ impl IpcServer {
 }
 
 fn management_request_is_allowed(request: &IpcRequest) -> bool {
+    // Unix management shares the same owner-only private socket boundary as
+    // core IPC. Windows management admits any interactive user for lifecycle
+    // reads; credentialed device binding requires the verified product pipe.
+    #[cfg(unix)]
+    if matches!(
+        request,
+        IpcRequest::BindPublicDevice { .. } | IpcRequest::UnbindPublicDevice { .. }
+    ) {
+        return true;
+    }
     matches!(
         request,
         IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetPublicDeviceBindingProtocol
             | IpcRequest::EnrollPublicDevice { .. }
             | IpcRequest::RecoverPublicDevice { .. }
             | IpcRequest::ServiceHealth
@@ -865,6 +907,16 @@ fn management_request_is_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::GetAutostartStatus
             | IpcRequest::ShutdownService { .. }
     )
+}
+
+fn binding_response(result: Result<(), &'static str>) -> IpcResponse {
+    match result {
+        Ok(()) => IpcResponse::Ack,
+        Err(message) => IpcResponse::Error {
+            code: "E_PUBLIC_DEVICE_BINDING".into(),
+            message: message.into(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1042,6 +1094,57 @@ mod tests {
     };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn public_binding_management_negotiates_and_fails_closed_without_registration() {
+        let state = Arc::new(AppState::new());
+        let server = IpcServer::new_management(state.clone());
+        let core = IpcServer::new(state);
+        let response = dispatch_request(&server, IpcRequest::GetPublicDeviceBindingProtocol).await;
+        assert!(matches!(
+            response,
+            IpcResponse::PublicDeviceBindingProtocol {
+                protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR
+            }
+        ));
+        for minor in [0, mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR] {
+            for bind in [true, false] {
+                let user_token =
+                    mrd_ipc::PublicUserCredential::try_from("user.access.secret".to_owned())
+                        .unwrap();
+                let request = if bind {
+                    IpcRequest::BindPublicDevice {
+                        protocol_minor: minor,
+                        user_token,
+                    }
+                } else {
+                    IpcRequest::UnbindPublicDevice {
+                        protocol_minor: minor,
+                        user_token,
+                    }
+                };
+                #[cfg(windows)]
+                assert!(
+                    !super::management_request_is_allowed(&request),
+                    "any interactive process must not borrow the resident device credential"
+                );
+                let response = dispatch_request(&server, request.clone()).await;
+                #[cfg(windows)]
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED")
+                );
+                #[cfg(unix)]
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_PUBLIC_DEVICE_BINDING")
+                );
+                assert!(!format!("{response:?}").contains("user.access.secret"));
+                let response = dispatch_request(&core, request).await;
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_PUBLIC_DEVICE_BINDING")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn dispatch_request_routes_capability_snapshot_without_accept_loop() {

@@ -1,12 +1,15 @@
-use crate::{ConnectionId, CoreConfig, Delivery, DeliveryTarget, RealtimeCore, RealtimeError};
+use crate::{
+    presence_query::{PresenceAuthorization, PresenceAuthorizationError, PresenceQuery},
+    ConnectionId, CoreConfig, Delivery, DeliveryTarget, RealtimeCore, RealtimeError,
+};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        DefaultBodyLimit, FromRequest, Request, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -156,6 +159,7 @@ pub struct RealtimeAppState {
     core: Arc<Mutex<RealtimeCore>>,
     peers: Arc<Mutex<HashMap<ConnectionId, mpsc::Sender<String>>>>,
     config: ServerRuntimeConfig,
+    presence_authorization: Option<Arc<PresenceAuthorization>>,
 }
 
 impl RealtimeAppState {
@@ -164,6 +168,23 @@ impl RealtimeAppState {
             core: Arc::new(Mutex::new(core)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             config,
+            presence_authorization: None,
+        }
+    }
+
+    pub fn with_presence_secret(
+        mut self,
+        secret: &str,
+    ) -> Result<Self, PresenceAuthorizationError> {
+        self.presence_authorization = Some(Arc::new(PresenceAuthorization::from_secret(secret)?));
+        Ok(self)
+    }
+
+    pub fn with_presence_authorization_from_env(self) -> Result<Self, PresenceAuthorizationError> {
+        match std::env::var("MRD_REALTIME_PRESENCE_SECRET") {
+            Ok(secret) => self.with_presence_secret(&zeroize::Zeroizing::new(secret)),
+            Err(std::env::VarError::NotPresent) => Ok(self),
+            Err(_) => Err(PresenceAuthorizationError),
         }
     }
 
@@ -200,7 +221,37 @@ pub fn build_router(state: RealtimeAppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws_handler))
+        .route(
+            "/internal/presence",
+            post(private_presence).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .with_state(state)
+}
+
+async fn private_presence(State(state): State<RealtimeAppState>, request: Request) -> Response {
+    let Some(authorization) = &state.presence_authorization else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !authorization.authorize(request.headers()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Json(query) = match Json::<PresenceQuery>::from_request(request, &state).await {
+        Ok(query) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(requested) = query.unique_device_ids() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let snapshot = {
+        let core = state.core.lock().await;
+        core.presence_snapshot(&requested, now_ms())
+    };
+    let mut response = Json(snapshot).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn health(State(state): State<RealtimeAppState>) -> Json<HealthResponse> {

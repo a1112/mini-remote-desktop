@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getMockInvoke } from "@/test/mocks/tauri";
-import { ipcPublicServerStatus } from "./commands";
+import { ipcBindPublicDevice, ipcUnbindPublicDevice, ipcPublicServerStatus } from "./commands";
 import { resetServiceBridgeConfigForTest } from "../serviceBridge/client";
 
 const status = {
@@ -36,5 +36,18 @@ describe("public server management command adapter", () => {
     vi.stubGlobal("fetch", fetch);
     expect(await ipcPublicServerStatus()).toEqual({ ok: true, value: status });
     expect(JSON.parse(fetch.mock.calls[0]?.[1]?.body ?? "{}")).toEqual({ request: { type: "GetPublicServerStatus" } });
+  });
+
+  it("sends an ephemeral user credential only through the native binding commands", async () => {
+    (window as Window & { __MRD_FORCE_WEB_BRIDGE__?: boolean }).__MRD_FORCE_WEB_BRIDGE__ = true;
+    const invoke = getMockInvoke();
+    invoke.mockResolvedValue(undefined);
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    expect(await ipcBindPublicDevice("user.access.token")).toEqual({ ok: true, value: undefined });
+    expect(await ipcUnbindPublicDevice("user.access.token")).toEqual({ ok: true, value: undefined });
+    expect(invoke).toHaveBeenCalledWith("ipc_bind_public_device", { userToken: "user.access.token" });
+    expect(invoke).toHaveBeenCalledWith("ipc_unbind_public_device", { userToken: "user.access.token" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

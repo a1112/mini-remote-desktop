@@ -2,6 +2,7 @@ pub mod auth;
 pub mod backend_token;
 pub mod persistent_identity;
 pub mod presence;
+pub mod presence_query;
 pub mod routes;
 pub mod ws;
 
@@ -593,6 +594,35 @@ impl RealtimeCore {
 
     pub fn presence_count(&self) -> usize {
         self.presence.len()
+    }
+
+    pub(crate) fn presence_snapshot(
+        &self,
+        requested: &[String],
+        sampled_at_ms: u64,
+    ) -> presence_query::PresenceSnapshot {
+        presence_query::PresenceSnapshot {
+            version: 1,
+            sampled_at_ms,
+            devices: requested
+                .iter()
+                .map(|device_id| {
+                    let entry = self.presence.by_device(&DeviceId(device_id.clone()));
+                    presence_query::DevicePresenceSnapshot {
+                        device_id: device_id.clone(),
+                        online: entry.is_some_and(|entry| {
+                            sampled_at_ms >= entry.last_seen_ms
+                                && sampled_at_ms < entry.token_expires_at_ms
+                                && sampled_at_ms
+                                    < entry
+                                        .last_seen_ms
+                                        .saturating_add(self.config.presence_ttl_ms)
+                        }),
+                        last_seen_ms: entry.map(|entry| entry.last_seen_ms),
+                    }
+                })
+                .collect(),
+        }
     }
 }
 

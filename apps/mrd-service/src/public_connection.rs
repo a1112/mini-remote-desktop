@@ -25,6 +25,9 @@ use tokio::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+mod binding;
+pub(crate) use binding::change_device_binding;
+
 pub const DEFAULT_PUBLIC_API_URL: &str = "https://175.178.16.90/rdesk/api/v1";
 const CONFIG_PURPOSE: &[u8] = b"MRD_PUBLIC_DEVICE_CREDENTIAL_V1\0";
 const MAX_CONFIG_BYTES: usize = 64 * 1024;

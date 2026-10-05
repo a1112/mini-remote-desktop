@@ -105,6 +105,9 @@ fn product_request_is_allowed(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetPublicDeviceBindingProtocol
+            | IpcRequest::BindPublicDevice { .. }
+            | IpcRequest::UnbindPublicDevice { .. }
             | IpcRequest::ServiceHealth
             | IpcRequest::GetShellStatus
             | IpcRequest::UiAttached { .. }
@@ -149,6 +152,7 @@ fn machine_public_request(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetPublicDeviceBindingProtocol
             | IpcRequest::ServiceHealth
             | IpcRequest::GetShellStatus
             | IpcRequest::UiAttached { .. }
@@ -297,5 +301,26 @@ mod tests {
         assert!(product_request_is_allowed(
             &IpcRequest::GetPublicServerStatus
         ));
+        assert!(product_request_is_allowed(
+            &IpcRequest::GetPublicDeviceBindingProtocol
+        ));
+        for request in [
+            IpcRequest::BindPublicDevice {
+                protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                    .unwrap(),
+            },
+            IpcRequest::UnbindPublicDevice {
+                protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token: mrd_ipc::PublicUserCredential::try_from("user.access.token".to_owned())
+                    .unwrap(),
+            },
+        ] {
+            assert!(product_request_is_allowed(&request));
+            assert!(
+                !machine_public_request(&request),
+                "binding must still verify the active desktop caller"
+            );
+        }
     }
 }

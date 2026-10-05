@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     public_signal_server_device_id: str = "signal-server"
     public_signal_server_key_id: str = ""
     realtime_server_health_url: str = "http://127.0.0.1:9542/health"
+    realtime_presence_secret: SecretStr | None = None
+    realtime_presence_url: str = "http://127.0.0.1:9542/internal/presence"
     realtime_server_command: str = "cargo"
     realtime_server_args: str = "run -p realtime-server"
     realtime_server_workdir: str = Field(default_factory=_repository_root)

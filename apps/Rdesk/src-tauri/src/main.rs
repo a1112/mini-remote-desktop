@@ -3117,6 +3117,65 @@ async fn ipc_public_server_status() -> Result<mrd_ipc::PublicServerStatus, Strin
     }
 }
 
+async fn change_public_device_binding(user_token: String, bind: bool) -> Result<(), String> {
+    use mrd_ipc::{
+        IpcRequest, IpcResponse, PublicUserCredential, PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+    };
+    let user_token = PublicUserCredential::try_from(user_token).map_err(str::to_owned)?;
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        #[cfg(windows)]
+        let mut client = mrd_ipc::client::IpcClient::product();
+        #[cfg(not(windows))]
+        let mut client = mrd_ipc::client::IpcClient::trusted_management();
+        // Never send a user credential to a service that has not advertised this
+        // exact narrow protocol, or to an unverified pipe server.
+        match client
+            .send_request_no_reconnect(IpcRequest::GetPublicDeviceBindingProtocol)
+            .await
+        {
+            Ok(IpcResponse::PublicDeviceBindingProtocol { protocol_minor })
+                if protocol_minor == PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR => {}
+            Ok(IpcResponse::Error { code, .. }) if code == "E_PRODUCT_CALLER_DENIED" => {
+                return Err("请使用已安装的桌面客户端绑定本机设备".to_owned());
+            }
+            _ => return Err("后台服务不支持安全设备绑定，请更新或重新启动后台服务".to_owned()),
+        }
+        let request = if bind {
+            IpcRequest::BindPublicDevice {
+                protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token,
+            }
+        } else {
+            IpcRequest::UnbindPublicDevice {
+                protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token,
+            }
+        };
+        match client.send_request_no_reconnect(request).await {
+            Ok(IpcResponse::Ack) => Ok(()),
+            Ok(IpcResponse::Error { code, message }) if code == "E_PUBLIC_DEVICE_BINDING" => {
+                Err(message)
+            }
+            Ok(IpcResponse::Error { code, .. }) if code == "E_PRODUCT_DESKTOP_DENIED" => {
+                Err("请在设备当前本机桌面登录后绑定或解绑设备".to_owned())
+            }
+            _ => Err("本机设备绑定失败，请确认后台服务已启动后重试".to_owned()),
+        }
+    })
+    .await
+    .map_err(|_| "本机设备绑定操作超时，请稍后重试".to_owned())?
+}
+
+#[tauri::command]
+async fn ipc_bind_public_device(user_token: String) -> Result<(), String> {
+    change_public_device_binding(user_token, true).await
+}
+
+#[tauri::command]
+async fn ipc_unbind_public_device(user_token: String) -> Result<(), String> {
+    change_public_device_binding(user_token, false).await
+}
+
 /// Get runtime snapshot via IPC (migrated version)
 #[tauri::command]
 async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
@@ -4815,6 +4874,8 @@ fn main() {
             ipc_session_snapshot,
             ipc_runtime_snapshot,
             ipc_public_server_status,
+            ipc_bind_public_device,
+            ipc_unbind_public_device,
             ipc_audit_log,
             ipc_capability_snapshot,
             ipc_peer_capability_snapshot,

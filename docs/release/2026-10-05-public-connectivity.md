@@ -18,6 +18,20 @@ fallback. Streaming requires an actual accepted frame, and input acknowledgments
 require an actual Agent result. Resource cleanup survives lost responses and
 native permission expiry without renewing the original authorization.
 
+Login, initialization, enrollment and credential recovery bind only this
+resident's current device to the authenticated account. The service derives the
+target and submits both user and protected device credentials to its configured
+HTTPS origin. Windows requires the installed client in the active console;
+the ordinary management pipe cannot borrow machine credentials for binding.
+The binding capability is negotiated before sending the ephemeral user token.
+The backend rechecks the immutable device authentication snapshot under the
+row lock, including credential version, revocation, tenant and machine identity.
+
+Device inventory reads authenticated realtime presence through a private
+loopback endpoint after user/tenant visibility checks. Configured query failures
+display offline. The query has a shared two-second deadline and bounded batches
+and response sizes; the public proxy blocks its internal route.
+
 ## Tencent endpoints and operation
 
 - API: `https://175.178.16.90/rdesk/api/v1`
@@ -41,9 +55,15 @@ remaining bounded.
 
 ## Verification evidence
 
-- Frontend: 753 tests, type checking and production bundle passed.
-- Backend: 598 tests and 13 subtests, including isolated PostgreSQL enrollment,
+- Frontend: 760 tests, type checking and production bundle passed.
+- Backend: 675 tests and 13 subtests, including isolated PostgreSQL enrollment,
   collision/concurrency, refresh/revocation and authorization-race checks.
+- Binding boundary: real Windows management and uninstalled-process product
+  pipe tests reject binding; own-device dual-credential HTTP tests passed.
+- Concurrent SQLite birth: a waiting observer reads until the original creator
+  commits the sealed schema, with a bounded two-second wait. It never rebuilds
+  an existing empty or corrupt file. Linux storage regression passed 27 tests
+  after reproducing both the premature rejection and unwanted file mutation.
 - Agent: 245 tests, including real child-process bootstrap.
 - Windows native fixture: signed Agent IPC, actual DXGI/OpenH264 frames, service
   media delivery and decoding, input result handling, lost-response cleanup,

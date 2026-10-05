@@ -51,6 +51,52 @@ mod wire {
         }
     }
 
+    /// Negotiated minor for the own-device, dual-credential binding operations.
+    pub const PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR: u16 = 1;
+
+    /// Ephemeral user JWT: bounded on construction/deserialization, erased on drop.
+    #[derive(Clone, Serialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+    #[serde(transparent)]
+    pub struct PublicUserCredential(String);
+
+    impl TryFrom<String> for PublicUserCredential {
+        type Error = &'static str;
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            let value = zeroize::Zeroizing::new(value);
+            let mut parts = value.split('.');
+            if value.is_empty()
+                || value.len() > 4096
+                || !(0..3).all(|_| {
+                    parts.next().is_some_and(|part| {
+                        !part.is_empty()
+                            && part.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                            })
+                    })
+                })
+                || parts.next().is_some()
+            {
+                return Err("用户登录凭据无效，请重新登录");
+            }
+            Ok(Self(value.as_str().to_owned()))
+        }
+    }
+    impl<'de> Deserialize<'de> for PublicUserCredential {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        }
+    }
+    impl PublicUserCredential {
+        pub fn secret(&self) -> &str {
+            &self.0
+        }
+    }
+    impl std::fmt::Debug for PublicUserCredential {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PublicUserCredential(REDACTED)")
+        }
+    }
+
     // === Shell / Lifecycle DTOs (Phase 2) ===
     // Defined first to avoid forward references
 
@@ -1994,6 +2040,18 @@ mod wire {
     pub enum IpcRequest {
         /// Secret-free public registration and authenticated signaling health.
         GetPublicServerStatus,
+        /// Negotiate before transmitting an ephemeral user credential.
+        GetPublicDeviceBindingProtocol,
+        /// Bind the resident's current registered device; no caller-selected target.
+        BindPublicDevice {
+            protocol_minor: u16,
+            user_token: PublicUserCredential,
+        },
+        /// Unbind the resident's current registered device; no caller-selected target.
+        UnbindPublicDevice {
+            protocol_minor: u16,
+            user_token: PublicUserCredential,
+        },
         /// Enroll this service-owned machine at its configured trusted server.
         /// Device credentials are never returned over this endpoint.
         EnrollPublicDevice {
@@ -2331,6 +2389,8 @@ mod wire {
     pub enum IpcResponse {
         /// Public server state without device credentials or privileged session data.
         PublicServerStatus { status: PublicServerStatus },
+        /// Explicit support for the narrow own-device binding protocol.
+        PublicDeviceBindingProtocol { protocol_minor: u16 },
         /// Device registration successful
         DeviceRegistered { device_id: DeviceId },
         /// List of available devices
@@ -2803,6 +2863,40 @@ pub use wire::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_binding_credentials_are_bounded_redacted_and_require_minor() {
+        let request = IpcRequest::BindPublicDevice {
+            protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: PublicUserCredential::try_from("user.access.secret".to_owned()).unwrap(),
+        };
+        assert!(!format!("{request:?}").contains("user.access.secret"));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["user_token"], "user.access.secret");
+        assert_eq!(
+            serde_json::from_value::<IpcRequest>(json.clone()).unwrap(),
+            request
+        );
+        let mut missing_minor = json;
+        missing_minor
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_minor");
+        assert!(serde_json::from_value::<IpcRequest>(missing_minor).is_err());
+        for secret in [
+            String::new(),
+            "one.part".into(),
+            "a.b.c.d".into(),
+            "a..c".into(),
+            "a.b.c\r\nInjected".into(),
+            format!("{}.b.c", "a".repeat(4096)),
+        ] {
+            let error = serde_json::from_value::<PublicUserCredential>(serde_json::json!(secret))
+                .unwrap_err();
+            assert!(!error.to_string().contains(&secret) || secret.is_empty());
+        }
+        assert!(PublicUserCredential::try_from(format!("{}.b.c", "a".repeat(4092))).is_ok());
+    }
 
     #[test]
     fn display_mode_ipc_round_trips_with_restore_metadata() {

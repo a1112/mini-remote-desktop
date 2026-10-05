@@ -580,6 +580,16 @@ export async function ipcPublicServerStatus(): Promise<AdapterResult<PublicServe
   );
 }
 
+/** Bind only the resident's own device. Device credentials never enter the WebView. */
+export async function ipcBindPublicDevice(userToken: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('ipc_bind_public_device', { userToken });
+}
+
+/** Unbind only the resident's own device using an ephemeral user credential. */
+export async function ipcUnbindPublicDevice(userToken: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('ipc_unbind_public_device', { userToken });
+}
+
 /** Read the operating system's actual background service startup configuration. */
 export async function shellGetAutostartStatus(): Promise<AdapterResult<AutostartStatus>> {
   return invokeAdapter<AutostartStatus>('shell_get_autostart_status');
