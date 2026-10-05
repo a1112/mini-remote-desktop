@@ -265,7 +265,10 @@ impl AuthorizedCommandExecutor for EncodedCaptureExecutor {
     }
     fn capture_access_units(
         &mut self,
-    ) -> Result<Vec<mrd_session_agent::media::EncodedMediaAccessUnit>, ()> {
+    ) -> Result<
+        Vec<mrd_session_agent::media::EncodedMediaAccessUnit>,
+        mrd_session_agent::runtime::CaptureAccessUnitsError,
+    > {
         if !self.live {
             return Ok(Vec::new());
         }

@@ -30,5 +30,7 @@ jobs:
           workspaces: tests/macos-native-surface-proof -> target
           shared-key: appkit-input-${{ matrix.architecture }}
           cache-on-failure: true
+      - name: Typecheck native UI window smoke helper
+        run: /usr/bin/xcrun swiftc -typecheck apps/Rdesk/scripts/smoke-macos-ui-window.swift
       - name: Prove real native input routing on the main thread
         run: cargo run --locked --manifest-path tests/macos-native-surface-proof/Cargo.toml

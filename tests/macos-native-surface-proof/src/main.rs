@@ -11,7 +11,7 @@ mod proof {
             NSBackingStoreBuffered, NSView, NSWindow, NSWindowOrderingMode, NSWindowStyleMask,
         },
         base::{id, nil, NO, YES},
-        foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString},
+        foundation::{NSAutoreleasePool, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, NSString},
     };
     use objc::{
         class,
@@ -78,9 +78,15 @@ mod proof {
     }
 
     unsafe fn pump_main_run_loop() {
-        let run_loop: id = msg_send![class!(NSRunLoop), currentRunLoop];
+        // A bare NSRunLoop pump does not distribute WindowServer activation events.
+        // Exercise NSApplication's real event loop, including key-window transitions.
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
         let until: id = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.01_f64];
-        let _: () = msg_send![run_loop, runUntilDate: until];
+        let event: id = msg_send![app, nextEventMatchingMask: u64::MAX untilDate: until inMode: NSDefaultRunLoopMode dequeue: YES];
+        if event != nil {
+            let _: () = msg_send![app, sendEvent: event];
+        }
+        let _: () = msg_send![app, updateWindows];
     }
 
     unsafe fn parent_window(app: id) -> Owned {
@@ -141,7 +147,11 @@ mod proof {
         );
         let pool = NSAutoreleasePool::new(nil);
         let app: id = msg_send![class!(NSApplication), sharedApplication];
-        let _: BOOL = msg_send![app, setActivationPolicy: 0_isize];
+        let activated: BOOL = msg_send![app, setActivationPolicy: 0_isize];
+        assert!(
+            activated != NO,
+            "AppKit fixture cannot become a foreground application"
+        );
         let _: () = msg_send![app, finishLaunching];
         let parent = parent_window(app);
         let content: id = msg_send![parent.0, contentView];

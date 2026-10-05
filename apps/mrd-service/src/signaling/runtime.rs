@@ -2083,7 +2083,7 @@ async fn run_connection(
     };
     let (socket, _) = match connected {
         Ok(Ok(value)) => value,
-        Ok(Err(error)) => return ConnectionExit::Failed(error.into()),
+        Ok(Err(error)) => return ConnectionExit::Failed(error),
         Err(_) => return ConnectionExit::Failed(SignalingRuntimeError::ConnectTimeout),
     };
     let (mut writer, mut reader) = socket.split();
@@ -2244,12 +2244,14 @@ async fn connect_signal_socket(
         >,
         tokio_tungstenite::tungstenite::handshake::client::Response,
     ),
-    tokio_tungstenite::tungstenite::Error,
+    SignalingRuntimeError,
 > {
     // Other workspace packages can enable both Rustls providers. WSS must
     // select our configured provider even before any QUIC/WebRTC connection.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    tokio_tungstenite::connect_async(endpoint).await
+    tokio_tungstenite::connect_async(endpoint)
+        .await
+        .map_err(Into::into)
 }
 
 async fn read_envelope<S>(

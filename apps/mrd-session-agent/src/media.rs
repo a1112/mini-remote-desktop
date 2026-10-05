@@ -7,7 +7,7 @@
 //! registry in the next Task 25 slice.
 
 use crate::capabilities::AgentCapabilities;
-use crate::runtime::AuthorizedCommandExecutor;
+use crate::runtime::{AuthorizedCommandExecutor, CaptureAccessUnitsError};
 use crate::{capture::CaptureAdapter, render::RenderAdapter};
 use mrd_agent_ipc::{
     AgentCapability, AgentCommand, AgentEventContext, AuthorizedCommand, CaptureSourceBounds,
@@ -449,7 +449,9 @@ where
         true
     }
 
-    fn capture_access_units(&mut self) -> Result<Vec<EncodedMediaAccessUnit>, ()> {
+    fn capture_access_units(
+        &mut self,
+    ) -> Result<Vec<EncodedMediaAccessUnit>, CaptureAccessUnitsError> {
         let mut units = Vec::new();
         for resource in self
             .registry
@@ -458,13 +460,13 @@ where
             .filter(|resource| resource.kind == MediaResourceKind::Capture)
         {
             if !self.capture.is_resource_running(&resource.resource_id) {
-                return Err(());
+                return Err(CaptureAccessUnitsError);
             }
             if let Some(unit) = self.capture.poll_encoded(&resource.resource_id) {
                 if unit.resource_id != resource.resource_id
                     || unit.session_id != resource.session_id
                 {
-                    return Err(());
+                    return Err(CaptureAccessUnitsError);
                 }
                 units.push(unit);
             }

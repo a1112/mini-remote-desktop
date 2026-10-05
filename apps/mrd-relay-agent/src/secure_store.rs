@@ -2039,7 +2039,9 @@ fn linux_systemd_acl_is_private(acl: &[u8], service_uid: u32) -> bool {
         (32, 0, u32::MAX),      // everyone else: no access
     ];
     acl[4..]
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .zip(expected)
         .all(|(entry, (tag, permissions, uid))| {
             entry[..2] == tag.to_le_bytes()

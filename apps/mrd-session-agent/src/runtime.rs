@@ -589,6 +589,11 @@ pub trait TrustedDesktopStateSource: Send + Sync {
     fn subscribe(&self) -> tokio::sync::watch::Receiver<()>;
 }
 
+/// A capture worker failed or returned a resource with mismatched identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("authorized capture resource failed")]
+pub struct CaptureAccessUnitsError;
+
 /// Product backend boundary that can receive only validated commands.
 pub trait AuthorizedCommandExecutor: Send {
     /// Capabilities implemented by this exact backend.
@@ -597,7 +602,9 @@ pub trait AuthorizedCommandExecutor: Send {
     fn execute(&mut self, command: AuthorizedCommand) -> CommandOutcome;
     /// Drain a bounded batch of encoded frames from authorized capture resources.
     /// `Err` signals a failed capture worker or a resource identity mismatch.
-    fn capture_access_units(&mut self) -> Result<Vec<crate::media::EncodedMediaAccessUnit>, ()> {
+    fn capture_access_units(
+        &mut self,
+    ) -> Result<Vec<crate::media::EncodedMediaAccessUnit>, CaptureAccessUnitsError> {
         Ok(Vec::new())
     }
     /// Whether a capture worker exists and needs the bounded frame-pump timer.
@@ -1758,17 +1765,15 @@ impl AgentRuntime {
                 };
                 let outcome = if is_cleanup && retired {
                     CommandOutcome::AlreadyStopped
-                } else if !is_cleanup
+                } else if (!is_cleanup
                     && (self.cleanup_receipts.len() >= MAX_CLEANUP_RECEIPTS
                         || self.started_resource_ids.len() >= REPLAY_LEDGER_CAPACITY
-                        || self.started_resource_ids.contains(&resource_id))
-                {
-                    CommandOutcome::Rejected
-                } else if start_input_blocked
-                    && matches!(
-                        authorized.command(),
-                        mrd_agent_ipc::AgentCommand::StartInput { .. }
-                    )
+                        || self.started_resource_ids.contains(&resource_id)))
+                    || (start_input_blocked
+                        && matches!(
+                            authorized.command(),
+                            mrd_agent_ipc::AgentCommand::StartInput { .. }
+                        ))
                 {
                     CommandOutcome::Rejected
                 } else if let Some(input) = &mut self.input {

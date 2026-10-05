@@ -716,6 +716,7 @@ enum StatusReporter {
     Scm(windows_service::service_control_handler::ServiceStatusHandle),
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 impl StatusReporter {
     fn running(&self) -> Result<()> {
         #[cfg(windows)]

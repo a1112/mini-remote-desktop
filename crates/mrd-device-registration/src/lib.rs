@@ -231,7 +231,7 @@ fn build_authorized_request(
         "{}/devices/{endpoint}",
         url.path().trim_end_matches('/')
     ));
-    let mut header = HeaderValue::from_str(&credential).map_err(|_| "设备登记凭据无效")?;
+    let mut header = HeaderValue::from_str(credential).map_err(|_| "设备登记凭据无效")?;
     header.set_sensitive(true);
     client
         .post(url)

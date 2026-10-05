@@ -2,7 +2,7 @@ use crate::app_state::{AppState, AuthenticatedPeerTrust, DeviceIdentityRegistryE
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue};
 use crate::transports::{quic::QuicTransportMux, TransportMuxConfig};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use mrd_application::ports::{
     SessionLifecycleState, SessionSnapshot, TransportEnvelope, TransportLane, TransportMuxPort,
     TransportSendOutcome, VideoEnvelopeMetadata,
@@ -5100,7 +5100,9 @@ async fn send_quic_media_loop(
                             .context("Agent encoded frame invalid")?;
                         media_sender::prepare_agent_transport_unit(validated, requested_codec)
                             .map_err(|error| {
-                                anyhow!("Agent codec does not match negotiated media: {error:?}")
+                                anyhow::anyhow!(
+                                    "Agent codec does not match negotiated media: {error:?}"
+                                )
                             })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -5115,7 +5117,7 @@ async fn send_quic_media_loop(
                 app_state
                     .take_agent_media_turn(&session_id.0, 8, requested_codec)
                     .await
-                    .map_err(|error| anyhow!("test media source rejected: {error:?}"))?
+                    .map_err(|error| anyhow::anyhow!("test media source rejected: {error:?}"))?
             };
             turn
         };
