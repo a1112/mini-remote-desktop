@@ -3341,7 +3341,10 @@ async fn webrtc_session_list_via_ipc() -> Result<Vec<String>, String> {
 
 /// Tauri 命令：设备注册
 ///
-/// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
+/// 通过后台服务登记或恢复设备，公网设备码由服务器分配（10 位）。
+// Preserve the existing ten named Tauri arguments used by the UI contract.
+// The public endpoint immediately maps enrollment/recovery to typed IPC requests.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn register_device(
     motherboard_serial: String,
