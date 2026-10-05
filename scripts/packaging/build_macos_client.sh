@@ -24,7 +24,7 @@ export MACOSX_DEPLOYMENT_TARGET=13.0
 cd "$workspace/apps/Rdesk"
 # beforeBuildCommand already builds MrdService.app with its privacy metadata,
 # then builds the frontend. Keep that single packaging entry point.
-pnpm tauri build --ci --bundles app -- --locked
+pnpm tauri build --ci --bundles app -- --locked --bin app
 
 bundle="$workspace/target/release/bundle/macos/Rdesk.app"
 service_bundle="$bundle/Contents/Resources/MrdService.app"
@@ -35,6 +35,7 @@ executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Con
 client_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist")
 service_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$service_bundle/Contents/Info.plist")
 [[ $client_identifier =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && $service_identifier =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo 'Invalid bundle identifier metadata.' >&2; exit 1; }
+node "$workspace/apps/Rdesk/scripts/verify-macos-bundle.mjs" "$bundle"
 client="$bundle/Contents/MacOS/$executable"
 test -x "$client"
 test -x "$service"

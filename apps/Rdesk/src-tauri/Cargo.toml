@@ -6,8 +6,18 @@ authors = ["you"]
 license = ""
 repository = ""
 default-run = "app"
+autobins = false
 edition = "2021"
 rust-version = "1.60"
+
+[[bin]]
+name = "app"
+path = "src/main.rs"
+
+[[bin]]
+name = "macos_metal_present_probe"
+path = "src/bin/macos_metal_present_probe.rs"
+required-features = ["diagnostic-probes"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -103,6 +113,8 @@ raw-window-handle = "0.6"
 x11 = { version = "2.21", features = ["xlib"] }
 
 [features]
+# Developer tools are explicitly enabled by the macOS benchmark harness.
+diagnostic-probes = []
 # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.
 # If you use cargo directly instead of tauri's cli you can use this feature flag to switch between tauri's `dev` and `build` modes.
 # DO NOT REMOVE!!

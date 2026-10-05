@@ -56,6 +56,8 @@ jobs:
       - name: Install frontend dependencies
         working-directory: apps/Rdesk
         run: pnpm install --frozen-lockfile
+      - name: Verify production bundle layout contract
+        run: node --test apps/Rdesk/scripts/verify-macos-bundle.test.mjs
       - name: Verify registration and protected storage
         run: cargo test --locked -p mrd-device-registration -p mrd-store-sqlite -p mrd-ipc
       - name: Verify real AppKit viewport input routing
