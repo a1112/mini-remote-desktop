@@ -265,8 +265,6 @@ mod proof {
                 &mut failures,
                 "native render overlay can become a key/main window",
             );
-            let _: () = msg_send![overlay.0, makeKeyWindow];
-            let _: () = msg_send![overlay.0, makeMainWindow];
             pump_main_run_loop();
             let actual_key: id = msg_send![app, keyWindow];
             let actual_first: id = msg_send![parent.0, firstResponder];

@@ -60,6 +60,19 @@ remaining bounded.
   collision/concurrency, refresh/revocation and authorization-race checks.
 - Binding boundary: real Windows management and uninstalled-process product
   pipe tests reject binding; own-device dual-credential HTTP tests passed.
+- Installed Windows acceptance: the actual protected process-image/kernel
+  boundary passed, and privileged Core IPC bound device `1501515774` to its
+  authenticated owner. With the UI closed, SCM restart changed the service PID,
+  automatically restored authenticated presence and kept the same device code
+  and account binding. The server independently confirmed online ownership.
+- Windows service/storage/realtime regression: 1,073 tests passed across
+  44 suites; 20 existing platform/live tests were ignored separately from the
+  explicit real installed-process acceptance.
+- Portable lint regression: Linux workspace Clippy excluding the GTK application
+  passed with warnings denied; 227 focused Linux tests passed. Windows service,
+  Agent and registration regression passed 1,274 tests in 43 suites (28 existing
+  ignored), and the native D3D11 renderer passed 25 tests. The Windows production
+  UI checked successfully with the unified window-vibrancy dependency.
 - Concurrent SQLite birth: a waiting observer reads until the original creator
   commits the sealed schema, with a bounded two-second wait. It never rebuilds
   an existing empty or corrupt file. Linux storage regression passed 27 tests
@@ -88,8 +101,16 @@ in the deployment acceptance manifest, separate from credentials.
 The manual `macOS client package` workflow builds Apple Silicon, Intel or both.
 It verifies native Mach-O architecture, nested service resources, signing and
 privacy metadata, and executes a real two-start IPC/Keychain persistence smoke
-test before publishing an artifact. Packages use ad-hoc development signing;
+test and an exact-process bundled UI/window smoke before publishing an artifact.
+Packages use ad-hoc development signing;
 normal macOS application approval, Keychain and privacy prompts remain enabled.
+
+The native Metal presentation layer must pass pointer events to WKWebView and
+retain its first responder. An AppKit main-thread regression proves the actual
+bare-view interception and the corrected production view policy. The bundle
+also uses one window-vibrancy version shared with Tauri to avoid duplicate
+Objective-C class definitions. Native package checks must pass on both
+architectures before their artifacts are considered accepted.
 
 macOS can be the controller for this Windows device. Actual Mac-to-Windows
 desktop acceptance requires the user's Mac and local Windows confirmation.
