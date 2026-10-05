@@ -27,16 +27,25 @@ cd "$workspace/apps/Rdesk"
 pnpm tauri build --ci --bundles app -- --locked
 
 bundle="$workspace/target/release/bundle/macos/Rdesk.app"
-service="$bundle/Contents/Resources/MrdService.app/Contents/MacOS/mrd-service"
+service_bundle="$bundle/Contents/Resources/MrdService.app"
+service="$service_bundle/Contents/MacOS/mrd-service"
+/usr/bin/plutil -lint "$bundle/Contents/Info.plist" "$service_bundle/Contents/Info.plist"
 executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Contents/Info.plist")
 [[ $executable =~ ^[a-zA-Z0-9._-]+$ ]] || { echo 'Invalid client executable metadata.' >&2; exit 1; }
+client_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Contents/Info.plist")
+service_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$service_bundle/Contents/Info.plist")
+[[ $client_identifier =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ && $service_identifier =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] || { echo 'Invalid bundle identifier metadata.' >&2; exit 1; }
 client="$bundle/Contents/MacOS/$executable"
 test -x "$client"
 test -x "$service"
 /usr/bin/lipo "$client" -verify_arch "$macho_arch"
 /usr/bin/lipo "$service" -verify_arch "$macho_arch"
+# Seal the copied service first, then the final outer resource envelope. Each
+# bundle uses its own identifier; neither bundle config supplies entitlements.
+/usr/bin/codesign --force --sign - --identifier "$service_identifier" "$service_bundle"
+/usr/bin/codesign --verify --strict "$service_bundle"
+/usr/bin/codesign --force --sign - --identifier "$client_identifier" "$bundle"
 /usr/bin/codesign --verify --deep --strict "$bundle"
-/usr/bin/plutil -lint "$bundle/Contents/Info.plist" "$bundle/Contents/Resources/MrdService.app/Contents/Info.plist"
 
 output="$workspace/target/macos-client-artifacts"
 mkdir -p "$output"

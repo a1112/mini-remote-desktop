@@ -1131,7 +1131,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         #[cfg(unix)]
-        if let mrd_ipc::transport::IpcEndpoint::UnixSocket(path) = endpoint {
+        {
+            let mrd_ipc::transport::IpcEndpoint::UnixSocket(path) = endpoint;
             // Transport ownership cleanup may already unlink the socket.
             if std::path::Path::new(&path).exists() {
                 std::fs::remove_file(path).unwrap();
