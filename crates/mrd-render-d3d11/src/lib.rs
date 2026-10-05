@@ -1756,7 +1756,7 @@ fn planar_upload_layout(
         .checked_mul(2)
         .and_then(|n| n.checked_mul(bytes_per_sample))
         .ok_or_else(invalid)?;
-    if pitch < row_bytes || pitch % bytes_per_sample != 0 {
+    if pitch < row_bytes || !pitch.is_multiple_of(bytes_per_sample) {
         return Err(invalid());
     }
     let uv_offset = pitch.checked_mul(height).ok_or_else(invalid)?;
