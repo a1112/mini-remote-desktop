@@ -97,11 +97,13 @@ impl IpcClient {
     /// Management containing secrets must authenticate the kernel server process.
     /// No endpoint or environment setting bypasses this Windows identity check.
     pub fn trusted_management() -> Self {
-        let mut client = Self::management();
+        let client = Self::management();
         #[cfg(windows)]
-        {
+        let client = {
+            let mut client = client;
             client.authenticated_product = true;
-        }
+            client
+        };
         client
     }
 

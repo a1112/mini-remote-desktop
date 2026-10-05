@@ -45,6 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos-package-${{ matrix.target }}
+          cache-on-failure: true
+          cache-workspace-crates: true
       - name: Verify native build architecture
         env:
           EXPECTED_TARGET: ${{ matrix.target }}

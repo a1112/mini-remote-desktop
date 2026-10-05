@@ -33,7 +33,8 @@ executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$bundle/Con
 client="$bundle/Contents/MacOS/$executable"
 test -x "$client"
 test -x "$service"
-/usr/bin/lipo -verify_arch "$macho_arch" "$client" "$service"
+/usr/bin/lipo "$client" -verify_arch "$macho_arch"
+/usr/bin/lipo "$service" -verify_arch "$macho_arch"
 /usr/bin/codesign --verify --deep --strict "$bundle"
 /usr/bin/plutil -lint "$bundle/Contents/Info.plist" "$bundle/Contents/Resources/MrdService.app/Contents/Info.plist"
 
