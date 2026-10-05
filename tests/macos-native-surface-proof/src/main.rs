@@ -185,6 +185,13 @@ mod proof {
             &mut failures,
             "render view must not accept first responder",
         );
+        let becomes: BOOL = msg_send![render.0, becomeFirstResponder];
+        let key_view: BOOL = msg_send![render.0, canBecomeKeyView];
+        record(
+            becomes == NO && key_view == NO,
+            &mut failures,
+            "render view must refuse direct first-responder and key-view eligibility",
+        );
 
         MOUSE_DOWN.store(0, Ordering::SeqCst);
         let event = native_mouse_event(parent.0, point);
@@ -201,15 +208,12 @@ mod proof {
             accepted != NO,
             "fixture underlying view cannot become first responder"
         );
-        let stolen: BOOL = msg_send![parent.0, makeFirstResponder: render.0];
         let first: id = msg_send![parent.0, firstResponder];
         record(
-            stolen == NO && first == receiver.0,
+            first == receiver.0,
             &mut failures,
-            "render surface took the underlying view's keyboard focus",
+            "native input view did not retain keyboard focus beneath the render surface",
         );
-        // Re-select the legitimate input view after a deliberately hostile focus attempt.
-        let _: BOOL = msg_send![parent.0, makeFirstResponder: receiver.0];
         KEY_DOWN.store(0, Ordering::SeqCst);
         let event = native_key_event(parent.0);
         assert!(event != nil, "AppKit key event construction failed");
