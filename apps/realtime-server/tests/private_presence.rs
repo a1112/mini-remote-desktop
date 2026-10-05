@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const SECRET: [u8; 32] = [7; 32];
 const CONTEXT: &[u8] = b"MRD_REALTIME_PRESENCE_QUERY_V1\0";
@@ -129,28 +129,92 @@ impl Fixture {
             .map(|value| format!("Authorization: {value}\r\n"))
             .collect::<String>();
         let request = format!("POST /internal/presence HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}", self.address, body.len());
-        let mut stream = tokio::net::TcpStream::connect(self.address).await.unwrap();
-        stream.write_all(request.as_bytes()).await.unwrap();
-        let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes))
-            .await
-            .unwrap()
-            .unwrap();
-        let response = String::from_utf8(bytes).unwrap();
-        let status = response
-            .lines()
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap();
-        (
-            status,
-            response.split_once("\r\n\r\n").unwrap().1.to_owned(),
-        )
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(self.address).await.unwrap();
+            stream.write_all(request.as_bytes()).await.unwrap();
+            read_http_response(&mut stream).await
+        })
+        .await
+        .unwrap()
     }
+}
+
+async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> (u16, String) {
+    const MAX_HEADER_BYTES: usize = 8 * 1024;
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+        assert!(
+            bytes.len() < MAX_HEADER_BYTES,
+            "HTTP headers exceed fixture bound"
+        );
+        let mut chunk = [0; 1024];
+        let available = chunk.len().min(MAX_HEADER_BYTES - bytes.len());
+        let received = stream.read(&mut chunk[..available]).await.unwrap();
+        assert!(
+            received > 0,
+            "connection ended before complete HTTP headers"
+        );
+        bytes.extend_from_slice(&chunk[..received]);
+    };
+    let headers = std::str::from_utf8(&bytes[..header_end - 4]).unwrap();
+    let mut lines = headers.split("\r\n");
+    let mut status_line = lines.next().unwrap().splitn(3, ' ');
+    assert_eq!(status_line.next(), Some("HTTP/1.1"));
+    let code = status_line.next().unwrap();
+    assert!(code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()));
+    let status: u16 = code.parse().unwrap();
+    assert!((100..=599).contains(&status));
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').unwrap();
+        assert!(!name.eq_ignore_ascii_case("transfer-encoding"));
+        if name.eq_ignore_ascii_case("content-length") {
+            let value = value.trim();
+            assert!(!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()));
+            assert!(content_length
+                .replace(value.parse::<usize>().unwrap())
+                .is_none());
+        }
+    }
+    let response_len = header_end.checked_add(content_length.unwrap()).unwrap();
+    assert!(
+        response_len <= MAX_RESPONSE_BYTES,
+        "HTTP response exceeds fixture bound"
+    );
+    assert!(
+        bytes.len() <= response_len,
+        "unexpected bytes after HTTP response"
+    );
+    let received = bytes.len();
+    bytes.resize(response_len, 0);
+    // A rejected unread request can reset the connection after the response.
+    // Read exactly its frame, so a complete response never depends on TCP EOF.
+    stream.read_exact(&mut bytes[received..]).await.unwrap();
+    (
+        status,
+        String::from_utf8(bytes[header_end..].to_vec()).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn fixture_reads_complete_http_response_without_waiting_for_connection_close() {
+    let (mut reader, mut writer) = tokio::io::duplex(256);
+    let task = tokio::spawn(async move {
+        writer
+            .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 4\r\n\r\nbody")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+    let response = tokio::time::timeout(Duration::from_secs(2), read_http_response(&mut reader))
+        .await
+        .unwrap();
+    task.abort();
+    assert_eq!(response, (413, "body".into()));
 }
 
 #[tokio::test]
