@@ -157,7 +157,11 @@ pub async fn spawn_from_env(ipc_server: IpcServer) -> Result<Option<JoinHandle<R
 
     info!("mrd-service web bridge listening on {}", bind);
     Ok(Some(tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await?;
         Ok(())
     })))
 }

@@ -16,6 +16,8 @@ mod accept_loop;
 mod audit;
 mod connection;
 mod dispatch;
+#[cfg(windows)]
+mod product;
 
 /// IPC server - handles requests from Rdesk shell
 #[derive(Clone)]
@@ -25,9 +27,33 @@ pub struct IpcServer {
     ui_launcher: UiLauncherPortRef,
     autostart: AutostartPortRef,
     management_only: bool,
+    #[cfg(windows)]
+    product_only: bool,
+    #[cfg(windows)]
+    product_caller: Option<crate::agent_runtime::ObservedAgentIdentity>,
 }
 
 impl IpcServer {
+    /// Installed UI channel with kernel caller verification and a strict command boundary.
+    #[cfg(windows)]
+    pub fn new_product(app_state: Arc<AppState>) -> Self {
+        Self::new_product_with_endpoint(
+            app_state,
+            transport::IpcEndpoint::product_from_env_or_default(),
+        )
+    }
+
+    /// Explicit endpoint retains the same caller verification, including in tests.
+    #[cfg(windows)]
+    pub fn new_product_with_endpoint(
+        app_state: Arc<AppState>,
+        endpoint: transport::IpcEndpoint,
+    ) -> Self {
+        let mut server = Self::new_with_endpoint(app_state, endpoint);
+        server.product_only = true;
+        server
+    }
+
     /// Dedicated local endpoint restricted to service lifecycle management.
     pub fn new_management(app_state: Arc<AppState>) -> Self {
         Self::new_management_with_endpoint(
@@ -66,6 +92,10 @@ impl IpcServer {
             ui_launcher: crate::shell::default_ui_launcher(),
             autostart: crate::shell::default_autostart("mrd-service"),
             management_only: false,
+            #[cfg(windows)]
+            product_only: false,
+            #[cfg(windows)]
+            product_caller: None,
         }
     }
 
@@ -80,6 +110,10 @@ impl IpcServer {
             ui_launcher,
             autostart: crate::shell::default_autostart("mrd-service"),
             management_only: false,
+            #[cfg(windows)]
+            product_only: false,
+            #[cfg(windows)]
+            product_caller: None,
         }
     }
 

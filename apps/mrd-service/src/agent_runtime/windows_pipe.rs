@@ -334,6 +334,14 @@ fn current_process_user_sid() -> Result<Vec<u8>, WindowsAgentPipeError> {
     token_user_sid(&token)
 }
 
+/// Inspect the kernel pipe caller after a frame has been read. Impersonation is
+/// fully reverted before this synchronous function returns, including errors.
+pub fn verify_connected_windows_interactive_peer(
+    server: &NamedPipeServer,
+) -> Result<VerifiedWindowsAgentPeer, WindowsAgentPipeError> {
+    inspect_connected_peer(server)
+}
+
 fn inspect_connected_peer(
     server: &NamedPipeServer,
 ) -> Result<VerifiedWindowsAgentPeer, WindowsAgentPipeError> {

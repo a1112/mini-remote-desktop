@@ -42,9 +42,18 @@ pub async fn install_connected_relay_session(
     let route = access
         .route_evidence(active_node_id, 0)
         .map_err(|_| RelayFailoverConfigError::ActiveRelayEvidenceMismatch)?;
+    let state = app_state
+        .wan_session_coordinator()
+        .ok_or(RelaySessionInstallError::AuthorizationUnavailable)?
+        .snapshot(&session_id)
+        .await
+        .map_err(|_| RelaySessionInstallError::AuthorizationUnavailable)?;
+    let grant = state
+        .grant()
+        .ok_or(RelaySessionInstallError::AuthorizationUnavailable)?;
     let evidence = app_state
         .webrtc_host
-        .verify_active_relay(&session_id, route)
+        .verify_active_wan_route(&session_id, route, grant.route_policy())
         .await?;
     let mux: Arc<dyn TransportMuxPort> = app_state.webrtc_host.transport_mux(&session_id).await?;
     coordinator

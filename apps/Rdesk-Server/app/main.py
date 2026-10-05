@@ -12,6 +12,7 @@ from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
+from app.db.migrate_add_relay_redundancy import migrate as migrate_relay_redundancy
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
@@ -26,6 +27,7 @@ async def lifespan(_: FastAPI):
         # explicit versioned migration above, never by metadata.create_all.
         await conn.run_sync(Base.metadata.create_all)
         await migrate_relay_access(conn, serial_pepper=settings.device_serial_pepper)
+        await migrate_relay_redundancy(conn)
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.

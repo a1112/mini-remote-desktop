@@ -322,7 +322,7 @@ PY
 
 [[ "$(/usr/bin/systemctl show mrd-coturn.service --property=Restart --value)" == no ]] \
   || fail relay_verify_coturn_restart_policy_invalid
-[[ "$(/usr/bin/systemctl show mrd-coturn.service --property=Type --value)" == simple ]] \
+[[ "$(/usr/bin/systemctl show mrd-coturn.service --property=Type --value)" == exec ]] \
   || fail relay_verify_coturn_type_invalid
 [[ "$(/usr/bin/systemctl show mrd-coturn.service --property=IPAccounting --value)" == yes ]] \
   || fail relay_verify_coturn_ip_accounting_invalid
@@ -372,7 +372,7 @@ credential_properties=(
 )
 /usr/bin/systemd-run --quiet --wait --collect --uid=mrd-relay --gid=mrd-relay \
   --property=Type=exec --property=NoNewPrivileges=yes "${credential_properties[@]}" \
-  /usr/local/bin/mrd-relay-agent validate --config %d/agent-config >/dev/null \
+  /usr/local/bin/mrd-relay-agent validate --config '${CREDENTIALS_DIRECTORY}/agent-config' >/dev/null \
   || fail relay_verify_static_validation_failed
 
 if [[ "$drained" == true ]]; then
@@ -395,7 +395,7 @@ challenge="$(/usr/bin/openssl rand -hex 32)"
 evidence_file="$(/usr/bin/mktemp --tmpdir=/run .mrd-relay-preflight.XXXXXX)"
 /usr/bin/systemd-run --quiet --wait --pipe --collect --uid=mrd-relay --gid=mrd-relay \
   --property=Type=exec --property=NoNewPrivileges=yes "${credential_properties[@]}" \
-  /usr/local/bin/mrd-relay-agent preflight --config %d/agent-config --challenge "$challenge" \
+  /usr/local/bin/mrd-relay-agent preflight --config '${CREDENTIALS_DIRECTORY}/agent-config' --challenge "$challenge" \
   > "$evidence_file" || fail relay_verify_live_preflight_failed
 
 validate_evidence "$evidence_file" "$challenge" linux-systemd \

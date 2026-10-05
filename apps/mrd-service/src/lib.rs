@@ -10,12 +10,15 @@ pub mod browser_webcodecs_preview;
 pub mod browser_webrtc_preview;
 pub mod capabilities;
 pub mod capture_source;
+#[cfg(windows)]
+pub mod console_capture;
 pub mod control_input;
 pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
 pub mod media_adaptation;
+pub mod public_connection;
 pub use mrd_mobile_gateway as mobile_gateway;
 pub mod relay;
 pub mod resource_monitor;

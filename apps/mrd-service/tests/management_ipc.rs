@@ -92,9 +92,15 @@ async fn real_management_pipe_enforces_the_allowlist_and_delivers_shutdown_ack()
         r"\\.\pipe\mrd-management-smoke-{unique}"
     ));
     #[cfg(unix)]
-    let endpoint = mrd_ipc::transport::IpcEndpoint::unix_socket(format!(
-        "/tmp/mrd-management-smoke-{unique}.sock"
-    ));
+    let endpoint = {
+        let mrd_ipc::transport::IpcEndpoint::UnixSocket(default) =
+            mrd_ipc::transport::IpcEndpoint::default_service();
+        mrd_ipc::transport::IpcEndpoint::unix_socket(
+            std::path::Path::new(&default)
+                .with_file_name(format!("mrd-management-smoke-{unique}.sock"))
+                .to_string_lossy(),
+        )
+    };
     let server = IpcServer::new_management_with_endpoint(state.clone(), endpoint.clone())
         .with_autostart(Arc::new(Mutex::new(mrd_service::NoOpAutostart::new(
             "test",

@@ -906,9 +906,11 @@ mod tests {
         }
         #[cfg(unix)]
         {
+            let mrd_ipc::transport::IpcEndpoint::UnixSocket(default_path) =
+                mrd_ipc::transport::IpcEndpoint::default_service();
             mrd_ipc::transport::IpcEndpoint::unix_socket(
-                std::env::temp_dir()
-                    .join(format!("mrd-owned-exit-test-{suffix}.sock"))
+                PathBuf::from(default_path)
+                    .with_file_name(format!("mrd-owned-exit-test-{suffix}.sock"))
                     .to_string_lossy(),
             )
         }
@@ -1092,11 +1094,15 @@ mod tests {
             r"\\.\pipe\mrd-ui-stop-test-{suffix}"
         ));
         #[cfg(unix)]
-        let endpoint = mrd_ipc::transport::IpcEndpoint::unix_socket(
-            std::env::temp_dir()
-                .join(format!("mrd-ui-stop-test-{suffix}.sock"))
-                .to_string_lossy(),
-        );
+        let endpoint = {
+            let mrd_ipc::transport::IpcEndpoint::UnixSocket(default_path) =
+                mrd_ipc::transport::IpcEndpoint::default_service();
+            mrd_ipc::transport::IpcEndpoint::unix_socket(
+                PathBuf::from(default_path)
+                    .with_file_name(format!("mrd-ui-stop-test-{suffix}.sock"))
+                    .to_string_lossy(),
+            )
+        };
         assert!(ipc_endpoint_is_gone(&endpoint).await.unwrap());
         let server = mrd_ipc::transport::IpcServer::bind_with_endpoint(endpoint.clone())
             .await
@@ -1126,7 +1132,10 @@ mod tests {
         }
         #[cfg(unix)]
         if let mrd_ipc::transport::IpcEndpoint::UnixSocket(path) = endpoint {
-            std::fs::remove_file(path).unwrap();
+            // Transport ownership cleanup may already unlink the socket.
+            if Path::new(&path).exists() {
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 }

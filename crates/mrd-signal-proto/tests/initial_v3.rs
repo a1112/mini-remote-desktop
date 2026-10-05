@@ -49,6 +49,31 @@ fn request() -> WanSessionRequestV3 {
     }
 }
 
+#[test]
+fn direct_first_policy_is_bound_to_the_signed_request_and_target_grant() {
+    let policy: WanRoutePolicyV3 = serde_json::from_str("\"direct_first\"").unwrap();
+    let controller = identity();
+    let target = identity();
+    let mut request = request();
+    let relay_commitment = request.commitment().unwrap();
+    request.route_policy = policy;
+    assert_ne!(request.commitment().unwrap(), relay_commitment);
+    let intent = SessionIntentV3::sign(
+        &controller,
+        SessionIntentV3Payload {
+            claims: claims(&controller, "controller-1", "target-1", 1),
+            request_commitment: request.commitment().unwrap(),
+            request,
+        },
+    )
+    .unwrap();
+    let mut grant = signed_grant(&target, &intent);
+    assert!(grant.verify_intent(&intent).is_err());
+    grant.payload.route_policy = policy;
+    let approved = SessionGrantV3::sign(&target, grant.payload).unwrap();
+    assert!(approved.verify_intent(&intent).is_ok());
+}
+
 fn signed_intent(identity: &DeviceIdentity) -> SessionIntentV3 {
     let request = request();
     let request_commitment = request.commitment().expect("request commitment");

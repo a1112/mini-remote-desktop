@@ -16,6 +16,7 @@ use mrd_application::ports::{
 };
 use mrd_pipeline_core::{EncodedAccessUnit, VideoCodec};
 use mrd_proto::SessionId;
+use mrd_signal_proto::WanRoutePolicyV3;
 use mrd_transport_webrtc::{
     CandidateKind, ControlLane, IceCandidate, IceServerConfig, IceTransportPolicy,
     PeerConnectionConfig, RestartRouteEvidence, SelectedCandidatePairStats, SessionDescription,
@@ -87,6 +88,33 @@ impl ServiceTurnRelayCredentials {
         config
     }
 
+    /// Derive public STUN discovery only from the authenticated TURN node.
+    pub fn apply_direct_first(&self, config: PeerConnectionConfig) -> PeerConnectionConfig {
+        let mut config = self.apply_relay_only(config);
+        let mut stun_urls = self
+            .urls
+            .iter()
+            .filter_map(|url| {
+                let endpoint = url.strip_prefix("turn:")?;
+                if url.contains("transport=tcp") {
+                    return None;
+                }
+                Some(format!("stun:{}", endpoint.split('?').next()?))
+            })
+            .collect::<Vec<_>>();
+        stun_urls.sort();
+        stun_urls.dedup();
+        if !stun_urls.is_empty() {
+            config.ice_servers.push(IceServerConfig::new(
+                stun_urls,
+                String::new(),
+                String::new(),
+            ));
+        }
+        config.ice_transport_policy = IceTransportPolicy::All;
+        config
+    }
+
     pub fn url_classes(&self) -> Vec<RelayUrlClass> {
         self.urls
             .iter()
@@ -116,6 +144,8 @@ struct ServiceWebRtcSession {
     mux: Arc<WebRtcTransportMux>,
     replacement_gate: Arc<Mutex<()>>,
     initial_relay_urls_digest: Option<[u8; 32]>,
+    initial_ice_policy: IceTransportPolicy,
+    verified_direct_first: Arc<AtomicBool>,
     relay_failure: Arc<RelayFailureGate>,
 }
 
@@ -213,9 +243,25 @@ impl VerifiedRelayEvidence {
 /// directory node and the exact TURN URL set used to create the peer.
 pub(crate) struct VerifiedActiveRelayEvidence {
     route: RelayRouteEvidence,
+    policy: WanRoutePolicyV3,
+    local_relay: bool,
+    remote_relay: bool,
 }
 
 impl VerifiedActiveRelayEvidence {
+    pub(crate) fn policy(&self) -> WanRoutePolicyV3 {
+        self.policy
+    }
+    pub(crate) fn local_relay(&self) -> bool {
+        self.local_relay
+    }
+    pub(crate) fn remote_relay(&self) -> bool {
+        self.remote_relay
+    }
+    pub(crate) fn uses_relay(&self) -> bool {
+        self.local_relay || self.remote_relay
+    }
+
     pub(crate) fn route(&self) -> &RelayRouteEvidence {
         &self.route
     }
@@ -248,8 +294,9 @@ impl ServiceWebRtcTransportHost {
         }
         let initial_relay_urls_digest = match config.ice_transport_policy {
             IceTransportPolicy::Relay => Some(replacement_urls_digest(&config)?),
-            IceTransportPolicy::All => None,
+            IceTransportPolicy::All => initial_turn_urls_digest(&config),
         };
+        let initial_ice_policy = config.ice_transport_policy;
         let mux_config = TransportMuxConfig::default();
         config.max_h264_access_unit_bytes = config
             .max_h264_access_unit_bytes
@@ -299,6 +346,8 @@ impl ServiceWebRtcTransportHost {
                 mux,
                 replacement_gate,
                 initial_relay_urls_digest,
+                initial_ice_policy,
+                verified_direct_first: Arc::new(AtomicBool::new(false)),
                 relay_failure,
             },
         );
@@ -311,9 +360,26 @@ impl ServiceWebRtcTransportHost {
         session_id: &SessionId,
         route: RelayRouteEvidence,
     ) -> Result<VerifiedActiveRelayEvidence, ServiceWebRtcTransportError> {
+        self.verify_active_wan_route(session_id, route, WanRoutePolicyV3::RelayOnly)
+            .await
+    }
+
+    /// Sealed evidence for the policy consented to by both devices. The directory
+    /// proves TURN backup authority; selected ICE statistics prove the actual path.
+    pub(crate) async fn verify_active_wan_route(
+        &self,
+        session_id: &SessionId,
+        route: RelayRouteEvidence,
+        policy: WanRoutePolicyV3,
+    ) -> Result<VerifiedActiveRelayEvidence, ServiceWebRtcTransportError> {
         let session = self.session_entry(session_id).await?;
         let _replacement_guard = session.replacement_gate.lock().await;
-        if route.session_id() != session_id.0
+        let required_ice = match policy {
+            WanRoutePolicyV3::RelayOnly => IceTransportPolicy::Relay,
+            WanRoutePolicyV3::DirectFirst => IceTransportPolicy::All,
+        };
+        if session.initial_ice_policy != required_ice
+            || route.session_id() != session_id.0
             || route.generation() != 0
             || session.initial_relay_urls_digest.as_ref() != Some(route.urls_digest())
             || session.peer.current_generation().await != 0
@@ -327,14 +393,25 @@ impl ServiceWebRtcTransportHost {
             .ok_or(ServiceWebRtcTransportError::ReplacementEvidenceMismatch)?;
         let mux_route = session.mux.route_snapshot().await;
         if !pair.nominated
-            || pair.local_candidate_kind != CandidateKind::Relay
-            || pair.remote_candidate_kind != CandidateKind::Relay
+            || pair.local_candidate_kind == CandidateKind::Unknown
+            || pair.remote_candidate_kind == CandidateKind::Unknown
+            || (policy == WanRoutePolicyV3::RelayOnly
+                && (pair.local_candidate_kind != CandidateKind::Relay
+                    || pair.remote_candidate_kind != CandidateKind::Relay))
             || mux_route.session_id != *session_id
             || mux_route.closed
         {
             return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
         }
-        Ok(VerifiedActiveRelayEvidence { route })
+        session
+            .verified_direct_first
+            .store(policy == WanRoutePolicyV3::DirectFirst, Ordering::Release);
+        Ok(VerifiedActiveRelayEvidence {
+            route,
+            policy,
+            local_relay: pair.local_candidate_kind == CandidateKind::Relay,
+            remote_relay: pair.remote_candidate_kind == CandidateKind::Relay,
+        })
     }
 
     pub(crate) async fn enable_relay_failover(
@@ -728,7 +805,10 @@ impl ServiceWebRtcTransportHost {
         let route = session.mux.route_snapshot().await;
         if session.peer.current_generation().await != generation
             || route.session_id != *session_id
-            || route.kind != TransportRouteKind::WebRtcRelay
+            || (route.kind != TransportRouteKind::WebRtcRelay
+                && !(generation == 0
+                    && route.kind == TransportRouteKind::WebRtcDirect
+                    && session.verified_direct_first.load(Ordering::Acquire)))
             || route.closed
         {
             return Err(ServiceWebRtcTransportError::ReplacementEvidenceMismatch);
@@ -759,6 +839,38 @@ impl ServiceWebRtcTransportHost {
             .cloned()
             .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))
     }
+}
+
+fn initial_turn_urls_digest(config: &PeerConnectionConfig) -> Option<[u8; 32]> {
+    let turn = config.ice_servers.first()?;
+    if config.ice_servers.len() > 2
+        || turn.urls.is_empty()
+        || turn
+            .urls
+            .iter()
+            .any(|url| !(url.starts_with("turn:") || url.starts_with("turns:")))
+    {
+        return None;
+    }
+    if let Some(stun) = config.ice_servers.get(1) {
+        let allowed = turn
+            .urls
+            .iter()
+            .filter_map(|url| {
+                let endpoint = url.strip_prefix("turn:")?;
+                (!url.contains("transport=tcp"))
+                    .then(|| format!("stun:{}", endpoint.split('?').next().unwrap_or(endpoint)))
+            })
+            .collect::<Vec<_>>();
+        if !stun.username.is_empty()
+            || !stun.credential.is_empty()
+            || stun.urls.is_empty()
+            || stun.urls.iter().any(|url| !allowed.contains(url))
+        {
+            return None;
+        }
+    }
+    Some(urls_digest(&turn.urls))
 }
 
 fn replacement_urls_digest(
@@ -1441,6 +1553,28 @@ mod tests {
         assert!(!debug.contains("temporary-user"));
         assert!(!debug.contains("temporary-password"));
         assert!(debug.contains("TurnUdp"));
+    }
+
+    #[test]
+    fn direct_first_keeps_exact_turn_authority_and_derives_stun_from_it() {
+        let credential = credentials();
+        let config = credential.apply_direct_first(PeerConnectionConfig::default());
+        assert_eq!(config.ice_transport_policy, IceTransportPolicy::All);
+        assert_eq!(config.ice_servers[0].urls, credential.urls);
+        assert_eq!(
+            config.ice_servers[1].urls,
+            vec!["stun:relay.example.test:3478".to_owned()]
+        );
+        assert!(config.ice_servers[1].username.is_empty());
+        assert!(config.ice_servers[1].credential.is_empty());
+        assert_eq!(
+            initial_turn_urls_digest(&config),
+            Some(urls_digest(&credential.urls))
+        );
+        assert!(replacement_urls_digest(&config).is_err());
+        let mut injected = config;
+        injected.ice_servers[1].urls = vec!["stun:untrusted.example.test:3478".into()];
+        assert_eq!(initial_turn_urls_digest(&injected), None);
     }
 
     #[test]

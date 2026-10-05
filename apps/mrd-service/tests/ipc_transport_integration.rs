@@ -25,11 +25,16 @@ fn test_endpoint(test_name: &str) -> IpcEndpoint {
 
     #[cfg(unix)]
     {
-        IpcEndpoint::unix_socket(format!(
-            "/tmp/mrd-service-{}-{}.sock",
-            test_name,
-            std::process::id()
-        ))
+        let IpcEndpoint::UnixSocket(default) = IpcEndpoint::default_service();
+        IpcEndpoint::unix_socket(
+            std::path::Path::new(&default)
+                .with_file_name(format!(
+                    "mrd-service-{}-{}.sock",
+                    test_name,
+                    std::process::id()
+                ))
+                .to_string_lossy(),
+        )
     }
 }
 

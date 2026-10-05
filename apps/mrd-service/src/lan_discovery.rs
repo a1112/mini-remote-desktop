@@ -2,7 +2,7 @@ use crate::app_state::{AppState, AuthenticatedPeerTrust, DeviceIdentityRegistryE
 #[cfg(all(test, any(windows, target_os = "macos")))]
 use crate::app_state::{MediaRenderFrame, MediaRenderQueueEnqueue};
 use crate::transports::{quic::QuicTransportMux, TransportMuxConfig};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use mrd_application::ports::{
     SessionLifecycleState, SessionSnapshot, TransportEnvelope, TransportLane, TransportMuxPort,
     TransportSendOutcome, VideoEnvelopeMetadata,
@@ -172,7 +172,8 @@ use media_frame_preparation::decoded_frame_to_rgb24;
 use media_frame_preparation::window_h264_capture_dimensions;
 use media_frame_preparation::{captured_frame_memory_path, h264_target_dimensions};
 pub(crate) use media_frame_preparation::{
-    decoded_frame_format_stage, decoded_frame_pixel_format, prepare_frame_for_h264,
+    decoded_frame_format_stage, decoded_frame_pixel_format, prepare_exact_frame_for_h264,
+    prepare_frame_for_h264,
 };
 use media_keyframe_request::{
     decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
@@ -4719,6 +4720,8 @@ async fn release_control_state_for_session(app_state: &Arc<AppState>, session_id
 }
 
 async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &SessionId) {
+    #[cfg(windows)]
+    app_state.console_capture.stop(app_state, session_id).await;
     app_state.remove_agent_render_route(session_id).await;
     app_state.media_profiles.lock().await.remove(session_id);
     app_state.capture_sources.lock().await.remove(session_id);
@@ -4893,6 +4896,7 @@ fn spawn_quic_media_sender(
             if !session_allows_media(&task_app_state, &task_session_id).await {
                 return Ok(());
             }
+            #[cfg(not(windows))]
             let _ = task_app_state
                 .session_authorizations
                 .mark_streaming(&task_session_id, now_ms())
@@ -4942,6 +4946,20 @@ async fn send_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
+    // Lifecycle fixtures use the existing synthetic source without a native
+    // authority. Every production Windows sender still requires its exact Agent.
+    #[cfg(all(windows, not(test)))]
+    let use_console_agent = true;
+    #[cfg(all(windows, test))]
+    let use_console_agent = app_state.console_capture.is_enabled();
+    #[cfg(windows)]
+    if use_console_agent {
+        let profile = selected_media_profile(&app_state, &session_id).await;
+        app_state
+            .console_capture
+            .start(&app_state, &session_id, &profile)
+            .await?;
+    }
     let negotiated_max_datagram_size = endpoint
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
@@ -5019,6 +5037,10 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_MEDIA_PROFILE_TRANSPORT);
+    #[cfg(windows)]
+    let first_agent_frame_deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(windows)]
+    let mut first_agent_frame_sent = false;
     loop {
         while delayed_media_children.try_join_next().is_some() {}
         while reliable_keyframe_children.try_join_next().is_some() {}
@@ -5045,6 +5067,7 @@ async fn send_quic_media_loop(
         );
         let requested_codec = LanAccessUnitCodec::from_profile(&profile);
         let loop_started = Instant::now();
+        #[cfg(not(windows))]
         let sender_turn = match app_state
             .take_agent_media_turn(&session_id.0, 8, requested_codec)
             .await
@@ -5062,6 +5085,39 @@ async fn send_quic_media_loop(
                 .await?;
                 continue;
             }
+        };
+        #[cfg(windows)]
+        let sender_turn = {
+            let agent_turn = async {
+                let units = app_state
+                    .console_capture
+                    .drain(&app_state, &session_id, 8)
+                    .await?;
+                let units = units
+                    .into_iter()
+                    .map(|unit| {
+                        let validated = media_sender::validate_agent_access_unit(unit)
+                            .context("Agent encoded frame invalid")?;
+                        media_sender::prepare_agent_transport_unit(validated, requested_codec)
+                            .map_err(|error| {
+                                anyhow!("Agent codec does not match negotiated media: {error:?}")
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<_, anyhow::Error>(SenderMediaTurn::Agent(units))
+            };
+            #[cfg(not(test))]
+            let turn = agent_turn.await?;
+            #[cfg(test)]
+            let turn = if use_console_agent {
+                agent_turn.await?
+            } else {
+                app_state
+                    .take_agent_media_turn(&session_id.0, 8, requested_codec)
+                    .await
+                    .map_err(|error| anyhow!("test media source rejected: {error:?}"))?
+            };
+            turn
         };
         let (access_units, capture_memory_path) =
             if !media_sender::sender_turn_requires_local_capture(&sender_turn) {
@@ -5086,6 +5142,10 @@ async fn send_quic_media_loop(
                     pipelines.set_codec_fallback_reason(session_id.clone(), None);
                 }
                 if access_units.is_empty() {
+                    #[cfg(windows)]
+                    if !first_agent_frame_sent && Instant::now() >= first_agent_frame_deadline {
+                        anyhow::bail!("The approved capture Agent did not produce its first frame");
+                    }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     sender_stats.record_elapsed("sender.agent_wait", loop_started);
                     continue;
@@ -5542,7 +5602,18 @@ async fn send_quic_media_loop(
                     // Enqueue acceptance is not wire-send evidence. The mux owns packetization
                     // and asynchronous endpoint I/O, so legacy fragment counters intentionally
                     // remain unchanged on this route.
-                    TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale => {}
+                    TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale =>
+                    {
+                        #[cfg(windows)]
+                        if !first_agent_frame_sent {
+                            app_state
+                                .session_authorizations
+                                .mark_streaming(&session_id, now_ms())
+                                .await
+                                .context("Capture authorization changed before first frame")?;
+                            first_agent_frame_sent = true;
+                        }
+                    }
                     TransportSendOutcome::Backpressured => {
                         frame_id = frame_id.wrapping_add(1).max(1);
                         continue;
@@ -6020,6 +6091,15 @@ async fn send_quic_media_loop(
                 .await?;
                 frame_id = frame_id.wrapping_add(1).max(1);
                 continue;
+            }
+            #[cfg(windows)]
+            if !first_agent_frame_sent {
+                app_state
+                    .session_authorizations
+                    .mark_streaming(&session_id, now_ms())
+                    .await
+                    .context("Capture authorization changed before first frame")?;
+                first_agent_frame_sent = true;
             }
             sender_stats.frame_completed();
             if !session_allows_media(&app_state, &session_id).await {

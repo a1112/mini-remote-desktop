@@ -24,7 +24,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _LOCK_CONTEXT = b"MRD_RELAY_ACCESS_SCHEMA_MIGRATION_V1\x00"
-_VERSIONS = (1, 2, 3, 4, 5, 6)
+_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
 
 
 class RelayAccessMigrationError(RuntimeError):
@@ -121,6 +121,7 @@ async def _migrate_connection(
         {1, 2, 3},
         {1, 2, 3, 4},
         {1, 2, 3, 4, 5},
+        {1, 2, 3, 4, 5, 6},
     )
     if applied_versions not in supported_upgrade_states:
         # Versions 1-3 shipped as one atomic legacy migration. A partial legacy
@@ -134,6 +135,7 @@ async def _migrate_connection(
     apply_device_identity = 4 not in applied_versions
     apply_directory_lifecycle = 5 not in applied_versions
     apply_wan_session = 6 not in applied_versions
+    apply_direct_first = 7 not in applied_versions
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
         "relay_node_registrations", "relay_audit_events", "relay_reservations",
@@ -374,6 +376,17 @@ async def _migrate_connection(
             )
         )
 
+    if apply_direct_first:
+        legacy_wan_route = await connection.run_sync(
+            lambda sync: _wan_route_constraint_is_legacy(
+                sync, schema, allow_missing=apply_wan_session
+            )
+        )
+        if legacy_wan_route:
+            await connection.execute(text(
+                f"ALTER TABLE {sessions} DROP CONSTRAINT ck_session_requests_wan_values"
+            ))
+
     checks = (
         (users, f"{effective_schema}.users", "ck_users_tenant_id", "length(tenant_id) BETWEEN 1 AND 64"),
         (users, f"{effective_schema}.users", "ck_users_tenant_id_canonical", "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"),
@@ -389,7 +402,7 @@ async def _migrate_connection(
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_policy_revision", "policy_revision IS NULL OR policy_revision > 0"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_approved_bundle", "status <> 'approved' OR (grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL)"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_request_bundle", "(requester_device_id IS NULL AND request_payload IS NULL AND request_commitment IS NULL AND access_mode IS NULL AND route_policy IS NULL AND requested_scopes IS NULL AND requested_profile IS NULL AND approved_scopes IS NULL AND approved_profile IS NULL AND active_relay_generation IS NULL) OR (requester_device_id IS NOT NULL AND request_payload IS NOT NULL AND request_commitment IS NOT NULL AND length(request_commitment) = 64 AND access_mode IS NOT NULL AND route_policy IS NOT NULL AND requested_scopes IS NOT NULL)"),
-        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_values", "requester_device_id IS NULL OR (requester_device_id <> target_device_id AND access_mode = 'attended' AND route_policy = 'relay_only')"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_values", "requester_device_id IS NULL OR (requester_device_id <> target_device_id AND access_mode = 'attended' AND route_policy IN ('relay_only', 'direct_first'))"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_approval_bundle", "requester_device_id IS NULL OR status <> 'approved' OR (approved_scopes IS NOT NULL AND policy_expires_at IS NOT NULL AND active_relay_generation IS NOT NULL AND active_relay_generation >= 0)"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_active_relay_generation", "active_relay_generation IS NULL OR (requester_device_id IS NOT NULL AND active_relay_generation >= 0)"),
     )
@@ -398,6 +411,7 @@ async def _migrate_connection(
             ((name.startswith("ck_session_requests_wan_")
               or name == "ck_session_requests_active_relay_generation")
              and apply_wan_session)
+            or (name == "ck_session_requests_wan_values" and apply_direct_first)
             or (name == "ck_session_requests_status" and (
                 apply_legacy_access or apply_directory_lifecycle
             ))
@@ -517,6 +531,29 @@ def _configured_serial_pepper(
             return None
         return decoded if len(decoded) >= 32 else None
     return None
+
+
+def _wan_route_constraint_is_legacy(
+    connection: object, schema: str | None, *, allow_missing: bool
+) -> bool:
+    checks = {
+        item["name"]: _normalize_check_expression(item["sqltext"])
+        for item in inspect(connection).get_check_constraints("session_requests", schema=schema)
+    }
+    actual = checks.get("ck_session_requests_wan_values")
+    if actual is None and allow_missing:
+        return False
+    prefix = ("requester_device_id IS NULL OR requester_device_id <> target_device_id "
+              "AND access_mode = 'attended' AND ")
+    legacy = _normalize_check_expression(prefix + "route_policy = 'relay_only'")
+    current = _normalize_check_expression(
+        prefix + "(route_policy = ANY (ARRAY['relay_only', 'direct_first']))"
+    )
+    if actual == legacy:
+        return True
+    if actual == current:
+        return False
+    raise RelayAccessMigrationError("relay access WAN route policy constraint differs")
 
 
 def _session_status_constraint_is_legacy(
@@ -1402,7 +1439,8 @@ def _verify(connection: object, schema: str | None) -> None:
             "ck_session_requests_wan_values": (
                 "requester_device_id IS NULL OR "
                 "requester_device_id <> target_device_id AND "
-                "access_mode = 'attended' AND route_policy = 'relay_only'"
+                "access_mode = 'attended' AND (route_policy = ANY "
+                "(ARRAY['relay_only', 'direct_first']))"
             ),
             "ck_session_requests_wan_approval_bundle": (
                 "requester_device_id IS NULL OR status <> 'approved' OR "
@@ -1415,6 +1453,21 @@ def _verify(connection: object, schema: str | None) -> None:
             ),
         },
     }
+    # The independently versioned redundancy migration runs after this one.
+    # On subsequent startup its exact owned constraint must join the closed
+    # allowlist; unrelated or drifted checks remain rejected.
+    if "relay_max_backups" in session_columns:
+        from app.db.migrate_add_relay_redundancy import verify_redundancy_column
+        verify_redundancy_column(connection, schema)
+    if inspector.has_table("relay_redundancy_schema_migrations", schema=schema):
+        versions = set(connection.execute(text(
+            f"SELECT version FROM {_table(effective_schema, 'relay_redundancy_schema_migrations')}"
+        )).scalars())
+        if versions != {1}:
+            raise RelayAccessMigrationError("relay redundancy migration versions differ")
+        required_checks["session_requests"]["ck_session_requests_relay_max_backups"] = (
+            "relay_max_backups >= 0 AND relay_max_backups <= 7"
+        )
     for table_name, expected in required_checks.items():
         checks = {
             item["name"]: _normalize_check_expression(item["sqltext"])

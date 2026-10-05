@@ -1,0 +1,81 @@
+name: macOS client package
+
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Mac architecture
+        type: choice
+        required: true
+        default: apple-silicon
+        options: [apple-silicon, intel, both]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.ref }}-${{ inputs.architecture }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: macOS package (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.architecture == 'intel' && '[{"architecture":"intel","runner":"macos-15-intel","target":"x86_64-apple-darwin"}]' || inputs.architecture == 'both' && '[{"architecture":"apple-silicon","runner":"macos-15","target":"aarch64-apple-darwin"},{"architecture":"intel","runner":"macos-15-intel","target":"x86_64-apple-darwin"}]' || '[{"architecture":"apple-silicon","runner":"macos-15","target":"aarch64-apple-darwin"}]') }}
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_TERM_COLOR: always
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/Rdesk/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-package-${{ matrix.target }}
+      - name: Verify native build architecture
+        env:
+          EXPECTED_TARGET: ${{ matrix.target }}
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          test "$host" = "$EXPECTED_TARGET"
+      - name: Install frontend dependencies
+        working-directory: apps/Rdesk
+        run: pnpm install --frozen-lockfile
+      - name: Verify registration and protected storage
+        run: cargo test --locked -p mrd-device-registration -p mrd-store-sqlite -p mrd-ipc
+      - name: Build client and embedded resident service
+        run: bash scripts/packaging/build_macos_client.sh
+      - name: Verify real native service startup and restart
+        shell: bash
+        run: |
+          set -euo pipefail
+          original_keychain=$(security default-keychain -d user | sed 's/^ *"//;s/" *$//')
+          smoke_keychain="$RUNNER_TEMP/mrd-runtime-smoke.keychain-db"
+          keychain_password=$(openssl rand -hex 32)
+          security create-keychain -p "$keychain_password" "$smoke_keychain"
+          trap 'security default-keychain -d user -s "$original_keychain"; security delete-keychain "$smoke_keychain"' EXIT
+          security unlock-keychain -p "$keychain_password" "$smoke_keychain"
+          security set-keychain-settings -lut 21600 "$smoke_keychain"
+          security default-keychain -d user -s "$smoke_keychain"
+          unset keychain_password
+          node apps/Rdesk/scripts/smoke-macos-service.mjs target/release/bundle/macos/Rdesk.app/Contents/Resources/MrdService.app/Contents/MacOS/mrd-service
+      - name: Upload downloadable client
+        uses: actions/upload-artifact@v4
+        with:
+          name: Rdesk-macos-${{ matrix.architecture }}-${{ github.sha }}
+          path: target/macos-client-artifacts/*
+          if-no-files-found: error
+          retention-days: 14

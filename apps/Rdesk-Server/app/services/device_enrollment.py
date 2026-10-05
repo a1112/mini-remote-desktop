@@ -6,6 +6,7 @@ import hmac
 import json
 import re
 import secrets
+import sqlite3
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ _TOKEN_CONTEXT = b"MRD_DEVICE_ENROLLMENT_TOKEN_V1\x00"
 _REQUEST_CONTEXT = b"MRD_DEVICE_REGISTRATION_REQUEST_V1\x00"
 _SERIAL_CONTEXT = b"MRD_DEVICE_SERIAL_V1\x00"
 _SERIAL_LOCK_CONTEXT = b"MRD_DEVICE_SERIAL_LOCK_V1\x00"
+_DEVICE_CODE_ATTEMPTS = 32
 _LOCAL_SERIAL_LOCKS: weakref.WeakValueDictionary[
     tuple[int, str], asyncio.Lock
 ] = weakref.WeakValueDictionary()
@@ -176,10 +178,6 @@ class DeviceEnrollmentService:
         if existing is not None:
             self._conflict()
         device_id = generate_device_id_from_digest(serial_digest)
-        if await self._session.scalar(
-            select(Device.id).where(Device.device_id == device_id)
-        ):
-            device_id = f"{device_id}-{secrets.token_hex(2)}"
         os_version = registration.get("os_version")
         os_type = (
             os_version.split()[0]
@@ -188,31 +186,43 @@ class DeviceEnrollmentService:
         )
         hostname = registration.get("hostname")
         device_name = registration.get("device_name") or hostname
-        device = Device(
-            name=device_name,
-            device_id=device_id,
-            os=os_type,
-            os_version=os_version,
-            hostname=hostname,
-            motherboard_serial=None,
-            motherboard_serial_digest=serial_digest,
-            cpu_info=registration.get("cpu_info"),
-            total_memory_mb=registration.get("total_memory_mb"),
-            gpu_info=registration.get("gpu_info"),
-            is_bound=False,
-        )
-        begin_nested = getattr(self._session, "begin_nested", None)
-        savepoint = await begin_nested() if callable(begin_nested) else None
-        try:
-            self._session.add(device)
-            await self._session.flush()
-        except IntegrityError:
-            if savepoint is not None:
+        # The unique index is the allocator's authority, including when two
+        # different physical devices concurrently receive the same candidate.
+        # A savepoint keeps the enrollment transaction usable after a collision.
+        for attempt in range(_DEVICE_CODE_ATTEMPTS):
+            device = Device(
+                name=device_name,
+                device_id=device_id,
+                os=os_type,
+                os_version=os_version,
+                hostname=hostname,
+                motherboard_serial=None,
+                motherboard_serial_digest=serial_digest,
+                cpu_info=registration.get("cpu_info"),
+                total_memory_mb=registration.get("total_memory_mb"),
+                gpu_info=registration.get("gpu_info"),
+                is_bound=False,
+            )
+            savepoint = await self._session.begin_nested()
+            try:
+                self._session.add(device)
+                await self._session.flush()
+            except IntegrityError as error:
                 await savepoint.rollback()
-            self._conflict()
-        else:
-            if savepoint is not None:
+                identity_constraint = _device_identity_constraint(error)
+                if identity_constraint == "serial":
+                    self._conflict()
+                if identity_constraint != "code":
+                    raise
+                if attempt + 1 < _DEVICE_CODE_ATTEMPTS:
+                    device_id = str(secrets.randbelow(10**10)).zfill(10)
+            else:
                 await savepoint.commit()
+                break
+        else:
+            raise DeviceEnrollmentError(
+                "device_code_unavailable", 503, "device code allocation unavailable"
+            )
         enrollment.consumed_at = now
         enrollment.request_digest = request_digest
         enrollment.registered_device_id = device.id
@@ -268,6 +278,32 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _device_identity_constraint(error: IntegrityError) -> str | None:
+    """Recognize only the two identity unique constraints, never other errors."""
+
+    original = error.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if sqlstate == "23505":
+        names = {
+            "ix_devices_device_id": "code",
+            "devices_device_id_key": "code",
+            "ix_devices_motherboard_serial_digest": "serial",
+            "devices_motherboard_serial_digest_key": "serial",
+        }
+        # asyncpg exposes the constraint on the underlying exception;
+        # psycopg exposes it through .diag instead.
+        for details in (original, original.__cause__, getattr(original, "diag", None)):
+            constraint_name = getattr(details, "constraint_name", None)
+            if constraint_name in names:
+                return names[constraint_name]
+    elif getattr(original, "sqlite_errorcode", None) == sqlite3.SQLITE_CONSTRAINT_UNIQUE:
+        return {
+            "UNIQUE constraint failed: devices.device_id": "code",
+            "UNIQUE constraint failed: devices.motherboard_serial_digest": "serial",
+        }.get(str(original))
+    return None
 
 
 def device_serial_digest(serial: str, pepper: bytes) -> str:

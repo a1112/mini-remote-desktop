@@ -13,6 +13,7 @@ const MAX_TRUSTED_KEYS_JSON_BYTES: usize = 8 * 1024;
 pub struct WanSessionBackendConfig {
     base_url: Url,
     device_token: Zeroizing<String>,
+    shared_credential: Option<std::sync::Arc<crate::public_connection::DeviceCredential>>,
     trusted_directory_keys: BTreeMap<String, Vec<u8>>,
     operation_deadline: Duration,
     max_body_bytes: usize,
@@ -74,6 +75,7 @@ impl WanSessionBackendConfig {
         Ok(Self {
             base_url,
             device_token: Zeroizing::new(device_token.to_owned()),
+            shared_credential: None,
             trusted_directory_keys,
             operation_deadline,
             max_body_bytes,
@@ -128,8 +130,19 @@ impl WanSessionBackendConfig {
         &self.base_url
     }
 
-    pub(crate) fn device_token(&self) -> &str {
-        &self.device_token
+    pub(crate) fn device_token(&self) -> Zeroizing<String> {
+        self.shared_credential
+            .as_ref()
+            .map(|credential| credential.snapshot())
+            .unwrap_or_else(|| Zeroizing::new(self.device_token.as_str().to_owned()))
+    }
+
+    pub(crate) fn with_device_credential(
+        mut self,
+        credential: std::sync::Arc<crate::public_connection::DeviceCredential>,
+    ) -> Self {
+        self.shared_credential = Some(credential);
+        self
     }
 
     pub(crate) fn trusted_directory_keys(&self) -> &BTreeMap<String, Vec<u8>> {

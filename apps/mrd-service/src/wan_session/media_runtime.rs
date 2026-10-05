@@ -11,7 +11,8 @@ use crate::{
     app_state::{AppState, WanMediaRuntimeRole},
     lan_discovery::{
         create_software_frame_capture, decoded_frame_format_stage, decoded_frame_pixel_format,
-        prepare_frame_for_h264, selected_capture_source_id, LanFrameCapture,
+        prepare_exact_frame_for_h264 as prepare_frame_for_h264, selected_capture_source_id,
+        LanFrameCapture,
     },
 };
 use mrd_application::ports::{
@@ -116,6 +117,11 @@ pub(crate) async fn start_target_runtime(
             &mut ready,
         )
         .await;
+        #[cfg(windows)]
+        task_app_state
+            .console_capture
+            .stop(&task_app_state, &task_session_id)
+            .await;
         let became_ready = ready.is_none();
         if result.is_err() {
             send_startup_failure(&mut ready);
@@ -245,6 +251,16 @@ async fn run_target_runtime(
     test_synthetic_capture: bool,
     ready: &mut Option<WanMediaReadySender>,
 ) -> Result<(), WanMediaRuntimeError> {
+    #[cfg(windows)]
+    {
+        #[cfg(any(test, debug_assertions))]
+        let use_agent = !test_synthetic_capture;
+        #[cfg(not(any(test, debug_assertions)))]
+        let use_agent = true;
+        if use_agent {
+            return run_console_agent_target(&app_state, &authority, &profile, mux, ready).await;
+        }
+    }
     let mut capture = create_target_capture(
         &app_state,
         authority.session_id(),
@@ -327,6 +343,81 @@ async fn run_target_runtime(
     }
 }
 
+/// The service transports encoded desktop frames; the approved interactive
+/// Agent owns capture and encoding. An empty first-frame queue never enables
+/// capture in the privileged resident process.
+#[cfg(windows)]
+async fn run_console_agent_target(
+    app_state: &Arc<AppState>,
+    authority: &WanMediaAuthority,
+    profile: &MediaProfile,
+    mux: Arc<dyn TransportMuxPort>,
+    ready: &mut Option<WanMediaReadySender>,
+) -> Result<(), WanMediaRuntimeError> {
+    app_state
+        .console_capture
+        .start(app_state, authority.session_id(), profile)
+        .await
+        .map_err(|error| {
+            tracing::warn!("Approved Agent capture could not start: {error:#}");
+            WanMediaRuntimeError::Capture
+        })?;
+    app_state
+        .media_pipelines
+        .lock()
+        .await
+        .set_active_encoder(authority.session_id().clone(), "session_agent");
+    let mut wait = tokio::time::interval(Duration::from_millis(2));
+    wait.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        wait.tick().await;
+        let units = app_state
+            .console_capture
+            .drain(app_state, authority.session_id(), 8)
+            .await
+            .map_err(|_| WanMediaRuntimeError::Capture)?;
+        for unit in units {
+            let sequence = unit.sequence;
+            let outcome = mux
+                .send(TransportEnvelope {
+                    session_id: authority.session_id().clone(),
+                    lane: TransportLane::Video,
+                    sequence,
+                    payload: unit.payload,
+                    video: Some(VideoEnvelopeMetadata {
+                        codec: "h264".to_owned(),
+                        timestamp_us: unit.timestamp_us,
+                        keyframe: unit.is_keyframe,
+                        width: profile.width,
+                        height: profile.height,
+                    }),
+                })
+                .await
+                .map_err(|_| WanMediaRuntimeError::Transport)?;
+            match outcome {
+                TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale => {
+                    publish_ready(
+                        app_state,
+                        authority,
+                        WanMediaRuntimeRole::TargetSender,
+                        sequence,
+                        ready,
+                    )
+                    .await?;
+                }
+                TransportSendOutcome::Backpressured => {
+                    app_state
+                        .media_pipelines
+                        .lock()
+                        .await
+                        .increment_dropped_frames(authority.session_id().clone(), 1);
+                }
+                TransportSendOutcome::Closed => return Err(WanMediaRuntimeError::Transport),
+            }
+        }
+    }
+}
+
 async fn run_controller_runtime(
     app_state: Arc<AppState>,
     authority: WanMediaAuthority,
@@ -370,6 +461,11 @@ async fn run_controller_runtime(
         let mut decoded_frames = decoded_frames?;
         if decoded_frames.is_empty() {
             continue;
+        }
+        if decoded_frames.iter().any(|frame| {
+            frame.width != profile.width as usize || frame.height != profile.height as usize
+        }) {
+            return Err(WanMediaRuntimeError::Evidence);
         }
         for frame in &mut decoded_frames {
             frame.timestamp_us = metadata.timestamp_us;
@@ -507,4 +603,46 @@ fn now_unix_us() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_micros().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod capture_profile_tests {
+    use super::*;
+
+    #[test]
+    fn wide_desktop_wan_capture_encodes_and_decodes_the_exact_approved_profile() {
+        let profile = default_wan_media_profile();
+        let timestamp = 55_000;
+        // Common Retina aspect ratio differs from the approved 16:9 WAN frame.
+        let source = CapturedFrame::from_cpu(
+            2880,
+            1800,
+            FramePixelFormat::Rgb24,
+            timestamp,
+            vec![73; 2880 * 1800 * 3],
+        );
+        let frame = prepare_frame_for_h264(source, &profile).unwrap();
+        assert_eq!((frame.width, frame.height), (1280, 720));
+        assert_eq!(frame.timestamp_us, timestamp);
+        let mut encoder = OpenH264Encoder::new_with_bitrate(
+            profile.width as usize,
+            profile.height as usize,
+            profile.fps,
+            profile.bitrate_mbps * 1_000_000,
+        )
+        .unwrap();
+        let units = encoder
+            .encode(&frame)
+            .expect("approved-profile frame must encode");
+        assert!(units.iter().any(|unit| unit.is_keyframe));
+        let mut decoder = H264SoftwareDecoder::new().unwrap();
+        for unit in units {
+            decoder.push_access_unit(&unit.bytes).unwrap();
+        }
+        let decoded = decoder.drain_decoded_frames();
+        assert!(!decoded.is_empty());
+        assert!(decoded
+            .iter()
+            .all(|frame| (frame.width, frame.height) == (1280, 720)));
+    }
 }

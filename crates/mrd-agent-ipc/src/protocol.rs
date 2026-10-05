@@ -624,6 +624,8 @@ pub struct InputEventEnvelope {
     pub start_grant_id: [u8; 32],
     /// Strictly increasing sequence local to this resource.
     pub sequence: u64,
+    /// Exclusive command deadline checked again by the injecting agent.
+    pub expires_at_ms: u64,
     /// Input operation. This payload is never echoed in an acknowledgment.
     pub event: InputEventPayload,
 }
@@ -639,6 +641,7 @@ impl InputEventEnvelope {
             || self.start_grant_id.iter().all(|byte| *byte == 0)
             || self.sequence == 0
             || self.sequence == u64::MAX
+            || self.expires_at_ms == 0
             || !self.event.has_valid_shape()
         {
             return Err(InputRejection::InvalidEvent);
@@ -658,6 +661,7 @@ impl InputEventEnvelope {
             resource_id: &'a [u8; 16],
             start_grant_id: &'a [u8; 32],
             sequence: u64,
+            expires_at_ms: u64,
             event: &'a InputEventPayload,
         }
         let encoded = serde_json::to_vec(&SemanticInputEvent {
@@ -665,6 +669,7 @@ impl InputEventEnvelope {
             resource_id: &self.resource_id,
             start_grant_id: &self.start_grant_id,
             sequence: self.sequence,
+            expires_at_ms: self.expires_at_ms,
             event: &self.event,
         })
         .map_err(|_| InputRejection::InvalidEvent)?;
@@ -759,6 +764,32 @@ pub struct RenderSurfaceTarget {
     pub window_handle: u64,
 }
 
+/// Exact encoder settings selected by the approved product media session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentCaptureProfile {
+    /// Exact encoded frame width, mapped to the entire captured display.
+    pub width: u32,
+    /// Encoded frame height.
+    pub height: u32,
+    /// Maximum capture/encode frames per second.
+    pub fps: u32,
+    /// H264 encoder target bitrate in bits per second.
+    pub bitrate_bps: u32,
+}
+
+impl AgentCaptureProfile {
+    /// Bound CPU allocation and encoder work before creating a desktop resource.
+    pub fn is_valid(&self) -> bool {
+        (2..=7680).contains(&self.width)
+            && self.width % 2 == 0
+            && (2..=4320).contains(&self.height)
+            && self.height % 2 == 0
+            && (1..=120).contains(&self.fps)
+            && (64_000..=100_000_000).contains(&self.bitrate_bps)
+    }
+}
+
 /// Product operation executed by an interactive-session agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(
@@ -774,6 +805,9 @@ pub enum AgentCommand {
         resource_id: [u8; 16],
         /// Platform display identifier.
         display_id: u32,
+        /// Immutable encoder profile included in the execute-grant digest.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<AgentCaptureProfile>,
     },
     /// Stop a capture resource.
     StopCapture {
@@ -852,6 +886,7 @@ impl AgentCommand {
             Self::StartCapture {
                 resource_id,
                 display_id,
+                ..
             } => (
                 b"start_capture".as_slice(),
                 resource_id,
@@ -927,6 +962,17 @@ impl AgentCommand {
             context.update(&(surface.surface_id.len() as u64).to_le_bytes());
             context.update(surface.surface_id.as_bytes());
             context.update(&surface.window_handle.to_le_bytes());
+        }
+        if let Self::StartCapture {
+            profile: Some(profile),
+            ..
+        } = self
+        {
+            context.update(b"capture-profile-v1\0");
+            context.update(&profile.width.to_le_bytes());
+            context.update(&profile.height.to_le_bytes());
+            context.update(&profile.fps.to_le_bytes());
+            context.update(&profile.bitrate_bps.to_le_bytes());
         }
         if let Self::StartInput { input_scopes, .. } = self {
             let encoded_scopes = serde_json::to_vec(input_scopes)
@@ -1243,6 +1289,30 @@ pub enum MediaCodec {
     Av1,
 }
 
+/// Physical desktop coordinates of the exact display being captured.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureSourceBounds {
+    /// Physical virtual-desktop horizontal origin, including negative displays.
+    pub left: i32,
+    /// Physical virtual-desktop vertical origin.
+    pub top: i32,
+    /// Full source display width before approved-profile scaling.
+    pub width: u32,
+    /// Full source display height before approved-profile scaling.
+    pub height: u32,
+}
+
+impl CaptureSourceBounds {
+    /// Reject empty, unreasonable, or overflowing physical display rectangles.
+    pub fn is_valid(&self) -> bool {
+        (1..=32_768).contains(&self.width)
+            && (1..=32_768).contains(&self.height)
+            && self.left.checked_add(self.width as i32).is_some()
+            && self.top.checked_add(self.height as i32).is_some()
+    }
+}
+
 /// One grant-bound encoded media access unit emitted by an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1261,6 +1331,9 @@ pub struct MediaAccessUnit {
     pub codec: MediaCodec,
     /// Whether this unit is an intra-coded keyframe.
     pub is_keyframe: bool,
+    /// Physical source geometry authenticated by the actual capture worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bounds: Option<CaptureSourceBounds>,
     /// Encoded payload bytes.
     pub payload: Vec<u8>,
 }
@@ -1273,6 +1346,7 @@ impl MediaAccessUnit {
             && self.session_id.len() <= AGENT_IPC_MAX_IDENTIFIER_BYTES
             && self.sequence > 0
             && self.context.sequence > 0
+            && self.source_bounds.is_none_or(|bounds| bounds.is_valid())
             && !self.payload.is_empty()
             && self.payload.len() <= AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES
     }

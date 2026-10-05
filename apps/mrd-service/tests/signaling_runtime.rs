@@ -2228,6 +2228,97 @@ struct BoundTokenVerifier {
     key_id: String,
 }
 
+#[test]
+fn service_restart_keeps_machine_key_and_registers_with_existing_realtime_replay() {
+    let machine = identity();
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let protector: Arc<dyn mrd_store_sqlite::SecretProtector> =
+        Arc::new(mrd_store_sqlite::AeadSecretProtector::from_key([93; 32]).unwrap());
+    let verifier = Arc::new(BoundTokenVerifier {
+        device_id: DeviceId("local-device".into()),
+        key_id: machine.key_id().into(),
+    });
+    let mut server = realtime_server::RealtimeCore::new(
+        realtime_server::CoreConfig {
+            server_device_id: DeviceId("signal-server".into()),
+            challenge_ttl_ms: 5_000,
+            presence_ttl_ms: 30_000,
+            route_ttl_ms: 30_000,
+            max_connections: 8,
+            max_messages_per_window: 64,
+            rate_window_ms: 1_000,
+        },
+        verifier,
+    )
+    .unwrap();
+    let mut previous_counter = 0;
+    let mut previous_heartbeat = None;
+    for restart in 0..3 {
+        let allocator = Arc::new(
+            mrd_service::signaling::PersistentSignalingCounter::open(
+                directory.path(),
+                protector.clone(),
+                machine.key_id(),
+            )
+            .unwrap(),
+        );
+        let config = SignalingConfig::new(
+            "ws://127.0.0.1:9542/ws",
+            DeviceId("local-device".into()),
+            "Local workstation",
+            BackendRole::Agent,
+            "backend-token-secret",
+            DeviceId("signal-server".into()),
+            None,
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+        )
+        .unwrap()
+        .with_counter_allocator(allocator);
+        let mut client = SignalingRuntimeCore::new(config, machine.clone());
+        let connection = realtime_server::ConnectionId::from_bytes([restart + 1; 16]).unwrap();
+        let now = NOW + u64::from(restart) * 20_000;
+        let challenge = server.open_connection(connection, now).unwrap();
+        let register = client.build_registration(challenge, now + 1).unwrap();
+        let result = server.handle(connection, register, now + 2);
+        assert!(
+            result.is_ok(),
+            "the same-key restarted service must register: {result:?}"
+        );
+        let deliveries = result.unwrap();
+        let AuthenticatedSignalMessage::Registered(registered) =
+            deliveries[0].envelope.message.clone()
+        else {
+            panic!("registered response");
+        };
+        client.accept_registered(registered, now + 2).unwrap();
+        let heartbeat = client.heartbeat_if_due(now + 10_003).unwrap().unwrap();
+        let AuthenticatedSignalMessage::PresenceHeartbeat(signed) = &heartbeat.message else {
+            panic!("heartbeat");
+        };
+        assert!(signed.payload.claims.counter > previous_counter);
+        previous_counter = signed.payload.claims.counter;
+        server
+            .handle(connection, heartbeat.clone(), now + 10_003)
+            .unwrap();
+        if let Some(old_heartbeat) = previous_heartbeat.take() {
+            let rejected = server
+                .handle(connection, old_heartbeat, now + 10_003)
+                .unwrap_err();
+            assert_eq!(rejected.reason_code(), ProtocolReasonCode::ReplayRejected);
+        }
+        previous_heartbeat = Some(heartbeat);
+        server.disconnect(connection);
+        drop(client);
+    }
+}
+
 impl realtime_server::BackendTokenVerifier for BoundTokenVerifier {
     fn verify(
         &self,
@@ -2244,6 +2335,40 @@ impl realtime_server::BackendTokenVerifier for BoundTokenVerifier {
             expires_at_ms: now_ms + 60_000,
         })
     }
+}
+
+#[test]
+fn counter_bound_to_another_machine_cannot_sign_a_registration() {
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let allocator = Arc::new(
+        mrd_service::signaling::PersistentSignalingCounter::open(
+            directory.path(),
+            Arc::new(mrd_store_sqlite::AeadSecretProtector::from_key([94; 32]).unwrap()),
+            "another-machine-key",
+        )
+        .unwrap(),
+    );
+    let mut runtime = SignalingRuntimeCore::new(
+        config(&identity()).with_counter_allocator(allocator),
+        identity(),
+    );
+    let error = runtime
+        .build_registration(
+            ServerChallenge {
+                challenge_id: [1; 16],
+                challenge_nonce: [2; 32],
+                issued_at_ms: NOW,
+                expires_at_ms: NOW + 5_000,
+            },
+            NOW,
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "signaling_counter_storage");
 }
 
 #[tokio::test]

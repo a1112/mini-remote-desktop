@@ -240,7 +240,7 @@ $coturnUnit = $texts["linux/mrd-coturn.service"]
 foreach ($pattern in @(
     '(?m)^Requires=mrd-relay-firewall\.service$',
     '(?m)^After=mrd-relay-firewall\.service$',
-    '(?m)^Type=simple$',
+    '(?m)^Type=exec$',
     '(?m)^User=mrd-coturn$',
     '(?m)^Group=mrd-coturn$',
     '(?m)^LoadCredential=turnserver\.conf:/etc/mrd-relay-agent/secrets/turnserver\.generated\.conf$',
@@ -271,7 +271,10 @@ foreach ($pattern in @(
     '(?m)^DirectoryMode=0750$',
     '(?m)^Accept=yes$',
     '(?m)^RemoveOnStop=yes$',
-    '(?m)^MaxConnections=16$'
+    '(?m)^MaxConnections=16$',
+    '(?m)^MaxConnectionsPerSource=4$',
+    '(?m)^TriggerLimitIntervalSec=30s$',
+    '(?m)^TriggerLimitBurst=256$'
   )) {
   Assert-Matches $controlSocket $pattern "Linux coturn control socket contains $pattern"
 }
@@ -286,7 +289,10 @@ foreach ($pattern in @(
     '(?m)^StandardError=journal$',
     '(?m)^NoNewPrivileges=true$',
     '(?m)^ProtectSystem=strict$',
-    '(?m)^ReadWritePaths=/etc/mrd-relay-agent/secrets /var/lib/mrd-coturn /run/mrd-coturn$'
+    '(?m)^CapabilityBoundingSet=$',
+    '(?m)^AmbientCapabilities=$',
+    '(?m)^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK$',
+    '(?m)^ReadWritePaths=/etc/mrd-relay-agent/secrets /var/lib/mrd-coturn$'
     ,'(?m)^RuntimeMaxSec=15s$'
     ,'(?m)^TasksMax=8$'
     ,'(?m)^MemoryMax=64M$'

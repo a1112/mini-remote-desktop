@@ -39,6 +39,73 @@ use sha2::{Digest as _, Sha256};
 const HELPER: &str = "/usr/local/libexec/mrd-relay-coturn-control";
 const CONTAINER_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[test]
+fn native_ice_candidate_foundation_is_bound_without_rejecting_standard_encoding() {
+    let challenge = [0x42; 32];
+    let valid = "candidate:AbCd0123+/AbCd0123+/AbCd0123+/12";
+    assert!(probe_proof_sha256(
+        CoturnTarget::LinuxSystemd,
+        4,
+        1,
+        &challenge,
+        valid,
+        "candidate:remote+relay/123",
+        1,
+        1,
+        23,
+        23
+    )
+    .is_ok());
+    for invalid in [
+        "candidate:+/ ",
+        "candidate:+/\n",
+        "candidate:+/=",
+        "other:abc+/",
+        "candidate:abcdefghijklmnopqrstuvwxyz123456+",
+    ] {
+        assert!(probe_proof_sha256(
+            CoturnTarget::LinuxSystemd,
+            4,
+            1,
+            &challenge,
+            invalid,
+            "candidate:remote+relay/123",
+            1,
+            1,
+            23,
+            23
+        )
+        .is_err());
+    }
+    let proof = probe_proof_sha256(
+        CoturnTarget::LinuxSystemd,
+        4,
+        1,
+        &challenge,
+        valid,
+        "candidate:remote+relay/123",
+        1,
+        1,
+        23,
+        23,
+    )
+    .unwrap();
+    let altered = probe_proof_sha256(
+        CoturnTarget::LinuxSystemd,
+        4,
+        1,
+        &challenge,
+        "candidate:AbCd0123+/AbCd0123+/AbCd0123+/13",
+        "candidate:remote+relay/123",
+        1,
+        1,
+        23,
+        23,
+    )
+    .unwrap();
+    assert_ne!(proof, altered);
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BrokerObservation {
     target: CoturnTarget,

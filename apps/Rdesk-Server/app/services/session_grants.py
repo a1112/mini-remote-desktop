@@ -43,6 +43,7 @@ class SessionGrantPolicy:
     allowed_regions: tuple[str, ...]
     preferred_regions: tuple[str, ...]
     accepted_transports: tuple[str, ...]
+    max_backups: int = 1
 
 
 class SessionGrantService:
@@ -336,6 +337,7 @@ def configured_session_grant_policy(configuration: object) -> SessionGrantPolicy
         allowed_regions=allowed,
         preferred_regions=preferred,
         accepted_transports=accepted,
+        max_backups=getattr(configuration, "relay_max_backups", 1),
     )
 
 
@@ -367,6 +369,9 @@ def validate_session_grant_policy(policy: SessionGrantPolicy) -> None:
         and 1 <= len(policy.preferred_regions) <= 8
         and all(region in policy.allowed_regions for region in policy.preferred_regions)
         and 1 <= len(policy.accepted_transports) <= 3
+        and isinstance(policy.max_backups, int)
+        and not isinstance(policy.max_backups, bool)
+        and 0 <= policy.max_backups <= 7
     )
     if not valid:
         raise SessionGrantError(
@@ -395,6 +400,7 @@ def bind_session_grant_policy(
     grant.relay_allowed_regions = list(policy.allowed_regions)
     grant.relay_preferred_regions = list(policy.preferred_regions)
     grant.relay_accepted_transports = list(policy.accepted_transports)
+    grant.relay_max_backups = policy.max_backups
 
 
 def _valid_tenant(value: object) -> bool:

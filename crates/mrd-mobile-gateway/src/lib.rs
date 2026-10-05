@@ -15,18 +15,22 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+#[cfg(windows)]
 use serde::Deserialize;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     env,
     net::{IpAddr, SocketAddr},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
-use tracing::{info, warn};
+#[cfg(windows)]
+use tokio::sync::mpsc;
+use tokio::sync::{broadcast, watch, Mutex};
+use tracing::info;
+#[cfg(windows)]
+use tracing::warn;
 
 #[cfg(windows)]
 mod video;
@@ -43,6 +47,7 @@ struct MobileState {
     phone_publisher_active: Arc<Mutex<bool>>,
 }
 
+#[cfg(windows)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DesktopControl {
@@ -321,7 +326,6 @@ async fn desktop_session(mut socket: WebSocket) {
                 "{\"type\":\"error\",\"message\":\"Windows capture is required\"}".into(),
             ))
             .await;
-        return;
     }
     #[cfg(windows)]
     desktop_session_windows(socket, false).await;
@@ -490,6 +494,7 @@ fn encode_desktop_jpeg(bgra: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     Ok(bytes)
 }
 
+#[cfg(any(windows, test))]
 fn is_valid_desktop_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 512 && !value.chars().any(|character| character == '\0')
 }
@@ -591,9 +596,13 @@ mod tests {
 
     #[test]
     fn mobile_gateway_accepts_unicode_desktop_text_and_bounds_its_length() {
-        let message =
-            serde_json::from_str::<DesktopControl>(r#"{"type":"text","value":"你好"}"#).unwrap();
-        assert!(matches!(message, DesktopControl::Text { value } if value == "你好"));
+        #[cfg(windows)]
+        {
+            let message =
+                serde_json::from_str::<DesktopControl>(r#"{"type":"text","value":"你好"}"#)
+                    .unwrap();
+            assert!(matches!(message, DesktopControl::Text { value } if value == "你好"));
+        }
         assert!(is_valid_desktop_text("你好"));
         assert!(!is_valid_desktop_text(&"a".repeat(513)));
     }

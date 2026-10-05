@@ -53,7 +53,11 @@ fn signed(payload: &Value) -> String {
 
 #[test]
 fn accepts_backend_signaling_credentials_for_both_roles() {
-    for role in [BackendRole::Controller, BackendRole::Agent] {
+    for role in [
+        BackendRole::Controller,
+        BackendRole::Agent,
+        BackendRole::Peer,
+    ] {
         let key = "ab".repeat(32);
         let result = verifier()
             .verify(&signed(&claims(role.clone(), &key)), NOW + 1)

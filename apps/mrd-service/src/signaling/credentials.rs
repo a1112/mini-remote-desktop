@@ -38,7 +38,7 @@ pub(super) async fn acquire_credential(
     identity: &DeviceIdentity,
 ) -> Result<Zeroizing<String>, SignalingRuntimeError> {
     let Some(endpoint) = config.credential_endpoint() else {
-        return Ok(Zeroizing::new(config.backend_device_token().to_owned()));
+        return Ok(config.backend_device_token());
     };
     let operation = async {
         let cleartext_loopback = endpoint.scheme() == "http";
@@ -52,7 +52,8 @@ pub(super) async fn acquire_credential(
         let client = builder
             .build()
             .map_err(|_| SignalingRuntimeError::CredentialsUnavailable)?;
-        let authorization = Zeroizing::new(format!("Bearer {}", config.backend_device_token()));
+        let authorization =
+            Zeroizing::new(format!("Bearer {}", config.backend_device_token().as_str()));
         let mut header = HeaderValue::from_str(&authorization)
             .map_err(|_| SignalingRuntimeError::CredentialsInvalid)?;
         header.set_sensitive(true);

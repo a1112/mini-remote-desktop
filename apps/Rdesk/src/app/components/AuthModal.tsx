@@ -14,6 +14,7 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { deviceService } from "../services/deviceService";
+import { SERVER_API_URL } from "../services/serverConfig";
 
 interface AuthModalProps {
   open: boolean;
@@ -35,8 +36,7 @@ type RegisterPayload = {
   password: string;
 };
 
-const API_BASE =
-  (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const API_BASE = SERVER_API_URL;
 
 export function AuthModal({ open, onClose }: AuthModalProps) {
   const { isDark } = useTheme();

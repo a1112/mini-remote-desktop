@@ -95,6 +95,20 @@ fn state_at_access_bound(
     role: WanSessionRole,
     bind_commitment: bool,
 ) -> WanSessionState {
+    state_at_access_bound_with_policy(
+        session_id,
+        role,
+        bind_commitment,
+        WanRoutePolicyV3::RelayOnly,
+    )
+}
+
+fn state_at_access_bound_with_policy(
+    session_id: &SessionId,
+    role: WanSessionRole,
+    bind_commitment: bool,
+    policy: WanRoutePolicyV3,
+) -> WanSessionState {
     let mut state = WanSessionState::new(role, identity_for_session(role, session_id));
     state
         .apply(
@@ -118,7 +132,7 @@ fn state_at_access_bound(
         7,
         10_000,
         9_000,
-        WanRoutePolicyV3::RelayOnly,
+        policy,
     )
     .unwrap();
     let grant = if bind_commitment {
@@ -318,6 +332,152 @@ async fn primary_only_signed_relay_url_is_used_for_generation_zero() {
         config.ice_servers[0].urls[0],
         "turn:relay-primary.example.test:3478?transport=udp"
     );
+}
+
+#[tokio::test]
+async fn direct_first_requires_a_bound_target_grant_and_keeps_turn_backup() {
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound_with_policy(
+        &session_id,
+        WanSessionRole::Controller,
+        true,
+        WanRoutePolicyV3::DirectFirst,
+    );
+    let context =
+        GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
+            .unwrap();
+    let config = context.primary_peer_config(&access).unwrap();
+    assert_eq!(
+        config.ice_transport_policy,
+        mrd_transport_webrtc::IceTransportPolicy::All
+    );
+    assert_eq!(config.ice_servers.len(), 2);
+    assert_eq!(
+        config.ice_servers[0].urls,
+        vec!["turn:relay-primary.example.test:3478?transport=udp".to_owned()]
+    );
+    assert_eq!(
+        config.ice_servers[1].urls,
+        vec!["stun:relay-primary.example.test:3478".to_owned()]
+    );
+    let unbound = state_at_access_bound_with_policy(
+        &session_id,
+        WanSessionRole::Controller,
+        false,
+        WanRoutePolicyV3::DirectFirst,
+    );
+    assert!(
+        GenerationZeroNegotiationContext::from_state(&unbound, GRANT_COMMITMENT.into(), 1_000)
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn real_direct_pair_proves_only_direct_first_and_carries_authenticated_mux_data() {
+    use mrd_application::ports::{
+        TransportEnvelope, TransportLane, TransportMuxPort, TransportRouteKind,
+    };
+    use mrd_service::transports::webrtc::ServiceWebRtcTransportHost;
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound_with_policy(
+        &session_id,
+        WanSessionRole::Controller,
+        true,
+        WanRoutePolicyV3::DirectFirst,
+    );
+    let context =
+        GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
+            .unwrap();
+    let left = ServiceWebRtcTransportHost::new();
+    let right = ServiceWebRtcTransportHost::new();
+    let mut left_config = context.primary_peer_config(&access).unwrap();
+    left_config.include_loopback_candidates = true;
+    let mut right_config = left_config.clone();
+    right_config.role = mrd_transport_webrtc::PeerConnectionRole::Answerer;
+    left.open_generation_zero(&session_id, left_config)
+        .await
+        .unwrap();
+    right
+        .open_generation_zero(&session_id, right_config)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let offer = left.create_offer(&session_id).await.unwrap();
+        let answer = right.accept_offer(&session_id, offer).await.unwrap();
+        left.accept_answer(&session_id, answer).await.unwrap();
+        let local = left
+            .next_local_candidate(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let remote = right
+            .next_local_candidate(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        right.add_ice_candidate(&session_id, local).await.unwrap();
+        left.add_ice_candidate(&session_id, remote).await.unwrap();
+        tokio::try_join!(
+            left.wait_connected(&session_id),
+            right.wait_connected(&session_id)
+        )
+        .unwrap();
+        let route = access.route_evidence("relay-primary", 0).unwrap();
+        assert!(left
+            .prove_generation_zero_route(&route, &session_id)
+            .await
+            .is_err());
+        let proof = left
+            .prove_generation_zero_route_with_policy(
+                &route,
+                &session_id,
+                WanRoutePolicyV3::DirectFirst,
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof.route_policy(), WanRoutePolicyV3::DirectFirst);
+        assert!(!proof.is_relay_to_relay());
+        let wrong = access.route_evidence("relay-backup", 0).unwrap();
+        assert!(left
+            .prove_generation_zero_route_with_policy(
+                &wrong,
+                &session_id,
+                WanRoutePolicyV3::DirectFirst
+            )
+            .await
+            .is_err());
+        let local_mux = left.transport_mux(&session_id).await.unwrap();
+        let remote_mux = right.transport_mux(&session_id).await.unwrap();
+        assert_eq!(
+            local_mux.route_snapshot().await.kind,
+            TransportRouteKind::WebRtcDirect
+        );
+        local_mux
+            .send(TransportEnvelope {
+                session_id: session_id.clone(),
+                lane: TransportLane::ControlReliable,
+                sequence: 1,
+                payload: b"direct-verified-control".to_vec(),
+                video: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            remote_mux
+                .recv(TransportLane::ControlReliable)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            b"direct-verified-control"
+        );
+    })
+    .await
+    .expect("real direct pair and data exchange deadline");
+    left.close_session(&session_id).await.unwrap();
+    right.close_session(&session_id).await.unwrap();
 }
 
 #[tokio::test]

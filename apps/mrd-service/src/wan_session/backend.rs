@@ -655,7 +655,7 @@ impl HttpWanSessionBackend {
         };
         for attempt in 1..=max_attempts {
             let mut authorization =
-                Zeroizing::new(format!("Bearer {}", self.config.device_token()));
+                Zeroizing::new(format!("Bearer {}", self.config.device_token().as_str()));
             let mut authorization_header = HeaderValue::from_str(&authorization)
                 .map_err(|_| WanSessionBackendError::InvalidConfiguration)?;
             authorization_header.set_sensitive(true);

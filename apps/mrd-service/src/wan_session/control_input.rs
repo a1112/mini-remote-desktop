@@ -255,11 +255,7 @@ impl ServiceWanControlInputPort {
                 .lock()
                 .await
                 .clear_session(session_id);
-            let _ = app_state
-                .control_input()
-                .lock()
-                .await
-                .release_session_all(session_id);
+            crate::control_input::release_authenticated_input(&app_state, session_id).await;
         }
     }
 
@@ -392,11 +388,8 @@ impl WanInputActivationPort for ServiceWanControlInputPort {
         let task_session_id = session_id.clone();
         let task = tokio::spawn(async move {
             run_target_receiver(Arc::clone(&task_app_state), task_authority, mux).await;
-            let _ = task_app_state
-                .control_input()
-                .lock()
-                .await
-                .release_session_all(&task_session_id);
+            crate::control_input::release_authenticated_input(&task_app_state, &task_session_id)
+                .await;
             task_app_state
                 .wan_control_inputs
                 .lock()
@@ -835,15 +828,18 @@ async fn process_target_envelope(
         authorization_failure = Some(failure.clone());
         Err(failure)
     } else {
-        match app_state
-            .control_input()
-            .lock()
-            .await
-            .handle_authenticated_session_event(
-                authority.session_id(),
-                service_control_scope(envelope.payload.scope),
-                &event,
-            ) {
+        match crate::control_input::apply_authenticated_input(
+            app_state,
+            authority.session_id(),
+            service_control_scope(envelope.payload.scope),
+            envelope.payload.sequence,
+            authorization
+                .expires_at_ms
+                .min(envelope.payload.expires_at_ms),
+            &event,
+        )
+        .await
+        {
             Ok(result) => Ok((input_lane, result.event_count)),
             Err(_) => {
                 let failure = control_failure(

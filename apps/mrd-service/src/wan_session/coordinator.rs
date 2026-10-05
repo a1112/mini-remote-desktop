@@ -675,7 +675,9 @@ impl WanSessionCoordinator {
                 || state.identity() != identity
                 || state.grant() != Some(grant)
                 || state.access() != Some(access)
-                || !proof.is_relay_to_relay()
+                || proof.route_policy() != grant.route_policy()
+                || (grant.route_policy() == WanRoutePolicyV3::RelayOnly
+                    && !proof.is_relay_to_relay())
                 || proof.access() != access
             {
                 return Err(WanSessionCoordinatorError::BackendBindingMismatch);
@@ -1677,7 +1679,6 @@ fn validate_request_identity(
         .validate()
         .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
     if request.access_mode != WanAccessModeV3::Attended
-        || request.route_policy != WanRoutePolicyV3::RelayOnly
         || !request_matches_identity(identity, request)
     {
         return Err(WanSessionCoordinatorError::BackendBindingMismatch);

@@ -158,6 +158,14 @@ def _install_dependency_stubs() -> None:
     security = types.ModuleType("app.core.security")
     security.create_access_token = lambda *_args: "token"
     security.create_device_access_token = lambda *_args: "device-token"
+    security.create_device_refresh_token = lambda *_args: None
+    security.get_device_refresh_identity = object()
+    security.DeviceRefreshIdentity = object
+    security.capture_device_auth_snapshot = lambda device: types.SimpleNamespace(
+        row_id=device.id, device_id=device.device_id,
+        auth_version=getattr(device, "auth_version", 1),
+        auth_revoked_at=getattr(device, "auth_revoked_at", None),
+    )
     security.get_device_enrollment_token_optional = object()
     security.get_current_device = object()
     security.get_current_device_optional = object()

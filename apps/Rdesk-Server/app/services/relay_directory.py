@@ -1645,6 +1645,7 @@ def _grant_conforms_to_current_policy(
         == list(current_policy.preferred_regions)
         and getattr(grant, "relay_accepted_transports", None)
         == list(current_policy.accepted_transports)
+        and _grant_max_backups(grant) == current_policy.max_backups
         and policy_deadline <= grant_deadline
         and grant_deadline <= now + timedelta(seconds=current_policy.grant_ttl_seconds)
         and policy_deadline
@@ -1724,7 +1725,7 @@ def _wan_request_binding_valid(
         and request.controller_device_id == controller.device_id
         and request.target_device_id == target.device_id
         and request.access_mode == "attended"
-        and request.route_policy == "relay_only"
+        and request.route_policy in {"relay_only", "direct_first"}
         and normalized["requested_scopes"] == grant.requested_scopes
         and normalized["requested_profile"] == grant.requested_profile
         and grant.request_commitment == commitment
@@ -1755,6 +1756,13 @@ def endpoint_parts(endpoint: str) -> tuple[str, str, int]:
     return transport, host, int(matched.group("port"))
 
 
+def _grant_max_backups(grant: object) -> int:
+    # Existing, unmapped test snapshots predate this field. Persisted grants
+    # have a non-null strict default installed by the redundancy migration.
+    value = getattr(grant, "relay_max_backups", 1)
+    return 1 if value is None else value
+
+
 def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
     allowed = _bounded_string_tuple(grant.relay_allowed_regions, {"region"})
     preferred = _bounded_string_tuple(grant.relay_preferred_regions, {"region"})
@@ -1768,6 +1776,9 @@ def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
         or any(region not in allowed for region in preferred)
         or grant.policy_revision is None
         or grant.policy_revision <= 0
+        or not isinstance(_grant_max_backups(grant), int)
+        or isinstance(_grant_max_backups(grant), bool)
+        or not 0 <= _grant_max_backups(grant) <= 7
     ):
         _deny_access()
     return RelaySelectionPolicy(
@@ -1775,7 +1786,7 @@ def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
         allowed_regions=allowed,
         preferred_regions=preferred,
         accepted_transports=accepted,
-        max_backups=1,
+        max_backups=_grant_max_backups(grant),
     )
 
 

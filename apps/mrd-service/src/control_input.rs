@@ -115,6 +115,57 @@ impl ControlInputRegistry {
         self.handle_event_inner(Some(session_id), event, Some(scope))
     }
 
+    #[cfg(any(windows, test))]
+    fn begin_agent_event(
+        &mut self,
+        session_id: &SessionId,
+        event: &ControlInputEvent,
+    ) -> Result<bool, InputError> {
+        let lane = input_lane(event);
+        counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).accepted_messages += 1;
+        if self.migration_frozen_sessions.contains(session_id)
+            && !matches!(event, ControlInputEvent::ReleaseAll)
+        {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).dropped_messages +=
+                1;
+            return Err(InputError::InvalidEvent(
+                "control input is frozen during relay migration".into(),
+            ));
+        }
+        if self.should_coalesce_realtime_event(Some(session_id), event) {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
+                .coalesced_messages += 1;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(windows, test))]
+    fn finish_agent_event(
+        &mut self,
+        session_id: &SessionId,
+        scope: ControlInputScope,
+        event: &ControlInputEvent,
+        result: Result<u32, InputError>,
+    ) -> Result<ControlInputResult, InputError> {
+        let lane = input_lane(event);
+        match result {
+            Ok(event_count) => {
+                self.record_successful_realtime_event(Some(session_id), event, Some(scope));
+                let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
+                counter.injected_messages += u64::from(event_count);
+                counter.last_error = None;
+                Ok(ControlInputResult { lane, event_count })
+            }
+            Err(error) => {
+                let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
+                counter.failed_messages += 1;
+                counter.last_error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
     fn handle_event_inner(
         &mut self,
         session_id: Option<&SessionId>,
@@ -448,6 +499,106 @@ impl Default for ControlInputRegistry {
     }
 }
 
+/// Network receivers call this only while their authorization gate is held and
+/// after validating the signed envelope, lane, scope, replay counter and expiry.
+pub(crate) async fn apply_authenticated_input(
+    state: &crate::AppState,
+    session_id: &SessionId,
+    scope: ControlInputScope,
+    _remote_sequence: u64,
+    remote_expires_at_ms: u64,
+    event: &ControlInputEvent,
+) -> Result<ControlInputResult, InputError> {
+    let registry = state.control_input();
+    let mut registry = registry.lock().await;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| InputError::Unavailable("input clock unavailable".into()))?
+        .as_millis();
+    if now_ms >= u128::from(remote_expires_at_ms) {
+        return Err(InputError::InvalidEvent(
+            "signed input event expired before application".into(),
+        ));
+    }
+    #[cfg(windows)]
+    if state.console_capture.is_enabled() {
+        // Keep this lock until the Agent acknowledges application. A migration
+        // freeze must wait for in-flight input before releasing its resources.
+        if !registry.begin_agent_event(session_id, event)? {
+            return Ok(ControlInputResult {
+                lane: input_lane(event),
+                event_count: 0,
+            });
+        }
+        let remote_scope = match scope {
+            ControlInputScope::Pointer => mrd_ipc::RemotePermissionScope::InputPointer,
+            ControlInputScope::Keyboard => mrd_ipc::RemotePermissionScope::InputKeyboard,
+        };
+        let result = state
+            .console_capture
+            .apply_input(
+                state,
+                session_id,
+                remote_scope,
+                _remote_sequence,
+                remote_expires_at_ms,
+                agent_event(event),
+            )
+            .await
+            .map(|ack| u32::from(ack.is_some()))
+            .map_err(|_| {
+                InputError::Unavailable("approved desktop Agent did not apply input".into())
+            });
+        return registry.finish_agent_event(session_id, scope, event, result);
+    }
+    registry.handle_authenticated_session_event(session_id, scope, event)
+}
+
+pub(crate) async fn release_authenticated_input(state: &crate::AppState, session_id: &SessionId) {
+    let registry = state.control_input();
+    let mut registry = registry.lock().await;
+    #[cfg(windows)]
+    if state.console_capture.is_enabled() {
+        if state
+            .console_capture
+            .stop_input(state, session_id)
+            .await
+            .is_err()
+        {
+            tracing::warn!(session_id = %session_id.0, "desktop Agent input cleanup failed");
+        }
+    }
+    let _ = registry.release_session_all(session_id);
+}
+
+#[cfg(windows)]
+fn agent_event(event: &ControlInputEvent) -> mrd_agent_ipc::InputEventPayload {
+    use mrd_agent_ipc::{InputButton as Button, InputEventPayload as Event, InputKey as Key};
+    match *event {
+        ControlInputEvent::MouseMove { x, y } => Event::MouseMove { x, y },
+        ControlInputEvent::MouseWheel { delta } => Event::MouseWheel { delta },
+        ControlInputEvent::MouseHorizontalWheel { delta } => Event::MouseHorizontalWheel { delta },
+        ControlInputEvent::MouseButton { button, pressed } => Event::MouseButton {
+            button: match button {
+                ControlInputButton::Left => Button::Left,
+                ControlInputButton::Right => Button::Right,
+                ControlInputButton::Middle => Button::Middle,
+                ControlInputButton::X1 => Button::X1,
+                ControlInputButton::X2 => Button::X2,
+            },
+            pressed,
+        },
+        ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code },
+            pressed,
+        } => Event::Key {
+            key: Key::VirtualKey { code },
+            pressed,
+        },
+        ControlInputEvent::ReleaseAll => Event::ReleaseAll,
+    }
+}
+
 fn input_lane(event: &ControlInputEvent) -> ControlInputLane {
     match event {
         ControlInputEvent::MouseMove { .. }
@@ -578,6 +729,115 @@ fn input_key_from_ipc(key: ControlInputKey) -> InputKey {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[tokio::test]
+    async fn input_expiring_while_waiting_for_registry_never_reaches_injector() {
+        let state = Arc::new(crate::AppState::new());
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        state
+            .replace_control_input_for_test(SharedRecordingInputInjector {
+                events: recorded.clone(),
+            })
+            .await;
+        let registry = state.control_input();
+        let held = registry.lock().await;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 30;
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move {
+            apply_authenticated_input(
+                &pending_state,
+                &SessionId("queued-expired".into()),
+                ControlInputScope::Pointer,
+                1,
+                deadline,
+                &ControlInputEvent::MouseMove { x: 20, y: 30 },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        assert!(pending.await.unwrap().is_err());
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resident_input_without_approved_agent_never_falls_back_to_session_zero() {
+        let state = crate::AppState::new();
+        state.bind_console_capture_issuer(Arc::new(
+            crate::agent_runtime::ExecuteGrantIssuer::from_seed([53; 32]).unwrap(),
+        ));
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        state
+            .replace_control_input_for_test(SharedRecordingInputInjector {
+                events: recorded.clone(),
+            })
+            .await;
+        let result = apply_authenticated_input(
+            &state,
+            &SessionId("unapproved-agent".into()),
+            ControlInputScope::Pointer,
+            1,
+            u64::MAX,
+            &ControlInputEvent::MouseMove { x: 25, y: 50 },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(recorded.lock().unwrap().is_empty());
+        assert_eq!(
+            state.control_input().lock().await.injected_message_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_input_counts_only_applied_ack_and_never_calls_local_injector() {
+        let mut registry = ControlInputRegistry::with_injector(
+            mrd_input::UnsupportedInputInjector::new("Session 0 must not inject"),
+        );
+        let session_id = SessionId("agent-applied".into());
+        let event = ControlInputEvent::MouseMove { x: 123, y: 456 };
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        assert_eq!(registry.injected_message_count(), 0);
+        registry
+            .finish_agent_event(&session_id, ControlInputScope::Pointer, &event, Ok(1))
+            .unwrap();
+        assert_eq!(registry.injected_message_count(), 1);
+        assert!(!registry.begin_agent_event(&session_id, &event).unwrap());
+        assert_eq!(registry.snapshot(session_id).realtime.coalesced_messages, 1);
+    }
+
+    #[test]
+    fn failed_agent_ack_does_not_coalesce_retry_and_migration_stays_frozen() {
+        let mut registry = ControlInputRegistry::with_injector(
+            mrd_input::UnsupportedInputInjector::new("Session 0 must not inject"),
+        );
+        let session_id = SessionId("agent-failed".into());
+        let event = ControlInputEvent::MouseMove { x: 12, y: 34 };
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        assert!(registry
+            .finish_agent_event(
+                &session_id,
+                ControlInputScope::Pointer,
+                &event,
+                Err(InputError::Unavailable(
+                    "Agent acknowledgement missing".into()
+                ))
+            )
+            .is_err());
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        registry.freeze_session_for_migration(&session_id).unwrap();
+        assert!(registry.begin_agent_event(&session_id, &event).is_err());
+        assert!(registry
+            .begin_agent_event(&session_id, &ControlInputEvent::ReleaseAll)
+            .unwrap());
+        assert_eq!(registry.injected_message_count(), 0);
+        assert_eq!(registry.snapshot(session_id).realtime.failed_messages, 1);
+    }
 
     #[derive(Clone)]
     struct SharedRecordingInputInjector {

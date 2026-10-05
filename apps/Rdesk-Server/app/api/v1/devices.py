@@ -1,3 +1,4 @@
+import hmac
 import re
 from datetime import UTC, datetime
 
@@ -10,7 +11,11 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
+    DeviceRefreshIdentity,
+    capture_device_auth_snapshot,
     create_device_access_token,
+    create_device_refresh_token,
+    get_device_refresh_identity,
     get_device_enrollment_token_optional,
     get_current_device,
     get_current_device_optional,
@@ -134,6 +139,7 @@ async def register_device(
             device_id=registered.device.device_id,
             device_name=registered.device.name,
             access_token=access_token,
+            refresh_token=create_device_refresh_token(registered.device),
         )
 
     # Without a one-time enrollment, this route is refresh-only. Authenticate
@@ -152,6 +158,7 @@ async def register_device(
         )
     else:
         assert current_device is not None
+        authenticated = capture_device_auth_snapshot(current_device)
         existing = await db.scalar(
             select(Device)
             .where(Device.id == current_device.id)
@@ -160,7 +167,15 @@ async def register_device(
         )
         if (
             existing is None
-            or existing.motherboard_serial_digest
+            or existing.id != authenticated.row_id
+            or existing.device_id != authenticated.device_id
+            or existing.auth_version != authenticated.auth_version
+            or existing.auth_revoked_at is not None
+            or authenticated.auth_revoked_at is not None
+        ):
+            _deny_device_registration(401)
+        if (
+            existing.motherboard_serial_digest
             != _device_serial_digest(payload.motherboard_serial)
         ):
             _deny_device_registration(403)
@@ -194,6 +209,7 @@ async def register_device(
             device_id=existing.device_id,
             device_name=existing.name,
             access_token=access_token,
+            refresh_token=create_device_refresh_token(existing),
         )
     else:
         raise HTTPException(
@@ -203,6 +219,49 @@ async def register_device(
                 "message": "device enrollment required",
             },
         )
+
+
+@router.post("/refresh", response_model=DeviceRegisterResponse)
+async def refresh_device_credentials(
+    payload: DeviceRegisterRequest,
+    identity: DeviceRefreshIdentity = Depends(get_device_refresh_identity),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceRegisterResponse:
+    # Refresh credentials are deliberately absent from all ordinary API auth
+    # dependencies. Lock and re-read the row so revocation cannot be bypassed by
+    # a stale identity-map object or a concurrent ownership/version change.
+    device = await db.scalar(
+        select(Device).where(Device.id == identity.row_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        device is None
+        or device.device_id != identity.device_id
+        or device.tenant_id != identity.tenant_id
+        or device.auth_version != identity.auth_version
+        or device.auth_revoked_at is not None
+        or identity.expires_at <= int(datetime.now(UTC).timestamp())
+        or not isinstance(device.motherboard_serial_digest, str)
+        or not hmac.compare_digest(device.motherboard_serial_digest, identity.serial_digest)
+        or not hmac.compare_digest(_device_serial_digest(payload.motherboard_serial), identity.serial_digest)
+    ):
+        raise HTTPException(status_code=401, detail="Invalid device authentication credentials")
+    device.hostname = payload.hostname
+    device.os_version = payload.os_version
+    device.os = payload.os_version.split()[0] if payload.os_version else "Unknown"
+    for field in ("cpu_info", "total_memory_mb", "gpu_info"):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(device, field, value)
+    if payload.device_name:
+        device.name = payload.device_name
+    access_token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
+    await _commit(db)
+    return DeviceRegisterResponse(
+        device_id=device.device_id, device_name=device.name,
+        access_token=access_token, refresh_token=refresh_token,
+    )
 
 
 @router.post(
@@ -569,11 +628,13 @@ async def rotate_device_credentials(
     device.auth_revoked_at = None
     await db.flush()
     token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
     await _commit(db)
     return DeviceCredentialResponse(
         device_id=device.device_id,
         auth_version=device.auth_version,
         access_token=token,
+        refresh_token=refresh_token,
     )
 
 
@@ -591,11 +652,13 @@ async def admin_rotate_device_credentials(
     device.auth_revoked_at = None
     await db.flush()
     token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
     await _commit(db)
     return DeviceCredentialResponse(
         device_id=device.device_id,
         auth_version=device.auth_version,
         access_token=token,
+        refresh_token=refresh_token,
     )
 
 

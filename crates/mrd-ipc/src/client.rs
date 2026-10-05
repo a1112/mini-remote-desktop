@@ -64,15 +64,45 @@ pub struct IpcClient {
     /// Target endpoint for the service connection.
     endpoint: IpcEndpoint,
     management: bool,
+    #[cfg(windows)]
+    authenticated_product: bool,
 }
 
 impl IpcClient {
     /// Create a new IPC client
     pub fn new() -> Self {
+        #[cfg(windows)]
+        if std::env::var(crate::transport::SERVICE_ENDPOINT_ENV)
+            .ok()
+            .and_then(|value| IpcEndpoint::from_env_value(&value))
+            .is_none()
+        {
+            return Self::product();
+        }
         Self::with_config_and_endpoint(
             ReconnectConfig::default(),
             IpcEndpoint::service_from_env_or_default(),
         )
+    }
+
+    /// Authenticated installed Windows UI endpoint. Explicit core constructors
+    /// keep their previous semantics for isolated tests and administrator tools.
+    #[cfg(windows)]
+    pub fn product() -> Self {
+        let mut client = Self::with_endpoint(IpcEndpoint::product_from_env_or_default());
+        client.authenticated_product = true;
+        client
+    }
+
+    /// Management containing secrets must authenticate the kernel server process.
+    /// No endpoint or environment setting bypasses this Windows identity check.
+    pub fn trusted_management() -> Self {
+        let mut client = Self::management();
+        #[cfg(windows)]
+        {
+            client.authenticated_product = true;
+        }
+        client
     }
 
     /// Create a client for the narrow service management endpoint.
@@ -121,6 +151,8 @@ impl IpcClient {
             reconnect_config: config,
             endpoint,
             management: false,
+            #[cfg(windows)]
+            authenticated_product: false,
         }
     }
 
@@ -156,6 +188,11 @@ impl IpcClient {
     }
 
     async fn connect_transport(&self) -> Result<crate::transport::IpcStream> {
+        #[cfg(windows)]
+        if self.authenticated_product {
+            return crate::transport::IpcClient::connect_product_with_endpoint(&self.endpoint)
+                .await;
+        }
         if self.management {
             crate::transport::IpcClient::connect_management_with_endpoint(&self.endpoint).await
         } else {
@@ -274,5 +311,32 @@ impl IpcClient {
 impl Default for IpcClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod product_constructor_tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_management_and_product_have_no_untrusted_fallback() {
+        let management = IpcClient::trusted_management();
+        assert!(management.authenticated_product);
+        assert_eq!(
+            management.endpoint,
+            IpcEndpoint::management_from_env_or_default()
+        );
+        let product = IpcClient::product();
+        assert!(product.authenticated_product);
+        assert_eq!(product.endpoint, IpcEndpoint::product_from_env_or_default());
+    }
+
+    #[test]
+    fn explicit_core_endpoints_preserve_administrator_and_isolated_test_semantics() {
+        let endpoint = IpcEndpoint::named_pipe(r"\\.\pipe\explicit-core-test");
+        let client = IpcClient::with_endpoint(endpoint.clone());
+        assert!(!client.authenticated_product);
+        assert_eq!(client.endpoint, endpoint);
+        assert!(!IpcClient::with_config(ReconnectConfig::default()).authenticated_product);
     }
 }

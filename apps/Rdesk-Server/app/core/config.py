@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     jwt_future_iat_skew_seconds: int = 60
     device_jwt_audience: str = ""
     device_jwt_expire_minutes: int = 60
+    device_refresh_jwt_audience: str = "rdesk-device-refresh"
+    device_refresh_jwt_expire_days: int = Field(default=365, ge=1, le=365)
     signaling_jwt_audience: str = "rdesk-signaling"
     signaling_jwt_ttl_seconds: int = 3600
     device_enrollment_token_pepper: SecretStr = SecretStr("")
@@ -48,6 +50,9 @@ class Settings(BaseSettings):
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: SecretStr = SecretStr("")
     signaling_ws_url: str = "ws://127.0.0.1:9542/ws"
+    public_api_url: str = "https://175.178.16.90/rdesk/api/v1"
+    public_signal_server_device_id: str = "signal-server"
+    public_signal_server_key_id: str = ""
     realtime_server_health_url: str = "http://127.0.0.1:9542/health"
     realtime_server_command: str = "cargo"
     realtime_server_args: str = "run -p realtime-server"
@@ -72,6 +77,7 @@ class Settings(BaseSettings):
     session_grant_ttl_seconds: int = 600
     relay_policy_ttl_seconds: int = 600
     relay_policy_revision: int = 1
+    relay_max_backups: int = Field(default=1, ge=0, le=7)
     relay_allowed_regions: str = ""
     relay_preferred_regions: str = ""
     relay_accepted_transports: str = "udp,tcp,tls"

@@ -1,6 +1,11 @@
 //! Authenticated device enrollment and refresh against the backend API.
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
+pub mod machine_identity;
+pub use machine_identity::stable_machine_identity;
+
+pub const DEVICE_CREDENTIAL_REJECTED: &str = "设备凭据已失效，请向管理员申请更新设备凭据";
 
 #[derive(Serialize)]
 pub struct DeviceRegistrationRequest {
@@ -18,6 +23,31 @@ pub struct DeviceRegistrationResponse {
     pub device_id: String,
     pub device_name: String,
     pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+impl Drop for DeviceRegistrationResponse {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        if let Some(token) = &mut self.refresh_token {
+            token.zeroize();
+        }
+    }
+}
+
+impl std::fmt::Debug for DeviceRegistrationResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceRegistrationResponse")
+            .field("device_id", &self.device_id)
+            .field("device_name", &self.device_name)
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 pub async fn register_device(
@@ -26,34 +56,100 @@ pub async fn register_device(
     enrollment_token: Option<&str>,
     device_token: Option<&str>,
 ) -> Result<DeviceRegistrationResponse, &'static str> {
-    let client = reqwest::Client::builder()
+    let client = registration_client()?;
+    let request = build_request(&client, api_base, payload, enrollment_token, device_token)?;
+    execute_registration(
+        &client,
+        request,
+        device_token.is_some(),
+        enrollment_token.is_some(),
+        false,
+    )
+    .await
+}
+
+/// Renew a registered machine after its short-lived access JWT has expired.
+/// This credential is accepted only by the dedicated backend renewal endpoint.
+pub async fn refresh_device(
+    api_base: &str,
+    payload: &DeviceRegistrationRequest,
+    refresh_token: &str,
+) -> Result<DeviceRegistrationResponse, &'static str> {
+    if !valid_device_token(refresh_token) {
+        return Err("设备凭据无效，请向管理员申请更新设备凭据");
+    }
+    let client = registration_client()?;
+    let credential = Zeroizing::new(format!("Bearer {refresh_token}"));
+    let request = build_authorized_request(
+        &client,
+        api_base,
+        payload,
+        "refresh",
+        "X-Rdesk-Device-Refresh-Authorization",
+        &credential,
+    )?;
+    execute_registration(&client, request, true, false, true).await
+}
+
+fn registration_client() -> Result<reqwest::Client, &'static str> {
+    reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|_| "无法初始化设备注册连接")?;
-    let request = build_request(&client, api_base, payload, enrollment_token, device_token)?;
-    let response = client
+        .map_err(|_| "无法初始化设备注册连接")
+}
+
+async fn execute_registration(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    has_device_token: bool,
+    has_enrollment_token: bool,
+    requires_refresh: bool,
+) -> Result<DeviceRegistrationResponse, &'static str> {
+    let mut response = client
         .execute(request)
         .await
         .map_err(|_| "连接服务器失败，请稍后重试")?;
     match response.status().as_u16() {
         200..=299 => {}
-        401 | 403 if device_token.is_some() => {
-            return Err("设备凭据已失效，请向管理员申请更新设备凭据")
-        }
-        409 if enrollment_token.is_some() => return Err("设备已登记，请向管理员申请更新设备凭据"),
+        401 | 403 if has_device_token => return Err(DEVICE_CREDENTIAL_REJECTED),
+        409 if has_enrollment_token => return Err("设备已登记，请向管理员申请更新设备凭据"),
         401 | 403 | 410 => return Err("设备登记码无效或已失效，请向管理员获取新登记码"),
         429 => return Err("注册请求过于频繁，请稍后重试"),
         _ => return Err("设备注册失败，请检查服务器配置后重试"),
     }
-    let registration = response
-        .json::<DeviceRegistrationResponse>()
+    const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err("服务器返回的设备登记响应无效");
+    }
+    let mut body = Zeroizing::new(Vec::new());
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|_| "服务器返回的设备登记响应无效")?;
+        .map_err(|_| "服务器返回的设备登记响应无效")?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err("服务器返回的设备登记响应无效");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let registration: DeviceRegistrationResponse =
+        serde_json::from_slice(&body).map_err(|_| "服务器返回的设备登记响应无效")?;
     if registration.device_id.is_empty()
         || registration.device_name.is_empty()
         || registration.access_token.is_empty()
+        || registration.device_id.len() > 64
+        || registration.device_name.len() > 128
+        || !valid_device_token(&registration.access_token)
+        || registration
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| !valid_device_token(token))
+        || (requires_refresh && registration.refresh_token.is_none())
     {
         return Err("服务器返回的设备登记响应无效");
     }
@@ -67,7 +163,6 @@ fn build_request(
     enrollment_token: Option<&str>,
     device_token: Option<&str>,
 ) -> Result<reqwest::Request, &'static str> {
-    use reqwest::{header::HeaderValue, Url};
     let (header_name, credential) = match (enrollment_token, device_token) {
         (Some(token), None)
             if token.len() == 43
@@ -77,17 +172,42 @@ fn build_request(
         {
             ("X-Rdesk-Device-Enrollment", token.to_owned())
         }
-        (None, Some(token))
-            if !token.is_empty()
-                && token
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.') =>
-        {
+        (None, Some(token)) if valid_device_token(token) => {
             ("X-Rdesk-Device-Authorization", format!("Bearer {token}"))
         }
         (None, None) => return Err("需要设备登记码，请向服务器管理员获取一次性登记码后注册"),
         _ => return Err("设备登记凭据无效，请重新输入管理员提供的登记码"),
     };
+    let credential = Zeroizing::new(credential);
+    build_authorized_request(
+        client,
+        api_base,
+        payload,
+        "register",
+        header_name,
+        &credential,
+    )
+}
+
+fn valid_device_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 4096
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && token.split('.').count() == 3
+        && token.split('.').all(|part| !part.is_empty())
+}
+
+fn build_authorized_request(
+    client: &reqwest::Client,
+    api_base: &str,
+    payload: &DeviceRegistrationRequest,
+    endpoint: &str,
+    header_name: &str,
+    credential: &str,
+) -> Result<reqwest::Request, &'static str> {
+    use reqwest::{header::HeaderValue, Url};
     let mut url = Url::parse(api_base.trim()).map_err(|_| "服务器地址无效")?;
     if !url.username().is_empty()
         || url.password().is_some()
@@ -108,7 +228,7 @@ fn build_request(
         return Err("服务器地址必须使用 HTTPS；本机调试可使用回环 HTTP 地址");
     }
     url.set_path(&format!(
-        "{}/devices/register",
+        "{}/devices/{endpoint}",
         url.path().trim_end_matches('/')
     ));
     let mut header = HeaderValue::from_str(&credential).map_err(|_| "设备登记凭据无效")?;
@@ -124,6 +244,121 @@ fn build_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_optional_long_lived_device_credential() {
+        let response: DeviceRegistrationResponse = serde_json::from_str(
+            r#"{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token","refresh_token":"refresh.jwt.token"}"#,
+        ).unwrap();
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["refresh_token"], "refresh.jwt.token");
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("refresh.jwt.token") && !debug.contains("access.jwt.token"));
+        let legacy: DeviceRegistrationResponse = serde_json::from_str(
+            r#"{"device_id":"123456789","device_name":"Old","access_token":"access.jwt.token"}"#,
+        )
+        .unwrap();
+        assert!(legacy.refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn long_lived_renewal_uses_only_the_dedicated_endpoint_and_header() {
+        let (base, captured) = fake_server("200 OK", r#"{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token","refresh_token":"next.refresh.token"}"#, "").await;
+        let response = refresh_device(&base, &payload(), "old.refresh.token")
+            .await
+            .unwrap();
+        assert_eq!(
+            response.refresh_token.as_deref(),
+            Some("next.refresh.token")
+        );
+        let request = captured.await.unwrap();
+        assert!(request.starts_with("POST /api/v1/devices/refresh HTTP/1.1\r\n"));
+        assert!(
+            request.contains("x-rdesk-device-refresh-authorization: Bearer old.refresh.token\r\n")
+        );
+        assert!(
+            !request.contains("x-rdesk-device-authorization:")
+                && !request.contains("x-rdesk-device-enrollment:")
+        );
+        assert!(request.contains("serial/with spaces"));
+    }
+
+    #[tokio::test]
+    async fn renewal_rejects_missing_malformed_and_oversized_credentials() {
+        let cases = [
+            r#"{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token"}"#.to_owned(),
+            r#"{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token","refresh_token":"not-a-jwt"}"#.to_owned(),
+            format!(r#"{{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token","refresh_token":"{}.jwt.token"}}"#, "a".repeat(4097)),
+        ];
+        for body in cases {
+            let (base, captured) = fake_server("200 OK", &body, "").await;
+            assert_eq!(
+                refresh_device(&base, &payload(), "old.refresh.token")
+                    .await
+                    .unwrap_err(),
+                "服务器返回的设备登记响应无效"
+            );
+            captured.await.unwrap();
+        }
+        for token in [
+            "",
+            "only-two.parts",
+            "a..b",
+            "a.b.c\r\nsecret",
+            "秘密.a.b",
+            &"a".repeat(4097),
+        ] {
+            assert!(
+                refresh_device("https://example.com/api/v1", &payload(), token)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renewal_rejects_redirects_and_secret_error_bodies() {
+        for (status, extra, expected) in [
+            (
+                "302 Found",
+                "Location: https://example.com/credential-sink\r\n",
+                "设备注册失败，请检查服务器配置后重试",
+            ),
+            (
+                "401 Unauthorized",
+                "",
+                "设备凭据已失效，请向管理员申请更新设备凭据",
+            ),
+        ] {
+            let (base, captured) = fake_server(status, "private-refresh-token", extra).await;
+            assert_eq!(
+                refresh_device(&base, &payload(), "old.refresh.token")
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            captured.await.unwrap();
+        }
+        for base in [
+            "http://example.com/api/v1",
+            "https://user:secret@example.com/api/v1",
+            "https://example.com/api/v1?token=secret",
+        ] {
+            assert!(refresh_device(base, &payload(), "old.refresh.token")
+                .await
+                .is_err());
+        }
+        let request = build_authorized_request(
+            &registration_client().unwrap(),
+            "https://example.com/api/v1",
+            &payload(),
+            "refresh",
+            "X-Rdesk-Device-Refresh-Authorization",
+            "Bearer old.refresh.token",
+        )
+        .unwrap();
+        assert!(request.headers()["X-Rdesk-Device-Refresh-Authorization"].is_sensitive());
+    }
 
     #[tokio::test]
     async fn ignores_environment_proxies_for_device_credentials() {
@@ -153,6 +388,11 @@ mod tests {
                 .await
                 .is_ok()
         );
+        captured.await.unwrap();
+        let (base, captured) = fake_server("200 OK", r#"{"device_id":"0123456789","device_name":"Office PC","access_token":"device.jwt.token","refresh_token":"refresh.jwt.token"}"#, "").await;
+        assert!(refresh_device(&base, &payload(), "old.refresh.token")
+            .await
+            .is_ok());
         captured.await.unwrap();
     }
 
@@ -223,6 +463,18 @@ mod tests {
                 .unwrap(),
             "设备凭据已失效，请向管理员申请更新设备凭据"
         );
+        captured.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_registration_credentials_without_exposing_the_body() {
+        let body = format!(
+            r#"{{"device_id":"0123456789","device_name":"Office","access_token":"{}"}}"#,
+            "sensitive".repeat(3000)
+        );
+        let (base, captured) = fake_server("200 OK", &body, "").await;
+        let result = register_device(&base, &payload(), Some(&"a".repeat(43)), None).await;
+        assert_eq!(result.err(), Some("服务器返回的设备登记响应无效"));
         captured.await.unwrap();
     }
 

@@ -15,24 +15,40 @@ pub(super) async fn dispatch_request(server: &IpcServer, request: IpcRequest) ->
 
 impl IpcServer {
     async fn dispatch_request_inner(&self, request: IpcRequest) -> IpcResponse {
+        #[cfg(windows)]
+        if self.product_only {
+            if let Some(denial) = self.product_request_denial(&request).await {
+                return denial;
+            }
+        }
         if self.management_only && !management_request_is_allowed(&request) {
             return IpcResponse::Error {
                 code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
                 message: "This endpoint accepts only service health, shell status, autostart and shutdown commands".to_owned(),
             };
         }
-        let _admission = if matches!(&request,
-            IpcRequest::StartSession { .. } | IpcRequest::StartLanRemoteSession { .. }
-            | IpcRequest::AcceptSession { .. } | IpcRequest::RequestRemoteSession { .. }
-            | IpcRequest::RecoverSession { .. }
+        let _admission = if matches!(
+            &request,
+            IpcRequest::EnrollPublicDevice { .. }
+                | IpcRequest::RecoverPublicDevice { .. }
+                | IpcRequest::StartSession { .. }
+                | IpcRequest::StartLanRemoteSession { .. }
+                | IpcRequest::AcceptSession { .. }
+                | IpcRequest::RequestRemoteSession { .. }
+                | IpcRequest::RecoverSession { .. }
         ) {
             match self.app_state.shutdown.admit() {
                 Ok(permit) => Some(permit),
-                Err(error) => return IpcResponse::Error {
-                    code: "E_SERVICE_SHUTTING_DOWN".to_owned(), message: error.to_string(),
-                },
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "E_SERVICE_SHUTTING_DOWN".to_owned(),
+                        message: error.to_string(),
+                    }
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
         let mut security_unhealthy = !self.app_state.security_is_healthy();
         if security_unhealthy && !allowed_when_security_unhealthy(&request) {
             return security_store_unavailable_response();
@@ -47,6 +63,41 @@ impl IpcServer {
             }
         }
         match request {
+            IpcRequest::GetPublicServerStatus => IpcResponse::PublicServerStatus {
+                status: self
+                    .app_state
+                    .public_connection
+                    .snapshot(&self.app_state.signaling_status.snapshot()),
+            },
+            IpcRequest::EnrollPublicDevice {
+                enrollment_token,
+                device_name,
+            } => {
+                match crate::public_connection::enroll(
+                    &self.app_state,
+                    enrollment_token.into_secret(),
+                    device_name,
+                )
+                .await
+                {
+                    Ok(status) => IpcResponse::PublicServerStatus { status },
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PUBLIC_ENROLLMENT".into(),
+                        message: message.into(),
+                    },
+                }
+            }
+            IpcRequest::RecoverPublicDevice { device_token } => {
+                match crate::public_connection::recover(&self.app_state, device_token.into_secret())
+                    .await
+                {
+                    Ok(status) => IpcResponse::PublicServerStatus { status },
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PUBLIC_RECOVERY".into(),
+                        message: message.into(),
+                    },
+                }
+            }
             IpcRequest::RegisterDevice {
                 device_id,
                 device_name,
@@ -160,7 +211,17 @@ impl IpcServer {
             }
 
             IpcRequest::RespondToConsent { response } => {
-                session::respond_to_consent(&self.app_state, response).await
+                #[cfg(windows)]
+                let session_id = response.session_id.clone();
+                let result = session::respond_to_consent(&self.app_state, response).await;
+                #[cfg(windows)]
+                if !matches!(result, IpcResponse::ConsentRecorded { .. }) {
+                    self.app_state
+                        .console_capture
+                        .stop(&self.app_state, &session_id)
+                        .await;
+                }
+                result
             }
 
             IpcRequest::SubscribeSessionEvents { query } => {
@@ -774,9 +835,10 @@ impl IpcServer {
             }
 
             IpcRequest::GetShellStatus => {
-                let _ = shell_handlers::refresh_autostart_state(&self.app_state, &self.autostart).await;
+                let _ =
+                    shell_handlers::refresh_autostart_state(&self.app_state, &self.autostart).await;
                 shell_handlers::shell_status(&self.app_state).await
-            },
+            }
 
             IpcRequest::SetAutostart { enabled } => {
                 shell_handlers::set_autostart(&self.app_state, &self.autostart, enabled).await
@@ -784,15 +846,24 @@ impl IpcServer {
 
             IpcRequest::GetAutostartStatus => shell_handlers::autostart_status(&self.autostart),
 
-            IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(&self.app_state, mode),
+            IpcRequest::ShutdownService { mode } => {
+                shell_handlers::shutdown_service(&self.app_state, mode)
+            }
         }
     }
 }
 
 fn management_request_is_allowed(request: &IpcRequest) -> bool {
-    matches!(request,
-        IpcRequest::ServiceHealth | IpcRequest::GetShellStatus | IpcRequest::SetAutostart { .. }
-        | IpcRequest::GetAutostartStatus | IpcRequest::ShutdownService { .. }
+    matches!(
+        request,
+        IpcRequest::GetPublicServerStatus
+            | IpcRequest::EnrollPublicDevice { .. }
+            | IpcRequest::RecoverPublicDevice { .. }
+            | IpcRequest::ServiceHealth
+            | IpcRequest::GetShellStatus
+            | IpcRequest::SetAutostart { .. }
+            | IpcRequest::GetAutostartStatus
+            | IpcRequest::ShutdownService { .. }
     )
 }
 
@@ -917,6 +988,7 @@ fn allowed_when_security_unhealthy(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::ServiceHealth
+            | IpcRequest::GetPublicServerStatus
             | IpcRequest::ListSessions
             | IpcRequest::SessionRuntimeSnapshot { .. }
             | IpcRequest::RuntimeSnapshot

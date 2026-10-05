@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { SERVER_API_URL } from "../services/serverConfig";
 import {
   Minus,
   Square,
@@ -599,7 +600,7 @@ interface ProfileModalProps {
   isDark: boolean;
 }
 
-const API_BASE = (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const API_BASE = SERVER_API_URL;
 
 function ProfileModal({ isOpen, onClose, userData, isDark }: ProfileModalProps) {
   const [activeTab, setActiveTab] = useState<"profile" | "password">("profile");

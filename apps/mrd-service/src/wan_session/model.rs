@@ -247,7 +247,6 @@ impl GrantBinding {
             || policy_revision == 0
             || grant_expires_at_ms == 0
             || policy_expires_at_ms < grant_expires_at_ms
-            || route_policy != WanRoutePolicyV3::RelayOnly
         {
             return Err(WanSessionModelError::InvalidPolicy);
         }
@@ -383,6 +382,7 @@ impl RelayAccessBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayRouteProof {
     access: RelayAccessBinding,
+    route_policy: WanRoutePolicyV3,
     local_candidate_relayed: bool,
     remote_candidate_relayed: bool,
 }
@@ -393,11 +393,28 @@ impl RelayRouteProof {
         local_candidate_relayed: bool,
         remote_candidate_relayed: bool,
     ) -> Result<Self, WanSessionModelError> {
-        if !local_candidate_relayed || !remote_candidate_relayed {
+        Self::from_verified_policy(
+            access,
+            WanRoutePolicyV3::RelayOnly,
+            local_candidate_relayed,
+            remote_candidate_relayed,
+        )
+    }
+
+    pub(crate) fn from_verified_policy(
+        access: &RelayAccessBinding,
+        route_policy: WanRoutePolicyV3,
+        local_candidate_relayed: bool,
+        remote_candidate_relayed: bool,
+    ) -> Result<Self, WanSessionModelError> {
+        if route_policy == WanRoutePolicyV3::RelayOnly
+            && (!local_candidate_relayed || !remote_candidate_relayed)
+        {
             return Err(WanSessionModelError::InvalidRoute);
         }
         Ok(Self {
             access: access.clone(),
+            route_policy,
             local_candidate_relayed,
             remote_candidate_relayed,
         })
@@ -417,6 +434,10 @@ impl RelayRouteProof {
 
     pub fn access(&self) -> &RelayAccessBinding {
         &self.access
+    }
+
+    pub fn route_policy(&self) -> WanRoutePolicyV3 {
+        self.route_policy
     }
 
     pub fn is_relay_to_relay(&self) -> bool {
@@ -633,7 +654,14 @@ impl WanSessionState {
             }
             WanSessionEvent::Negotiating => Ok(()),
             WanSessionEvent::RelayVerified(proof) => {
-                if proof.is_relay_to_relay() && self.access.as_ref() == Some(proof.access()) {
+                if self
+                    .grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.route_policy() == proof.route_policy())
+                    && (proof.route_policy() == WanRoutePolicyV3::DirectFirst
+                        || proof.is_relay_to_relay())
+                    && self.access.as_ref() == Some(proof.access())
+                {
                     self.route_proof = Some(proof.clone());
                     Ok(())
                 } else {

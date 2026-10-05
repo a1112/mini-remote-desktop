@@ -344,8 +344,46 @@ struct Fixture {
 }
 
 async fn make_fixture(gate: Option<Arc<Semaphore>>, replacement_same_as_active: bool) -> Fixture {
+    make_fixture_with_route(gate, replacement_same_as_active, false).await
+}
+
+fn single_access_response(generation: Option<u64>) -> Vec<u8> {
+    let mut body: serde_json::Value = serde_json::from_slice(&access_response_with_generation(
+        generation,
+        NOW + 30_000,
+        "domain-c",
+    ))
+    .unwrap();
+    let mut directory =
+        SignedRelayDirectory::from_json(&serde_json::to_vec(&body["directory"]).unwrap()).unwrap();
+    directory
+        .payload
+        .candidates
+        .retain(|candidate| candidate.node_id == "relay-a");
+    directory.signature_b64 = STANDARD.encode(
+        signing_key()
+            .sign(&directory.payload.canonical_signing_bytes().unwrap())
+            .to_bytes(),
+    );
+    body["directory"] = serde_json::to_value(directory).unwrap();
+    body["credentials"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|credential| credential["node_id"] == "relay-a");
+    serde_json::to_vec(&body).unwrap()
+}
+
+async fn make_fixture_with_route(
+    gate: Option<Arc<Semaphore>>,
+    replacement_same_as_active: bool,
+    direct_single: bool,
+) -> Fixture {
     let backend = Arc::new(FakeBackend::default());
-    backend.push(Ok(access_response(NOW + 30_000)));
+    backend.push(Ok(if direct_single {
+        single_access_response(None)
+    } else {
+        access_response(NOW + 30_000)
+    }));
     let clock = Arc::new(FakeClock::new(NOW));
     let client = Arc::new(RelayDirectoryClient::with_backend(
         relay_config(),
@@ -394,10 +432,22 @@ async fn make_fixture(gate: Option<Arc<Semaphore>>, replacement_same_as_active: 
         )
         .unwrap(),
     );
-    coordinator
-        .install_session(context.clone(), Arc::clone(&access), "relay-a", active)
-        .await
-        .unwrap();
+    if direct_single {
+        coordinator
+            .install_direct_session_for_test(
+                context.clone(),
+                Arc::clone(&access),
+                "relay-a",
+                active,
+            )
+            .await
+            .unwrap();
+    } else {
+        coordinator
+            .install_session(context.clone(), Arc::clone(&access), "relay-a", active)
+            .await
+            .unwrap();
+    }
     Fixture {
         backend,
         client,
@@ -411,6 +461,36 @@ async fn make_fixture(gate: Option<Arc<Semaphore>>, replacement_same_as_active: 
         remote_mux,
         _replacement_remote: replacement_remote,
     }
+}
+
+#[tokio::test]
+async fn failed_direct_route_can_fall_back_to_its_only_authorized_turn_node() {
+    let fixture = make_fixture_with_route(None, false, true).await;
+    let initial = fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .unwrap();
+    assert!(initial.active_node_id.is_empty());
+    assert!(initial.active_failure_domain.is_empty());
+    fixture.backend.push(Ok(single_access_response(Some(1))));
+    let outcome = fixture
+        .coordinator
+        .observe_health(&fixture.session_id, 0, RelayConnectionHealth::Failed)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, RelayRecoveryOutcome::Migrated { .. }),
+        "{outcome:?}"
+    );
+    let final_state = fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .unwrap();
+    assert_eq!(final_state.active_node_id, "relay-a");
+    assert_eq!(final_state.active_failure_domain, "domain-a");
+    assert_eq!(final_state.generation, 1);
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {

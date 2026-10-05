@@ -258,6 +258,26 @@ def test_create_inspect_and_exact_retry_use_the_rust_request_commitment(
     ]
 
 
+def test_direct_first_create_inspect_retry_preserves_authorized_policy(
+    device_sessions_api: DeviceSessionsAPI,
+) -> None:
+    api = device_sessions_api
+    payload = _request(session_id="direct-session")
+    payload["route_policy"] = "direct_first"
+    created = _create(api, payload=payload)
+    assert created.status_code == 200, created.text
+    body = created.json()
+    assert body["request"]["route_policy"] == "direct_first"
+    assert _create(api, payload=payload).json() == body
+    inspected = api.client.get("/api/v1/device-sessions/direct-session",
+                               headers=_headers(api, "target-1"))
+    assert inspected.status_code == 200
+    assert inspected.json() == body
+    payload["route_policy"] = "relay_only"
+    assert _create(api, payload=payload).status_code == 409
+    assert api.session.query(SessionRequest).count() == 1
+
+
 def test_conflicting_reuse_and_inspection_are_privacy_preserving(
     device_sessions_api: DeviceSessionsAPI,
 ) -> None:
@@ -371,7 +391,7 @@ def test_request_identity_and_closed_wan_modes_fail_closed(
     unattended["access_mode"] = "unattended"
     invalid_payloads.append(unattended)
     direct = _request(session_id="session-direct")
-    direct["route_policy"] = "direct_first"
+    direct["route_policy"] = "direct_only"
     invalid_payloads.append(direct)
     unsorted = _request(session_id="session-unsorted")
     unsorted["requested_scopes"] = ["screen.view", "input.keyboard"]

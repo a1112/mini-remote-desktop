@@ -1965,10 +1965,129 @@ fn verify_linux_credential_metadata(
         return Err(SecureStoreError::Permissions);
     }
     let mode = metadata.mode() & 0o7777;
-    if !matches!(mode, 0o400 | 0o600) {
+    if !matches!(mode, 0o400 | 0o600)
+        && !(mode == 0o440 && linux_systemd_credential_is_private(path, metadata)?)
+    {
         return Err(SecureStoreError::Permissions);
     }
     verify_linux_local_filesystem(path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_systemd_credential_is_private(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> Result<bool, SecureStoreError> {
+    use std::os::{
+        fd::AsRawFd as _,
+        unix::fs::{MetadataExt as _, OpenOptionsExt as _},
+    };
+
+    let parent = std::path::Path::new("/run/credentials/mrd-relay-agent.service");
+    if path.parent() != Some(parent) || metadata.uid() != 0 || metadata.gid() != 0 {
+        return Ok(false);
+    }
+    verify_linux_root_owned_directory_chain(parent)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| SecureStoreError::Io)?;
+    let opened = file.metadata().map_err(|_| SecureStoreError::Io)?;
+    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+        return Err(SecureStoreError::Invalid);
+    }
+    // Newer systemd exposes root-owned 0440 credentials through a read-only
+    // mount and one named-user ACL. Ordinary group-readable files stay invalid.
+    let mut filesystem: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: output is initialized and the descriptor remains owned by file.
+    if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut filesystem) } != 0 {
+        return Err(SecureStoreError::Io);
+    }
+    if filesystem.f_flag & libc::ST_RDONLY == 0 {
+        return Ok(false);
+    }
+    let mut acl = [0u8; 44];
+    // SAFETY: name is NUL-terminated, the writable buffer has the supplied size,
+    // and the file descriptor is retained throughout the call.
+    let length = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_access".as_ptr(),
+            acl.as_mut_ptr().cast(),
+            acl.len(),
+        )
+    };
+    if length != acl.len() as isize {
+        return Ok(false);
+    }
+    Ok(linux_systemd_acl_is_private(&acl, unsafe {
+        libc::geteuid()
+    }))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_systemd_acl_is_private(acl: &[u8], service_uid: u32) -> bool {
+    if acl.len() != 44 || acl[..4] != 2u32.to_le_bytes() || service_uid == 0 {
+        return false;
+    }
+    let expected = [
+        (1u16, 4u16, u32::MAX), // owner root: read
+        (2, 4, service_uid),    // only this unprivileged service: read
+        (4, 0, u32::MAX),       // owning group root: no access
+        (16, 4, u32::MAX),      // ACL mask: read only
+        (32, 0, u32::MAX),      // everyone else: no access
+    ];
+    acl[4..]
+        .chunks_exact(8)
+        .zip(expected)
+        .all(|(entry, (tag, permissions, uid))| {
+            entry[..2] == tag.to_le_bytes()
+                && entry[2..4] == permissions.to_le_bytes()
+                && entry[4..] == uid.to_le_bytes()
+        })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod systemd_credential_acl_tests {
+    use super::linux_systemd_acl_is_private;
+
+    fn fixture() -> Vec<u8> {
+        let mut result = 2u32.to_le_bytes().to_vec();
+        for (tag, permissions, uid) in [
+            (1u16, 4u16, u32::MAX),
+            (2, 4, 993),
+            (4, 0, u32::MAX),
+            (16, 4, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            result.extend(tag.to_le_bytes());
+            result.extend(permissions.to_le_bytes());
+            result.extend(uid.to_le_bytes());
+        }
+        result
+    }
+
+    #[test]
+    fn only_the_service_user_has_read_access() {
+        let good = fixture();
+        assert!(linux_systemd_acl_is_private(&good, 993));
+        assert!(!linux_systemd_acl_is_private(&good, 994));
+        assert!(!linux_systemd_acl_is_private(&good, 0));
+        for offset in [6, 14, 22, 30, 38] {
+            let mut bad = good.clone();
+            bad[offset] |= 2; // no owner, user, group, mask or other writes
+            assert!(!linux_systemd_acl_is_private(&bad, 993));
+        }
+        for offset in [22, 38] {
+            let mut bad = good.clone();
+            bad[offset] |= 4; // no group or public reader
+            assert!(!linux_systemd_acl_is_private(&bad, 993));
+        }
+        let mut extra = good.clone();
+        extra.extend([0; 8]);
+        assert!(!linux_systemd_acl_is_private(&extra, 993));
+    }
 }
 
 #[cfg(target_os = "linux")]

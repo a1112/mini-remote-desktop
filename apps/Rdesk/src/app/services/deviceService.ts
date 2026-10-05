@@ -8,8 +8,9 @@
  */
 
 import { useEffect, useState } from "react";
-import { ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
+import { ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
+import { DEFAULT_PUBLIC_API_URL, DEVICE_REGISTRATION_MODE, SERVER_API_URL } from "./serverConfig";
 
 interface HardwareInfo {
   motherboard_serial: string;
@@ -46,12 +47,8 @@ interface StoredDeviceInfo {
 
 const DEVICE_INFO_KEY = "rdesk_device_info";
 const LOCAL_ACCESS_TOKEN = "local-p2p";
-const API_BASE = (
-  (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1"
-).replace(/\/+$/, "");
-const DEVICE_REGISTRATION_MODE = (
-  (import.meta as any).env?.VITE_RDESK_DEVICE_REGISTRATION ?? "local"
-).toLowerCase();
+const SERVICE_MANAGED_TOKEN = "service-managed";
+const API_BASE = SERVER_API_URL;
 
 /**
  * 设备注册服务类
@@ -86,7 +83,10 @@ class DeviceRegistrationService {
     const useServerRegistration = this.shouldUseServerRegistration();
     this.registrationError = null;
     const stored = this.getStoredDeviceInfo();
-    if (stored && !this.isLocalOnlyDevice(stored)) {
+    if (this.shouldUseServiceManagedRegistration()) {
+      return this.restoreServiceManagedDevice(stored);
+    }
+    if (stored && !this.isLocalOnlyDevice(stored) && stored.access_token !== SERVICE_MANAGED_TOKEN) {
       // A failed refresh must never destroy a server-assigned identity.
       this.deviceInfo = stored;
       try {
@@ -156,8 +156,40 @@ class DeviceRegistrationService {
     };
     this.saveDeviceInfo(info);
     this.deviceInfo = info;
-    void this.syncWithLocalService(info);
+    if (info.access_token !== SERVICE_MANAGED_TOKEN) void this.syncWithLocalService(info);
     return info;
+  }
+
+  private shouldUseServiceManagedRegistration(): boolean {
+    return this.shouldUseServerRegistration() && API_BASE === DEFAULT_PUBLIC_API_URL;
+  }
+
+  private async restoreServiceManagedDevice(stored: StoredDeviceInfo | null): Promise<StoredDeviceInfo | null> {
+    try {
+      const result = await ipcPublicServerStatus();
+      if (!result.ok) throw new Error("无法读取本机设备登记状态，请确认后台服务已启动");
+      const status = result.value;
+      if (!status.device_registered || !status.device_id) {
+        this.deviceInfo = null;
+        this.registrationError = "需要设备登记码，请向服务器管理员获取一次性登记码后注册";
+        return null;
+      }
+      const info: StoredDeviceInfo = {
+        device_id: status.device_id,
+        device_name: status.device_name ?? stored?.device_name ?? "本机设备",
+        access_token: SERVICE_MANAGED_TOKEN,
+        motherboard_serial: "service-managed",
+        registered_at: stored?.registered_at ?? new Date().toISOString(),
+      };
+      this.saveDeviceInfo(info);
+      this.deviceInfo = info;
+      return info;
+    } catch {
+      this.registrationError = "无法读取本机设备登记状态，请确认后台服务已启动后重试";
+      // A cached code is display metadata only. It never proves public connectivity.
+      this.deviceInfo = stored?.access_token === SERVICE_MANAGED_TOKEN ? stored : null;
+      return this.deviceInfo;
+    }
   }
 
   getRegistrationError(): string | null {
@@ -244,7 +276,7 @@ class DeviceRegistrationService {
       totalMemoryMb: hardwareInfo.total_memory_mb,
       gpuInfo: JSON.stringify(hardwareInfo.gpu_info),
       deviceName: deviceName || hardwareInfo.hostname,
-      apiBase: (import.meta as any).env?.VITE_RDESK_SERVER_URL,
+      apiBase: API_BASE,
       ...credentials,
     });
     if (!result.ok) throw new Error(result.error.message);
@@ -311,11 +343,12 @@ class DeviceRegistrationService {
    * 获取访问令牌
    */
   getAccessToken(): string | null {
-    return this.deviceInfo?.access_token ?? null;
+    const token = this.deviceInfo?.access_token;
+    return token === SERVICE_MANAGED_TOKEN ? null : token ?? null;
   }
 
   private async syncWithLocalService(info: StoredDeviceInfo): Promise<void> {
-    if (!isTauriRuntime()) return;
+    if (!isTauriRuntime() || info.access_token === SERVICE_MANAGED_TOKEN) return;
     const result = await ipcRegisterDevice(info.device_id, info.device_name);
     if (!result.ok) {
       console.warn("[DeviceService] mrd-service device registration failed:", result.error.message);

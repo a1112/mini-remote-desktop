@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod backend_token;
+pub mod persistent_identity;
 pub mod presence;
 pub mod routes;
 pub mod ws;
@@ -12,6 +13,7 @@ use mrd_signal_proto::{
     SignalEnvelope, SignalProtocolError, SignalReplayGuard, VerifiedSignalMetadata,
     WebRtcDescriptionRoleV3,
 };
+use persistent_identity::{PersistentIdentityError, PersistentServerState, ServerSigningCounter};
 use presence::{PresenceEntry, PresenceError, PresenceRegistry};
 use ring::rand::{SecureRandom, SystemRandom};
 use routes::{AuthorizedRoutes, IntentDisposition, RouteError};
@@ -87,7 +89,7 @@ pub struct RealtimeCore {
     config: CoreConfig,
     authenticator: Authenticator,
     server_identity: DeviceIdentity,
-    server_counter: u64,
+    server_counter: ServerSigningCounter,
     replay: SignalReplayGuard,
     presence: PresenceRegistry,
     routes: AuthorizedRoutes,
@@ -113,6 +115,29 @@ impl RealtimeCore {
         config.validate()?;
         let server_identity = DeviceIdentity::generate(&SystemRandom::new())
             .map_err(|_| RealtimeError::EntropyUnavailable)?;
+        Self::with_signing_state(
+            config,
+            token_verifier,
+            server_identity,
+            ServerSigningCounter::Ephemeral(1),
+        )
+    }
+
+    pub fn with_persistent_state(
+        config: CoreConfig,
+        token_verifier: Arc<dyn BackendTokenVerifier>,
+        state: PersistentServerState,
+    ) -> Result<Self, RealtimeError> {
+        Self::with_signing_state(config, token_verifier, state.identity, state.counter)
+    }
+
+    fn with_signing_state(
+        config: CoreConfig,
+        token_verifier: Arc<dyn BackendTokenVerifier>,
+        server_identity: DeviceIdentity,
+        server_counter: ServerSigningCounter,
+    ) -> Result<Self, RealtimeError> {
+        config.validate()?;
         Ok(Self {
             authenticator: Authenticator::new(
                 config.server_device_id.clone(),
@@ -122,7 +147,7 @@ impl RealtimeCore {
             ),
             config,
             server_identity,
-            server_counter: 1,
+            server_counter,
             replay: SignalReplayGuard::new(4_096, 2_048),
             presence: PresenceRegistry::default(),
             routes: AuthorizedRoutes::default(),
@@ -209,7 +234,7 @@ impl RealtimeCore {
                 let metadata =
                     intent.verify_for(&request.target_device_id, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Controller {
+                if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let target = self
@@ -217,7 +242,7 @@ impl RealtimeCore {
                     .by_device(&request.target_device_id)
                     .ok_or(RealtimeError::TargetUnavailable)?
                     .clone();
-                if target.role != BackendRole::Agent {
+                if !target.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let disposition =
@@ -239,7 +264,7 @@ impl RealtimeCore {
                     &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Agent {
+                if !presence.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self
@@ -257,7 +282,7 @@ impl RealtimeCore {
                 let metadata =
                     offer.verify_for(&offer.payload.target_device_id, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Controller {
+                if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -275,7 +300,7 @@ impl RealtimeCore {
                     &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Agent {
+                if !presence.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -297,7 +322,7 @@ impl RealtimeCore {
                 };
                 let metadata = candidate.verify_for(expected_peer, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != required_role {
+                if !presence.role.has_capability(required_role) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -431,11 +456,7 @@ impl RealtimeCore {
         connection_id: ConnectionId,
         now_ms: u64,
     ) -> Result<Registered, RealtimeError> {
-        let counter = self.server_counter;
-        self.server_counter = self
-            .server_counter
-            .checked_add(1)
-            .ok_or(RealtimeError::CounterExhausted)?;
+        let counter = self.server_counter.next()?;
         let mut nonce = [0_u8; 16];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -608,6 +629,8 @@ pub enum RealtimeError {
     UnsupportedMessage,
     #[error("server counter is exhausted")]
     CounterExhausted,
+    #[error(transparent)]
+    PersistentIdentity(#[from] PersistentIdentityError),
     #[error("server entropy is unavailable")]
     EntropyUnavailable,
     #[error(transparent)]
@@ -623,9 +646,10 @@ pub enum RealtimeError {
 impl RealtimeError {
     pub fn reason_code(&self) -> ProtocolReasonCode {
         match self {
-            Self::InvalidConfig | Self::CounterExhausted | Self::EntropyUnavailable => {
-                ProtocolReasonCode::Internal
-            }
+            Self::InvalidConfig
+            | Self::CounterExhausted
+            | Self::EntropyUnavailable
+            | Self::PersistentIdentity(_) => ProtocolReasonCode::Internal,
             Self::InvalidConnection | Self::UnsupportedMessage => ProtocolReasonCode::Malformed,
             Self::ConnectionCapacity | Self::RateLimited => ProtocolReasonCode::RateLimited,
             Self::NotRegistered

@@ -4,9 +4,11 @@ mod audit_store;
 mod identity_store;
 mod integrity;
 mod migrations;
+mod secret_protection;
 mod trust_store;
 
 pub use audit_store::{AuditDraft, AuditQuery, AuditRecord};
+pub use secret_protection::AeadSecretProtector;
 pub use trust_store::{
     AppliedTrustTransition, AuditedTrustTransition, TrustRecord, TrustState,
     TrustTransitionRejection,

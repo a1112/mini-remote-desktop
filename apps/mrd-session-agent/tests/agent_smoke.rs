@@ -108,6 +108,7 @@ impl AuthorizedCommandExecutor for CountingCaptureExecutor {
             AgentCommand::StartCapture {
                 resource_id,
                 display_id,
+                ..
             } => {
                 assert_eq!(resource_id, &[13; 16]);
                 assert_eq!(*display_id, 0);
@@ -160,6 +161,7 @@ fn signed_start_capture(
     let command = AgentCommand::StartCapture {
         resource_id: [13; 16],
         display_id: 0,
+        profile: None,
     };
     let scopes = command.required_scopes();
     let mut execute = ExecuteCommand {
@@ -242,6 +244,200 @@ where
 fn descriptor() -> SessionDescriptor {
     SessionDescriptor::new(AGENT_INSTANCE_ID, 4_242, 55, [6; 32], 7, [8; 32], 1)
         .expect("valid fixed descriptor")
+}
+
+struct EncodedCaptureExecutor {
+    live: bool,
+    sequence: u64,
+    revoked: Arc<AtomicUsize>,
+}
+
+impl AuthorizedCommandExecutor for EncodedCaptureExecutor {
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::from_implemented([AgentCapability::Capture])
+    }
+    fn execute(&mut self, _command: AuthorizedCommand) -> CommandOutcome {
+        self.live = true;
+        CommandOutcome::Completed
+    }
+    fn has_capture_resources(&self) -> bool {
+        self.live
+    }
+    fn capture_access_units(
+        &mut self,
+    ) -> Result<Vec<mrd_session_agent::media::EncodedMediaAccessUnit>, ()> {
+        if !self.live {
+            return Ok(Vec::new());
+        }
+        self.sequence += 1;
+        Ok(vec![mrd_session_agent::media::EncodedMediaAccessUnit::new(
+            [13; 16],
+            execution_session_id(),
+            self.sequence,
+            self.sequence * 33_333,
+            self.sequence == 1,
+            vec![0, 0, 0, 1, 0x65],
+        )
+        .unwrap()])
+    }
+    fn revoke_session(&mut self, session: &SessionId) -> bool {
+        assert_eq!(*session, execution_session_id());
+        self.live = false;
+        self.revoked.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+}
+
+#[tokio::test]
+async fn encoded_capture_is_pumped_with_registered_context_and_stops_on_desktop_change() {
+    let (agent_stream, mut service) = tokio::io::duplex(64 * 1024);
+    let desktop_state = Arc::new(RwLock::new(Some(TrustedDesktopState {
+        desktop_epoch: 1,
+        desktop_kind: DesktopKind::Default,
+    })));
+    let (changes, _) = watch::channel(());
+    let revoked = Arc::new(AtomicUsize::new(0));
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(1),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .unwrap()
+    .with_attended_authority(
+        Arc::new(ApproveScreenView),
+        Arc::new(FixedExecuteGrantVerifier),
+        Arc::new(MutableDesktopSource {
+            state: desktop_state.clone(),
+            changes: changes.clone(),
+        }),
+        GRANT_ISSUER_KEY_ID,
+        Box::new(EncodedCaptureExecutor {
+            live: false,
+            sequence: 0,
+            revoked: revoked.clone(),
+        }),
+    )
+    .unwrap();
+    let agent = tokio::spawn(runtime.run(agent_stream));
+    let register = match read_agent_message(&mut service).await {
+        AgentToService::AgentRegister(value) => value,
+        other => panic!("unexpected {other:?}"),
+    };
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::AgentChallenge(AgentChallenge {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            challenge_id: CHALLENGE_ID,
+            challenge_nonce: [10; 32],
+            expected_agent_instance_id: register.agent_instance_id,
+            expected_process_id: register.process_id,
+            expected_process_creation_time: register.process_creation_time,
+            expected_logon_sid_hash: register.logon_sid_hash,
+            expected_windows_session_id: register.windows_session_id,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentRegistered(_)
+    ));
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentCapabilitySnapshot(_)
+    ));
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_start_capture([71; 32], [72; 16], 1))
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(ConsentRequest {
+            request_token: 73,
+            request_id: [73; 16],
+            session_id: execution_session_id(),
+            peer: execution_peer(),
+            requested_scopes: [PermissionScope::ScreenView].into_iter().collect(),
+            policy_revision: 1,
+            windows_session_id: 7,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+            authorization_expires_at_ms: 2_500,
+        }),
+    )
+    .await;
+    assert!(
+        matches!(read_agent_message(&mut service).await, AgentToService::ConsentResult(result) if result.decision == ConsentDecision::Approved)
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_start_capture([74; 32], [75; 16], 1))
+            .await
+            .outcome,
+        CommandOutcome::Completed
+    );
+    let first = match read_agent_message(&mut service).await {
+        AgentToService::MediaAccessUnit(unit) => unit,
+        other => panic!("expected encoded frame, got {other:?}"),
+    };
+    assert_eq!(first.resource_id, [13; 16]);
+    assert_eq!(first.session_id, execution_session_id().0);
+    assert_eq!(first.context.registration_id, REGISTRATION_ID);
+    assert_eq!(first.context.registration_epoch, 1);
+    assert_eq!(first.context.windows_session_id, 7);
+    assert_eq!(first.context.desktop_epoch, 1);
+    assert!(first.context.sequence > 0 && first.is_keyframe);
+    let second = match read_agent_message(&mut service).await {
+        AgentToService::MediaAccessUnit(unit) => unit,
+        other => panic!("expected second frame, got {other:?}"),
+    };
+    assert!(second.context.sequence > first.context.sequence && second.sequence > first.sequence);
+    *desktop_state.write().unwrap() = Some(TrustedDesktopState {
+        desktop_epoch: 2,
+        desktop_kind: DesktopKind::Secure,
+    });
+    changes.send_replace(());
+    loop {
+        match read_agent_message(&mut service).await {
+            AgentToService::AgentCapabilitySnapshot(snapshot) if snapshot.desktop_epoch == 2 => {
+                assert!(!snapshot.capabilities.contains(&AgentCapability::Capture));
+                break;
+            }
+            AgentToService::MediaAccessUnit(_) => {}
+            AgentToService::DesktopChanged(event) => {
+                assert!(event.context.sequence > second.context.sequence)
+            }
+            other => panic!("unexpected during desktop revoke: {other:?}"),
+        }
+    }
+    assert_eq!(revoked.load(Ordering::SeqCst), 1);
+    assert!(tokio::time::timeout(
+        Duration::from_millis(40),
+        read_frame::<_, AgentToService>(&mut service)
+    )
+    .await
+    .is_err());
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::StopAgent(StopAgent {
+            request_id: [76; 16],
+            reason: StopReason::ServiceShutdown,
+            deadline_ms: 2_000,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentStopping(_)
+    ));
+    assert_eq!(agent.await.unwrap().unwrap(), AgentExit::StoppedByService);
 }
 
 #[tokio::test]

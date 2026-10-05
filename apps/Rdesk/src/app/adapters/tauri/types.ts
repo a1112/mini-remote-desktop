@@ -863,6 +863,20 @@ export interface SignalingRuntimeSnapshot {
   last_error: string | null;
 }
 
+/** Secret-free public connectivity, reported by the background service. */
+export interface PublicServerStatus {
+  service_running: boolean;
+  api_url: string | null;
+  api_reachable: boolean | null;
+  device_registered: boolean;
+  device_id: string | null;
+  device_name: string | null;
+  signaling_state: SignalingRuntimeSnapshot['state'];
+  reconnect_attempt: number;
+  last_connected_at_ms: number | null;
+  last_error: string | null;
+}
+
 export interface AuditLogQuery {
   session_id?: string | null;
   action?: string | null;

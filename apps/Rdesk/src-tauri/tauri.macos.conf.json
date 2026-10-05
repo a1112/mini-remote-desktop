@@ -1,5 +1,8 @@
 {
   "bundle": {
+    "macOS": {
+      "minimumSystemVersion": "13.0"
+    },
     "resources": {
       "../../../target/release/MrdService.app": "MrdService.app"
     }

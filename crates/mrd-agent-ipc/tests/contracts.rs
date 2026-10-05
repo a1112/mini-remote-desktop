@@ -37,6 +37,86 @@ const COMMAND_DIGEST: [u8; 32] = [11; 32];
 const OTHER_RESOURCE_ID: [u8; 16] = [17; 16];
 
 #[test]
+fn capture_profile_is_part_of_the_signed_command_identity() {
+    let legacy: AgentCommand = serde_json::from_value(serde_json::json!({
+        "type": "start_capture", "payload": {"resource_id": RESOURCE_ID, "display_id": 0}
+    }))
+    .unwrap();
+    let command: AgentCommand = serde_json::from_value(serde_json::json!({
+        "type": "start_capture", "payload": {"resource_id": RESOURCE_ID, "display_id": 0,
+        "profile": {"width": 1280, "height": 720, "fps": 30, "bitrate_bps": 2_000_000}}
+    }))
+    .unwrap();
+    assert_ne!(legacy.digest(), command.digest());
+    let mut value = serde_json::to_value(&command).unwrap();
+    for (field, replacement) in [
+        ("width", 640),
+        ("height", 480),
+        ("fps", 60),
+        ("bitrate_bps", 1_000_000),
+    ] {
+        value["payload"]["profile"][field] = serde_json::json!(replacement);
+        let changed: AgentCommand = serde_json::from_value(value.clone()).unwrap();
+        assert_ne!(command.digest(), changed.digest());
+        value = serde_json::to_value(&command).unwrap();
+    }
+}
+
+#[test]
+fn capture_profile_rejects_unbounded_encoder_work_before_authorization() {
+    use mrd_agent_ipc::AgentCaptureProfile;
+    let valid = AgentCaptureProfile {
+        width: 1280,
+        height: 720,
+        fps: 30,
+        bitrate_bps: 2_000_000,
+    };
+    for invalid in [
+        AgentCaptureProfile { width: 0, ..valid },
+        AgentCaptureProfile {
+            width: 1279,
+            ..valid
+        },
+        AgentCaptureProfile {
+            width: 7682,
+            ..valid
+        },
+        AgentCaptureProfile {
+            height: 4322,
+            ..valid
+        },
+        AgentCaptureProfile { fps: 0, ..valid },
+        AgentCaptureProfile { fps: 121, ..valid },
+        AgentCaptureProfile {
+            bitrate_bps: 0,
+            ..valid
+        },
+        AgentCaptureProfile {
+            bitrate_bps: 100_000_001,
+            ..valid
+        },
+    ] {
+        let execute = execute_command(AgentCommand::StartCapture {
+            resource_id: RESOURCE_ID,
+            display_id: 0,
+            profile: Some(invalid),
+        });
+        assert_eq!(
+            validate_execute_command(&execute, &execution_context(1500), &AcceptAllVerifier),
+            Err(GrantValidationError::InvalidCaptureProfile)
+        );
+    }
+    let execute = execute_command(AgentCommand::StartCapture {
+        resource_id: RESOURCE_ID,
+        display_id: 0,
+        profile: Some(valid),
+    });
+    assert!(
+        validate_execute_command(&execute, &execution_context(1500), &AcceptAllVerifier).is_ok()
+    );
+}
+
+#[test]
 fn media_access_unit_round_trips_and_enforces_payload_bound() {
     let unit = MediaAccessUnit {
         context: AgentEventContext {
@@ -53,6 +133,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
         timestamp_us: 10,
         codec: MediaCodec::H264,
         is_keyframe: true,
+        source_bounds: None,
         payload: vec![1, 2, 3],
     };
     assert!(unit.is_valid());
@@ -60,6 +141,31 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
     let decoded: AgentToService =
         serde_json::from_slice(&serde_json::to_vec(&message).unwrap()).unwrap();
     assert_eq!(decoded, message);
+
+    let mut with_bounds = serde_json::to_value(&unit).unwrap();
+    with_bounds["source_bounds"] = serde_json::json!({
+        "left": -2560, "top": 120, "width": 2560, "height": 1440
+    });
+    let bounded: MediaAccessUnit = serde_json::from_value(with_bounds.clone())
+        .expect("capture source bounds must cross the authenticated media IPC boundary");
+    assert!(bounded.is_valid());
+    assert_eq!(
+        serde_json::to_value(&bounded).unwrap()["source_bounds"],
+        with_bounds["source_bounds"]
+    );
+    for (field, invalid) in [
+        ("width", 0_i64),
+        ("height", 32_769),
+        ("left", i64::from(i32::MAX)),
+    ] {
+        let mut value = with_bounds.clone();
+        value["source_bounds"][field] = serde_json::json!(invalid);
+        let invalid: MediaAccessUnit = serde_json::from_value(value).unwrap();
+        assert!(
+            !invalid.is_valid(),
+            "invalid capture source bounds must be rejected"
+        );
+    }
 
     let mut oversized = unit;
     oversized.payload = vec![0; AGENT_IPC_MAX_MEDIA_ACCESS_UNIT_BYTES + 1];
@@ -69,7 +175,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
 #[test]
 fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
     let unit = RenderAccessUnit {
         resource_id: RESOURCE_ID,
         session_id: "session-render".to_string(),
@@ -94,7 +200,7 @@ fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
 #[test]
 fn render_boundary_metrics_round_trip_with_protocol_minor_five() {
     assert_eq!(AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR, 5);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
     let metrics = RenderBoundaryMetrics {
         context: AgentEventContext {
             registration_id: REGISTRATION_ID,
@@ -275,6 +381,7 @@ fn input_event(sequence: u64, event: InputEventPayload) -> InputEventEnvelope {
         resource_id: RESOURCE_ID,
         start_grant_id: GRANT_ID,
         sequence,
+        expires_at_ms: 2_000,
         event,
     }
 }
@@ -503,6 +610,9 @@ fn input_event_commitment_and_validation_bind_the_authorized_resource() {
     changed.sequence += 1;
     variants.push(changed);
     let mut changed = envelope.clone();
+    changed.expires_at_ms -= 1;
+    variants.push(changed);
+    let mut changed = envelope.clone();
     changed.event = InputEventPayload::MouseMove { x: 12, y: 11 };
     variants.push(changed);
     for changed in variants {
@@ -589,6 +699,35 @@ fn input_event_shape_rejects_sentinels_invalid_sequences_and_invalid_keys() {
 }
 
 #[test]
+fn input_deadline_is_exclusive_bounded_by_the_start_grant_and_required_on_wire() {
+    let start = execute_command(AgentCommand::StartInput {
+        resource_id: RESOURCE_ID,
+        input_scopes: scopes([PermissionScope::InputPointer]),
+    });
+    let resource = authorize_input_resource(
+        validate_execute_command(&start, &execution_context(1_500), &AcceptAllVerifier).unwrap(),
+    )
+    .unwrap();
+    let mut envelope = input_event(1, InputEventPayload::MouseMove { x: 11, y: 12 });
+    envelope.expires_at_ms = 1_600;
+    assert!(validate_input_event(&envelope, &resource, &execution_context(1_599)).is_ok());
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &execution_context(1_600)),
+        Err(InputRejection::Grant)
+    );
+    envelope.expires_at_ms = 2_001;
+    assert_eq!(
+        validate_input_event(&envelope, &resource, &execution_context(1_500)),
+        Err(InputRejection::Grant)
+    );
+    envelope.expires_at_ms = 0;
+    assert_eq!(envelope.validate_shape(), Err(InputRejection::InvalidEvent));
+    let mut legacy = serde_json::to_value(input_event(1, InputEventPayload::ReleaseAll)).unwrap();
+    legacy.as_object_mut().unwrap().remove("expires_at_ms");
+    assert!(serde_json::from_value::<InputEventEnvelope>(legacy).is_err());
+}
+
+#[test]
 fn consent_result_is_correlated_and_cannot_expand_approved_scopes() {
     let validated = validate_consent_result(&consent_request(), &consent_result(), 1_700)
         .expect("bound consent result");
@@ -661,7 +800,7 @@ fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
 fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
     assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
 
     for reason in [
         ConsentCancelReason::CallerAborted,
@@ -684,6 +823,7 @@ fn every_product_command_round_trips_with_an_execute_grant() {
         AgentCommand::StartCapture {
             resource_id: RESOURCE_ID,
             display_id: 1,
+            profile: None,
         },
         AgentCommand::StopCapture {
             resource_id: RESOURCE_ID,
@@ -744,7 +884,7 @@ fn every_product_command_round_trips_with_an_execute_grant() {
 fn start_render_digest_binds_surface_identity_and_native_handle() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
     assert_eq!(AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, 4);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
     let command = AgentCommand::StartRender {
         resource_id: RESOURCE_ID,
         display_id: 1,
@@ -935,6 +1075,7 @@ fn execute_grant_is_bound_to_all_authorization_context() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let authorized =
         validate_execute_command(&execute, &execution_context(1_500), &AcceptAllVerifier)
@@ -960,6 +1101,7 @@ fn execute_rejects_claim_scopes_outside_local_authorization() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let mut context = execution_context(1_500);
     context.authorization_scopes = scopes([PermissionScope::ScreenView]);
@@ -975,6 +1117,7 @@ fn execute_rejects_grant_that_outlives_local_authorization() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let mut context = execution_context(1_500);
     context.authorization_expires_at_ms = execute.grant.claims.expires_at_ms;
@@ -992,6 +1135,7 @@ fn start_rejects_expired_local_authorization_but_cleanup_remains_authorizable() 
     let start = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let cleanup = execute_command(AgentCommand::StopCapture {
         resource_id: RESOURCE_ID,
@@ -1109,6 +1253,7 @@ fn execute_grant_digest_covers_the_command_id() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let mut substituted = execute.clone();
     substituted.command_id = [77; 16];
@@ -1122,11 +1267,12 @@ fn execute_grant_digest_covers_the_command_id() {
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 5);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     let digest = execute.command_digest();
     execute.request_token += 1;
@@ -1204,6 +1350,7 @@ fn execute_grant_rejects_each_mismatched_authorization_binding() {
     let execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
 
     let mut context = execution_context(1_500);
@@ -1287,6 +1434,7 @@ fn ordinary_session_agent_rejects_all_non_default_desktop_starts() {
     let mut capture = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     capture.grant.claims.desktop_kind = DesktopKind::Secure;
     let mut secure_context = execution_context(1_500);
@@ -1324,6 +1472,7 @@ fn ordinary_session_agent_rejects_all_non_default_desktop_starts() {
     let mut unknown = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,
         display_id: 1,
+        profile: None,
     });
     unknown.grant.claims.desktop_kind = DesktopKind::Unknown;
     let mut unknown_context = execution_context(1_500);

@@ -53,6 +53,16 @@ class DeviceAuthSnapshot:
     auth_revoked_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceRefreshIdentity:
+    row_id: str
+    device_id: str
+    tenant_id: str
+    auth_version: int
+    serial_digest: str
+    expires_at: int
+
+
 def capture_device_auth_snapshot(device: Device) -> DeviceAuthSnapshot:
     """Freeze the device-auth decision before later database awaits can refresh it."""
 
@@ -202,6 +212,44 @@ def create_device_access_token(device: Device) -> str:
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
+def create_device_refresh_token(device: Device) -> str | None:
+    """Issue a revocable device credential; renewal does not invalidate older copies."""
+    # Legacy inventory rows without a recorded machine digest cannot receive a
+    # credential that promises a machine binding. Enrollment/registration does.
+    if device.motherboard_serial_digest is None:
+        return None
+    configured = _configured_device_refresh_jwt()
+    if (
+        configured is None
+        or not isinstance(device.tenant_id, str)
+        or not 1 <= len(device.tenant_id) <= 64
+        or not isinstance(device.auth_version, int)
+        or isinstance(device.auth_version, bool)
+        or device.auth_version < 1
+        or not isinstance(device.motherboard_serial_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", device.motherboard_serial_digest, re.ASCII) is None
+        or device.auth_revoked_at is not None
+    ):
+        raise _relay_http_exception(503, "authentication_unavailable", "authentication service is not configured")
+    secret, issuer, audience, _maximum = configured
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "sub": device.id,
+        "device_id": device.device_id,
+        "tenant_id": device.tenant_id,
+        "auth_version": device.auth_version,
+        "serial_digest": device.motherboard_serial_digest,
+        "token_type": "device_refresh",
+        "role": "device_refresh",
+        "jti": os.urandom(16).hex(),
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "exp": now + settings.device_refresh_jwt_expire_days * 86400,
+    }
+    return jwt.encode(payload, secret, algorithm="HS256")
+
+
 security = HTTPBearer()
 trusted_mtls_proxy_scheme = APIKeyHeader(
     name="X-Rdesk-Client-TLS",
@@ -227,6 +275,12 @@ device_bearer_scheme = APIKeyHeader(
         "A device-role JWT issued when the physical device is first registered. "
         "Ownership-changing routes require this together with the user's Bearer JWT."
     ),
+    auto_error=False,
+)
+device_refresh_scheme = APIKeyHeader(
+    name="X-Rdesk-Device-Refresh-Authorization",
+    scheme_name="DeviceRefreshBearer",
+    description="Revocable machine-bound credential accepted only by /devices/refresh.",
     auto_error=False,
 )
 device_enrollment_scheme = APIKeyHeader(
@@ -310,6 +364,50 @@ async def get_current_device_optional(
 ) -> Device | None:
     _ = _device_marker
     return await _device_from_request(request, db, required=False)
+
+
+async def get_device_refresh_identity(
+    request: Request,
+    _marker: Annotated[str | None, Security(device_refresh_scheme)] = None,
+) -> DeviceRefreshIdentity:
+    """Freeze verified claims; the renewal route rechecks locked database state."""
+    values = request.headers.getlist("x-rdesk-device-refresh-authorization")
+    if len(values) != 1 or not 16 <= len(values[0]) <= 4096:
+        raise _device_credentials_exception()
+    matched = _DEVICE_AUTHORIZATION.fullmatch(values[0])
+    configured = _configured_device_refresh_jwt()
+    if matched is None or configured is None:
+        raise _device_credentials_exception()
+    try:
+        payload = _decode_access_token(matched.group(1), configured)
+        version = payload.get("auth_version")
+        serial = payload.get("serial_digest")
+        tenant = payload.get("tenant_id")
+        device_id = payload.get("device_id")
+        jti = payload.get("jti")
+        if (
+            payload.get("token_type") != "device_refresh"
+            or payload.get("role") != "device_refresh"
+            or payload.get("aud") != configured[2]
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 1
+            or not isinstance(tenant, str)
+            or not 1 <= len(tenant) <= 64
+            or not isinstance(device_id, str)
+            or not 1 <= len(device_id) <= 64
+            or not isinstance(serial, str)
+            or re.fullmatch(r"[0-9a-f]{64}", serial, re.ASCII) is None
+            or not isinstance(jti, str)
+            or re.fullmatch(r"[0-9a-f]{32}", jti, re.ASCII) is None
+        ):
+            raise _device_credentials_exception()
+    except jwt.PyJWTError:
+        raise _device_credentials_exception() from None
+    return DeviceRefreshIdentity(
+        row_id=payload["sub"], device_id=device_id, tenant_id=tenant,
+        auth_version=version, serial_digest=serial, expires_at=payload["exp"],
+    )
 
 
 async def get_device_enrollment_token_optional(
@@ -634,6 +732,26 @@ def _configured_device_jwt() -> tuple[str, str, str, int] | None:
     ):
         return None
     return secret, issuer, audience, maximum_minutes * 60
+
+
+def _configured_device_refresh_jwt() -> tuple[str, str, str, int] | None:
+    base = _configured_jwt()
+    raw_audience = settings.device_refresh_jwt_audience
+    days = settings.device_refresh_jwt_expire_days
+    if base is None or not isinstance(raw_audience, str):
+        return None
+    audience = raw_audience.strip()
+    if (
+        not audience or len(audience) > 256
+        or audience in {
+            settings.jwt_audience.strip(), settings.device_jwt_audience.strip(),
+            settings.signaling_jwt_audience.strip(),
+        }
+        or not isinstance(days, int) or isinstance(days, bool)
+        or not 1 <= days <= 365
+    ):
+        return None
+    return base[0], base[1], audience, 365 * 86400
 
 
 def _decode_access_token(

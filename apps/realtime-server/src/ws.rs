@@ -12,8 +12,8 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use mrd_proto::DeviceId;
 use mrd_signal_client::{
-    decode_authenticated_message, encode_authenticated_message, SignalClientError,
-    MAX_SIGNAL_MESSAGE_BYTES,
+    decode_authenticated_message, encode_authenticated_message, wait_until_message_issued,
+    SignalClientError, MAX_SIGNAL_MESSAGE_BYTES,
 };
 use mrd_signal_proto::{
     AuthenticatedSignalMessage, ProtocolReasonCode, SignalEnvelope, SignalErrorMessage,
@@ -299,6 +299,13 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
                 continue;
             }
         };
+        // Delay only at the transport boundary, outside the global core lock.
+        // The unmodified envelope is authenticated against a fresh real clock
+        // below; no timestamp, token lifetime or replay rule is relaxed.
+        tokio::select! {
+            _ = outbound.closed() => break,
+            _ = wait_until_message_issued(&envelope) => {},
+        }
         let deliveries = {
             let mut core = state.core.lock().await;
             core.handle(connection_id, envelope, now_ms())

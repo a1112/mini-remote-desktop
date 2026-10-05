@@ -21,6 +21,7 @@ mrd-session = { path = "../../crates/mrd-session" }
 ring.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 zeroize.workspace = true
 
 [target.'cfg(windows)'.dependencies]

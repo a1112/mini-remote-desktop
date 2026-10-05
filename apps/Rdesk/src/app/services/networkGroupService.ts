@@ -4,7 +4,9 @@
  * 提供网络分组的 CRUD 操作和设备管理功能。
  */
 
-const API_BASE = "http://127.0.0.1:9530/api/v1";
+import { SERVER_API_URL } from "./serverConfig";
+
+const API_BASE = SERVER_API_URL;
 
 /**
  * 网络分组接口

@@ -1,0 +1,23 @@
+[Unit]
+Description=MRD authenticated relay node control ingress
+After=network-online.target serverall-rdesk.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/usr/sbin/haproxy -c -f /etc/mrd-relay-control/haproxy.cfg
+ExecStart=/usr/sbin/haproxy -Ws -f /etc/mrd-relay-control/haproxy.cfg -p /run/mrd-relay-control/haproxy.pid
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=mrd-relay-control
+RuntimeDirectoryMode=0700
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+
+[Install]
+WantedBy=multi-user.target

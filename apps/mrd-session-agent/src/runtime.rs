@@ -20,7 +20,7 @@ use mrd_proto::SessionId;
 #[cfg(unix)]
 use std::path::{Component, Path};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     panic::{catch_unwind, AssertUnwindSafe},
     path::PathBuf,
     sync::Arc,
@@ -37,7 +37,10 @@ use tokio::{
 const INBOUND_QUEUE_CAPACITY: usize = 32;
 const OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const REPLAY_LEDGER_CAPACITY: usize = 4_096;
+const MAX_CLEANUP_RECEIPTS: usize = 256;
+const CLEANUP_RECEIPT_RETENTION: Duration = Duration::from_secs(5 * 60);
 const PARTIAL_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+const CAPTURE_PUMP_INTERVAL: Duration = Duration::from_millis(8);
 
 struct OutboundFrame {
     message: AgentToService,
@@ -592,6 +595,15 @@ pub trait AuthorizedCommandExecutor: Send {
     fn capabilities(&self) -> AgentCapabilities;
     /// Execute one already-authorized command without blocking the event loop.
     fn execute(&mut self, command: AuthorizedCommand) -> CommandOutcome;
+    /// Drain a bounded batch of encoded frames from authorized capture resources.
+    /// `Err` signals a failed capture worker or a resource identity mismatch.
+    fn capture_access_units(&mut self) -> Result<Vec<crate::media::EncodedMediaAccessUnit>, ()> {
+        Ok(Vec::new())
+    }
+    /// Whether a capture worker exists and needs the bounded frame-pump timer.
+    fn has_capture_resources(&self) -> bool {
+        false
+    }
     /// Route one authenticated encoded unit to an already-authorized render resource.
     fn render_access_unit(&mut self, _unit: mrd_agent_ipc::RenderAccessUnit) -> bool {
         false
@@ -666,6 +678,9 @@ pub enum AgentRuntimeError {
     /// A revoked session retained a desktop-bound media resource.
     #[error("session media cleanup failed")]
     MediaCleanupFailed,
+    /// Capture failed or emitted a frame outside its live consent binding.
+    #[error("session capture failed")]
+    MediaCaptureFailed,
     /// An encoded frame did not match a live authorized render resource.
     #[error("render access unit is not authorized for a live resource")]
     InvalidRenderAccessUnit,
@@ -696,6 +711,17 @@ struct AttendedAuthority {
     executor: Box<dyn AuthorizedCommandExecutor>,
 }
 
+/// A successful Start owns this identity for the rest of this registration.
+/// Only Stop may resolve the original authority after consent revocation, and
+/// only confirmed native cleanup permits an acknowledgement without execution.
+struct CleanupReceipt {
+    binding: TrustedSessionBinding,
+    capability: mrd_agent_ipc::AgentCapability,
+    grant_window: (u64, u64, u64),
+    retained_until: Instant,
+    retired: bool,
+}
+
 /// One connected session-agent runtime.
 ///
 /// Legacy split authority builders are intentionally absent:
@@ -721,6 +747,8 @@ pub struct AgentRuntime {
     input: Option<Box<dyn InputBackend>>,
     last_desktop_state: Option<TrustedDesktopState>,
     replay: ReplayLedger,
+    cleanup_receipts: HashMap<[u8; 16], CleanupReceipt>,
+    started_resource_ids: HashSet<[u8; 16]>,
     event_sequence: u64,
     cleanup_complete: bool,
 }
@@ -763,6 +791,8 @@ impl AgentRuntime {
             input: None,
             last_desktop_state: None,
             replay: ReplayLedger::new(REPLAY_LEDGER_CAPACITY),
+            cleanup_receipts: HashMap::new(),
+            started_resource_ids: HashSet::new(),
             event_sequence: 0,
             cleanup_complete: false,
         })
@@ -861,6 +891,8 @@ impl AgentRuntime {
                 self.config.heartbeat_interval,
             );
             heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut capture = tokio::time::interval(CAPTURE_PUMP_INTERVAL);
+            capture.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             loop {
             if desktop_changes
@@ -883,6 +915,7 @@ impl AgentRuntime {
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
                 .flatten();
             let event = {
+                let capture_enabled = self.authority.as_ref().is_some_and(|authority| authority.executor.has_capture_resources());
                 let consent_completion = async {
                     match self.authority.as_mut() {
                         Some(authority) => authority.manager.next_completion().await,
@@ -909,6 +942,7 @@ impl AgentRuntime {
                     _ = heartbeat.tick() => RegisteredLoopEvent::Heartbeat,
                     inbound_event = inbound.recv() => RegisteredLoopEvent::Inbound(inbound_event),
                     change = desktop_change => RegisteredLoopEvent::DesktopChanged(change),
+                    _ = capture.tick(), if capture_enabled => RegisteredLoopEvent::Capture,
                 }
             };
             let due_sessions = if !matches!(&event, RegisteredLoopEvent::WriterTerminal) {
@@ -922,6 +956,7 @@ impl AgentRuntime {
                     | RegisteredLoopEvent::Heartbeat
                     | RegisteredLoopEvent::Consent(Some(_))
                     | RegisteredLoopEvent::ConsentDeadline
+                    | RegisteredLoopEvent::Capture
             ) {
                 let desktop = self.current_desktop_state()?;
                 self.reconcile_desktop_authority(&outbound, desktop)?;
@@ -1116,6 +1151,9 @@ impl AgentRuntime {
                         outbound.enqueue(AgentToService::RenderBoundaryMetrics(message))?;
                     }
                 }
+                RegisteredLoopEvent::Capture => {
+                    self.pump_capture_access_units(&outbound, &identity)?;
+                }
                 RegisteredLoopEvent::WriterTerminal => {
                     return Err(AgentRuntimeError::OutboundUnavailable);
                 }
@@ -1248,6 +1286,7 @@ impl AgentRuntime {
         let (authorized, start_input_blocked) = if self.authority.is_some() {
             let desktop = self.current_desktop_state()?;
             self.reconcile_desktop_authority(writer, desktop)?;
+            self.prune_cleanup_receipts(Instant::now());
             let authority = self
                 .authority
                 .as_ref()
@@ -1257,27 +1296,56 @@ impl AgentRuntime {
                     &execute.command,
                     mrd_agent_ipc::AgentCommand::StartInput { .. }
                 );
-            let binding = authority
-                .manager
-                .resolve_binding(&execute.grant.claims.session_id, now_ms)
-                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            let (binding, retired) = if execute.command.is_cleanup() {
+                self.cleanup_receipts
+                    .get(execute.command.resource_id())
+                    .filter(|receipt| {
+                        receipt.capability == execute.command.required_capability()
+                            && receipt.grant_window
+                                == (
+                                    execute.grant.claims.issued_at_ms,
+                                    execute.grant.claims.not_before_ms,
+                                    execute.grant.claims.expires_at_ms,
+                                )
+                            && binding_matches_registration(&receipt.binding, identity)
+                            && (receipt.retired
+                                || binding_matches_runtime(&receipt.binding, identity, desktop))
+                    })
+                    .map_or((None, false), |receipt| {
+                        (Some(receipt.binding.clone()), receipt.retired)
+                    })
+            } else {
+                (
+                    authority
+                        .manager
+                        .resolve_binding(&execute.grant.claims.session_id, now_ms)
+                        .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
+                    false,
+                )
+            };
             let authorized = if let Some(binding) = binding {
-                if binding_matches_runtime(&binding, identity, desktop) {
+                if retired || binding_matches_runtime(&binding, identity, desktop) {
                     let context = ExecutionContext {
                         registration_id: binding.registration_id,
                         registration_epoch: binding.registration_epoch,
-                        session_id: binding.session_id,
-                        peer: binding.peer,
+                        session_id: binding.session_id.clone(),
+                        peer: binding.peer.clone(),
                         policy_revision: binding.policy_revision,
                         windows_session_id: binding.windows_session_id,
                         desktop_epoch: binding.desktop_epoch,
                         desktop_kind: binding.desktop_kind,
                         now_ms,
                         expected_issuer_key_id: binding.expected_issuer_key_id,
-                        authorization_scopes: binding.approved_scopes,
+                        authorization_scopes: binding.approved_scopes.clone(),
                         authorization_expires_at_ms: binding.authorization_expires_at_ms,
                     };
-                    validate_execute_command(execute, &context, authority.verifier.as_ref()).ok()
+                    match validate_execute_command(execute, &context, authority.verifier.as_ref()) {
+                        Ok(command) => Some((command, binding, retired)),
+                        Err(reason) => {
+                            tracing::warn!(?reason, "agent rejected execute authorization");
+                            None
+                        }
+                    }
                 } else {
                     None
                 }
@@ -1289,7 +1357,9 @@ impl AgentRuntime {
             (None, false)
         };
         let outcome = match authorized {
-            Some(authorized) => self.execute_once(authorized, start_input_blocked)?,
+            Some((authorized, binding, retired)) => {
+                self.execute_once(authorized, binding, retired, start_input_blocked)?
+            }
             None => CommandOutcome::Rejected,
         };
 
@@ -1333,6 +1403,9 @@ impl AgentRuntime {
                     .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
                 if let Some(binding) = binding {
                     if binding_matches_runtime(&binding, identity, desktop) {
+                        // Resolve trusted binding state before sampling the time
+                        // used at the actual injection boundary.
+                        let now_ms = self.clock.now_ms();
                         let context = ExecutionContext {
                             registration_id: binding.registration_id,
                             registration_epoch: binding.registration_epoch,
@@ -1501,6 +1574,13 @@ impl AgentRuntime {
                     Err(AgentRuntimeError::ConsentStateUnavailable)
                 };
             }
+            for receipt in self.cleanup_receipts.values_mut() {
+                if receipt.capability == mrd_agent_ipc::AgentCapability::Input
+                    && receipt.binding.session_id == change.session_id
+                {
+                    receipt.retired = true;
+                }
+            }
         }
         if completion.fresh_authority_change.is_some() {
             let resume_context = self.trusted_consent_context(identity)?;
@@ -1649,6 +1729,8 @@ impl AgentRuntime {
     fn execute_once(
         &mut self,
         authorized: AuthorizedCommand,
+        mut binding: TrustedSessionBinding,
+        retired: bool,
         start_input_blocked: bool,
     ) -> Result<CommandOutcome, AgentRuntimeError> {
         let grant_id = *authorized.grant_id();
@@ -1656,12 +1738,38 @@ impl AgentRuntime {
         let fingerprint = SemanticFingerprint::from_authorized(&authorized);
         match self.replay.reserve(grant_id, command_id, fingerprint)? {
             ReplayReservation::First => {
-                let capabilities = self.generic_executor_capabilities();
-                let outcome = if start_input_blocked
+                let resource_id = *authorized.command().resource_id();
+                let is_cleanup = authorized.command().is_cleanup();
+                let capability = authorized.command().required_capability();
+                let retained_until = binding.authorization_deadline + CLEANUP_RECEIPT_RETENTION;
+                let grant_window = (
+                    authorized.grant().claims().issued_at_ms,
+                    authorized.grant().claims().not_before_ms,
+                    authorized.grant().claims().expires_at_ms,
+                );
+                // Stop is bounded by the scopes and lifetime of this exact
+                // successful Start, rather than a later consent for the session.
+                binding.approved_scopes = authorized.grant().claims().scopes.clone();
+                binding.authorization_expires_at_ms = authorized.grant().claims().expires_at_ms;
+                let capabilities = if is_cleanup && retired {
+                    AgentCapabilities::empty()
+                } else {
+                    self.generic_executor_capabilities()
+                };
+                let outcome = if is_cleanup && retired {
+                    CommandOutcome::AlreadyStopped
+                } else if !is_cleanup
+                    && (self.cleanup_receipts.len() >= MAX_CLEANUP_RECEIPTS
+                        || self.started_resource_ids.len() >= REPLAY_LEDGER_CAPACITY
+                        || self.started_resource_ids.contains(&resource_id))
+                {
+                    CommandOutcome::Rejected
+                } else if start_input_blocked
                     && matches!(
                         authorized.command(),
                         mrd_agent_ipc::AgentCommand::StartInput { .. }
-                    ) {
+                    )
+                {
                     CommandOutcome::Rejected
                 } else if let Some(input) = &mut self.input {
                     match authorized.command().clone() {
@@ -1695,6 +1803,28 @@ impl AgentRuntime {
                 } else {
                     CommandOutcome::Rejected
                 };
+                if !is_cleanup && outcome == CommandOutcome::Completed {
+                    self.started_resource_ids.insert(resource_id);
+                    self.cleanup_receipts.insert(
+                        resource_id,
+                        CleanupReceipt {
+                            binding,
+                            capability,
+                            grant_window,
+                            retained_until,
+                            retired: false,
+                        },
+                    );
+                } else if is_cleanup
+                    && matches!(
+                        outcome,
+                        CommandOutcome::Completed | CommandOutcome::AlreadyStopped
+                    )
+                {
+                    if let Some(receipt) = self.cleanup_receipts.get_mut(&resource_id) {
+                        receipt.retired = true;
+                    }
+                }
                 self.replay.complete(command_id, outcome);
                 Ok(outcome)
             }
@@ -1702,10 +1832,23 @@ impl AgentRuntime {
         }
     }
 
+    fn prune_cleanup_receipts(&mut self, now: Instant) {
+        // Unconfirmed resources are never evicted to make room for new work.
+        // The registration-lifetime used-id set also survives receipt expiry.
+        self.cleanup_receipts
+            .retain(|_, receipt| !receipt.retired || now < receipt.retained_until);
+    }
+
     fn release_input(&mut self) -> Result<(), mrd_input::InputError> {
         self.input
             .as_mut()
-            .map_or(Ok(()), |input| input.release_all())
+            .map_or(Ok(()), |input| input.release_all())?;
+        for receipt in self.cleanup_receipts.values_mut() {
+            if receipt.capability == mrd_agent_ipc::AgentCapability::Input {
+                receipt.retired = true;
+            }
+        }
+        Ok(())
     }
 
     fn release_authority_invalidations(
@@ -1715,17 +1858,24 @@ impl AgentRuntime {
         let mut input_failed = false;
         let mut media_failed = false;
         for invalidation in invalidations {
-            if self
+            let session_input_failed = self
                 .input
                 .as_mut()
-                .is_some_and(|input| input.release_session(&invalidation.session_id).is_err())
-            {
-                input_failed = true;
-            }
-            if self.authority.as_mut().is_some_and(|authority| {
+                .is_some_and(|input| input.release_session(&invalidation.session_id).is_err());
+            let session_media_failed = self.authority.as_mut().is_some_and(|authority| {
                 !authority.executor.revoke_session(&invalidation.session_id)
-            }) {
-                media_failed = true;
+            });
+            input_failed |= session_input_failed;
+            media_failed |= session_media_failed;
+            if !session_input_failed && !session_media_failed {
+                for receipt in self.cleanup_receipts.values_mut() {
+                    if receipt.binding.session_id == invalidation.session_id
+                        && receipt.binding.authority_generation == invalidation.authority_generation
+                        && receipt.binding.consent_request_id == invalidation.consent_request_id
+                    {
+                        receipt.retired = true;
+                    }
+                }
             }
         }
         if input_failed {
@@ -1830,6 +1980,44 @@ impl AgentRuntime {
             sequence: self.event_sequence,
             observed_at_ms: self.clock.now_ms(),
         })
+    }
+
+    fn pump_capture_access_units(
+        &mut self,
+        writer: &OutboundWriter,
+        identity: &RegisteredAgentIdentity,
+    ) -> Result<(), AgentRuntimeError> {
+        let desktop = self.current_desktop_state()?;
+        let units = match self.authority.as_mut() {
+            Some(authority) => authority
+                .executor
+                .capture_access_units()
+                .map_err(|_| AgentRuntimeError::MediaCaptureFailed)?,
+            None => return Ok(()),
+        };
+        for unit in units {
+            let binding = self
+                .authority
+                .as_ref()
+                .expect("capture authority")
+                .manager
+                .resolve_binding(unit.session_id(), self.clock.now_ms())
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            if !binding.as_ref().is_some_and(|binding| {
+                binding_matches_runtime(binding, identity, desktop)
+                    && binding
+                        .approved_scopes
+                        .contains(&mrd_session::PermissionScope::ScreenView)
+            }) {
+                return Err(AgentRuntimeError::MediaCaptureFailed);
+            }
+            let context = self.next_event_context(identity, desktop)?;
+            let unit = unit
+                .into_ipc(context, mrd_agent_ipc::MediaCodec::H264)
+                .ok_or(AgentRuntimeError::MediaCaptureFailed)?;
+            writer.enqueue(AgentToService::MediaAccessUnit(unit))?;
+        }
+        Ok(())
     }
 
     fn current_desktop_state(&self) -> Result<TrustedDesktopState, AgentRuntimeError> {
@@ -1945,6 +2133,7 @@ enum RegisteredLoopEvent {
     DesktopChanged(Option<Result<(), tokio::sync::watch::error::RecvError>>),
     WriterTerminal,
     Heartbeat,
+    Capture,
 }
 
 async fn read_loop<R>(mut reader: R, sender: mpsc::Sender<InboundEvent>)
@@ -2165,6 +2354,212 @@ mod tests {
     use super::*;
     use mrd_proto::DeviceId;
     use tokio::io::AsyncWriteExt;
+
+    struct UnusedSigner;
+    impl RegistrationSigner for UnusedSigner {
+        fn key_id(&self) -> [u8; 32] {
+            [1; 32]
+        }
+        fn sign(&self, _: &[u8]) -> Result<[u8; 64], RegistrationSigningError> {
+            Err(RegistrationSigningError::Unavailable)
+        }
+    }
+
+    fn cleanup_test_runtime() -> AgentRuntime {
+        AgentRuntime::new(
+            AgentRuntimeConfig {
+                session: SessionDescriptor::new([1; 16], 1, 1, [1; 32], 7, [1; 32], 11).unwrap(),
+                heartbeat_interval: Duration::from_secs(30),
+                handshake_timeout: Duration::from_secs(1),
+            },
+            Arc::new(SystemClock),
+            Arc::new(UnusedSigner),
+        )
+        .unwrap()
+    }
+
+    fn cleanup_test_binding() -> TrustedSessionBinding {
+        TrustedSessionBinding {
+            authority_generation: 1,
+            consent_request_id: [1; 16],
+            registration_id: [1; 16],
+            registration_epoch: 1,
+            session_id: SessionId("cleanup-bound-session".into()),
+            peer: PeerBinding {
+                device_id: DeviceId("cleanup-bound-peer".into()),
+                key_id: [1; 32],
+            },
+            approved_scopes: [mrd_session::PermissionScope::InputKeyboard]
+                .into_iter()
+                .collect(),
+            policy_revision: 1,
+            windows_session_id: 7,
+            desktop_epoch: 11,
+            desktop_kind: DesktopKind::Default,
+            authorization_expires_at_ms: 2_000,
+            authorization_deadline: Instant::now() + Duration::from_secs(1),
+            expected_issuer_key_id: [1; 32],
+        }
+    }
+
+    #[test]
+    fn receipt_expiry_keeps_unconfirmed_resources_and_permanent_resource_id_ownership() {
+        let mut runtime = cleanup_test_runtime();
+        let now = Instant::now();
+        for (id, retired) in [([1; 16], true), ([2; 16], false)] {
+            runtime.started_resource_ids.insert(id);
+            runtime.cleanup_receipts.insert(
+                id,
+                CleanupReceipt {
+                    binding: cleanup_test_binding(),
+                    capability: mrd_agent_ipc::AgentCapability::Input,
+                    grant_window: (1_000, 1_000, 2_000),
+                    retained_until: now,
+                    retired,
+                },
+            );
+        }
+        runtime.prune_cleanup_receipts(now - Duration::from_nanos(1));
+        assert_eq!(runtime.cleanup_receipts.len(), 2);
+        runtime.prune_cleanup_receipts(now);
+        assert!(!runtime.cleanup_receipts.contains_key(&[1; 16]));
+        assert!(runtime.cleanup_receipts.contains_key(&[2; 16]));
+        assert!(runtime.started_resource_ids.contains(&[1; 16]));
+    }
+
+    #[test]
+    fn cleanup_receipt_capacity_and_expired_used_ids_reject_start_before_native_execution() {
+        struct AcceptVerifier;
+        impl ExecuteGrantVerifier for AcceptVerifier {
+            fn verify(&self, _: &[u8; 32], _: &[u8], _: &[u8; 64]) -> bool {
+                true
+            }
+        }
+        struct CountingInput(Arc<std::sync::atomic::AtomicUsize>);
+        impl InputBackend for CountingInput {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn start(&mut self, _: AuthorizedCommand) -> Result<(), mrd_agent_ipc::InputRejection> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn handle(
+                &mut self,
+                _: &mrd_agent_ipc::InputEventEnvelope,
+                _: &ExecutionContext,
+            ) -> InputAckOutcome {
+                panic!("capacity regression must never inject input")
+            }
+            fn stop(&mut self, _: &[u8; 16]) -> InputAckOutcome {
+                panic!("capacity regression must never execute cleanup")
+            }
+            fn release_session(&mut self, _: &SessionId) -> Result<(), mrd_input::InputError> {
+                Ok(())
+            }
+            fn release_all(&mut self) -> Result<(), mrd_input::InputError> {
+                Ok(())
+            }
+        }
+        fn start(
+            binding: &TrustedSessionBinding,
+            seed: u8,
+            resource_id: [u8; 16],
+        ) -> AuthorizedCommand {
+            let command = mrd_agent_ipc::AgentCommand::StartInput {
+                resource_id,
+                input_scopes: binding.approved_scopes.clone(),
+            };
+            let mut execute = mrd_agent_ipc::ExecuteCommand {
+                request_token: 1,
+                command_id: [seed; 16],
+                command,
+                grant: mrd_agent_ipc::ExecuteGrant {
+                    claims: mrd_agent_ipc::ExecuteGrantClaims {
+                        grant_id: [seed; 32],
+                        registration_id: binding.registration_id,
+                        registration_epoch: binding.registration_epoch,
+                        session_id: binding.session_id.clone(),
+                        peer: binding.peer.clone(),
+                        scopes: binding.approved_scopes.clone(),
+                        policy_revision: binding.policy_revision,
+                        windows_session_id: binding.windows_session_id,
+                        desktop_epoch: binding.desktop_epoch,
+                        desktop_kind: binding.desktop_kind,
+                        issued_at_ms: 1_000,
+                        not_before_ms: 1_000,
+                        expires_at_ms: 2_000,
+                        command_digest: [0; 32],
+                        audience: mrd_agent_ipc::GrantAudience::SessionAgent,
+                    },
+                    issuer_key_id: binding.expected_issuer_key_id,
+                    signature: [1; 64],
+                },
+            };
+            execute.grant.claims.command_digest = execute.command_digest();
+            validate_execute_command(
+                &execute,
+                &ExecutionContext {
+                    registration_id: binding.registration_id,
+                    registration_epoch: binding.registration_epoch,
+                    session_id: binding.session_id.clone(),
+                    peer: binding.peer.clone(),
+                    policy_revision: binding.policy_revision,
+                    windows_session_id: binding.windows_session_id,
+                    desktop_epoch: binding.desktop_epoch,
+                    desktop_kind: binding.desktop_kind,
+                    now_ms: 1_500,
+                    expected_issuer_key_id: binding.expected_issuer_key_id,
+                    authorization_scopes: binding.approved_scopes.clone(),
+                    authorization_expires_at_ms: binding.authorization_expires_at_ms,
+                },
+                &AcceptVerifier,
+            )
+            .unwrap()
+        }
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut runtime = cleanup_test_runtime();
+        runtime.input = Some(Box::new(CountingInput(starts.clone())));
+        let binding = cleanup_test_binding();
+        let now = Instant::now();
+        for seed in 0..MAX_CLEANUP_RECEIPTS {
+            runtime.cleanup_receipts.insert(
+                (seed as u128).to_le_bytes(),
+                CleanupReceipt {
+                    binding: binding.clone(),
+                    capability: mrd_agent_ipc::AgentCapability::Input,
+                    grant_window: (1_000, 1_000, 2_000),
+                    retained_until: now,
+                    retired: true,
+                },
+            );
+        }
+        assert_eq!(
+            runtime
+                .execute_once(start(&binding, 1, [255; 16]), binding.clone(), false, false)
+                .unwrap(),
+            CommandOutcome::Rejected
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        runtime.prune_cleanup_receipts(now);
+        assert!(runtime.cleanup_receipts.is_empty());
+        runtime.started_resource_ids.insert([255; 16]);
+        assert_eq!(
+            runtime
+                .execute_once(start(&binding, 2, [255; 16]), binding.clone(), false, false)
+                .unwrap(),
+            CommandOutcome::Rejected
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // New resource ownership is still allowed once retained receipts expire.
+        assert_eq!(
+            runtime
+                .execute_once(start(&binding, 3, [254; 16]), binding, false, false)
+                .unwrap(),
+            CommandOutcome::Completed
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     fn fingerprint(seed: u8) -> SemanticFingerprint {
         SemanticFingerprint {

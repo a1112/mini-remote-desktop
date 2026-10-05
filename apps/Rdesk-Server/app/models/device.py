@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from uuid import uuid4
 
@@ -103,11 +104,18 @@ class Device(Base):
 
 
 def generate_device_id_from_digest(serial_digest: str) -> str:
-    """Derive the stable public numeric ID from the non-reversible HMAC digest."""
+    """Derive the first ten-digit candidate from the non-reversible HMAC digest.
 
-    if len(serial_digest) != 64:
+    Persisted assignments are authoritative: registration resolves collisions
+    against the database and retries always return the stored device ID.
+    """
+
+    if (
+        not isinstance(serial_digest, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", serial_digest, flags=re.ASCII) is None
+    ):
         raise ValueError("device serial digest is invalid")
-    return str(int(serial_digest, 16) % 10**12).zfill(12)
+    return str(int(serial_digest, 16) % 10**10).zfill(10)
 
 
 class DeviceStatus(Base):

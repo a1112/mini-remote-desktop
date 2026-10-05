@@ -197,6 +197,13 @@ async fn run_live_probe(
     offer_connected?;
     answer_connected?;
 
+    let (offer_before, answer_before) = tokio::join!(
+        offerer.probe_traffic_checkpoint(),
+        answerer.probe_traffic_checkpoint(),
+    );
+    let offer_before = offer_before?;
+    let answer_before = answer_before?;
+
     let (offer_send, answer_send) = tokio::join!(
         offerer.send_control(ControlLane::Reliable, PROBE_PAYLOAD),
         answerer.send_control(ControlLane::Reliable, PROBE_PAYLOAD)
@@ -230,13 +237,11 @@ async fn run_live_probe(
         && answer_media.as_ref().map(|unit| &unit.bytes) == Some(&media_probe.bytes);
 
     let selected_pair = offerer
-        .selected_candidate_pair_stats()
-        .await
-        .ok_or_else(|| TransportError::Message("TURN probe selected pair is missing".into()))?;
+        .measured_probe_pair_since(&offer_before, PROBE_PAYLOAD.len())
+        .await?;
     let answer_pair = answerer
-        .selected_candidate_pair_stats()
-        .await
-        .ok_or_else(|| TransportError::Message("TURN probe answer pair is missing".into()))?;
+        .measured_probe_pair_since(&answer_before, PROBE_PAYLOAD.len())
+        .await?;
     TurnRelayProbeEvidence::from_observation(answer_pair, control_round_trip, media_round_trip)?;
     TurnRelayProbeEvidence::from_observation(selected_pair, control_round_trip, media_round_trip)
 }

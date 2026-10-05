@@ -467,8 +467,6 @@ pub(super) async fn process_authenticated_control_input_datagram(
 
     // Keep the authorization gate held through the final injection call. Trust,
     // policy, revocation, and terminal-route transitions use the same gate.
-    let control_input_registry = app_state.control_input();
-    let mut control_input = control_input_registry.lock().await;
     let injection_at_ms = super::now_ms();
     let expired = injection_at_ms > authorization.expires_at_ms
         || injection_at_ms > envelope.payload.expires_at_ms;
@@ -494,14 +492,8 @@ pub(super) async fn process_authenticated_control_input_datagram(
             injection_at_ms,
         )?;
         replay.cache_ack(replay_lane, envelope.payload.sequence, ack.clone());
-        if let Err(error) = control_input.release_session_all(&authorization.session_id) {
-            tracing::warn!(
-                session_id = %authorization.session_id.0,
-                %error,
-                "failed to release session input after control grant expiry"
-            );
-        }
-        drop(control_input);
+        crate::control_input::release_authenticated_input(app_state, &authorization.session_id)
+            .await;
         drop(replay_cache);
         audit_control_input_denial(app_state, &envelope, &failure, addr).await?;
         if expired {
@@ -529,12 +521,17 @@ pub(super) async fn process_authenticated_control_input_datagram(
         socket.send_to(&ack, addr).await?;
         return Ok(());
     }
-    let injection = control_input.handle_authenticated_session_event(
+    let injection = crate::control_input::apply_authenticated_input(
+        app_state,
         &authorization.session_id,
         service_control_scope(envelope.payload.scope),
+        envelope.payload.sequence,
+        authorization
+            .expires_at_ms
+            .min(envelope.payload.expires_at_ms),
         &event,
-    );
-    drop(control_input);
+    )
+    .await;
     let (ack_result, failure) = match injection {
         Ok(result) => (Ok((lane, result.event_count)), None),
         Err(error) => {
@@ -557,17 +554,8 @@ pub(super) async fn process_authenticated_control_input_datagram(
     drop(replay_cache);
 
     if let Some(failure) = failure {
-        if let Err(release_error) = control_input_registry
-            .lock()
-            .await
-            .release_session_all(&authorization.session_id)
-        {
-            tracing::warn!(
-                session_id = %authorization.session_id.0,
-                %release_error,
-                "failed to release session input after injector failure"
-            );
-        }
+        crate::control_input::release_authenticated_input(app_state, &authorization.session_id)
+            .await;
         let _ = app_state
             .session_authorizations
             .record_failure(

@@ -115,7 +115,7 @@ nft_snapshot_valid() {
   local snapshot=$2
   local normalized
   normalized="$(printf '%s\n' "$snapshot" | /usr/bin/sed -E \
-    's/^[[:space:]]+//;s/[[:space:]]+$//;s/[[:space:]]+/ /g')"
+    's/^[[:space:]]+//;s/[[:space:]]+$//;s/[[:space:]]+/ /g;s/^meta l4proto \{ 6, 17 \} /meta l4proto { tcp, udp } /')"
   [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Evc '^$')" == 14 ]] || return 1
   [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Ec '^}$')" == 3 ]] || return 1
   [[ "$(printf '%s\n' "$normalized" | /usr/bin/grep -Fxc 'table inet mrd_relay {')" == 1 ]] || return 1
@@ -223,6 +223,12 @@ if [[ "${1:-}" == --self-test && "$#" -eq 1 ]]; then
   if self_test_parse_config "$malformed"; then fail relay_firewall_self_test_range_accepted; fi
   good_snapshot=$'table inet mrd_relay {\n chain mrd_relay_owner_v1 {\n comment "mrd-relay-owner-v1"\n }\n chain input {\n type filter hook input priority -5; policy accept;\n udp dport 3478 accept\n tcp dport { 3478, 5349 } accept\n meta l4proto { tcp, udp } th dport 49160-49260 accept\n iifname "lo" ip saddr 127.0.0.0/8 tcp dport 9641 accept\n iifname "lo" ip6 saddr ::1 tcp dport 9641 accept\n tcp dport 9641 drop\n }\n}'
   nft_snapshot_valid 5349 "$good_snapshot" || fail relay_firewall_self_test_live_rules_rejected
+  numeric_snapshot="${good_snapshot/\{ tcp, udp \}/\{ 6, 17 \}}"
+  nft_snapshot_valid 5349 "$numeric_snapshot" || fail relay_firewall_self_test_numeric_live_rules_rejected
+  numeric_tampered="${good_snapshot/\{ tcp, udp \}/\{ 6, 58 \}}"
+  if nft_snapshot_valid 5349 "$numeric_tampered"; then
+    fail relay_firewall_self_test_numeric_tampered_rules_accepted
+  fi
   tampered_snapshot="${good_snapshot/udp dport 3478 accept/udp dport 3478 drop}"
   if nft_snapshot_valid 5349 "$tampered_snapshot"; then
     fail relay_firewall_self_test_tampered_live_rules_accepted

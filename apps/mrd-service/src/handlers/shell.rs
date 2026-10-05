@@ -136,7 +136,9 @@ pub async fn set_autostart(
 ) -> IpcResponse {
     tracing::info!("SetAutostart: enabled={}", enabled);
     let result = (|| -> anyhow::Result<Option<bool>> {
-        let autostart = autostart.lock().map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
+        let autostart = autostart
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
         if !autostart.is_supported() {
             return Ok(None);
         }
@@ -152,7 +154,8 @@ pub async fn set_autostart(
             } else {
                 IpcResponse::Error {
                     code: "E500".to_string(),
-                    message: "Autostart configuration does not match the requested state".to_string(),
+                    message: "Autostart configuration does not match the requested state"
+                        .to_string(),
                 }
             }
         }
@@ -160,7 +163,8 @@ pub async fn set_autostart(
             app_state.shell.lock().await.autostart_enabled = None;
             IpcResponse::Error {
                 code: "E501".to_string(),
-                message: "Autostart is not supported; install the background service first".to_string(),
+                message: "Autostart is not supported; install the background service first"
+                    .to_string(),
             }
         }
         Err(error) => {
@@ -177,8 +181,14 @@ pub async fn set_autostart(
 /// Return the current autostart state from the configured platform port.
 pub fn autostart_status(autostart: &AutostartPortRef) -> IpcResponse {
     match read_autostart_state(autostart) {
-        Ok(Some(enabled)) => IpcResponse::AutostartStatus { enabled, supported: true },
-        Ok(None) => IpcResponse::AutostartStatus { enabled: false, supported: false },
+        Ok(Some(enabled)) => IpcResponse::AutostartStatus {
+            enabled,
+            supported: true,
+        },
+        Ok(None) => IpcResponse::AutostartStatus {
+            enabled: false,
+            supported: false,
+        },
         Err(error) => IpcResponse::Error {
             code: "E500".to_string(),
             message: format!("{error:#}"),
@@ -187,7 +197,9 @@ pub fn autostart_status(autostart: &AutostartPortRef) -> IpcResponse {
 }
 
 fn read_autostart_state(autostart: &AutostartPortRef) -> anyhow::Result<Option<bool>> {
-    let autostart = autostart.lock().map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
+    let autostart = autostart
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Autostart configuration lock is unavailable"))?;
     if autostart.is_supported() {
         autostart.is_enabled().map(Some)
     } else {

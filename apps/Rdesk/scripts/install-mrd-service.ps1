@@ -3,6 +3,7 @@ param(
     [string]$SourceDirectory,
     [string]$InstallDirectory,
     [string]$DataDirectory,
+    [switch]$InstallClient,
     [switch]$SkipStart
 )
 
@@ -17,6 +18,14 @@ $serviceExe = Join-Path $InstallDirectory 'mrd-service.exe'
 $agentExe = Join-Path $InstallDirectory 'mrd-session-agent.exe'
 $sourceService = Join-Path $SourceDirectory 'mrd-service.exe'
 $sourceAgent = Join-Path $SourceDirectory 'mrd-session-agent.exe'
+$clientExe = Join-Path $InstallDirectory 'app.exe'
+$sourceClient = Join-Path $SourceDirectory 'app.exe'
+$releaseBinaries = @($sourceService, $sourceAgent)
+$installedBinaries = @($serviceExe, $agentExe)
+if ($InstallClient) {
+    $releaseBinaries += $sourceClient
+    $installedBinaries += $clientExe
+}
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -67,7 +76,7 @@ function Get-ServiceSddl {
 
 if (-not $WhatIfPreference) {
     Assert-Administrator
-    foreach ($source in @($sourceService, $sourceAgent)) {
+    foreach ($source in $releaseBinaries) {
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Required release binary was not found: $source"
         }
@@ -98,7 +107,14 @@ if ($PSCmdlet.ShouldProcess($serviceName, "Install or update background service 
                 Set-Content -LiteralPath (Join-Path $backupDirectory 'service-config.json') -Encoding UTF8
             $upgradeState.OldSddl | Set-Content -LiteralPath (Join-Path $backupDirectory 'service-sddl.txt') -Encoding ASCII
         }
-        foreach ($installedBinary in @($serviceExe, $agentExe)) {
+        if ($InstallClient) {
+            # The service authenticates UI peers by this protected installation path.
+            # Release running UI file handles before replacing its executable.
+            $installedUi = @(Get-CimInstance Win32_Process -Filter "Name='app.exe'" |
+                Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $clientExe, [StringComparison]::OrdinalIgnoreCase) })
+            foreach ($ui in $installedUi) { Stop-Process -Id $ui.ProcessId -Force }
+        }
+        foreach ($installedBinary in $installedBinaries) {
             if (Test-Path -LiteralPath $installedBinary -PathType Leaf) {
                 New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
                 $backupBinary = Join-Path $backupDirectory (Split-Path -Leaf $installedBinary)
@@ -114,6 +130,7 @@ if ($PSCmdlet.ShouldProcess($serviceName, "Install or update background service 
         # Executables are replaced only after the old process releases them.
         Copy-Item -LiteralPath $sourceService -Destination $serviceExe -Force
         Copy-Item -LiteralPath $sourceAgent -Destination $agentExe -Force
+        if ($InstallClient) { Copy-Item -LiteralPath $sourceClient -Destination $clientExe -Force }
         New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
         Set-ProtectedDataAcl -Path $DataDirectory
     } -Configure {

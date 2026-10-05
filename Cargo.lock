@@ -3328,8 +3328,12 @@ name = "mrd-device-registration"
 version = "0.1.0"
 dependencies = [
  "reqwest 0.12.28",
+ "security-framework",
  "serde",
+ "serde_json",
  "tokio",
+ "winreg 0.52.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3445,6 +3449,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3627,6 +3632,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "image",
+ "libc",
  "mrd-agent-ipc",
  "mrd-application",
  "mrd-capture-dxgi",
@@ -3636,6 +3642,7 @@ dependencies = [
  "mrd-codec-videotoolbox",
  "mrd-decode",
  "mrd-decode-nvdec",
+ "mrd-device-registration",
  "mrd-encode-nvenc",
  "mrd-encode-nvenc-av1",
  "mrd-encode-openh264",
@@ -3652,6 +3659,7 @@ dependencies = [
  "mrd-render-d3d11",
  "mrd-render-macos",
  "mrd-session",
+ "mrd-session-agent",
  "mrd-signal-client",
  "mrd-signal-proto",
  "mrd-store-sqlite",
@@ -3663,9 +3671,11 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustls",
+ "security-framework",
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror 1.0.69",
  "time",
  "tokio",
@@ -3710,6 +3720,7 @@ dependencies = [
  "ring",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "windows 0.62.2",
  "zeroize",
 ]
@@ -3718,10 +3729,13 @@ dependencies = [
 name = "mrd-signal-client"
 version = "0.1.0"
 dependencies = [
+ "mrd-identity",
  "mrd-proto",
  "mrd-signal-proto",
+ "ring",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -4996,6 +5010,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures-util",
+ "libc",
  "mrd-identity",
  "mrd-proto",
  "mrd-signal-client",
@@ -5003,8 +5018,10 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber",
  "zeroize",

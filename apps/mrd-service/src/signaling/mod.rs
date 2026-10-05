@@ -1,11 +1,13 @@
 //! Service-owned authenticated realtime signaling runtime.
 
 mod config;
+mod counter;
 mod credentials;
 mod event_mapper;
 mod runtime;
 
 pub use config::{SignalingConfig, SignalingConfigError};
+pub use counter::{PersistentSignalingCounter, SignalingCounterError};
 pub use event_mapper::ServiceSignalingMapper;
 pub use mrd_signal_proto::relay_candidate_fingerprint;
 pub use runtime::{

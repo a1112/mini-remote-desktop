@@ -713,7 +713,7 @@ describe("IncomingSessionConsentHost", () => {
 
     expect(await screen.findByText("This request has expired.")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Allow selected permissions" }),
+      screen.getByRole("button", { name: "在本机确认" }),
     ).toBeDisabled();
   });
 

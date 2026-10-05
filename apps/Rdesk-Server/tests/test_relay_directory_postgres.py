@@ -737,7 +737,7 @@ async def test_access_migration_creates_and_strictly_validates_device_enrollment
                 ).scalars()
             )
         assert "device_enrollments" in tables
-        assert versions == [1, 2, 3, 4, 5, 6]
+        assert versions == [1, 2, 3, 4, 5, 6, 7]
     finally:
         await engine.dispose()
         async with admin_engine.begin() as connection:
@@ -913,7 +913,7 @@ async def test_access_migration_runs_only_the_missing_version_step() -> None:
             await connection.run_sync(Base.metadata.create_all)
             await migrate_relay_access(connection)
             await connection.execute(
-                text("DELETE FROM relay_access_schema_migrations WHERE version = 6")
+                text("DELETE FROM relay_access_schema_migrations WHERE version = 7")
             )
 
         def capture_statement(*args: object) -> None:

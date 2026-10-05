@@ -8,7 +8,9 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
-Type=simple
+# Return from start only after ExecStart has executed the installed agent;
+# the installer immediately verifies MainPID's executable and binary hash.
+Type=exec
 User=mrd-relay
 Group=mrd-relay
 UMask=0077

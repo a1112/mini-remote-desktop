@@ -26,6 +26,15 @@ impl IpcServer {
         &self,
         ready: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        let server = if self.product_only {
+            transport::IpcServer::bind_product_with_endpoint(self.endpoint.clone()).await?
+        } else if self.management_only {
+            transport::IpcServer::bind_management_with_endpoint(self.endpoint.clone()).await?
+        } else {
+            transport::IpcServer::bind_with_endpoint(self.endpoint.clone()).await?
+        };
+        #[cfg(not(windows))]
         let server = if self.management_only {
             transport::IpcServer::bind_management_with_endpoint(self.endpoint.clone()).await?
         } else {

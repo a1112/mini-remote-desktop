@@ -534,6 +534,7 @@ mod tests {
             timestamp_us: 8,
             codec: MediaCodec::H264,
             is_keyframe: true,
+            source_bounds: None,
             payload: vec![1, 2, 3],
         })
         .expect("valid agent unit");
@@ -587,6 +588,7 @@ mod tests {
             timestamp_us: sequence,
             codec: MediaCodec::H264,
             is_keyframe: sequence == 1,
+            source_bounds: None,
             payload: vec![1],
         };
         assert!(ingress.push(make(1)));
@@ -621,6 +623,7 @@ mod tests {
             timestamp_us: sequence,
             codec: MediaCodec::H264,
             is_keyframe: sequence == 1,
+            source_bounds: None,
             payload: vec![1],
         };
         assert!(ingress.push(make("other-session", 1)));
@@ -659,6 +662,7 @@ mod tests {
             timestamp_us: 1,
             codec: MediaCodec::H264,
             is_keyframe: true,
+            source_bounds: None,
             payload: vec![1],
         }));
 
@@ -744,6 +748,7 @@ mod tests {
             timestamp_us: 1,
             codec: MediaCodec::H264,
             is_keyframe: true,
+            source_bounds: None,
             payload: vec![1],
         }));
         let first =

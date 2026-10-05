@@ -371,3 +371,78 @@ async fn controller_rejects_non_granted_codec_without_publishing_streaming() {
     wait_for_active_tasks(&app_state, &session_id, 0).await;
     media.stop_media_for_test(&session_id).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controller_rejects_encoded_dimensions_hidden_by_approved_metadata() {
+    let session_id = SessionId("wan-wrong-size".to_owned());
+    let state = relay_verified_state(session_id.clone(), WanSessionRole::Controller);
+    let coordinator = coordinator_with_state(&state).await;
+    let app_state = Arc::new(AppState::new());
+    let (local_mux, peer_mux) =
+        MemoryTransportMux::pair(session_id.clone(), TransportMuxConfig::test());
+    let media = Arc::new(ServiceWanMediaActivationPort::with_test_mux(
+        &app_state,
+        session_id.clone(),
+        Arc::new(local_mux),
+    ));
+    let activation = {
+        let coordinator = Arc::clone(&coordinator);
+        let media = Arc::clone(&media);
+        let state = state.clone();
+        tokio::spawn(
+            async move { start_verified_media(&coordinator, &state, media.as_ref()).await },
+        )
+    };
+    wait_for_active_tasks(&app_state, &session_id, 1).await;
+
+    // The actual H264 bitstream is 32x32 while its transport claims the approved 64x64.
+    let mut encoder = OpenH264Encoder::new_with_bitrate(32, 32, 10, 1_000_000).unwrap();
+    let frame = CapturedFrame::from_cpu(
+        32,
+        32,
+        FramePixelFormat::Rgb24,
+        123_000,
+        vec![0x70; 32 * 32 * 3],
+    );
+    let unit = encoder.encode(&frame).unwrap().into_iter().next().unwrap();
+    assert_eq!(
+        peer_mux
+            .send(TransportEnvelope {
+                session_id: session_id.clone(),
+                lane: TransportLane::Video,
+                sequence: 1,
+                payload: unit.bytes,
+                video: Some(VideoEnvelopeMetadata {
+                    codec: "h264".to_owned(),
+                    timestamp_us: unit.timestamp_us,
+                    keyframe: unit.is_keyframe,
+                    width: 64,
+                    height: 64,
+                }),
+            })
+            .await
+            .unwrap(),
+        TransportSendOutcome::Enqueued,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), activation)
+        .await
+        .expect("controller rejects the mismatched decoded frame promptly")
+        .expect("activation joins");
+    assert!(
+        result.is_err(),
+        "decoded dimensions must be checked before publishing readiness"
+    );
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Failed,
+    );
+    wait_for_active_tasks(&app_state, &session_id, 0).await;
+    assert!(app_state
+        .media_pipelines
+        .lock()
+        .await
+        .wan_media_runtime(&session_id)
+        .is_none_or(|runtime| !runtime.ready));
+    media.stop_media_for_test(&session_id).await.unwrap();
+}

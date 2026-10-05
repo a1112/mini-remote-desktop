@@ -827,6 +827,9 @@ fn validate_coturn_template_semantics(template: &str) -> Result<(), PlatformErro
     let mut listening_ip = None;
     let mut relay_ip = None;
     let mut external_ip = None;
+    let mut allocation_quota = None;
+    let mut bandwidth_capacity = None;
+    let mut allocation_bandwidth = None;
     for raw_line in template.lines() {
         if raw_line.len() > 4096 {
             return Err(PlatformError::ConfigInvalid);
@@ -877,11 +880,20 @@ fn validate_coturn_template_semantics(template: &str) -> Result<(), PlatformErro
             ("listening-port" | "tls-listening-port" | "min-port" | "max-port", Some(value))
                 if canonical_positive_u64(value).is_some_and(|value| value <= u16::MAX as u64) => {}
             ("total-quota", Some(value))
-                if canonical_positive_u64(value).is_some_and(|value| value <= u32::MAX as u64) => {}
+                if canonical_positive_u64(value).is_some_and(|value| value <= u32::MAX as u64) =>
+            {
+                allocation_quota = canonical_positive_u64(value);
+            }
             ("bps-capacity", Some(value))
                 if canonical_positive_u64(value)
                     .and_then(|value| value.checked_mul(8))
-                    .is_some() => {}
+                    .is_some() =>
+            {
+                bandwidth_capacity = canonical_positive_u64(value);
+            }
+            ("max-bps", Some(value)) if canonical_positive_u64(value).is_some() => {
+                allocation_bandwidth = canonical_positive_u64(value);
+            }
             ("realm" | "server-name", Some(value)) if valid_dns_name(value) => {}
             ("relay-ip", Some(value)) if valid_single_ip(value) => relay_ip = Some(value),
             ("external-ip", Some(value)) if valid_external_ip(value) => {
@@ -894,7 +906,6 @@ fn validate_coturn_template_semantics(template: &str) -> Result<(), PlatformErro
             | ("rest-api-separator", Some(":"))
             | ("unauthorized-ratelimit-rps", Some("10"))
             | ("user-quota", Some("4"))
-            | ("max-bps", Some("25000000"))
             | ("stale-nonce", Some("600"))
             | ("max-allocate-timeout", Some("15"))
             | ("max-allocate-lifetime", Some("900"))
@@ -920,6 +931,11 @@ fn validate_coturn_template_semantics(template: &str) -> Result<(), PlatformErro
             .iter()
             .any(|range| !denied_peer_ranges.contains(range))
         || !valid_external_relay_binding(external_ip, relay_ip, listening_ip)
+        || allocation_quota
+            .zip(bandwidth_capacity)
+            .and_then(|(quota, capacity)| capacity.checked_div(quota))
+            .filter(|value| *value > 0)
+            != allocation_bandwidth
     {
         return Err(PlatformError::ConfigInvalid);
     }

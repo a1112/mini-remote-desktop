@@ -628,6 +628,8 @@ impl super::coordinator::WanSessionCleanup for ServiceWanSessionCleanup {
         let app_state = self.app_state()?;
         super::control_input::clear_wan_control_input(&app_state, session_id).await;
         app_state.media_tasks.lock().await.abort_session(session_id);
+        #[cfg(windows)]
+        app_state.console_capture.stop(&app_state, session_id).await;
         app_state.media_profiles.lock().await.remove(session_id);
         app_state.capture_sources.lock().await.remove(session_id);
         app_state
@@ -1178,12 +1180,17 @@ async fn handle_initial_event(
     local_identity: Arc<mrd_identity::DeviceIdentity>,
     event: VerifiedSignalingEvent,
 ) {
-    let _admission = if matches!(&event.signal, AuthenticatedSessionSignal::SessionIntentV3 { .. }) {
+    let _admission = if matches!(
+        &event.signal,
+        AuthenticatedSessionSignal::SessionIntentV3 { .. }
+    ) {
         match app_state.shutdown.admit() {
             Ok(permit) => Some(permit),
             Err(_) => return,
         }
-    } else { None };
+    } else {
+        None
+    };
     let session_id = event.signal.session_id().clone();
     let result = if matches!(
         &event.signal,

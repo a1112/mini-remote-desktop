@@ -143,7 +143,7 @@ export function IncomingSessionDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Incoming remote session</AlertDialogTitle>
           <AlertDialogDescription>
-            Review the requesting device and choose the permissions to allow.
+            选择允许的权限后，在本机系统窗口中确认请求。
           </AlertDialogDescription>
         </AlertDialogHeader>
 
@@ -199,7 +199,7 @@ export function IncomingSessionDialog({
             onClick={approve}
             type="button"
           >
-            Allow selected permissions
+            在本机确认
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>

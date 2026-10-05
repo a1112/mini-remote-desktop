@@ -1105,7 +1105,7 @@ impl SignalingRuntimeCore {
         challenge: ServerChallenge,
         now_ms: u64,
     ) -> Result<SignalEnvelope, SignalingRuntimeError> {
-        let token = zeroize::Zeroizing::new(self.config.backend_device_token().to_owned());
+        let token = self.config.backend_device_token();
         self.build_registration_with_token(challenge, now_ms, &token)
     }
 
@@ -1729,11 +1729,21 @@ impl SignalingRuntimeCore {
         intended_peer_device_id: mrd_proto::DeviceId,
         now_ms: u64,
     ) -> Result<AuthClaims, SignalingRuntimeError> {
-        let counter = self.outbound_counter;
-        self.outbound_counter = self
-            .outbound_counter
-            .checked_add(1)
-            .ok_or(SignalingRuntimeError::CounterExhausted)?;
+        let counter = if let Some(allocator) = self.config.counter_allocator() {
+            if allocator.key_id() != self.identity.key_id() {
+                return Err(SignalingRuntimeError::CounterPersistence);
+            }
+            allocator.next().map_err(|error| match error {
+                super::SignalingCounterError::Exhausted => SignalingRuntimeError::CounterExhausted,
+                _ => SignalingRuntimeError::CounterPersistence,
+            })?
+        } else {
+            let counter = self.outbound_counter;
+            self.outbound_counter = counter
+                .checked_add(1)
+                .ok_or(SignalingRuntimeError::CounterExhausted)?;
+            counter
+        };
         let mut nonce = [0_u8; 16];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -1750,7 +1760,7 @@ impl SignalingRuntimeCore {
     }
 
     fn require_role(&self, required: BackendRole) -> Result<(), SignalingRuntimeError> {
-        if self.config.role() != required {
+        if !self.config.role().has_capability(required) {
             return Err(SignalingRuntimeError::RoleMismatch);
         }
         Ok(())
@@ -1807,6 +1817,92 @@ fn exponential_delay(initial: Duration, maximum: Duration, attempt: u32) -> Dura
     initial.saturating_mul(factor).min(maximum)
 }
 
+#[cfg(test)]
+mod tls_live_tests {
+    #[tokio::test]
+    async fn unexpected_signaling_task_exit_is_visible_to_its_resident_owner() {
+        let (shutdown, _receiver) = tokio::sync::oneshot::channel();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let task = super::SignalingTask {
+            shutdown: Some(shutdown),
+            join: tokio::spawn(async move {
+                let _ = entered.send(());
+                panic!("test-only unexpected signaling task exit");
+            }),
+        };
+        observed.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MRD_TEST_SIGNAL_WSS_URL and a trusted public signaling server"]
+    async fn public_wss_receives_challenge_without_prior_transport_initialization() {
+        use futures_util::{SinkExt, StreamExt};
+        let endpoint = std::env::var("MRD_TEST_SIGNAL_WSS_URL").expect("public WSS endpoint");
+        assert!(endpoint.starts_with("wss://"));
+        let (mut socket, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::connect_signal_socket(endpoint.clone()),
+        )
+        .await
+        .expect("bounded TLS handshake")
+        .expect("trusted public WSS handshake");
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("bounded server challenge");
+        let Some(mrd_signal_proto::SignalEnvelope {
+            message: mrd_signal_proto::AuthenticatedSignalMessage::ServerChallenge(challenge),
+            ..
+        }) = super::decode_socket_message(frame).unwrap()
+        else {
+            panic!("expected public server challenge")
+        };
+        mrd_signal_client::wait_until_message_issued(&mrd_signal_proto::SignalEnvelope::new(
+            mrd_signal_proto::AuthenticatedSignalMessage::ServerChallenge(challenge.clone()),
+        ))
+        .await;
+        let now = super::unix_time_ms();
+        let config = super::SignalingConfig::new(
+            &endpoint,
+            mrd_proto::DeviceId("tls-probe".into()),
+            "TLS probe",
+            mrd_proto::BackendRole::Peer,
+            "test-only-credential-never-sent",
+            mrd_proto::DeviceId("signal-server".into()),
+            None,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        let identity = std::sync::Arc::new(
+            mrd_identity::DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap(),
+        );
+        let mut core = super::SignalingRuntimeCore::new(config, identity);
+        let observations = (
+            now as i128 - challenge.issued_at_ms as i128,
+            challenge
+                .expires_at_ms
+                .saturating_sub(challenge.issued_at_ms),
+            challenge.challenge_id == [0; 16],
+            challenge.challenge_nonce == [0; 32],
+        );
+        assert!(core.build_registration(challenge, now).is_ok(),
+            "challenge validation: observed-minus-issued/lifetime/empty-id/empty-nonce={observations:?}");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+    }
+}
+
 #[derive(Default)]
 struct SignalingInbox(Mutex<Vec<VerifiedSignalingEvent>>);
 
@@ -1837,6 +1933,10 @@ pub struct SignalingTask {
 }
 
 impl SignalingTask {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
     /// Stop the reconnect loop and wait for its connection to close.
     pub async fn shutdown(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
@@ -1865,10 +1965,25 @@ pub async fn spawn_from_env(
 
 /// Spawn one explicitly configured service-owned signaling connection.
 pub fn spawn(
-    config: SignalingConfig,
+    mut config: SignalingConfig,
     app_state: Arc<AppState>,
 ) -> Result<SignalingTask, SignalingRuntimeError> {
     let identity = app_state.device_identities.machine_identity();
+    if config.counter_allocator().is_none() {
+        if let Some(allocator) = app_state
+            .public_connection
+            .signaling_counter()
+            .map_err(|_| SignalingRuntimeError::CounterPersistence)?
+        {
+            config = config.with_counter_allocator(allocator);
+        }
+    }
+    if config
+        .counter_allocator()
+        .is_some_and(|allocator| allocator.key_id() != identity.key_id())
+    {
+        return Err(SignalingRuntimeError::CounterPersistence);
+    }
     let status = Arc::clone(&app_state.signaling_status);
     let relay_signaling = Arc::clone(&app_state.relay_signaling);
     let outbound = relay_signaling.take_receiver()?;
@@ -1964,7 +2079,7 @@ async fn run_connection(
     let endpoint = core.config().endpoint().as_str().to_owned();
     let connected = tokio::select! {
         _ = &mut *shutdown => return ConnectionExit::Shutdown,
-        result = tokio::time::timeout(core.config().connect_timeout(), tokio_tungstenite::connect_async(endpoint)) => result,
+        result = tokio::time::timeout(core.config().connect_timeout(), connect_signal_socket(endpoint)) => result,
     };
     let (socket, _) = match connected {
         Ok(Ok(value)) => value,
@@ -2100,6 +2215,10 @@ async fn run_connection(
                     Ok(None) => continue,
                     Err(error) => return ConnectionExit::Failed(error),
                 };
+                tokio::select! {
+                    _ = &mut *shutdown => return ConnectionExit::Shutdown,
+                    _ = mrd_signal_client::wait_until_message_issued(&envelope) => {},
+                }
                 match core.handle_inbound(envelope, unix_time_ms()) {
                     Ok(InboundDisposition::Applied(event)) => {
                         inbox.push(*event);
@@ -2114,6 +2233,23 @@ async fn run_connection(
             }
         }
     }
+}
+
+async fn connect_signal_socket(
+    endpoint: String,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    // Other workspace packages can enable both Rustls providers. WSS must
+    // select our configured provider even before any QUIC/WebRTC connection.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    tokio_tungstenite::connect_async(endpoint).await
 }
 
 async fn read_envelope<S>(
@@ -2136,7 +2272,13 @@ where
         };
         let message = message.map_err(|_| SignalingRuntimeError::HandshakeTimeout)?;
         match decode_socket_message(message)? {
-            Some(envelope) => return Ok(Some(envelope)),
+            Some(envelope) => {
+                tokio::select! {
+                    _ = &mut *shutdown => return Ok(None),
+                    _ = mrd_signal_client::wait_until_message_issued(&envelope) => {},
+                }
+                return Ok(Some(envelope));
+            }
             None => continue,
         }
     }
@@ -2230,6 +2372,8 @@ pub enum SignalingRuntimeError {
     InvalidHeartbeatInterval,
     #[error("signaling counter is exhausted")]
     CounterExhausted,
+    #[error("protected signaling counter is unavailable or invalid")]
+    CounterPersistence,
     #[error("signaling entropy is unavailable")]
     EntropyUnavailable,
     #[error("signaling server rejected the protocol message")]
@@ -2297,6 +2441,7 @@ impl SignalingRuntimeError {
             Self::NotAuthenticated => "signaling_not_authenticated",
             Self::InvalidHeartbeatInterval => "signaling_invalid_heartbeat_interval",
             Self::CounterExhausted => "signaling_counter_exhausted",
+            Self::CounterPersistence => "signaling_counter_storage",
             Self::EntropyUnavailable => "signaling_entropy_unavailable",
             Self::ServerProtocol => "signaling_server_protocol",
             Self::ConnectTimeout => "signaling_connect_timeout",

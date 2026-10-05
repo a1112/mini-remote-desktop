@@ -37,6 +37,41 @@ impl SignalEnvelope {
         Ok(())
     }
 
+    /// Scheduling metadata only: this does not verify a signature, identity,
+    /// validity interval or replay state. Authentication must still follow.
+    pub fn unverified_claims(&self) -> Option<&AuthClaims> {
+        match &self.message {
+            AuthenticatedSignalMessage::Register(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::Registered(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::PresenceHeartbeat(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionIntent(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionGrant(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionDeny(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcOffer(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcAnswer(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcCandidate(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionIntentV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionGrantV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcOfferV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcAnswerV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcCandidateV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::RelayMigrationOffer(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::RelayMigrationAnswer(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::RelayMigrationCandidate(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::SessionClose(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ReconnectRequest(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ReconnectGrant(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ServerChallenge(_)
+            | AuthenticatedSignalMessage::ProtocolError(_) => None,
+        }
+    }
+
     /// Validate the mandatory envelope/message pairing before decoding a
     /// potentially sensitive authenticated payload.
     pub fn validate_wire_version(

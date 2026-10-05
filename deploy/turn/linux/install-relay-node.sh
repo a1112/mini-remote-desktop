@@ -433,7 +433,7 @@ PY
 max_allocations=${capacity_values[0]}
 max_egress_bps=${capacity_values[1]}
 coturn_capacity_bps=$((max_egress_bps / 8))
-coturn_per_allocation_bps=${capacity_values[2]}
+coturn_per_allocation_bps=$((coturn_capacity_bps / max_allocations))
 (( coturn_per_allocation_bps > 0 && coturn_per_allocation_bps <= coturn_capacity_bps )) \
   || fail relay_install_per_allocation_bandwidth_invalid
 
@@ -941,6 +941,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
       ;;
     total-quota=*) printf 'total-quota=%s\n' "$max_allocations" >> "$base_temporary" ;;
     bps-capacity=*) printf 'bps-capacity=%s\n' "$coturn_capacity_bps" >> "$base_temporary" ;;
+    max-bps=*) printf 'max-bps=%s\n' "$coturn_per_allocation_bps" >> "$base_temporary" ;;
     *) printf '%s\n' "$line" >> "$base_temporary" ;;
   esac
 done < "$turn_config"

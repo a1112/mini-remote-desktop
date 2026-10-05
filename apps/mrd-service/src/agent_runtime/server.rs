@@ -12,7 +12,7 @@ use mrd_agent_ipc::{
     RegisteredAgentIdentity, RenderAccessUnit, RenderBoundaryMetrics, ServiceToAgent, StopAgent,
     StopReason, ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
     AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
+    AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
     AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR,
     AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
 };
@@ -843,7 +843,7 @@ impl AgentServer {
         let route = self.registry.resolve_exact_with_minimum_minor(
             binding,
             AgentCapability::Input,
-            AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+            AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR,
             self.clock.now_ms(),
         )?;
         let control = self
@@ -888,7 +888,7 @@ impl AgentServer {
                 key,
                 binding: binding.clone(),
                 required_capability: AgentCapability::Input,
-                minimum_protocol_minor: AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+                minimum_protocol_minor: AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR,
                 cancellation: cancelled,
             })
             .is_err()
@@ -930,12 +930,21 @@ impl AgentServer {
         } else {
             AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR
         };
-        let route = self.registry.resolve_exact_with_minimum_minor(
-            binding,
-            required_capability,
-            minimum_protocol_minor,
-            self.clock.now_ms(),
-        )?;
+        let route = if execute.command.is_cleanup() {
+            self.registry.resolve_cleanup_with_minimum_minor(
+                binding,
+                required_capability,
+                minimum_protocol_minor,
+                self.clock.now_ms(),
+            )
+        } else {
+            self.registry.resolve_exact_with_minimum_minor(
+                binding,
+                required_capability,
+                minimum_protocol_minor,
+                self.clock.now_ms(),
+            )
+        }?;
         let control = self
             .controls
             .lock()
@@ -1134,6 +1143,11 @@ impl AgentServer {
                             if crate::lan_discovery::media_sender::validate_agent_access_unit(unit.clone()).is_none() {
                                 return Err(AgentServerError::UnsupportedRegisteredMessage);
                             }
+                            self.registry.record_heartbeat(
+                                connection_id,
+                                AgentHeartbeat { context: unit.context.clone() },
+                                self.clock.now_ms(),
+                            )?;
                             if let Ok(slot) = self.media_sink.lock() {
                                 if let Some(sink) = slot.as_ref() {
                                     sink(unit);
@@ -1246,12 +1260,13 @@ impl AgentServer {
                             {
                                 continue;
                             }
-                            let exact_route = match self.registry.resolve_exact_with_minimum_minor(
-                                &binding,
-                                required_capability,
-                                minimum_protocol_minor,
-                                self.clock.now_ms(),
-                            ) {
+                            let cleanup = matches!(&message, ServiceToAgent::Execute(execute) if execute.command.is_cleanup());
+                            let revalidated_route = if cleanup {
+                                self.registry.resolve_cleanup_with_minimum_minor(&binding, required_capability, minimum_protocol_minor, self.clock.now_ms())
+                            } else {
+                                self.registry.resolve_exact_with_minimum_minor(&binding, required_capability, minimum_protocol_minor, self.clock.now_ms())
+                            };
+                            let exact_route = match revalidated_route {
                                 Ok(route) => route,
                                 Err(error) => {
                                     control.fail_request(&key, AgentRequestError::Route(error));

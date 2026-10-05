@@ -34,6 +34,7 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  PublicServerStatus,
   AuditEvent,
   AuditLogQuery,
   AuditEventPageV2,
@@ -566,6 +567,16 @@ export async function shellGetStatus(): Promise<AdapterResult<ShellStatusSnapsho
     undefined,
     { type: 'GetShellStatus' },
     responseField<ShellStatusSnapshot>('status')
+  );
+}
+
+/** Read public connectivity through the restricted management IPC endpoint. */
+export async function ipcPublicServerStatus(): Promise<AdapterResult<PublicServerStatus>> {
+  return invokeBridgeOrTauri<PublicServerStatus>(
+    'ipc_public_server_status',
+    undefined,
+    { type: 'GetPublicServerStatus' },
+    responseField<PublicServerStatus>('status')
   );
 }
 

@@ -1,6 +1,9 @@
 use mrd_signal_proto::{SignalEnvelope, SignalMessage, SignalProtocolError};
 use thiserror::Error;
 
+mod issued_time;
+pub use issued_time::{wait_until_message_issued, MAX_FUTURE_MESSAGE_WAIT_MS};
+
 #[derive(Debug, Error)]
 pub enum SignalClientError {
     #[error("serialize signal message failed: {0}")]

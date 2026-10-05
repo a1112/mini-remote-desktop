@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     JSON,
     String,
     text,
@@ -56,7 +57,7 @@ class SessionRequest(Base):
         CheckConstraint(
             "requester_device_id IS NULL OR "
             "(requester_device_id <> target_device_id AND "
-            "access_mode = 'attended' AND route_policy = 'relay_only')",
+            "access_mode = 'attended' AND route_policy IN ('relay_only', 'direct_first'))",
             name="ck_session_requests_wan_values",
         ),
         CheckConstraint(
@@ -116,6 +117,9 @@ class SessionRequest(Base):
     )
     relay_accepted_transports: Mapped[list[str] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=True
+    )
+    relay_max_backups: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
     )
     request_payload: Mapped[dict[str, object] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=True

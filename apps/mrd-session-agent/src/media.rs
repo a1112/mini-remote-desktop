@@ -10,8 +10,8 @@ use crate::capabilities::AgentCapabilities;
 use crate::runtime::AuthorizedCommandExecutor;
 use crate::{capture::CaptureAdapter, render::RenderAdapter};
 use mrd_agent_ipc::{
-    AgentCapability, AgentCommand, AgentEventContext, AuthorizedCommand, CommandOutcome,
-    MediaAccessUnit, MediaCodec, RenderAccessUnit,
+    AgentCapability, AgentCommand, AgentEventContext, AuthorizedCommand, CaptureSourceBounds,
+    CommandOutcome, MediaAccessUnit, MediaCodec, RenderAccessUnit,
 };
 use mrd_proto::SessionId;
 use std::collections::{HashMap, VecDeque};
@@ -87,6 +87,7 @@ pub struct EncodedMediaAccessUnit {
     sequence: u64,
     timestamp_us: u64,
     keyframe: bool,
+    source_bounds: Option<CaptureSourceBounds>,
     payload: Vec<u8>,
 }
 
@@ -106,6 +107,7 @@ impl EncodedMediaAccessUnit {
             sequence,
             timestamp_us,
             keyframe,
+            source_bounds: None,
             payload,
         })
     }
@@ -135,6 +137,20 @@ impl EncodedMediaAccessUnit {
         self.keyframe
     }
 
+    /// Attach validated geometry from the exact physical capture worker.
+    pub fn with_source_bounds(mut self, bounds: CaptureSourceBounds) -> Option<Self> {
+        if !bounds.is_valid() {
+            return None;
+        }
+        self.source_bounds = Some(bounds);
+        Some(self)
+    }
+
+    /// Original physical desktop rectangle, before encoder-profile scaling.
+    pub fn source_bounds(&self) -> Option<CaptureSourceBounds> {
+        self.source_bounds
+    }
+
     /// Encoded payload, never raw desktop pixels.
     pub fn payload(&self) -> &[u8] {
         &self.payload
@@ -154,6 +170,7 @@ impl EncodedMediaAccessUnit {
             timestamp_us: self.timestamp_us,
             codec,
             is_keyframe: self.keyframe,
+            source_bounds: self.source_bounds,
             payload: self.payload,
         };
         unit.is_valid().then_some(unit)
@@ -316,6 +333,7 @@ where
             AgentCommand::StartCapture {
                 resource_id,
                 display_id,
+                profile,
             } => {
                 let result = self.registry.start(
                     *resource_id,
@@ -328,7 +346,10 @@ where
                     return CommandOutcome::Rejected;
                 }
                 let resource = self.registry.get(resource_id).expect("started resource");
-                if self.capture.start(resource, session_id) {
+                if self
+                    .capture
+                    .start_with_profile(resource, session_id, *profile)
+                {
                     CommandOutcome::Completed
                 } else {
                     let _ = self
@@ -426,6 +447,36 @@ where
         self.render_sequences
             .insert(unit.resource_id, unit.sequence);
         true
+    }
+
+    fn capture_access_units(&mut self) -> Result<Vec<EncodedMediaAccessUnit>, ()> {
+        let mut units = Vec::new();
+        for resource in self
+            .registry
+            .resources
+            .values()
+            .filter(|resource| resource.kind == MediaResourceKind::Capture)
+        {
+            if !self.capture.is_resource_running(&resource.resource_id) {
+                return Err(());
+            }
+            if let Some(unit) = self.capture.poll_encoded(&resource.resource_id) {
+                if unit.resource_id != resource.resource_id
+                    || unit.session_id != resource.session_id
+                {
+                    return Err(());
+                }
+                units.push(unit);
+            }
+        }
+        Ok(units)
+    }
+
+    fn has_capture_resources(&self) -> bool {
+        self.registry
+            .resources
+            .values()
+            .any(|resource| resource.kind == MediaResourceKind::Capture)
     }
 
     fn render_metrics(&self) -> Vec<crate::render::RenderAdapterMetrics> {
@@ -533,6 +584,56 @@ impl MediaResourceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct QueuedCapture(Option<EncodedMediaAccessUnit>);
+    impl CaptureAdapter for QueuedCapture {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn start(&mut self, _resource: &MediaResource, _session: &SessionId) -> bool {
+            true
+        }
+        fn stop(&mut self, _resource: &[u8; 16], _session: &SessionId) -> bool {
+            true
+        }
+        fn poll_encoded(&mut self, _resource: &[u8; 16]) -> Option<EncodedMediaAccessUnit> {
+            self.0.take()
+        }
+    }
+
+    #[test]
+    fn capture_pump_drains_only_exact_live_resource_ownership() {
+        let owner = SessionId("authorized-capture-owner".into());
+        let unit = EncodedMediaAccessUnit::new(
+            [67; 16],
+            owner.clone(),
+            1,
+            33_333,
+            true,
+            vec![0, 0, 0, 1, 0x65],
+        )
+        .unwrap();
+        let mut executor = MediaExecutor::new(QueuedCapture(Some(unit)), FakeRender::default());
+        executor
+            .registry
+            .start([67; 16], owner.clone(), 0, MediaResourceKind::Capture, None);
+        let units = executor.capture_access_units().unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].session_id(), &owner);
+        assert!(executor.capture_access_units().unwrap().is_empty());
+
+        let wrong = EncodedMediaAccessUnit::new(
+            [67; 16],
+            SessionId("other-session".into()),
+            1,
+            33_333,
+            true,
+            vec![0, 0, 0, 1, 0x65],
+        )
+        .unwrap();
+        executor.capture = QueuedCapture(Some(wrong));
+        assert!(executor.capture_access_units().is_err());
+    }
 
     #[derive(Default)]
     struct FakeCapture {
@@ -745,9 +846,18 @@ mod tests {
 
     #[test]
     fn encoded_unit_maps_to_authenticated_ipc_without_raw_frame_copy() {
+        let bounds = CaptureSourceBounds {
+            left: -2560,
+            top: 120,
+            width: 2560,
+            height: 1440,
+        };
         let unit =
             EncodedMediaAccessUnit::new([3; 16], session("owner"), 1, 42, true, vec![0x01, 0x02])
+                .unwrap()
+                .with_source_bounds(bounds)
                 .unwrap();
+        assert_eq!(unit.source_bounds(), Some(bounds));
         let ipc = unit
             .into_ipc(
                 AgentEventContext {
@@ -764,6 +874,7 @@ mod tests {
         assert!(ipc.is_valid());
         assert_eq!(ipc.payload, vec![0x01, 0x02]);
         assert_eq!(ipc.resource_id, [3; 16]);
+        assert_eq!(ipc.source_bounds, Some(bounds));
     }
 
     #[test]

@@ -127,7 +127,7 @@ def test_wan_session_models_create_with_the_local_sqlite_test_dialect() -> None:
 
 def test_relay_access_migration_has_an_additive_v6_step() -> None:
     source = Path(relay_access_migration.__file__).read_text(encoding="utf-8")
-    assert "_VERSIONS = (1, 2, 3, 4, 5, 6)" in source
+    assert "_VERSIONS = (1, 2, 3, 4, 5, 6, 7)" in source
     assert "CREATE TABLE IF NOT EXISTS {generations}" in source
     assert "ADD COLUMN IF NOT EXISTS requester_device_id" in source
     assert "ADD COLUMN IF NOT EXISTS active_relay_generation" in source
@@ -141,6 +141,54 @@ def _generation_table_sql(source: str) -> str:
     start = source.index("CREATE TABLE IF NOT EXISTS {generations}")
     end = source.index('"""', start)
     return source[start:end]
+
+
+@pytest.mark.skipif(not DATABASE_URL, reason="PostgreSQL migration verification required")
+@pytest.mark.anyio
+@pytest.mark.parametrize("drifted", [False, True])
+async def test_v7_upgrades_only_the_exact_v6_route_constraint(drifted: bool) -> None:
+    assert DATABASE_URL is not None
+    schema = "wan_route_v7_" + uuid4().hex
+    admin = create_async_engine(_asyncpg_url(DATABASE_URL))
+    async with admin.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(_asyncpg_url(DATABASE_URL),
+                                connect_args={"server_settings": {"search_path": schema}})
+    try:
+        async with engine.begin() as connection:
+            await migrate_relay_control(connection)
+            await connection.run_sync(Base.metadata.create_all)
+        await migrate_relay_access(engine)
+        route = "route_policy = 'relay_only'" if not drifted else "route_policy <> 'forbidden'"
+        async with engine.begin() as connection:
+            await connection.execute(text("DELETE FROM relay_access_schema_migrations WHERE version = 7"))
+            await connection.execute(text("ALTER TABLE session_requests DROP CONSTRAINT ck_session_requests_wan_values"))
+            await connection.execute(text(
+                "ALTER TABLE session_requests ADD CONSTRAINT ck_session_requests_wan_values CHECK ("
+                "requester_device_id IS NULL OR (requester_device_id <> target_device_id "
+                f"AND access_mode = 'attended' AND {route}))"
+            ))
+        if drifted:
+            with pytest.raises(relay_access_migration.RelayAccessMigrationError,
+                               match="WAN route policy constraint differs"):
+                await migrate_relay_access(engine)
+        else:
+            await migrate_relay_access(engine)
+            await migrate_relay_access(engine)
+        async with engine.connect() as connection:
+            versions = list((await connection.execute(text(
+                "SELECT version FROM relay_access_schema_migrations ORDER BY version"
+            ))).scalars())
+            checks = await connection.run_sync(lambda sync: {
+                c["name"]: c["sqltext"] for c in inspect(sync).get_check_constraints("session_requests")
+            })
+        assert versions == list(range(1, 7 if drifted else 8))
+        assert ("direct_first" in checks["ck_session_requests_wan_values"]) is not drifted
+    finally:
+        await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        await admin.dispose()
 
 
 @pytest.mark.skipif(

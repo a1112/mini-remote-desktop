@@ -927,7 +927,7 @@ async fn apply_secret_transaction(request: &BrokerRequest) -> Result<(), BrokerR
         let previous_invocation = previous_state
             .as_ref()
             .map(|state| state.invocation_id.as_str());
-        systemctl(&["restart", COTURN_UNIT]).await?;
+        queue_coturn_restart().await?;
         let systemd = wait_for_new_active_invocation(previous_invocation).await?;
         let material = load_verified_material()?;
         if material.secret_sha256 != journal.desired_secret_sha256
@@ -1032,7 +1032,7 @@ async fn reconcile_secret_pending(journal: &PendingJournal) -> Result<(), Broker
                 .previous_state
                 .as_ref()
                 .map(|state| state.invocation_id.as_str());
-            systemctl(&["restart", COTURN_UNIT]).await?;
+            queue_coturn_restart().await?;
             let systemd = wait_for_new_active_invocation(previous).await?;
             commit_recovered(journal, systemd)?;
             remove_transaction_artifacts()
@@ -1111,7 +1111,7 @@ async fn reconcile_drain_pending(
             clear_drain_journal()
         }
         LinuxDrainRecoveryAction::RestartUndrained => {
-            systemctl(&["restart", COTURN_UNIT]).await?;
+            queue_coturn_restart().await?;
             journal.phase = LinuxDrainJournalPhase::TargetMutationIssued;
             store_drain_journal(&journal)?;
             let systemd =
@@ -1240,7 +1240,7 @@ async fn rollback_pending(journal: &PendingJournal) -> Result<(), BrokerRuntimeE
     )?;
     match journal.previous_state.as_ref() {
         Some(previous) => {
-            systemctl(&["restart", COTURN_UNIT]).await?;
+            queue_coturn_restart().await?;
             let systemd = wait_for_new_active_invocation(Some(&previous.invocation_id)).await?;
             let material = load_verified_material()?;
             if material.secret_sha256 != previous.secret_sha256
@@ -1274,7 +1274,7 @@ async fn restart_committed() -> Result<(), BrokerRuntimeError> {
     if state.draining {
         return set_draining(false).await;
     }
-    systemctl(&["restart", COTURN_UNIT]).await?;
+    queue_coturn_restart().await?;
     let systemd = wait_for_new_active_invocation(Some(&state.invocation_id)).await?;
     let mut next = state;
     next.generation = next
@@ -1380,6 +1380,7 @@ async fn probe_payload(request: &BrokerRequest) -> Result<Vec<u8>, BrokerRuntime
         || before.applied_secret_version != expected_version
         || validate_probe_stability(&before, &before).is_err()
     {
+        eprintln!("relay_local_probe_before_fence_rejected");
         return Err(BrokerRuntimeError::ProbeFailed);
     }
     let listening_port = material
@@ -1387,20 +1388,32 @@ async fn probe_payload(request: &BrokerRequest) -> Result<Vec<u8>, BrokerRuntime
         .configured_endpoints()
         .first()
         .and_then(|endpoint| strict_turn_endpoint_port(endpoint))
-        .ok_or(BrokerRuntimeError::ProbeFailed)?;
-    let loopback_host = linux_probe_loopback_host(material.rendered.bytes())
-        .map_err(|_| BrokerRuntimeError::ProbeFailed)?;
+        .ok_or_else(|| {
+            eprintln!("relay_local_probe_endpoint_rejected");
+            BrokerRuntimeError::ProbeFailed
+        })?;
+    let loopback_host = linux_probe_loopback_host(material.rendered.bytes()).map_err(|_| {
+        eprintln!("relay_local_probe_listener_rejected");
+        BrokerRuntimeError::ProbeFailed
+    })?;
     let expires = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| BrokerRuntimeError::ProbeFailed)?
         .as_secs()
         .checked_add(300)
         .ok_or(BrokerRuntimeError::ProbeFailed)?;
-    let credentials = linux_probe_credentials(expires, challenge, &material.raw_secret)?;
-    let urls = vec![
-        format!("turn:{loopback_host}:{listening_port}?transport=udp"),
-        format!("turn:{loopback_host}:{listening_port}?transport=tcp"),
-    ];
+    let credentials =
+        linux_probe_credentials(expires, challenge, &material.raw_secret).map_err(|_| {
+            eprintln!("relay_local_probe_credentials_rejected");
+            BrokerRuntimeError::ProbeFailed
+        })?;
+    // A local health probe needs one real relay path. Mixing UDP and TCP
+    // creates competing allocations and leaves unused TCP allocations alive
+    // after cancellation; repeated probes can exhaust the declared quota.
+    // Public transport reachability is verified separately from this proof.
+    let urls = vec![format!(
+        "turn:{loopback_host}:{listening_port}?transport=udp"
+    )];
     let evidence = probe_turn_relay(TurnRelayProbeConfig {
         ice_servers: vec![IceServerConfig::new(
             urls,
@@ -1410,9 +1423,13 @@ async fn probe_payload(request: &BrokerRequest) -> Result<Vec<u8>, BrokerRuntime
         timeout: PROBE_TIMEOUT,
     })
     .await
-    .map_err(|_| BrokerRuntimeError::ProbeFailed)?;
+    .map_err(|_| {
+        eprintln!("relay_local_probe_live_negotiation_failed");
+        BrokerRuntimeError::ProbeFailed
+    })?;
     if !evidence.has_relay_pair() || !evidence.control_round_trip() || !evidence.media_round_trip()
     {
+        eprintln!("relay_local_probe_packet_evidence_rejected");
         return Err(BrokerRuntimeError::ProbeFailed);
     }
     let (after_state, _, after_systemd, after_external_restart) = verified_current_state().await?;
@@ -1428,6 +1445,7 @@ async fn probe_payload(request: &BrokerRequest) -> Result<Vec<u8>, BrokerRuntime
         external_restart_detected: after_external_restart,
     };
     if validate_probe_stability(&before, &after).is_err() {
+        eprintln!("relay_local_probe_after_fence_rejected");
         return Err(BrokerRuntimeError::ProbeFailed);
     }
     let pair = evidence.selected_pair();
@@ -1443,7 +1461,13 @@ async fn probe_payload(request: &BrokerRequest) -> Result<Vec<u8>, BrokerRuntime
         pair.bytes_sent,
         pair.bytes_received,
     )
-    .map_err(|_| BrokerRuntimeError::ProbeFailed)?;
+    .map_err(|_| {
+        eprintln!(
+            "relay_local_probe_proof_rejected packets_sent={} packets_received={} bytes_sent={} bytes_received={}",
+            pair.packets_sent, pair.packets_received, pair.bytes_sent, pair.bytes_received
+        );
+        BrokerRuntimeError::ProbeFailed
+    })?;
     let challenge_hex = hex(challenge);
     let proof_hex = hex(&proof);
     let response = ProbeResponse {
@@ -1529,6 +1553,13 @@ async fn native_scrape() -> Result<crate::metrics::NativeCoturnScrape, BrokerRun
         .scrape()
         .await
         .map_err(|_| BrokerRuntimeError::TargetFailed)
+}
+
+async fn queue_coturn_restart() -> Result<(), BrokerRuntimeError> {
+    // The job can outlive the short systemctl command timeout while coturn
+    // drains worker threads. Queue it, then each caller verifies the new live
+    // invocation under the existing bounded startup deadline before commit.
+    systemctl(&["--no-block", "restart", COTURN_UNIT]).await
 }
 
 async fn systemctl(arguments: &[&str]) -> Result<(), BrokerRuntimeError> {
@@ -1654,15 +1685,7 @@ async fn wait_for_new_active_invocation(
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     loop {
         let observed = systemd_show().await?;
-        let advanced = observed
-            .invocation_id
-            .as_deref()
-            .is_some_and(|value| previous != Some(value));
-        if observed.active_state == "active"
-            && observed.sub_state == "running"
-            && observed.main_pid != 0
-            && advanced
-        {
+        if new_active_invocation(&observed, previous) {
             return Ok(observed);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1670,6 +1693,16 @@ async fn wait_for_new_active_invocation(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn new_active_invocation(observed: &SystemdObservation, previous: Option<&str>) -> bool {
+    observed.active_state == "active"
+        && observed.sub_state == "running"
+        && observed.main_pid != 0
+        && observed
+            .invocation_id
+            .as_deref()
+            .is_some_and(|value| previous != Some(value))
 }
 
 fn load_state() -> Result<Option<CommittedState>, BrokerRuntimeError> {
@@ -1911,6 +1944,34 @@ fn monotonic_ns() -> Result<u64, BrokerRuntimeError> {
 
 #[cfg(test)]
 mod wsl_tests {
+    #[test]
+    fn queued_restart_requires_a_new_running_invocation_and_live_pid() {
+        let current = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let next = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut observation = SystemdObservation {
+            invocation_id: Some(next.to_owned()),
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            main_pid: 123,
+            ingress_bytes: Some(0),
+            egress_bytes: Some(0),
+            result: "success".into(),
+            exec_main_status: 0,
+        };
+        assert!(new_active_invocation(&observation, Some(current)));
+        assert!(!new_active_invocation(&observation, Some(next)));
+        observation.main_pid = 0;
+        assert!(!new_active_invocation(&observation, Some(current)));
+        observation.main_pid = 123;
+        observation.active_state = "activating".into();
+        assert!(!new_active_invocation(&observation, Some(current)));
+        observation.active_state = "active".into();
+        observation.sub_state = "start".into();
+        assert!(!new_active_invocation(&observation, Some(current)));
+        observation.sub_state = "running".into();
+        observation.invocation_id = None;
+        assert!(!new_active_invocation(&observation, None));
+    }
     use super::*;
     use base64::engine::general_purpose::STANDARD;
     use ring::hmac;

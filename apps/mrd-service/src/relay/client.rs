@@ -183,8 +183,10 @@ impl RelayAccessBackend for ReqwestRelayAccessBackend {
         &self,
         context: &RelayAccessContext,
     ) -> Result<Zeroizing<Vec<u8>>, RelayBackendError> {
-        let device_authorization =
-            Zeroizing::new(format!("Bearer {}", self.config.backend_device_token()));
+        let device_authorization = Zeroizing::new(format!(
+            "Bearer {}",
+            self.config.backend_device_token().as_str()
+        ));
         let mut device_authorization =
             reqwest::header::HeaderValue::from_str(&device_authorization)
                 .map_err(|_| RelayBackendError::InvalidResponse)?;

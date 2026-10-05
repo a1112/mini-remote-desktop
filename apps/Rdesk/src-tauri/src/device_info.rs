@@ -51,67 +51,13 @@ impl fmt::Display for HardwareInfo {
     }
 }
 
-/// 获取主板序列号（Windows）
+/// 获取与后台服务相同的持久设备身份；不可用时禁止主机名或临时随机回退。
 fn get_motherboard_serial() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        use std::process::Command;
-
-        // 使用 WMIC 获取主板序列号
-        let output = Command::new("wmic")
-            .args(["baseboard", "get", "serialnumber"])
-            .output();
-
-        if let Ok(out) = output {
-            if let Ok(text) = String::from_utf8(out.stdout) {
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    // 过滤掉表头和空行
-                    if !trimmed.is_empty()
-                        && !trimmed.eq_ignore_ascii_case("SerialNumber")
-                        && trimmed.len() > 5
-                    {
-                        return trimmed.to_string();
-                    }
-                }
-            }
-        }
-
-        // 回退方案：使用 MachineGuid
-        use winreg::enums::*;
-        use winreg::RegKey;
-
-        if let Ok(key) =
-            RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Cryptography")
-        {
-            if let Ok(guid) = key.get_value::<String, _>("MachineGuid") {
-                // MachineGuid 格式: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-                // 取前8位作为短ID
-                return guid.chars().take(8).collect();
-            }
-        }
-
-        // 最终回退：生成随机ID
-        format!("{:08x}", rand_seed())
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // 非Windows系统使用机器ID
-        get_hostname()
-    }
+    mrd_device_registration::stable_machine_identity(None).unwrap_or_else(|error| {
+        tracing::error!("Device identity unavailable: {error}");
+        String::new()
+    })
 }
-
-/// 简单的随机种子生成器（用于回退场景）
-#[cfg(target_os = "windows")]
-fn rand_seed() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u32)
-        .unwrap_or(0x12345678)
-}
-
 /// 获取主机名
 fn get_hostname() -> String {
     std::env::var("COMPUTERNAME")
@@ -362,13 +308,12 @@ mod tests {
         );
         assert!(!info.hostname.is_empty(), "Hostname should not be empty");
         assert!(!info.os_type.is_empty(), "OS type should not be empty");
-        println!("Hardware Info: {}", info);
     }
 
     #[test]
     fn test_motherboard_serial_stability() {
         let serial1 = get_motherboard_serial();
         let serial2 = get_motherboard_serial();
-        assert_eq!(serial1, serial2, "Motherboard serial should be stable");
+        assert!(serial1 == serial2, "Device identity should remain stable");
     }
 }

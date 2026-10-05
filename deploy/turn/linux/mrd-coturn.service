@@ -7,7 +7,7 @@ After=network-online.target
 After=mrd-relay-firewall.service
 
 [Service]
-Type=simple
+Type=exec
 User=mrd-coturn
 Group=mrd-coturn
 UMask=0077

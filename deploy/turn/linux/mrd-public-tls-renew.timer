@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the short-lived MRD public certificate every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+Unit=mrd-public-tls-renew.service
+
+[Install]
+WantedBy=timers.target

@@ -11,6 +11,8 @@ import { useDevices, type Device } from "./deviceData";
 import { useDeviceRegistration } from "../services/deviceService";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
+import { ServiceStatusPanel } from "./ServiceStatusPanel";
+import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 
 type MobileLayoutProps = { onOpenAuth: () => void };
 
@@ -35,8 +37,10 @@ function MobileHomePage() {
   ).slice(0, 3);
 
   const connect = async (rawId: string) => {
-    const deviceId = rawId.replace(/\s/g, "");
-    if (!deviceId || busy) return;
+    if (!rawId.trim() || busy) return;
+    const parsed = parseRemoteDeviceInput(rawId);
+    if (!parsed) { setError(DEVICE_CODE_INPUT_ERROR); return; }
+    const deviceId = parsed.deviceId;
     const device = devices.find((item) => item.deviceId.replace(/\s/g, "") === deviceId);
     setBusy(true);
     setError(null);
@@ -58,7 +62,7 @@ function MobileHomePage() {
   const copyMyId = async () => {
     if (!myDeviceId) return;
     try {
-      await navigator.clipboard.writeText(myDeviceId.replace(/\s/g, ""));
+      await navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -70,17 +74,18 @@ function MobileHomePage() {
     <div className="mobile-intro">
       <p className="mobile-eyebrow">安全远程访问</p>
       <h1>连接远程设备</h1>
-      <p>输入远程设备 ID，发起连接请求</p>
+      <p>输入 10 位远程设备码，发起连接请求</p>
     </div>
 
     <section className="mobile-card mobile-connect-card" aria-label="连接远程设备">
-      <label htmlFor="mobile-target-id" className="mobile-field-label">远程设备 ID</label>
+      <label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
       <div className="mobile-input-wrap">
         <Monitor size={20} aria-hidden="true" />
-        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入设备 ID"
+        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 10 位设备码"
           value={targetId} onChange={(event) => setTargetId(event.target.value)}
           onKeyDown={(event) => { if (event.key === "Enter") void connect(targetId); }} />
       </div>
+      <p className="mobile-state-text">已有的旧设备码和局域网标识仍可使用。</p>
       <button className="mobile-primary-button" disabled={!targetId.trim() || busy} onClick={() => void connect(targetId)}>
         {busy ? <LoaderCircle size={19} className="animate-spin" /> : null}
         {busy ? "连接中…" : "发起连接"}
@@ -109,7 +114,7 @@ function MobileHomePage() {
     </section>
 
     <section className="mobile-local-device" aria-label="本机设备">
-      <span><small>本机设备</small><strong>{myDeviceName || "设备 ID 未就绪"}</strong><code>{myDeviceId || "等待本机服务"}</code></span>
+      <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>
@@ -242,7 +247,7 @@ function MobileSettingsPage({ onOpenAuth }: MobileLayoutProps) {
       <button className="mobile-secondary-button" onClick={isLoggedIn ? logout : onOpenAuth}>{isLoggedIn ? "退出登录" : "登录账户"}</button>
     </section>
     <section className="mobile-card mobile-settings-card">
-      <h2>本机设备 ID</h2><code>{deviceId || "等待本机服务"}</code>
+      <h2>本机设备码</h2><code>{deviceId ? formatDeviceCode(deviceId) : "等待设备登记"}</code>
     </section>
   </div>;
 }
@@ -257,6 +262,7 @@ export function MobileLayout({ onOpenAuth }: MobileLayoutProps) {
       <Link to="/" className="mobile-brand" aria-label="R-Desk 首页"><span className="mobile-mark">R</span><span>R-Desk</span></Link>
       <button className="mobile-header-action" aria-label="打开设置" onClick={() => navigate("/settings")}><Settings2 size={23} /></button>
     </header>
+    <ServiceStatusPanel />
     <main className="mobile-main" id="mobile-main">
       {location.pathname === "/" ? <MobileHomePage /> : null}
       {location.pathname === "/devices" ? <MobileDevicesPage onOpenAuth={onOpenAuth} /> : null}

@@ -216,6 +216,9 @@ pub enum GrantValidationError {
     /// StartRender did not bind a valid product surface and native handle.
     #[error("start-render surface target is invalid")]
     InvalidRenderSurface,
+    /// Capture encoder settings exceed supported bounds.
+    #[error("capture profile is invalid")]
+    InvalidCaptureProfile,
     /// The grant belongs to a different registration.
     #[error("execute grant registration does not match")]
     RegistrationMismatch,
@@ -434,6 +437,8 @@ pub fn validate_input_event(
         if !resource.input_scopes.contains(&required_scope)
             || !context.authorization_scopes.contains(&required_scope)
             || context.now_ms >= claims.expires_at_ms
+            || context.now_ms >= envelope.expires_at_ms
+            || envelope.expires_at_ms > claims.expires_at_ms
             || context.now_ms >= context.authorization_expires_at_ms
         {
             return Err(InputRejection::Grant);
@@ -494,6 +499,15 @@ where
             || surface.window_handle == 0
         {
             return Err(GrantValidationError::InvalidRenderSurface);
+        }
+    }
+    if let AgentCommand::StartCapture {
+        profile: Some(profile),
+        ..
+    } = &execute.command
+    {
+        if !profile.is_valid() {
+            return Err(GrantValidationError::InvalidCaptureProfile);
         }
     }
 

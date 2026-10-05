@@ -42,6 +42,8 @@ pub struct AppState {
     pub devices: Arc<Mutex<DeviceRegistry>>,
     /// Service-owned authenticated signaling connection health.
     pub signaling_status: Arc<crate::signaling::SignalingStatus>,
+    /// Resident-owned protected public device registration and server health.
+    pub public_connection: Arc<crate::public_connection::PublicConnectionState>,
     /// Bounded authenticated relay-migration signaling commands and verified events.
     pub relay_signaling: Arc<crate::signaling::RelaySignalingBus>,
     signaling_mapper: Arc<RwLock<Option<Arc<crate::signaling::ServiceSignalingMapper>>>>,
@@ -112,9 +114,28 @@ pub struct AppState {
     >,
     /// Authenticated server used to deliver prepared render access units.
     agent_media_server: Arc<RwLock<Option<Arc<crate::agent_runtime::AgentServer>>>>,
+    /// Approved capture resources bound to one exact active local console Agent.
+    #[cfg(windows)]
+    pub console_capture: Arc<crate::console_capture::ConsoleCaptureState>,
 }
 
 impl AppState {
+    #[cfg(windows)]
+    pub fn bind_console_capture_issuer(
+        &self,
+        issuer: Arc<crate::agent_runtime::ExecuteGrantIssuer>,
+    ) {
+        self.console_capture.bind_issuer(issuer);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn console_agent_server(&self) -> Option<Arc<crate::agent_runtime::AgentServer>> {
+        self.agent_media_server
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
     /// Binds an authenticated agent server to this service's media ingress.
     pub fn bind_agent_media_server(&self, server: Arc<crate::agent_runtime::AgentServer>) {
         server.set_media_ingress(self.agent_media_ingress.clone());
@@ -481,6 +502,7 @@ impl AppState {
             sessions: Arc::new(Mutex::new(SessionRegistry::default())),
             devices: Arc::new(Mutex::new(DeviceRegistry::default())),
             signaling_status: Arc::new(crate::signaling::SignalingStatus::default()),
+            public_connection: Arc::new(crate::public_connection::PublicConnectionState::default()),
             relay_signaling: Arc::new(crate::signaling::RelaySignalingBus::default()),
             signaling_mapper: Arc::new(RwLock::new(None)),
             webrtc_host: Arc::new(crate::transports::webrtc::ServiceWebRtcTransportHost::new()),
@@ -529,6 +551,8 @@ impl AppState {
                     .expect("non-zero agent render route capacity"),
             )),
             agent_media_server: Arc::new(RwLock::new(None)),
+            #[cfg(windows)]
+            console_capture: Arc::new(crate::console_capture::ConsoleCaptureState::default()),
         }
     }
 

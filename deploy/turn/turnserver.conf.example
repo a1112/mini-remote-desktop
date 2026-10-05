@@ -26,7 +26,8 @@ unauthorized-ratelimit-rps=10
 # Bound allocations and bandwidth even if the control plane is unavailable.
 user-quota=4
 total-quota=100
-max-bps=25000000
+# Divide the total bytes/s by total-quota; installers preserve this exact bound.
+max-bps=1250000
 # Agent/backend max_egress_bps is bits/s; coturn max-bps/bps-capacity is bytes/s.
 # The one-gigabit example therefore renders as 125000000.
 bps-capacity=125000000

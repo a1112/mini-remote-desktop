@@ -3276,6 +3276,26 @@ async fn attended_lan_session_proves_controller_key_before_both_sides_stream() {
         .await
         .expect("target handler task")
         .expect("target handler result");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let mut both_streaming = true;
+            for state in [&controller_state, &target_state] {
+                let snapshot = state
+                    .session_authorizations
+                    .snapshot(&session_id)
+                    .await
+                    .expect("proven authorization");
+                both_streaming &= snapshot.route_state == mrd_ipc::RemoteRouteState::Connected
+                    && snapshot.media_state == mrd_ipc::RemoteMediaState::Streaming;
+            }
+            if both_streaming {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both sides stream after the target sends its first frame");
     for state in [&controller_state, &target_state] {
         let snapshot = state
             .session_authorizations
@@ -4307,13 +4327,9 @@ async fn target_sender_grant_expiry_closes_legacy_session_and_cleans_media() {
         grant_id: proof_material.grant_id,
         transport_fingerprint_sha256: proof_material.transport_fingerprint_sha256,
     });
-    install_test_screen_view_grant(
-        &app_state,
-        &session_id,
-        "controller-device",
-        now_ms().saturating_add(1_500),
-    )
-    .await;
+    let grant_deadline = now_ms().saturating_add(60_000);
+    install_test_screen_view_grant(&app_state, &session_id, "controller-device", grant_deadline)
+        .await;
 
     commit_prepared_lan_remote_session_with_timeout(&app_state, prepared, Duration::from_secs(5))
         .await
@@ -4350,6 +4366,14 @@ async fn target_sender_grant_expiry_closes_legacy_session_and_cleans_media() {
         .await
         .expect("authorized sender should produce a media datagram")
         .expect("authorized media datagram");
+
+    // Expire after the actual proof and first frame; host load must not decide
+    // whether this fixture ever reaches the streaming state being exercised.
+    app_state
+        .session_authorizations
+        .snapshot_at(&session_id, grant_deadline.saturating_add(1))
+        .await
+        .expect("expire the proven target grant");
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -5037,13 +5061,8 @@ async fn controller_receiver_grant_expiry_closes_legacy_session_and_cleans_media
         let _endpoint = endpoint;
         std::future::pending::<()>().await;
     });
-    install_test_screen_view_grant(
-        &app_state,
-        &session_id,
-        "target-device",
-        now_ms().saturating_add(200),
-    )
-    .await;
+    let grant_deadline = now_ms().saturating_add(60_000);
+    install_test_screen_view_grant(&app_state, &session_id, "target-device", grant_deadline).await;
 
     start_lan_media_receiver_with_timeout(
         app_state.clone(),
@@ -5067,6 +5086,13 @@ async fn controller_receiver_grant_expiry_closes_legacy_session_and_cleans_media
         .expect("streaming receiver authorization");
     assert_eq!(streaming.route_state, mrd_ipc::RemoteRouteState::Connected);
     assert_eq!(streaming.media_state, mrd_ipc::RemoteMediaState::Streaming);
+
+    // Expire only after the real handshake has committed. Advancing the
+    // authoritative registry clock avoids scheduler-dependent handshake races.
+    app_state
+        .session_authorizations
+        .snapshot_at(&session_id, grant_deadline + 1)
+        .await;
 
     timeout(Duration::from_secs(2), async {
         loop {

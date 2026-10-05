@@ -295,6 +295,7 @@ class DeviceSessionService:
                     or row.relay_allowed_regions != list(policy.allowed_regions)
                     or row.relay_preferred_regions != list(policy.preferred_regions)
                     or row.relay_accepted_transports != list(policy.accepted_transports)
+                    or row.relay_max_backups != policy.max_backups
                     or row.intended_peer_id != target.id
                     or not isinstance(row.grant_expires_at, datetime)
                     or _utc(row.grant_expires_at) <= now
@@ -530,7 +531,7 @@ def _is_authorized_participant(row: SessionRequest, device: Device) -> bool:
         and row.tenant_id == device.tenant_id
         and row.requester_device_id is not None
         and row.access_mode == "attended"
-        and row.route_policy == "relay_only"
+        and row.route_policy in {"relay_only", "direct_first"}
         and device.id in {row.requester_device_id, row.target_device_id}
         and (
             device.id != row.requester_device_id

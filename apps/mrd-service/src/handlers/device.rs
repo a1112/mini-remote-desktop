@@ -9,6 +9,16 @@ pub async fn register_device(
     device_id: DeviceId,
     device_name: String,
 ) -> IpcResponse {
+    let registered = app_state
+        .public_connection
+        .snapshot(&app_state.signaling_status.snapshot());
+    if registered.device_registered && registered.device_id.as_deref() != Some(device_id.0.as_str())
+    {
+        return IpcResponse::Error {
+            code: "E_DEVICE_IDENTITY_CONFLICT".into(),
+            message: "公网设备身份已固定，不能用本地注册覆盖".into(),
+        };
+    }
     tracing::info!("Registering device: {} ({})", device_id.0, device_name);
     let mut devices = app_state.devices.lock().await;
     devices.register(device_id.clone(), device_name);

@@ -33,11 +33,13 @@ MemoryDenyWriteExecute=true
 RemoveIPC=true
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Native getifaddrs needs route netlink for read-only interface enumeration.
+# CapabilityBoundingSet stays empty; network administration is not granted.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-ReadWritePaths=/etc/mrd-relay-agent/secrets /var/lib/mrd-coturn /run/mrd-coturn
+ReadWritePaths=/etc/mrd-relay-agent/secrets /var/lib/mrd-coturn
 TimeoutStartSec=15s
 RuntimeMaxSec=15s
 TasksMax=8

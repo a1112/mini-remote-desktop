@@ -24,6 +24,33 @@ use serde::{Deserialize, Serialize};
 mod wire {
     use super::*;
 
+    /// Sensitive management credentials serialize as strings and never appear in Debug.
+    #[derive(
+        Clone, Serialize, Deserialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+    )]
+    #[serde(transparent)]
+    pub struct PublicDeviceCredential(String);
+    impl From<String> for PublicDeviceCredential {
+        fn from(value: String) -> Self {
+            Self(value)
+        }
+    }
+    impl From<&str> for PublicDeviceCredential {
+        fn from(value: &str) -> Self {
+            Self(value.to_owned())
+        }
+    }
+    impl PublicDeviceCredential {
+        pub fn into_secret(mut self) -> String {
+            std::mem::take(&mut self.0)
+        }
+    }
+    impl std::fmt::Debug for PublicDeviceCredential {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PublicDeviceCredential(REDACTED)")
+        }
+    }
+
     // === Shell / Lifecycle DTOs (Phase 2) ===
     // Defined first to avoid forward references
 
@@ -1965,6 +1992,18 @@ mod wire {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     pub enum IpcRequest {
+        /// Secret-free public registration and authenticated signaling health.
+        GetPublicServerStatus,
+        /// Enroll this service-owned machine at its configured trusted server.
+        /// Device credentials are never returned over this endpoint.
+        EnrollPublicDevice {
+            enrollment_token: PublicDeviceCredential,
+            device_name: String,
+        },
+        /// Refresh the existing identity using an administrator-issued credential.
+        RecoverPublicDevice {
+            device_token: PublicDeviceCredential,
+        },
         /// Register local device with the service
         RegisterDevice {
             device_id: DeviceId,
@@ -2290,6 +2329,8 @@ mod wire {
     #[allow(clippy::large_enum_variant)]
     #[serde(tag = "type")]
     pub enum IpcResponse {
+        /// Public server state without device credentials or privileged session data.
+        PublicServerStatus { status: PublicServerStatus },
         /// Device registration successful
         DeviceRegistered { device_id: DeviceId },
         /// List of available devices
@@ -2665,6 +2706,21 @@ mod wire {
         /// Service-owned authenticated WAN signaling health.
         #[serde(default)]
         pub signaling: SignalingRuntimeSnapshot,
+    }
+
+    /// A narrow product health projection readable by a normal desktop client.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PublicServerStatus {
+        pub service_running: bool,
+        pub api_url: Option<String>,
+        pub api_reachable: Option<bool>,
+        pub device_registered: bool,
+        pub device_id: Option<String>,
+        pub device_name: Option<String>,
+        pub signaling_state: String,
+        pub reconnect_attempt: u32,
+        pub last_connected_at_ms: Option<u64>,
+        pub last_error: Option<String>,
     }
 
     /// Secret-free authenticated signaling health projection.

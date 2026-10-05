@@ -22,6 +22,8 @@
   <string>1</string>
   <key>LSBackgroundOnly</key>
   <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Rdesk needs local network access to discover devices and establish remote desktop sessions.</string>
 </dict>

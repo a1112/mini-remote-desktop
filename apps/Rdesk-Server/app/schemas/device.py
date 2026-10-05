@@ -43,6 +43,7 @@ class DeviceRegisterResponse(BaseModel):
     device_id: str = Field(..., description="分配的设备ID")
     device_name: str = Field(..., description="设备名称")
     access_token: str = Field(..., description="访问令牌", repr=False)
+    refresh_token: str | None = Field(default=None, repr=False, max_length=4096)
 
 
 class DeviceEnrollmentTokenOut(BaseModel):
@@ -68,6 +69,7 @@ class DeviceCredentialResponse(BaseModel):
     device_id: str
     auth_version: int
     access_token: str = Field(repr=False)
+    refresh_token: str | None = Field(default=None, repr=False, max_length=4096)
 
 
 class DeviceCredentialRevocationResponse(BaseModel):

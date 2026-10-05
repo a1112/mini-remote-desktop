@@ -18,6 +18,7 @@ import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher"
 import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
+import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 
 export function HomePage() {
   const { isDark } = useTheme();
@@ -54,7 +55,7 @@ export function HomePage() {
 
   const handleCopy = () => {
     if (!myDeviceId) return;
-    navigator.clipboard.writeText(myDeviceId.replace(/\s/g, ""));
+    navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -95,17 +96,8 @@ export function HomePage() {
     }
   };
 
-  // 格式化设备 ID（每3位一组）
-  const formatDeviceId = (id: string | null) => {
-    if (!id) return "设备 ID 未就绪";
-    const cleaned = id.replace(/\s/g, "");
-    if (cleaned.length === 9) {
-      return `${cleaned.slice(0, 3)} ${cleaned.slice(3, 6)} ${cleaned.slice(6)}`;
-    }
-    return cleaned;
-  };
-
-  const myId = formatDeviceId(myDeviceId);
+  const myId = formatDeviceCode(myDeviceId);
+  const hasTenDigitCode = /^\d{10}$/.test(normalizeDeviceCode(myDeviceId ?? ""));
 
   // 自动聚焦设备名称输入框
   useEffect(() => {
@@ -146,14 +138,19 @@ export function HomePage() {
 
   const handleConnect = () => {
     if (!connectId.trim()) return;
-    const found = devices.find((device) => device.deviceId.replace(/\s/g, "") === connectId.replace(/\s/g, ""));
+    const parsed = parseRemoteDeviceInput(connectId);
+    if (!parsed) {
+      setConnectionError(DEVICE_CODE_INPUT_ERROR);
+      return;
+    }
+    const found = devices.find((device) => normalizeDeviceCode(device.deviceId) === parsed.deviceId);
     if (found) {
       void launchSecureRemote(found);
     } else {
       void launchSecureRemote({
         id: "custom",
         name: "远程设备",
-        deviceId: connectId,
+        deviceId: parsed.deviceId,
         os: "Unknown",
       });
     }
@@ -239,7 +236,8 @@ export function HomePage() {
               )}
             </div>
 
-            {/* 设备ID + 复制图标 */}
+            <div className={`mb-1 text-center text-xs ${textSecondary}`}>{hasTenDigitCode ? "10 位设备码" : "当前设备标识"}</div>
+            {/* 设备码 + 复制图标 */}
             <div className="flex items-center justify-center gap-1.5 mb-4">
               <div className={`text-2xl font-mono tracking-widest ${textPrimary}`} style={{ fontSize: 18 }}>
                 {myId}
@@ -251,7 +249,7 @@ export function HomePage() {
                     ? "text-green-600"
                     : isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"
                 }`}
-                title={copied ? "已复制" : "复制ID"}
+                title={copied ? "已复制" : "复制设备码"}
               >
                 <Copy className="w-3.5 h-3.5" />
               </button>
@@ -269,17 +267,21 @@ export function HomePage() {
             <div className="space-y-3">
               <div>
                 <label className={`block mb-1.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  远程设备 ID
+                  远程设备码
                 </label>
                 <input
                   type="text"
+                  inputMode="text"
+                  autoComplete="off"
+                  aria-label="远程设备码"
                   value={connectId}
                   onChange={(e) => setConnectId(e.target.value)}
-                  placeholder="输入远程设备 ID"
+                  placeholder="输入 10 位设备码"
                   onKeyDown={(e) => e.key === "Enter" && handleConnect()}
                   className={`w-full px-3 py-2.5 rounded-lg border outline-none transition-all ${inputBg}`}
                   style={{ fontSize: 14 }}
                 />
+                <p className={`mt-1.5 text-xs ${textTertiary}`}>支持带空格的设备码；已有的旧码和局域网标识仍可连接。</p>
               </div>
 
               <div

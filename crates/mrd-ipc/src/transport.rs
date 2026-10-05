@@ -9,15 +9,19 @@ use serde::Serialize;
 /// Default Windows named pipe used by `mrd-service`.
 pub const SERVICE_PIPE_NAME: &str = r"\\.\pipe\mrd-service";
 #[cfg(unix)]
-/// Default Unix domain socket used by `mrd-service`.
-pub const SERVICE_SOCKET_PATH: &str = "/tmp/mrd-service.sock";
+/// Socket basename inside the current user's private runtime directory.
+pub const SERVICE_SOCKET_PATH: &str = "service.sock";
 /// Environment variable that overrides the service IPC endpoint.
 pub const SERVICE_ENDPOINT_ENV: &str = "MRD_SERVICE_IPC_ENDPOINT";
 /// Environment variable that overrides only the narrow service management endpoint.
 pub const MANAGEMENT_ENDPOINT_ENV: &str = "MRD_SERVICE_MANAGEMENT_IPC_ENDPOINT";
+/// Optional explicit endpoint for the authenticated installed Windows UI channel.
+pub const PRODUCT_ENDPOINT_ENV: &str = "MRD_SERVICE_PRODUCT_IPC_ENDPOINT";
 
 #[cfg(windows)]
 mod windows_management;
+#[cfg(windows)]
+pub mod windows_product;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -42,7 +46,11 @@ impl IpcEndpoint {
 
         #[cfg(unix)]
         {
-            Self::UnixSocket(SERVICE_SOCKET_PATH.to_string())
+            Self::UnixSocket(format!(
+                "/tmp/mrd-service-{}/{}",
+                unsafe { libc::geteuid() },
+                SERVICE_SOCKET_PATH
+            ))
         }
     }
 
@@ -103,6 +111,29 @@ impl IpcEndpoint {
             .ok()
             .and_then(|value| Self::from_env_value(&value))
             .unwrap_or_else(|| Self::management_for_service(Self::service_from_env_or_default()))
+    }
+
+    /// Windows installed UI channel; ordinary Unix clients retain private core IPC.
+    #[cfg(windows)]
+    pub fn product_for_service(service: Self) -> Self {
+        match service {
+            Self::NamedPipe(path) => Self::NamedPipe(format!("{path}-product")),
+        }
+    }
+
+    /// Resolve the dedicated installed UI endpoint without changing core overrides.
+    #[cfg(windows)]
+    pub fn product_from_env_or_default() -> Self {
+        std::env::var(PRODUCT_ENDPOINT_ENV)
+            .ok()
+            .and_then(|value| Self::from_env_value(&value))
+            .unwrap_or_else(|| Self::product_for_service(Self::service_from_env_or_default()))
+    }
+
+    /// Return the local named pipe endpoint for platform verification/testing.
+    #[cfg(windows)]
+    pub fn as_windows_pipe_name(&self) -> &str {
+        self.pipe_name()
     }
 
     #[cfg(windows)]
@@ -167,7 +198,7 @@ where
 /// Unix domain socket IPC server.
 pub struct IpcServer {
     listener: UnixListener,
-    management_socket: Option<(String, u64, u64)>,
+    owned_socket: (String, u64, u64),
 }
 
 #[cfg(unix)]
@@ -179,30 +210,55 @@ impl IpcServer {
 
     /// Bind a custom Unix domain socket endpoint.
     pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
-        let socket_path = endpoint.socket_path();
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path)?;
-        Ok(Self {
-            listener,
-            management_socket: None,
-        })
+        Self::bind_private(endpoint).await
     }
 
     /// Bind a dedicated owner-only management socket without replacing an existing endpoint.
     pub async fn bind_management_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
         anyhow::ensure!(
             endpoint != IpcEndpoint::service_from_env_or_default(),
             "Management IPC must use a distinct endpoint"
         );
+        Self::bind_private(endpoint).await
+    }
+
+    async fn bind_private(endpoint: IpcEndpoint) -> Result<Self> {
+        use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
         let path = endpoint.socket_path();
+        let socket_path = std::path::Path::new(path);
+        anyhow::ensure!(
+            socket_path.is_absolute(),
+            "IPC socket path must be absolute"
+        );
+        anyhow::ensure!(
+            socket_path.components().all(|part| matches!(
+                part,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )),
+            "IPC socket path contains an invalid component"
+        );
+        let parent = socket_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("IPC socket has no parent"))?;
+        match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        let directory = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            directory.is_dir()
+                && directory.uid() == unsafe { libc::geteuid() }
+                && directory.mode() & 0o777 == 0o700,
+            "IPC socket parent must be an owned private directory with mode 0700"
+        );
         if let Ok(existing) = std::fs::symlink_metadata(path) {
             anyhow::ensure!(
                 existing.file_type().is_socket() && existing.uid() == unsafe { libc::geteuid() },
-                "Management IPC endpoint exists and is not an owned socket"
+                "IPC endpoint exists and is not an owned socket"
             );
             match UnixStream::connect(path).await {
-                Ok(_) => anyhow::bail!("Management IPC endpoint already has an active listener"),
+                Ok(_) => anyhow::bail!("IPC endpoint already has an active listener"),
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -213,7 +269,7 @@ impl IpcServer {
             if let Ok(current) = std::fs::symlink_metadata(path) {
                 anyhow::ensure!(
                     current.dev() == existing.dev() && current.ino() == existing.ino(),
-                    "Management IPC endpoint changed during stale-socket recovery"
+                    "IPC endpoint changed during stale-socket recovery"
                 );
                 std::fs::remove_file(path)?;
             }
@@ -221,15 +277,27 @@ impl IpcServer {
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         let metadata = std::fs::symlink_metadata(path)?;
+        let current_directory = std::fs::symlink_metadata(parent)?;
+        anyhow::ensure!(
+            current_directory.dev() == directory.dev()
+                && current_directory.ino() == directory.ino()
+                && current_directory.uid() == unsafe { libc::geteuid() }
+                && current_directory.mode() & 0o777 == 0o700,
+            "IPC private directory changed during binding"
+        );
         Ok(Self {
             listener,
-            management_socket: Some((path.to_owned(), metadata.dev(), metadata.ino())),
+            owned_socket: (path.to_owned(), metadata.dev(), metadata.ino()),
         })
     }
 
     /// Accept a single IPC stream from a client.
     pub async fn accept(&self) -> Result<IpcStream> {
         let socket = self.listener.accept().await?.0;
+        anyhow::ensure!(
+            socket.peer_cred()?.uid() == unsafe { libc::geteuid() },
+            "IPC peer is not the current user"
+        );
         Ok(IpcStream { socket })
     }
 }
@@ -238,14 +306,13 @@ impl IpcServer {
 impl Drop for IpcServer {
     fn drop(&mut self) {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if let Some((path, device, inode)) = &self.management_socket {
-            if let Ok(current) = std::fs::symlink_metadata(path) {
-                if current.file_type().is_socket()
-                    && current.dev() == *device
-                    && current.ino() == *inode
-                {
-                    let _ = std::fs::remove_file(path);
-                }
+        let (path, device, inode) = &self.owned_socket;
+        if let Ok(current) = std::fs::symlink_metadata(path) {
+            if current.file_type().is_socket()
+                && current.dev() == *device
+                && current.ino() == *inode
+            {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
@@ -292,6 +359,16 @@ impl IpcServer {
         })
     }
 
+    /// Reserve a separate data-only product endpoint; caller authentication occurs
+    /// after reading each frame in the application dispatcher.
+    pub async fn bind_product_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        anyhow::ensure!(
+            endpoint != IpcEndpoint::management_from_env_or_default(),
+            "Product IPC must use a distinct endpoint"
+        );
+        Self::bind_management_with_endpoint(endpoint).await
+    }
+
     /// Accept a single IPC stream from a client.
     pub async fn accept(&self) -> Result<IpcStream> {
         let server = if let Some(sddl) = &self.management_sddl {
@@ -323,7 +400,42 @@ impl IpcClient {
 
     /// Connect to a custom Unix domain socket endpoint.
     pub async fn connect_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
-        let socket = UnixStream::connect(endpoint.socket_path()).await?;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let path = std::path::Path::new(endpoint.socket_path());
+        anyhow::ensure!(
+            path.is_absolute()
+                && path.components().all(|part| matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )),
+            "IPC socket path is invalid"
+        );
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("IPC socket has no parent"))?;
+        let directory = std::fs::symlink_metadata(parent)?;
+        let owner = unsafe { libc::geteuid() };
+        anyhow::ensure!(
+            directory.is_dir() && directory.uid() == owner && directory.mode() & 0o777 == 0o700,
+            "IPC socket parent is not a private owned directory"
+        );
+        let metadata = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            metadata.file_type().is_socket()
+                && metadata.uid() == owner
+                && metadata.mode() & 0o777 == 0o600,
+            "IPC endpoint is not a private owned socket"
+        );
+        let socket = UnixStream::connect(path).await?;
+        anyhow::ensure!(
+            socket.peer_cred()?.uid() == owner,
+            "IPC server is not the current user"
+        );
+        let current = std::fs::symlink_metadata(path)?;
+        anyhow::ensure!(
+            current.dev() == metadata.dev() && current.ino() == metadata.ino(),
+            "IPC socket changed while connecting"
+        );
         Ok(IpcStream { socket })
     }
 
@@ -356,6 +468,13 @@ impl IpcClient {
         Ok(IpcStream::Client(windows_management::connect_client(
             endpoint.pipe_name(),
         )?))
+    }
+
+    /// Authenticate the real installed service before any credential or request is sent.
+    pub async fn connect_product_with_endpoint(endpoint: &IpcEndpoint) -> Result<IpcStream> {
+        let pipe = windows_management::connect_client(endpoint.pipe_name())?;
+        let identity = windows_product::verify_pipe_server(&pipe)?;
+        Ok(IpcStream::ProductClient(pipe, identity))
     }
 }
 
@@ -399,16 +518,39 @@ impl IpcStream {
 pub enum IpcStream {
     /// Client-side pipe handle.
     Client(NamedPipeClient),
+    /// Installed service process and protected image stay pinned until disconnect.
+    ProductClient(NamedPipeClient, windows_product::VerifiedInstalledProcess),
     /// Server-side pipe handle.
     Server(tokio::net::windows::named_pipe::NamedPipeServer),
 }
 
 #[cfg(windows)]
 impl IpcStream {
+    /// Product callers have a small frame budget before their identity is known.
+    /// Reject the length prefix before allocating or waiting for its payload.
+    pub async fn recv_product_request(&mut self) -> Result<crate::IpcRequest> {
+        use tokio::io::AsyncReadExt;
+        let IpcStream::Server(pipe) = self else {
+            anyhow::bail!("Product request inspection requires a server pipe");
+        };
+        let mut prefix = [0_u8; 4];
+        pipe.read_exact(&mut prefix).await?;
+        let size = u32::from_le_bytes(prefix) as usize;
+        anyhow::ensure!(
+            size > 0 && size <= 64 * 1024,
+            "Product IPC frame exceeds the request budget"
+        );
+        let mut payload = vec![0_u8; size];
+        pipe.read_exact(&mut payload).await?;
+        Ok(serde_json::from_slice(&payload)?)
+    }
+
     /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
         match self {
-            IpcStream::Client(pipe) => write_json_message(pipe, request).await,
+            IpcStream::Client(pipe) | IpcStream::ProductClient(pipe, _) => {
+                write_json_message(pipe, request).await
+            }
             IpcStream::Server(pipe) => write_json_message(pipe, request).await,
         }
     }
@@ -416,7 +558,9 @@ impl IpcStream {
     /// Receive an IPC response.
     pub async fn recv_response(&mut self) -> Result<crate::IpcResponse> {
         let buf = match self {
-            IpcStream::Client(pipe) => read_message(pipe).await?,
+            IpcStream::Client(pipe) | IpcStream::ProductClient(pipe, _) => {
+                read_message(pipe).await?
+            }
             IpcStream::Server(pipe) => read_message(pipe).await?,
         };
         let response: crate::IpcResponse = serde_json::from_slice(&buf)?;
@@ -426,7 +570,9 @@ impl IpcStream {
     /// Send an IPC response.
     pub async fn send_response(&mut self, response: &crate::IpcResponse) -> Result<()> {
         match self {
-            IpcStream::Client(pipe) => write_json_message(pipe, response).await,
+            IpcStream::Client(pipe) | IpcStream::ProductClient(pipe, _) => {
+                write_json_message(pipe, response).await
+            }
             IpcStream::Server(pipe) => write_json_message(pipe, response).await,
         }
     }
@@ -434,7 +580,9 @@ impl IpcStream {
     /// Receive an IPC request.
     pub async fn recv_request(&mut self) -> Result<crate::IpcRequest> {
         let buf = match self {
-            IpcStream::Client(pipe) => read_message(pipe).await?,
+            IpcStream::Client(pipe) | IpcStream::ProductClient(pipe, _) => {
+                read_message(pipe).await?
+            }
             IpcStream::Server(pipe) => read_message(pipe).await?,
         };
         let request: crate::IpcRequest = serde_json::from_slice(&buf)?;
@@ -531,15 +679,91 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unix_management_socket_can_restart_and_recover_an_owned_stale_socket() {
-        let path = format!(
-            "/tmp/mrd-management-restart-test-{}-{}.sock",
+    async fn unix_client_refuses_a_socket_without_private_owner_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = private_test_directory("client-mode");
+        let path = directory.join("server.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let endpoint = IpcEndpoint::unix_socket(path.to_string_lossy());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(IpcClient::connect_with_endpoint(&endpoint).await.is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let client = IpcClient::connect_with_endpoint(&endpoint).await.unwrap();
+        let peer = listener.accept().await.unwrap();
+        drop(client);
+        drop(peer);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_core_socket_never_displaces_an_active_listener_or_regular_file() {
+        let directory = private_test_directory("core-security");
+        let path = directory.join("core.sock");
+        std::fs::write(&path, "preserve").unwrap();
+        let endpoint = IpcEndpoint::unix_socket(path.to_string_lossy());
+        assert!(IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "preserve");
+        std::fs::remove_file(&path).unwrap();
+        let active = IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .unwrap();
+        assert!(IpcServer::bind_with_endpoint(endpoint).await.is_err());
+        drop(active);
+        assert!(!path.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_core_socket_is_private_and_rejects_a_shared_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = private_test_directory("core-mode");
+        let path = directory.join("core.sock");
+        let endpoint = IpcEndpoint::unix_socket(path.to_string_lossy());
+        let server = IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(server);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(IpcServer::bind_with_endpoint(endpoint).await.is_err());
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn private_test_directory(name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = std::env::temp_dir().join(format!(
+            "mrd-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        );
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_management_socket_can_restart_and_recover_an_owned_stale_socket() {
+        let directory = private_test_directory("management-restart");
+        let path = directory
+            .join("management.sock")
+            .to_string_lossy()
+            .into_owned();
         let endpoint = IpcEndpoint::unix_socket(&path);
         let first = IpcServer::bind_management_with_endpoint(endpoint.clone())
             .await
@@ -560,19 +784,17 @@ mod tests {
             .unwrap();
         drop(recovered);
         assert!(!std::path::Path::new(&path).exists());
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_management_socket_never_replaces_regular_files_or_symlinks() {
-        let path = format!(
-            "/tmp/mrd-management-file-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let directory = private_test_directory("management-files");
+        let path = directory
+            .join("management.sock")
+            .to_string_lossy()
+            .into_owned();
         std::fs::write(&path, "preserve").unwrap();
         assert!(
             IpcServer::bind_management_with_endpoint(IpcEndpoint::unix_socket(&path))
@@ -589,5 +811,6 @@ mod tests {
         );
         std::fs::remove_file(link).unwrap();
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

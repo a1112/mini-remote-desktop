@@ -176,7 +176,11 @@ fn ensure_rustls_crypto_provider() {
 /// Tauri 命令：获取硬件信息
 #[tauri::command]
 fn get_hardware_info() -> Result<HardwareInfo, String> {
-    Ok(device_info::get_hardware_info())
+    let hardware = device_info::get_hardware_info();
+    if hardware.motherboard_serial.trim().is_empty() {
+        return Err("无法读取受保护设备身份，请解锁本机钥匙串或重启后台服务后重试".into());
+    }
+    Ok(hardware)
 }
 
 #[tauri::command]
@@ -2134,7 +2138,11 @@ async fn service_wait_for_stopped(
     state: tauri::State<'_, AppState>,
     timeout_secs: u64,
 ) -> Result<bool, String> {
-    state.service_manager.wait_for_stopped(timeout_secs).await.map_err(|error| format!("{error:#}"))
+    state
+        .service_manager
+        .wait_for_stopped(timeout_secs)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Check if this instance bootstrapped the service
@@ -2233,8 +2241,14 @@ struct AutostartStatus {
 #[tauri::command]
 async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
     let mut client = mrd_ipc::client::IpcClient::management();
-    match client.send_request(mrd_ipc::IpcRequest::GetAutostartStatus).await.map_err(|error| error.to_string())? {
-        mrd_ipc::IpcResponse::AutostartStatus { enabled, supported } => Ok(AutostartStatus { enabled, supported }),
+    match client
+        .send_request(mrd_ipc::IpcRequest::GetAutostartStatus)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        mrd_ipc::IpcResponse::AutostartStatus { enabled, supported } => {
+            Ok(AutostartStatus { enabled, supported })
+        }
         mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("Unexpected autostart status response".to_string()),
     }
@@ -2243,7 +2257,11 @@ async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
 #[tauri::command]
 async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
     let mut client = mrd_ipc::client::IpcClient::management();
-    match client.send_request(mrd_ipc::IpcRequest::SetAutostart { enabled }).await.map_err(|error| error.to_string())? {
+    match client
+        .send_request(mrd_ipc::IpcRequest::SetAutostart { enabled })
+        .await
+        .map_err(|error| error.to_string())?
+    {
         mrd_ipc::IpcResponse::Ack => Ok(()),
         mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("Unexpected autostart configuration response".to_string()),
@@ -2252,7 +2270,10 @@ async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
 
 /// Request service-owned shutdown and report rejection to the caller.
 #[tauri::command]
-async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn shell_shutdown_service(
+    mode: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let shutdown_mode = match mode.as_str() {
         "graceful" => mrd_ipc::ShutdownMode::Graceful,
         "force" => mrd_ipc::ShutdownMode::Force,
@@ -2260,7 +2281,11 @@ async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>)
         _ => return Err(format!("Unknown shutdown mode: {}", mode)),
     };
 
-    state.service_manager.request_shutdown(shutdown_mode).await.map_err(|error| format!("{error:#}"))
+    state
+        .service_manager
+        .request_shutdown(shutdown_mode)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Quit UI and stop service (explicit user action)
@@ -2268,8 +2293,14 @@ async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>)
 /// Phase 6: This now uses IPC ShutdownService instead of directly stopping
 /// the service process. Rdesk no longer owns service lifecycle.
 #[tauri::command]
-async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.service_manager.shutdown_and_wait(mrd_ipc::ShutdownMode::Graceful, 30).await
+async fn shell_quit_ui_and_stop_service(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .service_manager
+        .shutdown_and_wait(mrd_ipc::ShutdownMode::Graceful, 30)
+        .await
         .map_err(|error| format!("{error:#}"))?;
     request_app_exit(&app_handle, "user_quit");
     Ok(())
@@ -3072,6 +3103,22 @@ async fn ipc_secure_remote(request: mrd_ipc::IpcRequest) -> Result<mrd_ipc::IpcR
 
 /// Get runtime snapshot via IPC (migrated version)
 #[tauri::command]
+async fn ipc_public_server_status() -> Result<mrd_ipc::PublicServerStatus, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    let mut client = mrd_ipc::client::IpcClient::trusted_management();
+    match client
+        .send_request(IpcRequest::GetPublicServerStatus)
+        .await
+        .map_err(|_| "无法读取后台公网连接状态".to_owned())?
+    {
+        IpcResponse::PublicServerStatus { status } => Ok(status),
+        IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("后台返回的公网连接状态无效".into()),
+    }
+}
+
+/// Get runtime snapshot via IPC (migrated version)
+#[tauri::command]
 async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
@@ -3252,7 +3299,40 @@ async fn register_device(
     let api_base = std::env::var("RDESK_SERVER_URL")
         .ok()
         .or(api_base)
-        .unwrap_or_else(|| "http://127.0.0.1:9530/api/v1".to_owned());
+        .unwrap_or_else(|| "https://175.178.16.90/rdesk/api/v1".to_owned());
+    if api_base.trim_end_matches('/') == "https://175.178.16.90/rdesk/api/v1" {
+        use mrd_ipc::{IpcRequest, IpcResponse};
+        let request = match (enrollment_token, device_token) {
+            (Some(enrollment_token), None) => IpcRequest::EnrollPublicDevice {
+                enrollment_token: enrollment_token.into(),
+                device_name: device_name.unwrap_or(hostname),
+            },
+            (None, Some(device_token)) => IpcRequest::RecoverPublicDevice {
+                device_token: device_token.into(),
+            },
+            _ => return Err("请提供一次性设备登记码或管理员恢复凭据".into()),
+        };
+        let mut client = mrd_ipc::client::IpcClient::trusted_management();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            client.send_request(request),
+        )
+        .await
+        .map_err(|_| "后台设备登记超时，请重试同一登记码".to_owned())?
+        .map_err(|_| "无法连接设备后台服务".to_owned())?;
+        return match response {
+            IpcResponse::PublicServerStatus { status } if status.device_registered => {
+                Ok(DeviceRegistrationResponse {
+                    device_id: status.device_id.ok_or("后台设备码缺失")?,
+                    device_name: status.device_name.ok_or("后台设备名称缺失")?,
+                    access_token: "service-managed".into(),
+                    refresh_token: None,
+                })
+            }
+            IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+            _ => Err("后台设备登记响应无效".into()),
+        };
+    }
     mrd_device_registration::register_device(
         &api_base,
         &DeviceRegistrationRequest {
@@ -4652,7 +4732,9 @@ fn main() {
                                 eprintln!("Failed to register UI presence: {}", e);
                             }
                         }
-                        Ok(false) => eprintln!("mrd-service did not become ready within 30 seconds"),
+                        Ok(false) => {
+                            eprintln!("mrd-service did not become ready within 30 seconds")
+                        }
                         Err(e) => eprintln!("mrd-service health check failed: {e:#}"),
                     }
                 });
@@ -4732,6 +4814,7 @@ fn main() {
             ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
+            ipc_public_server_status,
             ipc_audit_log,
             ipc_capability_snapshot,
             ipc_peer_capability_snapshot,

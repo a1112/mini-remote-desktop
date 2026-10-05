@@ -84,6 +84,24 @@ fn replace_config_line(template: &[u8], needle: &str, replacement: Option<&str>)
     output.into_bytes()
 }
 
+#[test]
+fn allocation_bandwidth_is_derived_from_the_declared_total_and_quota() {
+    let baseline = hardened_coturn_template();
+    let sixteen = replace_config_line(&baseline, "total-quota=100", Some("total-quota=16"));
+    let sixteen = replace_config_line(
+        &sixteen,
+        "bps-capacity=125000000",
+        Some("bps-capacity=25000000"),
+    );
+    let valid = replace_config_line(&sixteen, "max-bps=1250000", Some("max-bps=1562500"));
+    assert!(render_linux_coturn_config(&valid, &[0x42; 32]).is_ok());
+    assert!(render_linux_coturn_config(&sixteen, &[0x42; 32]).is_err());
+    let excessive = replace_config_line(&valid, "max-bps=1562500", Some("max-bps=1562501"));
+    assert!(render_linux_coturn_config(&excessive, &[0x42; 32]).is_err());
+    let tiny = replace_config_line(&valid, "bps-capacity=25000000", Some("bps-capacity=8"));
+    assert!(render_linux_coturn_config(&tiny, &[0x42; 32]).is_err());
+}
+
 fn append_config_line(template: &[u8], line: &str) -> Vec<u8> {
     let mut output = template.to_vec();
     if !output.ends_with(b"\n") {

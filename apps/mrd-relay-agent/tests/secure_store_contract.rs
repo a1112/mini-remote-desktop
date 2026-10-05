@@ -725,6 +725,26 @@ fn linux_hardened_file_and_credential_reader_reject_links_and_loose_modes() {
 
     std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(reader.read_secret(), Err(SecureStoreError::Permissions));
+    std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o440)).unwrap();
+    assert_eq!(reader.read_secret(), Err(SecureStoreError::Permissions));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run in an isolated systemd mrd-relay-agent transient unit with a benign LoadCredential fixture"]
+fn linux_systemd_load_credential_accepts_only_the_protected_service_acl() {
+    let path =
+        std::path::PathBuf::from("/run/credentials/mrd-relay-agent.service/enrollment-token");
+    let reader = StrictCredentialFile::new_linux(path, 128)
+        .expect("systemd credential boundary must validate");
+    let secret = reader
+        .read_secret()
+        .expect("systemd credential must remain readable");
+    // Keep failed assertions from ever printing a production credential.
+    assert!(
+        secret.as_slice() == b"systemd-credential-fixture",
+        "unexpected fixture material"
+    );
 }
 
 #[cfg(target_os = "linux")]

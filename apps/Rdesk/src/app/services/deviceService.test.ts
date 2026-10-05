@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIpcRegisterDevice = vi.hoisted(() => vi.fn());
 const mockRegisterDevice = vi.hoisted(() => vi.fn());
+const mockPublicStatus = vi.hoisted(() => vi.fn());
 
 vi.mock("../adapters/tauri", () => ({
   ipcRegisterDevice: mockIpcRegisterDevice,
   registerDevice: mockRegisterDevice,
+  ipcPublicServerStatus: mockPublicStatus,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -34,6 +36,9 @@ describe("deviceService", () => {
     mockIpcRegisterDevice.mockReset();
     mockIpcRegisterDevice.mockResolvedValue({ ok: true, value: "registered" });
     mockRegisterDevice.mockReset();
+    mockPublicStatus.mockReset();
+    vi.spyOn(deviceService as any, "shouldUseServiceManagedRegistration").mockReturnValue(false);
+    vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(false);
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
     (window as any).__TAURI__ = {
@@ -188,5 +193,66 @@ describe("deviceService", () => {
     const info = await deviceService.initialize();
     expect(info).toBeNull();
     expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
+});
+
+describe("service-managed public device identity", () => {
+  const registeredStatus = {
+    service_running: true,
+    api_url: "https://175.178.16.90/rdesk/api/v1",
+    api_reachable: true,
+    device_registered: true,
+    device_id: "0123456789",
+    device_name: "Office PC",
+    signaling_state: "authenticated",
+    reconnect_attempt: 0,
+    last_connected_at_ms: 1000,
+    last_error: null,
+  };
+  beforeEach(() => {
+    localStorage.clear();
+    mockIpcRegisterDevice.mockReset();
+    mockIpcRegisterDevice.mockResolvedValue({ ok: true, value: "registered" });
+    mockRegisterDevice.mockReset();
+    mockPublicStatus.mockReset().mockResolvedValue({ ok: true, value: registeredStatus });
+    (deviceService as any).deviceInfo = null;
+    (deviceService as any).initPromise = null;
+    (window as any).__TAURI__ = { invoke: vi.fn().mockResolvedValue(hardwareInfo) };
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it("restores the resident identity without retrieving or refreshing a device JWT", async () => {
+    const info = await deviceService.initialize();
+    expect(info?.device_id).toBe("0123456789");
+    expect(info?.device_name).toBe("Office PC");
+    expect(info?.access_token).toBe("service-managed");
+    expect(mockRegisterDevice).not.toHaveBeenCalled();
+    expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
+    expect(deviceService.getAccessToken()).toBeNull();
+  });
+
+  it("does not present an old local-only identity as public registration", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify({ device_id: "lan-old", device_name: "Old PC", access_token: "local-p2p", motherboard_serial: "old", registered_at: "old" }));
+    mockPublicStatus.mockResolvedValue({ ok: true, value: { ...registeredStatus, device_registered: false, device_id: "lan-old" } });
+    expect(await deviceService.initialize()).toBeNull();
+    expect(deviceService.getDeviceId()).toBeNull();
+    expect(deviceService.getRegistrationError()).toContain("设备登记码");
+    expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
+  });
+
+  it("stores metadata after enrollment and skips the privileged legacy registration pipe", async () => {
+    mockRegisterDevice.mockResolvedValue({ ok: true, value: { device_id: "0123456789", device_name: "Office PC", access_token: "service-managed" } });
+    const enrollmentToken = "a".repeat(43);
+    const info = await deviceService.enroll(enrollmentToken, "Office PC");
+    expect(info.access_token).toBe("service-managed");
+    expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
+    expect(localStorage.getItem("rdesk_device_info")).not.toContain(enrollmentToken);
+    expect(mockRegisterDevice).toHaveBeenCalledWith(expect.objectContaining({ enrollmentToken, apiBase: "https://175.178.16.90/rdesk/api/v1" }));
+  });
+
+  it("does not send the service-managed placeholder back as a credential on initialization", async () => {
+    localStorage.setItem("rdesk_device_info", JSON.stringify({ device_id: "0123456789", device_name: "Office PC", access_token: "service-managed", motherboard_serial: "service-managed", registered_at: "old" }));
+    await deviceService.initialize();
+    expect(mockRegisterDevice).not.toHaveBeenCalled();
   });
 });
