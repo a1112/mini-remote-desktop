@@ -231,13 +231,22 @@ mod tests {
     }
 
     fn pending_birth_path() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "mrd-pending-birth-{}-{}.sqlite",
-            std::process::id(),
+        pending_birth_path_with_timestamp(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+        )
+    }
+
+    fn pending_birth_path_with_timestamp(timestamp: u128) -> std::path::PathBuf {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mrd-pending-birth-{}-{}-{}.sqlite",
+            std::process::id(),
+            timestamp,
+            sequence
         ));
         std::fs::OpenOptions::new()
             .write(true)
@@ -245,6 +254,30 @@ mod tests {
             .open(&path)
             .unwrap();
         path
+    }
+
+    #[test]
+    fn concurrent_birth_fixtures_are_independent_with_a_frozen_clock() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| pending_birth_path_with_timestamp(0)))
+            .collect();
+        // Reap every worker and remove its file even when the regression causes
+        // create_new to panic, before reporting the allocation failure.
+        let paths: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().ok())
+            .collect();
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        for path in &distinct {
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+            std::fs::remove_file(path).unwrap();
+        }
+        assert_eq!(
+            paths.len(),
+            8,
+            "every concurrent fixture must allocate a file"
+        );
+        assert_eq!(distinct.len(), 8, "fixtures must never share a file");
     }
 
     #[test]
