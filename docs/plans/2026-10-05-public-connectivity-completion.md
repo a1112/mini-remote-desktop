@@ -22,6 +22,17 @@ The user has authorized completing implementation, replacing the installed local
 
 ## Verification and rollback
 
+Native Mac controller acceptance must preserve the existing authorized DOM-to-IPC
+input path. The Metal presentation view sits above WKWebView, so a bare NSView
+intercepts pointer events. Use a render-only NSView subclass whose hitTest returns
+nil and which cannot become first responder. Presentation overlay windows ignore
+mouse events and cannot become key/main windows. Keep the current frame, layer and
+cleanup behavior. An independent AppKit main-thread fixture first reproduces the
+bare-view interception, then proves that the production policy returns the actual
+underlying view and retains its first responder. Run it on both native Mac
+architectures before packaging. Unify the direct window-vibrancy dependency with
+Tauri's version to avoid two definitions of the same Objective-C class.
+
 Live acceptance also found two disconnected paths: the legacy device list
 returns a static offline database field, and account binding sends only the
 user bearer even though the API correctly requires the device bearer too.

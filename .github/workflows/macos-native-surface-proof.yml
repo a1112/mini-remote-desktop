@@ -1,0 +1,34 @@
+name: macOS native surface input proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-appkit:
+    name: AppKit input routing (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: apple-silicon
+            runner: macos-15
+          - architecture: intel
+            runner: macos-15-intel
+    env:
+      CARGO_BUILD_JOBS: "2"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/macos-native-surface-proof -> target
+          shared-key: appkit-input-${{ matrix.architecture }}
+          cache-on-failure: true
+      - name: Prove real native input routing on the main thread
+        run: cargo run --locked --manifest-path tests/macos-native-surface-proof/Cargo.toml

@@ -58,6 +58,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify registration and protected storage
         run: cargo test --locked -p mrd-device-registration -p mrd-store-sqlite -p mrd-ipc
+      - name: Verify real AppKit viewport input routing
+        run: cargo run --locked --manifest-path tests/macos-native-surface-proof/Cargo.toml
       - name: Build client and embedded resident service
         run: bash scripts/packaging/build_macos_client.sh
       - name: Verify real native service startup and restart
