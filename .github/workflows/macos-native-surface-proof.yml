@@ -30,7 +30,28 @@ jobs:
           workspaces: tests/macos-native-surface-proof -> target
           shared-key: appkit-input-${{ matrix.architecture }}
           cache-on-failure: true
-      - name: Typecheck native UI window smoke helper
-        run: /usr/bin/xcrun swiftc -typecheck apps/Rdesk/scripts/smoke-macos-ui-window.swift
+      - name: Compile native UI window smoke helper with a fresh module cache
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          helper_directory="$(mktemp -d "$RUNNER_TEMP/mrd-window-helper-proof.XXXXXX")"
+          module_cache="$helper_directory/module-cache"
+          helper_executable="$helper_directory/window-check"
+          mkdir -m 700 "$module_cache"
+          started_seconds=$SECONDS
+          printf 'Native window helper cold compile started: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          printf 'Native window helper output: %s\n' "$helper_executable"
+          set +e
+          /usr/bin/time -p /usr/bin/xcrun swiftc \
+            apps/Rdesk/scripts/smoke-macos-ui-window.swift \
+            -module-cache-path "$module_cache" -o "$helper_executable"
+          compile_status=$?
+          set -e
+          printf 'Native window helper cold compile finished: elapsed=%ss exit=%s\n' \
+            "$((SECONDS - started_seconds))" "$compile_status"
+          if [ "$compile_status" -ne 0 ]; then exit "$compile_status"; fi
+          test -f "$helper_executable" && test ! -L "$helper_executable" && test -x "$helper_executable"
+          /usr/bin/file "$helper_executable"
       - name: Prove real native input routing on the main thread
         run: cargo run --locked --manifest-path tests/macos-native-surface-proof/Cargo.toml
