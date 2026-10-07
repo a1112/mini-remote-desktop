@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     auth,
     device_sessions,
+    device_self_enrollment,
     devices,
     network_groups,
     public,
@@ -17,6 +18,7 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
 api_router.include_router(device_sessions.router)
 api_router.include_router(devices.router)
+api_router.include_router(device_self_enrollment.router)
 api_router.include_router(network_groups.router)
 api_router.include_router(public.router)
 api_router.include_router(realtime.router)

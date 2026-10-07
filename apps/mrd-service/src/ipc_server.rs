@@ -31,6 +31,12 @@ pub struct IpcServer {
     product_only: bool,
     #[cfg(windows)]
     product_caller: Option<crate::agent_runtime::ObservedAgentIdentity>,
+    #[cfg(windows)]
+    product_audit_owners: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<mrd_proto::SessionId, product::ProductAuditOwner>,
+        >,
+    >,
 }
 
 impl IpcServer {
@@ -96,6 +102,8 @@ impl IpcServer {
             product_only: false,
             #[cfg(windows)]
             product_caller: None,
+            #[cfg(windows)]
+            product_audit_owners: Default::default(),
         }
     }
 
@@ -114,6 +122,8 @@ impl IpcServer {
             product_only: false,
             #[cfg(windows)]
             product_caller: None,
+            #[cfg(windows)]
+            product_audit_owners: Default::default(),
         }
     }
 

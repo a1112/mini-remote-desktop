@@ -1067,6 +1067,27 @@ export interface TrustedDeviceSnapshot {
   updated_at_ms: number;
 }
 
+/** Signed discovery candidate issued by the service. Its ID is a public selector. */
+export interface LanPairingCandidate {
+  candidate_id: string;
+  device_id: string;
+  device_name: string;
+  peer_key_id: string;
+  key_epoch: DecimalU64;
+  discovery_endpoint: string;
+  expires_at_ms: number;
+  permission_ceiling: RemotePermissionScope[];
+}
+
+export interface LanPairingApproval {
+  candidate_id: string;
+  device_id: string;
+  peer_key_id: string;
+  key_epoch: DecimalU64;
+  discovery_endpoint: string;
+  permission_ceiling: RemotePermissionScope[];
+}
+
 export interface TrustedDeviceApproval {
   peer_key_id: string;
   key_epoch: DecimalU64;

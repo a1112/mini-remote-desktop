@@ -244,7 +244,7 @@ describe("service-managed public device identity", () => {
     mockPublicStatus.mockResolvedValue({ ok: true, value: { ...registeredStatus, device_registered: false, device_id: "lan-old" } });
     expect(await deviceService.initialize()).toBeNull();
     expect(deviceService.getDeviceId()).toBeNull();
-    expect(deviceService.getRegistrationError()).toContain("设备登记码");
+    expect(deviceService.getRegistrationError()).toContain("设备尚未登记到服务器");
     expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
   });
 

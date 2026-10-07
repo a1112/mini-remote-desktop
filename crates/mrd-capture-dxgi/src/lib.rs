@@ -39,6 +39,44 @@ use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
 };
+#[cfg(windows)]
+use windows::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
+
+// Output coordinates and GDI fallback pixels must use the same physical space.
+// Restore the caller's context on every return, without changing process DPI.
+#[cfg(windows)]
+struct PhysicalPixelContext {
+    previous: DPI_AWARENESS_CONTEXT,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(windows)]
+impl PhysicalPixelContext {
+    fn enter() -> Result<Self, PipelineError> {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.0.is_null() {
+            return Err(PipelineError::message(
+                "cannot enter physical-pixel DPI context",
+            ));
+        }
+        Ok(Self {
+            previous,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PhysicalPixelContext {
+    fn drop(&mut self) {
+        unsafe {
+            SetThreadDpiAwarenessContext(self.previous);
+        }
+    }
+}
 
 #[cfg(windows)]
 // Keep the media sender paced by the requested profile. When Desktop Duplication
@@ -67,12 +105,16 @@ pub struct DxgiDesktopCapture {
 impl DxgiDesktopCapture {
     /// Number of physical displays currently visible to the capture backend.
     pub fn display_count() -> Result<usize, PipelineError> {
+        #[cfg(windows)]
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         Display::all()
             .map(|displays| displays.len())
             .map_err(|error| PipelineError::message(format!("enumerate displays failed: {error}")))
     }
 
     pub fn new_primary() -> Result<Self, PipelineError> {
+        #[cfg(windows)]
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         let display = Display::primary().map_err(|error| {
             PipelineError::message(format!("open primary display failed: {error}"))
         })?;
@@ -81,6 +123,8 @@ impl DxgiDesktopCapture {
 
     /// Open one enumerated physical display by its product display index.
     pub fn new_for_index(display_index: u32) -> Result<Self, PipelineError> {
+        #[cfg(windows)]
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         let displays = Display::all().map_err(|error| {
             PipelineError::message(format!("enumerate displays failed: {error}"))
         })?;
@@ -93,6 +137,8 @@ impl DxgiDesktopCapture {
     }
 
     pub fn new(display: Display) -> Result<Self, PipelineError> {
+        #[cfg(windows)]
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         Self::new_for_display(display, None)
     }
 
@@ -234,6 +280,8 @@ fn dxgi_cpu_target_for_scrap_index(index: usize) -> Result<DxgiOutputTarget, Pip
 impl FrameCapture for DxgiDesktopCapture {
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
         #[cfg(windows)]
+        let _physical_pixels = PhysicalPixelContext::enter()?;
+        #[cfg(windows)]
         let initial_wait_started_at = Instant::now();
         loop {
             match self.capturer.frame() {
@@ -356,6 +404,7 @@ impl DxgiSharedTextureCapture {
         mut accepts_output: impl FnMut(&DXGI_OUTPUT_DESC) -> bool,
         missing_message: &str,
     ) -> Result<Self, PipelineError> {
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.map_err(|error| {
             PipelineError::message(format!("CreateDXGIFactory1 failed: {error}"))
         })?;
@@ -547,6 +596,7 @@ impl FrameCapture for DxgiSharedTextureCapture {
     }
 
     fn capture_frame(&mut self) -> Result<CapturedFrame, PipelineError> {
+        let _physical_pixels = PhysicalPixelContext::enter()?;
         let Some(duplication) = self.duplication.as_ref().cloned() else {
             return self.recover_duplication_after_access_lost();
         };
@@ -732,6 +782,7 @@ fn capture_gdi_bgra_region(
     target_width: usize,
     target_height: usize,
 ) -> Result<Vec<u8>, PipelineError> {
+    let _physical_pixels = PhysicalPixelContext::enter()?;
     let target_width_i32 = i32::try_from(target_width)
         .map_err(|_| PipelineError::message("GDI target width exceeds i32"))?;
     let target_height_i32 = i32::try_from(target_height)
@@ -1096,6 +1147,7 @@ mod tests {
 
 #[cfg(windows)]
 pub fn enumerate_dxgi_output_targets() -> Result<Vec<DxgiOutputTarget>, PipelineError> {
+    let _physical_pixels = PhysicalPixelContext::enter()?;
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
         .map_err(|error| PipelineError::message(format!("CreateDXGIFactory1 failed: {error}")))?;
     let mut targets = Vec::new();

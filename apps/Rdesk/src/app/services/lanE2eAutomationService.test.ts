@@ -532,6 +532,190 @@ function withCaptureSourceCommands(
   };
 }
 
+const SCREEN_VIEW_BASELINE: MediaProfile = {
+  width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: "h264",
+  color_mode: "full", color_pipeline: "sdr8",
+};
+
+function createScreenViewCommands(profile = SCREEN_VIEW_BASELINE) {
+  const fixture = createSecureScenarioCommands({
+    remoteSession: { requested_scopes: ["screen.view"], granted_scopes: ["screen.view"] },
+    trustedDevice: { permission_ceiling: ["screen.view"] },
+  });
+  fixture.commands.ipcProbeSnapshot = vi.fn().mockResolvedValue(ok({
+    session_id: SECURE_SESSION_ID, frames_received: 4, frames_decoded: 3, frames_dropped: 0,
+    current_fps: 60, bitrate_mbps: profile.bitrate_mbps, media_probe_valid: true,
+    media_probe_format: "compressed_h264_test_pattern", media_probe_width: profile.width,
+    media_probe_height: profile.height, media_probe_target_fps: profile.fps,
+    media_probe_target_bitrate_mbps: profile.bitrate_mbps,
+  }));
+  fixture.commands.ipcMediaPipelineSnapshot = vi.fn().mockResolvedValue(ok({
+    session_id: SECURE_SESSION_ID, attached_surfaces: [DEFAULT_ATTACHED_SURFACE],
+    active_decoder: "nvdec", active_renderer: "d3d11", active_codec: "h264",
+    active_width: profile.width, active_height: profile.height, active_fps: profile.fps,
+    queue_depth: 0, dropped_frames: 0, render_presented_frames: 3, stage_metrics: [],
+    sender_transport: { capture_source_id: "display", capture_source_kind: "display" },
+  }));
+  return fixture;
+}
+
+describe("installed product screen-view performance baseline", () => {
+  const options = {
+    scenarioId: "cross.e2e.secure_remote_display" as const, targetDeviceId: "agent-device",
+    transportKind: "quic" as const, displayModePolicy: "none" as const,
+    requestedProfile: SCREEN_VIEW_BASELINE, sampleIntervalMs: 0, timeoutMs: 20,
+    createSessionId: () => SECURE_SESSION_ID,
+  };
+
+  it.each([SCREEN_VIEW_BASELINE, { ...SCREEN_VIEW_BASELINE, width: 2560, height: 1440, bitrate_mbps: 30 }])(
+    "uses only the attended screen.view contract and records the actual default source: %j",
+    async profile => {
+      const { commands, ipcRequestRemoteSession, ipcSendControlInput } = createScreenViewCommands(profile);
+      const result = await runLanE2EAutomation(commands, { ...options, requestedProfile: profile });
+      expect(result.status).toBe("completed");
+      expect(ipcRequestRemoteSession).toHaveBeenCalledWith({
+        session_id: SECURE_SESSION_ID, target_device_id: "agent-device", access_mode: "attended",
+        route_preference: "lan", requested_scopes: ["screen.view"], requested_profile: profile,
+      });
+      expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+      expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalled();
+      expect(commands.ipcSetRemoteDisplayMode).not.toHaveBeenCalled();
+      expect(ipcSendControlInput).not.toHaveBeenCalled();
+      expect(result.secureSessionEvidence?.authorizedInputVerified).toBe(false);
+      expect(result.captureSource?.id).toBe("display");
+      expect(result.captureSourceSelection).toBeUndefined();
+    },
+  );
+
+  it("waits for explicit user pairing when the verified service projection is not P2P available", async () => {
+    const { commands } = createScreenViewCommands();
+    const discovery = await commands.ipcRefreshLanDiscovery();
+    if (!discovery.ok) throw new Error(discovery.error.message);
+    const pendingPeer = { ...discovery.value.peers[0]!, p2p_available: false, p2p_control_addr: "" };
+    commands.ipcRefreshLanDiscovery = vi.fn().mockResolvedValue(ok({ ...discovery.value, peers: [pendingPeer] }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("peer_pairing_required");
+    expect(result.errorMessage).toContain("局域网配对");
+    expect(result.peer?.p2p_available).toBe(false);
+    expect(commands.ipcRequestRemoteSession).not.toHaveBeenCalled();
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("polls actual authorization snapshots while native consent is pending", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession, ipcRequestRemoteSession } = createScreenViewCommands();
+    const pending = { ...remoteSession, authorization_state: "authorizing" as const,
+      granted_scopes: [], route_state: "idle" as const, media_state: "idle" as const,
+      presentation_state: "authenticating" as const };
+    ipcRequestRemoteSession.mockResolvedValue(ok(pending));
+    ipcGetRemoteSession.mockResolvedValueOnce(ok(pending)).mockResolvedValue(ok(remoteSession));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("completed");
+    expect(ipcGetRemoteSession.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(commands.ipcStartLanRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it("reports waiting for native consent without sampling or calling privileged selection", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession, ipcRequestRemoteSession } = createScreenViewCommands();
+    const pending = { ...remoteSession, authorization_state: "authorizing" as const,
+      granted_scopes: [], route_state: "idle" as const, media_state: "idle" as const,
+      presentation_state: "authenticating" as const };
+    ipcRequestRemoteSession.mockResolvedValue(ok(pending));
+    ipcGetRemoteSession.mockResolvedValue(ok(pending));
+    const result = await runLanE2EAutomation(commands, { ...options, timeoutMs: 1 });
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("user_consent_required");
+    expect(result.sampleDurationMs).toBe(0);
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalled();
+    expect(commands.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(commands.ipcGetAuditEventsV2).not.toHaveBeenCalled();
+  });
+
+  it("cannot substitute another session while waiting for the user's decision", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession, ipcRequestRemoteSession } = createScreenViewCommands();
+    ipcRequestRemoteSession.mockResolvedValue(ok({ ...remoteSession, authorization_state: "authorizing", granted_scopes: [] }));
+    ipcGetRemoteSession.mockResolvedValue(ok({ ...remoteSession, session_id: "other-session" }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("session id mismatch");
+    expect(commands.ipcStartReceiver).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unexpectedly widened screen-view grant", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession } = createScreenViewCommands();
+    ipcGetRemoteSession.mockResolvedValue(ok({ ...remoteSession, granted_scopes: ["screen.view", "input.pointer"] }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("scope");
+    expect(commands.ipcSendControlInput).not.toHaveBeenCalled();
+  });
+
+  it("reports missing sender source metadata as unknown without guessing a source", async () => {
+    const { commands } = createScreenViewCommands();
+    const original = commands.ipcMediaPipelineSnapshot;
+    commands.ipcMediaPipelineSnapshot = async sessionId => {
+      const result = await original(sessionId);
+      return result.ok ? ok({ ...result.value, sender_transport: null }) : result;
+    };
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("completed");
+    expect(result.captureSource).toBeUndefined();
+    expect(result.captureSourceSelection).toBeUndefined();
+    expect(result.stages.some(stage => stage.stage === "capture_source" && stage.error?.includes("source ID is unavailable"))).toBe(true);
+    expect(commands.ipcSelectRemoteCaptureSource).not.toHaveBeenCalled();
+  });
+
+  it("does not relabel an audit failure as consent waiting merely because a session is pending", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession, ipcRequestRemoteSession } = createScreenViewCommands();
+    ipcRequestRemoteSession.mockResolvedValue(err("audit append unavailable"));
+    ipcGetRemoteSession.mockResolvedValue(ok({ ...remoteSession, authorization_state: "authorizing", granted_scopes: [] }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("failed");
+    expect(result.failureReason).toBe("session_start_failed");
+    expect(result.errorMessage).toContain("audit append unavailable");
+  });
+
+  it("recognizes a service-projected native consent deadline after a request error", async () => {
+    const { commands, remoteSession, ipcGetRemoteSession, ipcRequestRemoteSession } = createScreenViewCommands();
+    ipcRequestRemoteSession.mockResolvedValue(err("remote authorization deadline"));
+    ipcGetRemoteSession.mockResolvedValue(ok({ ...remoteSession, authorization_state: "expired", granted_scopes: [],
+      failure: { code: "authorization_timeout", message: "local native consent expired" } }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("user_consent_required");
+    expect(commands.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(result.sampleDurationMs).toBe(0);
+  });
+
+  it("asks the user to initialize a missing product identity without legacy registration", async () => {
+    const { commands } = createScreenViewCommands();
+    commands.ipcRuntimeSnapshot = vi.fn().mockResolvedValue(ok({ device_id: null, is_registered: false, sessions: [] }));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("skipped");
+    expect(result.failureReason).toBe("local_device_registration_failed");
+    expect(commands.ipcRegisterDevice).not.toHaveBeenCalled();
+    expect(commands.ipcRequestRemoteSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["0", "invalid", "18446744073709551616"])("rejects an invalid trusted-key epoch: %s", async keyEpoch => {
+    const { commands, trustedDevice, ipcListTrustedDevices } = createScreenViewCommands();
+    ipcListTrustedDevices.mockResolvedValue(ok([{ ...trustedDevice, key_epoch: keyEpoch }]));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("key epoch");
+  });
+
+  it("detects a trusted-key epoch change across the media sample", async () => {
+    const { commands, trustedDevice, ipcListTrustedDevices } = createScreenViewCommands();
+    ipcListTrustedDevices.mockResolvedValueOnce(ok([trustedDevice]))
+      .mockResolvedValue(ok([{ ...trustedDevice, key_epoch: "2" }]));
+    const result = await runLanE2EAutomation(commands, options);
+    expect(result.status).toBe("failed");
+    expect(result.errorMessage).toContain("key epoch");
+  });
+});
+
 describe("runLanE2EAutomation", () => {
   it("runs cross-device discovery without starting a session", async () => {
     const commands = createCommands();
@@ -777,6 +961,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -791,6 +976,7 @@ describe("runLanE2EAutomation", () => {
       session_id: SECURE_SESSION_ID,
       target_device_id: "agent-device",
       access_mode: "attended",
+      route_preference: "lan",
       requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: DEFAULT_REQUESTED_PROFILE,
     });
@@ -843,6 +1029,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -865,6 +1052,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -889,6 +1077,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -912,6 +1101,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -957,6 +1147,7 @@ describe("runLanE2EAutomation", () => {
     let currentTime = Date.now();
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -982,6 +1173,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -1021,6 +1213,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -1056,6 +1249,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -1079,6 +1273,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       requestedProfile: {
@@ -1108,6 +1303,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -1129,6 +1325,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,
@@ -1155,6 +1352,7 @@ describe("runLanE2EAutomation", () => {
 
     const result = await runLanE2EAutomation(commands, {
       scenarioId: "cross.e2e.secure_remote_display",
+      verifyControlInput: true,
       targetDeviceId: "agent-device",
       transportKind: "quic",
       sampleIntervalMs: 0,

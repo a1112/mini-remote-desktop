@@ -24,6 +24,7 @@ import { useDevices, Device } from "./deviceData";
 import { useTheme } from "./ThemeContext";
 import { NetworkGroupSelector } from "./NetworkGroupSelector";
 import { NetworkGroupEditModal } from "./NetworkGroupEditModal";
+import { LanPairingPanel } from "./LanPairingPanel";
 import { useNetworkGroups } from "../hooks/useNetworkGroups";
 import { networkGroupService } from "../services/networkGroupService";
 import {
@@ -51,6 +52,7 @@ export function DevicesPage() {
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupDescription, setNewGroupDescription] = useState("");
   const [launchingDeviceId, setLaunchingDeviceId] = useState<string | null>(null);
+  const [lanPairingOpen, setLanPairingOpen] = useState(false);
 
   // 右键菜单状态
   const [contextMenu, setContextMenu] = useState<{
@@ -221,21 +223,6 @@ export function DevicesPage() {
     }
   };
 
-  if (loading) {
-    return (
-      <div className={`flex items-center justify-center h-full ${textPrimary}`}>
-        加载设备中...
-      </div>
-    );
-  }
-  if (error) {
-    return (
-      <div className={`flex items-center justify-center h-full text-red-500`}>
-        设备加载失败: {error}
-      </div>
-    );
-  }
-
   return (
     <div className="flex h-full">
       {/* Main list */}
@@ -327,13 +314,20 @@ export function DevicesPage() {
             {launchingDeviceId === "__local_test__" ? "Opening..." : "测试窗口"}
           </button>
           <button
+            aria-expanded={lanPairingOpen}
+            onClick={() => setLanPairingOpen(open => !open)}
             className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"
             style={{ fontSize: 13 }}
           >
-            <Plus className="w-3.5 h-3.5" />
-            添加设备
+            <Wifi className="w-3.5 h-3.5" />
+            局域网配对
           </button>
         </div>
+
+        {lanPairingOpen ? <LanPairingPanel isDark={isDark} onPaired={refresh} /> : null}
+
+        {loading ? <p role="status" className={`mb-3 ${textPrimary}`}>加载设备中...</p> : null}
+        {error ? <p role="alert" className="mb-3 text-red-500">设备加载失败: {error}</p> : null}
 
         {/* 设备列表 */}
         <div className="grid grid-cols-2 gap-3">

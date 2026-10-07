@@ -405,6 +405,9 @@ export function scriptClassificationFromLanE2EReport(
   }
 
   switch (report.failureReason) {
+    case "peer_pairing_required":
+    case "user_consent_required":
+      return "skipped";
     case "peer_not_ready":
     case "peer_not_found":
       return "unsupported";

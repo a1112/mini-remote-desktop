@@ -1,16 +1,16 @@
 /**
  * 设备注册服务
  *
- * 自动处理设备注册，类似 RustDesk 的行为：
- * 1. 首次启动时自动获取硬件信息并注册
- * 2. 注册成功后保存设备信息到本地
- * 3. 后续启动时验证设备状态
+ * 读取后台持有的公网设备身份，持续同步设备码和连接状态。
+ * 首次登记/凭据恢复由显式登记流程完成，后台托管的凭据不进入前端缓存。
  */
 
 import { useEffect, useState } from "react";
 import { ipcBindPublicDevice, ipcUnbindPublicDevice, ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
+import type { PublicServerStatus } from "../adapters/tauri/types";
 import { isTauriRuntime } from "../utils/runtime";
 import { DEFAULT_PUBLIC_API_URL, DEVICE_REGISTRATION_MODE, SERVER_API_URL } from "./serverConfig";
+import { automaticEnrollmentMessage } from "../utils/automaticDeviceEnrollment";
 
 interface HardwareInfo {
   motherboard_serial: string;
@@ -50,6 +50,33 @@ const LOCAL_ACCESS_TOKEN = "local-p2p";
 const SERVICE_MANAGED_TOKEN = "service-managed";
 const API_BASE = SERVER_API_URL;
 
+interface PublicServerStatusState {
+  status: PublicServerStatus | null;
+  checking: boolean;
+  failed: boolean;
+}
+
+function publicRegistrationError(status: PublicServerStatus): string | null {
+  if (!status.service_running) return "本机后台服务未运行，启动后将自动重试。";
+  if (!status.api_url) return "公网服务器未配置，请检查服务器设置。";
+  if (!status.device_registered) {
+    const enrollmentMessage = automaticEnrollmentMessage(status.last_error);
+    if (enrollmentMessage) return enrollmentMessage;
+  }
+  if (status.api_reachable === false || status.last_error === "public_api_unreachable") {
+    return "无法连接公网服务器，正在自动重试；请检查网络。";
+  }
+  if (status.last_error === "public_configuration_unavailable") {
+    return "服务器接口可达，连接配置暂未就绪，正在自动重试。";
+  }
+  if (!status.device_registered || !status.device_id) {
+    return status.api_reachable === null
+      ? "正在检查服务器连接和设备登记状态。"
+      : "设备尚未登记到服务器，请完成设备登记；后台状态将自动刷新。";
+  }
+  return null;
+}
+
 /**
  * 设备注册服务类
  */
@@ -58,10 +85,51 @@ class DeviceRegistrationService {
   private registrationError: string | null = null;
   private bindingError: string | null = null;
   private initPromise: Promise<StoredDeviceInfo | null> | null = null;
+  private listeners = new Set<() => void>();
+  private publicStatusObservers = 0;
+  private publicStatusInterval: number | null = null;
+  private publicStatusRequest: Promise<StoredDeviceInfo | null> | null = null;
+  private publicStatusState: PublicServerStatusState = { status: null, checking: true, failed: false };
+  private readonly onVisible = () => { if (!document.hidden) void this.refreshPublicServerStatus(); };
+
+  private publish(): void {
+    this.listeners.forEach((listener) => listener());
+  }
+
+  private subscribe(listener: () => void, observePublicStatus: boolean): () => void {
+    this.listeners.add(listener);
+    if (observePublicStatus && this.publicStatusObservers++ === 0) {
+      this.publicStatusState = { status: null, checking: true, failed: false };
+      void this.refreshPublicServerStatus();
+      this.publicStatusInterval = window.setInterval(this.onVisible, 3000);
+      document.addEventListener("visibilitychange", this.onVisible);
+    }
+    return () => {
+      this.listeners.delete(listener);
+      if (observePublicStatus && --this.publicStatusObservers === 0) {
+        if (this.publicStatusInterval !== null) window.clearInterval(this.publicStatusInterval);
+        this.publicStatusInterval = null;
+        document.removeEventListener("visibilitychange", this.onVisible);
+        this.publicStatusState = { status: null, checking: true, failed: false };
+      }
+    };
+  }
+
+  subscribeDeviceRegistration(listener: () => void): () => void {
+    return this.subscribe(listener, this.shouldUseServiceManagedRegistration());
+  }
+
+  subscribePublicServerStatus(listener: () => void): () => void {
+    return this.subscribe(listener, true);
+  }
+
+  getPublicServerStatus(): PublicServerStatusState {
+    return this.publicStatusState;
+  }
 
   /**
    * 初始化设备注册服务
-   * 自动检查注册状态，如果未注册则自动注册
+   * 检查后台登记状态或恢复已有设备信息
    */
   async initialize(): Promise<StoredDeviceInfo | null> {
     // 如果已经在初始化，返回现有 Promise
@@ -76,6 +144,7 @@ class DeviceRegistrationService {
       return result;
     } finally {
       this.initPromise = null;
+      this.publish();
     }
   }
 
@@ -85,7 +154,7 @@ class DeviceRegistrationService {
     this.registrationError = null;
     const stored = this.getStoredDeviceInfo();
     if (this.shouldUseServiceManagedRegistration()) {
-      return this.restoreServiceManagedDevice(stored);
+      return this.refreshPublicServerStatus();
     }
     if (stored && !this.isLocalOnlyDevice(stored) && stored.access_token !== SERVICE_MANAGED_TOKEN) {
       // A failed refresh must never destroy a server-assigned identity.
@@ -161,6 +230,7 @@ class DeviceRegistrationService {
     };
     this.saveDeviceInfo(info);
     this.deviceInfo = info;
+    this.publish();
     if (info.access_token !== SERVICE_MANAGED_TOKEN) void this.syncWithLocalService(info);
     return info;
   }
@@ -169,16 +239,31 @@ class DeviceRegistrationService {
     return this.shouldUseServerRegistration() && API_BASE === DEFAULT_PUBLIC_API_URL;
   }
 
-  private async restoreServiceManagedDevice(stored: StoredDeviceInfo | null): Promise<StoredDeviceInfo | null> {
+  /** One request and one poller serve every mounted status/identity consumer. */
+  refreshPublicServerStatus(): Promise<StoredDeviceInfo | null> {
+    if (this.publicStatusRequest) return this.publicStatusRequest;
+    this.publicStatusState = { ...this.publicStatusState, checking: true };
+    this.publish();
+    this.publicStatusRequest = this.readPublicServerStatus().finally(() => {
+      this.publicStatusRequest = null;
+    });
+    return this.publicStatusRequest;
+  }
+
+  private async readPublicServerStatus(): Promise<StoredDeviceInfo | null> {
     try {
       const result = await ipcPublicServerStatus();
       if (!result.ok) throw new Error("无法读取本机设备登记状态，请确认后台服务已启动");
       const status = result.value;
+      this.publicStatusState = { status, checking: false, failed: false };
+      if (!this.shouldUseServiceManagedRegistration()) return this.deviceInfo;
+      const stored = this.getStoredDeviceInfo();
+      this.registrationError = publicRegistrationError(status);
       if (!status.device_registered || !status.device_id) {
         this.deviceInfo = null;
-        this.registrationError = "需要设备登记码，请向服务器管理员获取一次性登记码后注册";
         return null;
       }
+      const previousDeviceId = this.deviceInfo?.device_id;
       const info: StoredDeviceInfo = {
         device_id: status.device_id,
         device_name: status.device_name ?? stored?.device_name ?? "本机设备",
@@ -186,15 +271,23 @@ class DeviceRegistrationService {
         motherboard_serial: "service-managed",
         registered_at: stored?.registered_at ?? new Date().toISOString(),
       };
-      this.saveDeviceInfo(info);
+      if (JSON.stringify(info) !== JSON.stringify(stored)) this.saveDeviceInfo(info);
       this.deviceInfo = info;
-      await this.bindManagedDeviceIfLoggedIn();
+      this.publish();
+      // Polling never repeatedly binds the same device. Login binds explicitly.
+      if (previousDeviceId !== info.device_id) await this.bindManagedDeviceIfLoggedIn();
       return info;
     } catch {
-      this.registrationError = "无法读取本机设备登记状态，请确认后台服务已启动后重试";
-      // A cached code is display metadata only. It never proves public connectivity.
-      this.deviceInfo = stored?.access_token === SERVICE_MANAGED_TOKEN ? stored : null;
+      this.publicStatusState = { status: null, checking: false, failed: true };
+      if (this.shouldUseServiceManagedRegistration()) {
+        this.registrationError = "暂时无法读取后台设备登记状态，正在自动重试。";
+        // A cached code is display metadata only. It never proves public connectivity.
+        const stored = this.getStoredDeviceInfo();
+        this.deviceInfo = stored?.access_token === SERVICE_MANAGED_TOKEN ? stored : null;
+      }
       return this.deviceInfo;
+    } finally {
+      this.publish();
     }
   }
 
@@ -204,6 +297,7 @@ class DeviceRegistrationService {
 
   private recordBindingError(message: string | null): void {
     this.bindingError = message;
+    this.publish();
     window.dispatchEvent(new Event("rdesk:device-binding-changed"));
   }
 
@@ -588,13 +682,14 @@ export function useDeviceRegistration() {
   };
 
   useEffect(() => {
-    const onBindingChanged = () => updateInfo(deviceService.getDeviceInfo());
-    window.addEventListener("rdesk:device-binding-changed", onBindingChanged);
+    const unsubscribe = deviceService.subscribeDeviceRegistration(() => updateInfo(deviceService.getDeviceInfo()));
+    let mounted = true;
     deviceService.initialize().then((info) => {
+      if (!mounted) return;
       updateInfo(info);
       setIsLoading(false);
     });
-    return () => window.removeEventListener("rdesk:device-binding-changed", onBindingChanged);
+    return () => { mounted = false; unsubscribe(); };
   }, []);
 
   return {
@@ -603,8 +698,19 @@ export function useDeviceRegistration() {
     isRegistered,
     isLoading,
     registrationError,
-    refresh: () => updateInfo(deviceService.getDeviceInfo()),
+    refresh: async () => updateInfo(await deviceService.initialize()),
     getAccessToken: () => deviceService.getAccessToken(),
     reregister: () => deviceService.reregister(),
   };
+}
+
+/** Secret-free live connectivity; cached device metadata cannot make this online. */
+export function usePublicServerStatus() {
+  const [snapshot, setSnapshot] = useState(() => deviceService.getPublicServerStatus());
+  useEffect(() => {
+    const unsubscribe = deviceService.subscribePublicServerStatus(() => setSnapshot(deviceService.getPublicServerStatus()));
+    setSnapshot(deviceService.getPublicServerStatus());
+    return unsubscribe;
+  }, []);
+  return { ...snapshot, refresh: () => deviceService.refreshPublicServerStatus() };
 }

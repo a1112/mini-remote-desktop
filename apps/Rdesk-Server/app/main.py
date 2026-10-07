@@ -13,6 +13,9 @@ from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
 from app.db.migrate_add_relay_redundancy import migrate as migrate_relay_redundancy
+from app.db.migrate_add_device_self_enrollment import (
+    SELF_ENROLLMENT_TABLES, migrate as migrate_device_self_enrollment,
+)
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
@@ -25,9 +28,15 @@ async def lifespan(_: FastAPI):
         await migrate_relay_control(conn)
         # legacy/dev bootstrap only. Relay tables are created and verified by the
         # explicit versioned migration above, never by metadata.create_all.
-        await conn.run_sync(Base.metadata.create_all)
+        # These public identity tables must be created and verified only by the
+        # explicit migration, never silently bootstrapped by ORM create_all.
+        await conn.run_sync(lambda sync: Base.metadata.create_all(
+            sync, tables=[table for table in Base.metadata.sorted_tables
+                          if table.name not in SELF_ENROLLMENT_TABLES],
+        ))
         await migrate_relay_access(conn, serial_pepper=settings.device_serial_pepper)
         await migrate_relay_redundancy(conn)
+        await migrate_device_self_enrollment(conn)
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.

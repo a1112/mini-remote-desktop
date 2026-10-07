@@ -5,13 +5,14 @@ use ring::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
-pub(crate) const STORE_FORMAT_VERSION: u32 = 2;
+pub(crate) const STORE_FORMAT_VERSION: u32 = 3;
+pub(crate) const LEGACY_STORE_FORMAT_VERSION: u32 = 2;
 const STORE_KEY_NAME: &str = "store_integrity_key_v1";
 const STORE_KEY_PURPOSE: &[u8] = b"MRD_STORE_INTEGRITY_KEY_V1";
-const MANIFEST_DOMAIN: &[u8] = b"MRD_STORE_MANIFEST_V2";
 
 #[derive(Clone)]
 pub(crate) struct StoreMeta {
+    pub(crate) format_version: u32,
     pub(crate) store_id: Vec<u8>,
     pub(crate) generation: u64,
     pub(crate) schema_commitment: Vec<u8>,
@@ -53,6 +54,7 @@ pub(crate) fn bootstrap_store(
     let identity_commitment = crate::identity_store::uninitialized_identity_commitment();
     let (trust_count, trust_commitment) = crate::trust_store::trust_commitment(connection)?;
     let mut meta = StoreMeta {
+        format_version: STORE_FORMAT_VERSION,
         store_id,
         generation: 1,
         schema_commitment,
@@ -72,7 +74,7 @@ pub(crate) fn bootstrap_store(
            audit_commitment, manifest_seal
          ) VALUES (1, ?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, 1, ?8, ?9)",
         params![
-            STORE_FORMAT_VERSION,
+            meta.format_version,
             meta.store_id,
             meta.generation,
             meta.schema_commitment,
@@ -154,7 +156,7 @@ pub(crate) fn write_meta(
             meta.audit_initialized,
             meta.audit_commitment,
             meta.manifest_seal,
-            STORE_FORMAT_VERSION,
+            meta.format_version,
             meta.store_id
         ],
     )?;
@@ -185,10 +187,14 @@ fn query_meta(connection: &Connection) -> Result<Option<StoreMeta>, StoreError> 
             [],
             |row| {
                 let format_version: u32 = row.get(0)?;
-                if format_version != STORE_FORMAT_VERSION {
+                if !matches!(
+                    format_version,
+                    LEGACY_STORE_FORMAT_VERSION | STORE_FORMAT_VERSION
+                ) {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
                 Ok(StoreMeta {
+                    format_version,
                     store_id: row.get(1)?,
                     generation: row.get(2)?,
                     schema_commitment: row.get(3)?,
@@ -219,8 +225,12 @@ fn manifest_seal(key: &[u8], meta: &StoreMeta) -> Vec<u8> {
 }
 
 fn manifest_bytes(meta: &StoreMeta) -> Vec<u8> {
-    let mut bytes = MANIFEST_DOMAIN.to_vec();
-    bytes.extend_from_slice(&STORE_FORMAT_VERSION.to_be_bytes());
+    let mut bytes = match meta.format_version {
+        LEGACY_STORE_FORMAT_VERSION => b"MRD_STORE_MANIFEST_V2".to_vec(),
+        STORE_FORMAT_VERSION => b"MRD_STORE_MANIFEST_V3".to_vec(),
+        _ => unreachable!("metadata format is validated before sealing"),
+    };
+    bytes.extend_from_slice(&meta.format_version.to_be_bytes());
     append_field(&mut bytes, &meta.store_id);
     bytes.extend_from_slice(&meta.generation.to_be_bytes());
     append_field(&mut bytes, &meta.schema_commitment);
@@ -238,6 +248,7 @@ fn ensure_empty_security_state(connection: &Connection) -> Result<(), StoreError
         "store_meta",
         "machine_identity",
         "trusted_devices",
+        "trust_permissions",
         "store_secrets",
         "audit_head",
         "audit_events",

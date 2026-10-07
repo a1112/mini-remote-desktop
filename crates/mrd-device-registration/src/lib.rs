@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 pub mod machine_identity;
 pub use machine_identity::stable_machine_identity;
+pub mod auto_enrollment;
 
 pub const DEVICE_CREDENTIAL_REJECTED: &str = "设备凭据已失效，请向管理员申请更新设备凭据";
 
@@ -107,7 +108,7 @@ async fn execute_registration(
     has_enrollment_token: bool,
     requires_refresh: bool,
 ) -> Result<DeviceRegistrationResponse, &'static str> {
-    let mut response = client
+    let response = client
         .execute(request)
         .await
         .map_err(|_| "连接服务器失败，请稍后重试")?;
@@ -119,6 +120,13 @@ async fn execute_registration(
         429 => return Err("注册请求过于频繁，请稍后重试"),
         _ => return Err("设备注册失败，请检查服务器配置后重试"),
     }
+    parse_registration(response, requires_refresh).await
+}
+
+async fn parse_registration(
+    mut response: reqwest::Response,
+    requires_refresh: bool,
+) -> Result<DeviceRegistrationResponse, &'static str> {
     const MAX_RESPONSE_BYTES: usize = 16 * 1024;
     if response
         .content_length()
@@ -207,8 +215,20 @@ fn build_authorized_request(
     header_name: &str,
     credential: &str,
 ) -> Result<reqwest::Request, &'static str> {
-    use reqwest::{header::HeaderValue, Url};
-    let mut url = Url::parse(api_base.trim()).map_err(|_| "服务器地址无效")?;
+    use reqwest::header::HeaderValue;
+    let url = registration_endpoint(api_base, endpoint)?;
+    let mut header = HeaderValue::from_str(credential).map_err(|_| "设备登记凭据无效")?;
+    header.set_sensitive(true);
+    client
+        .post(url)
+        .header(header_name, header)
+        .json(payload)
+        .build()
+        .map_err(|_| "设备登记请求无效")
+}
+
+fn registration_endpoint(api_base: &str, endpoint: &str) -> Result<reqwest::Url, &'static str> {
+    let mut url = reqwest::Url::parse(api_base.trim()).map_err(|_| "服务器地址无效")?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -231,14 +251,7 @@ fn build_authorized_request(
         "{}/devices/{endpoint}",
         url.path().trim_end_matches('/')
     ));
-    let mut header = HeaderValue::from_str(credential).map_err(|_| "设备登记凭据无效")?;
-    header.set_sensitive(true);
-    client
-        .post(url)
-        .header(header_name, header)
-        .json(payload)
-        .build()
-        .map_err(|_| "设备登记请求无效")
+    Ok(url)
 }
 
 #[cfg(test)]

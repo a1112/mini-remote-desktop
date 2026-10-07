@@ -132,7 +132,10 @@ impl PersistentStore {
         if observed_version > integrity::STORE_FORMAT_VERSION {
             return Err(StoreError::UnsupportedSchema(observed_version));
         }
-        if observed_version != 0 && observed_version != integrity::STORE_FORMAT_VERSION {
+        if !matches!(
+            observed_version,
+            0 | integrity::LEGACY_STORE_FORMAT_VERSION | integrity::STORE_FORMAT_VERSION
+        ) {
             return Err(StoreError::StoreIntegrity);
         }
         migrations::configure(&connection)?;
@@ -147,6 +150,18 @@ impl PersistentStore {
             integrity::bootstrap_store(&transaction, protector.as_ref())?;
         } else if version == integrity::STORE_FORMAT_VERSION {
             migrations::validate_schema(&transaction)?;
+        } else if version == integrity::LEGACY_STORE_FORMAT_VERSION {
+            // Validate every old sealed component before changing a table or
+            // blessing its contents with the new format's commitment.
+            let (mut meta, store_key) =
+                verify_store_snapshot_connection(&transaction, protector.as_ref())?;
+            migrations::upgrade_verified_v2_schema(&transaction)?;
+            meta.format_version = integrity::STORE_FORMAT_VERSION;
+            meta.schema_commitment = migrations::schema_commitment(&transaction)?;
+            let (trust_count, trust_commitment) = trust_store::trust_commitment(&transaction)?;
+            meta.trust_count = trust_count;
+            meta.trust_commitment = trust_commitment;
+            integrity::write_meta(&transaction, store_key.as_ref(), &mut meta)?;
         } else if version > integrity::STORE_FORMAT_VERSION {
             return Err(StoreError::UnsupportedSchema(version));
         } else {
@@ -209,6 +224,10 @@ fn verify_store_snapshot_connection(
     protector: &dyn SecretProtector,
 ) -> Result<(integrity::StoreMeta, SecretBytes), StoreError> {
     let (meta, store_key) = integrity::load_verified_meta(connection, protector)?;
+    if migrations::schema_version(connection)? != meta.format_version {
+        return Err(StoreError::StoreIntegrity);
+    }
+    migrations::validate_schema(connection)?;
     if migrations::schema_commitment(connection)? != meta.schema_commitment {
         return Err(StoreError::StoreIntegrity);
     }

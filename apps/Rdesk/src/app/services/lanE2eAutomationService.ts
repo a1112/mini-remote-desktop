@@ -64,6 +64,8 @@ export type LanE2EFailureReason =
   | "peer_not_found"
   | "peer_version_mismatch"
   | "peer_not_ready"
+  | "peer_pairing_required"
+  | "user_consent_required"
   | "session_start_failed"
   | "capture_source_failed"
   | "display_mode_failed"
@@ -138,6 +140,8 @@ export interface LanE2EAutomationOptions {
   expectedPeerBuildId?: string;
   renderProfileCap?: boolean;
   renderDisplay?: boolean;
+  /** Explicit input test opt-in; the secure display baseline only requests screen.view. */
+  verifyControlInput?: boolean;
   adaptive?: boolean;
   adaptiveConfig?: AdaptiveMediaConfig;
   faultPlan?: CrossDeviceFaultPlan;
@@ -216,6 +220,7 @@ export interface SecureSessionEvidence {
 
 interface SecureAuthorityBinding {
   peerKeyId: string;
+  peerKeyEpoch: string;
   policyRevision: string;
   trustRevision: string;
   transportFingerprintSha256: string;
@@ -438,7 +443,7 @@ const REMOTE_DISPLAY_SURFACE_ATTACH_TIMEOUT_MS = 10_000;
 const REMOTE_DISPLAY_SURFACE_ATTACH_POLL_MS = 100;
 const SECURE_ROUTE_EVIDENCE_MAX_AGE_MS = 30_000;
 const SECURE_ROUTE_EVIDENCE_FUTURE_SKEW_MS = 5_000;
-const SECURE_AUDIT_PAGE_LIMIT = 200;
+const SECURE_AUDIT_PAGE_LIMIT = 64;
 const SECURE_AUDIT_MAX_PAGES = 32;
 const INPUT_CONTROL_ACK_PROBE_EVENT: ControlInputEvent = {
   kind: "mouse_move",
@@ -473,6 +478,10 @@ export async function runLanE2EAutomation(
   const renderDisplayEnabled = options.renderDisplay ?? true;
   const secureRemoteDisplayScenario =
     scenarioId === "cross.e2e.secure_remote_display";
+  const verifyControlInput = secureRemoteDisplayScenario && options.verifyControlInput === true;
+  const secureRequiredScopes: RemoteSessionSnapshot["requested_scopes"] = verifyControlInput
+    ? ["screen.view", "input.pointer", "input.keyboard"]
+    : ["screen.view"];
   const requestMediaProfile = shouldRequestMediaProfile(scenarioId, transportKind);
   let requestedProfile = options.requestedProfile;
   const validationMode = transportKind === "webrtc" ? "webrtc_rtp" : "quic_datagram";
@@ -481,6 +490,8 @@ export async function runLanE2EAutomation(
   let displayWindow: RemoteDisplayWindowContext | undefined;
   let captureSource: CaptureSource | undefined;
   let captureSourceSelection: CaptureSourceSelection | undefined;
+  let lastReportedCaptureSourceId: string | undefined;
+  let captureSourceMetadataMissingReported = false;
   let displayModeChange: DisplayModeChange | undefined;
   let sessionSnapshot: SessionRuntimeSnapshot | undefined;
   let probeSnapshot: ProbeSnapshot | undefined;
@@ -641,6 +652,8 @@ export async function runLanE2EAutomation(
           ? "Secure LAN remote display requires QUIC"
           : !stopOnComplete
             ? "Secure LAN remote display requires authoritative cleanup"
+            : !verifyControlInput && displayModePolicy !== "none"
+              ? "Screen-view-only baseline requires displayModePolicy=none"
             : !renderDisplayEnabled
               ? "Secure LAN remote display requires native presentation"
               : null;
@@ -652,6 +665,11 @@ export async function runLanE2EAutomation(
     await unwrap(commands.serviceBootstrapIfNeeded(), "service_unhealthy");
     await unwrap(commands.serviceWaitForHealthy(10), "service_unhealthy");
     const runtime = await unwrap(commands.ipcRuntimeSnapshot(), "service_unhealthy");
+    if (secureRemoteDisplayScenario && (!runtime.is_registered || !runtime.device_id?.trim())) {
+      const message = "请先在正式客户端初始化本机设备身份，再启动屏幕查看测试；性能脚本不会调用旧设备注册接口。";
+      stage("preflight", "skipped", message);
+      return finish("skipped", "local_device_registration_failed", message);
+    }
     controllerDeviceId = await ensureLocalDeviceRegistered(commands, runtime, now);
     const peerSelection = await waitForLanPeer(
       commands,
@@ -664,6 +682,11 @@ export async function runLanE2EAutomation(
     const selectedPeer = peerSelection.peer;
     peer = selectedPeer;
     if (peerSelection.failureReason) {
+      if (secureRemoteDisplayScenario && selectedPeer && !selectedPeer.p2p_available) {
+        const message = "等待用户在双方正式客户端的“设备 → 局域网配对”中核对并确认对端；服务尚未投影可用的可信 P2P 设备。";
+        stage("pairing", "skipped", message);
+        return finish("skipped", "peer_pairing_required", message);
+      }
       stage("preflight", "failed", peerSelection.message);
       return finish("failed", peerSelection.failureReason, peerSelection.message);
     }
@@ -673,7 +696,7 @@ export async function runLanE2EAutomation(
     }
     if (
       scenarioId === "cross.e2e.input_control" ||
-      secureRemoteDisplayScenario
+      verifyControlInput
     ) {
       const inputControlGate = describeInputControlPeerGate(selectedPeer, transportKind);
       if (inputControlGate) {
@@ -685,19 +708,18 @@ export async function runLanE2EAutomation(
         stage("control", "skipped", message);
         return finish("skipped", "control_input_unsupported", message);
       }
-      if (
-        secureRemoteDisplayScenario &&
-        (!commands.ipcRequestRemoteSession ||
-          !commands.ipcGetRemoteSession ||
-          !commands.ipcGetRouteEvidence ||
-          !commands.ipcListTrustedDevices ||
-          !commands.ipcGetAuditEventsV2)
-      ) {
-        const message =
-          "Secure LAN remote display requires authoritative session and audit evidence";
-        stage("preflight", "failed", message);
-        return finish("failed", "runtime_error", message);
-      }
+    }
+    if (
+      secureRemoteDisplayScenario &&
+      (!commands.ipcRequestRemoteSession ||
+        !commands.ipcGetRemoteSession ||
+        !commands.ipcGetRouteEvidence ||
+        !commands.ipcListTrustedDevices ||
+        !commands.ipcGetAuditEventsV2)
+    ) {
+      const message = "Secure LAN remote display requires authoritative session and audit evidence";
+      stage("preflight", "failed", message);
+      return finish("failed", "runtime_error", message);
     }
     if (
       options.expectedPeerBuildId &&
@@ -757,16 +779,29 @@ export async function runLanE2EAutomation(
       // audit append fails. Always run the emergency stop path after an
       // attempted secure start, even when the request returns an error.
       sessionStarted = true;
-      await unwrap(
-        commands.ipcRequestRemoteSession!({
-          session_id: sessionId,
-          target_device_id: selectedPeer.device_id,
-          access_mode: "attended",
-          requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
-          requested_profile: sessionStartProfile ?? null,
-        }),
-        "session_start_failed"
-      );
+      const startResult = await commands.ipcRequestRemoteSession!({
+        session_id: sessionId,
+        target_device_id: selectedPeer.device_id,
+        access_mode: "attended",
+        route_preference: "lan",
+        requested_scopes: secureRequiredScopes,
+        requested_profile: sessionStartProfile ?? null,
+      });
+      if (!startResult.ok) {
+        const pending = await commands.ipcGetRemoteSession!(sessionId);
+        if (pending.ok && pending.value.session_id === sessionId &&
+            pending.value.peer_device_id === selectedPeer.device_id &&
+            pending.value.role === "controller" &&
+            pending.value.access_mode === "attended" &&
+            pending.value.failure?.code === "authorization_timeout") {
+          throw new LanE2ECommandError("user_consent_required", "等待被控端用户在原生同意窗口确认本次屏幕查看；尚未开始性能采样。");
+        }
+        throw new LanE2ECommandError("session_start_failed", startResult.error.message);
+      }
+      await waitForSecureSessionAuthorization(commands, {
+        sessionId, peerDeviceId: selectedPeer.device_id, requiredScopes: secureRequiredScopes,
+        timeoutMs, pollIntervalMs: sampleIntervalMs, now,
+      }, startResult.value);
     } else {
       await unwrap(
         commands.ipcStartLanRemoteSession(
@@ -780,22 +815,6 @@ export async function runLanE2EAutomation(
     }
     sessionStarted = true;
     stage("pairing", "completed");
-
-    if (secureRemoteDisplayScenario && secureSessionEvidence) {
-      secureAuthorityBinding = await loadSecureAuthorityBinding(commands, {
-        sessionId,
-        peerDeviceId: selectedPeer.device_id,
-        now,
-      });
-      Object.assign(secureSessionEvidence, {
-        trustedIdentityVerified: true,
-        authorizationGranted: true,
-        authorizationBasis: secureAuthorityBinding.authorizationBasis,
-        scopeAuthorized: true,
-        selectedRoute: "lan_quic",
-        quicPeerAuthenticated: true,
-      });
-    }
 
     if (scenarioId === "cross.e2e.input_control") {
       stage("control", "started");
@@ -811,15 +830,19 @@ export async function runLanE2EAutomation(
     }
 
     stage("capture_source", "started");
-    captureSourceSelection = await selectRemoteCaptureSourceForSession(
-      commands,
-      sessionId,
-      options.preferredCaptureSourceId,
-      options.preferredCaptureSourceKind,
-      requestedProfile
-    );
-    captureSource = captureSourceSelection.source;
-    stage("capture_source", "completed");
+    if (secureRemoteDisplayScenario && !verifyControlInput) {
+      stage("capture_source", "skipped", "仅屏幕查看：保留被控端已授权的默认采集源，实际源将由 sender 元数据报告；不执行采集源切换。");
+    } else {
+      captureSourceSelection = await selectRemoteCaptureSourceForSession(
+        commands,
+        sessionId,
+        options.preferredCaptureSourceId,
+        options.preferredCaptureSourceKind,
+        requestedProfile
+      );
+      captureSource = captureSourceSelection.source;
+      stage("capture_source", "completed");
+    }
 
     if (displayModePolicy !== "none" && requestedProfile) {
       stage("display_mode", "started");
@@ -938,6 +961,18 @@ export async function runLanE2EAutomation(
     await unwrap(commands.ipcStartReceiver(sessionId), "receiver_start_failed");
     stage("receiver", "completed");
 
+    if (secureRemoteDisplayScenario && secureSessionEvidence) {
+      secureAuthorityBinding = await loadSecureAuthorityBinding(commands, {
+        sessionId, peerDeviceId: selectedPeer.device_id, now,
+        requiredScopes: secureRequiredScopes, timeoutMs, pollIntervalMs: sampleIntervalMs,
+      });
+      Object.assign(secureSessionEvidence, {
+        trustedIdentityVerified: true, authorizationGranted: true,
+        authorizationBasis: secureAuthorityBinding.authorizationBasis,
+        scopeAuthorized: true, selectedRoute: "lan_quic", quicPeerAuthenticated: true,
+      });
+    }
+
     if (scenarioId === "cross.fault.recovery") {
       const faultPlan = options.faultPlan ?? { type: "network.pause_peer" as const, durationMs: 1000 };
       stage("fault", "started");
@@ -994,6 +1029,25 @@ export async function runLanE2EAutomation(
           mediaPipelineSnapshot.session_id,
           sessionId
         );
+        if (!verifyControlInput) {
+          const sender = mediaPipelineSnapshot.sender_transport as
+            | { capture_source_id?: unknown } | null | undefined;
+          const actualSourceId = typeof sender?.capture_source_id === "string"
+            ? sender.capture_source_id.trim() : "";
+          if (actualSourceId && actualSourceId !== lastReportedCaptureSourceId) {
+            lastReportedCaptureSourceId = actualSourceId;
+            captureSourceMetadataMissingReported = false;
+            const sources = await unwrap(commands.ipcListRemoteCaptureSources(sessionId, false, 24), "capture_source_failed");
+            captureSource = sources.find(source => source.id === actualSourceId);
+            if (captureSource) stage("capture_source", "completed");
+            else stage("capture_source", "skipped", `Sender reports source ${actualSourceId}, but its metadata is unavailable; no source selection was performed.`);
+          } else if (!actualSourceId && !captureSourceMetadataMissingReported) {
+            captureSource = undefined;
+            lastReportedCaptureSourceId = undefined;
+            captureSourceMetadataMissingReported = true;
+            stage("capture_source", "skipped", "Sender source ID is unavailable; the default capture source is unknown, and no source selection was performed.");
+          }
+        }
       }
       mediaAdaptationSnapshot = mediaPipelineSnapshot.adaptation ?? mediaAdaptationSnapshot;
       if (displayWindow) {
@@ -1366,25 +1420,27 @@ export async function runLanE2EAutomation(
             stage("assert", "failed", message);
             return finish("failed", "no_remote_frames", message);
           }
-          stage("control", "started");
-          controlInputAck = await runControlInputAckProbe(commands, sessionId);
-          secureSessionEvidence.authorizedInputVerified =
-            controlInputAck.event_count > 0;
-          if (!secureSessionEvidence.authorizedInputVerified) {
-            const message = `Authenticated control input ACK did not confirm any events for ${sessionId}`;
-            stage("control", "failed", message);
-            return finish("failed", "control_input_failed", message);
+          if (verifyControlInput) {
+            stage("control", "started");
+            controlInputAck = await runControlInputAckProbe(commands, sessionId);
+            secureSessionEvidence.authorizedInputVerified = controlInputAck.event_count > 0;
+            if (!secureSessionEvidence.authorizedInputVerified) {
+              const message = `Authenticated control input ACK did not confirm any events for ${sessionId}`;
+              stage("control", "failed", message);
+              return finish("failed", "control_input_failed", message);
+            }
+            stage("control", "completed");
           }
           const finalAuthorityBinding = await loadSecureAuthorityBinding(commands, {
             sessionId,
             peerDeviceId: selectedPeer.device_id,
             now,
+            requiredScopes: secureRequiredScopes, timeoutMs, pollIntervalMs: sampleIntervalMs,
           });
           assertSecureAuthorityBindingStable(
             secureAuthorityBinding,
             finalAuthorityBinding
           );
-          stage("control", "completed");
         }
         stage("assert", "completed");
         return finish("completed");
@@ -1415,8 +1471,9 @@ export async function runLanE2EAutomation(
   } catch (error) {
     const mapped = error instanceof LanE2ECommandError ? error.reason : "runtime_error";
     const message = error instanceof Error ? error.message : String(error);
-    stage(stageForFailure(mapped), "failed", message);
-    return finish("failed", mapped, message);
+    const waitingForUser = mapped === "user_consent_required" || mapped === "peer_pairing_required";
+    stage(stageForFailure(mapped), waitingForUser ? "skipped" : "failed", message);
+    return finish(waitingForUser ? "skipped" : "failed", mapped, message);
   } finally {
     if (stopOnComplete && sessionStarted && sessionId) {
       stage("cleanup", "started");
@@ -1439,7 +1496,7 @@ export async function runLanE2EAutomation(
       }
       if (secureSessionEvidence) {
         secureSessionEvidence.cleanupCompleted = cleanupSucceeded;
-        if (cleanupSucceeded && commands.ipcGetAuditEventsV2) {
+        if (cleanupSucceeded && secureSessionEvidence.authorizationGranted && commands.ipcGetAuditEventsV2) {
           try {
             auditEventIds.push(
               ...(await collectSecureLifecycleAuditIds(commands, {
@@ -1489,25 +1546,84 @@ function assertSessionScopedResponse(
   }
 }
 
+function isPendingSecureAuthorization(session: RemoteSessionSnapshot): boolean {
+  return ["discovered", "authenticating", "authorizing", "awaiting_local_consent"].includes(session.authorization_state);
+}
+
+async function waitForSecureSessionAuthorization(
+  commands: LanE2EAutomationCommands,
+  params: {
+    sessionId: string;
+    peerDeviceId: string;
+    requiredScopes: RemoteSessionSnapshot["requested_scopes"];
+    now: () => number;
+    timeoutMs: number;
+    pollIntervalMs: number;
+    requireStreaming?: boolean;
+  },
+  initial?: RemoteSessionSnapshot,
+): Promise<RemoteSessionSnapshot> {
+  const deadline = Date.now() + Math.max(0, params.timeoutMs);
+  let session = initial ?? await unwrap(commands.ipcGetRemoteSession!(params.sessionId), "runtime_error");
+  const peerKeyId = session.peer_key_id;
+  while (true) {
+    const identityFailure =
+      session.session_id !== params.sessionId ? "remote session id mismatch"
+      : session.peer_device_id !== params.peerDeviceId ? "peer device id mismatch"
+      : session.role !== "controller" ? "remote session role is not controller"
+      : session.access_mode !== "attended" ? "requested attended consent was replaced"
+      : !session.peer_key_id.trim() || session.peer_key_id !== peerKeyId ? "peer key binding changed"
+      : session.requested_scopes.length !== params.requiredScopes.length ||
+        !params.requiredScopes.every(scope => session.requested_scopes.includes(scope))
+        ? "requested permission scopes differ from this test" : null;
+    if (identityFailure) throw new LanE2ECommandError("runtime_error", identityFailure);
+    if (session.authorization_state === "granted") {
+      if (!params.requiredScopes.every(scope => session.granted_scopes.includes(scope)) ||
+          !session.granted_scopes.every(scope => params.requiredScopes.includes(scope))) {
+        throw new LanE2ECommandError("runtime_error", "granted permission scopes exceed or omit the requested test scopes");
+      }
+      if (typeof session.authorization_expires_at_ms !== "number" ||
+          !Number.isFinite(session.authorization_expires_at_ms) ||
+          session.authorization_expires_at_ms <= params.now()) {
+        throw new LanE2ECommandError("runtime_error", "authorization is expired or its expiry is missing");
+      }
+      if (!params.requireStreaming || (session.route_state === "connected" &&
+          session.media_state === "streaming" && session.presentation_state === "streaming")) return session;
+    } else if (!isPendingSecureAuthorization(session)) {
+      if (session.failure?.code === "authorization_timeout") {
+        throw new LanE2ECommandError("user_consent_required", "本次原生同意等待已到期，请被控端用户确认新会话后重试；尚未开始性能采样。");
+      }
+      throw new LanE2ECommandError("session_start_failed", session.failure?.message ?? `Authorization ended as ${session.authorization_state}`);
+    }
+    if (Date.now() >= deadline) {
+      if (session.authorization_state === "granted") {
+        throw new LanE2ECommandError("no_remote_frames", "Authorization was granted, but its route and media have not reached streaming");
+      }
+      throw new LanE2ECommandError("user_consent_required", "等待被控端用户在原生同意窗口确认本次屏幕查看；尚未开始性能采样。");
+    }
+    await sleep(Math.min(Math.max(1, params.pollIntervalMs), Math.max(1, deadline - Date.now())));
+    session = await unwrap(commands.ipcGetRemoteSession!(params.sessionId), "runtime_error");
+  }
+}
+
 async function loadSecureAuthorityBinding(
   commands: LanE2EAutomationCommands,
   params: {
     sessionId: string;
     peerDeviceId: string;
     now: () => number;
+    requiredScopes: RemoteSessionSnapshot["requested_scopes"];
+    timeoutMs: number;
+    pollIntervalMs: number;
   }
 ): Promise<SecureAuthorityBinding> {
-  const [remoteSession, routeEvidence, trustedDevices] = await Promise.all([
-    unwrap(commands.ipcGetRemoteSession!(params.sessionId), "runtime_error"),
+  const remoteSession = await waitForSecureSessionAuthorization(commands, { ...params, requireStreaming: true });
+  const [routeEvidence, trustedDevices] = await Promise.all([
     unwrap(commands.ipcGetRouteEvidence!(params.sessionId), "runtime_error"),
     unwrap(commands.ipcListTrustedDevices!(true), "runtime_error"),
   ]);
   const nowMs = params.now();
-  const requiredScopes: RemoteSessionSnapshot["granted_scopes"] = [
-    "screen.view",
-    "input.pointer",
-    "input.keyboard",
-  ];
+  const requiredScopes = params.requiredScopes;
   const authorizationBasis =
     remoteSession.access_mode === "attended"
       ? "consent"
@@ -1544,6 +1660,9 @@ async function loadSecureAuthorityBinding(
     !trustedDevice && "peer key is absent from the trusted-device registry",
     trustedDevice?.state !== "trusted" && "peer key is not trusted",
     trustedDevice != null &&
+      (!isCanonicalDecimalU64(trustedDevice.key_epoch) || trustedDevice.key_epoch === "0") &&
+      "trusted key epoch is invalid",
+    trustedDevice != null &&
       !requiredScopes.every((scope) => trustedDevice.permission_ceiling.includes(scope)) &&
       "trusted-device ceiling does not authorize required scopes",
     trustedDevice != null && !isCanonicalDecimalU64(trustedDevice.trust_revision) &&
@@ -1576,6 +1695,7 @@ async function loadSecureAuthorityBinding(
 
   return {
     peerKeyId: remoteSession.peer_key_id,
+    peerKeyEpoch: trustedDevice.key_epoch,
     policyRevision: remoteSession.policy_revision,
     trustRevision: trustedDevice.trust_revision,
     transportFingerprintSha256: fingerprint.toLowerCase(),
@@ -1595,6 +1715,7 @@ function assertSecureAuthorityBindingStable(
   }
   const changed = [
     initial.peerKeyId !== final.peerKeyId && "peer key",
+    initial.peerKeyEpoch !== final.peerKeyEpoch && "key epoch",
     initial.policyRevision !== final.policyRevision && "policy revision",
     initial.trustRevision !== final.trustRevision && "trust revision",
     initial.transportFingerprintSha256 !== final.transportFingerprintSha256 &&
@@ -2868,7 +2989,10 @@ function stageForFailure(reason: LanE2EFailureReason): LanE2EStageEvent["stage"]
     case "peer_not_found":
     case "peer_version_mismatch":
     case "peer_not_ready":
+    case "peer_pairing_required":
       return "preflight";
+    case "user_consent_required":
+      return "session";
     case "session_start_failed":
       return "pairing";
     case "capture_source_failed":

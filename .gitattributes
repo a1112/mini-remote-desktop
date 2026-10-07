@@ -1,6 +1,9 @@
 *.ps1 text eol=lf
 *.sh text eol=lf
 
+# Historical schema bytes are authenticated by this frozen sealed v2 fixture.
+/crates/mrd-store-sqlite/tests/fixtures/sealed-v2.sql text eol=lf
+
 # Preserve exact upstream experiment bytes and historical whitespace.
 /subprojects/GPUTest/** -text -whitespace
 /subprojects/GPU_Test_2/** -text -whitespace

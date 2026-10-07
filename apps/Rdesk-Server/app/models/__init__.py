@@ -1,5 +1,6 @@
 from app.models.device import Device, DeviceStatus
 from app.models.device_enrollment import DeviceEnrollment
+from app.models.device_machine_identity import DeviceMachineIdentity, DeviceSelfEnrollmentChallenge
 from app.models.device_network_group import DeviceNetworkGroup
 from app.models.network_group import NetworkGroup
 from app.models.relay_enrollment import RelayEnrollment
@@ -16,6 +17,8 @@ __all__ = [
     "Device",
     "DeviceStatus",
     "DeviceEnrollment",
+    "DeviceMachineIdentity",
+    "DeviceSelfEnrollmentChallenge",
     "SessionRequest",
     "NetworkGroup",
     "DeviceNetworkGroup",

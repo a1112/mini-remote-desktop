@@ -27,6 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod binding;
 pub(crate) use binding::change_device_binding;
+mod auto_enrollment;
 
 pub const DEFAULT_PUBLIC_API_URL: &str = "https://175.178.16.90/rdesk/api/v1";
 const CONFIG_PURPOSE: &[u8] = b"MRD_PUBLIC_DEVICE_CREDENTIAL_V1\0";
@@ -701,6 +702,7 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
         let mut stack: Option<Stack> = None;
         let mut credential: Option<Arc<DeviceCredential>> = None;
         let mut last_refresh: Option<tokio::time::Instant> = None;
+        let mut enrollment_retry = auto_enrollment::EnrollmentRetry::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -755,6 +757,31 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
                 _ = &mut stopping => break,
                 guard = state.public_connection.operation.lock() => guard,
             };
+            if state.public_connection.registration().is_none() {
+                if !enrollment_retry.ready() {
+                    continue;
+                }
+                *state.public_connection.last_error.write().unwrap() =
+                    Some("public_auto_enrollment_pending".into());
+                let enrolled = tokio::select! {
+                    _ = &mut stopping => break,
+                    result = auto_enrollment::enroll_missing(&state, &api_url) => result,
+                };
+                match enrolled {
+                    Ok(()) => {
+                        enrollment_retry.reset();
+                        // The freshly issued JWT already belongs to the new
+                        // durable identity, so open the public stack this turn.
+                        last_refresh = Some(tokio::time::Instant::now());
+                    }
+                    Err(error) => {
+                        enrollment_retry.defer(error);
+                        *state.public_connection.last_error.write().unwrap() =
+                            Some(error.status_code().into());
+                        continue;
+                    }
+                }
+            }
             if let Some(mut saved) = state.public_connection.registration() {
                 // A persisted JWT may be near expiry after a restart. Renew it
                 // before handing the first credential to the signaling connection.

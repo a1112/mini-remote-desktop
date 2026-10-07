@@ -1,11 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user_optional, get_current_device
+from app.db.session import get_db
 from app.models.device import Device
 from app.models.user import User
 from app.schemas.realtime import SignalingCredentialRequest, SignalingCredentialResponse
 from app.services.realtime_manager import RealtimeSidecarManager
 from app.services.signaling_credentials import issue_signaling_credential
+from app.services.device_enrollment import DeviceEnrollmentError
+from app.services.device_self_enrollment import require_pinned_signaling_key
 
 router = APIRouter(prefix="/realtime", tags=["realtime"])
 
@@ -14,7 +18,12 @@ router = APIRouter(prefix="/realtime", tags=["realtime"])
 async def signaling_device_credentials(
     payload: SignalingCredentialRequest,
     current_device: Device = Depends(get_current_device),
+    db: AsyncSession = Depends(get_db),
 ) -> SignalingCredentialResponse:
+    try:
+        await require_pinned_signaling_key(db, current_device.id, payload.device_key_id)
+    except DeviceEnrollmentError as error:
+        raise HTTPException(error.status_code, detail={"code": error.code}) from None
     return issue_signaling_credential(current_device, payload)
 
 

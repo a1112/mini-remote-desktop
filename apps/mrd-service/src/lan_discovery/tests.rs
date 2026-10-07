@@ -4954,6 +4954,10 @@ async fn receiver_connect_failure_leaves_no_session_or_media_state() {
 async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
     let app_state = Arc::new(AppState::new());
     let session_id = SessionId("receiver-commit-stop-race".to_string());
+    // Driver capability probing is synchronous and may be cold on a fresh
+    // Windows test process. Complete it before timing the registry barrier;
+    // this test measures receiver publication versus stop, not codec startup.
+    let peer_capabilities = lan_media_capabilities();
     let (listener, bootstrap) = QuinnServerListener::bind("127.0.0.1:0")
         .await
         .expect("temporary QUIC listener");
@@ -4987,7 +4991,7 @@ async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
             "127.0.0.1".parse().unwrap(),
             DeviceId("target-device".to_string()),
             default_media_profile_negotiation(),
-            lan_media_capabilities(),
+            peer_capabilities,
             None,
             Duration::from_secs(1),
         )

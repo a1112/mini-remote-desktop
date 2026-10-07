@@ -83,6 +83,31 @@ impl AuditLogRegistry {
         }
     }
 
+    /// Service-global exclusive lower bound captured before starting an owned
+    /// operation. The persistent read verifies the complete sealed snapshot.
+    #[cfg(any(windows, test))]
+    pub(crate) fn last_sequence(&self) -> Result<u64, StoreError> {
+        match &self.backend {
+            AuditLogBackend::InMemory(log) => Ok(log
+                .lock()
+                .map_err(|_| StoreError::StoreIntegrity)?
+                .next_id
+                .saturating_sub(1)),
+            AuditLogBackend::Persistent(store) => Ok(store
+                .query_audit(&AuditQuery {
+                    after_sequence: None,
+                    limit: 1,
+                    session_id: None,
+                    action: None,
+                    outcome: None,
+                    peer_device_id: None,
+                })?
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(0)),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
@@ -555,6 +580,66 @@ fn parse_route_kind(value: &str) -> Option<RemoteRouteKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_sequence_is_global_and_survives_bounded_fake_retention() {
+        let registry = AuditLogRegistry::default();
+        assert_eq!(registry.last_sequence().unwrap(), 0);
+        let AuditLogBackend::InMemory(log) = &registry.backend else {
+            unreachable!()
+        };
+        log.lock().unwrap().max_events = 1;
+        for id in ["one", "two", "three"] {
+            registry
+                .record(
+                    "session.test",
+                    "allowed",
+                    Some(SessionId(id.into())),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vec![],
+                )
+                .unwrap();
+        }
+        assert_eq!(log.lock().unwrap().events.len(), 1);
+        assert_eq!(registry.last_sequence().unwrap(), 3);
+    }
+
+    #[test]
+    fn last_sequence_reads_only_an_integrity_verified_persistent_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owned-audit.sqlite");
+        let store = Arc::new(
+            PersistentStore::open(
+                &path,
+                Arc::new(mrd_store_sqlite::AeadSecretProtector::from_key([55; 32]).unwrap()),
+            )
+            .unwrap(),
+        );
+        let registry = AuditLogRegistry::persistent(store);
+        assert_eq!(registry.last_sequence().unwrap(), 0);
+        registry
+            .record(
+                "session.test",
+                "allowed",
+                Some(SessionId("fixture".into())),
+                None,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(registry.last_sequence().unwrap(), 1);
+        // Tamper only with an isolated regression fixture, never a live store.
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute("UPDATE audit_events SET outcome='forged'", [])
+            .unwrap();
+        assert!(registry.last_sequence().is_err());
+    }
 
     #[test]
     fn query_limit_returns_latest_matching_events() {

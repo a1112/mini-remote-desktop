@@ -1,13 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { ChevronDown, Loader2, RefreshCw, Wifi, WifiOff } from "lucide-react";
 import { useTheme } from "./ThemeContext";
-import { ipcPublicServerStatus } from "../adapters/tauri/commands";
+import { usePublicServerStatus } from "../services/deviceService";
 import type { PublicServerStatus } from "../adapters/tauri/types";
 import { formatDeviceCode } from "../utils/deviceCode";
+import { automaticEnrollmentLabel, automaticEnrollmentMessage } from "../utils/automaticDeviceEnrollment";
 
 function connectionLabel(status: PublicServerStatus): string {
   if (!status.service_running) return "本机后台服务未运行";
   if (!status.api_url) return "公网服务器未配置";
+  if (!status.device_registered) {
+    const enrollmentLabel = automaticEnrollmentLabel(status.last_error);
+    if (enrollmentLabel) return enrollmentLabel;
+  }
+  if (!status.device_registered && (status.api_reachable === false || status.last_error === "public_api_unreachable")) return "公网服务器暂时不可达，正在重试";
   if (!status.device_registered) return "等待设备登记";
   switch (status.signaling_state) {
     case "authenticated": return "公网服务器已连接";
@@ -40,6 +46,8 @@ function serverHost(url: string | null): string {
 /** Map known sanitized codes; never render arbitrary transport errors or credentials. */
 function connectionError(code: string | null): string | null {
   if (!code) return null;
+  const enrollmentMessage = automaticEnrollmentMessage(code);
+  if (enrollmentMessage) return enrollmentMessage;
   const known: Record<string, string> = {
     public_api_unreachable: "无法连接公网服务器，请检查网络后重试。",
     public_configuration_unavailable: "服务器接口可达，连接配置暂未就绪，请稍后重试。",
@@ -63,42 +71,8 @@ function connectionError(code: string | null): string | null {
 
 export function ServiceStatusPanel() {
   const { isDark } = useTheme();
-  const [status, setStatus] = useState<PublicServerStatus | null>(null);
-  const [checking, setChecking] = useState(true);
-  const [failed, setFailed] = useState(false);
+  const { status, checking, failed, refresh } = usePublicServerStatus();
   const [expanded, setExpanded] = useState(false);
-  const inFlight = useRef(false);
-  const mounted = useRef(false);
-
-  const refresh = useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    if (mounted.current) setChecking(true);
-    try {
-      const result = await ipcPublicServerStatus();
-      if (!mounted.current) return;
-      setStatus(result.ok ? result.value : null);
-      setFailed(!result.ok);
-    } catch {
-      if (mounted.current) { setStatus(null); setFailed(true); }
-    } finally {
-      inFlight.current = false;
-      if (mounted.current) setChecking(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    mounted.current = true;
-    void refresh();
-    const interval = window.setInterval(() => { if (!document.hidden) void refresh(); }, 3000);
-    const onVisible = () => { if (!document.hidden) void refresh(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      mounted.current = false;
-      window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [refresh]);
 
   const online = Boolean(status?.service_running && status.device_registered && status.signaling_state === "authenticated");
   const label = status ? connectionLabel(status) : failed ? "无法读取连接状态" : "正在检查服务器连接";

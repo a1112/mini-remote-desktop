@@ -53,6 +53,35 @@ describe("public server connection status", () => {
     expect(screen.queryByText("公网服务器已连接")).not.toBeInTheDocument();
   });
 
+  it("reports a failed API probe before enrollment as a network problem", async () => {
+    mocks.getStatus.mockResolvedValue({ ok: true, value: { ...connected, device_registered: false, device_id: null, signaling_state: "disabled", api_reachable: false, last_error: "public_api_unreachable" } });
+    render(<ServiceStatusPanel />);
+    expect(await screen.findByText("公网服务器暂时不可达，正在重试")).toBeInTheDocument();
+    expect(screen.queryByText("等待设备登记")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["public_auto_enrollment_pending", "正在领取设备码", "正在自动登记并领取设备码，请稍候。"],
+    ["public_auto_enrollment_rate_limited", "自动登记暂未完成，正在重试", "设备登记请求较多，后台将稍后自动重试。"],
+    ["public_auto_enrollment_identity_conflict", "等待恢复已有设备身份", "本机已有设备身份需要恢复，请使用设备恢复入口。"],
+  ])("shows automatic enrollment %s without claiming an authenticated connection", async (code, label, message) => {
+    mocks.getStatus.mockResolvedValue({ ok: true, value: { ...connected, device_registered: false, device_id: null, signaling_state: "disabled", last_error: code } });
+    render(<ServiceStatusPanel />);
+    expect(await screen.findByText(label)).toBeInTheDocument();
+    expect(screen.queryByText("公网服务器已连接")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "连接详情" }));
+    expect(screen.getByText(message)).toBeInTheDocument();
+  });
+
+  it("preserves authenticated signaling when only the API probe is unreachable", async () => {
+    mocks.getStatus.mockResolvedValue({ ok: true, value: { ...connected, api_reachable: false, last_error: "public_api_unreachable" } });
+    render(<ServiceStatusPanel />);
+    expect(await screen.findByText("公网服务器已连接")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "连接详情" }));
+    expect(screen.getByText("服务器接口暂时不可达")).toBeInTheDocument();
+    expect(screen.getByText("信令已认证在线")).toBeInTheDocument();
+  });
+
   it("drops an authenticated display after the next status request fails", async () => {
     render(<ServiceStatusPanel />);
     expect(await screen.findByText("公网服务器已连接")).toBeInTheDocument();
