@@ -1576,4 +1576,53 @@ mod tests {
         assert_eq!(failure.code, RemoteReasonCode::PolicyChanged);
         assert!(failure.message.contains("not granted"));
     }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_same_uid_ui_claim_fails_closed_without_os_identity() {
+        use crate::shell::{InMemoryUiLauncher, UiLauncherPortRef};
+        use mrd_ipc::{ConsentDecision, ConsentResponse};
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        let app_state = Arc::new(AppState::new());
+        let launcher_impl = InMemoryUiLauncher::new();
+        let peer_pid = std::process::id();
+        // Model a malicious same-UID client first claiming the active PID, as
+        // the old self-declared lifecycle path allowed.
+        launcher_impl.simulate_attach(peer_pid);
+        let launcher: UiLauncherPortRef = Arc::new(Mutex::new(launcher_impl));
+        let server = IpcServer::new_with_launcher(
+            app_state,
+            mrd_ipc::transport::IpcEndpoint::service_from_env_or_default(),
+            launcher,
+        )
+        .with_peer_identity(peer_pid, PathBuf::from("/tmp/Rdesk"));
+
+        let attached = server
+            .handle_request(IpcRequest::UiAttached {
+                pid: peer_pid,
+                executable_path: Some("/tmp/Rdesk".to_owned()),
+            })
+            .await;
+        assert!(matches!(
+            attached,
+            IpcResponse::Error { ref code, .. } if code == "E_UI_CALLER_DENIED"
+        ));
+
+        let consent = server
+            .handle_request(IpcRequest::RespondToConsent {
+                response: ConsentResponse {
+                    session_id: SessionId("same-uid-spoof".to_owned()),
+                    decision: ConsentDecision::Deny,
+                    approved_scopes: Vec::new(),
+                    expected_policy_revision: DecimalU64::from(1),
+                },
+            })
+            .await;
+        assert!(matches!(
+            consent,
+            IpcResponse::Error { ref code, .. } if code == "E_CONSENT_CALLER_DENIED"
+        ));
+    }
 }
