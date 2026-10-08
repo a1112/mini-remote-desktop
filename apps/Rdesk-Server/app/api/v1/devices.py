@@ -141,17 +141,21 @@ async def register_device(
                 token=enrollment_token,
                 registration=payload.model_dump(mode="json"),
             )
+            access_token = create_device_access_token(registered.device)
+            # create_device_refresh_token rotates the active JTI on the model.
+            # Generate it before the enrollment commit so the token returned to
+            # a newly enrolled device is backed by durable server state.
+            refresh_token = create_device_refresh_token(registered.device)
             await _commit(db)
             await db.refresh(registered.device)
         except DeviceEnrollmentError as error:
             await db.rollback()
             _raise_device_enrollment(error)
-        access_token = create_device_access_token(registered.device)
         return DeviceRegisterResponse(
             device_id=registered.device.device_id,
             device_name=registered.device.name,
             access_token=access_token,
-            refresh_token=create_device_refresh_token(registered.device),
+            refresh_token=refresh_token,
         )
 
     # Without a one-time enrollment, this route is refresh-only. Authenticate
@@ -211,17 +215,19 @@ async def register_device(
         if payload.device_name:
             existing.name = payload.device_name
 
-        await db.commit()
-        await db.refresh(existing)
-
-        # 生成访问令牌
+        # Generate the rotating JTI before committing; otherwise a freshly
+        # returned enrollment/refresh credential can be absent after a new
+        # session reads the device row.
         access_token = create_device_access_token(existing)
+        refresh_token = create_device_refresh_token(existing)
+        await _commit(db)
+        await db.refresh(existing)
 
         return DeviceRegisterResponse(
             device_id=existing.device_id,
             device_name=existing.name,
             access_token=access_token,
-            refresh_token=create_device_refresh_token(existing),
+            refresh_token=refresh_token,
         )
     else:
         raise HTTPException(

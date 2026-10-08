@@ -173,11 +173,23 @@ async def upload_avatar(
     filename = f"{uuid.uuid4()}_{uuid.uuid4().hex[:8]}{ext}"
     file_path = _owned_avatar_path(filename)
     assert file_path is not None
-    old_filename = _avatar_filename_from_url(current_user.avatar_url)
-    old_path = _owned_avatar_path(old_filename) if old_filename else None
     avatar_url = get_avatar_url(filename)
 
     async with _avatar_lock(current_user.id):
+        # The dependency object may have been loaded before another upload
+        # acquired this user's lock. Re-read the row while holding the same
+        # process lock so each replacement fences the avatar that is current
+        # at commit time instead of leaving the previous replacement orphaned.
+        locked_user = await db.scalar(
+            select(User)
+            .where(User.id == current_user.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        old_filename = _avatar_filename_from_url(locked_user.avatar_url)
+        old_path = _owned_avatar_path(old_filename) if old_filename else None
         size = 0
         try:
             with file_path.open("wb") as output:
@@ -189,7 +201,7 @@ async def upload_avatar(
                             detail="File size must be less than 5MB",
                         )
                     output.write(chunk)
-            current_user.avatar_url = avatar_url
+            locked_user.avatar_url = avatar_url
             await db.commit()
         except Exception:
             file_path.unlink(missing_ok=True)
@@ -221,17 +233,23 @@ async def delete_avatar(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    if current_user.avatar_url:
-        # Extract filename from URL
-        filename = _avatar_filename_from_url(current_user.avatar_url)
+    async with _avatar_lock(current_user.id):
+        # A delete can race with an upload just like another replacement. Use
+        # the row locked under the per-user fence so a stale dependency object
+        # cannot clear the new URL or remove the wrong file.
+        locked_user = await db.scalar(
+            select(User)
+            .where(User.id == current_user.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if locked_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        filename = _avatar_filename_from_url(locked_user.avatar_url)
         file_path = _owned_avatar_path(filename) if filename else None
-
-        # Delete file if exists
+        locked_user.avatar_url = None
+        await db.commit()
         if file_path is not None:
             file_path.unlink(missing_ok=True)
-
-        # Clear avatar URL
-        current_user.avatar_url = None
-        await db.commit()
 
     return {"message": "Avatar deleted successfully"}

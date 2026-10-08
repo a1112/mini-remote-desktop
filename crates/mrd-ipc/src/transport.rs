@@ -516,6 +516,34 @@ impl IpcStream {
         Ok(peer_pid as u32)
     }
 
+    /// Return the kernel-reported executable image for the macOS peer PID.
+    ///
+    /// This is deliberately obtained from the socket peer PID rather than
+    /// from the request's declared executable path. A same-UID client can
+    /// forge the latter, while `proc_pidpath` asks the kernel for the image
+    /// belonging to the authenticated socket peer.
+    #[cfg(target_os = "macos")]
+    pub fn peer_process_path(&self, peer_pid: u32) -> Result<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let length = unsafe {
+            libc::proc_pidpath(
+                peer_pid as libc::pid_t,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+            )
+        };
+        anyhow::ensure!(
+            length > 0 && (length as usize) <= buffer.len(),
+            "unable to resolve the macOS IPC peer executable"
+        );
+        buffer.truncate(length as usize);
+        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            buffer,
+        )))
+    }
+
     /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
         write_json_message(&mut self.socket, request).await

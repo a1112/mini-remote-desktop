@@ -1,5 +1,8 @@
 use super::{AutostartPort, TrayModel, TrayPort, UiLaunchRequest, UiLaunchResult, UiLauncherPort};
 use anyhow::{anyhow, Context};
+use security_framework::os::macos::code_signing::{
+    Flags as CodeSigningFlags, GuestAttributes, SecCode, SecRequirement,
+};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -9,6 +12,7 @@ use std::{
 };
 
 const DEFAULT_LABEL_PREFIX: &str = "com.mini-remote-desktop";
+const UI_CODE_REQUIREMENT: &str = r#"anchor apple generic and identifier "com.a1112.rdesk""#;
 
 pub struct MacosUiLauncher {
     app_name: String,
@@ -118,6 +122,82 @@ impl UiLauncherPort for MacosUiLauncher {
 
     fn get_ui_path(&self) -> anyhow::Result<Option<PathBuf>> {
         Ok(self.configured_ui_path())
+    }
+
+    fn is_trusted_ui_peer(
+        &self,
+        peer_pid: u32,
+        peer_executable_path: Option<&Path>,
+    ) -> anyhow::Result<bool> {
+        // The PID and image path come from the kernel-bound socket peer. The
+        // request's declared PID/path is intentionally never used here.
+        if self.get_ui_pid()? != Some(peer_pid) {
+            return Ok(false);
+        }
+        let Some(peer_executable_path) = peer_executable_path else {
+            return Ok(false);
+        };
+        if peer_executable_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some("Rdesk")
+        {
+            return Ok(false);
+        }
+
+        // Resolve the live process through Security.framework using its PID,
+        // then require the signed Rdesk bundle identity. This binds consent
+        // to macOS's code identity instead of a forgeable same-UID path.
+        let mut attributes = GuestAttributes::new();
+        attributes.set_pid(peer_pid as libc::pid_t);
+        let guest =
+            match SecCode::copy_guest_with_attribues(None, &attributes, CodeSigningFlags::NONE) {
+                Ok(guest) => guest,
+                Err(_) => return Ok(false),
+            };
+        let requirement: SecRequirement = UI_CODE_REQUIREMENT
+            .parse()
+            .map_err(|error| anyhow!("invalid Rdesk code-signing requirement: {error}"))?;
+        if guest
+            .check_validity(
+                CodeSigningFlags::CHECK_NESTED_CODE | CodeSigningFlags::STRICT_VALIDATE,
+                &requirement,
+            )
+            .is_err()
+        {
+            return Ok(false);
+        }
+
+        if let Some(configured_path) = self.configured_ui_path() {
+            let expected_path = configured_ui_executable_path(&configured_path);
+            return Ok(paths_refer_to_same_file(
+                &expected_path,
+                peer_executable_path,
+            ));
+        }
+        Ok(true)
+    }
+}
+
+fn configured_ui_executable_path(path: &Path) -> PathBuf {
+    if is_app_bundle(path) {
+        let executable = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Rdesk");
+        path.join("Contents").join("MacOS").join(executable)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn paths_refer_to_same_file(expected: &Path, actual: &Path) -> bool {
+    match (
+        std::fs::canonicalize(expected),
+        std::fs::canonicalize(actual),
+    ) {
+        (Ok(expected), Ok(actual)) => expected == actual,
+        _ => expected == actual,
     }
 }
 

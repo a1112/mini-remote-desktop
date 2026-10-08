@@ -856,6 +856,12 @@ impl IpcServer {
                 pid,
                 executable_path,
             } => {
+                #[cfg(target_os = "macos")]
+                let executable_path = self
+                    .peer_executable_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or(executable_path);
                 shell_handlers::ui_attached(
                     &self.app_state,
                     &self.ui_launcher,
@@ -890,6 +896,13 @@ impl IpcServer {
     #[cfg(target_os = "macos")]
     fn macos_sensitive_request_denial(&self, request: &IpcRequest) -> Option<IpcResponse> {
         let pid = self.peer_pid?;
+        let peer_executable_path = self.peer_executable_path.as_deref();
+        let trusted_peer = self
+            .ui_launcher
+            .lock()
+            .ok()
+            .and_then(|launcher| launcher.is_trusted_ui_peer(pid, peer_executable_path).ok())
+            .unwrap_or(false);
         let trusted_pid = self
             .ui_launcher
             .lock()
@@ -899,18 +912,19 @@ impl IpcServer {
         match request {
             IpcRequest::UiAttached { pid: requested, .. }
             | IpcRequest::UiDetached { pid: requested, .. }
-                if !matches_peer(*requested) =>
+                if !trusted_peer || !matches_peer(*requested) =>
             {
                 Some(IpcResponse::Error {
                     code: "E_UI_CALLER_DENIED".to_owned(),
-                    message: "UI lifecycle updates must come from the reported macOS UI process"
+                    message: "UI lifecycle updates require the signed macOS Rdesk process"
                         .to_owned(),
                 })
             }
-            IpcRequest::RespondToConsent { .. } if trusted_pid != Some(pid) => {
+            IpcRequest::RespondToConsent { .. } if !trusted_peer || trusted_pid != Some(pid) => {
                 Some(IpcResponse::Error {
                     code: "E_CONSENT_CALLER_DENIED".to_owned(),
-                    message: "Consent must be answered by the active macOS UI process".to_owned(),
+                    message: "Consent must be answered by the signed macOS Rdesk process"
+                        .to_owned(),
                 })
             }
             _ => None,
@@ -1561,5 +1575,54 @@ mod tests {
         assert_eq!(peer_key_id.as_deref(), Some("sha256:controller-key"));
         assert_eq!(failure.code, RemoteReasonCode::PolicyChanged);
         assert!(failure.message.contains("not granted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_same_uid_ui_claim_fails_closed_without_os_identity() {
+        use crate::shell::{InMemoryUiLauncher, UiLauncherPortRef};
+        use mrd_ipc::{ConsentDecision, ConsentResponse};
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        let app_state = Arc::new(AppState::new());
+        let launcher_impl = InMemoryUiLauncher::new();
+        let peer_pid = std::process::id();
+        // Model a malicious same-UID client first claiming the active PID, as
+        // the old self-declared lifecycle path allowed.
+        launcher_impl.simulate_attach(peer_pid);
+        let launcher: UiLauncherPortRef = Arc::new(Mutex::new(launcher_impl));
+        let server = IpcServer::new_with_launcher(
+            app_state,
+            mrd_ipc::transport::IpcEndpoint::service_from_env_or_default(),
+            launcher,
+        )
+        .with_peer_identity(peer_pid, PathBuf::from("/tmp/Rdesk"));
+
+        let attached = server
+            .handle_request(IpcRequest::UiAttached {
+                pid: peer_pid,
+                executable_path: Some("/tmp/Rdesk".to_owned()),
+            })
+            .await;
+        assert!(matches!(
+            attached,
+            IpcResponse::Error { ref code, .. } if code == "E_UI_CALLER_DENIED"
+        ));
+
+        let consent = server
+            .handle_request(IpcRequest::RespondToConsent {
+                response: ConsentResponse {
+                    session_id: SessionId("same-uid-spoof".to_owned()),
+                    decision: ConsentDecision::Deny,
+                    approved_scopes: Vec::new(),
+                    expected_policy_revision: DecimalU64::from(1),
+                },
+            })
+            .await;
+        assert!(matches!(
+            consent,
+            IpcResponse::Error { ref code, .. } if code == "E_CONSENT_CALLER_DENIED"
+        ));
     }
 }

@@ -38,7 +38,7 @@ async fn management_reports_public_connection_without_exposing_security_or_sessi
 }
 
 #[tokio::test]
-async fn management_rejects_invalid_enrollment_without_starting_or_changing_identity() {
+async fn management_rejects_enrollment_without_starting_or_changing_identity() {
     let state = Arc::new(AppState::new());
     let server = IpcServer::new_management(state.clone());
     let request: IpcRequest = serde_json::from_str(
@@ -46,7 +46,7 @@ async fn management_rejects_invalid_enrollment_without_starting_or_changing_iden
     )
     .unwrap();
     assert!(
-        matches!(server.handle_request(request).await, IpcResponse::Error {code, message} if code == "E_PUBLIC_ENROLLMENT" && !message.contains("bad-secret"))
+        matches!(server.handle_request(request).await, IpcResponse::Error {code, ..} if code == "E_MANAGEMENT_COMMAND_DENIED")
     );
     assert!(state.devices.lock().await.get_local_device().is_none());
 }

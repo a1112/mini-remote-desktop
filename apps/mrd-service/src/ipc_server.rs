@@ -29,6 +29,8 @@ pub struct IpcServer {
     management_only: bool,
     #[cfg(target_os = "macos")]
     peer_pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    peer_executable_path: Option<std::path::PathBuf>,
     #[cfg(windows)]
     product_only: bool,
     #[cfg(windows)]
@@ -96,6 +98,8 @@ impl IpcServer {
             management_only: false,
             #[cfg(target_os = "macos")]
             peer_pid: None,
+            #[cfg(target_os = "macos")]
+            peer_executable_path: None,
             #[cfg(windows)]
             product_only: false,
             #[cfg(windows)]
@@ -116,6 +120,8 @@ impl IpcServer {
             management_only: false,
             #[cfg(target_os = "macos")]
             peer_pid: None,
+            #[cfg(target_os = "macos")]
+            peer_executable_path: None,
             #[cfg(windows)]
             product_only: false,
             #[cfg(windows)]
@@ -134,9 +140,14 @@ impl IpcServer {
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn with_peer_pid(&self, peer_pid: u32) -> Self {
+    pub(crate) fn with_peer_identity(
+        &self,
+        peer_pid: u32,
+        peer_executable_path: std::path::PathBuf,
+    ) -> Self {
         let mut bound = self.clone();
         bound.peer_pid = Some(peer_pid);
+        bound.peer_executable_path = Some(peer_executable_path);
         bound
     }
 }
