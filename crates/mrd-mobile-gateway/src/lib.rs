@@ -87,7 +87,7 @@ pub fn router() -> Router {
         phone_publisher_active: Arc::new(Mutex::new(false)),
         pairing_token: env::var("MRD_MOBILE_GATEWAY_PAIRING_TOKEN")
             .ok()
-            .filter(|token| token.as_bytes().len() >= MIN_PAIRING_TOKEN_BYTES)
+            .filter(|token| token.len() >= MIN_PAIRING_TOKEN_BYTES)
             .map(Arc::<str>::from),
     };
     if state.pairing_token.is_none() {
