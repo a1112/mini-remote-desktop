@@ -53,6 +53,7 @@ struct ServerState {
 }
 
 type SharedState = Arc<RwLock<ServerState>>;
+type HeartbeatPacket = (Vec<u8>, SocketAddr);
 
 /// 服务器配置
 #[derive(Debug, Clone, Deserialize)]
@@ -150,8 +151,8 @@ async fn main() -> Result<()> {
     });
 
     let (heartbeat_tx, heartbeat_rx): (
-        mpsc::Sender<(Vec<u8>, SocketAddr)>,
-        mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+        mpsc::Sender<HeartbeatPacket>,
+        mpsc::Receiver<HeartbeatPacket>,
     ) = mpsc::channel(HEARTBEAT_QUEUE_CAPACITY);
     let heartbeat_rx = Arc::new(tokio::sync::Mutex::new(heartbeat_rx));
     for _ in 0..HEARTBEAT_WORKERS {

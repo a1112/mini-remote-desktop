@@ -49,3 +49,9 @@ Android 每次新建屏幕采集会话都要求用户再次批准。辅助功能
 启动网关后打开 `https://127.0.0.1:9534/mobile/desktop?token=<配对令牌>`，点击“开始 30 秒测试”。页面分别统计实际接收、解码和绘制帧率，以及同机采集到绘制时间。首次访问临时证书时，需要核对发现响应中的 `tls_sha256`。新端点为 `/mobile/desktop/video/ws`，使用 DXGI 共享纹理、NVENC H.264、WebCodecs；需要 NVIDIA NVENC 和支持 WebCodecs 的本机浏览器。启动脚本会为当前进程查找已安装 NVIDIA 驱动目录，不修改系统 PATH。
 
 动态测试、协议及结果见 [本机测试说明](../../tests/mobile-gateway/README.md)。本机测试结果不能当作手机 Wi-Fi 或手机被控性能。
+
+## 启动器图标检查
+
+原生 Android 图标位于 `app/src/main/res`，Manifest 引用 `@mipmap/ic_launcher` 与 `@mipmap/ic_launcher_round`。包含五种密度的 legacy PNG、API26 adaptive 前景/背景和 API33 单色主题层。母版与可复现命令见 [branding/README.md](branding/README.md)。
+
+静态检查不会验证最终 APK。已安装且接受许可的 SDK 36 环境可运行 `bash scripts/build_and_verify_launcher.sh`，检查单元测试、merged manifest 与最终 APK 资源。当前 B optical-v2 母版仍为候选；桌面 Tauri 资源未在本次 Android 修复中更改。
