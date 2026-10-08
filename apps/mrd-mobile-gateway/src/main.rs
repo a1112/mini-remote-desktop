@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         .context("invalid MRD_MOBILE_GATEWAY_BIND")?;
     let pairing_token = env::var("MRD_MOBILE_GATEWAY_PAIRING_TOKEN")
         .context("MRD_MOBILE_GATEWAY_PAIRING_TOKEN must be set")?;
-    if pairing_token.as_bytes().len() < 32 {
+    if pairing_token.len() < 32 {
         bail!("MRD_MOBILE_GATEWAY_PAIRING_TOKEN must contain at least 32 bytes");
     }
     let router = mrd_mobile_gateway::router();
