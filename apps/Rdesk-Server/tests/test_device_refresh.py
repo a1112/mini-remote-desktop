@@ -1,6 +1,7 @@
 """Long-lived device credentials are accepted only by the dedicated renewal route."""
 
 import asyncio
+import hashlib
 import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -159,6 +160,19 @@ def test_first_enrollment_and_owner_rotation_issue_machine_bound_refresh(device_
         headers={"X-Rdesk-Device-Enrollment": _issue_device_enrollment(device_api)})
     assert enrolled.status_code == 200, enrolled.text
     token = enrolled.json()["refresh_token"]
+    claims = jwt.decode(token, options={"verify_signature": False})
+    # Force a database read after the response has been built. The enrollment
+    # JTI must survive the request commit, rather than only living in the
+    # request's identity map.
+    persisted = device_api.session.scalar(
+        select(Device)
+        .where(Device.device_id == enrolled.json()["device_id"])
+        .execution_options(populate_existing=True)
+    )
+    assert persisted is not None
+    assert persisted.active_refresh_jti_hash == hashlib.sha256(
+        claims["jti"].encode("ascii")
+    ).hexdigest()
     assert _renew(device_api, token, "brand-new-serial").status_code == 200
     model = DeviceRegisterResponse.model_validate(enrolled.json())
     assert token not in repr(model) and model.access_token not in repr(model)

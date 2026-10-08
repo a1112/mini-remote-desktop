@@ -856,6 +856,12 @@ impl IpcServer {
                 pid,
                 executable_path,
             } => {
+                #[cfg(target_os = "macos")]
+                let executable_path = self
+                    .peer_executable_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or(executable_path);
                 shell_handlers::ui_attached(
                     &self.app_state,
                     &self.ui_launcher,
@@ -890,6 +896,13 @@ impl IpcServer {
     #[cfg(target_os = "macos")]
     fn macos_sensitive_request_denial(&self, request: &IpcRequest) -> Option<IpcResponse> {
         let pid = self.peer_pid?;
+        let peer_executable_path = self.peer_executable_path.as_deref();
+        let trusted_peer = self
+            .ui_launcher
+            .lock()
+            .ok()
+            .and_then(|launcher| launcher.is_trusted_ui_peer(pid, peer_executable_path).ok())
+            .unwrap_or(false);
         let trusted_pid = self
             .ui_launcher
             .lock()
@@ -899,18 +912,19 @@ impl IpcServer {
         match request {
             IpcRequest::UiAttached { pid: requested, .. }
             | IpcRequest::UiDetached { pid: requested, .. }
-                if !matches_peer(*requested) =>
+                if !trusted_peer || !matches_peer(*requested) =>
             {
                 Some(IpcResponse::Error {
                     code: "E_UI_CALLER_DENIED".to_owned(),
-                    message: "UI lifecycle updates must come from the reported macOS UI process"
+                    message: "UI lifecycle updates require the signed macOS Rdesk process"
                         .to_owned(),
                 })
             }
-            IpcRequest::RespondToConsent { .. } if trusted_pid != Some(pid) => {
+            IpcRequest::RespondToConsent { .. } if !trusted_peer || trusted_pid != Some(pid) => {
                 Some(IpcResponse::Error {
                     code: "E_CONSENT_CALLER_DENIED".to_owned(),
-                    message: "Consent must be answered by the active macOS UI process".to_owned(),
+                    message: "Consent must be answered by the signed macOS Rdesk process"
+                        .to_owned(),
                 })
             }
             _ => None,

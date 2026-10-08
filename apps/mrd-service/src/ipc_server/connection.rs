@@ -14,7 +14,11 @@ impl IpcServer {
             return self.handle_management_connection(stream).await;
         }
         #[cfg(target_os = "macos")]
-        let peer_bound_server = self.with_peer_pid(stream.peer_process_id()?);
+        let peer_pid = stream.peer_process_id()?;
+        #[cfg(target_os = "macos")]
+        let peer_executable_path = stream.peer_process_path(peer_pid)?;
+        #[cfg(target_os = "macos")]
+        let peer_bound_server = self.with_peer_identity(peer_pid, peer_executable_path);
         #[cfg(not(target_os = "macos"))]
         let peer_bound_server = self.clone();
         loop {
