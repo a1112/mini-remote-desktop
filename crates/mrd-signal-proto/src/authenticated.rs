@@ -320,6 +320,22 @@ where
         now_ms: u64,
         replay: &mut SignalReplayGuard,
     ) -> Result<VerifiedSignalMetadata, SignalProtocolError> {
+        let metadata = self.verify_for_without_replay(expected_peer, now_ms)?;
+        replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        Ok(metadata)
+    }
+
+    /// Verify signature, claims, and payload without mutating replay state.
+    ///
+    /// Registration performs backend-token and identity binding checks after
+    /// cryptographic verification. Keeping replay commit separate prevents an
+    /// unauthenticated caller from consuming a global signer slot with a
+    /// syntactically valid but backend-invalid registration.
+    pub fn verify_for_without_replay(
+        &self,
+        expected_peer: &DeviceId,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, SignalProtocolError> {
         if self.signer_public_key.len() != 32 || self.signature.len() != 64 {
             return Err(SignalProtocolError::InvalidSignature);
         }
@@ -336,11 +352,6 @@ where
             &self.signature,
         )
         .map_err(|_| SignalProtocolError::InvalidSignature)?;
-        replay.accept(
-            &self.payload.claims().issuer_key_id,
-            self.payload.claims().counter,
-            self.payload.claims().nonce,
-        )?;
         Ok(VerifiedSignalMetadata::from_claims(self.payload.claims()))
     }
 }

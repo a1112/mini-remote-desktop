@@ -1,4 +1,5 @@
 import hmac
+import hashlib
 import re
 from datetime import UTC, datetime
 
@@ -14,6 +15,7 @@ from app.core.security import (
     DeviceRefreshIdentity,
     DeviceAuthSnapshot,
     capture_device_auth_snapshot,
+    device_auth_snapshot_matches,
     create_device_access_token,
     create_device_refresh_token,
     get_device_refresh_identity,
@@ -254,6 +256,11 @@ async def refresh_device_credentials(
         or not isinstance(device.motherboard_serial_digest, str)
         or not hmac.compare_digest(device.motherboard_serial_digest, identity.serial_digest)
         or not hmac.compare_digest(_device_serial_digest(payload.motherboard_serial), identity.serial_digest)
+        or device.active_refresh_jti_hash is None
+        or not hmac.compare_digest(
+            device.active_refresh_jti_hash,
+            hashlib.sha256(identity.jti.encode("ascii")).hexdigest(),
+        )
     ):
         raise HTTPException(status_code=401, detail="Invalid device authentication credentials")
     device.hostname = payload.hostname
@@ -648,12 +655,12 @@ async def rotate_device_credentials(
     current_device: Device = Depends(get_current_device),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceCredentialResponse:
+    authenticated = capture_device_auth_snapshot(current_device)
     device = await _locked_device(db, device_id)
     if (
-        current_device.id != device.id
-        or not device.is_bound
-        or device.bound_user_id != current_user.id
-        or device.tenant_id != current_user.tenant_id
+        not device_auth_snapshot_matches(device, authenticated)
+        or authenticated.bound_user_id != current_user.id
+        or authenticated.tenant_id != current_user.tenant_id
     ):
         raise HTTPException(status_code=403, detail="Device credential rotation denied")
     device.auth_version += 1

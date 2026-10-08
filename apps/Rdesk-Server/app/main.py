@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
 import shlex
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from app.api.v1.router import api_router
@@ -44,6 +45,52 @@ app.state.realtime_manager = RealtimeSidecarManager(
     ],
     workdir=settings.realtime_server_workdir,
 )
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+@app.middleware("http")
+async def reject_oversized_requests(request: Request, call_next):
+    """Reject oversized bodies before FastAPI parses or stores them."""
+
+    limit = 8 * 1024 * 1024
+    if request.url.path.startswith("/api/v1/auth/"):
+        limit = 64 * 1024
+    elif request.url.path.endswith("/avatar"):
+        limit = 6 * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            length = limit + 1
+        if length < 0 or length > limit:
+            return JSONResponse(
+                {"detail": "request body is too large"}, status_code=413
+            )
+
+    # Content-Length is optional for chunked requests. Wrap the ASGI receive
+    # callable as well so a client cannot bypass the limit by streaming an
+    # unbounded body.
+    received = 0
+    receive = request._receive
+
+    async def limited_receive():
+        nonlocal received
+        message = await receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _RequestBodyTooLarge
+        return message
+
+    request._receive = limited_receive
+    try:
+        return await call_next(request)
+    except _RequestBodyTooLarge:
+        return JSONResponse({"detail": "request body is too large"}, status_code=413)
 
 app.add_middleware(
     CORSMiddleware,

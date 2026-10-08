@@ -9,6 +9,14 @@ impl IpcServer {
         if self.product_only {
             return self.handle_product_connection(stream).await;
         }
+        #[cfg(windows)]
+        if self.management_only {
+            return self.handle_management_connection(stream).await;
+        }
+        #[cfg(target_os = "macos")]
+        let peer_bound_server = self.with_peer_pid(stream.peer_process_id()?);
+        #[cfg(not(target_os = "macos"))]
+        let peer_bound_server = self.clone();
         loop {
             match stream.recv_request().await {
                 Ok(request) => {
@@ -16,7 +24,7 @@ impl IpcServer {
                         mrd_ipc::IpcRequest::ShutdownService { mode } => Some(mode.clone()),
                         _ => None,
                     };
-                    let response = self.handle_request(request).await;
+                    let response = peer_bound_server.handle_request(request).await;
                     let sent = stream.send_response(&response).await;
                     if matches!(response, mrd_ipc::IpcResponse::Ack) {
                         if let Some(mode) = shutdown_mode {
@@ -35,6 +43,43 @@ impl IpcServer {
                     }
                     break;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn handle_management_connection(
+        &self,
+        mut stream: transport::IpcStream,
+    ) -> anyhow::Result<()> {
+        // A management client must present its first request promptly and may
+        // not hold an accept worker indefinitely with an idle pipe.
+        let mut first_frame = true;
+        loop {
+            let budget = if first_frame {
+                std::time::Duration::from_secs(3)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
+            let request = match tokio::time::timeout(budget, stream.recv_request()).await {
+                Ok(Ok(request)) => request,
+                _ => break,
+            };
+            first_frame = false;
+            if !management_request_is_allowed_for_connection(&request) {
+                let response = mrd_ipc::IpcResponse::Error {
+                    code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
+                    message: "management endpoint is read-only".to_owned(),
+                };
+                if stream.send_response(&response).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            let response = self.handle_request(request).await;
+            if stream.send_response(&response).await.is_err() {
+                break;
             }
         }
         Ok(())
@@ -81,6 +126,18 @@ impl IpcServer {
         }
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn management_request_is_allowed_for_connection(request: &mrd_ipc::IpcRequest) -> bool {
+    matches!(
+        request,
+        mrd_ipc::IpcRequest::GetPublicServerStatus
+            | mrd_ipc::IpcRequest::GetPublicDeviceBindingProtocol
+            | mrd_ipc::IpcRequest::ServiceHealth
+            | mrd_ipc::IpcRequest::GetShellStatus
+            | mrd_ipc::IpcRequest::GetAutostartStatus
+    )
 }
 
 pub(super) fn is_connection_closed_error(error: &anyhow::Error) -> bool {

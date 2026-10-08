@@ -1655,7 +1655,17 @@ impl SignalingRuntimeCore {
         };
         match self.peer_keys.get(&metadata.issuer_device_id) {
             Some(existing) if existing != &metadata.issuer_key_id => {
-                return Err(SignalingRuntimeError::PeerIdentityChanged);
+                // A peer key is a backend-authorized identity binding. Ignore
+                // a conflicting message and keep the shared signaling socket
+                // alive; tearing down the socket lets one authenticated peer
+                // force every other route into a reconnect loop.
+                tracing::warn!(
+                    peer_device_id = %metadata.issuer_device_id.0,
+                    expected_key_id = %existing,
+                    observed_key_id = %metadata.issuer_key_id,
+                    "ignoring peer identity mismatch"
+                );
+                return Ok(InboundDisposition::Control);
             }
             None => {
                 if self.peer_keys.len() >= PEER_KEY_LIMIT {

@@ -490,6 +490,32 @@ pub struct IpcStream {
 
 #[cfg(unix)]
 impl IpcStream {
+    /// Return the kernel-reported peer process on macOS. UID-only checks are
+    /// insufficient for consent because another same-UID process could forge
+    /// an approval; callers must bind sensitive decisions to this PID.
+    #[cfg(target_os = "macos")]
+    pub fn peer_process_id(&self) -> Result<u32> {
+        use std::mem::size_of;
+        use std::os::unix::io::AsRawFd;
+        let fd = self.socket.as_raw_fd();
+        let mut peer_pid: libc::pid_t = 0;
+        let mut length = size_of::<libc::pid_t>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut peer_pid as *mut libc::pid_t).cast(),
+                &mut length,
+            )
+        };
+        anyhow::ensure!(
+            result == 0 && peer_pid > 0,
+            "unable to authenticate the macOS IPC peer process"
+        );
+        Ok(peer_pid as u32)
+    }
+
     /// Send an IPC request.
     pub async fn send_request(&mut self, request: &crate::IpcRequest) -> Result<()> {
         write_json_message(&mut self.socket, request).await

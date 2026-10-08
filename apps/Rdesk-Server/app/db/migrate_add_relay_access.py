@@ -24,7 +24,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _LOCK_CONTEXT = b"MRD_RELAY_ACCESS_SCHEMA_MIGRATION_V1\x00"
-_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 class RelayAccessMigrationError(RuntimeError):
@@ -122,6 +122,7 @@ async def _migrate_connection(
         {1, 2, 3, 4},
         {1, 2, 3, 4, 5},
         {1, 2, 3, 4, 5, 6},
+        {1, 2, 3, 4, 5, 6, 7},
     )
     if applied_versions not in supported_upgrade_states:
         # Versions 1-3 shipped as one atomic legacy migration. A partial legacy
@@ -136,6 +137,7 @@ async def _migrate_connection(
     apply_directory_lifecycle = 5 not in applied_versions
     apply_wan_session = 6 not in applied_versions
     apply_direct_first = 7 not in applied_versions
+    apply_session_security = 8 not in applied_versions
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
         "relay_node_registrations", "relay_audit_events", "relay_reservations",
@@ -212,6 +214,10 @@ async def _migrate_connection(
         f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS "
         "auth_revoked_at TIMESTAMPTZ",
     )
+    session_security_statements = (
+        f"ALTER TABLE {users} ADD COLUMN IF NOT EXISTS session_version INTEGER",
+        f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS active_refresh_jti_hash VARCHAR(64)",
+    )
     directory_lifecycle_statements = (
         f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
         f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS "
@@ -235,6 +241,7 @@ async def _migrate_connection(
         + (device_identity_statements if apply_device_identity else ())
         + (directory_lifecycle_statements if apply_directory_lifecycle else ())
         + (wan_session_statements if apply_wan_session else ())
+        + (session_security_statements if apply_session_security else ())
     ):
         await connection.execute(text(statement))
 
@@ -348,6 +355,16 @@ async def _migrate_connection(
         )
         await connection.execute(
             text(f"UPDATE {devices} SET auth_version = 1 WHERE auth_version IS NULL")
+        )
+    if apply_session_security:
+        await connection.execute(
+            text(f"UPDATE {users} SET session_version = 1 WHERE session_version IS NULL")
+        )
+        await connection.execute(
+            text(
+                f"ALTER TABLE {users} ALTER COLUMN session_version SET DEFAULT 1, "
+                "ALTER COLUMN session_version SET NOT NULL"
+            )
         )
         await connection.execute(
             text(
@@ -662,6 +679,7 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
         "users": {
             "id": (String, 36, False),
             "tenant_id": (String, 64, False),
+            "session_version": (Integer, None, False),
         },
         "devices": {
             "id": (String, 36, False),
@@ -672,6 +690,7 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
             "motherboard_serial_digest": (String, 64, True),
             "auth_version": (Integer, None, False),
             "auth_revoked_at": (DateTime, None, True),
+            "active_refresh_jti_hash": (String, 64, True),
         },
         "session_requests": {
             "id": (String, 36, False),
@@ -1390,12 +1409,19 @@ def _verify(connection: object, schema: str | None) -> None:
     }
     if _normalize_server_default(device_columns["auth_version"]["default"]) != "1":
         raise RelayAccessMigrationError("relay device auth version default differs")
+    user_columns = {
+        column["name"]: column
+        for column in inspector.get_columns("users", schema=schema)
+    }
+    if _normalize_server_default(user_columns["session_version"]["default"]) != "1":
+        raise RelayAccessMigrationError("relay user session version default differs")
     if any(
         device_columns[name]["default"] is not None
         for name in (
             "motherboard_serial",
             "motherboard_serial_digest",
             "auth_revoked_at",
+            "active_refresh_jti_hash",
         )
     ):
         raise RelayAccessMigrationError("relay device identity defaults differ")

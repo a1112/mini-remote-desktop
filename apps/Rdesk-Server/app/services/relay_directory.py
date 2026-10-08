@@ -13,7 +13,7 @@ from typing import Callable, Iterable, NoReturn, Protocol
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from app.core.security import DeviceAuthSnapshot
+from app.core.security import DeviceAuthSnapshot, device_auth_snapshot_matches
 from app.models.device import Device
 from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_audit_event import RelayAuditEvent
@@ -176,6 +176,8 @@ class RelayAccessService:
         session_id: str,
         policy_revision: int,
         intended_peer_id: str,
+        auth_snapshot: DeviceAuthSnapshot | None = None,
+        current_device_id: str | None = None,
     ) -> RelayAccessResult:
         async with session_grant_identity_lock(self._session, "session:" + session_id):
             return await self._issue_access_locked(
@@ -183,6 +185,8 @@ class RelayAccessService:
                 session_id=session_id,
                 policy_revision=policy_revision,
                 intended_peer_id=intended_peer_id,
+                auth_snapshot=auth_snapshot,
+                current_device_id=current_device_id,
             )
 
     async def create_wan_generation_locked(
@@ -356,6 +360,8 @@ class RelayAccessService:
                 session_id=session_id,
                 policy_revision=policy_revision,
                 intended_peer_id=intended_peer_id,
+                auth_snapshot=auth_snapshot,
+                current_device_id=current_device.id,
             )
         if generation is None:
             _deny_access()
@@ -1072,6 +1078,8 @@ class RelayAccessService:
         session_id: str,
         policy_revision: int,
         intended_peer_id: str,
+        auth_snapshot: DeviceAuthSnapshot | None = None,
+        current_device_id: str | None = None,
     ) -> RelayAccessResult:
         now = _utc(self._now())
         try:
@@ -1081,16 +1089,33 @@ class RelayAccessService:
                 )
                 if grant_preview is None:
                     _deny_access()
-                target_device = await self._session.scalar(
+                device_ids = {grant_preview.target_device_id}
+                if auth_snapshot is not None:
+                    if current_device_id != auth_snapshot.row_id:
+                        _deny_access()
+                    device_ids.add(auth_snapshot.row_id)
+                device_rows = await self._session.scalars(
                     select(Device)
-                    .where(Device.id == grant_preview.target_device_id)
+                    .where(Device.id.in_(device_ids))
+                    .order_by(Device.id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
+                devices = {device.id: device for device in device_rows}
+                target_device = devices.get(grant_preview.target_device_id)
                 if target_device is None:
                     _deny_access()
                 if not target_device.is_bound or target_device.bound_user_id is None:
                     _deny_access()
+                if auth_snapshot is not None:
+                    caller_device = devices.get(auth_snapshot.row_id)
+                    if (
+                        caller_device is None
+                        or not device_auth_snapshot_matches(caller_device, auth_snapshot)
+                        or caller_device.bound_user_id != current_user_id
+                        or caller_device.tenant_id != grant_preview.tenant_id
+                    ):
+                        _deny_access()
                 participant_rows = await self._session.scalars(
                     select(User)
                     .where(

@@ -563,11 +563,6 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::RefreshLanDiscovery
             | IpcRequest::GetDevicePreferences
             | IpcRequest::UpdateDevicePreference { .. }
-            | IpcRequest::ListDirectory { .. }
-            | IpcRequest::StartFileTransfer { .. }
-            | IpcRequest::ListFileTransfers
-            | IpcRequest::ListFileTransferProviders
-            | IpcRequest::CancelFileTransfer { .. }
             | IpcRequest::WakeOnLan { .. }
             | IpcRequest::RequestRemoteDevicePowerAction { .. }
             | IpcRequest::ListSessions
@@ -578,7 +573,6 @@ pub fn is_ipc_request_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::ListRemoteDisplayModes { .. }
             | IpcRequest::SetRemoteDisplayMode { .. }
             | IpcRequest::RestoreRemoteDisplayMode { .. }
-            | IpcRequest::CrossE2EInjectFault { .. }
             | IpcRequest::StartReceiver { .. }
             | IpcRequest::SessionRuntimeSnapshot { .. }
             | IpcRequest::RuntimeSnapshot
@@ -845,15 +839,15 @@ mod tests {
     }
 
     #[test]
-    fn web_bridge_allows_directory_listing() {
-        assert!(is_ipc_request_allowed(&IpcRequest::ListDirectory {
+    fn web_bridge_blocks_privileged_file_requests() {
+        assert!(!is_ipc_request_allowed(&IpcRequest::ListDirectory {
             path: Some(".".to_string()),
         }));
     }
 
     #[test]
     fn web_bridge_allows_local_file_transfer_requests() {
-        assert!(is_ipc_request_allowed(&IpcRequest::StartFileTransfer {
+        assert!(!is_ipc_request_allowed(&IpcRequest::StartFileTransfer {
             request: mrd_ipc::FileTransferStartRequest {
                 source_device_id: None,
                 target_device_id: None,
@@ -868,11 +862,11 @@ mod tests {
                 provider_hint: None,
             },
         }));
-        assert!(is_ipc_request_allowed(&IpcRequest::ListFileTransfers));
-        assert!(is_ipc_request_allowed(
+        assert!(!is_ipc_request_allowed(&IpcRequest::ListFileTransfers));
+        assert!(!is_ipc_request_allowed(
             &IpcRequest::ListFileTransferProviders
         ));
-        assert!(is_ipc_request_allowed(&IpcRequest::CancelFileTransfer {
+        assert!(!is_ipc_request_allowed(&IpcRequest::CancelFileTransfer {
             transfer_id: "file-transfer-1".to_string(),
         }));
     }
@@ -886,8 +880,8 @@ mod tests {
     }
 
     #[test]
-    fn web_bridge_allows_cross_e2e_fault_requests() {
-        assert!(is_ipc_request_allowed(&IpcRequest::CrossE2EInjectFault {
+    fn web_bridge_blocks_cross_e2e_fault_requests() {
+        assert!(!is_ipc_request_allowed(&IpcRequest::CrossE2EInjectFault {
             session_id: mrd_proto::SessionId("fault-session".to_string()),
             fault_type: "network.pause_peer".to_string(),
             duration_ms: Some(500),

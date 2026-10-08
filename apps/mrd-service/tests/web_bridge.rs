@@ -54,6 +54,24 @@ fn bridge_allows_only_browser_safe_ipc_requests() {
         }
     ));
 
+    // The browser bridge must never expose the privileged local filesystem
+    // capability. File operations remain available through native IPC only.
+    assert!(!is_ipc_request_allowed(&IpcRequest::ListDirectory {
+        path: Some(".".to_string()),
+    }));
+    assert!(!is_ipc_request_allowed(&IpcRequest::ListFileTransfers));
+    assert!(!is_ipc_request_allowed(&IpcRequest::StartFileTransfer {
+        request: mrd_ipc::FileTransferStartRequest {
+            source_device_id: None,
+            target_device_id: None,
+            entries: Vec::new(),
+            target_path: ".".to_string(),
+            conflict_policy: mrd_ipc::FileTransferConflictPolicy::Rename,
+            transport_hint: Some("local".to_string()),
+            provider_hint: None,
+        },
+    }));
+
     assert!(!is_ipc_request_allowed(&IpcRequest::ShutdownService {
         mode: ShutdownMode::Graceful
     }));

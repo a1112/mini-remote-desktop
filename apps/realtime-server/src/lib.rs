@@ -702,6 +702,7 @@ impl RealtimeError {
                 RouteError::Conflict | RouteError::MigrationConflict => {
                     ProtocolReasonCode::Conflict
                 }
+                RouteError::Capacity => ProtocolReasonCode::RateLimited,
                 _ => ProtocolReasonCode::UnauthorizedRoute,
             },
         }

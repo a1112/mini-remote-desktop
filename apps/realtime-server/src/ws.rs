@@ -213,6 +213,14 @@ struct HealthResponse {
     service: &'static str,
     protocol_version: u16,
     supported_protocol_versions: [u16; 2],
+}
+
+#[derive(Debug, Serialize)]
+struct InternalHealthResponse {
+    status: &'static str,
+    service: &'static str,
+    protocol_version: u16,
+    supported_protocol_versions: [u16; 2],
     authenticated_presence: usize,
     authorized_routes: usize,
 }
@@ -220,6 +228,7 @@ struct HealthResponse {
 pub fn build_router(state: RealtimeAppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/internal/health", get(internal_health))
         .route("/ws", get(ws_handler))
         .route(
             "/internal/presence",
@@ -255,8 +264,24 @@ async fn private_presence(State(state): State<RealtimeAppState>, request: Reques
 }
 
 async fn health(State(state): State<RealtimeAppState>) -> Json<HealthResponse> {
-    let core = state.core.lock().await;
+    let _ = state;
     Json(HealthResponse {
+        status: "ok",
+        service: "realtime-server",
+        protocol_version: SIGNAL_PROTOCOL_V3,
+        supported_protocol_versions: [SIGNAL_PROTOCOL_V2, SIGNAL_PROTOCOL_V3],
+    })
+}
+
+async fn internal_health(State(state): State<RealtimeAppState>, request: Request) -> Response {
+    let Some(authorization) = &state.presence_authorization else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !authorization.authorize(request.headers()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let core = state.core.lock().await;
+    let mut response = Json(InternalHealthResponse {
         status: "ok",
         service: "realtime-server",
         protocol_version: SIGNAL_PROTOCOL_V3,
@@ -264,6 +289,12 @@ async fn health(State(state): State<RealtimeAppState>) -> Json<HealthResponse> {
         authenticated_presence: core.presence_count(),
         authorized_routes: core.route_count(),
     })
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 async fn ws_handler(
@@ -380,7 +411,6 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
 }
 
 async fn deliver_all(state: &RealtimeAppState, deliveries: Vec<Delivery>) {
-    let mut failed = Vec::new();
     for delivery in deliveries {
         let DeliveryTarget::Connection(connection_id) = delivery.target;
         let Ok(encoded) = encode_authenticated_message(&delivery.envelope) else {
@@ -391,15 +421,10 @@ async fn deliver_all(state: &RealtimeAppState, deliveries: Vec<Delivery>) {
             if sender.try_send(encoded).is_err() {
                 tracing::warn!(
                     connection_id = ?connection_id,
-                    "realtime outbound queue unavailable"
+                    "realtime outbound queue full; dropping sender traffic"
                 );
-                failed.push(connection_id);
             }
         }
-    }
-    for connection_id in failed {
-        state.peers.lock().await.remove(&connection_id);
-        state.core.lock().await.disconnect(connection_id);
     }
 }
 

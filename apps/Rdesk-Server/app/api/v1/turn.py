@@ -1,10 +1,16 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.security import get_current_user
+from app.db.session import get_db
 from app.models.user import User
+from app.models.session_request import SessionRequest
 from app.services.turn_credentials import (
     TurnCredentialConfigurationError,
     TurnCredentialExpired,
@@ -57,12 +63,33 @@ async def create_turn_credentials(
     payload: TurnCredentialRequest,
     current_user: User = Depends(get_current_user),
     issuer: TurnCredentialService = Depends(get_turn_credential_service),
+    db: AsyncSession = Depends(get_db),
 ) -> TurnCredentialResponse:
+    grant = await db.scalar(
+        select(SessionRequest).where(SessionRequest.id == payload.session_id)
+    )
+    now = int(datetime.now(UTC).timestamp())
+    if (
+        grant is None
+        or grant.status != "approved"
+        or grant.requester_user_id != current_user.id
+        or grant.tenant_id != current_user.tenant_id
+        or grant.grant_expires_at is None
+        or int(grant.grant_expires_at.timestamp()) <= now
+        or grant.policy_expires_at is None
+        or int(grant.policy_expires_at.timestamp()) <= now
+    ):
+        raise HTTPException(status_code=403, detail="TURN session authorization required")
+    deadline = min(
+        payload.credential_deadline_unix_seconds,
+        int(grant.grant_expires_at.timestamp()),
+        int(grant.policy_expires_at.timestamp()),
+    )
     try:
         credential = issuer.issue(
             user_id=current_user.id,
             session_id=payload.session_id,
-            credential_deadline_unix_seconds=payload.credential_deadline_unix_seconds,
+            credential_deadline_unix_seconds=deadline,
         )
     except TurnCredentialExpired as error:
         raise HTTPException(status_code=410, detail=str(error)) from error
