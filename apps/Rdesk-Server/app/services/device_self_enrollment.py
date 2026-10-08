@@ -23,13 +23,14 @@ from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
-from app.models.device import Device, generate_device_id_from_digest
+from app.models.device import Device, generate_device_id_from_digest, generate_random_device_id
 from app.models.device_machine_identity import DeviceMachineIdentity, DeviceSelfEnrollmentChallenge
 from app.models.relay_audit_event import RelayAuditEvent
 from app.schemas.device import DeviceRegisterRequest
 from app.schemas.device_self_enrollment import (
     DeviceSelfEnrollmentChallengeRequest,
     DeviceSelfEnrollmentChallengeResponse,
+    DeviceSelfRegistrationPayload,
     DeviceSelfRegisterRequest,
 )
 from app.services.device_enrollment import (
@@ -166,7 +167,7 @@ class DeviceSelfEnrollmentService:
                     bytes.fromhex(request.signature),
                     contextual_self_registration(canonical_self_registration(self._api_url, request)),
                 )
-                registration = DeviceRegisterRequest.model_validate(json.loads(
+                registration = DeviceSelfRegistrationPayload.model_validate(json.loads(
                     request.registration_json, object_pairs_hook=_unique_json_object,
                     parse_constant=_reject_json_constant,
                 ))
@@ -181,14 +182,25 @@ class DeviceSelfEnrollmentService:
                 mapping = await self._session.scalar(select(DeviceMachineIdentity).where(
                     DeviceMachineIdentity.key_id == request.key_id
                 ).with_for_update().execution_options(populate_existing=True))
+                if mapping is None and registration.expected_device_id is not None:
+                    # Recovery must return the caller's existing assignment;
+                    # a missing mapping cannot turn recovery into allocation.
+                    _conflict()
                 if mapping is not None:
                     if not hmac.compare_digest(mapping.public_key, request.public_key):
                         _invalid()
                     device = await self._session.scalar(select(Device).where(
                         Device.id == mapping.device_row_id
                     ).with_for_update().execution_options(populate_existing=True))
-                    if device is None or device.auth_revoked_at is not None:
+                    if device is None:
+                        if registration.expected_device_id is not None:
+                            _conflict()
                         _invalid()
+                    if device.auth_revoked_at is not None:
+                        _invalid()
+                    if (registration.expected_device_id is not None
+                            and device.device_id != registration.expected_device_id):
+                        _conflict()
                     if not hmac.compare_digest(device.motherboard_serial_digest or "", serial_digest):
                         _conflict()
                     # A new valid challenge may replace lost local credentials,
@@ -245,7 +257,7 @@ class DeviceSelfEnrollmentService:
                 if constraint != "code":
                     raise
                 if attempt + 1 < 32:
-                    device_id = str(secrets.randbelow(10**10)).zfill(10)
+                    device_id = generate_random_device_id()
             else:
                 await savepoint.commit()
                 return device

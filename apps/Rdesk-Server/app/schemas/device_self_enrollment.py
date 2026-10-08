@@ -2,6 +2,14 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.device import DeviceRegisterRequest
+
+
+class DeviceSelfRegistrationPayload(DeviceRegisterRequest):
+    """Machine metadata and an optional recovery target covered by the signature."""
+
+    expected_device_id: str | None = Field(default=None, min_length=1, max_length=64, strict=True)
+
 
 class DeviceSelfEnrollmentChallengeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")

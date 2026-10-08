@@ -12,6 +12,23 @@ fn default_hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
+        .and_then(non_empty_trimmed)
+        .or_else(system_hostname)
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let length = buffer.iter().position(|byte| *byte == 0)?;
+    non_empty_trimmed(std::str::from_utf8(&buffer[..length]).ok()?.to_owned())
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

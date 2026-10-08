@@ -213,6 +213,15 @@ impl PublicConnectionState {
             machine_key_id: machine_key_id.to_owned(),
         };
         let saved = config.load()?;
+        if let Some(saved) = &saved {
+            if !saved.machine_serial.is_empty() {
+                mrd_device_registration::validate_saved_machine_identity(
+                    &saved.machine_serial,
+                    Some(machine_key_id),
+                )
+                .map_err(|_| anyhow!("registered hardware identity does not match this machine"))?;
+            }
+        }
         let serial = match &saved {
             Some(saved) if !saved.machine_serial.is_empty() => saved.machine_serial.clone(),
             Some(_) => format!("mrd-machine-key:{machine_key_id}"),
@@ -430,7 +439,9 @@ async fn apply_registration(
     {
         return Err("设备恢复身份不匹配");
     }
-    if value.device_id.len() != 10 || !value.device_id.bytes().all(|byte| byte.is_ascii_digit()) {
+    if !matches!(value.device_id.len(), 9 | 10)
+        || !value.device_id.bytes().all(|byte| byte.is_ascii_digit())
+    {
         // Historical IDs are acceptable only when refreshing an existing identity.
         if state
             .public_connection
@@ -439,7 +450,7 @@ async fn apply_registration(
             .is_none_or(|saved| saved.device_id != value.device_id)
         {
             value.access_token.zeroize();
-            return Err("服务器未返回有效的10位设备码");
+            return Err("服务器未返回有效的数字设备码");
         }
     }
     let saved = Registration {
@@ -820,25 +831,51 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
                     };
                     let refreshed =
                         tokio::select! { _ = &mut stopping => break, result = renewal => result };
-                    match refreshed {
-                        Ok(value) if value.device_id == saved.device_id => {
-                            match apply_registration(&state, &saved.api_url, value).await {
-                                Ok(()) => {
-                                    saved = state
-                                        .public_connection
-                                        .registration()
-                                        .expect("successful protected save");
-                                    last_refresh = Some(tokio::time::Instant::now());
-                                }
-                                Err(_) => {
-                                    *state.public_connection.last_error.write().unwrap() =
-                                        Some("public_credential_save_failed".into());
-                                }
+                    if auto_enrollment::needs_existing_recovery(&refreshed) {
+                        let recovered = tokio::select! {
+                            _ = &mut stopping => break,
+                            result = auto_enrollment::recover_existing(&state, &saved) => result,
+                        };
+                        match recovered {
+                            Ok(()) => {
+                                saved = state
+                                    .public_connection
+                                    .registration()
+                                    .expect("successful protected recovery");
+                                last_refresh = Some(tokio::time::Instant::now());
+                            }
+                            Err(error) => {
+                                *state.public_connection.last_error.write().unwrap() =
+                                    Some(error.status_code().into());
+                                // Never open a signaling stack with a credential
+                                // already rejected by ordinary renewal. Keep the
+                                // assignment and retry on the regular next tick.
+                                continue;
                             }
                         }
-                        _ => {
-                            *state.public_connection.last_error.write().unwrap() =
-                                Some("public_credential_refresh_failed".into());
+                    } else {
+                        match refreshed {
+                            Ok(value) if value.device_id == saved.device_id => {
+                                match apply_registration(&state, &saved.api_url, value).await {
+                                    Ok(()) => {
+                                        saved = state
+                                            .public_connection
+                                            .registration()
+                                            .expect("successful protected save");
+                                        last_refresh = Some(tokio::time::Instant::now());
+                                    }
+                                    Err(_) => {
+                                        *state.public_connection.last_error.write().unwrap() =
+                                            Some("public_credential_save_failed".into());
+                                        continue;
+                                    }
+                                }
+                            }
+                            _ => {
+                                *state.public_connection.last_error.write().unwrap() =
+                                    Some("public_credential_refresh_failed".into());
+                                continue;
+                            }
                         }
                     }
                 }

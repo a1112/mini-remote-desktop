@@ -12,7 +12,7 @@ import { useDeviceRegistration } from "../services/deviceService";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
-import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { DEVICE_CODE_INPUT_ERROR, deviceCodeLabel, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 
 type MobileLayoutProps = { onOpenAuth: () => void };
 
@@ -74,14 +74,14 @@ function MobileHomePage() {
     <div className="mobile-intro">
       <p className="mobile-eyebrow">安全远程访问</p>
       <h1>连接远程设备</h1>
-      <p>输入 10 位远程设备码，发起连接请求</p>
+      <p>输入 9 位远程设备码，发起连接请求</p>
     </div>
 
     <section className="mobile-card mobile-connect-card" aria-label="连接远程设备">
       <label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
       <div className="mobile-input-wrap">
         <Monitor size={20} aria-hidden="true" />
-        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 10 位设备码"
+        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 9 位设备码"
           value={targetId} onChange={(event) => setTargetId(event.target.value)}
           onKeyDown={(event) => { if (event.key === "Enter") void connect(targetId); }} />
       </div>
@@ -114,7 +114,7 @@ function MobileHomePage() {
     </section>
 
     <section className="mobile-local-device" aria-label="本机设备">
-      <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
+      <span><small>{deviceCodeLabel(myDeviceId)}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>

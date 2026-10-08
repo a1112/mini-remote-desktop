@@ -46,6 +46,8 @@ enum RuntimeControl {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunMode {
     Console,
+    #[cfg(target_os = "macos")]
+    UserStart,
     #[cfg(windows)]
     WindowsService,
 }
@@ -59,6 +61,13 @@ fn main() -> Result<()> {
     }
     initialize_logging();
 
+    #[cfg(target_os = "macos")]
+    if std::env::args_os().any(|argument| argument == "--authorize-keychain") {
+        security::authorize_keychain_access().map_err(anyhow::Error::msg)?;
+        info!("macOS Keychain access check passed; use --authorize-keychain-and-run or the UI start action to run with single-read approval");
+        return Ok(());
+    }
+
     #[cfg(windows)]
     if std::env::args_os().any(|argument| argument == "--service") {
         info!("mrd-service dispatching to Windows SCM");
@@ -69,7 +78,14 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run_service(RunMode::Console, None, StatusReporter::Console));
+    let mode = RunMode::Console;
+    #[cfg(target_os = "macos")]
+    let mode = if std::env::args_os().any(|argument| argument == "--authorize-keychain-and-run") {
+        RunMode::UserStart
+    } else {
+        mode
+    };
+    let result = runtime.block_on(run_service(mode, None, StatusReporter::Console));
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     result
 }
@@ -442,14 +458,15 @@ async fn run_service(
 }
 
 #[cfg(target_os = "macos")]
-async fn run_service(
-    _mode: RunMode,
-    _controls: Option<()>,
-    reporter: StatusReporter,
-) -> Result<()> {
+async fn run_service(mode: RunMode, _controls: Option<()>, reporter: StatusReporter) -> Result<()> {
     let tray = shell::default_tray();
     let directory = security::ensure_protected_product_data_dir().map_err(anyhow::Error::msg)?;
-    let protector = security::platform_secret_protector().map_err(anyhow::Error::msg)?;
+    let protector = if mode == RunMode::UserStart {
+        security::user_start_secret_protector()
+    } else {
+        security::platform_secret_protector()
+    }
+    .map_err(anyhow::Error::msg)?;
     let app_state = Arc::new(
         AppState::open_persistent_with_tray_and_lan_discovery_config(
             tray.clone(),

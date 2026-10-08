@@ -18,12 +18,19 @@ export function parseRemoteDeviceInput(value: string): {
   kind: "current" | "legacy";
 } | null {
   const code = normalizeDeviceCode(value);
-  if (/^\d{10}$/.test(code)) return { deviceId: code, kind: "current" };
-  if (/^\d{9}$/.test(code)) return { deviceId: code, kind: "legacy" };
+  if (/^\d{9}$/.test(code)) return { deviceId: code, kind: "current" };
+  if (/^\d{10}$/.test(code)) return { deviceId: code, kind: "legacy" };
   if (/[A-Za-z]/.test(code) && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/.test(code)) {
     return { deviceId: code, kind: "legacy" };
   }
   return null;
 }
 
-export const DEVICE_CODE_INPUT_ERROR = "请输入 10 位数字设备码，也可使用已有的旧设备码或局域网标识";
+export const DEVICE_CODE_INPUT_ERROR = "请输入 9 位数字设备码，也可使用已有的旧设备码或局域网标识";
+
+export function deviceCodeLabel(value: string | null | undefined): string {
+  const code = normalizeDeviceCode(value ?? "");
+  if (/^\d{9}$/.test(code)) return "9 位设备码";
+  if (/^\d{10}$/.test(code)) return "已有 10 位设备码";
+  return "当前设备标识";
+}

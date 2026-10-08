@@ -1,346 +1,94 @@
-import { useState, useEffect } from "react";
-import {
-  X,
-  Monitor,
-  CheckCircle,
-  AlertCircle,
-  Loader2,
-} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { X, CheckCircle, Loader2, RefreshCw, AlertCircle } from "lucide-react";
 import { useTheme } from "./ThemeContext";
-import { deviceService } from "../services/deviceService";
-
-interface HardwareInfo {
-  motherboard_serial: string;
-  hostname: string;
-  os_type: string;
-  os_version: string;
-  cpu_info: {
-    name: string;
-    vendor_id: string;
-    cores: number;
-    max_frequency_mhz?: number;
-  };
-  total_memory_mb: number;
-  gpu_info: Array<{
-    name: string;
-    vendor: string;
-    memory_mb?: number;
-  }>;
-}
-
-interface DeviceRegisterResponse {
-  device_id: string;
-  device_name: string;
-  access_token: string;
-}
+import { useDeviceRegistration, usePublicServerStatus } from "../services/deviceService";
+import { deviceCodeLabel, formatDeviceCode } from "../utils/deviceCode";
+import { LOCAL_SERVICE_STOPPED_MESSAGE, LOCAL_SERVICE_UNREACHABLE_MESSAGE } from "../utils/automaticDeviceEnrollment";
 
 interface DeviceRegisterModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSuccess?: (deviceId: string, deviceName: string, accessToken: string) => void;
+  onSuccess?: () => void;
 }
 
-export function DeviceRegisterModal({
-  isOpen,
-  onClose,
-  onSuccess,
-}: DeviceRegisterModalProps) {
+export function DeviceRegisterModal({ isOpen, ...props }: DeviceRegisterModalProps) {
+  return isOpen ? <AutomaticDeviceRegistrationDialog {...props} /> : null;
+}
+
+function AutomaticDeviceRegistrationDialog({ onClose, onSuccess }: Omit<DeviceRegisterModalProps, "isOpen">) {
   const { isDark } = useTheme();
-  const [step, setStep] = useState<"loading" | "register" | "success">("loading");
-  const [hardwareInfo, setHardwareInfo] = useState<HardwareInfo | null>(null);
-  const [deviceName, setDeviceName] = useState("");
-  const [enrollmentToken, setEnrollmentToken] = useState("");
-  const [credentialMode, setCredentialMode] = useState<"enroll" | "recover">("enroll");
-  const validCredential = credentialMode === "enroll"
-    ? /^[A-Za-z0-9_-]{43}$/.test(enrollmentToken.trim())
-    : /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(enrollmentToken.trim());
-  const [error, setError] = useState<string | null>(null);
-  const [registering, setRegistering] = useState(false);
-  const [result, setResult] = useState<DeviceRegisterResponse | null>(null);
+  const { deviceId: managedDeviceId, registrationError } = useDeviceRegistration();
+  const { status, checking, failed, starting, startupError, refresh, startService } = usePublicServerStatus();
+  const [retrying, setRetrying] = useState(false);
+  const notifiedDeviceId = useRef<string | null>(null);
+  const deviceId = status?.service_running && status.device_registered && status.device_id === managedDeviceId
+    ? managedDeviceId : null;
 
-  // 获取硬件信息
   useEffect(() => {
-    setEnrollmentToken("");
-    setCredentialMode("enroll");
-    setError(null);
-    setResult(null);
-    setStep("loading");
-    if (isOpen) {
-      fetchHardwareInfo();
+    if (deviceId && notifiedDeviceId.current !== deviceId) {
+      notifiedDeviceId.current = deviceId;
+      onSuccess?.();
     }
-  }, [isOpen]);
+  }, [deviceId, onSuccess]);
 
-  const fetchHardwareInfo = async () => {
-    try {
-      if (window.__TAURI__) {
-        const info = await window.__TAURI__.invoke<HardwareInfo>("get_hardware_info");
-        setHardwareInfo(info);
-        setDeviceName(info.hostname);
-        setStep("register");
-      } else {
-        throw new Error("仅桌面客户端可以注册设备");
-      }
-    } catch (err) {
-      setError(`获取硬件信息失败: ${err}`);
-      setStep("register");
-    }
+  const retry = async () => {
+    setRetrying(true);
+    try { await refresh(); } finally { setRetrying(false); }
   };
-
-  const handleRegister = async () => {
-    if (!hardwareInfo || !validCredential) return;
-
-    setRegistering(true);
-    setError(null);
-    const credential = enrollmentToken.trim();
-    setEnrollmentToken("");
-
-    try {
-      const response = credentialMode === "enroll"
-        ? await deviceService.enroll(credential, deviceName || hardwareInfo.hostname)
-        : await deviceService.recoverDeviceCredential(credential);
-      setResult(response);
-      setStep("success");
-
-      if (onSuccess) {
-        onSuccess(response.device_id, response.device_name, response.access_token);
-      }
-    } catch (err) {
-      setError(`注册失败: ${err}`);
-    } finally {
-      setRegistering(false);
-    }
-  };
-
-  const handleClose = () => {
-    setStep("loading");
-    setHardwareInfo(null);
-    setDeviceName("");
-    setEnrollmentToken("");
-    setError(null);
-    setResult(null);
-    onClose();
-  };
-
-  if (!isOpen) return null;
-
-  const cardBg = isDark ? "bg-[#232323]" : "bg-white";
-  const textPrimary = isDark ? "text-gray-100" : "text-gray-900";
-  const textSecondary = isDark ? "text-gray-400" : "text-gray-500";
-  const inputBg = isDark
-    ? "bg-[#2a2a2a] border-gray-600 text-gray-200"
-    : "bg-gray-50 border-gray-200 text-gray-900";
-  const buttonPrimary = isDark
-    ? "bg-blue-600 hover:bg-blue-500 text-white"
-    : "bg-blue-600 hover:bg-blue-700 text-white";
-  const buttonDisabled = isDark
-    ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-    : "bg-gray-200 text-gray-400 cursor-not-allowed";
+  const localUnavailable = failed || status?.service_running === false;
+  const message = starting ? "正在启动本机后台服务…"
+    : startupError ?? (failed ? LOCAL_SERVICE_UNREACHABLE_MESSAGE
+      : status?.service_running === false ? LOCAL_SERVICE_STOPPED_MESSAGE
+      : registrationError ?? (status ? "正在自动登记并领取设备码，请稍候。" : "正在检查本机后台服务…"));
+  const inProgress = starting || (!localUnavailable && (
+    checking || status?.last_error === "public_auto_enrollment_pending"
+    || Boolean(status?.service_running && !status.device_registered && !status.last_error && status.api_url && status.api_reachable !== false)
+  ));
+  const card = isDark ? "bg-[#232323] border-gray-700 text-gray-100" : "bg-white border-gray-200 text-gray-900";
+  const secondary = isDark ? "text-gray-400" : "text-gray-500";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Overlay */}
-      <div
-        className={`absolute inset-0 ${isDark ? "bg-black/60" : "bg-black/40"}`}
-        onClick={handleClose}
-      />
-
-      {/* Modal */}
-      <div
-        className={`relative w-full max-w-lg rounded-2xl shadow-2xl ${cardBg} border ${
-          isDark ? "border-gray-700" : "border-gray-200"
-        }`}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b">
-          <h2 className={`text-xl font-semibold ${textPrimary}`}>
-            {step === "success" ? "设备注册成功" : "设备注册"}
-          </h2>
-          <button
-            onClick={handleClose}
-            className={`p-2 rounded-lg ${isDark ? "hover:bg-gray-700" : "hover:bg-gray-100"}`}
-          >
-            <X className="w-5 h-5" />
-          </button>
+      <div className={`absolute inset-0 ${isDark ? "bg-black/60" : "bg-black/40"}`} onClick={onClose} />
+      <div role="dialog" aria-modal="true" aria-labelledby="device-registration-title"
+        className={`relative w-full max-w-lg rounded-2xl border shadow-2xl ${card}`}>
+        <div className="flex items-center justify-between border-b p-6">
+          <h2 id="device-registration-title" className="text-xl font-semibold">设备自动登记</h2>
+          <button onClick={onClose} aria-label="关闭设备登记状态" className="rounded-lg p-2"><X className="h-5 w-5" /></button>
         </div>
-
-        {/* Content */}
-        <div className="p-6">
-          {step === "loading" && (
-            <div className="flex flex-col items-center justify-center py-12">
-              <Loader2 className="w-12 h-12 animate-spin text-blue-500 mb-4" />
-              <p className={textSecondary}>正在获取硬件信息...</p>
-            </div>
-          )}
-          {step === "register" && !hardwareInfo && error && (
-            <div role="alert" className="text-sm text-red-500 py-8 text-center">{error}</div>
-          )}
-
-          {step === "register" && hardwareInfo && (
-            <div className="space-y-6">
-              {/* Hardware Info Display */}
-              <div className={`p-4 rounded-xl ${isDark ? "bg-[#2a2a2a]" : "bg-gray-50"}`}>
-                <div className="flex items-center gap-3 mb-4">
-                  <Monitor className="w-6 h-6 text-blue-500" />
-                  <div>
-                    <div className={`text-sm ${textSecondary}`}>设备标识</div>
-                    <div className={`font-mono text-sm ${textPrimary}`}>
-                      {hardwareInfo.motherboard_serial}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4 text-sm">
-                  <div>
-                    <div className={textSecondary}>主机名</div>
-                    <div className={textPrimary}>{hardwareInfo.hostname}</div>
-                  </div>
-                  <div>
-                    <div className={textSecondary}>操作系统</div>
-                    <div className={textPrimary}>{hardwareInfo.os_version}</div>
-                  </div>
-                  <div>
-                    <div className={textSecondary}>CPU</div>
-                    <div className={textPrimary}>{hardwareInfo.cpu_info.name}</div>
-                  </div>
-                  <div>
-                    <div className={textSecondary}>内存</div>
-                    <div className={textPrimary}>
-                      {(hardwareInfo.total_memory_mb / 1024).toFixed(1)} GB
-                    </div>
-                  </div>
-                </div>
-
-                {hardwareInfo.gpu_info.length > 0 && (
-                  <div className="mt-4">
-                    <div className={textSecondary}>显卡</div>
-                    <div className={textPrimary}>
-                      {hardwareInfo.gpu_info.map((gpu, i) => (
-                        <div key={i} className="text-sm">
-                          {gpu.name} {gpu.memory_mb && `(${gpu.memory_mb / 1024}GB)`}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* Device Name Input */}
-              <div>
-                <label className={`block text-sm font-medium mb-2 ${textPrimary}`}>
-                  设备名称
-                </label>
-                <input
-                  type="text"
-                  value={deviceName}
-                  onChange={(e) => setDeviceName(e.target.value)}
-                  placeholder="输入设备显示名称"
-                  className={`w-full px-4 py-3 rounded-lg border ${inputBg} focus:outline-none focus:ring-2 focus:ring-blue-500`}
-                />
-              </div>
-
-              <div>
-                <div className={`flex gap-4 mb-4 text-sm ${textPrimary}`}>
-                  <label><input type="radio" name="device-credential-mode" checked={credentialMode === "enroll"} onChange={() => { setCredentialMode("enroll"); setEnrollmentToken(""); }} /> 登记新设备</label>
-                  <label><input type="radio" name="device-credential-mode" checked={credentialMode === "recover"} onChange={() => { setCredentialMode("recover"); setEnrollmentToken(""); }} /> 更新设备凭据</label>
-                </div>
-                <label htmlFor="device-enrollment-token" className={`block text-sm font-medium mb-2 ${textPrimary}`}>
-                  {credentialMode === "enroll" ? "设备登记码" : "新设备凭据"}
-                </label>
-                <input
-                  id="device-enrollment-token"
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={enrollmentToken}
-                  onChange={(e) => setEnrollmentToken(e.target.value)}
-                  placeholder={credentialMode === "enroll" ? "输入管理员提供的一次性登记码" : "输入管理员换发的新设备凭据"}
-                  className={`w-full px-4 py-3 rounded-lg border ${inputBg} focus:outline-none focus:ring-2 focus:ring-blue-500`}
-                />
-                <p className={`mt-2 text-sm ${textSecondary}`}>{credentialMode === "enroll" ? "请向服务器管理员获取 43 位登记码，登记成功后即失效。" : "设备已登记但凭据过期时，请向管理员申请换发凭据，更新后保留原设备码。"}</p>
-              </div>
-
-              {/* Error Message */}
-              {error && (
-                <div className={`flex items-start gap-3 p-4 rounded-lg ${
-                  isDark ? "bg-red-900/20 text-red-400" : "bg-red-50 text-red-600"
-                }`}>
-                  <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
-                  <span className="text-sm">{error}</span>
-                </div>
-              )}
-
-              {/* Register Button */}
-              <button
-                onClick={handleRegister}
-                disabled={registering || !deviceName.trim() || !validCredential}
-                className={`w-full py-3 rounded-lg font-medium transition-colors ${
-                  registering || !deviceName.trim() || !validCredential
-                    ? buttonDisabled
-                    : buttonPrimary
-                }`}
-              >
-                {registering ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <Loader2 className="w-5 h-5 animate-spin" />
-                    注册中...
-                  </span>
-                ) : (
-                  credentialMode === "enroll" ? "注册设备" : "更新设备凭据"
-                )}
+        <div className="space-y-5 p-6 text-center">
+          {deviceId ? (
+            <>
+              <CheckCircle className="mx-auto h-12 w-12 text-green-500" />
+              <p role="status">设备已自动登记</p>
+              <div className={secondary}>{status?.device_name || "本机设备"}</div>
+              <div className={secondary}>{deviceCodeLabel(deviceId)}</div>
+              <div className="font-mono text-2xl tracking-widest">{formatDeviceCode(deviceId)}</div>
+              <p className={`text-sm ${secondary}`}>此设备码与本机身份绑定，下次启动会自动恢复。</p>
+              <button onClick={onClose} className="w-full rounded-lg bg-blue-600 py-3 text-white">完成</button>
+            </>
+          ) : (
+            <>
+              {inProgress
+                ? <Loader2 role="progressbar" aria-label={starting ? "启动后台服务" : "设备登记进度"} className="mx-auto h-12 w-12 animate-spin text-blue-500" />
+                : <AlertCircle className="mx-auto h-12 w-12 text-amber-500" aria-hidden="true" />}
+              <p role="status" aria-live="polite">{message}</p>
+              <p className={`text-sm ${secondary}`}>{localUnavailable
+                ? "后台服务运行后会自动领取设备码。如果系统弹出授权提示，请完成授权。"
+                : "首次启动将自动领取设备码，无需填写登记码或设备凭据。"}</p>
+              {localUnavailable && <button onClick={() => void startService()} disabled={checking || starting}
+                className="w-full rounded-lg bg-blue-600 py-3 text-white disabled:opacity-50">
+                {starting ? "正在启动…" : "启动后台服务"}
+              </button>}
+              <button onClick={() => void retry()} disabled={checking || retrying || starting}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 py-3 text-white disabled:opacity-50">
+                <RefreshCw className={`h-4 w-4 ${retrying ? "animate-spin" : ""}`} />
+                {checking || retrying ? "正在检查…" : "立即重试"}
               </button>
-            </div>
-          )}
-
-          {step === "success" && result && (
-            <div className="text-center py-8">
-              <div className="flex justify-center mb-6">
-                <div className={`w-16 h-16 rounded-full flex items-center justify-center ${
-                  isDark ? "bg-green-900/30" : "bg-green-100"
-                }`}>
-                  <CheckCircle className="w-10 h-10 text-green-500" />
-                </div>
-              </div>
-
-              <h3 className={`text-xl font-semibold mb-2 ${textPrimary}`}>
-                设备注册成功！
-              </h3>
-
-              <div className={`my-6 p-4 rounded-xl ${isDark ? "bg-[#2a2a2a]" : "bg-gray-50"}`}>
-                <div className="grid grid-cols-2 gap-4 text-left">
-                  <div>
-                    <div className={`text-sm ${textSecondary}`}>设备 ID</div>
-                    <div className={`font-mono ${textPrimary}`}>{result.device_id}</div>
-                  </div>
-                  <div>
-                    <div className={`text-sm ${textSecondary}`}>设备名称</div>
-                    <div className={textPrimary}>{result.device_name}</div>
-                  </div>
-                </div>
-              </div>
-
-              <p className={`text-sm ${textSecondary} mb-6`}>
-                设备已成功注册到服务器，现在可以开始使用远程桌面功能。
-              </p>
-
-              <button
-                onClick={handleClose}
-                className={`px-8 py-3 rounded-lg font-medium ${buttonPrimary}`}
-              >
-                完成
-              </button>
-            </div>
+            </>
           )}
         </div>
       </div>
     </div>
   );
-}
-
-// 扩展 window 类型以支持 Tauri invoke
-declare global {
-  interface Window {
-    __TAURI__?: {
-      invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
-    };
-  }
 }

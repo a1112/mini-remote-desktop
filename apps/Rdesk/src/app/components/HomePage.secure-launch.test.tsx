@@ -7,7 +7,7 @@ import { HomePage } from "./HomePage";
 const mocks = vi.hoisted(() => ({
   launchRemoteDisplayForDevice: vi.fn(),
   navigate: vi.fn(),
-  enrollmentRequired: false,
+  enrollmentPending: false,
   refreshRegistration: vi.fn(),
   localDeviceId: "0123456789",
 }));
@@ -25,14 +25,14 @@ vi.mock("../services/deviceService", () => ({
   useDeviceRegistration: () => ({
     deviceId: mocks.localDeviceId,
     deviceName: "Local PC",
-    registrationError: mocks.enrollmentRequired ? "需要设备登记码，请向服务器管理员获取一次性登记码后注册" : null,
+    registrationError: mocks.enrollmentPending ? "正在自动登记并领取设备码，请稍候。" : null,
     refresh: mocks.refreshRegistration,
   }),
 }));
 
 vi.mock("./DeviceRegisterModal", () => ({
-  DeviceRegisterModal: ({ isOpen, onSuccess }: { isOpen: boolean; onSuccess: () => void }) =>
-    isOpen ? <button onClick={() => onSuccess()}>提交设备登记码</button> : null,
+  DeviceRegisterModal: ({ isOpen }: { isOpen: boolean }) =>
+    isOpen ? <div role="dialog">设备自动登记状态</div> : null,
 }));
 
 vi.mock("../services/remoteDisplayLauncher", () => ({
@@ -59,7 +59,8 @@ vi.mock("../services/connectionHistoryService", () => ({
 describe("HomePage secure remote launch", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.enrollmentRequired = false;
+    mocks.enrollmentPending = false;
+    mocks.localDeviceId = "0123456789";
     mocks.launchRemoteDisplayForDevice.mockResolvedValue({
       sessionId: "secure-session",
       windowLabel: null,
@@ -67,26 +68,39 @@ describe("HomePage secure remote launch", () => {
     });
   });
 
-  it("offers reachable server enrollment and refreshes the displayed identity after success", async () => {
-    mocks.enrollmentRequired = true;
+  it("shows automatic registration progress with a status dialog and no enrollment input", async () => {
+    mocks.enrollmentPending = true;
+    mocks.localDeviceId = "";
     const user = userEvent.setup();
     render(<HomePage />);
-    expect(screen.getByText(/需要设备登记码/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "登记到服务器" }));
-    await user.click(screen.getByRole("button", { name: "提交设备登记码" }));
-    expect(mocks.refreshRegistration).toHaveBeenCalled();
+    expect(screen.getByText(/正在自动登记并领取设备码/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "查看设备登记状态" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("设备自动登记状态");
+    expect(screen.queryByLabelText("设备登记码")).not.toBeInTheDocument();
+    expect(mocks.refreshRegistration).not.toHaveBeenCalled();
+  });
+
+  it("shows new nine digit device codes in 3-3-3 groups and copies every digit", async () => {
+    mocks.localDeviceId = "012345678";
+    const user = userEvent.setup();
+    const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();
+    render(<HomePage />);
+    expect(screen.getByText("012 345 678")).toBeInTheDocument();
+    expect(screen.getByText("9 位设备码")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "复制设备码" }));
+    expect(write).toHaveBeenCalledWith("012345678");
   });
 
   it("shows a ten digit device code in readable groups without losing its leading zero", () => {
     render(<HomePage />);
     expect(screen.getByText("012 345 6789")).toBeInTheDocument();
-    expect(screen.getByText("10 位设备码")).toBeInTheDocument();
+    expect(screen.getByText("已有 10 位设备码")).toBeInTheDocument();
   });
 
   it("preserves leading zeroes when connecting with a grouped ten digit code", async () => {
     const user = userEvent.setup();
     render(<HomePage />);
-    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "012 345 6789");
+    await user.type(screen.getByPlaceholderText("输入 9 位设备码"), "012 345 6789");
     await user.click(screen.getByRole("button", { name: "立即连接" }));
     expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith("0123456789", expect.anything());
   });
@@ -102,10 +116,10 @@ describe("HomePage secure remote launch", () => {
   it("rejects invalid characters without connecting to a modified device code", async () => {
     const user = userEvent.setup();
     render(<HomePage />);
-    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "0123456789/secret");
+    await user.type(screen.getByPlaceholderText("输入 9 位设备码"), "0123456789/secret");
     await user.click(screen.getByRole("button", { name: "立即连接" }));
     expect(mocks.launchRemoteDisplayForDevice).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent("请输入 10 位数字设备码");
+    expect(screen.getByRole("alert")).toHaveTextContent("请输入 9 位数字设备码");
   });
 
   it("requests an authenticated Auto session for a known recent device", async () => {
@@ -137,7 +151,7 @@ describe("HomePage secure remote launch", () => {
     render(<HomePage />);
 
     await user.type(
-      screen.getByPlaceholderText("输入 10 位设备码"),
+      screen.getByPlaceholderText("输入 9 位设备码"),
       "900 123 456",
     );
     await user.click(screen.getByRole("button", { name: "立即连接" }));

@@ -1,6 +1,6 @@
-//! Automatic first registration, serialized with manual enrollment and recovery.
+//! Automatic registration and credential recovery, serialized with manual changes.
 
-use super::{apply_registration, machine_payload, AppState};
+use super::{apply_registration, machine_payload, AppState, Registration};
 use mrd_device_registration::auto_enrollment::{self as self_enrollment, SelfEnrollmentError};
 use std::{sync::Arc, time::Duration};
 
@@ -68,6 +68,65 @@ pub(super) async fn enroll_missing(
         .map_err(|_| EnrollmentFailure::ProtectedStorage)
 }
 
+/// A network or protocol failure cannot select the identity recovery route.
+pub(super) fn needs_existing_recovery(
+    renewal: &Result<mrd_device_registration::DeviceRegistrationResponse, &'static str>,
+) -> bool {
+    matches!(
+        renewal,
+        Err(mrd_device_registration::DEVICE_CREDENTIAL_REJECTED)
+    )
+}
+
+/// The caller owns `PublicConnectionState.operation` across this future.
+/// Recovery retains the local assignment on every failure and proves only the
+/// key selected by the configured protected credential store.
+pub(super) async fn recover_existing(
+    state: &Arc<AppState>,
+    saved: &Registration,
+) -> Result<(), EnrollmentFailure> {
+    let identity = state.device_identities.machine_identity();
+    {
+        let persistence = state.public_connection.persistence.read().unwrap();
+        let current = state.public_connection.registration();
+        let api_url = state.public_connection.api_url.read().unwrap();
+        let machine_serial = state.public_connection.machine_serial.read().unwrap();
+        if persistence
+            .as_ref()
+            .is_none_or(|config| config.machine_key_id != identity.key_id())
+            || current.as_ref().is_none_or(|current| {
+                current.device_id != saved.device_id
+                    || current.api_url != saved.api_url
+                    || current.machine_serial != saved.machine_serial
+            })
+            || saved.api_url.trim_end_matches('/') != api_url.trim_end_matches('/')
+            || (!saved.machine_serial.is_empty() && saved.machine_serial != *machine_serial)
+        {
+            return Err(EnrollmentFailure::ProtectedStorage);
+        }
+    }
+    let registration = self_enrollment::self_register_existing(
+        &saved.api_url,
+        &machine_payload(state, saved.device_name.clone()),
+        identity.key_id(),
+        identity.public_key(),
+        &saved.device_id,
+        |bytes| {
+            identity
+                .sign_context_bytes(self_enrollment::SIGNATURE_CONTEXT, bytes)
+                .map_err(|_| SelfEnrollmentError::SigningFailed)
+        },
+    )
+    .await?;
+    // Defense in depth before either credentials or the device registry changes.
+    if registration.device_id != saved.device_id {
+        return Err(SelfEnrollmentError::InvalidResponse.into());
+    }
+    apply_registration(state, &saved.api_url, registration)
+        .await
+        .map_err(|_| EnrollmentFailure::ProtectedStorage)
+}
+
 /// Notifications and API polling cannot turn an enrollment failure into a busy
 /// claim loop. The supervisor's regular tick retries at or after this deadline.
 #[derive(Default)]
@@ -107,6 +166,144 @@ impl EnrollmentRetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_credential_rejection_selects_identity_recovery() {
+        assert!(needs_existing_recovery(&Err(
+            mrd_device_registration::DEVICE_CREDENTIAL_REJECTED
+        )));
+        for error in [
+            "连接服务器失败，请稍后重试",
+            "注册请求过于频繁，请稍后重试",
+            "设备注册失败，请检查服务器配置后重试",
+            "服务器返回的设备登记响应无效",
+        ] {
+            assert!(!needs_existing_recovery(&Err(error)));
+        }
+        assert!(!needs_existing_recovery(&Ok(
+            mrd_device_registration::DeviceRegistrationResponse {
+                device_id: "123456789".into(),
+                device_name: "Office".into(),
+                access_token: "new.access.token".into(),
+                refresh_token: Some("new.refresh.token".into()),
+            }
+        )));
+    }
+
+    fn saved_registration(state: &Arc<AppState>) -> Registration {
+        Registration {
+            device_id: "legacy-device-42".into(),
+            device_name: "Office".into(),
+            access_token: "existing.access.token".into(),
+            refresh_token: Some("existing.refresh.token".into()),
+            api_url: "https://127.0.0.1:9/api/v1".into(),
+            machine_serial: state
+                .public_connection
+                .machine_serial
+                .read()
+                .unwrap()
+                .clone(),
+        }
+    }
+
+    fn assert_existing_identity_retained(state: &Arc<AppState>) {
+        let saved = state.public_connection.registration().unwrap();
+        assert_eq!(saved.device_id, "legacy-device-42");
+        assert_eq!(saved.access_token, "existing.access.token");
+        assert_eq!(
+            saved.refresh_token.as_deref(),
+            Some("existing.refresh.token")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_unprotected_or_different_machine_keys_without_identity_loss() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new());
+        *state.public_connection.api_url.write().unwrap() = "https://127.0.0.1:9/api/v1".into();
+        *state.public_connection.registration.write().unwrap() = Some(saved_registration(&state));
+        let saved = state.public_connection.registration().unwrap();
+        assert_eq!(
+            recover_existing(&state, &saved).await,
+            Err(EnrollmentFailure::ProtectedStorage)
+        );
+        assert_existing_identity_retained(&state);
+        state
+            .public_connection
+            .configure_persistence(
+                directory.path().to_path_buf(),
+                Arc::new(mrd_store_sqlite::AeadSecretProtector::from_key([95; 32]).unwrap()),
+                &"a".repeat(64),
+            )
+            .unwrap();
+        *state.public_connection.api_url.write().unwrap() = "https://127.0.0.1:9/api/v1".into();
+        *state.public_connection.registration.write().unwrap() = Some(saved_registration(&state));
+        let saved = state.public_connection.registration().unwrap();
+        assert_eq!(
+            recover_existing(&state, &saved).await,
+            Err(EnrollmentFailure::ProtectedStorage)
+        );
+        assert_existing_identity_retained(&state);
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_preserves_durable_credentials_and_rejects_identity_substitution() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new());
+        let key_id = state
+            .device_identities
+            .machine_identity()
+            .key_id()
+            .to_owned();
+        state
+            .public_connection
+            .configure_persistence(
+                directory.path().to_path_buf(),
+                Arc::new(mrd_store_sqlite::AeadSecretProtector::from_key([96; 32]).unwrap()),
+                &key_id,
+            )
+            .unwrap();
+        *state.public_connection.api_url.write().unwrap() = "https://127.0.0.1:9/api/v1".into();
+        state
+            .public_connection
+            .save(saved_registration(&state))
+            .unwrap();
+        let saved = state.public_connection.registration().unwrap();
+        assert_eq!(
+            recover_existing(&state, &saved).await,
+            Err(EnrollmentFailure::Protocol(
+                SelfEnrollmentError::ConnectionFailed
+            ))
+        );
+        assert_existing_identity_retained(&state);
+        let persisted = state
+            .public_connection
+            .persistence
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.device_id, saved.device_id);
+        assert_eq!(persisted.access_token, saved.access_token);
+        assert_eq!(persisted.refresh_token, saved.refresh_token);
+        for mutation in 0..3 {
+            let mut substitution = saved.clone();
+            match mutation {
+                0 => substitution.device_id = "987654321".into(),
+                1 => substitution.api_url = "https://other.example/api/v1".into(),
+                2 => substitution.machine_serial = "different-machine".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                recover_existing(&state, &substitution).await,
+                Err(EnrollmentFailure::ProtectedStorage)
+            );
+            assert_existing_identity_retained(&state);
+        }
+    }
 
     #[test]
     fn retry_deadline_is_capped_and_survives_notifications() {

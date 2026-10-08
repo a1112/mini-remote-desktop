@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 pub mod machine_identity;
-pub use machine_identity::stable_machine_identity;
+pub use machine_identity::{stable_machine_identity, validate_saved_machine_identity};
 pub mod auto_enrollment;
 
 pub const DEVICE_CREDENTIAL_REJECTED: &str = "设备凭据已失效，请向管理员申请更新设备凭据";

@@ -18,7 +18,7 @@ import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher"
 import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
-import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { DEVICE_CODE_INPUT_ERROR, deviceCodeLabel, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 
 export function HomePage() {
   const { isDark } = useTheme();
@@ -40,7 +40,7 @@ export function HomePage() {
         lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
       };
     });
-  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError } = useDeviceRegistration();
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
   const [copied, setCopied] = useState(false);
@@ -97,7 +97,6 @@ export function HomePage() {
   };
 
   const myId = formatDeviceCode(myDeviceId);
-  const hasTenDigitCode = /^\d{10}$/.test(normalizeDeviceCode(myDeviceId ?? ""));
 
   // 自动聚焦设备名称输入框
   useEffect(() => {
@@ -174,7 +173,6 @@ export function HomePage() {
       <DeviceRegisterModal
         isOpen={registrationOpen}
         onClose={() => setRegistrationOpen(false)}
-        onSuccess={() => refresh()}
       />
       <div className="grid grid-cols-5 gap-6">
         {/* Left: ID + Connect */}
@@ -236,7 +234,7 @@ export function HomePage() {
               )}
             </div>
 
-            <div className={`mb-1 text-center text-xs ${textSecondary}`}>{hasTenDigitCode ? "10 位设备码" : "当前设备标识"}</div>
+            <div className={`mb-1 text-center text-xs ${textSecondary}`}>{deviceCodeLabel(myDeviceId)}</div>
             {/* 设备码 + 复制图标 */}
             <div className="flex items-center justify-center gap-1.5 mb-4">
               <div className={`text-2xl font-mono tracking-widest ${textPrimary}`} style={{ fontSize: 18 }}>
@@ -256,7 +254,7 @@ export function HomePage() {
             </div>
             {registrationError && <p role="alert" className="mb-3 text-sm text-amber-600">{registrationError}</p>}
             <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
-              登记到服务器
+              查看设备登记状态
             </button>
           </div>
 
@@ -276,7 +274,7 @@ export function HomePage() {
                   aria-label="远程设备码"
                   value={connectId}
                   onChange={(e) => setConnectId(e.target.value)}
-                  placeholder="输入 10 位设备码"
+                  placeholder="输入 9 位设备码"
                   onKeyDown={(e) => e.key === "Enter" && handleConnect()}
                   className={`w-full px-3 py-2.5 rounded-lg border outline-none transition-all ${inputBg}`}
                   style={{ fontSize: 14 }}

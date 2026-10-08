@@ -2,13 +2,15 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PublicServerStatus } from "../adapters/tauri/types";
 
-const mocks = vi.hoisted(() => ({ status: vi.fn(), bind: vi.fn(), register: vi.fn() }));
+const mocks = vi.hoisted(() => ({ status: vi.fn(), bind: vi.fn(), register: vi.fn(), bootstrap: vi.fn() }));
 vi.mock("../adapters/tauri", () => ({
   ipcPublicServerStatus: mocks.status,
   ipcBindPublicDevice: mocks.bind,
   ipcUnbindPublicDevice: vi.fn(),
   ipcRegisterDevice: vi.fn(),
   registerDevice: mocks.register,
+  getHardwareInfo: vi.fn(),
+  serviceBootstrapIfNeeded: mocks.bootstrap,
 }));
 vi.mock("../utils/runtime", () => ({ isTauriRuntime: () => true }));
 
@@ -19,7 +21,7 @@ const registered: PublicServerStatus = {
   api_url: "https://175.178.16.90/rdesk/api/v1",
   api_reachable: true,
   device_registered: true,
-  device_id: "0123456789",
+  device_id: "012345678",
   device_name: "Office PC",
   signaling_state: "authenticated",
   reconnect_attempt: 0,
@@ -35,6 +37,7 @@ describe("live service-managed device identity", () => {
     mocks.status.mockReset().mockResolvedValue({ ok: true, value: registered });
     mocks.bind.mockReset().mockResolvedValue({ ok: true });
     mocks.register.mockReset();
+    mocks.bootstrap.mockReset().mockResolvedValue({ ok: true, value: true });
     (deviceService as any).deviceInfo = null;
     (deviceService as any).registrationError = null;
     (deviceService as any).bindingError = null;
@@ -50,11 +53,11 @@ describe("live service-managed device identity", () => {
     const { result } = renderHook(() => ({ identity: useDeviceRegistration(), connection: usePublicServerStatus() }));
     await act(async () => {});
     expect(result.current.identity.deviceId).toBeNull();
-    expect(result.current.identity.registrationError).toContain("正在自动重试");
+    expect(result.current.identity.registrationError).toContain("无法连接本机后台服务");
     expect(result.current.connection.failed).toBe(true);
 
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
-    expect(result.current.identity.deviceId).toBe("0123456789");
+    expect(result.current.identity.deviceId).toBe("012345678");
     expect(result.current.identity.registrationError).toBeNull();
     expect(result.current.connection.status?.signaling_state).toBe("authenticated");
     expect(mocks.register).not.toHaveBeenCalled();
@@ -69,12 +72,12 @@ describe("live service-managed device identity", () => {
     await act(async () => {});
     expect(mocks.status).toHaveBeenCalledTimes(1);
     expect(result.current.first.deviceId).toBeNull();
-    expect(result.current.first.registrationError).toContain("设备尚未登记");
+    expect(result.current.first.registrationError).toContain("正在自动登记");
     expect(mocks.bind).not.toHaveBeenCalled();
 
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
-    expect(result.current.first.deviceId).toBe("0123456789");
-    expect(result.current.second.deviceId).toBe("0123456789");
+    expect(result.current.first.deviceId).toBe("012345678");
+    expect(result.current.second.deviceId).toBe("012345678");
     expect(mocks.status).toHaveBeenCalledTimes(2);
     expect(mocks.bind).toHaveBeenCalledTimes(1);
     expect(localStorage.getItem("rdesk_device_info")).not.toContain("private.user.credential");
@@ -93,9 +96,9 @@ describe("live service-managed device identity", () => {
     await act(async () => {});
     await act(async () => { await result.current.first.refresh(); });
     expect(mocks.status).toHaveBeenCalledTimes(2);
-    expect(result.current.first.deviceId).toBe("0123456789");
-    expect(result.current.second.deviceId).toBe("0123456789");
-    expect(result.current.connection.status?.device_id).toBe("0123456789");
+    expect(result.current.first.deviceId).toBe("012345678");
+    expect(result.current.second.deviceId).toBe("012345678");
+    expect(result.current.connection.status?.device_id).toBe("012345678");
   });
 
   it("keeps cached code as metadata while failed connectivity cannot remain authenticated", async () => {
@@ -103,7 +106,7 @@ describe("live service-managed device identity", () => {
     await act(async () => {});
     mocks.status.mockRejectedValueOnce(new Error("Bearer private.transport.secret"));
     await act(async () => { await result.current.connection.refresh(); });
-    expect(result.current.identity.deviceId).toBe("0123456789");
+    expect(result.current.identity.deviceId).toBe("012345678");
     expect(result.current.connection.status).toBeNull();
     expect(result.current.connection.failed).toBe(true);
     expect(result.current.identity.registrationError).not.toContain("private");
@@ -130,7 +133,29 @@ describe("live service-managed device identity", () => {
       resolveStatus({ ok: true, value: registered });
       await Promise.all([first, second]);
     });
-    expect(result.current.identity.deviceId).toBe("0123456789");
+    expect(result.current.identity.deviceId).toBe("012345678");
     expect(mocks.status).toHaveBeenCalledTimes(1);
+  });
+
+  it("deduplicates explicit service startup across consumers and refreshes shared registration state", async () => {
+    mocks.status.mockResolvedValueOnce({ ok: false, error: { message: "IPC unavailable" } });
+    let finishBootstrap!: (value: { ok: true; value: boolean }) => void;
+    mocks.bootstrap.mockImplementationOnce(() => new Promise((resolve) => { finishBootstrap = resolve; }));
+    const { result } = renderHook(() => ({ identity: useDeviceRegistration(), first: usePublicServerStatus(), second: usePublicServerStatus() }));
+    await act(async () => {});
+    let starts!: [Promise<boolean>, Promise<boolean>];
+    await act(async () => { starts = [result.current.first.startService(), result.current.second.startService()]; });
+    expect(result.current.first.starting).toBe(true);
+    expect(result.current.second.starting).toBe(true);
+    expect(mocks.bootstrap).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      finishBootstrap({ ok: true, value: true });
+      await Promise.all(starts);
+    });
+    expect(mocks.status).toHaveBeenCalledTimes(2);
+    expect(result.current.first.starting).toBe(false);
+    expect(result.current.second.startupError).toBeNull();
+    expect(result.current.identity.deviceId).toBe("012345678");
   });
 });

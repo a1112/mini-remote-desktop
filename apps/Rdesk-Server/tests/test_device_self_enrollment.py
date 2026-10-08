@@ -29,7 +29,9 @@ from app.db.migrate_add_device_self_enrollment import (
 from app.db.session import Base
 from app.models.device import Device
 from app.models.device_machine_identity import DeviceMachineIdentity, DeviceSelfEnrollmentChallenge
-from app.schemas.device_self_enrollment import DeviceSelfEnrollmentChallengeRequest, DeviceSelfRegisterRequest
+from app.schemas.device_self_enrollment import (
+    DeviceSelfEnrollmentChallengeRequest, DeviceSelfRegistrationPayload, DeviceSelfRegisterRequest,
+)
 from app.services import device_self_enrollment as enrollment
 from app.services.device_enrollment import DeviceEnrollmentError
 from app.services.device_self_enrollment import (
@@ -52,9 +54,13 @@ def _key(seed: int = 17):
     return private, {"protocol_version": 1, "key_id": hashlib.sha256(public).hexdigest(), "public_key": public.hex()}
 
 
-def _signed(private, identity, challenge, *, serial="self-machine", raw=None, api_url=API_URL):
+def _signed(private, identity, challenge, *, serial="self-machine", raw=None, api_url=API_URL,
+            expected_device_id=None):
+    registration = _register_payload(serial)
+    if expected_device_id is not None:
+        registration["expected_device_id"] = expected_device_id
     payload = {**identity, "challenge_id": challenge["challenge_id"], "nonce": challenge["nonce"],
-               "registration_json": raw or json.dumps(_register_payload(serial), separators=(",", ":")),
+               "registration_json": raw or json.dumps(registration, separators=(",", ":")),
                "signature": "00" * 64}
     parsed = DeviceSelfRegisterRequest.model_validate(payload)
     payload["signature"] = private.sign(contextual_self_registration(
@@ -120,7 +126,7 @@ def test_shared_cross_language_crypto_vector(unicode):
 
 def test_first_code_unbound_and_fresh_reenrollment_keeps_identity(self_api):
     private, identity, result = _enroll(self_api)
-    assert len(result["device_id"]) == 10 and result["device_id"].isascii() and result["device_id"].isdigit()
+    assert len(result["device_id"]) == 9 and result["device_id"].isascii() and result["device_id"].isdigit()
     assert result["refresh_token"]
     mapping = self_api.session.scalar(select(DeviceMachineIdentity))
     device = self_api.session.get(Device, mapping.device_row_id)
@@ -134,6 +140,130 @@ def test_first_code_unbound_and_fresh_reenrollment_keeps_identity(self_api):
     assert again.json()["device_id"] == result["device_id"]
     assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 1
     assert self_api.session.scalar(select(func.count()).select_from(Device)) == 2
+
+
+@pytest.mark.parametrize("legacy_code", ["0123456789", "012345678901"])
+def test_fresh_machine_proof_recovers_persisted_legacy_code(self_api, legacy_code):
+    private, identity, _ = _enroll(self_api)
+    mapping = self_api.session.scalar(select(DeviceMachineIdentity))
+    device = self_api.session.get(Device, mapping.device_row_id)
+    device.device_id = legacy_code
+    self_api.session.commit()
+    challenge = _challenge(self_api, identity)
+    recovered = self_api.client.post(REGISTER_PATH, json=_signed(private, identity, challenge))
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["device_id"] == legacy_code
+    assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 1
+
+
+@pytest.mark.parametrize("stored_code", [None, "0123456789", "012345678901"])
+def test_expected_code_recovers_same_assignment_and_owner_without_http_credentials(self_api, stored_code):
+    private, identity, result = _enroll(self_api)
+    mapping = self_api.session.scalar(select(DeviceMachineIdentity))
+    device = self_api.session.get(Device, mapping.device_row_id)
+    device.device_id = stored_code or result["device_id"]
+    device.is_bound = True
+    device.bound_user_id = self_api.owner.id
+    device.tenant_id = self_api.owner.tenant_id
+    device.auth_version = 3
+    self_api.session.commit()
+    expected = (device.id, device.device_id, device.is_bound, device.bound_user_id,
+                device.tenant_id, device.auth_version, mapping.key_id, mapping.public_key)
+    challenge = _challenge(self_api, identity)
+    recovered = self_api.client.post(REGISTER_PATH, json=_signed(
+        private, identity, challenge, expected_device_id=device.device_id,
+    ))
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["device_id"] == device.device_id
+    assert recovered.json()["access_token"] and recovered.json()["refresh_token"]
+    self_api.session.refresh(device)
+    self_api.session.refresh(mapping)
+    assert (device.id, device.device_id, device.is_bound, device.bound_user_id,
+            device.tenant_id, device.auth_version, mapping.key_id, mapping.public_key) == expected
+    assert self_api.session.scalar(select(func.count()).select_from(Device)) == 2
+    assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 1
+
+
+def test_wrong_expected_code_conflicts_before_metadata_updates(self_api):
+    private, identity, result = _enroll(self_api)
+    mapping = self_api.session.scalar(select(DeviceMachineIdentity))
+    device = self_api.session.get(Device, mapping.device_row_id)
+    expected = (device.device_id, device.hostname, device.os_version, device.auth_version)
+    challenge = _challenge(self_api, identity)
+    registration = {**_register_payload("self-machine"), "hostname": "changed-host",
+                    "expected_device_id": "different-stored-code"}
+    denied = self_api.client.post(REGISTER_PATH, json=_signed(
+        private, identity, challenge, raw=json.dumps(registration),
+    ))
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "device_self_enrollment_conflict"
+    assert "access_token" not in denied.text and "refresh_token" not in denied.text
+    self_api.session.refresh(device)
+    assert (device.device_id, device.hostname, device.os_version, device.auth_version) == expected
+    assert device.device_id == result["device_id"]
+    assert self_api.session.scalar(select(func.count()).select_from(Device)) == 2
+    assert self_api.session.scalar(select(DeviceSelfEnrollmentChallenge).where(
+        DeviceSelfEnrollmentChallenge.challenge_id == challenge["challenge_id"]
+    )).consumed_at is None
+
+
+@pytest.mark.parametrize("serial", ["never-registered-machine", "serial-a"])
+def test_expected_code_with_missing_machine_mapping_never_allocates(self_api, serial, monkeypatch):
+    private, identity = _key()
+    challenge = _challenge(self_api, identity)
+
+    async def allocation_forbidden(*args, **kwargs):
+        raise AssertionError("recovery cannot allocate a device")
+    monkeypatch.setattr(DeviceSelfEnrollmentService, "_allocate_device", allocation_forbidden)
+    denied = self_api.client.post(REGISTER_PATH, json=_signed(
+        private, identity, challenge, serial=serial, expected_device_id=self_api.device.device_id,
+    ))
+    assert denied.status_code == 409, denied.text
+    assert denied.json()["detail"]["code"] == "device_self_enrollment_conflict"
+    assert "access_token" not in denied.text and "refresh_token" not in denied.text
+    assert self_api.session.scalar(select(func.count()).select_from(Device)) == 1
+    assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 0
+    assert self_api.session.scalar(select(DeviceSelfEnrollmentChallenge)).consumed_at is None
+
+
+def test_expected_code_cannot_be_changed_without_resigning_payload(self_api):
+    private, identity, result = _enroll(self_api)
+    challenge = _challenge(self_api, identity)
+    payload = _signed(private, identity, challenge, expected_device_id=result["device_id"])
+    registration = json.loads(payload["registration_json"])
+    registration["expected_device_id"] = "different-stored-code"
+    payload["registration_json"] = json.dumps(registration)
+    denied = self_api.client.post(REGISTER_PATH, json=payload)
+    assert denied.status_code == 401, denied.text
+    assert self_api.session.scalar(select(func.count()).select_from(Device)) == 2
+    assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 1
+    assert self_api.session.scalar(select(DeviceSelfEnrollmentChallenge).where(
+        DeviceSelfEnrollmentChallenge.challenge_id == challenge["challenge_id"]
+    )).consumed_at is None
+
+
+@pytest.mark.parametrize("expected", ["", "a" * 65, 123456789, True])
+def test_expected_code_is_a_bounded_string(expected):
+    with pytest.raises(ValidationError):
+        DeviceSelfRegistrationPayload.model_validate({
+            **_register_payload(), "expected_device_id": expected,
+        })
+
+
+def test_existing_machine_key_cannot_switch_hardware_serial(self_api):
+    private, identity, result = _enroll(self_api)
+    challenge = _challenge(self_api, identity)
+    rejected = self_api.client.post(REGISTER_PATH, json=_signed(
+        private, identity, challenge, serial="changed-machine-serial",
+    ))
+    assert rejected.status_code == 409, rejected.text
+    mapping = self_api.session.scalar(select(DeviceMachineIdentity))
+    assert self_api.session.get(Device, mapping.device_row_id).device_id == result["device_id"]
+    assert self_api.session.scalar(select(func.count()).select_from(Device)) == 2
+    stored = self_api.session.scalar(select(DeviceSelfEnrollmentChallenge).where(
+        DeviceSelfEnrollmentChallenge.challenge_id == challenge["challenge_id"]
+    ))
+    assert stored.consumed_at is None
 
 
 def test_nonce_stored_only_as_digest_and_replay_never_mints_again(self_api):
@@ -192,7 +322,8 @@ def test_signed_registration_rejects_duplicate_unknown_and_invalid_fields(self_a
     assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 0
 
 
-def test_revocation_never_restored_by_fresh_machine_proof(self_api):
+@pytest.mark.parametrize("with_expected_code", [False, True])
+def test_revocation_never_restored_by_fresh_machine_proof(self_api, with_expected_code):
     private, identity, result = _enroll(self_api)
     mapping = self_api.session.scalar(select(DeviceMachineIdentity))
     device = self_api.session.get(Device, mapping.device_row_id)
@@ -200,7 +331,10 @@ def test_revocation_never_restored_by_fresh_machine_proof(self_api):
     device.auth_version += 1
     self_api.session.commit()
     challenge = _challenge(self_api, identity)
-    rejected = self_api.client.post(REGISTER_PATH, json=_signed(private, identity, challenge))
+    rejected = self_api.client.post(REGISTER_PATH, json=_signed(
+        private, identity, challenge,
+        expected_device_id=result["device_id"] if with_expected_code else None,
+    ))
     assert rejected.status_code == 401
     self_api.session.refresh(device)
     assert device.auth_revoked_at is not None and device.device_id == result["device_id"]
@@ -232,24 +366,31 @@ def test_new_device_signaling_key_must_match_pinned_machine(self_api):
     assert bad.status_code == 401 and "token" not in bad.json()
 
 
-def test_code_collision_retries_and_never_replaces_legacy_row(self_api, monkeypatch):
+@pytest.mark.parametrize("occupied", ["000000041", "100000000001"])
+def test_code_collision_retries_and_never_replaces_existing_row(self_api, monkeypatch, occupied):
+    self_api.device.device_id = occupied
+    self_api.session.commit()
     monkeypatch.setattr(enrollment, "generate_device_id_from_digest", lambda _: self_api.device.device_id)
-    monkeypatch.setattr(enrollment.secrets, "randbelow", lambda _: 42)
+    bounds = []
+    monkeypatch.setattr(enrollment.secrets, "randbelow", lambda bound: bounds.append(bound) or 42)
     _, _, result = _enroll(self_api)
-    assert result["device_id"] == "0000000042"
+    assert result["device_id"] == "000000042"
+    assert bounds == [10**9]
     self_api.session.refresh(self_api.device)
-    assert self_api.device.device_id == "100000000001"
+    assert self_api.device.device_id == occupied
 
 
 def test_exhausted_code_collisions_roll_back_mapping_and_nonce(self_api, monkeypatch):
-    self_api.device.device_id = "0000000042"
+    self_api.device.device_id = "000000042"
     self_api.session.commit()
-    monkeypatch.setattr(enrollment, "generate_device_id_from_digest", lambda _: "0000000042")
-    monkeypatch.setattr(enrollment.secrets, "randbelow", lambda _: 42)
+    monkeypatch.setattr(enrollment, "generate_device_id_from_digest", lambda _: "000000042")
+    bounds = []
+    monkeypatch.setattr(enrollment.secrets, "randbelow", lambda bound: bounds.append(bound) or 42)
     private, identity = _key()
     challenge = _challenge(self_api, identity)
     denied = self_api.client.post(REGISTER_PATH, json=_signed(private, identity, challenge))
     assert denied.status_code == 503
+    assert len(bounds) == 31 and set(bounds) == {10**9}
     assert self_api.session.scalar(select(func.count()).select_from(Device)) == 1
     assert self_api.session.scalar(select(func.count()).select_from(DeviceMachineIdentity)) == 0
     assert self_api.session.scalar(select(DeviceSelfEnrollmentChallenge)).consumed_at is None
@@ -304,7 +445,8 @@ def test_registration_utf8_limit_is_bytes_and_forbids_envelope_extras():
     private, identity = _key()
     challenge = {"challenge_id": "11" * 16, "nonce": "22" * 32}
     payload = _signed(private, identity, challenge)
-    for changes in ({"registration_json": "中" * 3000}, {"access_token": "not-accepted"}):
+    for changes in ({"registration_json": "中" * 3000}, {"access_token": "not-accepted"},
+                    {"expected_device_id": "unsigned-outer-field"}):
         with pytest.raises(ValidationError):
             DeviceSelfRegisterRequest.model_validate({**payload, **changes})
 

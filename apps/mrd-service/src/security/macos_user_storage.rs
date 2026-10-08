@@ -137,10 +137,31 @@ pub fn verify_owner_only_file(path: &Path) -> Result<(), String> {
 }
 
 pub(super) fn load_master_key() -> Result<Zeroizing<[u8; 32]>, String> {
+    load_master_key_with_interaction(false)
+}
+
+pub(super) fn load_master_key_for_user_start() -> Result<Zeroizing<[u8; 32]>, String> {
+    load_master_key_with_interaction(true)
+}
+
+pub(super) fn authorize_master_key_access() -> Result<(), String> {
+    // Used only by the explicit foreground CLI before the service runtime is
+    // created. macOS owns the prompt and the user's allow/deny decision.
+    drop(load_master_key_with_interaction(true)?);
+    Ok(())
+}
+
+fn load_master_key_with_interaction(allow_prompt: bool) -> Result<Zeroizing<[u8; 32]>, String> {
     let directory = ensure_protected_product_data_dir()?;
     // Background services must fail promptly when the login Keychain is locked.
-    let _interaction = SecKeychain::disable_user_interaction()
-        .map_err(|_| "macOS Keychain interaction policy could not be set".to_owned())?;
+    let _interaction = if allow_prompt {
+        None
+    } else {
+        Some(
+            SecKeychain::disable_user_interaction()
+                .map_err(|_| "macOS Keychain interaction policy could not be set".to_owned())?,
+        )
+    };
     let keychain =
         SecKeychain::default().map_err(|_| "macOS login Keychain is unavailable".to_owned())?;
     let load = || keychain.find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
@@ -169,7 +190,7 @@ pub(super) fn load_master_key() -> Result<Zeroizing<[u8; 32]>, String> {
                 load().map_err(|_| "macOS Keychain master key readback failed".to_owned())?;
             Zeroizing::new(password.to_vec())
         }
-        Err(_) => return Err("macOS Keychain master key cannot be accessed".to_owned()),
+        Err(_) => return Err("macOS Keychain access is required; choose Start Backend in Rdesk or run mrd-service --authorize-keychain-and-run in the logged-in user session, then confirm the native prompt".to_owned()),
     };
     if bytes.len() != 32 {
         return Err("macOS Keychain master key is invalid".to_owned());

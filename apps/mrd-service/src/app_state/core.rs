@@ -801,6 +801,11 @@ impl AppState {
             &mut snapshot,
             input_injector_available,
         );
+        #[cfg(target_os = "macos")]
+        crate::capabilities::apply_macos_capture_permission_status(
+            &mut snapshot,
+            mrd_capture_macos::screen_capture_access_is_granted(),
+        );
         snapshot
     }
 

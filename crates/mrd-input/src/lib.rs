@@ -3,6 +3,9 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputButton {
     Left,
@@ -13,6 +16,8 @@ pub enum InputButton {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputKey {
+    /// A Windows VK identifier used by the shared control protocol. Native
+    /// injectors translate this identifier to the host platform's key code.
     VirtualKey(u16),
 }
 
@@ -40,6 +45,11 @@ pub enum InputError {
 pub trait InputInjector: Send {
     fn is_available(&self) -> bool;
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError>;
+
+    /// Clear cached desktop context after every injected key and button has
+    /// been successfully released. Implementations only reset bookkeeping;
+    /// callers remain responsible for sending the release events first.
+    fn reset_idle_state(&mut self) {}
 }
 
 impl<T: InputInjector + ?Sized> InputInjector for Box<T> {
@@ -49,6 +59,10 @@ impl<T: InputInjector + ?Sized> InputInjector for Box<T> {
 
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
         (**self).inject(event)
+    }
+
+    fn reset_idle_state(&mut self) {
+        (**self).reset_idle_state();
     }
 }
 
@@ -167,6 +181,8 @@ impl<I: InputInjector> TrackedInputInjector<I> {
         }
         self.active_keys.clear();
 
+        self.reset_idle_state();
+
         Ok(released)
     }
 
@@ -203,6 +219,12 @@ impl<I: InputInjector> InputInjector for TrackedInputInjector<I> {
         self.update_pressed_state(event);
         Ok(())
     }
+
+    fn reset_idle_state(&mut self) {
+        if self.active_buttons.is_empty() && self.active_keys.is_empty() {
+            self.inner.reset_idle_state();
+        }
+    }
 }
 
 fn push_unique<T: PartialEq>(items: &mut Vec<T>, value: T) {
@@ -214,6 +236,60 @@ fn push_unique<T: PartialEq>(items: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct IdleResetProbe {
+        reset_count: usize,
+        events: Vec<InputEvent>,
+    }
+
+    impl InputInjector for IdleResetProbe {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+            self.events.push(*event);
+            Ok(())
+        }
+
+        fn reset_idle_state(&mut self) {
+            self.reset_count += 1;
+        }
+    }
+
+    #[test]
+    fn tracked_boxed_injector_resets_context_only_after_input_is_released() {
+        let mut injector = TrackedInputInjector::new(Box::new(IdleResetProbe::default()));
+        injector
+            .inject(&InputEvent::Key {
+                key: InputKey::VirtualKey(0x41),
+                pressed: true,
+            })
+            .expect("key down");
+        injector
+            .inject(&InputEvent::MouseButton {
+                button: InputButton::Left,
+                pressed: true,
+            })
+            .expect("button down");
+        injector.reset_idle_state();
+        assert_eq!(injector.inner().reset_count, 0);
+        injector
+            .inject(&InputEvent::Key {
+                key: InputKey::VirtualKey(0x41),
+                pressed: false,
+            })
+            .expect("key up");
+        injector.reset_idle_state();
+        assert_eq!(injector.inner().reset_count, 0);
+        injector.release_all().expect("release final button");
+        assert_eq!(injector.inner().reset_count, 1);
+        assert_eq!(injector.inner().events.len(), 4);
+        injector.reset_idle_state();
+        assert_eq!(injector.inner().reset_count, 2);
+        assert_eq!(injector.inner().events.len(), 4);
+    }
 
     #[test]
     fn recording_injector_records_all_input_event_kinds() {

@@ -3434,8 +3434,46 @@ async fn signed_remote_session_request_requires_consent_and_signed_grant() {
                 .media_profile
                 .expect("media profile negotiation");
             assert_eq!(negotiation.status, "downgraded");
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(negotiation.selected.width, LAN_MEDIA_TARGET_WIDTH);
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(negotiation.selected.height, LAN_MEDIA_TARGET_HEIGHT);
+            #[cfg(target_os = "macos")]
+            {
+                let source = synthetic_capture_source();
+                assert_eq!(negotiation.selected.width, source.width);
+                assert_eq!(negotiation.selected.height, source.height);
+                assert_eq!(
+                    negotiation.selected_source_id.as_deref(),
+                    Some(source.id.as_str())
+                );
+                assert_eq!(
+                    ack.payload
+                        .grant
+                        .as_ref()
+                        .unwrap()
+                        .payload
+                        .profile_constraint,
+                    Some(media_profile_constraint_hash(&negotiation).unwrap())
+                );
+                let committed = app_state
+                    .media_profiles
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .unwrap();
+                assert_eq!(committed, negotiation);
+                assert_eq!(
+                    app_state
+                        .capture_sources
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .unwrap()
+                        .source,
+                    source
+                );
+            }
             assert_eq!(negotiation.selected.fps, 240);
             assert_eq!(
                 negotiation.selected.bitrate_mbps,

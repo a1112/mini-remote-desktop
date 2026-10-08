@@ -47,7 +47,7 @@ describe("mobile pages", () => {
   it("starts an authenticated session for the entered device ID", async () => {
     const user = userEvent.setup();
     renderMobile();
-    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "900 123 456");
+    await user.type(screen.getByPlaceholderText("输入 9 位设备码"), "900 123 456");
     await user.click(screen.getByRole("button", { name: "发起连接" }));
     expect(mocks.launch).toHaveBeenCalledWith("900123456", expect.objectContaining({ routePreference: "auto" }));
     expect(await screen.findByText("会话路由已打开")).toBeInTheDocument();
@@ -56,7 +56,7 @@ describe("mobile pages", () => {
   it("preserves leading zeroes in a ten digit remote device code", async () => {
     const user = userEvent.setup();
     renderMobile();
-    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "012 345 6789");
+    await user.type(screen.getByPlaceholderText("输入 9 位设备码"), "012 345 6789");
     await user.click(screen.getByRole("button", { name: "发起连接" }));
     expect(mocks.launch).toHaveBeenCalledWith("0123456789", expect.objectContaining({ routePreference: "auto" }));
     expect(await screen.findByText("会话路由已打开")).toBeInTheDocument();
@@ -65,11 +65,11 @@ describe("mobile pages", () => {
   it("rejects malformed input while preserving legacy LAN identifiers", async () => {
     const user = userEvent.setup();
     renderMobile();
-    const input = screen.getByPlaceholderText("输入 10 位设备码");
+    const input = screen.getByPlaceholderText("输入 9 位设备码");
     await user.type(input, "0123456789/private");
     await user.click(screen.getByRole("button", { name: "发起连接" }));
     expect(mocks.launch).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent("请输入 10 位数字设备码");
+    expect(screen.getByRole("alert")).toHaveTextContent("请输入 9 位数字设备码");
     await user.clear(input);
     await user.type(input, "lan-LCXACE");
     await user.click(screen.getByRole("button", { name: "发起连接" }));

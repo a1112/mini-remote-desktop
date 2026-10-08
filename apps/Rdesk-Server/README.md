@@ -91,3 +91,11 @@ Self-enrolled devices can receive signaling credentials only for their pinned
 key; the existing signed WebSocket challenge then proves its private key.
 Ordinary HTTP device tokens remain bearer credentials protected by resident
 storage. This feature does not claim proof-of-possession for every HTTP route.
+
+New assignments are nine decimal characters, including leading zeroes. The
+first candidate is derived from the server-keyed serial digest modulo `10^9`;
+database uniqueness and bounded nine-digit collision retries finalize the
+assignment. Existing codes are returned unchanged on retry and refresh.
+Credential recovery places `expected_device_id` inside the signed
+`registration_json`; it requires the existing pinned machine and exact assigned
+code. Missing mappings, changed codes and revoked identities are rejected.

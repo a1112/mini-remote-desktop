@@ -17,7 +17,7 @@ from pydantic import SecretStr
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
-from app.models.device import Device, generate_device_id_from_digest
+from app.models.device import Device, generate_device_id_from_digest, generate_random_device_id
 from app.models.device_enrollment import DeviceEnrollment
 from app.models.relay_audit_event import RelayAuditEvent
 
@@ -215,7 +215,7 @@ class DeviceEnrollmentService:
                 if identity_constraint != "code":
                     raise
                 if attempt + 1 < _DEVICE_CODE_ATTEMPTS:
-                    device_id = str(secrets.randbelow(10**10)).zfill(10)
+                    device_id = generate_random_device_id()
             else:
                 await savepoint.commit()
                 break

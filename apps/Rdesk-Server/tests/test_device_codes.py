@@ -41,14 +41,14 @@ def _use_savepoints(device_api: SimpleNamespace) -> None:
 
 
 @pytest.mark.parametrize("digest", ["0" * 64, "f" * 64, "A" * 64])
-def test_new_device_codes_are_ten_ascii_digits(digest: str) -> None:
+def test_new_device_codes_are_nine_ascii_digits(digest: str) -> None:
     code = generate_device_id_from_digest(digest)
-    assert re.fullmatch(r"[0-9]{10}", code, flags=re.ASCII)
+    assert re.fullmatch(r"[0-9]{9}", code, flags=re.ASCII)
     assert generate_device_id_from_digest(digest) == code
 
 
 def test_device_code_preserves_leading_zeroes() -> None:
-    assert generate_device_id_from_digest("0" * 64) == "0000000000"
+    assert generate_device_id_from_digest("0" * 64) == "000000000"
 
 
 @pytest.mark.parametrize("digest", ["f" * 63, "g" * 64, "\u0660" * 64, None])
@@ -57,12 +57,12 @@ def test_device_code_rejects_invalid_serial_digest(digest: object) -> None:
         generate_device_id_from_digest(digest)
 
 
-def test_enrollment_allocates_ten_digit_code_and_reuses_exact_retry(
+def test_enrollment_allocates_nine_digit_code_and_reuses_exact_retry(
     device_api: SimpleNamespace,
 ) -> None:
     _use_savepoints(device_api)
     token = _issue_device_enrollment(device_api)
-    payload = _register_payload("new-ten-digit-device")
+    payload = _register_payload("new-nine-digit-device")
     first = device_api.client.post(
         "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
     )
@@ -70,16 +70,39 @@ def test_enrollment_allocates_ten_digit_code_and_reuses_exact_retry(
         "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
     )
     assert first.status_code == retry.status_code == 200
-    assert re.fullmatch(r"[0-9]{10}", first.json()["device_id"], flags=re.ASCII)
+    assert re.fullmatch(r"[0-9]{9}", first.json()["device_id"], flags=re.ASCII)
     assert retry.json()["device_id"] == first.json()["device_id"]
     assert device_api.session.scalar(select(func.count()).select_from(Device)) == 2
+
+
+@pytest.mark.parametrize("legacy_code", ["0123456789", "012345678901"])
+def test_exact_enrollment_retry_keeps_persisted_legacy_code(
+    device_api: SimpleNamespace, legacy_code: str,
+) -> None:
+    _use_savepoints(device_api)
+    token = _issue_device_enrollment(device_api)
+    payload = _register_payload("legacy-retry-device")
+    first = device_api.client.post(
+        "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
+    )
+    assert first.status_code == 200, first.text
+    device = device_api.session.scalar(select(Device).where(
+        Device.device_id == first.json()["device_id"]
+    ))
+    device.device_id = legacy_code
+    device_api.session.commit()
+    retry = device_api.client.post(
+        "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["device_id"] == legacy_code
 
 
 def test_database_code_collision_retries_with_numeric_code(
     device_api: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_savepoints(device_api)
-    occupied = "0123456789"
+    occupied = "012345678"
     device_api.device.device_id = occupied
     device_api.session.commit()
     monkeypatch.setattr(device_enrollment, "generate_device_id_from_digest", lambda _: occupied)
@@ -90,11 +113,11 @@ def test_database_code_collision_retries_with_numeric_code(
         "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
     )
     assert response.status_code == 200, response.text
-    assert response.json()["device_id"] == "0000000042"
+    assert response.json()["device_id"] == "000000042"
     retry = device_api.client.post(
         "/api/v1/devices/register", json=payload, headers=_enrollment_headers(token)
     )
-    assert retry.json()["device_id"] == "0000000042"
+    assert retry.json()["device_id"] == "000000042"
     device_api.session.refresh(device_api.device)
     assert device_api.device.device_id == occupied
 
@@ -103,7 +126,7 @@ def test_exhausted_code_collisions_leave_enrollment_unconsumed(
     device_api: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _use_savepoints(device_api)
-    occupied = "0000000042"
+    occupied = "000000042"
     device_api.device.device_id = occupied
     device_api.session.commit()
     attempts: list[int] = []
@@ -123,14 +146,14 @@ def test_exhausted_code_collisions_leave_enrollment_unconsumed(
     assert response.status_code == 503, response.text
     assert response.json()["detail"]["code"] == "device_code_unavailable"
     assert 1 <= len(attempts) <= 64
-    assert set(attempts) == {10**10}
+    assert set(attempts) == {10**9}
     enrollment = device_api.session.scalar(select(DeviceEnrollment))
     assert enrollment.consumed_at is None
     assert enrollment.registered_device_id is None
     assert device_api.session.scalar(select(func.count()).select_from(Device)) == 1
 
 
-@pytest.mark.parametrize("legacy_code", ["821456789", "012345678901", "123456789012-abcd"])
+@pytest.mark.parametrize("legacy_code", ["821456789", "0123456789", "012345678901", "123456789012-abcd"])
 def test_authenticated_refresh_keeps_legacy_device_code(
     device_api: SimpleNamespace, legacy_code: str,
 ) -> None:
@@ -186,7 +209,7 @@ def test_serial_unique_constraint_never_retries_or_changes_existing_device(
 
     attempts: list[int] = []
     monkeypatch.setattr(
-        device_enrollment, "generate_device_id_from_digest", lambda _: "0000000042"
+        device_enrollment, "generate_device_id_from_digest", lambda _: "000000042"
     )
     monkeypatch.setattr(
         device_enrollment.secrets, "randbelow", lambda bound: attempts.append(bound) or 43
@@ -253,7 +276,7 @@ async def test_concurrent_different_devices_with_one_candidate_get_unique_codes(
 ) -> None:
     both_inserting = asyncio.Event()
     initial_inserts = 0
-    occupied_candidate = "0000000042"
+    occupied_candidate = "000000042"
 
     class RacingSession(AsyncSession):
         async def flush(self, objects=None) -> None:
@@ -299,7 +322,7 @@ async def test_concurrent_different_devices_with_one_candidate_get_unique_codes(
             asyncio.gather(consume(0), consume(1)), timeout=10,
         )
         assert initial_inserts == 2
-        assert {result[1] for result in results} == {"0000000042", "0000000043"}
+        assert {result[1] for result in results} == {"000000042", "000000043"}
         assert len({result[0] for result in results}) == 2
         assert not any(result[2] for result in results)
         for index in range(2):
@@ -319,7 +342,7 @@ async def test_concurrent_different_devices_with_one_candidate_get_unique_codes(
 async def test_postgres_exhausted_collisions_preserve_unconsumed_enrollment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    occupied_candidate = "0000000042"
+    occupied_candidate = "000000042"
     monkeypatch.setattr(
         device_enrollment, "generate_device_id_from_digest", lambda _: occupied_candidate
     )

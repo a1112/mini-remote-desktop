@@ -1,4 +1,5 @@
 import re
+import secrets
 from datetime import datetime
 from uuid import uuid4
 
@@ -16,6 +17,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.session import Base
+
+
+_DEVICE_CODE_DIGITS = 9
+_DEVICE_CODE_SPACE = 10**_DEVICE_CODE_DIGITS
 
 
 class Device(Base):
@@ -104,7 +109,7 @@ class Device(Base):
 
 
 def generate_device_id_from_digest(serial_digest: str) -> str:
-    """Derive the first ten-digit candidate from the non-reversible HMAC digest.
+    """Derive the first nine-digit candidate from the non-reversible HMAC digest.
 
     Persisted assignments are authoritative: registration resolves collisions
     against the database and retries always return the stored device ID.
@@ -115,7 +120,13 @@ def generate_device_id_from_digest(serial_digest: str) -> str:
         or re.fullmatch(r"[0-9a-fA-F]{64}", serial_digest, flags=re.ASCII) is None
     ):
         raise ValueError("device serial digest is invalid")
-    return str(int(serial_digest, 16) % 10**10).zfill(10)
+    return str(int(serial_digest, 16) % _DEVICE_CODE_SPACE).zfill(_DEVICE_CODE_DIGITS)
+
+
+def generate_random_device_id() -> str:
+    """Allocate a collision candidate within the same nine-digit code space."""
+
+    return str(secrets.randbelow(_DEVICE_CODE_SPACE)).zfill(_DEVICE_CODE_DIGITS)
 
 
 class DeviceStatus(Base):

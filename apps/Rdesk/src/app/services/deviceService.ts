@@ -2,34 +2,15 @@
  * 设备注册服务
  *
  * 读取后台持有的公网设备身份，持续同步设备码和连接状态。
- * 首次登记/凭据恢复由显式登记流程完成，后台托管的凭据不进入前端缓存。
+ * 首次登记由后台服务自动完成，后台托管的凭据不进入前端缓存。
  */
 
 import { useEffect, useState } from "react";
-import { ipcBindPublicDevice, ipcUnbindPublicDevice, ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
+import { getHardwareInfo as getHardwareInfoCommand, type HardwareInfo, ipcBindPublicDevice, ipcUnbindPublicDevice, ipcPublicServerStatus, ipcRegisterDevice, registerDevice as registerDeviceCommand, serviceBootstrapIfNeeded } from "../adapters/tauri";
 import type { PublicServerStatus } from "../adapters/tauri/types";
 import { isTauriRuntime } from "../utils/runtime";
-import { DEFAULT_PUBLIC_API_URL, DEVICE_REGISTRATION_MODE, SERVER_API_URL } from "./serverConfig";
-import { automaticEnrollmentMessage } from "../utils/automaticDeviceEnrollment";
-
-interface HardwareInfo {
-  motherboard_serial: string;
-  hostname: string;
-  os_type: string;
-  os_version: string;
-  cpu_info: {
-    name: string;
-    vendor_id: string;
-    cores: number;
-    max_frequency_mhz?: number;
-  };
-  total_memory_mb: number;
-  gpu_info: Array<{
-    name: string;
-    vendor: string;
-    memory_mb?: number;
-  }>;
-}
+import { DEVICE_REGISTRATION_MODE, SERVER_API_URL } from "./serverConfig";
+import { automaticEnrollmentMessage, LOCAL_SERVICE_UNREACHABLE_MESSAGE, LOCAL_SERVICE_STOPPED_MESSAGE, LOCAL_SERVICE_START_FAILED_MESSAGE } from "../utils/automaticDeviceEnrollment";
 
 interface DeviceRegistrationResponse {
   device_id: string;
@@ -54,11 +35,23 @@ interface PublicServerStatusState {
   status: PublicServerStatus | null;
   checking: boolean;
   failed: boolean;
+  starting: boolean;
+  startupError: string | null;
+}
+
+function publicServerConfigurationError(status: PublicServerStatus | null): string | null {
+  if (!status?.api_url) return "无法确认后台服务的公网服务器配置，请刷新后重试。";
+  if (status.api_url.replace(/\/+$/, "") !== API_BASE) {
+    return "后台服务的公网服务器与客户端配置不一致，请检查服务器配置。";
+  }
+  return null;
 }
 
 function publicRegistrationError(status: PublicServerStatus): string | null {
-  if (!status.service_running) return "本机后台服务未运行，启动后将自动重试。";
+  if (!status.service_running) return LOCAL_SERVICE_STOPPED_MESSAGE;
   if (!status.api_url) return "公网服务器未配置，请检查服务器设置。";
+  const configurationError = publicServerConfigurationError(status);
+  if (configurationError) return configurationError;
   if (!status.device_registered) {
     const enrollmentMessage = automaticEnrollmentMessage(status.last_error);
     if (enrollmentMessage) return enrollmentMessage;
@@ -72,7 +65,7 @@ function publicRegistrationError(status: PublicServerStatus): string | null {
   if (!status.device_registered || !status.device_id) {
     return status.api_reachable === null
       ? "正在检查服务器连接和设备登记状态。"
-      : "设备尚未登记到服务器，请完成设备登记；后台状态将自动刷新。";
+      : "正在自动登记并领取设备码，请稍候。";
   }
   return null;
 }
@@ -89,7 +82,8 @@ class DeviceRegistrationService {
   private publicStatusObservers = 0;
   private publicStatusInterval: number | null = null;
   private publicStatusRequest: Promise<StoredDeviceInfo | null> | null = null;
-  private publicStatusState: PublicServerStatusState = { status: null, checking: true, failed: false };
+  private publicServiceStartRequest: Promise<boolean> | null = null;
+  private publicStatusState: PublicServerStatusState = { status: null, checking: true, failed: false, starting: false, startupError: null };
   private readonly onVisible = () => { if (!document.hidden) void this.refreshPublicServerStatus(); };
 
   private publish(): void {
@@ -99,7 +93,7 @@ class DeviceRegistrationService {
   private subscribe(listener: () => void, observePublicStatus: boolean): () => void {
     this.listeners.add(listener);
     if (observePublicStatus && this.publicStatusObservers++ === 0) {
-      this.publicStatusState = { status: null, checking: true, failed: false };
+      this.publicStatusState = { ...this.publicStatusState, status: null, checking: true, failed: false, startupError: null };
       void this.refreshPublicServerStatus();
       this.publicStatusInterval = window.setInterval(this.onVisible, 3000);
       document.addEventListener("visibilitychange", this.onVisible);
@@ -110,7 +104,7 @@ class DeviceRegistrationService {
         if (this.publicStatusInterval !== null) window.clearInterval(this.publicStatusInterval);
         this.publicStatusInterval = null;
         document.removeEventListener("visibilitychange", this.onVisible);
-        this.publicStatusState = { status: null, checking: true, failed: false };
+        this.publicStatusState = { ...this.publicStatusState, status: null, checking: true, failed: false, startupError: null };
       }
     };
   }
@@ -173,7 +167,7 @@ class DeviceRegistrationService {
       }
     }
     if (useServerRegistration) {
-      this.registrationError = "需要设备登记码，请向服务器管理员获取一次性登记码后注册";
+      this.registrationError = "正在等待后台自动登记并领取设备码，请稍候。";
       return null;
     }
     try {
@@ -236,7 +230,7 @@ class DeviceRegistrationService {
   }
 
   private shouldUseServiceManagedRegistration(): boolean {
-    return this.shouldUseServerRegistration() && API_BASE === DEFAULT_PUBLIC_API_URL;
+    return this.shouldUseServerRegistration();
   }
 
   /** One request and one poller serve every mounted status/identity consumer. */
@@ -250,16 +244,43 @@ class DeviceRegistrationService {
     return this.publicStatusRequest;
   }
 
+  /** Only an explicit user action bootstraps the local service; polling merely reads status. */
+  startBackgroundService(): Promise<boolean> {
+    if (this.publicServiceStartRequest) return this.publicServiceStartRequest;
+    this.publicStatusState = { ...this.publicStatusState, starting: true, startupError: null };
+    this.publish();
+    this.publicServiceStartRequest = this.bootstrapBackgroundService().finally(() => {
+      this.publicServiceStartRequest = null;
+      this.publicStatusState = { ...this.publicStatusState, starting: false };
+      this.publish();
+    });
+    return this.publicServiceStartRequest;
+  }
+
+  private async bootstrapBackgroundService(): Promise<boolean> {
+    try {
+      const result = await serviceBootstrapIfNeeded();
+      if (!result.ok) throw new Error("service bootstrap failed");
+      await this.refreshPublicServerStatus();
+      if (this.publicStatusState.status?.service_running) return true;
+    } catch {
+      // OS authorization and other startup errors may include private native details.
+    }
+    this.publicStatusState = { ...this.publicStatusState, startupError: LOCAL_SERVICE_START_FAILED_MESSAGE };
+    return false;
+  }
+
   private async readPublicServerStatus(): Promise<StoredDeviceInfo | null> {
     try {
       const result = await ipcPublicServerStatus();
       if (!result.ok) throw new Error("无法读取本机设备登记状态，请确认后台服务已启动");
       const status = result.value;
-      this.publicStatusState = { status, checking: false, failed: false };
+      this.publicStatusState = { ...this.publicStatusState, status, checking: false, failed: false,
+        startupError: status.service_running ? null : this.publicStatusState.startupError };
       if (!this.shouldUseServiceManagedRegistration()) return this.deviceInfo;
       const stored = this.getStoredDeviceInfo();
       this.registrationError = publicRegistrationError(status);
-      if (!status.device_registered || !status.device_id) {
+      if (!status.service_running || publicServerConfigurationError(status) || !status.device_registered || !status.device_id) {
         this.deviceInfo = null;
         return null;
       }
@@ -278,9 +299,9 @@ class DeviceRegistrationService {
       if (previousDeviceId !== info.device_id) await this.bindManagedDeviceIfLoggedIn();
       return info;
     } catch {
-      this.publicStatusState = { status: null, checking: false, failed: true };
+      this.publicStatusState = { ...this.publicStatusState, status: null, checking: false, failed: true };
       if (this.shouldUseServiceManagedRegistration()) {
-        this.registrationError = "暂时无法读取后台设备登记状态，正在自动重试。";
+        this.registrationError = LOCAL_SERVICE_UNREACHABLE_MESSAGE;
         // A cached code is display metadata only. It never proves public connectivity.
         const stored = this.getStoredDeviceInfo();
         this.deviceInfo = stored?.access_token === SERVICE_MANAGED_TOKEN ? stored : null;
@@ -363,12 +384,10 @@ class DeviceRegistrationService {
    * 获取硬件信息（通过 Tauri）
    */
   private async getHardwareInfo(): Promise<HardwareInfo> {
-    // 检查 Tauri 环境是否可用
-    const tauri = typeof window !== "undefined" ? window.__TAURI__ : undefined;
-    const isTauriAvailable = typeof tauri?.invoke === "function";
-
-    if (!isTauriAvailable) throw new Error("仅桌面客户端可以读取设备硬件信息");
-    return tauri.invoke<HardwareInfo>("get_hardware_info");
+    if (!isTauriRuntime()) throw new Error("仅桌面客户端可以读取设备硬件信息");
+    const result = await getHardwareInfoCommand();
+    if (!result.ok) throw new Error(result.error.message);
+    return result.value;
   }
 
   /**
@@ -485,10 +504,19 @@ class DeviceRegistrationService {
     isNewBinding?: boolean;
   }> {
     if (!this.deviceInfo && this.initPromise) await this.initPromise;
+    const serviceManaged = this.shouldUseServiceManagedRegistration() || this.deviceInfo?.access_token === SERVICE_MANAGED_TOKEN;
+    if (serviceManaged) {
+      const configurationError = publicServerConfigurationError(this.publicStatusState.status);
+      if (configurationError) {
+        this.registrationError = configurationError;
+        this.publish();
+        return { success: false, message: configurationError };
+      }
+    }
     if (!this.deviceInfo) {
       return { success: false, message: "登记设备后将自动绑定当前登录账户" };
     }
-    if (this.deviceInfo.access_token === SERVICE_MANAGED_TOKEN || this.shouldUseServiceManagedRegistration()) {
+    if (serviceManaged) {
       const userToken = this.getUserAccessToken();
       if (!userToken) return { success: false, message: "请先登录再绑定本机设备" };
       try {
@@ -579,6 +607,12 @@ class DeviceRegistrationService {
     if (this.deviceInfo?.access_token === SERVICE_MANAGED_TOKEN || this.shouldUseServiceManagedRegistration()) {
       if (targetDeviceId !== this.deviceInfo?.device_id) {
         this.recordBindingError("后台服务只允许解绑当前本机设备");
+        return false;
+      }
+      const configurationError = publicServerConfigurationError(this.publicStatusState.status);
+      if (configurationError) {
+        this.registrationError = configurationError;
+        this.publish();
         return false;
       }
       const userToken = this.getUserAccessToken();
@@ -712,5 +746,5 @@ export function usePublicServerStatus() {
     setSnapshot(deviceService.getPublicServerStatus());
     return unsubscribe;
   }, []);
-  return { ...snapshot, refresh: () => deviceService.refreshPublicServerStatus() };
+  return { ...snapshot, refresh: () => deviceService.refreshPublicServerStatus(), startService: () => deviceService.startBackgroundService() };
 }

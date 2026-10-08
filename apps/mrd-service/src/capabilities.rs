@@ -88,17 +88,53 @@ pub fn apply_control_input_capability_status(
     snapshot: &mut CapabilitySnapshot,
     input_injector_available: bool,
 ) {
-    if input_injector_available {
-        return;
-    }
-
     if let Some(item) = snapshot
         .capabilities
         .iter_mut()
         .find(|item| item.id == "control.keyboard_mouse")
     {
-        item.status = CapabilityStatus::Unsupported;
-        item.reason = Some("Input injector is unavailable on this host.".to_string());
+        if snapshot.platform == CapabilityPlatform::Macos {
+            item.status = if input_injector_available {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::PermissionMissing
+            };
+            item.reason = Some(if input_injector_available {
+                "macOS keyboard and mouse control is authorized by Accessibility.".to_string()
+            } else {
+                "Allow Rdesk Service in System Settings > Privacy & Security > Accessibility."
+                    .to_string()
+            });
+        } else if !input_injector_available {
+            item.status = CapabilityStatus::Unsupported;
+            item.reason = Some("Input injector is unavailable on this host.".to_string());
+        }
+    }
+}
+
+pub fn apply_macos_capture_permission_status(
+    snapshot: &mut CapabilitySnapshot,
+    screen_recording_available: bool,
+) {
+    if snapshot.platform != CapabilityPlatform::Macos {
+        return;
+    }
+    if let Some(item) = snapshot
+        .capabilities
+        .iter_mut()
+        .find(|item| item.id == "capture.macos")
+    {
+        item.status = if screen_recording_available {
+            CapabilityStatus::Available
+        } else {
+            CapabilityStatus::PermissionMissing
+        };
+        item.reason = Some(if screen_recording_available {
+            "macOS Screen Recording is authorized for the service capture adapter.".to_string()
+        } else {
+            "Allow Rdesk Service in System Settings > Privacy & Security > Screen Recording."
+                .to_string()
+        });
     }
 }
 
@@ -351,7 +387,7 @@ fn local_capabilities(
 ) -> Vec<CapabilityItem> {
     let mut items = Vec::new();
 
-    add_capture_capabilities(&mut items, &platform);
+    add_capture_capabilities(&mut items, &platform, probe_mode);
     add_capture_source_capabilities(&mut items, &platform);
     add_encode_capabilities(&mut items, &platform, probe_mode);
     add_decode_capabilities(&mut items, &platform, probe_mode);
@@ -366,7 +402,11 @@ fn local_capabilities(
     items
 }
 
-fn add_capture_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_capture_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    _probe_mode: CapabilityProbeMode,
+) {
     match platform {
         CapabilityPlatform::Windows => {
             push_available(
@@ -391,8 +431,25 @@ fn add_capture_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
                 CapabilityDomain::Capture,
                 "capture.macos",
                 "ScreenCaptureKit",
-                "macOS capture is available through the Rdesk harness path.",
+                "macOS service capture uses ScreenCaptureKit and requires Screen Recording access.",
             );
+            #[cfg(target_os = "macos")]
+            if matches!(_probe_mode, CapabilityProbeMode::Runtime) {
+                let granted = mrd_capture_macos::screen_capture_access_is_granted();
+                let item = items
+                    .last_mut()
+                    .expect("macOS capture capability was added");
+                item.status = if granted {
+                    CapabilityStatus::Available
+                } else {
+                    CapabilityStatus::PermissionMissing
+                };
+                item.reason = Some(if granted {
+                    "macOS Screen Recording is authorized for the service capture adapter."
+                } else {
+                    "Allow Rdesk Service in System Settings > Privacy & Security > Screen Recording."
+                }.to_string());
+            }
         }
         CapabilityPlatform::Linux => {
             #[cfg(target_os = "linux")]
@@ -1753,6 +1810,15 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             "control.keyboard_mouse",
             "Keyboard and mouse control",
         );
+    } else if matches!(platform, CapabilityPlatform::Macos) {
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Control,
+            "control.keyboard_mouse",
+            "Keyboard and mouse control",
+            "macOS service input uses CoreGraphics events and requires Accessibility access.",
+        );
     } else {
         push_item(
             items,
@@ -1761,7 +1827,7 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             "control.keyboard_mouse",
             "Keyboard and mouse control",
             CapabilityStatus::Unsupported,
-            Some("Input injection is currently implemented only for Windows SendInput."),
+            Some("Input injection is implemented for Windows and macOS user sessions."),
         );
     }
     let (remote_power_status, remote_power_reason) =
@@ -2322,6 +2388,53 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_permissions_follow_grants_and_revocations() {
+        let mut snapshot = CapabilitySnapshot {
+            schema_version: SCHEMA_VERSION,
+            platform: CapabilityPlatform::Macos,
+            service_version: "test".to_string(),
+            capabilities: local_capabilities(
+                CapabilityPlatform::Macos,
+                CapabilityProbeMode::Static,
+            ),
+            constraints: Vec::new(),
+            profiles: Vec::new(),
+            updated_at_ms: 0,
+        };
+        for available in [false, true, false] {
+            apply_control_input_capability_status(&mut snapshot, available);
+            apply_macos_capture_permission_status(&mut snapshot, available);
+            for id in ["capture.macos", "control.keyboard_mouse"] {
+                let item = snapshot
+                    .capabilities
+                    .iter()
+                    .find(|item| item.id == id)
+                    .unwrap();
+                assert_eq!(
+                    item.status,
+                    if available {
+                        CapabilityStatus::Available
+                    } else {
+                        CapabilityStatus::PermissionMissing
+                    }
+                );
+                assert!(!item.reason.as_deref().unwrap().contains("harness"));
+            }
+        }
+    }
+
+    #[test]
+    fn macos_control_is_declared_before_permission_probe() {
+        let items = local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
+        let control = items
+            .iter()
+            .find(|item| item.id == "control.keyboard_mouse")
+            .unwrap();
+        assert_eq!(control.status, CapabilityStatus::Supported);
+        assert_eq!(items.iter().filter(|item| item.id == control.id).count(), 1);
+    }
 
     #[test]
     fn d3d11_shared_static_status_requires_an_actual_sharing_probe() {

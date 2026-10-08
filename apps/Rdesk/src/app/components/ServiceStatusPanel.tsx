@@ -4,7 +4,7 @@ import { useTheme } from "./ThemeContext";
 import { usePublicServerStatus } from "../services/deviceService";
 import type { PublicServerStatus } from "../adapters/tauri/types";
 import { formatDeviceCode } from "../utils/deviceCode";
-import { automaticEnrollmentLabel, automaticEnrollmentMessage } from "../utils/automaticDeviceEnrollment";
+import { automaticEnrollmentLabel, automaticEnrollmentMessage, LOCAL_SERVICE_UNREACHABLE_MESSAGE, LOCAL_SERVICE_STOPPED_MESSAGE } from "../utils/automaticDeviceEnrollment";
 
 function connectionLabel(status: PublicServerStatus): string {
   if (!status.service_running) return "本机后台服务未运行";
@@ -71,31 +71,37 @@ function connectionError(code: string | null): string | null {
 
 export function ServiceStatusPanel() {
   const { isDark } = useTheme();
-  const { status, checking, failed, refresh } = usePublicServerStatus();
+  const { status, checking, failed, starting, startupError, refresh, startService } = usePublicServerStatus();
   const [expanded, setExpanded] = useState(false);
 
   const online = Boolean(status?.service_running && status.device_registered && status.signaling_state === "authenticated");
-  const label = status ? connectionLabel(status) : failed ? "无法读取连接状态" : "正在检查服务器连接";
-  const error = connectionError(status?.last_error ?? null);
+  const localUnavailable = failed || status?.service_running === false;
+  const label = starting ? "正在启动本机后台服务" : status ? connectionLabel(status) : failed ? "无法连接本机后台服务" : "正在检查本机后台服务";
+  const error = startupError ?? (failed ? LOCAL_SERVICE_UNREACHABLE_MESSAGE
+    : status?.service_running === false ? LOCAL_SERVICE_STOPPED_MESSAGE : connectionError(status?.last_error ?? null));
   const muted = isDark ? "text-gray-400" : "text-gray-500";
   const tone = online ? "text-emerald-600" : status?.signaling_state === "connecting" ? "text-blue-500" : "text-amber-600";
 
   return <section aria-label="服务器连接状态" className={`shrink-0 border-b px-3 py-2 ${isDark ? "bg-[#1f1f1f] border-gray-700 text-gray-200" : "bg-white border-gray-200 text-gray-800"}`}>
     <div className="flex flex-wrap items-center gap-2">
       <div className={`flex min-w-0 flex-1 items-center gap-2 text-sm ${tone}`} role="status" aria-live="polite">
-        {checking && !status ? <Loader2 className="h-4 w-4 shrink-0 animate-spin" /> : online ? <Wifi className="h-4 w-4 shrink-0" /> : <WifiOff className="h-4 w-4 shrink-0" />}
+        {starting || (checking && !status && !failed)
+          ? <Loader2 role="progressbar" aria-label="检查后台服务" className="h-4 w-4 shrink-0 animate-spin" />
+          : online ? <Wifi className="h-4 w-4 shrink-0" /> : <WifiOff className="h-4 w-4 shrink-0" />}
         <span>{label}</span>
       </div>
       <button type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${muted}`}>
         连接详情 <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
       </button>
-      <button type="button" aria-label="刷新连接状态" title="刷新连接状态" onClick={() => void refresh()} disabled={checking} className={`rounded p-1.5 disabled:opacity-40 ${muted}`}>
+      {localUnavailable && <button type="button" onClick={() => void startService()} disabled={checking || starting}
+        className={`rounded px-2 py-1 text-xs disabled:opacity-40 ${muted}`}>{starting ? "正在启动…" : "启动后台服务"}</button>}
+      <button type="button" aria-label="刷新连接状态" title="刷新连接状态" onClick={() => void refresh()} disabled={checking || starting} className={`rounded p-1.5 disabled:opacity-40 ${muted}`}>
         <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} />
       </button>
     </div>
     {expanded && <div className={`mt-2 space-y-1.5 border-t pt-2 text-xs ${isDark ? "border-gray-700" : "border-gray-100"}`}>
       <dl className="grid grid-cols-[5rem_1fr] gap-x-2 gap-y-1.5">
-        <dt className={muted}>本机后台</dt><dd>{status?.service_running ? "后台服务运行中" : status ? "后台服务未运行" : "状态未知"}</dd>
+        <dt className={muted}>本机后台</dt><dd>{status?.service_running ? "后台服务运行中" : status ? "后台服务未运行" : failed ? "无法连接后台服务" : "正在检查"}</dd>
         <dt className={muted}>公网服务器</dt><dd>{serverHost(status?.api_url ?? null)}</dd>
         <dt className={muted}>服务器接口</dt><dd>{status?.api_reachable === true ? "服务器接口可达" : status?.api_reachable === false ? "服务器接口暂时不可达" : "尚未检测"}</dd>
         <dt className={muted}>设备登记</dt><dd>{status?.device_registered ? `已登记 · ${formatDeviceCode(status.device_id)}` : "设备尚未登记到服务器"}</dd>
@@ -103,7 +109,7 @@ export function ServiceStatusPanel() {
         {status?.last_connected_at_ms && <><dt className={muted}>最近连接</dt><dd>{new Date(status.last_connected_at_ms).toLocaleString("zh-CN")}</dd></>}
       </dl>
       {error && <p className="text-amber-600">{error}</p>}
-      {failed && <p className="text-amber-600">请确认本机后台服务已启动，然后刷新连接状态。</p>}
+      {localUnavailable && <p className="text-amber-600">如果系统弹出授权提示，请完成授权后重试。</p>}
     </div>}
   </section>;
 }

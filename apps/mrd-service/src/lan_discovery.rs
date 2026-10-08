@@ -1177,6 +1177,8 @@ struct LanRemoteSessionPreparation {
     transport: String,
     source_media_capabilities: Vec<String>,
     negotiation: MediaProfileNegotiation,
+    #[cfg(target_os = "macos")]
+    capture_selection: CaptureSourceSelection,
     prepared_server: QuinnPreparedServer,
     expected_peer_ip: IpAddr,
 }
@@ -1187,6 +1189,8 @@ struct PreparedLanRemoteSession {
     transport: String,
     source_media_capabilities: Vec<String>,
     negotiation: MediaProfileNegotiation,
+    #[cfg(target_os = "macos")]
+    capture_selection: CaptureSourceSelection,
     listener: QuinnServerListener,
     bootstrap: QuinnServerBootstrap,
     expected_peer_ip: IpAddr,
@@ -3681,6 +3685,28 @@ async fn prepare_lan_remote_session(
     }
     let negotiation =
         negotiate_media_profile(requested_profile).map_err(|error| error.to_string())?;
+    // Bind the source and actual frame dimensions before hashing the profile
+    // into the signed grant. Commit must use the same selection as bootstrap.
+    #[cfg(target_os = "macos")]
+    let (negotiation, capture_selection) = {
+        let mut negotiation = negotiation;
+        #[cfg(test)]
+        let source = synthetic_capture_source();
+        #[cfg(not(test))]
+        let source =
+            tokio::task::spawn_blocking(|| crate::capture_source::default_capture_source(false))
+                .await
+                .map_err(|error| format!("capture source query failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+        reconcile_negotiation_to_capture_source(&mut negotiation, &source);
+        let selection = CaptureSourceSelection {
+            session_id: session_id.clone(),
+            source,
+            status: "selected".to_string(),
+            reason: Some("default fullscreen capture source".to_string()),
+        };
+        (negotiation, selection)
+    };
     if let Err(error) = ensure_peer_can_receive_selected_media(
         source_device_id.0.as_str(),
         &negotiation.selected,
@@ -3697,6 +3723,8 @@ async fn prepare_lan_remote_session(
         transport,
         source_media_capabilities,
         negotiation,
+        #[cfg(target_os = "macos")]
+        capture_selection,
         prepared_server,
         expected_peer_ip,
     })
@@ -3711,6 +3739,8 @@ async fn bind_prepared_lan_remote_session(
         transport,
         source_media_capabilities,
         negotiation,
+        #[cfg(target_os = "macos")]
+        capture_selection,
         prepared_server,
         expected_peer_ip,
     } = preparation;
@@ -3744,6 +3774,8 @@ async fn bind_prepared_lan_remote_session(
             transport,
             source_media_capabilities,
             negotiation,
+            #[cfg(target_os = "macos")]
+            capture_selection,
             listener,
             bootstrap,
             expected_peer_ip,
@@ -3775,6 +3807,8 @@ async fn commit_prepared_lan_remote_session_with_timeout(
         transport,
         source_media_capabilities,
         negotiation,
+        #[cfg(target_os = "macos")]
+        capture_selection,
         listener,
         bootstrap,
         expected_peer_ip,
@@ -3794,14 +3828,16 @@ async fn commit_prepared_lan_remote_session_with_timeout(
             anyhow::bail!("remote authorization changed before LAN sender commit");
         }
     }
-    #[cfg(test)]
+    #[cfg(target_os = "macos")]
+    let capture_selection = Some(capture_selection);
+    #[cfg(all(test, not(target_os = "macos")))]
     let capture_selection = Some(CaptureSourceSelection {
         session_id: session_id.clone(),
         source: synthetic_capture_source(),
         status: "selected".to_string(),
         reason: Some("test synthetic capture source".to_string()),
     });
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(target_os = "macos")))]
     let capture_selection = crate::capture_source::default_capture_source(false)
         .ok()
         .map(|source| CaptureSourceSelection {

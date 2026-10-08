@@ -1,4 +1,4 @@
-//! First-start enrollment proved by the protected installation's Ed25519 key.
+//! Enrollment and existing credential recovery proved by the protected installation's key.
 //!
 //! The signer receives canonical bytes and keeps its private key with its owner.
 //! Neither server error bodies nor enrollment credentials enter diagnostics.
@@ -74,6 +74,13 @@ struct ClaimRequest<'a> {
     signature: &'a str,
 }
 
+#[derive(Serialize)]
+struct ExistingRegistrationRequest<'a> {
+    #[serde(flatten)]
+    registration: &'a DeviceRegistrationRequest,
+    expected_device_id: &'a str,
+}
+
 /// Obtain the same server-managed device identity on retries after a lost reply.
 /// The caller signs with `SIGNATURE_CONTEXT`; it never exports the private key.
 pub async fn self_register<F>(
@@ -81,6 +88,52 @@ pub async fn self_register<F>(
     payload: &DeviceRegistrationRequest,
     key_id: &str,
     public_key: &[u8],
+    signer: F,
+) -> Result<DeviceRegistrationResponse, SelfEnrollmentError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, SelfEnrollmentError>,
+{
+    self_register_request(api_base, payload, key_id, public_key, None, signer).await
+}
+
+/// Recover only the already-pinned identity, never allocate a replacement code.
+/// The expected ID is part of the signed registration JSON, including legacy IDs.
+pub async fn self_register_existing<F>(
+    api_base: &str,
+    payload: &DeviceRegistrationRequest,
+    key_id: &str,
+    public_key: &[u8],
+    expected_device_id: &str,
+    signer: F,
+) -> Result<DeviceRegistrationResponse, SelfEnrollmentError>
+where
+    F: FnOnce(&[u8]) -> Result<Vec<u8>, SelfEnrollmentError>,
+{
+    if expected_device_id.is_empty()
+        || expected_device_id.len() > 64
+        || expected_device_id
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(SelfEnrollmentError::InvalidRequest);
+    }
+    self_register_request(
+        api_base,
+        payload,
+        key_id,
+        public_key,
+        Some(expected_device_id),
+        signer,
+    )
+    .await
+}
+
+async fn self_register_request<F>(
+    api_base: &str,
+    payload: &DeviceRegistrationRequest,
+    key_id: &str,
+    public_key: &[u8],
+    expected_device_id: Option<&str>,
     signer: F,
 ) -> Result<DeviceRegistrationResponse, SelfEnrollmentError>
 where
@@ -94,7 +147,14 @@ where
         return Err(SelfEnrollmentError::InvalidRequest);
     }
     let registration_json = Zeroizing::new(
-        serde_json::to_string(payload).map_err(|_| SelfEnrollmentError::InvalidRequest)?,
+        match expected_device_id {
+            Some(expected_device_id) => serde_json::to_string(&ExistingRegistrationRequest {
+                registration: payload,
+                expected_device_id,
+            }),
+            None => serde_json::to_string(payload),
+        }
+        .map_err(|_| SelfEnrollmentError::InvalidRequest)?,
     );
     if registration_json.len() > MAX_REGISTRATION_BYTES {
         return Err(SelfEnrollmentError::InvalidRequest);
@@ -141,12 +201,17 @@ where
     let registration = crate::parse_registration(response, true)
         .await
         .map_err(|_| SelfEnrollmentError::InvalidResponse)?;
-    if registration.device_id.len() != 10
-        || !registration
-            .device_id
-            .bytes()
-            .all(|byte| byte.is_ascii_digit())
-    {
+    let valid_identity = match expected_device_id {
+        Some(expected) => registration.device_id == expected,
+        None => {
+            matches!(registration.device_id.len(), 9 | 10)
+                && registration
+                    .device_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+        }
+    };
+    if !valid_identity {
         return Err(SelfEnrollmentError::InvalidResponse);
     }
     Ok(registration)
@@ -599,10 +664,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_requires_a_ten_digit_code_and_durable_refresh_credential() {
+    async fn claim_requires_a_numeric_code_and_durable_refresh_credential() {
         let key = [7u8; 32];
         for body in [
-            r#"{"device_id":"123456789","device_name":"Office","access_token":"access.jwt.token","refresh_token":"refresh.jwt.token"}"#,
+            r#"{"device_id":"12345678","device_name":"Office","access_token":"access.jwt.token","refresh_token":"refresh.jwt.token"}"#,
             r#"{"device_id":"0123456789","device_name":"Office","access_token":"access.jwt.token"}"#,
             r#"{"device_id":"0123456789","device_name":"Office","access_token":"secret","refresh_token":"refresh.jwt.token"}"#,
         ] {
@@ -623,6 +688,152 @@ mod tests {
                 SelfEnrollmentError::InvalidResponse
             );
             assert_eq!(captured.await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_accepts_new_nine_digit_and_existing_ten_digit_codes() {
+        let key = [7u8; 32];
+        for code in ["012345678", "0123456789"] {
+            let body = format!(
+                r#"{{"device_id":"{code}","device_name":"Office","access_token":"access.jwt.token","refresh_token":"refresh.jwt.token"}}"#
+            );
+            let (base, captured) = fake_server(|base| {
+                vec![
+                    ("200 OK".into(), challenge_json(base), String::new()),
+                    ("200 OK".into(), body, String::new()),
+                ]
+            })
+            .await;
+            let response = self_register(&base, &payload(), &sha256_hex(&key), &key, |_| {
+                Ok(vec![9; 64])
+            })
+            .await
+            .unwrap();
+            assert_eq!(response.device_id, code);
+            assert_eq!(captured.await.unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_recovery_signs_expected_identity_and_retains_legacy_codes() {
+        let key = [7u8; 32];
+        let key_id = sha256_hex(&key);
+        for code in [
+            "012345678",
+            "0123456789",
+            "012345678901",
+            "legacy-device-42",
+        ] {
+            let body = serde_json::json!({
+                "device_id": code,
+                "device_name": "Office",
+                "access_token": "access.jwt.token",
+                "refresh_token": "refresh.jwt.token",
+            })
+            .to_string();
+            let (base, captured) = fake_server(|base| {
+                vec![
+                    ("200 OK".into(), challenge_json(base), String::new()),
+                    ("200 OK".into(), body, String::new()),
+                ]
+            })
+            .await;
+            let signed = Arc::new(Mutex::new(Vec::new()));
+            let signed_copy = signed.clone();
+            let response =
+                self_register_existing(&base, &payload(), &key_id, &key, code, |bytes| {
+                    *signed_copy.lock().unwrap() = bytes.to_vec();
+                    Ok(vec![9; 64])
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.device_id, code);
+            let requests = captured.await.unwrap();
+            let claim = http_body(&requests[1]);
+            assert!(claim.get("expected_device_id").is_none());
+            let registration_json = claim["registration_json"].as_str().unwrap();
+            let mut registration: serde_json::Value =
+                serde_json::from_str(registration_json).unwrap();
+            assert_eq!(registration["expected_device_id"], code);
+            registration
+                .as_object_mut()
+                .unwrap()
+                .remove("expected_device_id");
+            assert_eq!(registration, serde_json::to_value(payload()).unwrap());
+            let canonical = canonical_bytes(&challenge(&base), &key_id, registration_json);
+            assert_eq!(*signed.lock().unwrap(), canonical);
+
+            // Altering only the requested identity changes the machine-key proof.
+            let mut tampered: serde_json::Value = serde_json::from_str(registration_json).unwrap();
+            tampered["expected_device_id"] = "987654321".into();
+            assert_ne!(
+                canonical,
+                canonical_bytes(&challenge(&base), &key_id, &tampered.to_string())
+            );
+            for request in requests {
+                let headers = request
+                    .split_once("\r\n\r\n")
+                    .unwrap()
+                    .0
+                    .to_ascii_lowercase();
+                assert!(!headers.contains("authorization"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_recovery_rejects_reassigned_identity_and_invalid_saved_ids() {
+        let key = [7u8; 32];
+        for returned in ["987654321", "0123456789", "legacy-other-42"] {
+            let body = serde_json::json!({
+                "device_id": returned,
+                "device_name": "Office",
+                "access_token": "access.jwt.token",
+                "refresh_token": "refresh.jwt.token",
+            })
+            .to_string();
+            let (base, captured) = fake_server(|base| {
+                vec![
+                    ("200 OK".into(), challenge_json(base), String::new()),
+                    ("200 OK".into(), body, String::new()),
+                ]
+            })
+            .await;
+            assert_eq!(
+                self_register_existing(
+                    &base,
+                    &payload(),
+                    &sha256_hex(&key),
+                    &key,
+                    "012345678",
+                    |_| Ok(vec![9; 64]),
+                )
+                .await
+                .unwrap_err(),
+                SelfEnrollmentError::InvalidResponse
+            );
+            assert_eq!(captured.await.unwrap().len(), 2);
+        }
+        for code in [
+            "".to_owned(),
+            "a".repeat(65),
+            "code with spaces".into(),
+            "code\n".into(),
+        ] {
+            assert_eq!(
+                self_register_existing(
+                    "https://127.0.0.1:9/api/v1",
+                    &payload(),
+                    &sha256_hex(&key),
+                    &key,
+                    &code,
+                    |_| panic!("invalid saved ID must not reach signer"),
+                )
+                .await
+                .unwrap_err(),
+                SelfEnrollmentError::InvalidRequest
+            );
         }
     }
 

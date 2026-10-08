@@ -3,10 +3,11 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
 
-const mocks = vi.hoisted(() => ({ getStatus: vi.fn() }));
+const mocks = vi.hoisted(() => ({ getStatus: vi.fn(), bootstrap: vi.fn() }));
 vi.mock("./ThemeContext", () => ({ useTheme: () => ({ isDark: false }) }));
 vi.mock("../adapters/tauri/commands", () => ({
   ipcPublicServerStatus: mocks.getStatus,
+  serviceBootstrapIfNeeded: mocks.bootstrap,
   shellGetStatus: vi.fn().mockResolvedValue({ ok: true, value: {} }),
   ipcRuntimeSnapshot: vi.fn().mockResolvedValue({ ok: true, value: { sessions: [] } }),
   getClientDiagnostics: vi.fn().mockResolvedValue({ ok: false, error: { message: "unavailable" } }),
@@ -28,6 +29,7 @@ const connected = {
 describe("public server connection status", () => {
   beforeEach(() => {
     mocks.getStatus.mockReset().mockResolvedValue({ ok: true, value: connected });
+    mocks.bootstrap.mockReset().mockResolvedValue({ ok: true, value: true });
   });
 
   it("shows public connection only after device signaling authentication", async () => {
@@ -63,7 +65,7 @@ describe("public server connection status", () => {
   it.each([
     ["public_auto_enrollment_pending", "正在领取设备码", "正在自动登记并领取设备码，请稍候。"],
     ["public_auto_enrollment_rate_limited", "自动登记暂未完成，正在重试", "设备登记请求较多，后台将稍后自动重试。"],
-    ["public_auto_enrollment_identity_conflict", "等待恢复已有设备身份", "本机已有设备身份需要恢复，请使用设备恢复入口。"],
+    ["public_auto_enrollment_identity_conflict", "正在恢复已有设备身份", "本机已有设备身份暂未恢复，后台将自动重试。"],
   ])("shows automatic enrollment %s without claiming an authenticated connection", async (code, label, message) => {
     mocks.getStatus.mockResolvedValue({ ok: true, value: { ...connected, device_registered: false, device_id: null, signaling_state: "disabled", last_error: code } });
     render(<ServiceStatusPanel />);
@@ -88,8 +90,22 @@ describe("public server connection status", () => {
     mocks.getStatus.mockResolvedValue({ ok: false, error: { message: "Bearer secret-token https://user:password@api.example/?token=secret" } });
     await userEvent.click(screen.getByRole("button", { name: "刷新连接状态" }));
     await waitFor(() => expect(screen.queryByText("公网服务器已连接")).not.toBeInTheDocument());
-    expect(screen.getByText("无法读取连接状态")).toBeInTheDocument();
+    expect(screen.getByText("无法连接本机后台服务")).toBeInTheDocument();
     expect(screen.queryByText(/secret-token|password|token=secret/)).not.toBeInTheDocument();
+  });
+
+  it("shows a local-service connection failure with a startup action and no pending spinner", async () => {
+    mocks.getStatus.mockResolvedValueOnce({ ok: false, error: { message: "private native error" } });
+    render(<ServiceStatusPanel />);
+    expect(await screen.findByText("无法连接本机后台服务")).toBeInTheDocument();
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(mocks.bootstrap).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole("button", { name: "连接详情" }));
+    expect(screen.getByText(/自动登记无法继续/)).toBeInTheDocument();
+    expect(screen.queryByText("private native error")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "启动后台服务" }));
+    expect(mocks.bootstrap).toHaveBeenCalledOnce();
+    expect(await screen.findByText("公网服务器已连接")).toBeInTheDocument();
   });
 
   it("never renders secrets, file paths or URL credentials in connection details", async () => {

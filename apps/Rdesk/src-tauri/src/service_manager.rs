@@ -89,6 +89,8 @@ impl ServiceManager {
         let exe_path = self.ensure_service_executable()?;
 
         let mut command = Command::new(&exe_path);
+        #[cfg(target_os = "macos")]
+        command.arg("--authorize-keychain-and-run");
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

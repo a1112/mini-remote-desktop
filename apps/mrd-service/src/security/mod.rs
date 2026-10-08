@@ -10,12 +10,16 @@ mod unsupported;
 mod windows_dpapi;
 
 #[cfg(target_os = "macos")]
-pub use macos_keychain::platform_secret_protector;
+pub use macos_keychain::{platform_secret_protector, user_start_secret_protector};
 #[cfg(target_os = "macos")]
 pub use macos_user_storage::{
     ensure_protected_product_data_dir, protected_product_data_dir, verify_owner_only_file,
     verify_protected_product_data_dir,
 };
+#[cfg(target_os = "macos")]
+pub fn authorize_keychain_access() -> Result<(), String> {
+    macos_user_storage::authorize_master_key_access()
+}
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub use unsupported::{platform_secret_protector, UnsupportedSecretProtector};
 #[cfg(windows)]

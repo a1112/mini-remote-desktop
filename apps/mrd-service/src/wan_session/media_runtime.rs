@@ -525,6 +525,18 @@ async fn create_target_capture(
     let source_id = selected_capture_source_id(app_state, session_id)
         .await
         .map_err(|_| WanMediaRuntimeError::Capture)?;
+    #[cfg(target_os = "macos")]
+    {
+        // WAN resizes frames to the already approved exact dimensions. Bind
+        // only the local source identity so pointer geometry uses that source
+        // while retaining the signed video profile unchanged.
+        let mut profiles = app_state.media_profiles.lock().await;
+        let mut negotiation = profiles
+            .get(session_id)
+            .ok_or(WanMediaRuntimeError::Evidence)?;
+        negotiation.selected_source_id = Some(source_id.clone());
+        profiles.set(session_id.clone(), negotiation);
+    }
     create_software_frame_capture(&source_id, profile)
         .await
         .map(Box::new)

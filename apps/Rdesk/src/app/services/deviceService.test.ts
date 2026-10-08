@@ -5,6 +5,7 @@ const mockRegisterDevice = vi.hoisted(() => vi.fn());
 const mockPublicStatus = vi.hoisted(() => vi.fn());
 const mockBindPublicDevice = vi.hoisted(() => vi.fn());
 const mockUnbindPublicDevice = vi.hoisted(() => vi.fn());
+const mockGetHardwareInfo = vi.hoisted(() => vi.fn());
 
 vi.mock("../adapters/tauri", () => ({
   ipcRegisterDevice: mockIpcRegisterDevice,
@@ -12,6 +13,7 @@ vi.mock("../adapters/tauri", () => ({
   ipcPublicServerStatus: mockPublicStatus,
   ipcBindPublicDevice: mockBindPublicDevice,
   ipcUnbindPublicDevice: mockUnbindPublicDevice,
+  getHardwareInfo: mockGetHardwareInfo,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -46,9 +48,8 @@ describe("deviceService", () => {
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
     (deviceService as any).bindingError = null;
-    (window as any).__TAURI__ = {
-      invoke: vi.fn().mockResolvedValue(hardwareInfo),
-    };
+    (window as any).__TAURI__ = { core: { invoke: vi.fn() } };
+    mockGetHardwareInfo.mockReset().mockResolvedValue({ ok: true, value: hardwareInfo });
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -127,7 +128,9 @@ describe("deviceService", () => {
 
   it("waits for pending LAN initialization before persisting a server enrollment", async () => {
     let resolveHardware!: (value: typeof hardwareInfo) => void;
-    (window.__TAURI__!.invoke as any).mockImplementationOnce(() => new Promise((resolve) => { resolveHardware = resolve; }));
+    mockGetHardwareInfo.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveHardware = (value) => resolve({ ok: true, value });
+    }));
     mockRegisterDevice.mockResolvedValue({ ok: true, value: serverInfo });
     const initializing = deviceService.initialize();
     const enrolling = deviceService.enroll("a".repeat(43));
@@ -194,10 +197,18 @@ describe("deviceService", () => {
   });
 
   it("does not create a device identity when hardware information is unavailable", async () => {
-    delete (window as any).__TAURI__;
+    mockGetHardwareInfo.mockResolvedValue({ ok: false, error: { message: "本机钥匙串已锁定" } });
     const info = await deviceService.initialize();
     expect(info).toBeNull();
     expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
+
+  it("creates a LAN identity through the hardware adapter when Tauri 2 exposes no top-level invoke", async () => {
+    const info = await deviceService.initialize();
+    expect(info?.device_id).toBe("lan-MOCKUN3Q8K3Y");
+    expect(info?.device_name).toBe(hardwareInfo.hostname);
+    expect(mockGetHardwareInfo).toHaveBeenCalledOnce();
+    expect(mockIpcRegisterDevice).toHaveBeenCalledWith("lan-MOCKUN3Q8K3Y", hardwareInfo.hostname);
   });
 });
 
@@ -225,7 +236,8 @@ describe("service-managed public device identity", () => {
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
     (deviceService as any).bindingError = null;
-    (window as any).__TAURI__ = { invoke: vi.fn().mockResolvedValue(hardwareInfo) };
+    (window as any).__TAURI__ = { core: { invoke: vi.fn() } };
+    mockGetHardwareInfo.mockReset().mockResolvedValue({ ok: true, value: hardwareInfo });
   });
   afterEach(() => vi.restoreAllMocks());
 
@@ -236,6 +248,7 @@ describe("service-managed public device identity", () => {
     expect(info?.access_token).toBe("service-managed");
     expect(mockRegisterDevice).not.toHaveBeenCalled();
     expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
+    expect(mockGetHardwareInfo).not.toHaveBeenCalled();
     expect(deviceService.getAccessToken()).toBeNull();
   });
 
@@ -244,7 +257,7 @@ describe("service-managed public device identity", () => {
     mockPublicStatus.mockResolvedValue({ ok: true, value: { ...registeredStatus, device_registered: false, device_id: "lan-old" } });
     expect(await deviceService.initialize()).toBeNull();
     expect(deviceService.getDeviceId()).toBeNull();
-    expect(deviceService.getRegistrationError()).toContain("设备尚未登记到服务器");
+    expect(deviceService.getRegistrationError()).toContain("正在自动登记");
     expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
   });
 
@@ -278,6 +291,33 @@ describe("service-managed public device identity", () => {
     await deviceService.initialize();
     expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
     expect(localStorage.getItem("rdesk_device_info")).not.toContain("user.access.token");
+  });
+
+  it("blocks automatic and explicit account binding when native and login API endpoints differ", async () => {
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    mockPublicStatus.mockResolvedValue({ ok: true, value: {
+      ...registeredStatus, api_url: "https://other.example/rdesk/api/v1",
+    } });
+
+    expect(await deviceService.initialize()).toBeNull();
+    expect(deviceService.getRegistrationError()).toContain("服务器与客户端配置不一致");
+    const binding = await deviceService.bindDevice("user-1");
+    expect(binding.success).toBe(false);
+    expect(binding.message).toContain("服务器与客户端配置不一致");
+    expect(mockBindPublicDevice).not.toHaveBeenCalled();
+    expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
+
+  it("binds automatically when only a trailing slash differs in the native API URL", async () => {
+    localStorage.setItem("rdesk_access_token", "user.access.token");
+    mockPublicStatus.mockResolvedValue({ ok: true, value: {
+      ...registeredStatus, api_url: `${registeredStatus.api_url}/`,
+    } });
+
+    expect((await deviceService.initialize())?.device_id).toBe(registeredStatus.device_id);
+    expect(mockBindPublicDevice).toHaveBeenCalledOnce();
+    expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
+    expect(deviceService.getRegistrationError()).toBeNull();
   });
 
   it.each(["enroll", "recoverDeviceCredential"] as const)("binds after %s when already logged in", async (operation) => {
