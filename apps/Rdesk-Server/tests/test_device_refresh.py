@@ -68,8 +68,9 @@ def test_expired_access_renews_same_device_and_rotates_long_lived_credential(dev
     valid_access = renewed.json()["access_token"]
     assert device_api.client.post("/api/v1/devices/register", json=_register_payload("serial-a"),
         headers={"X-Rdesk-Device-Authorization": f"Bearer {valid_access}"}).status_code == 200
-    # These are revocable long-lived credentials, not single-use refresh tokens.
-    assert _renew(device_api, refresh).status_code == 200
+    # Rotation advances the device's active JTI, so a replayed credential is
+    # rejected even while the replacement remains valid.
+    assert _renew(device_api, refresh).status_code == 401
 
 
 @pytest.mark.parametrize("mutation", [

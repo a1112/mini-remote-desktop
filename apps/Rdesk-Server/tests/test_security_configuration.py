@@ -348,6 +348,7 @@ async def test_jwt_rejects_missing_or_wrong_context_and_unbounded_time(
     claims = {
         "sub": "secure-admin-id",
         "role": "admin",
+        "session_version": 1,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=5)).timestamp()),
         "iss": issuer,
