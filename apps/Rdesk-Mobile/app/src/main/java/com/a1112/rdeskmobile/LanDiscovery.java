@@ -14,7 +14,7 @@ import org.json.JSONObject;
 
 final class LanDiscovery {
     interface Listener {
-        void onGateway(String address, int port, String name);
+        void onGateway(String address, int port, String name, String fingerprint);
         void onFinished();
     }
 
@@ -30,7 +30,7 @@ final class LanDiscovery {
             Set<String> prefixes = new LinkedHashSet<>();
             targets.add(InetAddress.getByName("255.255.255.255"));
             try {
-                Protocol.desktopUrl(knownHost, 9534);
+                if (!Protocol.isGatewayHostValid(knownHost, 9534)) throw new IllegalArgumentException("invalid gateway");
                 targets.add(InetAddress.getByName(knownHost));
             } catch (Exception ignored) {}
             Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
@@ -71,8 +71,10 @@ final class LanDiscovery {
                     if (!"rdesk_gateway".equals(json.optString("type"))) continue;
                     String host = reply.getAddress().getHostAddress();
                     int port = json.optInt("port", -1);
-                    Protocol.desktopUrl(host, port);
-                    if (seen.add(host + ":" + port)) listener.onGateway(host, port, json.optString("name", "Rdesk 电脑"));
+                    if (!Protocol.isGatewayHostValid(host, port)) throw new IllegalArgumentException("invalid gateway");
+                    String fingerprint = json.optString("tls_sha256", "");
+                    if (!Protocol.isCertificateFingerprintValid(fingerprint)) throw new IllegalArgumentException("missing certificate fingerprint");
+                    if (seen.add(host + ":" + port)) listener.onGateway(host, port, json.optString("name", "Rdesk 电脑"), fingerprint);
                 } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {}

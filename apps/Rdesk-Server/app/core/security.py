@@ -60,6 +60,7 @@ class DeviceRefreshIdentity:
     tenant_id: str
     auth_version: int
     serial_digest: str
+    jti: str
     expires_at: int
 
 
@@ -74,6 +75,24 @@ def capture_device_auth_snapshot(device: Device) -> DeviceAuthSnapshot:
         tenant_id=device.tenant_id,
         is_bound=device.is_bound,
         auth_revoked_at=device.auth_revoked_at,
+    )
+
+
+def device_auth_snapshot_matches(
+    device: Device, snapshot: DeviceAuthSnapshot
+) -> bool:
+    """Compare every authorization-relevant field after a database lock."""
+
+    return (
+        snapshot.auth_revoked_at is None
+        and snapshot.is_bound
+        and device.id == snapshot.row_id
+        and device.device_id == snapshot.device_id
+        and device.auth_version == snapshot.auth_version
+        and device.bound_user_id == snapshot.bound_user_id
+        and device.tenant_id == snapshot.tenant_id
+        and device.is_bound == snapshot.is_bound
+        and device.auth_revoked_at == snapshot.auth_revoked_at
     )
 
 
@@ -137,7 +156,9 @@ def password_needs_rehash(password_hash: str) -> bool:
         return True
 
 
-def create_access_token(user_id: str, username: str, role: str) -> str:
+def create_access_token(
+    user_id: str, username: str, role: str, session_version: int = 1
+) -> str:
     configured = _configured_jwt()
     if configured is None:
         raise _relay_http_exception(
@@ -162,6 +183,7 @@ def create_access_token(user_id: str, username: str, role: str) -> str:
         "sub": user_id,
         "username": username,
         "role": role,
+        "session_version": session_version,
         "iss": issuer,
         "aud": audience,
         "iat": int(now.timestamp()),
@@ -213,7 +235,7 @@ def create_device_access_token(device: Device) -> str:
 
 
 def create_device_refresh_token(device: Device) -> str | None:
-    """Issue a revocable device credential; renewal does not invalidate older copies."""
+    """Issue a single-use, revocable device refresh credential."""
     # Legacy inventory rows without a recorded machine digest cannot receive a
     # credential that promises a machine binding. Enrollment/registration does.
     if device.motherboard_serial_digest is None:
@@ -233,6 +255,7 @@ def create_device_refresh_token(device: Device) -> str | None:
         raise _relay_http_exception(503, "authentication_unavailable", "authentication service is not configured")
     secret, issuer, audience, _maximum = configured
     now = int(datetime.now(timezone.utc).timestamp())
+    jti = os.urandom(16).hex()
     payload = {
         "sub": device.id,
         "device_id": device.device_id,
@@ -241,12 +264,13 @@ def create_device_refresh_token(device: Device) -> str | None:
         "serial_digest": device.motherboard_serial_digest,
         "token_type": "device_refresh",
         "role": "device_refresh",
-        "jti": os.urandom(16).hex(),
+        "jti": jti,
         "iss": issuer,
         "aud": audience,
         "iat": now,
         "exp": now + settings.device_refresh_jwt_expire_days * 86400,
     }
+    device.active_refresh_jti_hash = hashlib.sha256(jti.encode("ascii")).hexdigest()
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
@@ -311,13 +335,20 @@ async def get_current_user(
         payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
         token_role = payload.get("role")
-        if user_id is None or token_role not in {"user", "admin"}:
+        token_version = payload.get("session_version")
+        if (
+            user_id is None
+            or token_role not in {"user", "admin"}
+            or not isinstance(token_version, int)
+            or isinstance(token_version, bool)
+            or token_version < 1
+        ):
             raise credentials_exception
     except jwt.PyJWTError:
         raise credentials_exception
 
     user = await db.scalar(select(User).where(User.id == user_id))
-    if user is None or user.role != token_role:
+    if user is None or user.role != token_role or user.session_version != token_version:
         raise credentials_exception
 
     return user
@@ -337,13 +368,26 @@ async def get_current_user_optional(
         payload = _decode_access_token(credentials.credentials, configured)
         user_id: str = payload.get("sub")
         token_role = payload.get("role")
-        if user_id is None or token_role not in {"user", "admin"}:
+        token_version = payload.get("session_version")
+        if (
+            user_id is None
+            or token_role not in {"user", "admin"}
+            or not isinstance(token_version, int)
+            or isinstance(token_version, bool)
+            or token_version < 1
+        ):
             return None
     except jwt.PyJWTError:
         return None
 
     user = await db.scalar(select(User).where(User.id == user_id))
-    return user if user is not None and user.role == token_role else None
+    return (
+        user
+        if user is not None
+        and user.role == token_role
+        and user.session_version == token_version
+        else None
+    )
 
 
 async def get_current_device(
@@ -406,7 +450,8 @@ async def get_device_refresh_identity(
         raise _device_credentials_exception() from None
     return DeviceRefreshIdentity(
         row_id=payload["sub"], device_id=device_id, tenant_id=tenant,
-        auth_version=version, serial_digest=serial, expires_at=payload["exp"],
+        auth_version=version, serial_digest=serial, jti=jti,
+        expires_at=payload["exp"],
     )
 
 

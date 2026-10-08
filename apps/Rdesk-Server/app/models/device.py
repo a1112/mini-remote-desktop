@@ -87,6 +87,11 @@ class Device(Base):
     auth_revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # SHA-256 of the one active refresh-token JTI. Refresh replaces this value
+    # while holding the device row lock, making credentials single-use.
+    active_refresh_jti_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
 
     status: Mapped["DeviceStatus"] = relationship(
         "DeviceStatus",

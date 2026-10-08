@@ -18,15 +18,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket as TokioUdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// 默认配置
 const DEFAULT_UDP_PORT: u16 = 21114;
 const DEFAULT_WEBSOCKET_PORT: u16 = 9527;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const CONNECTION_TIMEOUT_SECS: u64 = 60;
+const MAX_DEVICES: usize = 10_000;
+const HEARTBEAT_QUEUE_CAPACITY: usize = 256;
+const HEARTBEAT_WORKERS: usize = 8;
+const MAX_DEVICE_ID_BYTES: usize = 128;
+const MAX_DEVICE_NAME_BYTES: usize = 128;
+const MAX_DEVICE_TYPE_BYTES: usize = 32;
+const MAX_TRANSPORTS: usize = 8;
+const MAX_TRANSPORT_BYTES: usize = 32;
+const SOURCE_RATE_WINDOW: Duration = Duration::from_secs(1);
+const SOURCE_RATE_LIMIT: u32 = 32;
 
 /// 在线设备信息
 #[derive(Debug, Clone)]
@@ -39,6 +49,7 @@ struct OnlineDevice {
 /// 服务器状态
 struct ServerState {
     devices: HashMap<String, OnlineDevice>,
+    source_rates: HashMap<std::net::IpAddr, (Instant, u32)>,
 }
 
 type SharedState = Arc<RwLock<ServerState>>;
@@ -122,6 +133,7 @@ async fn main() -> Result<()> {
     // 共享状态
     let state = Arc::new(RwLock::new(ServerState {
         devices: HashMap::new(),
+        source_rates: HashMap::new(),
     }));
 
     // 启动超时清理任务
@@ -137,6 +149,26 @@ async fn main() -> Result<()> {
         print_statistics(state_clone).await;
     });
 
+    let (heartbeat_tx, heartbeat_rx): (
+        mpsc::Sender<(Vec<u8>, SocketAddr)>,
+        mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    ) = mpsc::channel(HEARTBEAT_QUEUE_CAPACITY);
+    let heartbeat_rx = Arc::new(tokio::sync::Mutex::new(heartbeat_rx));
+    for _ in 0..HEARTBEAT_WORKERS {
+        let state = state.clone();
+        let receiver = heartbeat_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some((packet, addr)) = receiver.lock().await.recv().await else {
+                    break;
+                };
+                if let Err(error) = handle_heartbeat(&packet, addr, state.clone()).await {
+                    debug!(error = %error, peer = %addr, "heartbeat rejected");
+                }
+            }
+        });
+    }
+
     // 消息处理计数器
     let msg_count = Arc::new(AtomicU64::new(0));
 
@@ -145,19 +177,14 @@ async fn main() -> Result<()> {
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
-                let state = state.clone();
                 let msg_count = msg_count.clone();
                 let packet = buf[..len].to_vec();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_heartbeat(&packet, addr, state).await {
-                        warn!(error = %e, peer = %addr, "failed to handle heartbeat");
-                    } else {
-                        let count = msg_count.fetch_add(1, Ordering::Relaxed) + 1;
-                        if count.is_multiple_of(100) {
-                            debug!(count, "heartbeats processed");
-                        }
+                if heartbeat_tx.try_send((packet, addr)).is_ok() {
+                    let count = msg_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count.is_multiple_of(100) {
+                        debug!(count, "heartbeats queued");
                     }
-                });
+                }
             }
             Err(e) => {
                 error!(error = %e, "recv_from error");
@@ -168,11 +195,23 @@ async fn main() -> Result<()> {
 
 /// 处理心跳消息
 async fn handle_heartbeat(data: &[u8], addr: SocketAddr, state: SharedState) -> Result<()> {
+    anyhow::ensure!(data.len() <= 4096, "heartbeat packet is too large");
     // 解析 JSON 消息
     let msg: HeartbeatMessage = serde_json::from_slice(data)?;
     let device_id = msg.device_id.clone();
     let device_type = msg.device_type.clone();
     let device_name = msg.device_name.clone();
+    anyhow::ensure!(
+        !device_id.is_empty()
+            && device_id.len() <= MAX_DEVICE_ID_BYTES
+            && device_type.len() <= MAX_DEVICE_TYPE_BYTES
+            && device_name.len() <= MAX_DEVICE_NAME_BYTES
+            && msg.transports.len() <= MAX_TRANSPORTS
+            && msg.transports.iter().all(|item| {
+                !item.is_empty() && item.len() <= MAX_TRANSPORT_BYTES && item.is_ascii()
+            }),
+        "heartbeat fields exceed bounds"
+    );
 
     let now = Instant::now();
     let device = OnlineDevice {
@@ -184,8 +223,25 @@ async fn handle_heartbeat(data: &[u8], addr: SocketAddr, state: SharedState) -> 
     // 更新设备状态
     {
         let mut s = state.write().await;
+        let rate = s.source_rates.entry(addr.ip()).or_insert((now, 0));
+        if now.duration_since(rate.0) >= SOURCE_RATE_WINDOW {
+            *rate = (now, 0);
+        }
+        rate.1 = rate.1.saturating_add(1);
+        anyhow::ensure!(
+            rate.1 <= SOURCE_RATE_LIMIT,
+            "heartbeat source rate exceeded"
+        );
         let is_new = !s.devices.contains_key(&device_id);
+        anyhow::ensure!(
+            !is_new || s.devices.len() < MAX_DEVICES,
+            "heartbeat device capacity exceeded"
+        );
         s.devices.insert(device_id.clone(), device);
+        if s.source_rates.len() > MAX_DEVICES {
+            s.source_rates
+                .retain(|_, (started, _)| now.duration_since(*started) < SOURCE_RATE_WINDOW);
+        }
 
         if is_new {
             info!(

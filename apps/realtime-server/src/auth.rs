@@ -148,7 +148,7 @@ impl Authenticator {
         {
             return Err(AuthError::ChallengeMismatch);
         }
-        register.verify_for(&self.server_device_id, now_ms, replay)?;
+        let metadata = register.verify_for_without_replay(&self.server_device_id, now_ms)?;
         let token = self
             .token_verifier
             .verify(&register.payload.backend_device_token, now_ms)
@@ -163,16 +163,10 @@ impl Authenticator {
         {
             return Err(AuthError::TokenBindingMismatch);
         }
-        Ok(AuthenticatedRegistration {
-            token,
-            metadata: VerifiedSignalMetadata {
-                issuer_device_id: claims.issuer_device_id.clone(),
-                issuer_key_id: claims.issuer_key_id.clone(),
-                intended_peer_device_id: claims.intended_peer_device_id.clone(),
-                counter: claims.counter,
-                nonce: claims.nonce,
-            },
-        })
+        // Replay state is committed only after the backend token and all
+        // signed identity bindings have been accepted.
+        replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        Ok(AuthenticatedRegistration { token, metadata })
     }
 
     pub fn remove_connection(&mut self, connection_id: ConnectionId) {

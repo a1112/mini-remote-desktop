@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Heartbeat message sent by a local device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HeartbeatMessage {
     /// Device identifier.
     pub device_id: String,

@@ -15,6 +15,10 @@ pub(super) async fn dispatch_request(server: &IpcServer, request: IpcRequest) ->
 
 impl IpcServer {
     async fn dispatch_request_inner(&self, request: IpcRequest) -> IpcResponse {
+        #[cfg(target_os = "macos")]
+        if let Some(response) = self.macos_sensitive_request_denial(&request) {
+            return response;
+        }
         #[cfg(windows)]
         if self.product_only {
             if let Some(denial) = self.product_request_denial(&request).await {
@@ -882,12 +886,44 @@ impl IpcServer {
             }
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn macos_sensitive_request_denial(&self, request: &IpcRequest) -> Option<IpcResponse> {
+        let pid = self.peer_pid?;
+        let trusted_pid = self
+            .ui_launcher
+            .lock()
+            .ok()
+            .and_then(|launcher| launcher.get_ui_pid().ok().flatten());
+        let matches_peer = |expected: u32| expected == pid;
+        match request {
+            IpcRequest::UiAttached { pid: requested, .. }
+            | IpcRequest::UiDetached { pid: requested, .. }
+                if !matches_peer(*requested) =>
+            {
+                Some(IpcResponse::Error {
+                    code: "E_UI_CALLER_DENIED".to_owned(),
+                    message: "UI lifecycle updates must come from the reported macOS UI process"
+                        .to_owned(),
+                })
+            }
+            IpcRequest::RespondToConsent { .. } if trusted_pid != Some(pid) => {
+                Some(IpcResponse::Error {
+                    code: "E_CONSENT_CALLER_DENIED".to_owned(),
+                    message: "Consent must be answered by the active macOS UI process".to_owned(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 fn management_request_is_allowed(request: &IpcRequest) -> bool {
     // Unix management shares the same owner-only private socket boundary as
-    // core IPC. Windows management admits any interactive user for lifecycle
-    // reads; credentialed device binding requires the verified product pipe.
+    // core IPC. The Windows management pipe is intentionally read-only: its
+    // ACL grants interactive users data rights, so enrollment/recovery,
+    // autostart, and shutdown mutations must go through the verified product
+    // pipe or an explicitly elevated service administrator endpoint.
     #[cfg(unix)]
     if matches!(
         request,
@@ -899,13 +935,9 @@ fn management_request_is_allowed(request: &IpcRequest) -> bool {
         request,
         IpcRequest::GetPublicServerStatus
             | IpcRequest::GetPublicDeviceBindingProtocol
-            | IpcRequest::EnrollPublicDevice { .. }
-            | IpcRequest::RecoverPublicDevice { .. }
             | IpcRequest::ServiceHealth
             | IpcRequest::GetShellStatus
-            | IpcRequest::SetAutostart { .. }
             | IpcRequest::GetAutostartStatus
-            | IpcRequest::ShutdownService { .. }
     )
 }
 

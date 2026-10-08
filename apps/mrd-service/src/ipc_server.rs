@@ -27,6 +27,8 @@ pub struct IpcServer {
     ui_launcher: UiLauncherPortRef,
     autostart: AutostartPortRef,
     management_only: bool,
+    #[cfg(target_os = "macos")]
+    peer_pid: Option<u32>,
     #[cfg(windows)]
     product_only: bool,
     #[cfg(windows)]
@@ -92,6 +94,8 @@ impl IpcServer {
             ui_launcher: crate::shell::default_ui_launcher(),
             autostart: crate::shell::default_autostart("mrd-service"),
             management_only: false,
+            #[cfg(target_os = "macos")]
+            peer_pid: None,
             #[cfg(windows)]
             product_only: false,
             #[cfg(windows)]
@@ -110,6 +114,8 @@ impl IpcServer {
             ui_launcher,
             autostart: crate::shell::default_autostart("mrd-service"),
             management_only: false,
+            #[cfg(target_os = "macos")]
+            peer_pid: None,
             #[cfg(windows)]
             product_only: false,
             #[cfg(windows)]
@@ -125,6 +131,13 @@ impl IpcServer {
     /// Get access to the app state (for testing/integration)
     pub fn app_state(&self) -> &Arc<AppState> {
         &self.app_state
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_peer_pid(&self, peer_pid: u32) -> Self {
+        let mut bound = self.clone();
+        bound.peer_pid = Some(peer_pid);
+        bound
     }
 }
 

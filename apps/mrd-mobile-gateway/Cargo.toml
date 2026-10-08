@@ -11,7 +11,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 mrd-mobile-gateway = { path = "../../crates/mrd-mobile-gateway" }
+rcgen = "0.13"
+rustls-pemfile = "2"
+sha2 = "0.10"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

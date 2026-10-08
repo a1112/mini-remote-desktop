@@ -22,7 +22,7 @@
   const send = value => { if(socket?.readyState===WebSocket.OPEN) socket.send(JSON.stringify(value)); };
   $('form').onsubmit = event => {
     event.preventDefault(); if(socket) socket.close(); clear(); status('正在连接…');
-    socket = new WebSocket(`ws://${location.host}/mobile/phone/control/ws`); socket.binaryType='blob';
+  socket = new WebSocket(`wss://${location.host}/mobile/phone/control/ws${location.search}`); socket.binaryType='blob';
     socket.onmessage = event => {
       if(typeof event.data === 'string') {
         let message; try {message=JSON.parse(event.data)} catch {return}

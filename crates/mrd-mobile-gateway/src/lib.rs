@@ -3,10 +3,10 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        ConnectInfo, State,
+        ConnectInfo, Query, State,
     },
     http::{
-        header::{HOST, ORIGIN, X_FRAME_OPTIONS},
+        header::{HeaderName, HOST, ORIGIN, X_FRAME_OPTIONS},
         uri::Authority,
         HeaderMap, StatusCode,
     },
@@ -45,6 +45,15 @@ struct MobileState {
     phone_frames: watch::Sender<Option<Bytes>>,
     phone_controls: broadcast::Sender<String>,
     phone_publisher_active: Arc<Mutex<bool>>,
+    pairing_token: Option<Arc<str>>,
+}
+
+const PAIRING_TOKEN_HEADER: &str = "x-mrd-pairing-token";
+const MIN_PAIRING_TOKEN_BYTES: usize = 32;
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct PairingQuery {
+    token: Option<String>,
 }
 
 #[cfg(windows)]
@@ -61,11 +70,12 @@ enum DesktopControl {
 }
 
 pub fn router_from_env() -> Router {
-    let enabled = env::var("MRD_MOBILE_GATEWAY_ENABLED").is_ok_and(|value| value == "1");
-    if !enabled {
-        return Router::new();
+    if env::var("MRD_MOBILE_GATEWAY_ENABLED").is_ok_and(|value| value == "1") {
+        tracing::warn!(
+            "ignoring MRD_MOBILE_GATEWAY_ENABLED on the cleartext web bridge; run the standalone TLS gateway instead"
+        );
     }
-    router()
+    Router::new()
 }
 
 pub fn router() -> Router {
@@ -75,7 +85,16 @@ pub fn router() -> Router {
         phone_frames,
         phone_controls,
         phone_publisher_active: Arc::new(Mutex::new(false)),
+        pairing_token: env::var("MRD_MOBILE_GATEWAY_PAIRING_TOKEN")
+            .ok()
+            .filter(|token| token.as_bytes().len() >= MIN_PAIRING_TOKEN_BYTES)
+            .map(Arc::<str>::from),
     };
+    if state.pairing_token.is_none() {
+        tracing::warn!(
+            "mobile gateway has no valid pairing token; all mobile requests will be rejected"
+        );
+    }
     info!("mobile gateway enabled on the web bridge listener");
     Router::new()
         .route("/mobile/desktop/ws", get(desktop_ws))
@@ -118,57 +137,110 @@ fn host_is_trusted(host: &str) -> bool {
     name.eq_ignore_ascii_case("localhost") || name.parse::<IpAddr>().is_ok_and(is_trusted_peer)
 }
 
-fn allowed_request(peer: SocketAddr, headers: &HeaderMap) -> bool {
+fn constant_time_token_eq(expected: &str, supplied: &str) -> bool {
+    let expected = expected.as_bytes();
+    let supplied = supplied.as_bytes();
+    let mut difference = expected.len() ^ supplied.len();
+    for index in 0..expected.len().max(supplied.len()) {
+        difference |= usize::from(
+            expected.get(index).copied().unwrap_or_default()
+                ^ supplied.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+fn allowed_request(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+    pairing_token: Option<&str>,
+) -> bool {
     let origin = headers
         .get(ORIGIN)
         .map(|value| value.to_str().unwrap_or(""));
     let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let header_token = headers
+        .get(HeaderName::from_static(PAIRING_TOKEN_HEADER))
+        .and_then(|value| value.to_str().ok());
+    let supplied_token = header_token.or(query_token);
     is_trusted_peer(peer.ip())
         && host.is_some_and(host_is_trusted)
         && origin_matches_host(origin, host)
+        && pairing_token.is_some_and(|expected| {
+            supplied_token.is_some_and(|supplied| constant_time_token_eq(expected, supplied))
+        })
 }
 
 async fn phone_page(
+    State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    allowed_request(peer, &headers)
-        .then_some((
-            [(X_FRAME_OPTIONS, "DENY")],
-            Html(include_str!("mobile_phone_page.html")),
-        ))
-        .ok_or(StatusCode::FORBIDDEN)
+    allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    )
+    .then_some((
+        [(X_FRAME_OPTIONS, "DENY")],
+        Html(include_str!("mobile_phone_page.html")),
+    ))
+    .ok_or(StatusCode::FORBIDDEN)
 }
 
 async fn desktop_ws(
+    State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    if !allowed_request(peer, &headers) {
+    if !allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(ws.on_upgrade(desktop_session))
 }
 
 async fn desktop_page(
+    State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    allowed_request(peer, &headers)
-        .then_some((
-            [(X_FRAME_OPTIONS, "DENY")],
-            Html(include_str!("desktop_video_page.html")),
-        ))
-        .ok_or(StatusCode::FORBIDDEN)
+    allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    )
+    .then_some((
+        [(X_FRAME_OPTIONS, "DENY")],
+        Html(include_str!("desktop_video_page.html")),
+    ))
+    .ok_or(StatusCode::FORBIDDEN)
 }
 
 async fn desktop_video_ws(
+    State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    if !allowed_request(peer, &headers) {
+    if !allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(ws.on_upgrade(|mut socket| async move {
@@ -190,9 +262,15 @@ async fn phone_publish_ws(
     State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    if !allowed_request(peer, &headers) {
+    if !allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(ws.on_upgrade(move |socket| phone_publish_session(socket, state)))
@@ -202,9 +280,15 @@ async fn phone_control_ws(
     State(state): State<MobileState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<PairingQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, StatusCode> {
-    if !allowed_request(peer, &headers) {
+    if !allowed_request(
+        peer,
+        &headers,
+        query.token.as_deref(),
+        state.pairing_token.as_deref(),
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(ws.on_upgrade(move |socket| phone_control_session(socket, state)))
@@ -562,8 +646,19 @@ pub fn validate_jpeg(bytes: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn discovery_reply(probe: &[u8], name: &str, port: u16) -> Option<String> {
-    if probe != b"MRD_DISCOVER_V1" || port == 0 {
+pub fn discovery_reply(
+    probe: &[u8],
+    name: &str,
+    port: u16,
+    certificate_fingerprint: &str,
+) -> Option<String> {
+    if probe != b"MRD_DISCOVER_V1"
+        || port == 0
+        || certificate_fingerprint.len() != 64
+        || !certificate_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
         return None;
     }
     let safe_name: String = name
@@ -572,7 +667,13 @@ pub fn discovery_reply(probe: &[u8], name: &str, port: u16) -> Option<String> {
         .take(48)
         .collect();
     Some(
-        serde_json::json!({ "type": "rdesk_gateway", "name": safe_name, "port": port }).to_string(),
+        serde_json::json!({
+            "type": "rdesk_gateway",
+            "name": safe_name,
+            "port": port,
+            "tls_sha256": certificate_fingerprint.to_ascii_lowercase(),
+        })
+        .to_string(),
     )
 }
 
@@ -615,12 +716,13 @@ mod tests {
 
     #[test]
     fn discovery_only_answers_expected_probe_without_secret() {
-        assert!(discovery_reply(b"MRD_DISCOVER_V1", "Office-PC", 9534).is_some());
-        assert!(discovery_reply(b"other", "Office-PC", 9534).is_none());
-        let reply = discovery_reply(b"MRD_DISCOVER_V1", "Office-PC", 9534).unwrap();
+        let fingerprint = "a".repeat(64);
+        assert!(discovery_reply(b"MRD_DISCOVER_V1", "Office-PC", 9534, &fingerprint).is_some());
+        assert!(discovery_reply(b"other", "Office-PC", 9534, &fingerprint).is_none());
+        let reply = discovery_reply(b"MRD_DISCOVER_V1", "Office-PC", 9534, &fingerprint).unwrap();
         assert!(reply.contains("Office-PC"));
         assert!(reply.contains("9534"));
-        assert!(!reply.contains("token"));
+        assert!(reply.contains("tls_sha256"));
     }
 
     #[test]

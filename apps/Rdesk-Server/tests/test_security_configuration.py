@@ -114,6 +114,7 @@ def _user() -> User:
         email="secure-admin@example.test",
         password_hash=hash_password("correct horse battery staple"),
         role="admin",
+        session_version=1,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
