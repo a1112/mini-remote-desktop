@@ -168,7 +168,20 @@ def _install_dependency_stubs() -> None:
         row_id=device.id, device_id=device.device_id,
         auth_version=getattr(device, "auth_version", 1),
         auth_revoked_at=getattr(device, "auth_revoked_at", None),
+        bound_user_id=device.bound_user_id,
+        is_bound=device.is_bound,
         tenant_id=device.tenant_id,
+    )
+    security.device_auth_snapshot_matches = lambda device, snapshot: (
+        device.id == snapshot.row_id
+        and device.device_id == snapshot.device_id
+        and device.auth_version == snapshot.auth_version
+        and device.bound_user_id == snapshot.bound_user_id
+        and device.is_bound == snapshot.is_bound
+        and device.tenant_id == snapshot.tenant_id
+        and device.auth_revoked_at == snapshot.auth_revoked_at
+        and snapshot.auth_revoked_at is None
+        and snapshot.is_bound
     )
     security.get_device_enrollment_token_optional = object()
     security.get_current_device = object()
