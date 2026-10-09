@@ -73,4 +73,4 @@ export const router = createBrowserRouter([
       { path: "run/:runId", Component: RunDetailPage },
     ],
   },
-]);
+], { basename: import.meta.env.BASE_URL });

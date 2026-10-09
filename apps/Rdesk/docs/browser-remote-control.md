@@ -19,6 +19,8 @@
 
 缺少 pin、目标离线或身份无法验证时，API 返回明确错误，不使用首次连接信任、不导出机器 Device token、不从本机预览冒充远端画面。
 
+网页部署在子路径时，构建需传入相同的 Vite base，例如 `VITE_RDESK_SERVER_URL=https://175.178.16.90/rdesk/api/v1 pnpm build --base /apps/rdesk/`。路由使用构建的 `BASE_URL`，静态服务器需将该前缀下的页面请求回退至同一 `index.html`，并直接提供资源文件；原生客户端和根路径开发保持默认 `/`。
+
 ## 浏览器链路
 
 `POST /api/v1/browser-sessions` 使用当前用户 JWT、临时公钥、目标及请求权限创建有人值守会话。浏览器身份最多持续十分钟，只能作为 Controller 操作本次 session/target；物理设备接口不接受这种身份。
