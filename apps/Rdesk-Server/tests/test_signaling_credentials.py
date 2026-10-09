@@ -38,6 +38,8 @@ def client(monkeypatch):
 
     class Database:
         async def scalar(self, statement):
+            if "device_machine_identities" in str(statement):
+                return None  # Legacy devices have no pinned machine mapping.
             return device
 
     async def database():

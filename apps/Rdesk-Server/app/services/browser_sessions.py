@@ -14,6 +14,7 @@ from app.schemas.session import DeviceSessionCreateIn
 from app.services.browser_authority import browser_authority_valid
 from app.services.device_sessions import DeviceSessionError, DeviceSessionService
 from app.services.session_grants import session_grant_identity_lock
+from app.services.device_principal_keys import key_is_physical_machine, principal_key_lock
 
 
 BROWSER_LIFETIME_SECONDS = 600
@@ -39,7 +40,10 @@ class BrowserSessionService:
 
     async def create(self, *, user, user_version, payload: BrowserSessionCreateIn):
         user_role, user_tenant = user.role, user.tenant_id
-        async with session_grant_identity_lock(self.db, "browser:" + payload.session_id):
+        key_id = hashlib.sha256(bytes(payload.controller_public_key)).hexdigest()
+        async with principal_key_lock(self.db, key_id), session_grant_identity_lock(self.db, "browser:" + payload.session_id):
+            if await key_is_physical_machine(self.db, key_id):
+                self.conflict()
             owner = await self.db.scalar(select(User).where(User.id == user.id)
                                          .execution_options(populate_existing=True))
             if (owner is None or owner.session_version != user_version
@@ -84,7 +88,7 @@ class BrowserSessionService:
                     user_id=owner.id, tenant_id=owner.tenant_id, user_session_version=user_version,
                     target_device_row_id=row.target_device_id,
                     public_key=bytes(payload.controller_public_key),
-                    key_id=hashlib.sha256(bytes(payload.controller_public_key)).hexdigest(),
+                    key_id=key_id,
                     allowed_scopes=list(payload.requested_scopes), created_at=now,
                     expires_at=now + timedelta(seconds=BROWSER_LIFETIME_SECONDS))
                 self.db.add(principal)

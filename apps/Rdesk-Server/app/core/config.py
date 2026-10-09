@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     device_enrollment_token_pepper: SecretStr = SecretStr("")
     device_serial_pepper: SecretStr = SecretStr("")
     device_enrollment_ttl_seconds: int = 300
+    device_self_enrollment_enabled: bool = False
+    device_self_enrollment_ttl_seconds: int = Field(default=60, ge=10, le=120)
+    device_self_enrollment_global_per_minute: int = Field(default=1000, ge=1, le=5000)
+    device_self_enrollment_ip_per_minute: int = Field(default=30, ge=1, le=500)
+    device_self_enrollment_key_per_minute: int = Field(default=5, ge=1, le=30)
+    # Only these socket peers may supply one validated X-Real-IP value.
+    device_self_enrollment_trusted_proxies: str = ""
     password_pbkdf2_iterations: int = 600_000
     bootstrap_admin_enabled: bool = False
     bootstrap_admin_username: str = ""

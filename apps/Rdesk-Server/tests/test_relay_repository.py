@@ -5,6 +5,7 @@ import hmac
 import base64
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -1235,13 +1236,52 @@ def test_model_repr_does_not_expose_credential_fields() -> None:
     assert "password" not in repr(reservation).lower()
 
 
-def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap() -> None:
-    main_source = (
-        Path(__file__).parents[1] / "app" / "main.py"
-    ).read_text(encoding="utf-8")
-    migration_call = "await migrate_relay_control(conn)"
-    legacy_bootstrap = "await conn.run_sync(Base.metadata.create_all)"
-    assert migration_call in main_source
-    assert legacy_bootstrap in main_source
-    assert main_source.index(migration_call) < main_source.index(legacy_bootstrap)
-    assert "legacy/dev bootstrap" in main_source
+@pytest.mark.asyncio
+async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(monkeypatch) -> None:
+    from app import main
+    from app.db.migrate_add_device_self_enrollment import SELF_ENROLLMENT_TABLES
+
+    calls = []
+    bootstrapped = []
+
+    class Connection:
+        async def run_sync(self, operation):
+            return operation(self)
+
+    @asynccontextmanager
+    async def connection_scope():
+        yield Connection()
+
+    @asynccontextmanager
+    async def session_scope():
+        yield object()
+
+    class Engine:
+        begin = staticmethod(connection_scope)
+
+    def migration(label):
+        async def step(connection, **kwargs):
+            calls.append(label)
+        return step
+
+    def metadata(connection, *, tables):
+        calls.append("legacy_metadata")
+        bootstrapped.extend(table.name for table in tables)
+
+    monkeypatch.setattr(main, "engine", Engine())
+    monkeypatch.setattr(main, "AsyncSessionLocal", session_scope)
+    monkeypatch.setattr(main.Base.metadata, "create_all", metadata)
+    for name, label in (
+        ("migrate_relay_control", "relay_control"),
+        ("migrate_relay_access", "relay_access"),
+        ("migrate_relay_redundancy", "relay_redundancy"),
+        ("migrate_browser_controllers", "browser_controllers"),
+        ("migrate_device_self_enrollment", "device_self_enrollment"),
+        ("seed_initial_data", "seed"),
+    ):
+        monkeypatch.setattr(main, name, migration(label))
+    async with main.lifespan(main.app):
+        pass
+    assert calls == ["relay_control", "legacy_metadata", "relay_access", "relay_redundancy", "browser_controllers", "device_self_enrollment", "seed"]
+    assert "devices" in bootstrapped
+    assert not SELF_ENROLLMENT_TABLES.intersection(bootstrapped)

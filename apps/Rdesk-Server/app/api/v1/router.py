@@ -4,6 +4,7 @@ from app.api.v1 import (
     auth,
     browser_sessions,
     device_sessions,
+    device_self_enrollment,
     devices,
     network_groups,
     public,
@@ -19,6 +20,7 @@ api_router.include_router(auth.router)
 api_router.include_router(browser_sessions.router)
 api_router.include_router(device_sessions.router)
 api_router.include_router(devices.router)
+api_router.include_router(device_self_enrollment.router)
 api_router.include_router(network_groups.router)
 api_router.include_router(public.router)
 api_router.include_router(realtime.router)

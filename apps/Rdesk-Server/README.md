@@ -67,3 +67,27 @@ these tests on Linux, Windows, and macOS.
 - `POST /api/v1/sessions/request`
 - Relay enrollment, heartbeat, directory, access, and migration endpoints under
   `/api/v1/relays`
+
+## Automatic first-start device codes
+
+Set `RDESK_DEVICE_SELF_ENROLLMENT_ENABLED=true` to permit first-start allocation.
+The resident proves its persistent Ed25519 machine key through the version 1
+`POST /api/v1/devices/self-enrollment-challenge` and
+`POST /api/v1/devices/self-register` protocol. Challenges expire after 60 seconds,
+are consumed once, and are limited across workers by the shared PostgreSQL
+transaction lock and global/IP/key budgets. Only explicitly trusted socket
+proxies may supply a single `X-Real-IP`; configure the proxy to replace inbound
+values and bound request bodies.
+
+New codes have no account owner and grant no screen permission. Fresh proof of
+the same key returns the stored code after a restart or loss of the registration
+file. A revoked device stays revoked, and a motherboard serial cannot recover
+or replace an existing device. Administrator OTP registration and legacy
+authenticated refresh remain available. The independent versioned migration
+creates and verifies the two new tables without altering existing Device columns
+or the public connection bootstrap. Back up PostgreSQL before deploying.
+
+Self-enrolled devices can receive signaling credentials only for their pinned
+key; the existing signed WebSocket challenge then proves its private key.
+Ordinary HTTP device tokens remain bearer credentials protected by resident
+storage. This feature does not claim proof-of-possession for every HTTP route.
