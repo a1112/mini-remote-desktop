@@ -54,6 +54,7 @@ impl realtime_server::BackendTokenVerifier for ExchangedTokenVerifier {
             device_key_id: self.key_id.clone(),
             role: BackendRole::Agent,
             expires_at_ms: now_ms + 60_000,
+            browser: None,
         })
     }
 }

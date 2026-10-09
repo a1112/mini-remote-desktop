@@ -61,7 +61,7 @@ pub(crate) async fn metadata(
     response(
         client
             .get(endpoint)
-            .header(reqwest::header::AUTHORIZATION, bearer(token)?)
+            .header("X-Rdesk-Device-Authorization", bearer(token)?)
             .send()
             .await
             .map_err(|_| "temporary_http_unavailable")?,
@@ -77,7 +77,7 @@ pub(crate) async fn publish(
     response(
         client
             .post(endpoint)
-            .header(reqwest::header::AUTHORIZATION, bearer(token)?)
+            .header("X-Rdesk-Device-Authorization", bearer(token)?)
             .json(proof)
             .send()
             .await
@@ -90,15 +90,95 @@ pub(crate) async fn publish(
 mod tests {
     use super::*;
     use axum::{
-        routing::{get, post},
         Json, Router,
+        http::{HeaderMap, StatusCode},
+        routing::{get, post},
     };
+
+    // Mirrors get_current_device -> _device_from_request: physical credentials
+    // belong to X-Rdesk-Device-Authorization, not the user Authorization header.
+    async fn device_authenticated_status(
+        headers: HeaderMap,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        if headers.contains_key(reqwest::header::AUTHORIZATION)
+            || headers
+                .get_all("x-rdesk-device-authorization")
+                .iter()
+                .count()
+                != 1
+            || headers
+                .get("x-rdesk-device-authorization")
+                .is_none_or(|value| value != "Bearer synthetic-device-token")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(Json(serde_json::json!({
+            "enabled": true, "ready": true, "generation": 5,
+            "expires_at_ms": 600000, "reason": null
+        })))
+    }
+
+    async fn device_auth_server() -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new().route(
+            "/temporary",
+            get(device_authenticated_status).post(device_authenticated_status),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/temporary", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn temporary_metadata_uses_physical_device_authorization() {
+        let (endpoint, server) = device_auth_server().await;
+        let client = client().unwrap();
+        let wrong = client
+            .get(&endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                "Bearer synthetic-device-token",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let result = metadata(&client, &endpoint, "synthetic-device-token").await;
+        server.abort();
+        assert_eq!(result.unwrap().generation, 5);
+    }
+
+    #[tokio::test]
+    async fn temporary_publication_uses_physical_device_authorization() {
+        let (endpoint, server) = device_auth_server().await;
+        let client = client().unwrap();
+        let wrong = client
+            .post(&endpoint)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                "Bearer synthetic-device-token",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let proof = TemporaryPublicationProof {
+            key_id: "fixture-key".into(),
+            public_key: "public-key".into(),
+            access_json: "{}".into(),
+            signature: "signature".into(),
+        };
+        let result = publish(&client, &endpoint, "synthetic-device-token", &proof).await;
+        server.abort();
+        assert_eq!(result.unwrap().generation, 5);
+    }
     #[tokio::test]
     async fn real_http_publication_and_metadata_are_bounded_and_do_not_redirect() {
         let router=Router::new()
             .route("/temporary",get(||async{Json(serde_json::json!({"enabled":false,"ready":false,"generation":4,"expires_at_ms":null,"reason":"disabled"}))})
                 .post(|headers:axum::http::HeaderMap,Json(body):Json<serde_json::Value>|async move {
-                    assert_eq!(headers[reqwest::header::AUTHORIZATION],"Bearer synthetic-device-token");
+                    assert_eq!(headers["x-rdesk-device-authorization"],"Bearer synthetic-device-token");
+                    assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
                     assert_eq!(body["key_id"],"fixture-key");
                     Json(serde_json::json!({"enabled":true,"ready":true,"generation":5,"expires_at_ms":600000,"reason":null}))
                 }))
