@@ -2,12 +2,13 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-import hashlib, hmac, ipaddress, json, struct
+import hashlib, hmac, ipaddress, json, sqlite3, struct
 from urllib.parse import urlsplit
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 from app.models.device import Device
 from app.models.browser_controller import BrowserController
 from app.models.device_machine_identity import DeviceMachineIdentity
@@ -17,6 +18,7 @@ from app.models.relay_reservation import RelayReservation
 from app.schemas.guest_browser import TemporaryAccessDocument, TemporaryAccessStatus
 from app.services.device_enrollment import _serial_lock
 from app.services.device_sessions import DeviceSessionError
+from app.services.device_principal_keys import key_is_browser_controller, principal_key_lock
 from app.services.browser_authority import utc
 from app.services.device_self_enrollment import (
     _unique_json_object,
@@ -69,6 +71,27 @@ def invalid():
     )
 
 
+def _machine_identity_conflict(error):
+    """Only immutable machine-key unique violations are expected conflicts."""
+    original = error.orig
+    state = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if state == "23505":
+        for details in (original, original.__cause__, getattr(original, "diag", None)):
+            if getattr(details, "constraint_name", None) in {
+                "device_machine_identities_pkey",
+                "device_machine_identities_device_row_id_key",
+            }:
+                return True
+    elif getattr(original, "sqlite_errorcode", None) in {
+        sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT_UNIQUE
+    }:
+        return str(original) in {
+            "UNIQUE constraint failed: device_machine_identities.key_id",
+            "UNIQUE constraint failed: device_machine_identities.device_row_id",
+        }
+    return False
+
+
 class TemporaryAccessService:
     def __init__(self, db, *, api_url, pepper, now=None):
         url = urlsplit(api_url)
@@ -114,6 +137,19 @@ class TemporaryAccessService:
             )
         except (ValueError, InvalidSignature, ValidationError):
             invalid()
+        # Shared with browser registration and self-enrollment. PostgreSQL holds
+        # this advisory lock until the caller commits or rolls back.
+        async with principal_key_lock(self.db, payload.key_id):
+            if await key_is_browser_controller(self.db, payload.key_id):
+                invalid()
+            try:
+                return await self._publish_locked(snapshot, payload, document)
+            except IntegrityError as error:
+                if _machine_identity_conflict(error):
+                    invalid()
+                raise
+
+    async def _publish_locked(self, snapshot, payload, document):
         device = await self.db.scalar(
             select(Device)
             .where(Device.id == snapshot.row_id)
@@ -128,11 +164,33 @@ class TemporaryAccessService:
         if (
             device is None
             or not snapshot_matches(device, snapshot)
-            or mapping is None
-            or mapping.key_id != payload.key_id
-            or mapping.public_key != payload.public_key
             or document.device_id != device.device_id
             or document.auth_version != device.auth_version
+        ):
+            invalid()
+        row = await self.db.scalar(
+            select(DeviceTemporaryAccess)
+            .where(DeviceTemporaryAccess.device_row_id == device.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        # Mapping reads deliberately do not acquire another row lock: existing
+        # self-enrollment locks its mapping before its physical device row.
+        key_mapping = await self.db.scalar(
+            select(DeviceMachineIdentity)
+            .where(DeviceMachineIdentity.key_id == payload.key_id)
+            .execution_options(populate_existing=True)
+        )
+        if mapping is None:
+            # A missing pin alongside published state is corruption, not a
+            # legacy device. A disable document carries no freshness proof.
+            if row is not None or not document.enabled or key_mapping is not None:
+                invalid()
+        elif (
+            mapping.key_id != payload.key_id
+            or mapping.public_key != payload.public_key
+            or key_mapping is None
+            or key_mapping.device_row_id != device.id
         ):
             invalid()
         now = utc(self.now())
@@ -143,12 +201,6 @@ class TemporaryAccessService:
             datetime.fromtimestamp(document.expires_at_ms / 1000, UTC)
             if document.enabled
             else None
-        )
-        row = await self.db.scalar(
-            select(DeviceTemporaryAccess)
-            .where(DeviceTemporaryAccess.device_row_id == device.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
         )
         # An unkeyed digest of verifier-bearing JSON would itself be an offline
         # password oracle, bypassing verifier_hmac after a database-only leak.
@@ -164,6 +216,36 @@ class TemporaryAccessService:
             ):
                 return self.status(row, device)
             invalid()
+        affected = list(
+            await self.db.scalars(
+                select(SessionRequest)
+                .where(
+                    SessionRequest.target_device_id == device.id,
+                    SessionRequest.authority_kind == "temporary_password",
+                    SessionRequest.status.in_(
+                        ["requested", "approved"]
+                        if not document.enabled
+                        else ["requested"]
+                    ),
+                )
+                .order_by(SessionRequest.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        # Session row locks may have waited too. Check freshness immediately
+        # before the durable first pin and all publication writes.
+        now = utc(self.now())
+        now_ms = int(now.timestamp() * 1000)
+        if document.enabled and not now_ms < document.expires_at_ms <= now_ms + 600_000:
+            invalid()
+        if mapping is None:
+            self.db.add(DeviceMachineIdentity(
+                key_id=payload.key_id,
+                public_key=payload.public_key,
+                device_row_id=device.id,
+                created_at=now,
+            ))
         values = dict(
             generation=document.generation,
             target_auth_version=device.auth_version,
@@ -186,23 +268,6 @@ class TemporaryAccessService:
         else:
             for key, value in values.items():
                 setattr(row, key, value)
-        affected = list(
-            await self.db.scalars(
-                select(SessionRequest)
-                .where(
-                    SessionRequest.target_device_id == device.id,
-                    SessionRequest.authority_kind == "temporary_password",
-                    SessionRequest.status.in_(
-                        ["requested", "approved"]
-                        if not document.enabled
-                        else ["requested"]
-                    ),
-                )
-                .order_by(SessionRequest.id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
         for grant in affected:
             grant.status = "revoked"
             if grant.grant_expires_at is not None:
