@@ -152,6 +152,17 @@ impl ServerSigningCounter {
     }
 }
 
+impl Drop for ServerSigningCounter {
+    fn drop(&mut self) {
+        if let Self::Persistent { file, .. } = self {
+            // A forked child can retain this open file description until exec.
+            // Closing only our descriptor would leave its flock held past
+            // shutdown; relinquish ownership before File's destructor runs.
+            let _ = file.unlock();
+        }
+    }
+}
+
 fn load_pkcs8(bytes: &[u8]) -> Result<DeviceIdentity, PersistentIdentityError> {
     if let Ok(identity) = DeviceIdentity::from_pkcs8(bytes) {
         return Ok(identity);
@@ -332,6 +343,120 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&counter).unwrap()).unwrap();
         assert_eq!(stored.reserved_through, COUNTER_BLOCK);
         assert!(PersistentServerState::from_files(&key, &counter).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn counter_releases_its_lock_while_forked_child_retains_the_descriptor() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        fn pipe() -> [OwnedFd; 2] {
+            let mut descriptors = [-1; 2];
+            // SAFETY: pipe2 initializes the two writable descriptor slots.
+            assert_eq!(
+                unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            // SAFETY: each successful pipe descriptor is transferred once.
+            descriptors.map(|descriptor| unsafe { OwnedFd::from_raw_fd(descriptor) })
+        }
+
+        struct ForkedDescriptorHolder {
+            pid: libc::pid_t,
+            release: OwnedFd,
+        }
+
+        impl Drop for ForkedDescriptorHolder {
+            fn drop(&mut self) {
+                let signal = [1_u8];
+                // SAFETY: release is owned and signal contains one readable byte.
+                unsafe { libc::write(self.release.as_raw_fd(), signal.as_ptr().cast(), 1) };
+                let mut status = 0;
+                loop {
+                    // SAFETY: pid is this test's child and status is writable.
+                    let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                    if result >= 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (_directory, key, counter, key_id) = fixture();
+        let mut owner = PersistentServerState::from_files(&key, &counter).unwrap();
+        assert_eq!(owner.counter.next().unwrap(), 1);
+        let [ready_read, ready_write] = pipe();
+        let [release_read, release_write] = pipe();
+        // The child deliberately does not exec, so O_CLOEXEC cannot release the
+        // counter descriptor it inherits from the live owner.
+        // SAFETY: after fork the child uses only async-signal-safe libc calls
+        // and _exit; it neither allocates nor runs inherited Rust destructors.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe {
+                libc::close(ready_read.as_raw_fd());
+                libc::close(release_write.as_raw_fd());
+                let signal = [1_u8];
+                if libc::write(ready_write.as_raw_fd(), signal.as_ptr().cast(), 1) != 1 {
+                    libc::_exit(1);
+                }
+                let mut release_poll = libc::pollfd {
+                    fd: release_read.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let mut release_signal = [0_u8];
+                if libc::poll(&mut release_poll, 1, 30_000) != 1
+                    || libc::read(
+                        release_read.as_raw_fd(),
+                        release_signal.as_mut_ptr().cast(),
+                        1,
+                    ) != 1
+                {
+                    libc::_exit(2);
+                }
+                libc::_exit(0);
+            }
+        }
+        let child = ForkedDescriptorHolder {
+            pid,
+            release: release_write,
+        };
+        drop(ready_write);
+        drop(release_read);
+        let mut ready_poll = libc::pollfd {
+            fd: ready_read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the poll descriptor and subsequent one-byte buffer are valid.
+        assert_eq!(unsafe { libc::poll(&mut ready_poll, 1, 5_000) }, 1);
+        let mut ready_signal = [0_u8];
+        assert_eq!(
+            unsafe { libc::read(ready_read.as_raw_fd(), ready_signal.as_mut_ptr().cast(), 1) },
+            1
+        );
+        assert!(matches!(
+            PersistentServerState::from_files(&key, &counter),
+            Err(PersistentIdentityError::AlreadyLocked)
+        ));
+        drop(owner);
+        let mut restarted = PersistentServerState::from_files(&key, &counter)
+            .expect("shutdown must unlock the counter while a forked child retains its descriptor");
+        assert_eq!(restarted.identity.key_id(), key_id);
+        assert_eq!(restarted.counter.next().unwrap(), COUNTER_BLOCK + 1);
+        assert!(matches!(
+            PersistentServerState::from_files(&key, &counter),
+            Err(PersistentIdentityError::AlreadyLocked)
+        ));
+        let mut status = 0;
+        // SAFETY: WNOHANG checks that this test's child still holds its descriptor.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, 0);
+        drop(restarted);
+        drop(child);
     }
 
     #[test]
