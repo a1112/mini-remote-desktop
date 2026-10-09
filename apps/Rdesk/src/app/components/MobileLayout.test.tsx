@@ -8,7 +8,9 @@ const mocks = vi.hoisted(() => ({
   launch: vi.fn(),
   history: [] as Array<{ sessionId: string; peerDeviceId: string; role: "controller"; startedAt: number; endedAt: number | null }>,
   devices: [] as Array<Record<string, unknown>>,
+  native: true,
 }));
+vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => mocks.native }));
 
 vi.mock("./ThemeContext", () => ({ useTheme: () => ({ isDark: true, theme: "dark", setTheme: vi.fn() }) }));
 vi.mock("./AuthContext", () => ({ useAuth: () => ({ isLoggedIn: false, user: null, logout: vi.fn() }) }));
@@ -28,6 +30,7 @@ function renderMobile(path = "/") {
 describe("mobile pages", () => {
   beforeEach(() => {
     mocks.history = [];
+    mocks.native = true;
     mocks.devices = [];
     mocks.launch.mockReset().mockResolvedValue({ sessionId: "real-session", mode: "route" });
   });
@@ -42,6 +45,17 @@ describe("mobile pages", () => {
     expect(screen.getByText("暂无已发现设备")).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "记录" }));
     expect(screen.getByText("暂无连接记录")).toBeInTheDocument();
+  });
+
+  it('shows zero-install browser controller mode and navigates to its dedicated session page', async () => {
+    mocks.native = false;
+    mocks.launch.mockResolvedValue({ sessionId: 'browser-session', mode: 'route', routePath: '/browser-session/browser-session' });
+    render(<MemoryRouter><Routes><Route path="/browser-session/:id" element={<div>网页会话已打开</div>} /><Route path="*" element={<MobileLayout onOpenAuth={vi.fn()} />} /></Routes></MemoryRouter>);
+    expect(screen.getByText('网页控制端')).toBeInTheDocument();
+    expect(screen.queryByText('123 456 789')).not.toBeInTheDocument();
+    await userEvent.type(screen.getByPlaceholderText('输入 10 位设备码'), '0123456789');
+    await userEvent.click(screen.getByRole('button', { name: '发起连接' }));
+    expect(await screen.findByText('网页会话已打开')).toBeInTheDocument();
   });
 
   it("starts an authenticated session for the entered device ID", async () => {

@@ -5,6 +5,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 _SENSITIVE_PATH_PREFIXES = (
     "/api/v1/auth",
+    "/api/v1/browser-sessions",
     "/api/v1/device-sessions",
     "/api/v1/devices",
     "/api/v1/relays",

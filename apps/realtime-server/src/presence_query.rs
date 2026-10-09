@@ -1,5 +1,6 @@
 use axum::http::{header::AUTHORIZATION, HeaderMap};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use mrd_proto::BackendRole;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -96,6 +97,20 @@ pub(crate) struct DevicePresenceSnapshot {
     pub device_id: String,
     pub online: bool,
     pub last_seen_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct IdentitySnapshot {
+    pub version: u8,
+    pub sampled_at_ms: u64,
+    pub identities: Vec<RegisteredIdentitySnapshot>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RegisteredIdentitySnapshot {
+    pub device_id: String,
+    pub device_key_id: String,
+    pub role: BackendRole,
 }
 
 #[cfg(test)]

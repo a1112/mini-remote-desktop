@@ -25,6 +25,7 @@ required-features = ["diagnostic-probes"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+mrd-process = { path = "../../../crates/mrd-process" }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 base64 = "0.22"

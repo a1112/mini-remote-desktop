@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Networks, Pid, System};
 
@@ -396,7 +395,7 @@ fn run_nvidia_smi(nvidia_smi_available: &mut Option<bool>, args: &[&str]) -> Opt
     let mut saw_executable = false;
 
     for executable in nvidia_smi_candidates() {
-        match Command::new(executable).args(args).output() {
+        match mrd_process::background_command(executable).args(args).output() {
             Ok(output) if output.status.success() => {
                 *nvidia_smi_available = Some(true);
                 return String::from_utf8(output.stdout).ok();

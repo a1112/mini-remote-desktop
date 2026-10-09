@@ -244,8 +244,17 @@ impl H264AccessUnitAssembler {
             return None;
         }
 
-        if end || marker {
+        if marker && !end {
+            // An RTP access-unit marker cannot repair a truncated FU-A NAL.
+            self.reset();
+            return None;
+        }
+        if end {
             self.fua_active = false;
+        }
+        // FU-A end completes one NAL. A multi-slice picture may contain
+        // additional NALs; only the RTP marker completes the access unit.
+        if marker {
             return self.take_access_unit();
         }
 
@@ -1636,6 +1645,53 @@ mod tests {
         assert_eq!(
             assembler.push_rtp_payload(&[0x7c, 0x45, 0xcc, 0xdd], true),
             Some(vec![0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd])
+        );
+    }
+
+    #[test]
+    fn fua_nal_end_preserves_multiple_slices_until_access_unit_marker() {
+        let mut assembler = H264AccessUnitAssembler::default();
+        assert_eq!(
+            assembler.push_rtp_packet(&[24, 0, 2, 0x67, 0x42, 0, 2, 0x68, 0xce], false, 1),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x85, 0xaa], false, 2),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x45, 0xbb], false, 3),
+            None,
+            "FU-A end completes a NAL, not the multi-slice access unit"
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x85, 0xcc], false, 4),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x45, 0xdd], true, 5),
+            Some(vec![
+                0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68, 0xce, 0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0, 0,
+                0, 1, 0x65, 0xcc, 0xdd,
+            ])
+        );
+    }
+
+    #[test]
+    fn fua_access_unit_marker_without_nal_end_rejects_damage_and_recovers() {
+        let mut assembler = H264AccessUnitAssembler::default();
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x85, 0xaa], false, 1),
+            None
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x7c, 0x05, 0xbb], true, 2),
+            None,
+            "a marker cannot complete an unfinished FU-A NAL"
+        );
+        assert_eq!(
+            assembler.push_rtp_packet(&[0x65, 0xcc], true, 3),
+            Some(vec![0, 0, 0, 1, 0x65, 0xcc])
         );
     }
 

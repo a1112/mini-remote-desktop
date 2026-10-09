@@ -2,6 +2,7 @@ use mrd_signal_proto::{SignalEnvelope, SignalMessage, SignalProtocolError};
 use thiserror::Error;
 
 mod issued_time;
+mod strict_value;
 pub use issued_time::{wait_until_message_issued, MAX_FUTURE_MESSAGE_WAIT_MS};
 
 #[derive(Debug, Error)]
@@ -41,7 +42,9 @@ pub fn decode_authenticated_message(raw: &str) -> Result<SignalEnvelope, SignalC
     if raw.len() > MAX_SIGNAL_MESSAGE_BYTES {
         return Err(SignalClientError::MessageTooLarge);
     }
-    let value: serde_json::Value = serde_json::from_str(raw)?;
+    // Read generic JSON before the version gate, without collapsing duplicate
+    // keys or deserializing a private authenticated payload prematurely.
+    let value = serde_json::from_str::<strict_value::StrictValue>(raw)?.0;
     if let (Some(version), Some(message_type)) = (
         value.get("version").and_then(serde_json::Value::as_u64),
         value
@@ -170,5 +173,122 @@ mod tests {
         ));
         let encoded = encode_authenticated_message(&envelope).unwrap();
         assert_eq!(decode_authenticated_message(&encoded).unwrap(), envelope);
+    }
+
+    fn signed_register_wire() -> String {
+        use mrd_identity::DeviceIdentity;
+        use mrd_signal_proto::{
+            AuthClaims, AuthenticatedRegister, AuthenticatedSignalMessage, RegisterPayload,
+            SignalEnvelope,
+        };
+        let identity = DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
+        let signed = AuthenticatedRegister::sign(
+            &identity,
+            RegisterPayload {
+                claims: AuthClaims {
+                    issuer_device_id: DeviceId("controller-1".into()),
+                    issuer_key_id: identity.key_id().into(),
+                    intended_peer_device_id: DeviceId("signal-server".into()),
+                    issued_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                    counter: 1,
+                    nonce: [1; 16],
+                },
+                role: BackendRole::Controller,
+                device_name: "Rdesk".into(),
+                backend_device_token: "test-credential".into(),
+                challenge_id: [7; 16],
+                challenge_nonce: [8; 32],
+            },
+        )
+        .unwrap();
+        encode_authenticated_message(&SignalEnvelope::new(AuthenticatedSignalMessage::Register(
+            signed,
+        )))
+        .unwrap()
+    }
+
+    #[test]
+    fn authenticated_decode_rejects_duplicate_keys_at_every_envelope_depth() {
+        let raw = signed_register_wire();
+        assert!(decode_authenticated_message(&raw).is_ok());
+        for (name, altered) in [
+            (
+                "version",
+                raw.replacen(r#""version":2"#, r#""version":999,"version":2"#, 1),
+            ),
+            (
+                "escaped version alias",
+                raw.replacen(r#""version":2"#, r#""\u0076ersion":999,"version":2"#, 1),
+            ),
+            (
+                "message type",
+                raw.replacen(
+                    r#""type":"register""#,
+                    r#""type":"other","type":"register""#,
+                    1,
+                ),
+            ),
+            (
+                "signed signal",
+                raw.replacen(
+                    r#""signer_public_key":"#,
+                    r#""signer_public_key":[],"signer_public_key":"#,
+                    1,
+                ),
+            ),
+            (
+                "payload",
+                raw.replacen(
+                    r#""device_name":"Rdesk""#,
+                    r#""device_name":"other","device_name":"Rdesk""#,
+                    1,
+                ),
+            ),
+            (
+                "claims",
+                raw.replacen(r#""counter":1"#, r#""counter":999,"counter":1"#, 1),
+            ),
+            (
+                "whole message",
+                raw.replacen(r#""message":"#, r#""message":{},"message":"#, 1),
+            ),
+        ] {
+            assert_ne!(altered, raw, "mutation did not apply: {name}");
+            assert!(
+                decode_authenticated_message(&altered).is_err(),
+                "accepted ambiguous {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_decode_rejects_unknown_message_enum_fields() {
+        let raw = signed_register_wire();
+        let altered = raw.replacen(
+            r#""type":"register""#,
+            r#""unknown":true,"type":"register""#,
+            1,
+        );
+        assert_ne!(altered, raw);
+        assert!(decode_authenticated_message(&altered).is_err());
+    }
+
+    #[test]
+    fn authenticated_decode_keeps_version_precheck_before_sensitive_payload_deserialization() {
+        use mrd_signal_proto::SignalProtocolError;
+        for raw in [
+            r#"{"version":999,"message":{"type":"register","payload":{"backend_device_token":{"sensitive":"not-a-string"}}}}"#,
+            r#"{"version":4,"message":{"type":"session_intent_v3","payload":{"claims":"not-a-claims-object"}}}"#,
+            r#"{"version":3,"message":{"type":"protocol_error","payload":{"reason":"not-a-valid-reason"}}}"#,
+            r#"{"version":2,"message":{"type":"session_intent","payload":{"claims":"legacy-no-longer-accepted"}}}"#,
+        ] {
+            assert!(matches!(
+                decode_authenticated_message(raw),
+                Err(SignalClientError::Protocol(
+                    SignalProtocolError::UnsupportedVersion
+                ))
+            ));
+        }
     }
 }

@@ -510,6 +510,8 @@ async def _device_from_request(
     device = await db.scalar(select(Device).where(Device.id == device_row_id))
     if (
         device is None
+        or getattr(device, "principal_kind", "physical") == "browser_controller"
+        or device.device_id.startswith("browser_")
         or device.device_id != device_id
         or device.auth_version != auth_version
         or device.auth_revoked_at is not None

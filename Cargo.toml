@@ -27,6 +27,7 @@ members = [
   "crates/mrd-observability",
   "crates/mrd-application",
   "crates/mrd-pipeline-core",
+  "crates/mrd-process",
   "crates/mrd-proto",
   "crates/mrd-render",
   "crates/mrd-render-d3d11",

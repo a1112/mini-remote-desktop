@@ -1482,6 +1482,17 @@ def _verify(connection: object, schema: str | None) -> None:
     # The independently versioned redundancy migration runs after this one.
     # On subsequent startup its exact owned constraint must join the closed
     # allowlist; unrelated or drifted checks remain rejected.
+    # Browser principals also run after access migration. Fresh metadata already
+    # contains this column, while an upgraded schema gains it after the first
+    # access pass. Admit only its verified, exact owned CHECK in both cases.
+    if "principal_kind" in device_columns:
+        from app.db.migrate_add_browser_controllers import verify_browser_device_column
+        try:
+            required_checks["devices"]["ck_devices_principal_kind"] = verify_browser_device_column(
+                connection, schema, inspector=inspector
+            )
+        except RuntimeError as error:
+            raise RelayAccessMigrationError("relay browser principal schema differs") from error
     if "relay_max_backups" in session_columns:
         from app.db.migrate_add_relay_redundancy import verify_redundancy_column
         verify_redundancy_column(connection, schema)

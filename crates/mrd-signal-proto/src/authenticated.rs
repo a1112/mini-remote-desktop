@@ -132,7 +132,12 @@ impl<'de> Deserialize<'de> for SignalEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum AuthenticatedSignalMessage {
     ServerChallenge(ServerChallenge),
     Register(AuthenticatedRegister),

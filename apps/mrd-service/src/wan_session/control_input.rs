@@ -222,10 +222,20 @@ impl ServiceWanControlInputPort {
             let route = binding.mux.route_snapshot().await;
             if route.session_id == *session_id
                 && !route.closed
-                && (route.kind == TransportRouteKind::WebRtcRelay
+                && (route.kind == binding.authority.expected_route_kind()
                     || cfg!(any(test, debug_assertions))
                         && route.kind == TransportRouteKind::TestMemory)
             {
+                if route.kind == TransportRouteKind::WebRtcDirect {
+                    let verified = app_state
+                        .webrtc_host
+                        .verified_media_mux(session_id, binding.authority.generation())
+                        .await
+                        .map_err(|_| route_lost())?;
+                    if !Arc::ptr_eq(&verified, &binding.mux) {
+                        return Err(route_lost());
+                    }
+                }
                 return Ok((binding.authority, binding.mux));
             }
             return Err(route_lost());
@@ -294,15 +304,16 @@ impl ServiceWanControlInputPort {
     }
 }
 
-/// Retain the stable mux only after the media adapter verified the exact relay generation.
-/// The mux survives atomic relay replacement, while every use still requires a live relay route.
+/// Retain the mux only after media verified the grant and actual selected route.
+/// Native relay muxes keep their verified atomic replacement semantics. Direct
+/// muxes must remain the exact generation-zero host mux at every input use.
 pub(crate) async fn bind_verified_mux(
     app_state: &Arc<AppState>,
     authority: WanMediaAuthority,
     mux: Arc<dyn TransportMuxPort>,
 ) -> Result<(), WanMediaActivationError> {
     let route = mux.route_snapshot().await;
-    let allowed_route = route.kind == TransportRouteKind::WebRtcRelay
+    let allowed_route = route.kind == authority.expected_route_kind()
         || cfg!(any(test, debug_assertions)) && route.kind == TransportRouteKind::TestMemory;
     if route.session_id != *authority.session_id() || route.closed || !allowed_route {
         return Err(WanMediaActivationError::StartupFailed);
@@ -1315,3 +1326,7 @@ fn route_lost() -> RemoteFailure {
         "verified WAN control route is unavailable",
     )
 }
+
+#[cfg(test)]
+#[path = "browser_direct_tests.rs"]
+mod browser_direct_tests;

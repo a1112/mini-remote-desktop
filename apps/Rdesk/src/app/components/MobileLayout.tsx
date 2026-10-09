@@ -13,6 +13,7 @@ import { useConnectionHistory } from "../services/connectionHistoryService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
 import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { isTauriRuntime } from '../utils/runtime';
 
 type MobileLayoutProps = { onOpenAuth: () => void };
 
@@ -51,7 +52,7 @@ function MobileHomePage() {
         targetOs: device?.os ?? "Unknown",
         routePreference: "auto",
       });
-      navigate(`/session/${result.sessionId}`);
+      navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "连接请求失败");
     } finally {
@@ -113,12 +114,12 @@ function MobileHomePage() {
       })}</div>}
     </section>
 
-    <section className="mobile-local-device" aria-label="本机设备">
+    {isTauriRuntime() ? <section className="mobile-local-device" aria-label="本机设备">
       <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>
-    </section>
+    </section> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。登录后连接远端设备，由对方确认画面和键鼠权限。</p></section>}
   </div>;
 }
 
@@ -185,7 +186,7 @@ function MobileDeviceDetailPage({ deviceId }: { deviceId: string }) {
         targetIp: target.ip,
         lanP2P: target.p2pAvailable && !target.isLocal,
       });
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "连接请求失败");
     } finally { setBusy(false); }
@@ -229,7 +230,7 @@ function MobileHistoryPage() {
 
 function MobileSettingsPage({ onOpenAuth }: MobileLayoutProps) {
   const { theme, setTheme } = useTheme();
-  const { isLoggedIn, user, logout } = useAuth();
+  const { isLoggedIn, user, logout, logoutError } = useAuth();
   const { deviceId } = useDeviceRegistration();
   return <div className="mobile-page">
     <div className="mobile-intro"><p className="mobile-eyebrow">个人偏好</p><h1>设置</h1><p>管理显示方式与账户</p></div>
@@ -245,10 +246,11 @@ function MobileSettingsPage({ onOpenAuth }: MobileLayoutProps) {
       <h2>账户</h2>
       <div className="mobile-account-row"><UserRound size={22} /><span>{isLoggedIn ? user?.username : "尚未登录"}</span></div>
       <button className="mobile-secondary-button" onClick={isLoggedIn ? logout : onOpenAuth}>{isLoggedIn ? "退出登录" : "登录账户"}</button>
+      {logoutError && <p role="alert" className="mt-3 break-words text-sm text-red-500">{logoutError}</p>}
     </section>
-    <section className="mobile-card mobile-settings-card">
+    {isTauriRuntime() && <section className="mobile-card mobile-settings-card">
       <h2>本机设备码</h2><code>{deviceId ? formatDeviceCode(deviceId) : "等待设备登记"}</code>
-    </section>
+    </section>}
   </div>;
 }
 

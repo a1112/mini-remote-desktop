@@ -12,6 +12,9 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AdapterResult,
   AutostartStatus,
+  CloseBehavior,
+  UiPreferences,
+  ServiceStatusInfo,
   ClientDiagnostics,
   DeviceInfo,
   DevicePreference,
@@ -116,8 +119,15 @@ async function invokeAdapter<T>(
     const result = await invoke<T>(command, args);
     return { ok: true, value: result };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: { message } };
+    const nativeError = typeof error === 'object' && error !== null
+      ? error as { message?: unknown; code?: unknown }
+      : null;
+    const message = typeof nativeError?.message === 'string' ? nativeError.message : String(error);
+    // Rust commands may reject with either a structured error or "E_CODE: detail".
+    const code = typeof nativeError?.code === 'string'
+      ? nativeError.code
+      : /^\s*(E_[A-Z0-9_]+):/.exec(message)?.[1];
+    return { ok: false, error: { message, ...(code ? { code } : {}) } };
   }
 }
 
@@ -556,6 +566,58 @@ export async function serviceDidBootstrap(): Promise<AdapterResult<boolean>> {
 /** Confirm that the background service has finished stopping. */
 export async function serviceWaitForStopped(timeoutSecs: number): Promise<AdapterResult<boolean>> {
   return invokeAdapter<boolean>('service_wait_for_stopped', { timeoutSecs });
+}
+
+/** Read the service's running state and health together, independently of shell errors. */
+export async function ipcServiceHealth(): Promise<AdapterResult<ServiceStatusInfo>> {
+  const result = await invokeBridgeOrTauri<unknown>(
+    'ipc_service_health',
+    undefined,
+    { type: 'ServiceHealth' },
+    responseField<unknown>('status')
+  );
+  if (!result.ok) return result;
+
+  const status = result.value;
+  if (
+    typeof status !== 'object' || status === null ||
+    !('running' in status) || typeof status.running !== 'boolean' ||
+    !('healthy' in status) || typeof status.healthy !== 'boolean' ||
+    ('pid' in status && status.pid !== null && status.pid !== undefined &&
+      (typeof status.pid !== 'number' || !Number.isInteger(status.pid) || status.pid <= 0))
+  ) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: 'Invalid service health response' } };
+  }
+  return { ok: true, value: status as ServiceStatusInfo };
+}
+
+/** Window close behavior belongs to the native UI shell, not the browser bridge. */
+async function invokeUiPreferences(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<AdapterResult<UiPreferences>> {
+  if (isBrowserContext()) {
+    return { ok: false, error: { code: 'E_UNSUPPORTED', message: 'Window close behavior requires the desktop app' } };
+  }
+  const result = await invokeAdapter<unknown>(command, args);
+  if (!result.ok) return result;
+  const preferences = result.value;
+  if (
+    typeof preferences !== 'object' || preferences === null ||
+    !('close_behavior' in preferences) ||
+    (preferences.close_behavior !== 'hide_to_tray' && preferences.close_behavior !== 'exit_ui')
+  ) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: 'Invalid UI preferences response' } };
+  }
+  return { ok: true, value: preferences as UiPreferences };
+}
+
+export async function getUiPreferences(): Promise<AdapterResult<UiPreferences>> {
+  return invokeUiPreferences('get_ui_preferences');
+}
+
+export async function setCloseBehavior(closeBehavior: CloseBehavior): Promise<AdapterResult<UiPreferences>> {
+  return invokeUiPreferences('set_close_behavior', { closeBehavior });
 }
 
 /**

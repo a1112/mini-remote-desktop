@@ -43,6 +43,7 @@ impl BackendTokenVerifier for Tokens {
 struct Fixture {
     address: SocketAddr,
     task: tokio::task::JoinHandle<()>,
+    key_ids: HashMap<String, String>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -62,6 +63,7 @@ impl Fixture {
         };
         let mut tokens = HashMap::new();
         let mut identities = Vec::new();
+        let mut key_ids = HashMap::new();
         for (index, (device_id, _last_seen, expiry)) in entries.iter().enumerate() {
             let identity = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
             tokens.insert(
@@ -71,9 +73,11 @@ impl Fixture {
                     device_key_id: identity.key_id().into(),
                     role: BackendRole::Peer,
                     expires_at_ms: *expiry,
+                    browser: None,
                 },
             );
             identities.push(identity);
+            key_ids.insert((*device_id).into(), identities[index].key_id().into());
         }
         let mut core = RealtimeCore::new(config.clone(), Arc::new(Tokens(tokens))).unwrap();
         for (index, (device_id, last_seen, _expiry)) in entries.iter().enumerate() {
@@ -121,14 +125,22 @@ impl Fixture {
         let task = tokio::spawn(async move {
             axum::serve(listener, build_router(state)).await.unwrap();
         });
-        Self { address, task }
+        Self {
+            address,
+            task,
+            key_ids,
+        }
     }
     async fn query(&self, authorization: &[&str], body: &str) -> (u16, String) {
+        self.query_path("/internal/presence", authorization, body)
+            .await
+    }
+    async fn query_path(&self, path: &str, authorization: &[&str], body: &str) -> (u16, String) {
         let headers = authorization
             .iter()
             .map(|value| format!("Authorization: {value}\r\n"))
             .collect::<String>();
-        let request = format!("POST /internal/presence HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}", self.address, body.len());
+        let request = format!("POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}Connection: close\r\n\r\n{body}", self.address, body.len());
         tokio::time::timeout(Duration::from_secs(2), async {
             let mut stream = tokio::net::TcpStream::connect(self.address).await.unwrap();
             stream.write_all(request.as_bytes()).await.unwrap();
@@ -137,6 +149,113 @@ impl Fixture {
         .await
         .unwrap()
     }
+}
+
+#[tokio::test]
+async fn private_identities_returns_only_current_requested_physical_registration_keys() {
+    let now = now_ms();
+    let secret = URL_SAFE_NO_PAD.encode(SECRET);
+    let fixture = Fixture::start(
+        Some(&secret),
+        &[
+            ("live", now, now + 60_000),
+            ("hidden", now, now + 60_000),
+            ("stale", now - 30_000, now + 60_000),
+            ("expired", now - 10, now - 1),
+            (
+                "browser_0123456789abcdef0123456789abcdef",
+                now,
+                now + 60_000,
+            ),
+        ],
+    )
+    .await;
+    let (status, body) = fixture.query_path(
+        "/internal/identities",
+        &[&bearer(CONTEXT)],
+        r#"{"device_ids":["unknown","live","live","stale","expired","browser_0123456789abcdef0123456789abcdef"]}"#,
+    ).await;
+    assert_eq!(status, 200);
+    let result: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(result.as_object().unwrap().len(), 3);
+    assert_eq!(result["version"], 1);
+    assert!(result["sampled_at_ms"].as_u64().unwrap() >= now);
+    assert_eq!(
+        result["identities"],
+        json!([{
+            "device_id":"live", "device_key_id":fixture.key_ids["live"], "role":"Peer",
+        }])
+    );
+    assert!(!body.contains("hidden") && !body.contains("token") && !body.contains("browser_"));
+}
+
+#[tokio::test]
+async fn private_identities_requires_configured_presence_authorization() {
+    let unavailable = Fixture::start(None, &[]).await;
+    assert_eq!(
+        unavailable
+            .query_path("/internal/identities", &[], r#"{"device_ids":[]}"#)
+            .await
+            .0,
+        503
+    );
+    let secret = URL_SAFE_NO_PAD.encode(SECRET);
+    let fixture = Fixture::start(Some(&secret), &[]).await;
+    let valid = bearer(CONTEXT);
+    let foreign = bearer(b"MRD_RELAY_REQUEST_V1\0");
+    for headers in [
+        vec![],
+        vec![valid.as_str(), valid.as_str()],
+        vec![foreign.as_str()],
+        vec!["Bearer short"],
+    ] {
+        let (status, body) = fixture
+            .query_path("/internal/identities", &headers, r#"{"device_ids":[]}"#)
+            .await;
+        assert_eq!(status, 403);
+        assert!(!body.contains(&secret) && !body.contains(&valid));
+    }
+}
+
+#[tokio::test]
+async fn private_identities_keeps_the_same_bounded_explicit_query_contract() {
+    let secret = URL_SAFE_NO_PAD.encode(SECRET);
+    let fixture = Fixture::start(Some(&secret), &[]).await;
+    let valid = bearer(CONTEXT);
+    for body in [
+        json!({"device_ids":vec!["same";129]}).to_string(),
+        json!({"device_ids":["a".repeat(129)]}).to_string(),
+    ] {
+        assert_eq!(
+            fixture
+                .query_path("/internal/identities", &[&valid], &body)
+                .await
+                .0,
+            400
+        );
+    }
+    assert_eq!(
+        fixture
+            .query_path(
+                "/internal/identities",
+                &[&valid],
+                r#"{"device_ids":[],"enumerate":true}"#
+            )
+            .await
+            .0,
+        422
+    );
+    assert_eq!(
+        fixture
+            .query_path(
+                "/internal/identities",
+                &[&valid],
+                &format!("{}{}", r#"{"device_ids":[]}"#, " ".repeat(32 * 1024))
+            )
+            .await
+            .0,
+        413
+    );
 }
 
 async fn read_http_response(stream: &mut (impl AsyncRead + Unpin)) -> (u16, String) {

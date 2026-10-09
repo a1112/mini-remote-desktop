@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import (
     create_access_token,
+    get_current_user,
     hash_password,
     password_needs_rehash,
     verify_password,
@@ -16,12 +17,26 @@ from app.core.response_security import no_store_sensitive_response
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import LoginRequest, LoginResponse, RegisterRequest
+from app.schemas.session import DeviceSessionTransitionIn
 
 router = APIRouter(
     prefix="/auth",
     tags=["auth"],
     dependencies=[Depends(no_store_sensitive_response)],
 )
+
+
+@router.post("/logout")
+async def logout(_: DeviceSessionTransitionIn, user: User = Depends(get_current_user),
+                 db: AsyncSession = Depends(get_db)) -> dict[str, bool]:
+    version = user.session_version
+    locked = await db.scalar(select(User).where(User.id == user.id).with_for_update()
+                             .execution_options(populate_existing=True))
+    if locked is None or locked.session_version != version:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+    locked.session_version += 1
+    await db.commit()
+    return {"logged_out": True}
 
 _ATTEMPT_WINDOW_SECONDS = 60.0
 _ATTEMPT_LIMIT = 8

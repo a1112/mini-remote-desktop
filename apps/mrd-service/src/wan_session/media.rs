@@ -10,9 +10,10 @@ use super::{
     model::{WanSessionPhase, WanSessionRole, WanSessionState},
 };
 use async_trait::async_trait;
+use mrd_application::ports::TransportRouteKind;
 use mrd_ipc::{LanDiscoverySnapshot, MediaProfile, RemoteRoutePreference};
 use mrd_proto::{DeviceId, SessionId};
-use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3};
+use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3, WanRoutePolicyV3};
 use std::{fmt, time::Duration};
 use thiserror::Error;
 use tokio::sync::oneshot;
@@ -205,6 +206,7 @@ pub struct WanMediaAuthority {
     approved_scopes: Vec<WanPermissionScopeV3>,
     approved_profile: Option<WanMediaProfileV3>,
     generation: u64,
+    expected_route_kind: TransportRouteKind,
 }
 
 impl fmt::Debug for WanMediaAuthority {
@@ -248,7 +250,12 @@ impl WanMediaAuthority {
         let proof = state
             .route_proof()
             .ok_or(WanMediaActivationError::MissingRouteProof)?;
-        if !proof.is_relay_to_relay() || state.access() != Some(proof.access()) {
+        if proof.route_policy() != grant.route_policy()
+            || (grant.route_policy() == WanRoutePolicyV3::RelayOnly && !proof.is_relay_to_relay())
+            || state.access() != Some(proof.access())
+            || proof.access().policy_revision() != grant.policy_revision()
+            || proof.access().generation() != 0
+        {
             return Err(WanMediaActivationError::InvalidRouteProof);
         }
         Ok(Self {
@@ -268,6 +275,11 @@ impl WanMediaAuthority {
             approved_scopes: grant.approved_scopes().to_vec(),
             approved_profile: grant.approved_profile().cloned(),
             generation: proof.access().generation(),
+            expected_route_kind: if proof.has_relay_candidate() {
+                TransportRouteKind::WebRtcRelay
+            } else {
+                TransportRouteKind::WebRtcDirect
+            },
         })
     }
 
@@ -289,6 +301,10 @@ impl WanMediaAuthority {
 
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) const fn expected_route_kind(&self) -> TransportRouteKind {
+        self.expected_route_kind
     }
 
     pub(crate) fn controller_device_id(&self) -> &DeviceId {
@@ -528,45 +544,135 @@ pub async fn start_verified_media(
 ) -> Result<WanMediaPlan, WanMediaActivationError> {
     let authority = WanMediaAuthority::from_relay_verified(state)?;
     let plan = authority.media_plan()?;
-    let start_result = match plan.action() {
-        WanMediaAction::CaptureAndSend => media.start_target_capture_send(&authority).await,
-        WanMediaAction::ReceiveAndRender => media.start_controller_receive_render(&authority).await,
-    };
+    let start_result = initialize_media_runtime(media, &authority, &plan).await;
+    complete_registered_media(
+        coordinator,
+        media,
+        &authority,
+        plan,
+        start_result,
+        MediaFailureOwner::Coordinator,
+    )
+    .await
+}
+
+async fn initialize_media_runtime(
+    media: &dyn WanMediaActivationPort,
+    authority: &WanMediaAuthority,
+    plan: &WanMediaPlan,
+) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
+    match plan.action() {
+        WanMediaAction::CaptureAndSend => media.start_target_capture_send(authority).await,
+        WanMediaAction::ReceiveAndRender => media.start_controller_receive_render(authority).await,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MediaFailureOwner {
+    Coordinator,
+    Service,
+}
+
+async fn complete_registered_media(
+    coordinator: &WanSessionCoordinator,
+    media: &dyn WanMediaActivationPort,
+    authority: &WanMediaAuthority,
+    plan: WanMediaPlan,
+    start_result: Result<WanMediaActivationReceipt, WanMediaActivationError>,
+    failure_owner: MediaFailureOwner,
+) -> Result<WanMediaPlan, WanMediaActivationError> {
     let receipt = match start_result {
         Ok(receipt) => receipt,
         Err(error) => {
-            fail_media_session(coordinator, media, authority.session_id()).await;
+            fail_media_session(coordinator, media, authority.session_id(), failure_owner).await;
             return Err(error);
         }
     };
-    if let Err(error) = receipt.wait(&authority).await {
-        fail_media_session(coordinator, media, authority.session_id()).await;
+    if let Err(error) = receipt.wait(authority).await {
+        fail_media_session(coordinator, media, authority.session_id(), failure_owner).await;
         return Err(error);
     }
     let current_state = match coordinator.snapshot(authority.session_id()).await {
         Ok(state) => state,
         Err(_) => {
-            fail_media_session(coordinator, media, authority.session_id()).await;
+            fail_media_session(coordinator, media, authority.session_id(), failure_owner).await;
             return Err(WanMediaActivationError::CoordinatorFailure);
         }
     };
     let current = WanMediaAuthority::from_relay_verified(&current_state);
-    if current.as_ref() != Ok(&authority) {
-        fail_media_session(coordinator, media, authority.session_id()).await;
+    if current.as_ref() != Ok(authority) {
+        fail_media_session(coordinator, media, authority.session_id(), failure_owner).await;
         return Err(WanMediaActivationError::AuthorityChanged);
     }
     if let Err(_error) = coordinator.record_streaming(authority.session_id()).await {
-        fail_media_session(coordinator, media, authority.session_id()).await;
+        fail_media_session(coordinator, media, authority.session_id(), failure_owner).await;
         return Err(WanMediaActivationError::CoordinatorFailure);
     }
     Ok(plan)
+}
+
+async fn owned_media_cancelled(cancellation: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *cancellation.borrow() {
+            return;
+        }
+        if cancellation.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The short initialization/registration transaction finishes before service
+/// cleanup can run. Once its receipt is registered, owned cancellation may
+/// drop the receipt/commit/failure wait; coordinator cleanup owns all tasks.
+pub(crate) async fn start_verified_media_owned(
+    coordinator: &WanSessionCoordinator,
+    state: &WanSessionState,
+    media: &dyn WanMediaActivationPort,
+    cancellation: &tokio::sync::watch::Receiver<bool>,
+    startup_gate: &tokio::sync::Mutex<()>,
+) -> Result<WanMediaPlan, WanMediaActivationError> {
+    let authority = WanMediaAuthority::from_relay_verified(state)?;
+    let plan = authority.media_plan()?;
+    let mut cancellation = cancellation.clone();
+    let startup_guard = tokio::select! {
+        biased;
+        _ = owned_media_cancelled(&mut cancellation) => return Err(WanMediaActivationError::AuthorityChanged),
+        guard = startup_gate.lock() => guard,
+    };
+    let current = coordinator
+        .snapshot(authority.session_id())
+        .await
+        .map_err(|_| WanMediaActivationError::CoordinatorFailure)?;
+    if *cancellation.borrow()
+        || WanMediaAuthority::from_relay_verified(&current).as_ref() != Ok(&authority)
+    {
+        return Err(WanMediaActivationError::AuthorityChanged);
+    }
+    // Do not select/drop between spawn and registration: the receipt returned
+    // by this port means startup ownership has been handed to the service.
+    let start_result = initialize_media_runtime(media, &authority, &plan).await;
+    drop(startup_guard);
+    tokio::select! {
+        biased;
+        _ = owned_media_cancelled(&mut cancellation) => Err(WanMediaActivationError::AuthorityChanged),
+        result = complete_registered_media(coordinator, media, &authority, plan, start_result, MediaFailureOwner::Service) => result,
+    }
 }
 
 async fn fail_media_session(
     coordinator: &WanSessionCoordinator,
     media: &dyn WanMediaActivationPort,
     session_id: &SessionId,
+    failure_owner: MediaFailureOwner,
 ) {
+    // Owned callers return the live error to the service terminalizer, which
+    // holds the authorization gate through cleanup and IPC/auth projection.
+    // Keeping that transaction outside the receipt cancellation fence also
+    // prevents it from cancelling/dropping its own projection future.
+    if matches!(failure_owner, MediaFailureOwner::Service) {
+        return;
+    }
     let coordinator_entry_missing = match coordinator
         .fail(session_id, super::model::WanSessionFailure::Transport)
         .await

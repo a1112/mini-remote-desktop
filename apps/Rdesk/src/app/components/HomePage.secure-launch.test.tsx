@@ -10,7 +10,9 @@ const mocks = vi.hoisted(() => ({
   enrollmentRequired: false,
   refreshRegistration: vi.fn(),
   localDeviceId: "0123456789",
+  native: true,
 }));
+vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => mocks.native }));
 
 vi.mock("react-router", () => ({
   useNavigate: () => mocks.navigate,
@@ -60,6 +62,7 @@ describe("HomePage secure remote launch", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.enrollmentRequired = false;
+    mocks.native = true;
     mocks.launchRemoteDisplayForDevice.mockResolvedValue({
       sessionId: "secure-session",
       windowLabel: null,
@@ -75,6 +78,17 @@ describe("HomePage secure remote launch", () => {
     await user.click(screen.getByRole("button", { name: "登记到服务器" }));
     await user.click(screen.getByRole("button", { name: "提交设备登记码" }));
     expect(mocks.refreshRegistration).toHaveBeenCalled();
+  });
+
+  it('shows browser controller mode without offering host device enrollment and follows its independent route', async () => {
+    mocks.native = false;
+    mocks.launchRemoteDisplayForDevice.mockResolvedValue({ sessionId: 'browser-session', mode: 'route', routePath: '/browser-session/browser-session' });
+    render(<HomePage />);
+    expect(screen.getByText('网页控制端')).toBeInTheDocument();
+    expect(screen.getByText(/无需安装客户端或登记本机/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '登记到服务器' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText('办公室电脑'));
+    expect(mocks.navigate).toHaveBeenCalledWith('/browser-session/browser-session');
   });
 
   it("shows a ten digit device code in readable groups without losing its leading zero", () => {

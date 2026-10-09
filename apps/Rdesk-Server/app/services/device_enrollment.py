@@ -165,7 +165,8 @@ class DeviceEnrollmentService:
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
-            if device is None:
+            if (device is None or device.principal_kind != "physical"
+                or device.device_id.startswith("browser_")):
                 self._invalid()
             return RegisteredDevice(device=device, recovered=True)
 

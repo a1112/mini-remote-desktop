@@ -18,11 +18,13 @@ import {
 } from "./ipcSessionService";
 import { saveWebRemoteSession } from "./webRemoteSessionService";
 import { waitForRemoteSessionStreaming } from "./remoteSessionStateService";
+import { createBrowserRemoteSession } from "./browserRemoteSessionService";
 
 export type RemoteDisplayLaunchResult = {
   sessionId: string;
   windowLabel: string | null;
   mode: "native_window" | "route";
+  routePath?: string;
   captureSourceSelection?: CaptureSourceSelection | null;
   remoteSession?: RemoteSessionSnapshot;
 };
@@ -146,7 +148,20 @@ export async function launchRemoteDisplayForDevice(
 
   if (!tauriRuntime) {
     if (!options?.localTest) {
-      throw new Error("Secure remote sessions require the desktop client");
+      const browserSession = await createBrowserRemoteSession(targetDeviceId, {
+        ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
+        ...(options?.targetDeviceName ? { targetDeviceName: options.targetDeviceName } : {}),
+        ...(options?.targetOs ? { targetOs: options.targetOs } : {}),
+        ...(options?.targetIp ? { targetIp: options.targetIp } : {}),
+        ...(options?.requestedProfile ? { requestedProfile: options.requestedProfile } : {}),
+        ...(options?.routePreference ? { routePreference: options.routePreference } : {}),
+      });
+      return {
+        sessionId: browserSession.sessionId,
+        windowLabel: null,
+        mode: "route",
+        routePath: `/browser-session/${encodeURIComponent(browserSession.sessionId)}`,
+      };
     }
     saveWebRemoteSession({
       sessionId,

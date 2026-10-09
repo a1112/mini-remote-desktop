@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mrd-process = { path = "../mrd-process" }
 openh264 = "0.8"
 mrd-pipeline-core = { path = "../mrd-pipeline-core" }
 mrd-decode-nvdec = { path = "../mrd-decode-nvdec" }

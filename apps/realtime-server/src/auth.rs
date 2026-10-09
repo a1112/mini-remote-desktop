@@ -1,8 +1,8 @@
 use crate::ConnectionId;
-use mrd_proto::{BackendRole, DeviceId};
+use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
     AuthenticatedRegister, ServerChallenge, SignalProtocolError, SignalReplayGuard,
-    VerifiedSignalMetadata,
+    VerifiedSignalMetadata, WanPermissionScopeV3,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{collections::HashMap, sync::Arc};
@@ -14,6 +14,16 @@ pub struct VerifiedBackendToken {
     pub device_key_id: String,
     pub role: BackendRole,
     pub expires_at_ms: u64,
+    pub browser: Option<BrowserSignalingRestriction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSignalingRestriction {
+    pub user_id: String,
+    pub tenant_id: String,
+    pub session_id: SessionId,
+    pub target_device_id: DeviceId,
+    pub allowed_scopes: Vec<WanPermissionScopeV3>,
 }
 
 pub trait BackendTokenVerifier: Send + Sync {

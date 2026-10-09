@@ -443,6 +443,10 @@ impl RelayRouteProof {
     pub fn is_relay_to_relay(&self) -> bool {
         self.local_candidate_relayed && self.remote_candidate_relayed
     }
+
+    pub(crate) fn has_relay_candidate(&self) -> bool {
+        self.local_candidate_relayed || self.remote_candidate_relayed
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

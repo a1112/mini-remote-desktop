@@ -67,6 +67,7 @@ impl Fixture {
             device_key_id: identity.key_id().into(),
             role: BackendRole::Peer,
             expires_at_ms: now_ms() + token_lifetime_ms,
+            browser: None,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = listener.local_addr().unwrap();

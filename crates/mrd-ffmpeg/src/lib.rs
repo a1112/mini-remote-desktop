@@ -4,7 +4,6 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    process::Command,
 };
 use thiserror::Error;
 
@@ -571,7 +570,7 @@ fn tool_file_names(tool: &str) -> Vec<String> {
 }
 
 fn probe_tool_version(path: &Path) -> Result<String, String> {
-    let output = Command::new(path)
+    let output = mrd_process::background_command(path)
         .arg("-version")
         .output()
         .map_err(|error| format!("failed to run {}: {error}", path.display()))?;

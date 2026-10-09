@@ -30,6 +30,96 @@ fn claims(role: BackendRole, key: &str) -> Value {
     })
 }
 
+fn browser_claims(key: &str) -> Value {
+    json!({
+        "sub": "browser_0123456789abcdef0123456789abcdef",
+        "device_id": "browser_0123456789abcdef0123456789abcdef",
+        "device_key_id": key,
+        "role": "Controller", "token_type": "browser_signaling",
+        "iss": "rdesk-backend", "aud": "rdesk-signaling",
+        "iat": NOW / 1000, "exp": NOW / 1000 + 300,
+        "user_id": "user-1", "tenant_id": "tenant-1",
+        "session_id": "session-browser-1", "target_device_id": "123456789012",
+        "allowed_scopes": ["input.keyboard", "input.pointer", "screen.view"],
+    })
+}
+
+#[test]
+fn accepts_session_bound_browser_controller_signaling_credentials() {
+    let result = verifier()
+        .verify(&signed(&browser_claims(&"ab".repeat(32))), NOW + 1)
+        .expect(
+            "a browser Controller credential must authenticate independently of machine tokens",
+        );
+    assert_eq!(
+        result.device_id,
+        DeviceId("browser_0123456789abcdef0123456789abcdef".into())
+    );
+    assert_eq!(result.role, BackendRole::Controller);
+    assert_eq!(result.expires_at_ms, NOW + 300_000);
+}
+
+#[test]
+fn browser_credentials_reject_unbound_roles_scopes_and_ambiguous_claims() {
+    let base = browser_claims(&"ab".repeat(32));
+    for (field, value) in [
+        ("role", json!("Agent")),
+        ("role", json!("Peer")),
+        ("device_id", json!("123456789012")),
+        ("sub", json!("other-browser")),
+        ("user_id", json!("")),
+        ("tenant_id", json!("")),
+        ("session_id", json!("")),
+        ("target_device_id", json!("")),
+        ("target_device_id", base["device_id"].clone()),
+        ("allowed_scopes", json!([])),
+        ("allowed_scopes", json!(["screen.view", "input.pointer"])),
+        ("allowed_scopes", json!(["screen.view", "screen.view"])),
+        ("allowed_scopes", json!(["file.write", "screen.view"])),
+        ("exp", json!(NOW / 1000 + 601)),
+        ("unknown", json!(true)),
+    ] {
+        let mut altered = base.clone();
+        altered[field] = value;
+        assert!(
+            verifier().verify(&signed(&altered), NOW).is_err(),
+            "accepted invalid {field}"
+        );
+    }
+    for field in [
+        "user_id",
+        "tenant_id",
+        "session_id",
+        "target_device_id",
+        "allowed_scopes",
+    ] {
+        let mut altered = base.clone();
+        altered.as_object_mut().unwrap().remove(field);
+        assert!(
+            verifier().verify(&signed(&altered), NOW).is_err(),
+            "accepted missing {field}"
+        );
+    }
+    let duplicate = format!(
+        "{{\"session_id\":\"another-session\",{}",
+        &base.to_string()[1..]
+    );
+    assert!(verifier()
+        .verify(
+            &signed_parts(r#"{"alg":"HS256","typ":"JWT"}"#, &duplicate, SECRET),
+            NOW
+        )
+        .is_err());
+}
+
+#[test]
+fn machine_credentials_cannot_claim_the_reserved_browser_namespace() {
+    let mut altered = claims(BackendRole::Controller, &"ab".repeat(32));
+    altered["sub"] = json!("browser_0123456789abcdef0123456789abcdef");
+    altered["device_id"] = altered["sub"].clone();
+    assert!(verifier().verify(&signed(&altered), NOW).is_err());
+}
+
 fn signed_parts(header: &str, payload: &str, secret: &[u8]) -> String {
     let encoded = format!(
         "{}.{}",

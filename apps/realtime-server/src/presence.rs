@@ -1,4 +1,4 @@
-use crate::ConnectionId;
+use crate::{auth::BrowserSignalingRestriction, ConnectionId};
 use mrd_proto::{BackendRole, DeviceId};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -11,6 +11,7 @@ pub struct PresenceEntry {
     pub role: BackendRole,
     pub last_seen_ms: u64,
     pub token_expires_at_ms: u64,
+    pub browser: Option<BrowserSignalingRestriction>,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +84,13 @@ impl PresenceRegistry {
 
     pub fn len(&self) -> usize {
         self.by_device.len()
+    }
+
+    pub fn browser_count(&self) -> usize {
+        self.by_device
+            .values()
+            .filter(|entry| entry.browser.is_some())
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {

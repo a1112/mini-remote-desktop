@@ -1,7 +1,11 @@
 //! Verification of backend-issued credentials bound to one signaling identity and role.
-use crate::{BackendTokenError, BackendTokenVerifier, VerifiedBackendToken};
+use crate::{
+    auth::BrowserSignalingRestriction, BackendTokenError, BackendTokenVerifier,
+    VerifiedBackendToken,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use mrd_proto::{BackendRole, DeviceId};
+use mrd_proto::{BackendRole, DeviceId, SessionId};
+use mrd_signal_proto::WanPermissionScopeV3;
 use ring::hmac;
 use serde::Deserialize;
 use thiserror::Error;
@@ -9,6 +13,7 @@ use zeroize::Zeroizing;
 
 const MAX_TOKEN_BYTES: usize = 8_192;
 const MAX_LIFETIME_SECONDS: u64 = 3_600;
+const MAX_BROWSER_LIFETIME_SECONDS: u64 = 600;
 const CLOCK_SKEW_SECONDS: u64 = 60;
 const DEFAULT_AUDIENCE: &str = "rdesk-signaling";
 
@@ -87,7 +92,68 @@ impl JwtBackendTokenVerifier {
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let signed_bytes = token.as_bytes().get(..token.rfind('.')?)?;
         hmac::verify(&self.key, signed_bytes, &signature).ok()?;
-        let claims: Claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+        let parsed: CredentialClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+        let (claims, browser) = match parsed {
+            CredentialClaims::Device(claims) => {
+                if claims.device_id.starts_with("browser_") {
+                    return None;
+                }
+                (claims, None)
+            }
+            CredentialClaims::Browser(claims) => {
+                if claims.token_type != "browser_signaling"
+                    || claims.role != BackendRole::Controller
+                    || !valid_browser_id(&claims.device_id)
+                    || !valid_principal_identifier(&claims.user_id, 64)
+                    || !valid_principal_identifier(&claims.tenant_id, 64)
+                    || !valid_principal_identifier(&claims.session_id, 36)
+                    || !valid_device_id(&claims.target_device_id)
+                    || claims.target_device_id.starts_with("browser_")
+                    || claims.exp.checked_sub(claims.iat)? > MAX_BROWSER_LIFETIME_SECONDS
+                    || claims.allowed_scopes.is_empty()
+                    || claims.allowed_scopes.len() > 3
+                    || !claims
+                        .allowed_scopes
+                        .contains(&WanPermissionScopeV3::ScreenView)
+                    || !claims
+                        .allowed_scopes
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1])
+                    || claims.allowed_scopes.iter().any(|scope| {
+                        !matches!(
+                            scope,
+                            WanPermissionScopeV3::ScreenView
+                                | WanPermissionScopeV3::InputKeyboard
+                                | WanPermissionScopeV3::InputPointer
+                        )
+                    })
+                {
+                    return None;
+                }
+                let browser = BrowserSignalingRestriction {
+                    user_id: claims.user_id,
+                    tenant_id: claims.tenant_id,
+                    session_id: SessionId(claims.session_id),
+                    target_device_id: DeviceId(claims.target_device_id),
+                    allowed_scopes: claims.allowed_scopes,
+                };
+                (
+                    Claims {
+                        sub: claims.sub,
+                        device_id: claims.device_id,
+                        device_key_id: claims.device_key_id,
+                        role: claims.role,
+                        token_type: "signaling".into(),
+                        iss: claims.iss,
+                        aud: claims.aud,
+                        iat: claims.iat,
+                        exp: claims.exp,
+                    },
+                    Some(browser),
+                )
+            }
+        };
         let expires_at_ms = claims.exp.checked_mul(1_000)?;
         if claims.token_type != "signaling"
             || claims.iss != self.issuer
@@ -107,6 +173,7 @@ impl JwtBackendTokenVerifier {
             device_key_id: claims.device_key_id,
             role: claims.role,
             expires_at_ms,
+            browser,
         })
     }
 }
@@ -144,6 +211,30 @@ fn valid_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_browser_id(value: &str) -> bool {
+    value.strip_prefix("browser_").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn valid_principal_identifier(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CredentialClaims {
+    Device(Claims),
+    Browser(BrowserClaims),
+}
+
 // Deserializing directly into structs rejects duplicate fields. Unknown header
 // extensions and claims are also rejected instead of silently ignoring semantics.
 #[derive(Deserialize)]
@@ -165,4 +256,23 @@ struct Claims {
     aud: String,
     iat: u64,
     exp: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserClaims {
+    sub: String,
+    device_id: String,
+    device_key_id: String,
+    role: BackendRole,
+    token_type: String,
+    iss: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+    user_id: String,
+    tenant_id: String,
+    session_id: String,
+    target_device_id: String,
+    allowed_scopes: Vec<WanPermissionScopeV3>,
 }

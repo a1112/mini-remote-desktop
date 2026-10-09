@@ -27,8 +27,11 @@ mod test_orchestrator;
 mod webrtc_host;
 mod webrtc_media;
 
+#[cfg(test)]
+use app_settings::save_settings;
 use app_settings::{
-    default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
+    default_settings_path, load_settings, update_settings, AppSettings, CloseBehavior,
+    DecodePolicy, UiPreferences, UiPreferencesCache,
 };
 use device_info::HardwareInfo;
 use mrd_device_registration::{DeviceRegistrationRequest, DeviceRegistrationResponse};
@@ -107,6 +110,7 @@ enum TrayAction {
 #[derive(Clone)]
 struct AppState {
     settings_path: std::path::PathBuf,
+    ui_preferences: std::sync::Arc<UiPreferencesCache>,
     // Service lifecycle manager - controls mrd-service
     service_manager: std::sync::Arc<service_manager::ServiceManager>,
     // Test harness for end-to-end pipeline visualization
@@ -254,7 +258,26 @@ fn center_window(window: WebviewWindow) -> Result<(), String> {
 
 #[tauri::command]
 fn close_window(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|err| err.to_string())
+    if window.label() == "main" {
+        handle_main_window_close(window.app_handle())
+    } else {
+        window.hide().map_err(|error| error.to_string())
+    }
+}
+
+fn tray_action_for_close_behavior(close_behavior: CloseBehavior) -> TrayAction {
+    match close_behavior {
+        CloseBehavior::HideToTray => TrayAction::HideWindow,
+        CloseBehavior::ExitUi => TrayAction::QuitUi,
+    }
+}
+
+fn handle_main_window_close(app: &AppHandle) -> Result<(), String> {
+    let preferences = app.state::<AppState>().ui_preferences.snapshot()?;
+    apply_tray_action(
+        app,
+        tray_action_for_close_behavior(preferences.close_behavior),
+    )
 }
 
 #[tauri::command]
@@ -2070,6 +2093,21 @@ async fn set_decode_policy(
 }
 
 #[tauri::command]
+fn get_ui_preferences(state: tauri::State<'_, AppState>) -> Result<UiPreferences, String> {
+    state.ui_preferences.snapshot()
+}
+
+#[tauri::command]
+fn set_close_behavior(
+    state: tauri::State<'_, AppState>,
+    close_behavior: CloseBehavior,
+) -> Result<UiPreferences, String> {
+    state
+        .ui_preferences
+        .set_close_behavior(&state.settings_path, close_behavior)
+}
+
+#[tauri::command]
 fn ffmpeg_probe(
     state: tauri::State<'_, AppState>,
 ) -> Result<mrd_ffmpeg::FfmpegProbeResult, String> {
@@ -3428,9 +3466,9 @@ async fn set_decode_policy_with(
     decode_policy: DecodePolicy,
 ) -> Result<DecodePolicyResponse, String> {
     // Save policy to settings - actual decode policy application now happens in mrd-service
-    let mut settings = load_settings(settings_path)?;
-    settings.decode_policy = decode_policy;
-    save_settings(settings_path, &settings)?;
+    update_settings(settings_path, |settings| {
+        settings.decode_policy = decode_policy
+    })?;
     Ok(DecodePolicyResponse {
         decode_policy: decode_policy.as_str().to_string(),
     })
@@ -3453,10 +3491,9 @@ async fn ffmpeg_download_at_path(
 }
 
 fn reset_ffmpeg_settings_at_path(settings_path: &std::path::Path) -> Result<AppSettings, String> {
-    let mut settings = load_settings(settings_path)?;
-    settings.ffmpeg = mrd_ffmpeg::golden_settings();
-    save_settings(settings_path, &settings)?;
-    Ok(settings)
+    update_settings(settings_path, |settings| {
+        settings.ffmpeg = mrd_ffmpeg::golden_settings();
+    })
 }
 
 // ============================================================================
@@ -4238,6 +4275,55 @@ mod tray_tests {
         std::fs::remove_file(&path).expect("cleanup temp settings");
     }
 
+    #[tokio::test]
+    async fn app_settings_decode_update_preserves_saved_close_behavior() {
+        let path = unique_settings_path("decode-preserves-close");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        std::fs::write(&path, r#"{"close_behavior":"exit_ui"}"#).expect("save preferences");
+
+        set_decode_policy_with(&path, DecodePolicy::Nvdec)
+            .await
+            .expect("update decode policy");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings"))
+                .expect("parse settings");
+
+        assert_eq!(saved["close_behavior"], "exit_ui");
+        std::fs::remove_file(&path).expect("cleanup settings");
+    }
+
+    #[test]
+    fn app_settings_ffmpeg_reset_preserves_saved_close_behavior() {
+        let path = unique_settings_path("ffmpeg-reset-preserves-close");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        std::fs::write(
+            &path,
+            r#"{"close_behavior":"exit_ui","decode_policy":"software"}"#,
+        )
+        .expect("save preferences");
+
+        reset_ffmpeg_settings_at_path(&path).expect("reset ffmpeg");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings"))
+                .expect("parse settings");
+
+        assert_eq!(saved["close_behavior"], "exit_ui");
+        assert_eq!(saved["decode_policy"], "software");
+        std::fs::remove_file(&path).expect("cleanup settings");
+    }
+
+    #[test]
+    fn app_settings_close_behavior_uses_only_ui_actions() {
+        assert_eq!(
+            tray_action_for_close_behavior(CloseBehavior::HideToTray),
+            TrayAction::HideWindow
+        );
+        assert_eq!(
+            tray_action_for_close_behavior(CloseBehavior::ExitUi),
+            TrayAction::QuitUi
+        );
+    }
+
     #[test]
     fn reset_ffmpeg_settings_uses_golden_defaults() {
         let path = unique_settings_path("ffmpeg-reset");
@@ -4643,7 +4729,7 @@ fn main() {
     spawn_native_surface_control_input_forwarder();
 
     let settings_path = default_settings_path();
-    let _settings = load_settings(&settings_path).unwrap_or_else(|error| {
+    let settings = load_settings(&settings_path).unwrap_or_else(|error| {
         eprintln!("failed to load app settings: {error}");
         AppSettings::default()
     });
@@ -4696,6 +4782,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState {
             settings_path,
+            ui_preferences: std::sync::Arc::new(UiPreferencesCache::from_settings(&settings)),
             service_manager,
             test_harness,
             test_orchestrator,
@@ -4757,8 +4844,8 @@ fn main() {
                             return;
                         }
                         api.prevent_close();
-                        if let Err(error) = hide_main_window(&app_handle_for_close) {
-                            eprintln!("failed to hide Rdesk window: {error}");
+                        if let Err(error) = handle_main_window_close(&app_handle_for_close) {
+                            eprintln!("failed to close Rdesk window: {error}");
                         }
                     }
                 });
@@ -4834,6 +4921,8 @@ fn main() {
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
+            get_ui_preferences,
+            set_close_behavior,
             ffmpeg_probe,
             ffmpeg_download,
             ffmpeg_reset_golden_settings,

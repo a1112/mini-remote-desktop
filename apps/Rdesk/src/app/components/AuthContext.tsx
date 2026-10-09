@@ -1,4 +1,7 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
+import { closeAllBrowserRemoteSessions } from '../services/browserRemoteSessionService';
+import { SERVER_API_URL } from '../services/serverConfig';
+import { isTauriRuntime } from '../utils/runtime';
 
 interface UserInfo {
   id: string;
@@ -12,6 +15,7 @@ interface AuthContextType {
   token: string | null;
   login: (token: string, user: UserInfo) => void;
   logout: () => void;
+  logoutError: string | null;
 }
 
 const AuthContext = createContext<AuthContextType>({
@@ -20,6 +24,7 @@ const AuthContext = createContext<AuthContextType>({
   token: null,
   login: () => {},
   logout: () => {},
+  logoutError: null,
 });
 
 export function useAuth() {
@@ -44,6 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   // 初始化：检查本地存储的登录状态
   useEffect(() => {
@@ -75,6 +81,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const login = useCallback((newToken: string, newUser: UserInfo) => {
+    setLogoutError(null);
     localStorage.setItem(TOKEN_KEY, newToken);
     localStorage.setItem(USER_KEY, JSON.stringify(newUser));
     setToken(newToken);
@@ -83,15 +90,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
+    const capturedToken = localStorage.getItem(TOKEN_KEY) ?? token;
+    setLogoutError(null);
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
     setToken(null);
     setUser(null);
     setIsLoggedIn(false);
-  }, []);
+    window.dispatchEvent(new Event("rdesk-auth-changed"));
+    if (!isTauriRuntime()) {
+      void closeAllBrowserRemoteSessions('logout').catch(error => {
+        if (!localStorage.getItem(TOKEN_KEY)) setLogoutError(`本地已退出，远端会话结束请求失败：${error instanceof Error ? error.message : String(error)}`);
+      });
+      if (capturedToken) {
+        void fetch(`${SERVER_API_URL}/auth/logout`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${capturedToken}`, 'Content-Type': 'application/json' },
+          body: '{}',
+        }).then(response => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        }).catch(error => {
+          if (!localStorage.getItem(TOKEN_KEY)) setLogoutError(`本地已退出，服务端撤销失败：${error instanceof Error ? error.message : String(error)}。无法确认远端已即时停止。`);
+        });
+      }
+    }
+  }, [token]);
 
   return (
-    <AuthContext.Provider value={{ isLoggedIn, user, token, login, logout }}>
+    <AuthContext.Provider value={{ isLoggedIn, user, token, login, logout, logoutError }}>
       {children}
     </AuthContext.Provider>
   );

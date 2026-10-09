@@ -200,6 +200,8 @@ async def register_device(
     os_type = payload.os_version.split()[0] if payload.os_version else "Unknown"
 
     if existing:
+        if existing.principal_kind != "physical" or existing.device_id.startswith("browser_"):
+            _deny_device_registration(401)
         # 设备已存在，更新信息
         if payload.hostname:
             existing.hostname = payload.hostname
@@ -249,7 +251,7 @@ async def refresh_device_credentials(
     # dependencies. Lock and re-read the row so revocation cannot be bypassed by
     # a stale identity-map object or a concurrent ownership/version change.
     device = await db.scalar(
-        select(Device).where(Device.id == identity.row_id).with_for_update()
+        select(Device).where(Device.id == identity.row_id, Device.principal_kind == "physical").with_for_update()
         .execution_options(populate_existing=True)
     )
     if (
@@ -357,7 +359,7 @@ async def list_devices(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[DeviceOut]:
-    stmt: Select[tuple[Device]] = select(Device).options(selectinload(Device.status))
+    stmt: Select[tuple[Device]] = select(Device).where(Device.principal_kind == "physical").options(selectinload(Device.status))
     if current_user.role != "admin":
         stmt = stmt.where(
             Device.tenant_id == current_user.tenant_id,
@@ -392,7 +394,7 @@ async def get_device(
 ) -> DeviceOut:
     stmt = (
         select(Device)
-        .where(Device.id == device_id)
+        .where(Device.id == device_id, Device.principal_kind == "physical")
         .options(selectinload(Device.status))
     )
     if current_user.role != "admin":
@@ -474,7 +476,7 @@ async def unbind_device(
     _require_matching_device(current_device, payload.device_id)
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == payload.device_id)
+        .where(Device.device_id == payload.device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -529,7 +531,7 @@ async def bind_device_owner(
         )
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -730,7 +732,7 @@ async def revoke_device_credentials(
 async def _locked_device(db: AsyncSession, device_id: str) -> Device:
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -750,7 +752,7 @@ async def get_binding_status(
 
     返回：是否已绑定、绑定的用户信息、绑定时间
     """
-    statement = select(Device).where(Device.device_id == device_id)
+    statement = select(Device).where(Device.device_id == device_id, Device.principal_kind == "physical")
     if current_user.role != "admin":
         statement = statement.where(
             Device.tenant_id == current_user.tenant_id,
@@ -803,7 +805,7 @@ async def rename_device(
     """
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )

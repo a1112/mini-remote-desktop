@@ -4,6 +4,7 @@ import { useTheme } from "./ThemeContext";
 import { ipcPublicServerStatus } from "../adapters/tauri/commands";
 import type { PublicServerStatus } from "../adapters/tauri/types";
 import { formatDeviceCode } from "../utils/deviceCode";
+import { isTauriRuntime } from '../utils/runtime';
 
 function connectionLabel(status: PublicServerStatus): string {
   if (!status.service_running) return "本机后台服务未运行";
@@ -71,6 +72,7 @@ export function ServiceStatusPanel() {
   const mounted = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (!isTauriRuntime()) return;
     if (inFlight.current) return;
     inFlight.current = true;
     if (mounted.current) setChecking(true);
@@ -88,6 +90,7 @@ export function ServiceStatusPanel() {
   }, []);
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
     mounted.current = true;
     void refresh();
     const interval = window.setInterval(() => { if (!document.hidden) void refresh(); }, 3000);
@@ -100,6 +103,7 @@ export function ServiceStatusPanel() {
     };
   }, [refresh]);
 
+  if (!isTauriRuntime()) return <p role="status" className={`shrink-0 border-b px-4 py-2 text-xs ${isDark ? 'border-gray-700 text-gray-400' : 'border-gray-200 text-gray-500'}`}>网页控制端无需本机后台服务</p>;
   const online = Boolean(status?.service_running && status.device_registered && status.signaling_state === "authenticated");
   const label = status ? connectionLabel(status) : failed ? "无法读取连接状态" : "正在检查服务器连接";
   const error = connectionError(status?.last_error ?? null);

@@ -12,6 +12,7 @@ import type {
 } from "../adapters/tauri/types";
 import { IncomingSessionDialog } from "./IncomingSessionDialog";
 import { getTauriWindowLabel } from "../utils/tauriWindow";
+import { isTauriRuntime } from '../utils/runtime';
 import { recordConnectionClosed, recordConnectionSnapshot } from "../services/connectionHistoryService";
 
 const EVENT_PAGE_SIZE = 64;
@@ -34,6 +35,7 @@ export function IncomingSessionConsentHost() {
   const seenSessionIds = useRef(new Set<string>());
 
   useEffect(() => {
+    if (!isTauriRuntime()) return;
     let stopped = false;
     let timer: number | undefined;
     let cursor: string | null = null;

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.core.security import DeviceAuthSnapshot, device_auth_snapshot_matches
+from app.services.browser_authority import browser_authority_valid
 from app.models.device import Device
 from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_audit_event import RelayAuditEvent
@@ -523,6 +524,8 @@ class RelayAccessService:
             or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
             or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id
         ):
+            _deny_access()
+        if not await browser_authority_valid(self._session, grant, now=self._now()):
             _deny_access()
         return grant, controller, target, caller
 

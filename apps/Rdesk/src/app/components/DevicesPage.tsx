@@ -200,7 +200,7 @@ export function DevicesPage() {
         targetIp: device.ip,
         lanP2P: device.p2pAvailable && !device.isLocal,
       });
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
       alert(error instanceof Error ? error.message : "Open remote display failed");
     } finally {

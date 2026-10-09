@@ -19,8 +19,10 @@ import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
 import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { isTauriRuntime } from '../utils/runtime';
 
 export function HomePage() {
+  const native = isTauriRuntime();
   const { isDark } = useTheme();
   const navigate = useNavigate();
   const { devices } = useDevices();
@@ -125,7 +127,7 @@ export function HomePage() {
         targetOs: target.os,
         routePreference: "auto",
       });
-      navigate(`/session/${result.sessionId}`);
+      navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
       setConnectionError(
         error instanceof Error ? error.message : "安全远程会话请求失败",
@@ -171,16 +173,16 @@ export function HomePage() {
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
-      <DeviceRegisterModal
+      {native && <DeviceRegisterModal
         isOpen={registrationOpen}
         onClose={() => setRegistrationOpen(false)}
         onSuccess={() => refresh()}
-      />
+      />}
       <div className="grid grid-cols-5 gap-6">
         {/* Left: ID + Connect */}
         <div className="col-span-2 space-y-5">
           {/* My Device card */}
-          <div className={`p-5 rounded-xl border ${card}`}>
+          {native ? <div className={`p-5 rounded-xl border ${card}`}>
             {/* 设备名称 + 编辑按钮 */}
             <div className="flex items-center justify-center gap-2 mb-2">
               {editingDeviceName ? (
@@ -258,7 +260,7 @@ export function HomePage() {
             <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
               登记到服务器
             </button>
-          </div>
+          </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。登录账户后选择远端设备，等待对方同意即可查看画面并控制已授权的键鼠。</p></section>}
 
           {/* Connect card */}
           <div className={`p-5 rounded-xl border ${card}`}>

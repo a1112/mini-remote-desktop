@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mrd-signal-proto = { path = "../mrd-signal-proto" }
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

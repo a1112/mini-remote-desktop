@@ -1,4 +1,5 @@
 from app.models.device import Device, DeviceStatus
+from app.models.browser_controller import BrowserController
 from app.models.device_enrollment import DeviceEnrollment
 from app.models.device_network_group import DeviceNetworkGroup
 from app.models.network_group import NetworkGroup
@@ -14,6 +15,7 @@ from app.models.user import User
 __all__ = [
     "User",
     "Device",
+    "BrowserController",
     "DeviceStatus",
     "DeviceEnrollment",
     "SessionRequest",

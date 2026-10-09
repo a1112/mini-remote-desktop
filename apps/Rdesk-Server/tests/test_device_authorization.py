@@ -91,6 +91,7 @@ class Device:
     status = Column()
     tenant_id = Column()
     is_bound = Column()
+    principal_kind = Column()
 
     def __init__(
         self,
@@ -102,6 +103,7 @@ class Device:
         self.id = database_id or f"db-{device_id}"
         self.name = f"device-{device_id}"
         self.device_id = device_id
+        self.principal_kind = "physical"
         self.os = "Linux"
         self.icon = "Monitor"
         self.status = None

@@ -21,6 +21,7 @@ from app.schemas.session import (
     DeviceSessionOut,
 )
 from app.services.relay_directory import RelayAccessService
+from app.services.browser_authority import browser_authority_valid
 from app.services.session_grants import (
     SessionGrantError,
     bind_session_grant_policy,
@@ -172,6 +173,9 @@ class DeviceSessionService:
         )
         if row is None or not _is_authorized_participant(row, current_device):
             _not_found()
+        if not await browser_authority_valid(self._session, row, now=self._now(),
+                                             allow_terminal=current_device.id == row.target_device_id):
+            _not_found()
         return row
 
     async def approve(
@@ -264,6 +268,8 @@ class DeviceSessionService:
             ):
                 _not_found()
             request = device_session_out(row).request
+            if not await browser_authority_valid(self._session, row, now=self._now()):
+                _not_found()
             if (
                 request.controller_device_id != controller.device_id
                 or request.target_device_id != target.device_id
@@ -279,6 +285,8 @@ class DeviceSessionService:
             )
             if (
                 not approved_scopes
+                or (controller.principal_kind == "browser_controller"
+                    and "screen.view" not in approved_scopes)
                 or row.requested_scopes is None
                 or any(scope not in row.requested_scopes for scope in approved_scopes)
                 or not _profile_within(approved_profile, row.requested_profile)
@@ -360,6 +368,9 @@ class DeviceSessionService:
                 .execution_options(populate_existing=True)
             )
             if row is None or not _is_authorized_participant(row, current_device):
+                _not_found()
+            if not await browser_authority_valid(self._session, row, now=self._now(),
+                allow_terminal=current_device.id == row.target_device_id or row.status == "closed"):
                 _not_found()
             if authorization == "target" and row.target_device_id != current_device.id:
                 _deny()

@@ -123,9 +123,7 @@ fn get_os_version() -> String {
 fn get_cpu_info() -> CpuInfo {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-
-        let name = Command::new("wmic")
+        let name = mrd_process::background_command("wmic")
             .args(["cpu", "get", "name"])
             .output()
             .ok()
@@ -138,7 +136,7 @@ fn get_cpu_info() -> CpuInfo {
             })
             .unwrap_or_else(|| "Unknown CPU".to_string());
 
-        let vendor_id = Command::new("wmic")
+        let vendor_id = mrd_process::background_command("wmic")
             .args(["cpu", "get", "Manufacturer"])
             .output()
             .ok()
@@ -197,9 +195,7 @@ fn get_total_memory_mb() -> u64 {
 fn get_gpu_info() -> Vec<GpuInfo> {
     #[cfg(target_os = "windows")]
     {
-        use std::process::Command;
-
-        let output = Command::new("wmic")
+        let output = mrd_process::background_command("wmic")
             .args(["path", "win32_VideoController", "get", "name,AdapterRAM"])
             .output();
 

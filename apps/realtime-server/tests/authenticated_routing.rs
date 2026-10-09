@@ -87,6 +87,7 @@ fn token(device: &TestDevice, role: BackendRole, expires_at_ms: u64) -> Verified
         device_key_id: device.identity.key_id().into(),
         role,
         expires_at_ms,
+        browser: None,
     }
 }
 
@@ -333,6 +334,7 @@ fn register_requires_challenge_key_proof_and_unexpired_backend_token() {
             device_key_id: "victim-key-id".into(),
             role: BackendRole::Controller,
             expires_at_ms: NOW + 10_000,
+            browser: None,
         },
     );
     let mut guarded = RealtimeCore::new(config(), Arc::new(tokens)).unwrap();

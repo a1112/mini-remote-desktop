@@ -793,6 +793,12 @@ impl ServiceWebRtcTransportHost {
             .ok_or_else(|| ServiceWebRtcTransportError::SessionNotFound(session_id.clone()))
     }
 
+    /// Browser controllers currently authorize only the original ICE generation.
+    pub(crate) async fn active_wan_generation(&self, session_id: &SessionId) -> Option<u64> {
+        let session = self.session_entry(session_id).await.ok()?;
+        Some(session.peer.current_generation().await)
+    }
+
     /// Return the stable media mux only while it still represents the exact
     /// relay generation authorized by the WAN coordinator.
     pub(crate) async fn verified_media_mux(

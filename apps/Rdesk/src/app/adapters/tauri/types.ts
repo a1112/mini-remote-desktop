@@ -610,6 +610,19 @@ export interface AutostartStatus {
   supported: boolean;
 }
 
+/** The authoritative local service health snapshot returned by ServiceHealth. */
+export interface ServiceStatusInfo {
+  running: boolean;
+  healthy: boolean;
+  pid?: number | null;
+}
+
+export type CloseBehavior = 'hide_to_tray' | 'exit_ui';
+
+export interface UiPreferences {
+  close_behavior: CloseBehavior;
+}
+
 export interface ShellStatusSnapshot {
   service_pid: number;
   ui_pid: number | null;

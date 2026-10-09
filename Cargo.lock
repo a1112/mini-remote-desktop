@@ -123,6 +123,7 @@ dependencies = [
  "mrd-ipc",
  "mrd-observability",
  "mrd-pipeline-core",
+ "mrd-process",
  "mrd-proto",
  "mrd-render",
  "mrd-render-d3d11",
@@ -3339,6 +3340,7 @@ dependencies = [
  "mrd-ffmpeg",
  "mrd-observability",
  "mrd-pipeline-core",
+ "mrd-process",
  "openh264",
  "rust_h265",
  "serde_json",
@@ -3416,6 +3418,7 @@ dependencies = [
 name = "mrd-ffmpeg"
 version = "0.1.0"
 dependencies = [
+ "mrd-process",
  "reqwest 0.12.28",
  "serde",
  "sha2",
@@ -3541,6 +3544,10 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "mrd-process"
+version = "0.1.0"
 
 [[package]]
 name = "mrd-proto"
@@ -3689,6 +3696,7 @@ dependencies = [
  "mrd-ipc",
  "mrd-mobile-gateway",
  "mrd-pipeline-core",
+ "mrd-process",
  "mrd-proto",
  "mrd-relay-control",
  "mrd-render",
@@ -3769,6 +3777,7 @@ dependencies = [
  "mrd-proto",
  "mrd-signal-proto",
  "ring",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

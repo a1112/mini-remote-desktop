@@ -32,7 +32,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 #[derive(Debug, Clone)]
 pub struct ServerRuntimeConfig {
@@ -154,10 +154,38 @@ fn env_usize(
     Ok(value)
 }
 
+const SOCKET_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
+struct SocketShutdown {
+    final_message: Option<String>,
+}
+
+#[derive(Clone)]
+struct SocketPeer {
+    outbound: mpsc::Sender<String>,
+    shutdown: watch::Sender<Option<SocketShutdown>>,
+}
+
+impl SocketPeer {
+    fn close(&self, final_message: Option<String>) {
+        // First-wins: actor cleanup must not overwrite a target-signed close
+        // already selected for delivery to this terminating browser.
+        self.shutdown.send_if_modified(|state| {
+            if state.is_some() {
+                false
+            } else {
+                *state = Some(SocketShutdown { final_message });
+                true
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct RealtimeAppState {
     core: Arc<Mutex<RealtimeCore>>,
-    peers: Arc<Mutex<HashMap<ConnectionId, mpsc::Sender<String>>>>,
+    peers: Arc<Mutex<HashMap<ConnectionId, SocketPeer>>>,
     config: ServerRuntimeConfig,
     presence_authorization: Option<Arc<PresenceAuthorization>>,
 }
@@ -195,13 +223,11 @@ impl RealtimeAppState {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let expired = state.core.lock().await.prune(now_ms());
-                if !expired.is_empty() {
-                    let mut peers = state.peers.lock().await;
-                    for connection in expired {
-                        peers.remove(&connection);
-                    }
-                }
+                let mut core = state.core.lock().await;
+                let expired = core.prune(now_ms());
+                // Queue/close publication follows core order; no socket I/O is
+                // awaited while either shared registry is locked.
+                deliver_all(&state, Vec::new(), expired).await;
             }
         })
     }
@@ -234,6 +260,10 @@ pub fn build_router(state: RealtimeAppState) -> Router {
             "/internal/presence",
             post(private_presence).layer(DefaultBodyLimit::max(32 * 1024)),
         )
+        .route(
+            "/internal/identities",
+            post(private_identities).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .with_state(state)
 }
 
@@ -255,6 +285,33 @@ async fn private_presence(State(state): State<RealtimeAppState>, request: Reques
         let core = state.core.lock().await;
         core.presence_snapshot(&requested, now_ms())
     };
+    let mut response = Json(snapshot).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn private_identities(State(state): State<RealtimeAppState>, request: Request) -> Response {
+    let Some(authorization) = &state.presence_authorization else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !authorization.authorize(request.headers()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Json(query) = match Json::<PresenceQuery>::from_request(request, &state).await {
+        Ok(query) => query,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let Some(requested) = query.unique_device_ids() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let snapshot = state
+        .core
+        .lock()
+        .await
+        .identity_snapshot(&requested, now_ms());
     let mut response = Json(snapshot).into_response();
     response.headers_mut().insert(
         axum::http::header::CACHE_CONTROL,
@@ -324,6 +381,17 @@ fn forwarded_as_https(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
 }
 
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<Option<SocketShutdown>>) {
+    loop {
+        if shutdown.borrow().is_some() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
     let Ok(connection_id) = random_connection_id() else {
         return;
@@ -341,29 +409,61 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
     let (mut socket_sender, mut socket_receiver) = socket.split();
     let (outbound, mut outbound_receiver) =
         mpsc::channel::<String>(state.config.outbound_queue_capacity);
-    state
-        .peers
-        .lock()
-        .await
-        .insert(connection_id, outbound.clone());
-    let writer = tokio::spawn(async move {
-        while let Some(message) = outbound_receiver.recv().await {
+    let (shutdown, mut reader_shutdown) = watch::channel(None::<SocketShutdown>);
+    let mut writer_shutdown = reader_shutdown.clone();
+    let peer = SocketPeer {
+        outbound: outbound.clone(),
+        shutdown,
+    };
+    state.peers.lock().await.insert(connection_id, peer.clone());
+    let mut writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut writer_shutdown) => break,
+                message = outbound_receiver.recv() => {
+                    let Some(message) = message else { break };
+                    if socket_sender.send(Message::Text(message.into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        // Terminal signed close bypasses a full ordinary queue. Stop accepting
+        // old traffic, send the exact authenticated close, then the WS close.
+        outbound_receiver.close();
+        let closing = writer_shutdown.borrow().clone();
+        if let Some(SocketShutdown {
+            final_message: Some(message),
+        }) = closing
+        {
             if socket_sender
                 .send(Message::Text(message.into()))
                 .await
                 .is_err()
             {
-                break;
+                return;
             }
         }
+        let _ = socket_sender.send(Message::Close(None)).await;
     });
     let challenge = SignalEnvelope::new(AuthenticatedSignalMessage::ServerChallenge(challenge));
     if let Ok(encoded) = encode_authenticated_message(&challenge) {
         let _ = outbound.try_send(encoded);
     }
 
-    while let Some(result) = socket_receiver.next().await {
-        let Ok(message) = result else { break };
+    let mut writer_joined = false;
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut reader_shutdown) => break,
+            _ = &mut writer => {
+                writer_joined = true;
+                break;
+            }
+            result = socket_receiver.next() => result,
+        };
+        let Some(Ok(message)) = result else { break };
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
                 break;
@@ -381,19 +481,22 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
                 continue;
             }
         };
-        // Delay only at the transport boundary, outside the global core lock.
-        // The unmodified envelope is authenticated against a fresh real clock
-        // below; no timestamp, token lifetime or replay rule is relaxed.
+        // Waits and socket writes stay outside the core lock; shutdown cancels
+        // both idle reads and messages waiting for their authenticated time.
         tokio::select! {
-            _ = outbound.closed() => break,
+            biased;
+            _ = wait_for_shutdown(&mut reader_shutdown) => break,
+            _ = &mut writer => {
+                writer_joined = true;
+                break;
+            }
             _ = wait_until_message_issued(&envelope) => {},
         }
-        let deliveries = {
-            let mut core = state.core.lock().await;
-            core.handle(connection_id, envelope, now_ms())
-        };
+        let mut core = state.core.lock().await;
+        let deliveries = core.handle(connection_id, envelope, now_ms());
+        let terminal = core.take_transport_closures();
         match deliveries {
-            Ok(deliveries) => deliver_all(&state, deliveries).await,
+            Ok(deliveries) => deliver_all(&state, deliveries, terminal).await,
             Err(error) => {
                 tracing::warn!(
                     connection_id = ?connection_id,
@@ -401,29 +504,56 @@ async fn handle_socket(socket: WebSocket, state: RealtimeAppState) {
                     "authenticated realtime message rejected"
                 );
                 send_error(&outbound, error.reason_code());
+                deliver_all(&state, Vec::new(), terminal).await;
             }
         }
     }
 
+    peer.close(None);
+    drop(outbound);
+    if !writer_joined
+        && tokio::time::timeout(SOCKET_SHUTDOWN_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+    {
+        writer.abort();
+        // Await cancellation before capacity is freed: dropping a JoinHandle
+        // would leave a blocked writer and its queue/socket detached.
+        let _ = writer.await;
+    }
+    drop(socket_receiver);
     state.peers.lock().await.remove(&connection_id);
     state.core.lock().await.disconnect(connection_id);
-    writer.abort();
 }
 
-async fn deliver_all(state: &RealtimeAppState, deliveries: Vec<Delivery>) {
+async fn deliver_all(
+    state: &RealtimeAppState,
+    deliveries: Vec<Delivery>,
+    terminal: Vec<ConnectionId>,
+) {
+    let peers = state.peers.lock().await;
+    let mut final_messages = HashMap::new();
     for delivery in deliveries {
         let DeliveryTarget::Connection(connection_id) = delivery.target;
         let Ok(encoded) = encode_authenticated_message(&delivery.envelope) else {
             continue;
         };
-        let sender = state.peers.lock().await.get(&connection_id).cloned();
-        if let Some(sender) = sender {
-            if sender.try_send(encoded).is_err() {
+        if terminal.contains(&connection_id) {
+            final_messages.insert(connection_id, encoded);
+            continue;
+        }
+        if let Some(peer) = peers.get(&connection_id) {
+            if peer.shutdown.borrow().is_none() && peer.outbound.try_send(encoded).is_err() {
                 tracing::warn!(
                     connection_id = ?connection_id,
                     "realtime outbound queue full; dropping sender traffic"
                 );
             }
+        }
+    }
+    for connection_id in terminal {
+        if let Some(peer) = peers.get(&connection_id) {
+            peer.close(final_messages.remove(&connection_id));
         }
     }
 }
@@ -576,3 +706,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ws_lifecycle_tests.rs"]
+mod ws_lifecycle_tests;

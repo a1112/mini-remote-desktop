@@ -75,6 +75,39 @@ def test_enrollment_allocates_ten_digit_code_and_reuses_exact_retry(
     assert device_api.session.scalar(select(func.count()).select_from(Device)) == 2
 
 
+@pytest.mark.parametrize("reserved_identity", ["browser_kind", "browser_prefix"])
+def test_physical_enrollment_retry_cannot_return_browser_credentials(device_api, reserved_identity):
+    _use_savepoints(device_api)
+    token = _issue_device_enrollment(device_api)
+    payload = _register_payload("reserved-browser-identity")
+    first = device_api.client.post("/api/v1/devices/register", json=payload,
+                                   headers=_enrollment_headers(token))
+    assert first.status_code == 200
+    registered = device_api.session.scalar(select(Device).where(Device.device_id == first.json()["device_id"]))
+    if reserved_identity == "browser_kind":
+        registered.principal_kind = "browser_controller"
+    else:
+        registered.device_id = "browser_reserved"
+    device_api.session.commit()
+    retried = device_api.client.post("/api/v1/devices/register", json=payload,
+                                     headers=_enrollment_headers(token))
+    assert retried.status_code == 401
+    assert "access_token" not in retried.text
+
+
+@pytest.mark.parametrize("reserved_identity", ["browser_kind", "browser_prefix"])
+def test_admin_physical_registration_cannot_return_browser_credentials(device_api, reserved_identity):
+    if reserved_identity == "browser_kind":
+        device_api.device.principal_kind = "browser_controller"
+    else:
+        device_api.device.device_id = "browser_reserved"
+    device_api.session.commit()
+    response = device_api.client.post("/api/v1/devices/register", json=_register_payload("serial-a"),
+                                     headers={"Authorization": f"Bearer {device_api.admin_token}"})
+    assert response.status_code == 401
+    assert "access_token" not in response.text
+
+
 def test_database_code_collision_retries_with_numeric_code(
     device_api: SimpleNamespace, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

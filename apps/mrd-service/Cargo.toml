@@ -17,6 +17,7 @@ name = "wan_session_e2e"
 path = "tests/wan_session_e2e.rs"
 
 [dependencies]
+mrd-process = { path = "../../crates/mrd-process" }
 async-trait = "0.1"
 ed25519-dalek.workspace = true
 anyhow.workspace = true
@@ -100,6 +101,7 @@ production-vvc-software-codec = [
 
 [dev-dependencies]
 realtime-server = { path = "../realtime-server" }
+webrtc = "0.12"
 rusqlite.workspace = true
 tempfile = "3"
 

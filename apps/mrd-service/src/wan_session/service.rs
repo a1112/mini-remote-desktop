@@ -11,7 +11,7 @@ use super::{
         WanSessionCoordinatorError, WanSessionPortError, WanSessionWorkflowPorts,
     },
     media::{
-        enable_input_after_control_evidence, start_verified_media, WanMediaActivationError,
+        enable_input_after_control_evidence, start_verified_media_owned, WanMediaActivationError,
         WanMediaActivationPort, WanMediaActivationReceipt, WanMediaAuthority,
     },
     media_runtime::{start_controller_runtime, start_target_runtime},
@@ -804,11 +804,15 @@ impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
         {
             return Err(WanSessionPortError::Rejected);
         }
-        WanSessionApproval::new(
-            snapshot.granted_scopes.into_iter().map(wan_scope).collect(),
-            profile,
-        )
-        .map_err(|_| WanSessionPortError::Rejected)
+        // IPC and WAN scopes have different enum orderings. The v3 wire
+        // requires strictly ordered scopes for the exact approved grant.
+        let mut approved_scopes = snapshot
+            .granted_scopes
+            .into_iter()
+            .map(wan_scope)
+            .collect::<Vec<_>>();
+        approved_scopes.sort_unstable();
+        WanSessionApproval::new(approved_scopes, profile).map_err(|_| WanSessionPortError::Rejected)
     }
 }
 
@@ -1197,6 +1201,7 @@ async fn handle_initial_event(
         AuthenticatedSessionSignal::SessionIntentV3 { .. }
     ) {
         handle_target_intent(
+            &app_state,
             &coordinator,
             event,
             &local_device_id,
@@ -1229,6 +1234,7 @@ async fn handle_initial_event(
 }
 
 async fn handle_target_intent(
+    app_state: &Arc<crate::AppState>,
     coordinator: &WanSessionCoordinator,
     event: VerifiedSignalingEvent,
     local_device_id: &DeviceId,
@@ -1243,13 +1249,151 @@ async fn handle_target_intent(
     .map_err(|_| ())?;
     let session_id = verified.identity().session_id().clone();
     coordinator
-        .accept_verified_target_intent(verified)
+        .accept_verified_target_intent(verified.clone())
         .await
         .map_err(|_| ())?;
-    coordinator
-        .approve_target(&session_id)
+    // Capture the local consent policy before any backend approval/signaling
+    // awaits. The server policy revision is independently versioned.
+    let approval = async {
+        let local = app_state
+            .session_authorizations
+            .snapshot(&session_id)
+            .await
+            .ok_or(())?;
+        if local.role != mrd_ipc::RemoteSessionRole::Agent
+            || local.peer_device_id != *verified.identity().controller_device_id()
+            || local.peer_key_id != verified.identity().controller_key_fingerprint()
+        {
+            return Err(());
+        }
+        let local_policy_revision = local.policy_revision.get();
+        coordinator
+            .approve_target(&session_id)
+            .await
+            .map_err(|_| ())?;
+        let state = coordinator.snapshot(&session_id).await.map_err(|_| ())?;
+        install_target_authorization(app_state, &state, &verified, local_policy_revision)
+            .await
+            .map_err(|_| ())
+    }
+    .await;
+    if approval.is_err() {
+        // A published backend grant is insufficient if the local authorization
+        // was revoked or changed. Terminalize and release every runtime port.
+        let _ = fail_wan_session(app_state, &session_id, WanSessionFailure::PolicyMismatch).await;
+    }
+    approval
+}
+
+async fn install_target_authorization(
+    app_state: &Arc<crate::AppState>,
+    state: &WanSessionState,
+    verified: &VerifiedWanSessionIntent,
+    expected_local_policy_revision: u64,
+) -> Result<(), RemoteFailure> {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let now = now_unix_ms();
+    let identity = state.identity();
+    let local_device = app_state
+        .devices
+        .lock()
         .await
-        .map_err(|_| ())?;
+        .get_local_device()
+        .map(|(device, _)| device.clone())
+        .ok_or_else(controller_grant_mismatch)?;
+    let local_identity = app_state.device_identities.machine_identity();
+    let trust = app_state
+        .device_identities
+        .authenticated_peer_trust_current_key(
+            identity.controller_key_fingerprint(),
+            verified.controller_public_key(),
+        )
+        .map_err(|_| controller_grant_trust_invalid())?;
+    if matches!(
+        trust,
+        crate::app_state::AuthenticatedPeerTrust::Suspended
+            | crate::app_state::AuthenticatedPeerTrust::Revoked
+            | crate::app_state::AuthenticatedPeerTrust::EpochMismatch
+    ) {
+        return Err(controller_grant_trust_invalid());
+    }
+    let grant = state.grant().ok_or_else(controller_grant_mismatch)?;
+    let access = state.access().ok_or_else(controller_grant_mismatch)?;
+    let commitment = grant
+        .grant_commitment()
+        .ok_or_else(controller_grant_mismatch)?;
+    if state.role() != WanSessionRole::Target
+        || state.phase() != WanSessionPhase::AccessBound
+        || identity != verified.identity()
+        || identity.target_device_id() != &local_device
+        || identity.target_key_fingerprint() != Some(local_identity.key_id())
+        || state.request_commitment() != Some(verified.request_commitment())
+        || state.intent_commitment() != Some(verified.intent_commitment())
+        || grant.request_commitment() != verified.request_commitment()
+        || grant.route_policy() != verified.request().route_policy
+        || access.policy_revision() != grant.policy_revision()
+        || access.generation() != 0
+        || decode_sha256(commitment).is_none()
+        || now >= grant.grant_expires_at_ms()
+        || now >= grant.policy_expires_at_ms()
+        || grant.grant_expires_at_ms() > identity.deadline_unix_ms()
+        || grant.policy_expires_at_ms() > identity.deadline_unix_ms()
+    {
+        return Err(controller_grant_mismatch());
+    }
+    let mut scopes = grant
+        .approved_scopes()
+        .iter()
+        .copied()
+        .map(ipc_scope)
+        .collect::<Vec<_>>();
+    scopes.sort_unstable();
+    let existing = app_state
+        .session_authorizations
+        .snapshot_at(identity.session_id(), now)
+        .await
+        .ok_or_else(controller_grant_mismatch)?;
+    if existing.role != mrd_ipc::RemoteSessionRole::Agent
+        || existing.access_mode != mrd_ipc::RemoteAccessMode::Attended
+        || existing.peer_device_id != *identity.controller_device_id()
+        || existing.peer_key_id != identity.controller_key_fingerprint()
+        || existing.granted_scopes != scopes
+    {
+        return Err(controller_grant_mismatch());
+    }
+    let mut authorization = crate::session_authorization::VerifiedSessionGrant {
+        grant_id: format!("sha256:{commitment}"),
+        session_id: identity.session_id().clone(),
+        granted_scopes: scopes,
+        issued_at_ms: now,
+        expires_at_ms: grant.grant_expires_at_ms(),
+        policy_revision: grant.policy_revision(),
+        route_constraint: "webrtc_relay".to_owned(),
+        transport_fingerprint_sha256: decode_sha256(access.relay_url_digest())
+            .ok_or_else(controller_grant_mismatch)?,
+    };
+    app_state
+        .session_authorizations
+        .bind_authenticated_peer_key(identity.session_id(), verified.controller_public_key(), now)
+        .await?;
+    if existing.authorization_state == RemoteAuthorizationState::Granted {
+        let current = app_state
+            .session_authorizations
+            .active_grant(identity.session_id())
+            .await;
+        if let Some(current) = current.as_ref() {
+            authorization.issued_at_ms = current.issued_at_ms;
+        }
+        return if current.as_ref() == Some(&authorization) {
+            Ok(())
+        } else {
+            Err(controller_grant_mismatch())
+        };
+    }
+    app_state
+        .session_authorizations
+        .install_verified_wan_target_grant(authorization, expected_local_policy_revision, now)
+        .await?;
     Ok(())
 }
 
@@ -1551,40 +1695,84 @@ async fn spawn_generation_zero(
         WAN_NEGOTIATION_TIMEOUT,
     )
     .map_err(|_| ())?;
+    if super::browser_authority::requires_browser_authority_watch(&state) {
+        let watch_app = Arc::clone(&app_state);
+        let watch_session = session_id.clone();
+        let watch_backend = Arc::clone(&backend);
+        let watch_coordinator = Arc::clone(&coordinator);
+        coordinator
+            .spawn_owned_task(session_id, move |cancellation| async move {
+                let owned_cancellation = cancellation.into_receiver();
+                if let Some(failure) = super::browser_authority::monitor_browser_authority(
+                    watch_backend.as_ref(),
+                    &state,
+                    owned_cancellation.clone(),
+                    Duration::from_secs(2),
+                    Duration::from_secs(2),
+                    Some(watch_app.webrtc_host.as_ref()),
+                )
+                .await
+                {
+                    let _ = fail_owned_wan_session(
+                        &watch_app,
+                        &watch_coordinator,
+                        &watch_session,
+                        &owned_cancellation,
+                        failure,
+                    )
+                    .await;
+                }
+            })
+            .await
+            .map_err(|_| ())?;
+    }
     let media = Arc::new(ServiceWanMediaActivationPort::new(&app_state));
     let failure_app_state = Arc::clone(&app_state);
     let owned_session_id = session_id.clone();
     let task_coordinator = Arc::clone(&coordinator);
     coordinator
         .spawn_owned_task(session_id, move |cancellation| async move {
+            let owned_cancellation = cancellation.into_receiver();
             let outcome = negotiator
                 .negotiate_with_cancellation(
                     context,
                     verified_access.as_ref(),
-                    cancellation.into_receiver(),
+                    owned_cancellation.clone(),
                 )
                 .await;
             if let Err(error) = outcome {
-                // Always reconcile through the service terminalizer. Some
-                // coordinator commit errors are already terminal, while host
-                // errors remain live for this wrapper to fail; both require the
-                // same authorization-gated public projection.
-                let _ = fail_wan_session(
+                finish_negotiation_failure(
                     &failure_app_state,
+                    &task_coordinator,
                     &owned_session_id,
-                    negotiation_failure(error),
+                    &owned_cancellation,
+                    error,
                 )
                 .await;
+                return;
+            }
+            if *owned_cancellation.borrow() {
                 return;
             }
             if let Ok(state) = task_coordinator.snapshot(&owned_session_id).await {
                 let authority = WanMediaAuthority::from_relay_verified(&state);
                 let activation = async {
                     let authority = authority?;
-                    start_verified_media(task_coordinator.as_ref(), &state, media.as_ref()).await?;
-                    reconcile_wan_session(&failure_app_state, &owned_session_id)
-                        .await
-                        .map_err(|_| WanMediaActivationError::CoordinatorFailure)?;
+                    start_verified_media_owned(
+                        task_coordinator.as_ref(),
+                        &state,
+                        media.as_ref(),
+                        &owned_cancellation,
+                        &failure_app_state.authorization_security_gate,
+                    )
+                    .await?;
+                    reconcile_owned_wan_session(
+                        &failure_app_state,
+                        &owned_session_id,
+                        &owned_cancellation,
+                    )
+                    .await
+                    .map_err(|_| WanMediaActivationError::CoordinatorFailure)?;
                     if authority.role() == WanSessionRole::Target
                         && (authority.allows_scope(WanPermissionScopeV3::InputPointer)
                             || authority.allows_scope(WanPermissionScopeV3::InputKeyboard))
@@ -1597,19 +1785,116 @@ async fn spawn_generation_zero(
                 }
                 .await;
                 if activation.is_err() {
-                    let _ = fail_wan_session(
+                    let _ = fail_owned_wan_session(
                         &failure_app_state,
+                        &task_coordinator,
                         &owned_session_id,
+                        &owned_cancellation,
                         WanSessionFailure::Transport,
                     )
                     .await;
                 } else {
-                    let _ = reconcile_wan_session(&failure_app_state, &owned_session_id).await;
+                    let _ = reconcile_owned_wan_session(
+                        &failure_app_state,
+                        &owned_session_id,
+                        &owned_cancellation,
+                    )
+                    .await;
                 }
             }
         })
         .await
         .map_err(|_| ())
+}
+
+// An owned task must not wait for a gate held by a sibling that is cancelling
+// and joining it. Cancellation interrupts even a previously queued gate lock.
+async fn owned_authorization_guard<'a>(
+    app_state: &'a crate::AppState,
+    cancellation: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    let mut cancellation = cancellation.clone();
+    let guard = tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if *cancellation.borrow() { return; }
+                if cancellation.changed().await.is_err() { return; }
+            }
+        } => return None,
+        guard = app_state.authorization_security_gate.lock() => guard,
+    };
+    if *cancellation.borrow() {
+        None
+    } else {
+        Some(guard)
+    }
+}
+
+async fn fail_owned_wan_session(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    owned_cancellation: &tokio::sync::watch::Receiver<bool>,
+    failure: WanSessionFailure,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    if *owned_cancellation.borrow()
+        || coordinator
+            .snapshot(session_id)
+            .await?
+            .phase()
+            .is_terminal()
+    {
+        return Ok(None);
+    }
+    let Some(_guard) = owned_authorization_guard(app_state, owned_cancellation).await else {
+        return Ok(None);
+    };
+    if coordinator
+        .snapshot(session_id)
+        .await?
+        .phase()
+        .is_terminal()
+    {
+        return Ok(None);
+    }
+    terminalize_wan_session_under_security_gate(
+        app_state,
+        session_id,
+        ServiceWanTerminalRequest::Fail {
+            failure,
+            remote_failure: wan_remote_failure(failure),
+        },
+    )
+    .await
+}
+
+async fn reconcile_owned_wan_session(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    cancellation: &tokio::sync::watch::Receiver<bool>,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    let Some(_guard) = owned_authorization_guard(app_state, cancellation).await else {
+        return Err(WanSessionCoordinatorError::SessionTerminal);
+    };
+    reconcile_wan_session_under_security_gate(app_state, session_id).await
+}
+
+async fn finish_negotiation_failure(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    owned_cancellation: &tokio::sync::watch::Receiver<bool>,
+    error: GenerationZeroNegotiationError,
+) {
+    let _ = fail_owned_wan_session(
+        app_state,
+        coordinator,
+        session_id,
+        owned_cancellation,
+        negotiation_failure(error),
+    )
+    .await;
 }
 
 fn negotiation_failure(error: GenerationZeroNegotiationError) -> WanSessionFailure {
@@ -1630,3 +1915,11 @@ fn negotiation_failure(error: GenerationZeroNegotiationError) -> WanSessionFailu
         | GenerationZeroNegotiationError::AlreadyOwned => WanSessionFailure::Transport,
     }
 }
+
+#[cfg(test)]
+#[path = "target_authority_tests.rs"]
+mod target_authority_tests;
+
+#[cfg(test)]
+#[path = "cleanup_reentrancy_tests.rs"]
+mod cleanup_reentrancy_tests;

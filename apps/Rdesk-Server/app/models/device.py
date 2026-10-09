@@ -22,6 +22,10 @@ class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (
         CheckConstraint(
+            "principal_kind IN ('physical', 'browser_controller')",
+            name="ck_devices_principal_kind",
+        ),
+        CheckConstraint(
             "length(tenant_id) BETWEEN 1 AND 64",
             name="ck_devices_tenant_id",
         ),
@@ -52,6 +56,9 @@ class Device(Base):
     )
     name: Mapped[str] = mapped_column(String(128), index=True)
     device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    principal_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="physical", server_default=text("'physical'")
+    )
     os: Mapped[str] = mapped_column(String(64))
     icon: Mapped[str] = mapped_column(String(32), default="Monitor")
     location: Mapped[str] = mapped_column(String(64), default="")

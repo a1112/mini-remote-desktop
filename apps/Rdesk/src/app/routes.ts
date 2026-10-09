@@ -6,6 +6,7 @@ import { DevicesPage } from "./components/DevicesPage";
 import { DeviceDetailPage } from "./components/DeviceDetailPage";
 import { RemoteSessionPage } from "./components/RemoteSessionPage";
 import { RemoteDisplayWindowPage } from "./components/RemoteDisplayWindowPage";
+import { BrowserRemoteSessionPage } from "./components/BrowserRemoteSessionPage";
 import { TestPage } from "./components/TestPage";
 // Test Workbench
 import {
@@ -26,6 +27,10 @@ import {
 } from "./components/TestWorkbench";
 
 export const router = createBrowserRouter([
+  {
+    path: "/browser-session/:id",
+    Component: BrowserRemoteSessionPage,
+  },
   {
     path: "/session/:id",
     Component: RemoteSessionPage,

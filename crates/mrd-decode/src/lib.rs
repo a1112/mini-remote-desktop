@@ -7,10 +7,12 @@ use openh264::{
     decoder::{DecodedYUV, Decoder as OpenH264Decoder},
     formats::YUVSource,
 };
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::{
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -1121,7 +1123,7 @@ impl FfmpegCliDecoder {
             }
         }
 
-        let mut child = Command::new(&self.ffmpeg_path)
+        let mut child = mrd_process::background_command(&self.ffmpeg_path)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

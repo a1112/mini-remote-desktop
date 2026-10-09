@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
 
 const mocks = vi.hoisted(() => ({ getStatus: vi.fn() }));
+vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => true }));
 vi.mock("./ThemeContext", () => ({ useTheme: () => ({ isDark: false }) }));
 vi.mock("../adapters/tauri/commands", () => ({
   ipcPublicServerStatus: mocks.getStatus,

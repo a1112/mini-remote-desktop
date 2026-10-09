@@ -714,8 +714,35 @@ impl SessionAuthorizationRegistry {
 
     pub async fn install_verified_grant(
         &self,
+        grant: VerifiedSessionGrant,
+        installed_at_ms: u64,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        self.install_verified_grant_inner(grant, installed_at_ms, None)
+            .await
+    }
+
+    /// A WAN target has an independently versioned backend policy. Only the
+    /// service verified-intent boundary may exchange the exact local consent
+    /// revision for that policy after binding the authenticated controller key.
+    pub(crate) async fn install_verified_wan_target_grant(
+        &self,
+        grant: VerifiedSessionGrant,
+        expected_local_policy_revision: u64,
+        installed_at_ms: u64,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        self.install_verified_grant_inner(
+            grant,
+            installed_at_ms,
+            Some(expected_local_policy_revision),
+        )
+        .await
+    }
+
+    async fn install_verified_grant_inner(
+        &self,
         mut grant: VerifiedSessionGrant,
         installed_at_ms: u64,
+        wan_local_policy_revision: Option<u64>,
     ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
         normalize_scopes(&mut grant.granted_scopes);
         let mut inner = self.inner.lock().await;
@@ -740,8 +767,24 @@ impl SessionAuthorizationRegistry {
         } else {
             grant.granted_scopes == record.snapshot.granted_scopes
         };
-        let policy_binding_is_valid = record.snapshot.role == RemoteSessionRole::Controller
-            || grant.policy_revision == record.snapshot.policy_revision.get();
+        let policy_binding_is_valid = match wan_local_policy_revision {
+            Some(expected_revision) => {
+                record.snapshot.role == RemoteSessionRole::Agent
+                    && record.request.access_mode == RemoteAccessMode::Attended
+                    && record.request.transport_kind == "webrtc_relay"
+                    && record.snapshot.policy_revision.get() == expected_revision
+                    && record
+                        .peer_public_key
+                        .is_some_and(|key| public_key_id(&key) == record.request.peer_key_id)
+                    && installed_at_ms < record.request.expires_at_ms
+                    && grant.expires_at_ms <= record.request.expires_at_ms
+                    && grant.policy_revision > 0
+            }
+            None => {
+                record.snapshot.role == RemoteSessionRole::Controller
+                    || grant.policy_revision == record.snapshot.policy_revision.get()
+            }
+        };
         let Some(route_kind) = remote_route_kind(&record.request.transport_kind) else {
             return Err(failure(
                 RemoteReasonCode::PolicyChanged,

@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   initialize: vi.fn(),
   waitForRemoteSessionStreaming: vi.fn(),
   runtime: { isTauri: true },
+  createBrowserRemoteSession: vi.fn(),
 }));
 
 const DEFAULT_HEVC_1080P60_PROFILE = {
@@ -76,6 +77,10 @@ vi.mock("./webRemoteSessionService", () => ({
   saveWebRemoteSession: mocks.saveWebRemoteSession,
 }));
 
+vi.mock("./browserRemoteSessionService", () => ({
+  createBrowserRemoteSession: mocks.createBrowserRemoteSession,
+}));
+
 vi.mock("./remoteSessionStateService", () => ({
   waitForRemoteSessionStreaming: mocks.waitForRemoteSessionStreaming,
 }));
@@ -84,6 +89,7 @@ describe("launchRemoteDisplayForDevice", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.runtime.isTauri = true;
+    mocks.createBrowserRemoteSession.mockResolvedValue({ sessionId: "browser-peer-session" });
     mocks.openRemoteDisplayWindow.mockResolvedValue({
       ok: true,
       value: { label: "render-local-display-test-1" },
@@ -305,19 +311,35 @@ describe("launchRemoteDisplayForDevice", () => {
     expect(result.captureSourceSelection?.source.id).toBe("windows:window:0x1234");
   });
 
-  it("fails closed instead of simulating a peer connection in a browser", async () => {
+  it("requests an authenticated browser session without a local service", async () => {
     mocks.runtime.isTauri = false;
 
-    await expect(
-      launchRemoteDisplayForDevice("remote-device", {
-        sessionId: "browser-peer-session",
-        transportKind: "webrtc",
-      }),
-    ).rejects.toThrow("Secure remote sessions require the desktop client");
+    const result = await launchRemoteDisplayForDevice("remote-device", {
+      sessionId: "browser-peer-session",
+      transportKind: "quic",
+      targetDeviceName: "Remote Mac",
+      targetOs: "macOS",
+    });
 
+    expect(mocks.createBrowserRemoteSession).toHaveBeenCalledWith("remote-device", {
+      sessionId: "browser-peer-session",
+      targetDeviceName: "Remote Mac",
+      targetOs: "macOS",
+    });
+    expect(result).toEqual({ sessionId: "browser-peer-session", windowLabel: null, mode: "route", routePath: "/browser-session/browser-peer-session" });
     expect(mocks.saveWebRemoteSession).not.toHaveBeenCalled();
     expect(mocks.requestRemoteSession).not.toHaveBeenCalled();
     expect(mocks.openRemoteDisplayWindow).not.toHaveBeenCalled();
+    expect(mocks.getDeviceInfo).not.toHaveBeenCalled();
+    expect(mocks.initialize).not.toHaveBeenCalled();
+  });
+
+  it("does not navigate when the browser authorization request fails", async () => {
+    mocks.runtime.isTauri = false;
+    mocks.createBrowserRemoteSession.mockRejectedValue(new Error("Browser login required"));
+    await expect(launchRemoteDisplayForDevice("remote-device")).rejects.toThrow("Browser login required");
+    expect(mocks.saveWebRemoteSession).not.toHaveBeenCalled();
+    expect(mocks.requestRemoteSession).not.toHaveBeenCalled();
   });
 
   it("retains the explicit browser-local WebRTC self-test", async () => {

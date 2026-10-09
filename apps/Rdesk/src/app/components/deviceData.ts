@@ -360,12 +360,16 @@ export function useDevices(options?: UseDevicesOptions) {
     let localDevice: Device | null = null;
 
     try {
-      [lanDevices, localDevice] = await Promise.all([
-        fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
-        fetchLocalDevice(),
-        deviceActionService.refreshDevicePreferences(),
-      ]);
-      setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
+      if (isTauriRuntime()) {
+        [lanDevices, localDevice] = await Promise.all([
+          fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
+          fetchLocalDevice(),
+          deviceActionService.refreshDevicePreferences(),
+        ]);
+        setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
+      } else {
+        setCurrentDeviceId(null);
+      }
 
       if (!isLoggedIn || !token) {
         setDevices(mergeDevices([], lanDevices, localDevice));

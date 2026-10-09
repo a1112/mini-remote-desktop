@@ -16,6 +16,7 @@ const adapter = vi.hoisted(() => ({
 const windowApi = vi.hoisted(() => ({
   getLabel: vi.fn(),
 }));
+vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => true }));
 
 vi.mock("../adapters/tauri", () => ({
   ipcGetRemoteSession: adapter.getRemoteSession,
