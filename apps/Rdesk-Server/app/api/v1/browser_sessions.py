@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 import re
 import hashlib
@@ -30,13 +31,15 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 router = APIRouter(prefix="/browser-sessions", tags=["browser-sessions"], route_class=DeviceSessionAPIRoute)
 
 
-async def _response(db, row, principal, shadow):
+async def _response(db, row, principal, shadow, *, authority_service=None):
     target_id = row.request_payload["target_device_id"]
     binding = BrowserCredentialBinding(session_id=row.id, user_id=principal.user_id,
         user_session_version=principal.user_session_version, tenant_id=principal.tenant_id,
         controller_row_id=shadow.id, controller_device_id=shadow.device_id,
         controller_key_id=principal.key_id, target_row_id=row.target_device_id,
-        target_device_id=target_id, request_commitment=row.request_commitment)
+        target_device_id=target_id, request_commitment=row.request_commitment,
+        authority_kind=principal.authority_kind, temporary_access_generation=principal.temporary_access_generation,
+        target_auth_version=principal.target_auth_version)
     server_key = settings.public_signal_server_key_id
     relay_key = settings.relay_directory_signing_key_id
     server_id = settings.public_signal_server_device_id
@@ -59,6 +62,7 @@ async def _response(db, row, principal, shadow):
     if not isinstance(target_key, str) or re.fullmatch(r"[0-9a-f]{64}", target_key, re.ASCII) is None:
         raise HTTPException(status_code=503, detail={"code": "browser_identity_unavailable",
                             "message": "Trusted target connection identity is unavailable"})
+    binding = replace(binding, target_key_id=target_key)
     try:
         seed = _decode_secret_b64(settings.relay_directory_signing_private_key, expected_length=32)
         relay_public = Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
@@ -67,7 +71,7 @@ async def _response(db, row, principal, shadow):
     except (ValueError, TypeError, binascii.Error):
         raise HTTPException(status_code=503, detail={"code": "browser_identity_unavailable",
                             "message": "Trusted relay directory identity is unavailable"}) from None
-    row, principal, shadow = await BrowserSessionService(db).revalidate_for_credential(binding)
+    row, principal, shadow = await (authority_service or BrowserSessionService(db)).revalidate_for_credential(binding)
     base = issue_signaling_credential(shadow, SignalingCredentialRequest(
         device_key_id=principal.key_id, role="Controller"))
     configured = _configured_device_jwt()
@@ -83,6 +87,9 @@ async def _response(db, row, principal, shadow):
         "user_id": principal.user_id, "tenant_id": principal.tenant_id,
         "session_id": row.id, "target_device_id": row.request_payload["target_device_id"],
         "allowed_scopes": list(row.approved_scopes if row.status == "approved" else principal.allowed_scopes)}
+    if principal.authority_kind == "temporary_password":
+        claims.update(token_type="guest_browser_signaling", authority_kind="temporary_password",
+            temporary_access_generation=principal.temporary_access_generation, target_auth_version=principal.target_auth_version)
     return BrowserSessionOut(controller_device_id=shadow.device_id, controller_key_id=principal.key_id,
         signaling_url=signaling_url, signaling_server_device_id=server_id,
         signaling_server_key_id=server_key, target_key_id=target_key, relay_directory_key_id=relay_key,

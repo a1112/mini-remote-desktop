@@ -1338,6 +1338,7 @@ def _verify_relay_access_generation_table(
 
 def _verify(connection: object, schema: str | None) -> None:
     inspector = inspect(connection)
+    guest_authority_check = None
     effective_schema = schema or connection.scalar(text("SELECT current_schema()"))
     if not isinstance(effective_schema, str):
         raise RelayAccessMigrationError("relay access schema is invalid")
@@ -1358,6 +1359,14 @@ def _verify(connection: object, schema: str | None) -> None:
             column["name"]: column
             for column in inspector.get_columns(table_name, schema=schema)
         }
+        if table_name == "session_requests" and "authority_kind" in columns:
+            from app.db.migrate_add_guest_temporary_access import verify_guest_session_authority
+            try:
+                guest_authority_check = verify_guest_session_authority(connection, schema, inspector=inspector)
+            except RuntimeError as error:
+                raise RelayAccessMigrationError("relay guest authority schema differs") from error
+            expected = dict(expected)
+            expected["requester_user_id"] = (String, 36, True)
         for name, (expected_type, length, nullable) in expected.items():
             column = columns.get(name)
             if (
@@ -1505,6 +1514,8 @@ def _verify(connection: object, schema: str | None) -> None:
         required_checks["session_requests"]["ck_session_requests_relay_max_backups"] = (
             "relay_max_backups >= 0 AND relay_max_backups <= 7"
         )
+    if guest_authority_check is not None:
+        required_checks["session_requests"]["ck_session_requests_authority"] = guest_authority_check
     for table_name, expected in required_checks.items():
         checks = {
             item["name"]: _normalize_check_expression(item["sqltext"])

@@ -105,6 +105,10 @@ fn product_request_is_allowed(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetTemporaryAccessStatus
+            | IpcRequest::ReadTemporaryAccessPassword
+            | IpcRequest::RotateTemporaryAccessPassword
+            | IpcRequest::DisableTemporaryAccess
             | IpcRequest::GetPublicDeviceBindingProtocol
             | IpcRequest::BindPublicDevice { .. }
             | IpcRequest::UnbindPublicDevice { .. }

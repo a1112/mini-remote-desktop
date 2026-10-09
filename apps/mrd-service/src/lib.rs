@@ -27,6 +27,8 @@ pub mod session_authorization;
 pub mod shell;
 pub mod shutdown;
 pub mod signaling;
+pub mod temporary_access;
+mod temporary_access_http;
 pub mod transports;
 pub mod wake_on_lan;
 pub mod wan_session;

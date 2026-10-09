@@ -30,6 +30,80 @@ async function successfulBootstrap(init: RequestInit) {
   }));
 }
 
+async function successfulGuestBootstrap(init: RequestInit) {
+  const body = JSON.parse(init.body as string);
+  delete body.temporary_password;
+  const response = await successfulBootstrap({ ...init, body: JSON.stringify(body) });
+  return new Response(JSON.stringify({ ...await response.json(), http_credential: { token: 'guest-http-only', expires_at_ms: Date.now() + 500000 } }));
+}
+
+describe('temporary password guest browser access', () => {
+  it('connects without account login and sends the password only to the guest create endpoint', async () => {
+    const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    const created = await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    expect(created.sessionId).toMatch(/^[a-f0-9-]{36}$/);
+    const [url, init] = request.mock.calls[0]!;
+    expect(url).toMatch(/\/guest-browser-sessions$/);
+    expect(init.headers).not.toHaveProperty('Authorization');
+    expect(init.credentials).toBe('omit');
+    expect(JSON.parse(init.body as string)).toMatchObject({ temporary_password: 'ABCD2345', access_mode: 'attended', target_device_id: '753662296' });
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+    await closeAllBrowserRemoteSessions('leave');
+    const [closeUrl, closeInit] = request.mock.calls[request.mock.calls.length - 1]!;
+    expect(closeUrl).toMatch(new RegExp(`/guest-browser-sessions/${created.sessionId}/close$`));
+    expect(closeInit.headers).toMatchObject({ Authorization: 'Bearer guest-http-only' });
+    expect(closeInit.body).not.toContain('ABCD2345');
+  });
+
+  it('uses a separate guest credential even when an account is already logged in', async () => {
+    localStorage.setItem('rdesk_access_token', 'account-credential');
+    const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    expect(request.mock.calls[0]![1].headers).not.toHaveProperty('Authorization');
+    await closeAllBrowserRemoteSessions();
+    expect(request.mock.calls[request.mock.calls.length - 1]![1].headers).toMatchObject({ Authorization: 'Bearer guest-http-only' });
+    expect(localStorage.getItem('rdesk_access_token')).toBe('account-credential');
+  });
+
+  it('rejects empty and malformed guest passwords before contacting the server', async () => {
+    const request = vi.fn(); vi.stubGlobal('fetch', request);
+    await expect(createBrowserRemoteSession('753662296', { temporaryPassword: '' })).rejects.toThrow('临时密码');
+    await expect(createBrowserRemoteSession('753662296', { temporaryPassword: 'bad/pwd' })).rejects.toThrow('临时密码');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('closes a late guest POST with its guest credential after local cancellation', async () => {
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const request = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/guest-browser-sessions')) { entered = true; await gate; return successfulGuestBootstrap(init); }
+      return new Response('{}');
+    });
+    vi.stubGlobal('fetch', request);
+    const creating = createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    const outcome = creating.catch(error => error);
+    await until(() => entered); await closeAllBrowserRemoteSessions(); release();
+    expect((await outcome).message).toContain('取消');
+    const close = request.mock.calls.filter(([url]) => url.endsWith('/close'));
+    expect(close).toHaveLength(1);
+    expect(close[0]![1].headers).toMatchObject({ Authorization: 'Bearer guest-http-only' });
+  });
+
+  it('rejects a missing or expired guest HTTP credential instead of using the signaling token', async () => {
+    const request = vi.fn(async (_url: string, init: RequestInit) => {
+      const response = await successfulGuestBootstrap(init);
+      const body = await response.json(); body.http_credential = { token: 'guest-http-only', expires_at_ms: Date.now() - 1 };
+      return new Response(JSON.stringify(body));
+    });
+    vi.stubGlobal('fetch', request);
+    await expect(createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' })).rejects.toThrow('访客');
+    expect(localStorage.length).toBe(0);
+  });
+});
+
 describe('independent browser remote session bootstrap', () => {
   it('requires the actual logged-in user and never contacts a localhost service', async () => {
     const request = vi.fn();

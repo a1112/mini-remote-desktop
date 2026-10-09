@@ -121,7 +121,7 @@ def test_browser_migration_rejects_drifted_identity_and_lifecycle_constraints(be
     ("public_key BLOB", "public_key VARCHAR(32)"),
     ("allowed_scopes JSON", "allowed_scopes TEXT"),
     ("revoked_at DATETIME", "revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP"),
-    ("user_session_version INTEGER NOT NULL", "user_session_version INTEGER NOT NULL DEFAULT 1"),
+    ("user_session_version INTEGER", "user_session_version INTEGER DEFAULT 1"),
 ])
 def test_browser_migration_rejects_drifted_principal_table_column_contract(before, after):
     from app.db.migrate_add_browser_controllers import migrate_connection

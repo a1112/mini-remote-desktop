@@ -57,6 +57,12 @@ fn accepts_session_bound_browser_controller_signaling_credentials() {
     );
     assert_eq!(result.role, BackendRole::Controller);
     assert_eq!(result.expires_at_ms, NOW + 300_000);
+    assert_eq!(
+        result.browser.unwrap().authority,
+        realtime_server::auth::BrowserSignalingAuthority::Account {
+            user_id: "user-1".into()
+        }
+    );
 }
 
 #[test]

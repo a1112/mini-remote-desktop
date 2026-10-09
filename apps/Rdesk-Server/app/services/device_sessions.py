@@ -248,23 +248,24 @@ class DeviceSessionService:
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
+            guest = row is not None and row.authority_kind == "temporary_password"
             if (
                 row is None
                 or row.requester_device_id != getattr(controller, "id", None)
                 or row.target_device_id != getattr(target, "id", None)
                 or caller is None
                 or current_device.id != auth_snapshot.row_id
-                or not _matches_auth_snapshot(caller, auth_snapshot)
+                or not _matches_auth_snapshot(caller, auth_snapshot, allow_unbound=guest)
                 or not _is_authorized_participant(row, caller)
                 or controller is None
                 or target is None
-                or not _is_active_device(controller)
-                or not _is_active_device(target)
-                or controller.bound_user_id != row.requester_user_id
-                or users_by_id.get(controller.bound_user_id) is None
-                or users_by_id.get(target.bound_user_id) is None
-                or users_by_id[controller.bound_user_id].tenant_id != row.tenant_id
-                or users_by_id[target.bound_user_id].tenant_id != row.tenant_id
+                or (not guest and (not _is_active_device(controller)
+                    or not _is_active_device(target)
+                    or controller.bound_user_id != row.requester_user_id
+                    or users_by_id.get(controller.bound_user_id) is None
+                    or users_by_id.get(target.bound_user_id) is None
+                    or users_by_id[controller.bound_user_id].tenant_id != row.tenant_id
+                    or users_by_id[target.bound_user_id].tenant_id != row.tenant_id))
             ):
                 _not_found()
             request = device_session_out(row).request
@@ -319,6 +320,8 @@ class DeviceSessionService:
                     target_device=target,
                     generation=active_generation,
                 )
+                if guest:
+                    await self._require_guest_approval_authority(row)
                 return row
             if row.status != "requested":
                 _conflict()
@@ -330,6 +333,10 @@ class DeviceSessionService:
                 now=now,
                 set_status=False,
             )
+            if guest:
+                deadline = _utc(row.authority_expires_at)
+                row.grant_expires_at = min(_utc(row.grant_expires_at), deadline)
+                row.policy_expires_at = min(_utc(row.policy_expires_at), deadline)
             row.approved_scopes = approved_scopes
             row.approved_profile = approved_profile
             await relay_access.create_wan_generation_locked(
@@ -337,6 +344,8 @@ class DeviceSessionService:
                 target_device=target,
                 generation=0,
             )
+            if guest:
+                await self._require_guest_approval_authority(row)
             self._audit(
                 action="wan_session_approved",
                 row=row,
@@ -344,6 +353,23 @@ class DeviceSessionService:
             )
             await self._session.flush()
             return row
+
+    async def _require_guest_approval_authority(self, row: SessionRequest) -> None:
+        # Capacity and reservation validation await external work. Reject if the
+        # short authority expires while those calls are in progress; the caller
+        # rolls back the newly created generation and reservations atomically.
+        if not await browser_authority_valid(self._session, row, now=self._now()):
+            _not_found()
+        at = _utc(self._now())
+        if any(
+            not isinstance(deadline, datetime) or _utc(deadline) <= at
+            for deadline in (
+                row.authority_expires_at,
+                row.grant_expires_at,
+                row.policy_expires_at,
+            )
+        ):
+            _not_found()
 
     async def transition(
         self,
@@ -520,7 +546,11 @@ def device_session_out(row: SessionRequest) -> DeviceSessionOut:
             )
         ):
             _conflict()
+        guest = getattr(row, "authority_kind", "account") == "temporary_password"
         return DeviceSessionOut(
+            authority_kind="temporary_password" if guest else None,
+            temporary_access_generation=row.temporary_access_generation if guest else None,
+            target_auth_version=row.target_auth_version if guest else None,
             session_id=row.id,
             request=request,
             request_commitment=row.request_commitment,
@@ -537,8 +567,14 @@ def device_session_out(row: SessionRequest) -> DeviceSessionOut:
 
 
 def _is_authorized_participant(row: SessionRequest, device: Device) -> bool:
+    guest = getattr(row, "authority_kind", "account") == "temporary_password"
     return (
-        _is_active_device(device)
+        (_is_active_device(device) or (guest and device.auth_revoked_at is None
+            and _valid_tenant(device.tenant_id)
+            and ((device.id == row.target_device_id and device.principal_kind == "physical"
+                  and device.auth_version == row.target_auth_version)
+                 or (device.id == row.requester_device_id and device.principal_kind == "browser_controller"
+                     and not device.is_bound and device.bound_user_id is None))))
         and row.tenant_id == device.tenant_id
         and row.requester_device_id is not None
         and row.access_mode == "attended"
@@ -561,11 +597,11 @@ def _is_active_device(device: Device) -> bool:
 
 
 def _matches_auth_snapshot(
-    device: Device, snapshot: DeviceAuthSnapshot
+    device: Device, snapshot: DeviceAuthSnapshot, *, allow_unbound: bool = False
 ) -> bool:
     return (
         snapshot.auth_revoked_at is None
-        and snapshot.is_bound
+        and (snapshot.is_bound or allow_unbound)
         and device.id == snapshot.row_id
         and device.device_id == snapshot.device_id
         and device.auth_version == snapshot.auth_version

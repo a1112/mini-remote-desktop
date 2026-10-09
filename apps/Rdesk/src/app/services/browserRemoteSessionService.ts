@@ -31,6 +31,8 @@ export type BrowserRemoteCreateOptions = {
   targetIp?: string;
   requestedProfile?: MediaProfile;
   routePreference?: RemoteRoutePreference;
+  temporaryPassword?: string;
+  signal?: AbortSignal;
 };
 
 export type BrowserSessionBootstrap = {
@@ -45,6 +47,7 @@ export type BrowserSessionBootstrap = {
   target_key_id: string;
   relay_directory_key_id: string;
   relay_directory_public_key: number[];
+  http_credential?: { token: string; expires_at_ms: number };
 };
 export type BrowserRemoteContext = {
   identity: BrowserSigningIdentity;
@@ -59,13 +62,13 @@ const pendingCreates = new Set<string>();
 let creationEpoch = 0;
 const CLOSED_STATES = new Set(['rejected', 'expired', 'closed', 'revoked']);
 
-async function browserApi<T>(userToken: string, path: string, body?: unknown): Promise<T> {
+async function browserApi<T>(accessToken: string | undefined, path: string, body?: unknown): Promise<T> {
   const cancel = new AbortController();
   const timer = setTimeout(() => cancel.abort(), 10_000);
   try {
     const response = await fetch(`${SERVER_API_URL}${path}`, {
       method: body === undefined ? 'GET' : 'POST',
-      headers: { Authorization: `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+      headers: { ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}), 'Content-Type': 'application/json' },
       credentials: 'omit',
       signal: cancel.signal,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -124,17 +127,22 @@ export async function createBrowserRemoteSession(
   targetDeviceId: string,
   options?: BrowserRemoteCreateOptions,
 ): Promise<{ sessionId: string }> {
-  const token = localStorage.getItem('rdesk_access_token')?.trim();
-  if (!token) throw new Error('请先登录后连接远端设备');
+  const guest = options?.temporaryPassword !== undefined;
+  let password = options?.temporaryPassword ?? '';
+  if (guest && !/^[A-Za-z0-9]{8}$/.test(password)) throw new Error('请输入设备上显示的 8 位临时密码');
+  const token = guest ? undefined : localStorage.getItem('rdesk_access_token')?.trim();
+  if (!guest && !token) throw new Error('请先登录后连接远端设备，或使用设备码和临时密码');
   if (!globalThis.isSecureContext || !globalThis.crypto?.subtle) throw new Error('网页远控需要 HTTPS 安全连接（开发环境可使用 localhost）');
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(targetDeviceId)) throw new Error('远端设备标识无效');
   if (ownedSessions.size + pendingCreates.size >= 4) throw new Error('请先关闭已有网页会话');
   const sessionId = options?.sessionId ?? crypto.randomUUID();
   if (ownedSessions.has(sessionId) || pendingCreates.has(sessionId)) throw new Error('网页会话已存在');
   const epoch = creationEpoch;
-  const stillCurrent = () => epoch === creationEpoch && localStorage.getItem('rdesk_access_token')?.trim() === token;
+  const stillCurrent = () => !options?.signal?.aborted && epoch === creationEpoch && (guest || localStorage.getItem('rdesk_access_token')?.trim() === token);
   pendingCreates.add(sessionId);
-  const path = `/browser-sessions/${encodeURIComponent(sessionId)}`;
+  const prefix = guest ? '/guest-browser-sessions' : '/browser-sessions';
+  const path = `${prefix}/${encodeURIComponent(sessionId)}`;
+  let accessToken = token;
   let created = false;
   try {
     const identity = await createBrowserSigningIdentity();
@@ -146,23 +154,31 @@ export async function createBrowserRemoteSession(
       route_policy: options?.routePreference === 'wan_relay' ? 'relay_only' : 'direct_first',
       controller_public_key: identity.publicKey,
     };
-    const raw = await browserApi<BrowserSessionBootstrap>(token, '/browser-sessions', body);
+    const raw = await browserApi<BrowserSessionBootstrap>(token, prefix, guest ? { ...body, temporary_password: password } : body);
+    password = '';
     created = true;
+    if (guest) {
+      const credential = raw?.http_credential;
+      if (!credential || typeof credential.token !== 'string' || !credential.token || credential.token.length > 4096
+        || !Number.isSafeInteger(credential.expires_at_ms) || credential.expires_at_ms <= Date.now()
+        || credential.expires_at_ms > raw.expires_at_ms) throw new Error('访客会话凭据无效或已过期');
+      accessToken = credential.token;
+    }
     if (!stillCurrent()) throw new Error('网页会话创建已取消');
     const bootstrap = await validateBrowserBootstrap(raw, identity, { sessionId, targetDeviceId, requestBody: body });
     if (!stillCurrent()) throw new Error('网页会话创建已取消');
     const context: BrowserRemoteContext = {
       identity, bootstrap,
-      getBootstrap: async () => validateBrowserBootstrap(await browserApi<BrowserSessionBootstrap>(token, path), identity, { sessionId, targetDeviceId, controllerId: bootstrap.controller_device_id }),
-      getRelayAccess: () => browserApi(token, `${path}/relay-access`, { generation: 0 }),
-      closeBackend: async () => { await browserApi(token, `${path}/close`, {}); },
+      getBootstrap: async () => validateBrowserBootstrap(await browserApi<BrowserSessionBootstrap>(accessToken, path), identity, { sessionId, targetDeviceId, controllerId: bootstrap.controller_device_id }),
+      getRelayAccess: () => browserApi(accessToken, `${path}/relay-access`, { generation: 0 }),
+      closeBackend: async () => { await browserApi(accessToken, `${path}/close`, {}); },
     };
     ownedSessions.set(sessionId, { context, closed: false });
     return { sessionId };
   } catch (error) {
-    if (created) await browserApi(token, `${path}/close`, {}).catch(() => undefined);
+    if (created && accessToken) await browserApi(accessToken, `${path}/close`, {}).catch(() => undefined);
     throw error;
-  } finally { pendingCreates.delete(sessionId); }
+  } finally { password = ''; pendingCreates.delete(sessionId); }
 }
 
 export function attachBrowserRemoteSession(sessionId: string, observer: BrowserRemoteObserver): BrowserRemoteHandle {
@@ -223,4 +239,11 @@ export async function closeAllBrowserRemoteSessions(reason = 'logout'): Promise<
     if (entry.handle) await entry.handle.close(reason);
     else { entry.closed = true; ownedSessions.delete(id); await entry.context.closeBackend(); }
   }));
+}
+
+export async function closeBrowserRemoteSession(sessionId: string, reason = 'cancelled'): Promise<void> {
+  const entry = ownedSessions.get(sessionId);
+  if (!entry) return;
+  if (entry.handle) await entry.handle.close(reason);
+  else { entry.closed = true; ownedSessions.delete(sessionId); await entry.context.closeBackend(); }
 }

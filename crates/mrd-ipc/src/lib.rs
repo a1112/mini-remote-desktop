@@ -97,6 +97,51 @@ mod wire {
         }
     }
 
+    /// Temporary access state without its locally held password.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TemporaryAccessStatus {
+        pub enabled: bool,
+        pub ready: bool,
+        pub generation: u64,
+        pub expires_at_ms: Option<u64>,
+        pub reason: Option<String>,
+    }
+
+    /// Memory-only local password; formatting always redacts its contents.
+    #[derive(
+        Clone, Serialize, Deserialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+    )]
+    #[serde(transparent)]
+    pub struct TemporaryAccessPassword(String);
+
+    impl TemporaryAccessPassword {
+        pub fn secret(&self) -> &str {
+            &self.0
+        }
+        pub fn into_secret(mut self) -> String {
+            std::mem::take(&mut self.0)
+        }
+    }
+    impl From<String> for TemporaryAccessPassword {
+        fn from(value: String) -> Self {
+            Self(value)
+        }
+    }
+    impl std::fmt::Debug for TemporaryAccessPassword {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("TemporaryAccessPassword(REDACTED)")
+        }
+    }
+
+    /// Password reads are available only to the authenticated local product UI.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TemporaryAccessSecret {
+        pub status: TemporaryAccessStatus,
+        pub password: Option<TemporaryAccessPassword>,
+    }
+
     // === Shell / Lifecycle DTOs (Phase 2) ===
     // Defined first to avoid forward references
 
@@ -2040,6 +2085,14 @@ mod wire {
     pub enum IpcRequest {
         /// Secret-free public registration and authenticated signaling health.
         GetPublicServerStatus,
+        /// Secret-free temporary-password availability for this machine.
+        GetTemporaryAccessStatus,
+        /// Cleartext read restricted to the authenticated local product UI.
+        ReadTemporaryAccessPassword,
+        /// Replace the password and invalidate pending requests from its old generation.
+        RotateTemporaryAccessPassword,
+        /// Freeze temporary access and revoke its active guest sessions.
+        DisableTemporaryAccess,
         /// Negotiate before transmitting an ephemeral user credential.
         GetPublicDeviceBindingProtocol,
         /// Bind the resident's current registered device; no caller-selected target.
@@ -2389,6 +2442,10 @@ mod wire {
     pub enum IpcResponse {
         /// Public server state without device credentials or privileged session data.
         PublicServerStatus { status: PublicServerStatus },
+        /// Temporary password state without any cleartext credential.
+        TemporaryAccessStatus { status: TemporaryAccessStatus },
+        /// A memory-only response exclusively for the verified local UI.
+        TemporaryAccessSecret { secret: TemporaryAccessSecret },
         /// Explicit support for the narrow own-device binding protocol.
         PublicDeviceBindingProtocol { protocol_minor: u16 },
         /// Device registration successful

@@ -54,7 +54,9 @@ describe("mobile pages", () => {
     expect(screen.getByText('网页控制端')).toBeInTheDocument();
     expect(screen.queryByText('123 456 789')).not.toBeInTheDocument();
     await userEvent.type(screen.getByPlaceholderText('输入 10 位设备码'), '0123456789');
-    await userEvent.click(screen.getByRole('button', { name: '发起连接' }));
+    await userEvent.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await userEvent.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).toHaveBeenCalledWith('0123456789', expect.objectContaining({ temporaryPassword: 'ABCD2345' }));
     expect(await screen.findByText('网页会话已打开')).toBeInTheDocument();
   });
 

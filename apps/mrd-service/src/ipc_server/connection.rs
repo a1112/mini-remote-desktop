@@ -137,6 +137,7 @@ fn management_request_is_allowed_for_connection(request: &mrd_ipc::IpcRequest) -
     matches!(
         request,
         mrd_ipc::IpcRequest::GetPublicServerStatus
+            | mrd_ipc::IpcRequest::GetTemporaryAccessStatus
             | mrd_ipc::IpcRequest::GetPublicDeviceBindingProtocol
             | mrd_ipc::IpcRequest::ServiceHealth
             | mrd_ipc::IpcRequest::GetShellStatus

@@ -3155,6 +3155,60 @@ async fn ipc_public_server_status() -> Result<mrd_ipc::PublicServerStatus, Strin
     }
 }
 
+/// This command reads a secret-free status over the protected local IPC channel.
+#[tauri::command]
+async fn ipc_temporary_access_status() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    match client
+        .send_request_no_reconnect(mrd_ipc::IpcRequest::GetTemporaryAccessStatus)
+        .await
+        .map_err(|_| "无法读取临时密码状态".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessStatus { status } => Ok(status),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+/// Cleartext exists only in the resident and this verified native UI's memory.
+#[tauri::command]
+async fn ipc_temporary_access_secret() -> Result<mrd_ipc::TemporaryAccessSecret, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    match client
+        .send_request_no_reconnect(mrd_ipc::IpcRequest::ReadTemporaryAccessPassword)
+        .await
+        .map_err(|_| "无法读取本机临时密码".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessSecret { secret } => Ok(secret),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+async fn temporary_access_change(disable: bool) -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let request = if disable {
+        mrd_ipc::IpcRequest::DisableTemporaryAccess
+    } else {
+        mrd_ipc::IpcRequest::RotateTemporaryAccessPassword
+    };
+    match client
+        .send_request_no_reconnect(request)
+        .await
+        .map_err(|_| "无法更新临时密码，请检查后台服务".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessStatus { status } => Ok(status),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+#[tauri::command]
+async fn ipc_temporary_access_rotate() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    temporary_access_change(false).await
+}
+#[tauri::command]
+async fn ipc_temporary_access_disable() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    temporary_access_change(true).await
+}
+
 async fn change_public_device_binding(user_token: String, bind: bool) -> Result<(), String> {
     use mrd_ipc::{
         IpcRequest, IpcResponse, PublicUserCredential, PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
@@ -4966,6 +5020,10 @@ fn main() {
             ipc_session_snapshot,
             ipc_runtime_snapshot,
             ipc_public_server_status,
+            ipc_temporary_access_status,
+            ipc_temporary_access_secret,
+            ipc_temporary_access_rotate,
+            ipc_temporary_access_disable,
             ipc_bind_public_device,
             ipc_unbind_public_device,
             ipc_audit_log,

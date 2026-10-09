@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_serializer
 
 
 class SessionRequestIn(BaseModel):
@@ -172,6 +172,17 @@ class DeviceSessionOut(BaseModel):
     policy_expires_at: datetime | None = None
     grant_expires_at: datetime | None = None
     active_relay_generation: int | None = Field(default=None, ge=0)
+    authority_kind: Literal["temporary_password"] | None = None
+    temporary_access_generation: int | None = Field(default=None, ge=1)
+    target_auth_version: int | None = Field(default=None, ge=1)
+
+    @model_serializer(mode="wrap")
+    def compatible_authority(self, handler):
+        data = handler(self)
+        if self.authority_kind is None:
+            for key in ("authority_kind", "temporary_access_generation", "target_auth_version"):
+                data.pop(key, None)
+        return data
 
 
 class DeviceSessionApprovalIn(BaseModel):

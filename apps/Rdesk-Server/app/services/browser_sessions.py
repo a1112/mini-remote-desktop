@@ -23,8 +23,8 @@ BROWSER_LIFETIME_SECONDS = 600
 @dataclass(frozen=True)
 class BrowserCredentialBinding:
     session_id: str
-    user_id: str
-    user_session_version: int
+    user_id: str | None
+    user_session_version: int | None
     tenant_id: str
     controller_row_id: str
     controller_device_id: str
@@ -32,6 +32,10 @@ class BrowserCredentialBinding:
     target_row_id: str
     target_device_id: str
     request_commitment: str
+    target_key_id: str | None = None
+    authority_kind: str = "account"
+    temporary_access_generation: int | None = None
+    target_auth_version: int | None = None
 
 
 class BrowserSessionService:

@@ -1,7 +1,7 @@
 //! Verification of backend-issued credentials bound to one signaling identity and role.
 use crate::{
-    auth::BrowserSignalingRestriction, BackendTokenError, BackendTokenVerifier,
-    VerifiedBackendToken,
+    auth::{BrowserSignalingAuthority, BrowserSignalingRestriction},
+    BackendTokenError, BackendTokenVerifier, VerifiedBackendToken,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use mrd_proto::{BackendRole, DeviceId, SessionId};
@@ -132,7 +132,68 @@ impl JwtBackendTokenVerifier {
                     return None;
                 }
                 let browser = BrowserSignalingRestriction {
-                    user_id: claims.user_id,
+                    authority: BrowserSignalingAuthority::Account {
+                        user_id: claims.user_id,
+                    },
+                    tenant_id: claims.tenant_id,
+                    session_id: SessionId(claims.session_id),
+                    target_device_id: DeviceId(claims.target_device_id),
+                    allowed_scopes: claims.allowed_scopes,
+                };
+                (
+                    Claims {
+                        sub: claims.sub,
+                        device_id: claims.device_id,
+                        device_key_id: claims.device_key_id,
+                        role: claims.role,
+                        token_type: "signaling".into(),
+                        iss: claims.iss,
+                        aud: claims.aud,
+                        iat: claims.iat,
+                        exp: claims.exp,
+                    },
+                    Some(browser),
+                )
+            }
+            CredentialClaims::Guest(claims) => {
+                if claims.token_type != "guest_browser_signaling"
+                    || claims.authority_kind != "temporary_password"
+                    || claims.role != BackendRole::Controller
+                    || !valid_browser_id(&claims.device_id)
+                    || !valid_principal_identifier(&claims.tenant_id, 64)
+                    || !valid_principal_identifier(&claims.session_id, 36)
+                    || !valid_device_id(&claims.target_device_id)
+                    || claims.target_device_id.starts_with("browser_")
+                    || claims.exp.checked_sub(claims.iat)? > MAX_BROWSER_LIFETIME_SECONDS
+                    || claims.temporary_access_generation == 0
+                    || claims.temporary_access_generation > i64::MAX as u64
+                    || claims.target_auth_version == 0
+                    || claims.target_auth_version > i64::MAX as u64
+                    || claims.allowed_scopes.is_empty()
+                    || claims.allowed_scopes.len() > 3
+                    || !claims
+                        .allowed_scopes
+                        .contains(&WanPermissionScopeV3::ScreenView)
+                    || !claims
+                        .allowed_scopes
+                        .windows(2)
+                        .all(|pair| pair[0] < pair[1])
+                    || claims.allowed_scopes.iter().any(|scope| {
+                        !matches!(
+                            scope,
+                            WanPermissionScopeV3::ScreenView
+                                | WanPermissionScopeV3::InputKeyboard
+                                | WanPermissionScopeV3::InputPointer
+                        )
+                    })
+                {
+                    return None;
+                }
+                let browser = BrowserSignalingRestriction {
+                    authority: BrowserSignalingAuthority::TemporaryPassword {
+                        temporary_access_generation: claims.temporary_access_generation,
+                        target_auth_version: claims.target_auth_version,
+                    },
                     tenant_id: claims.tenant_id,
                     session_id: SessionId(claims.session_id),
                     target_device_id: DeviceId(claims.target_device_id),
@@ -233,6 +294,7 @@ fn valid_principal_identifier(value: &str, maximum: usize) -> bool {
 enum CredentialClaims {
     Device(Claims),
     Browser(BrowserClaims),
+    Guest(GuestClaims),
 }
 
 // Deserializing directly into structs rejects duplicate fields. Unknown header
@@ -275,4 +337,28 @@ struct BrowserClaims {
     session_id: String,
     target_device_id: String,
     allowed_scopes: Vec<WanPermissionScopeV3>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestClaims {
+    sub: String,
+    device_id: String,
+    device_key_id: String,
+    role: BackendRole,
+    token_type: String,
+    authority_kind: String,
+    iss: String,
+    aud: String,
+    iat: u64,
+    exp: u64,
+    // Unit requires an explicit null; an absent or synthetic account ID fails.
+    #[serde(rename = "user_id")]
+    _user_id: (),
+    tenant_id: String,
+    session_id: String,
+    target_device_id: String,
+    allowed_scopes: Vec<WanPermissionScopeV3>,
+    temporary_access_generation: u64,
+    target_auth_version: u64,
 }

@@ -35,10 +35,18 @@ def verify_browser_device_column(connection, schema=None, *, inspector=None):
     return expression
 
 
+def _normalize_default(value):
+    from app.db.migrate_add_relay_access import _normalize_server_default
+    return _normalize_server_default(value)
+
+
 def _browser_check_expression(expression):
     from app.db.migrate_add_relay_access import _CHECK_CAST
     if not isinstance(expression, str):
         return None
+    if "authority_kind" in expression.lower() or "verifier_hmac" in expression.lower():
+        from app.db.migrate_add_guest_temporary_access import authority_expression
+        return authority_expression(expression)
     # PostgreSQL adds casts and parentheses to these four simple predicates.
     # Keep token boundaries so an altered function/operator cannot collapse into
     # the same expression; added boolean clauses remain visible and are rejected.
@@ -48,14 +56,14 @@ def _browser_check_expression(expression):
     return " ".join(normalized.split())
 
 
-def _verify_browser_principal_table(connection):
+def _verify_browser_principal_table(connection, *, expected_table=None):
     from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
     from app.db.migrate_add_relay_access import (
         _assert_constraint_states, _foreign_key_signature, _index_access_method,
         _primary_key_matches, _unique_constraint_signature,
     )
 
-    table = BrowserController.__table__
+    table = expected_table if expected_table is not None else BrowserController.__table__
     inspector = inspect(connection)
     postgresql = connection.dialect.name == "postgresql"
     current_schema = inspector.default_schema_name
@@ -80,7 +88,7 @@ def _verify_browser_principal_table(connection):
         if (actual["nullable"] is not column.nullable
             or str(actual["type"].compile(dialect=connection.dialect)).upper()
                 != str(column.type.compile(dialect=connection.dialect)).upper()
-            or actual.get("default") is not None
+            or _normalize_default(actual.get("default")) != _normalize_default(str(column.server_default.arg) if column.server_default else None)
             or actual.get("computed") is not None
             or actual.get("identity") is not None):
             differs("column " + name)
@@ -189,6 +197,11 @@ def migrate_connection(connection):
             "NOT NULL DEFAULT 'physical' CONSTRAINT ck_devices_principal_kind "
             "CHECK (principal_kind IN ('physical', 'browser_controller'))"))
     verify_browser_device_column(connection)
+    if inspector.has_table("browser_controllers"):
+        principal_columns = {column["name"] for column in inspector.get_columns("browser_controllers")}
+        if "authority_kind" not in principal_columns:
+            from app.db.migrate_add_guest_temporary_access import upgrade_browser_authority
+            upgrade_browser_authority(connection)
     BrowserController.__table__.create(connection, checkfirst=True)
     _verify_browser_principal_table(connection)
 

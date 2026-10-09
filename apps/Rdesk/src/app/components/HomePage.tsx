@@ -20,6 +20,8 @@ import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
 import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 import { isTauriRuntime } from '../utils/runtime';
+import { GuestRemoteConnectForm } from './GuestRemoteConnectForm';
+import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
 
 export function HomePage() {
   const native = isTauriRuntime();
@@ -178,9 +180,9 @@ export function HomePage() {
         onClose={() => setRegistrationOpen(false)}
         onSuccess={() => refresh()}
       />}
-      <div className="grid grid-cols-5 gap-6">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
         {/* Left: ID + Connect */}
-        <div className="col-span-2 space-y-5">
+        <div className="space-y-5 lg:col-span-2">
           {/* My Device card */}
           {native ? <div className={`p-5 rounded-xl border ${card}`}>
             {/* 设备名称 + 编辑按钮 */}
@@ -260,13 +262,14 @@ export function HomePage() {
             <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
               登记到服务器
             </button>
-          </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。登录账户后选择远端设备，等待对方同意即可查看画面并控制已授权的键鼠。</p></section>}
+            <TemporaryAccessPasswordCard />
+          </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。使用设备码和临时密码即可发起连接，双方无需登录；对方确认后查看画面并控制已授权的键鼠。</p></section>}
 
           {/* Connect card */}
           <div className={`p-5 rounded-xl border ${card}`}>
             <h3 className={`mb-4 ${textPrimary}`} style={{ fontSize: 15 }}>连接到远程设备</h3>
 
-            <div className="space-y-3">
+            {native ? <div className="space-y-3">
               <div>
                 <label className={`block mb-1.5 ${textSecondary}`} style={{ fontSize: 12 }}>
                   远程设备码
@@ -323,12 +326,12 @@ export function HomePage() {
                   <span>{connectionError}</span>
                 </div>
               ) : null}
-            </div>
+            </div> : <GuestRemoteConnectForm />}
           </div>
         </div>
 
         {/* Right: Recent connections */}
-        <div className="col-span-3">
+        <div className="lg:col-span-3">
           <div className={`p-5 rounded-xl border h-full ${card}`}>
             <div className="flex items-center justify-between mb-4">
               <h3 className={textPrimary} style={{ fontSize: 15 }}>最近连接</h3>

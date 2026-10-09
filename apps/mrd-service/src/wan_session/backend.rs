@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Weak},
     time::SystemTime,
 };
 use thiserror::Error;
@@ -134,6 +134,7 @@ pub enum WanSessionStatus {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct WanSessionRecord {
+    temporary_authority: Option<crate::temporary_access::TemporaryGuestAuthority>,
     binding: WanSessionBinding,
     request: WanSessionRequestV3,
     request_commitment: String,
@@ -163,6 +164,9 @@ impl fmt::Debug for WanSessionRecord {
 }
 
 impl WanSessionRecord {
+    pub fn temporary_authority(&self) -> Option<crate::temporary_access::TemporaryGuestAuthority> {
+        self.temporary_authority
+    }
     pub fn binding(&self) -> &WanSessionBinding {
         &self.binding
     }
@@ -382,6 +386,7 @@ pub trait WanSessionBackend: Send + Sync {
 /// Production adapter from the device-authenticated HTTP/backend port to the
 /// coordinator's deadline-fenced workflow contract.
 pub struct ServiceWanSessionWorkflowBackend {
+    temporary_owner: Option<Weak<crate::AppState>>,
     backend: Arc<dyn WanSessionBackend>,
     bindings: RwLock<HashMap<SessionId, WanSessionBinding>>,
     relay_access: RwLock<HashMap<SessionId, WanRelayAccess>>,
@@ -399,18 +404,68 @@ impl ServiceWanSessionWorkflowBackend {
     pub fn new(backend: Arc<dyn WanSessionBackend>) -> Self {
         Self {
             backend,
+            temporary_owner: None,
             bindings: RwLock::new(HashMap::new()),
             relay_access: RwLock::new(HashMap::new()),
         }
     }
 
-    fn snapshot(
+    pub(crate) fn with_temporary_authority(mut self, owner: &Arc<crate::AppState>) -> Self {
+        self.temporary_owner = Some(Arc::downgrade(owner));
+        self
+    }
+
+    async fn snapshot(
         &self,
         record: WanSessionRecord,
     ) -> Result<
         super::coordinator::WanBackendSessionSnapshot,
         super::coordinator::WanSessionPortError,
     > {
+        if let Some(authority) = record.temporary_authority() {
+            let owner = self
+                .temporary_owner
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+            let auth = owner
+                .public_connection
+                .device_auth_version()
+                .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+            let online = owner.signaling_status.snapshot().state
+                == crate::signaling::SignalingConnectionState::Authenticated;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0);
+            if !owner
+                .public_connection
+                .temporary
+                .lock()
+                .await
+                .authorize_guest(
+                    &record.binding().session_id().0,
+                    authority,
+                    record.request_commitment(),
+                    record.status() == WanSessionStatus::Approved,
+                    now,
+                    online,
+                    auth,
+                )
+            {
+                return Err(super::coordinator::WanSessionPortError::Rejected);
+            }
+        } else if let Some(owner) = self.temporary_owner.as_ref().and_then(Weak::upgrade) {
+            if owner
+                .public_connection
+                .temporary
+                .lock()
+                .await
+                .has_guest_session(&record.binding().session_id().0)
+            {
+                return Err(super::coordinator::WanSessionPortError::Rejected);
+            }
+        }
         self.bindings
             .write()
             .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
@@ -476,6 +531,14 @@ impl ServiceWanSessionWorkflowBackend {
             .get(session_id)
             .cloned();
         let Some(binding) = binding else {
+            if let Some(owner) = self.temporary_owner.as_ref().and_then(Weak::upgrade) {
+                owner
+                    .public_connection
+                    .temporary
+                    .lock()
+                    .await
+                    .forget_guest_session(&session_id.0);
+            }
             return Ok(());
         };
         let result = if failed {
@@ -485,6 +548,15 @@ impl ServiceWanSessionWorkflowBackend {
         };
         match result {
             Ok(_) | Err(WanSessionBackendError::NotFound) => {
+                if let Some(owner) = self.temporary_owner.as_ref().and_then(Weak::upgrade) {
+                    owner
+                        .public_connection
+                        .temporary
+                        .lock()
+                        .await
+                        .forget_guest_session(&session_id.0);
+                }
+
                 self.bindings
                     .write()
                     .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
@@ -525,6 +597,7 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
                 .await
                 .map_err(map_workflow_error)?,
         )
+        .await
     }
 
     async fn inspect(
@@ -541,6 +614,7 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
                 .await
                 .map_err(map_workflow_error)?,
         )
+        .await
     }
 
     async fn approve(
@@ -558,6 +632,7 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
                 .await
                 .map_err(map_workflow_error)?,
         )
+        .await
     }
 
     async fn access_generation_zero(
@@ -927,6 +1002,9 @@ struct EmptyBody {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDeviceSessionOut {
+    authority_kind: Option<String>,
+    temporary_access_generation: Option<u64>,
+    target_auth_version: Option<u64>,
     session_id: SessionId,
     request: WanSessionRequestV3,
     request_commitment: String,
@@ -948,6 +1026,51 @@ fn parse_record(
     raw.request
         .validate()
         .map_err(|_| WanSessionBackendError::InvalidResponse)?;
+    let temporary_authority = crate::temporary_access::TemporaryGuestAuthority::from_wire(
+        raw.authority_kind.as_deref(),
+        raw.temporary_access_generation,
+        raw.target_auth_version,
+    )
+    .map_err(|_| WanSessionBackendError::InvalidResponse)?;
+    if temporary_authority.is_some() {
+        let browser_id = raw
+            .request
+            .controller_device_id
+            .0
+            .strip_prefix("browser_")
+            .is_some_and(|suffix| {
+                suffix.len() == 32
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        let allowed = |scope: &WanPermissionScopeV3| {
+            matches!(
+                scope,
+                WanPermissionScopeV3::ScreenView
+                    | WanPermissionScopeV3::InputKeyboard
+                    | WanPermissionScopeV3::InputPointer
+            )
+        };
+        if !browser_id
+            || raw.request.access_mode != WanAccessModeV3::Attended
+            || !raw
+                .request
+                .requested_scopes
+                .contains(&WanPermissionScopeV3::ScreenView)
+            || raw
+                .request
+                .requested_scopes
+                .iter()
+                .any(|scope| !allowed(scope))
+            || raw.approved_scopes.as_ref().is_some_and(|scopes| {
+                !scopes.contains(&WanPermissionScopeV3::ScreenView)
+                    || scopes.iter().any(|scope| !allowed(scope))
+            })
+        {
+            return Err(WanSessionBackendError::InvalidResponse);
+        }
+    }
     let binding = WanSessionBinding::new(
         raw.session_id.clone(),
         raw.request.controller_device_id.clone(),
@@ -998,6 +1121,7 @@ fn parse_record(
         return Err(WanSessionBackendError::InvalidResponse);
     }
     Ok(WanSessionRecord {
+        temporary_authority,
         binding,
         request: raw.request,
         request_commitment: raw.request_commitment,

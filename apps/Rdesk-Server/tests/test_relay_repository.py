@@ -1240,6 +1240,7 @@ def test_model_repr_does_not_expose_credential_fields() -> None:
 async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(monkeypatch) -> None:
     from app import main
     from app.db.migrate_add_device_self_enrollment import SELF_ENROLLMENT_TABLES
+    from app.db.migrate_add_guest_temporary_access import GUEST_TABLES
 
     calls = []
     bootstrapped = []
@@ -1277,11 +1278,12 @@ async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(mon
         ("migrate_relay_redundancy", "relay_redundancy"),
         ("migrate_browser_controllers", "browser_controllers"),
         ("migrate_device_self_enrollment", "device_self_enrollment"),
+        ("migrate_guest_temporary_access", "guest_temporary_access"),
         ("seed_initial_data", "seed"),
     ):
         monkeypatch.setattr(main, name, migration(label))
     async with main.lifespan(main.app):
         pass
-    assert calls == ["relay_control", "legacy_metadata", "relay_access", "relay_redundancy", "browser_controllers", "device_self_enrollment", "seed"]
+    assert calls == ["relay_control", "legacy_metadata", "relay_access", "relay_redundancy", "browser_controllers", "device_self_enrollment", "guest_temporary_access", "seed"]
     assert "devices" in bootstrapped
-    assert not SELF_ENROLLMENT_TABLES.intersection(bootstrapped)
+    assert not (SELF_ENROLLMENT_TABLES | GUEST_TABLES).intersection(bootstrapped)

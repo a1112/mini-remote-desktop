@@ -26,6 +26,7 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod binding;
+pub(crate) mod temporary;
 pub(crate) use binding::change_device_binding;
 
 pub const DEFAULT_PUBLIC_API_URL: &str = "https://175.178.16.90/rdesk/api/v1";
@@ -168,6 +169,10 @@ fn uuid_suffix() -> Result<String> {
 
 /// Readable status and serialized enrollment, independent of UI lifetime.
 pub struct PublicConnectionState {
+    pub(crate) temporary: Arc<Mutex<crate::temporary_access::TemporaryAccessState>>,
+    pub(crate) temporary_operation: Mutex<()>,
+    pub(crate) temporary_epoch: Arc<crate::temporary_access::TemporaryOperationEpoch>,
+    pub(crate) temporary_auth_version: std::sync::atomic::AtomicU64,
     registration: RwLock<Option<Registration>>,
     persistence: RwLock<Option<ProtectedConfig>>,
     signing_counter: std::sync::Mutex<Option<Arc<signaling::PersistentSignalingCounter>>>,
@@ -180,7 +185,15 @@ pub struct PublicConnectionState {
 }
 impl Default for PublicConnectionState {
     fn default() -> Self {
+        let temporary_epoch = Arc::new(crate::temporary_access::TemporaryOperationEpoch::default());
         Self {
+            temporary: Arc::new(Mutex::new(
+                crate::temporary_access::TemporaryAccessState::default()
+                    .with_operation_epoch(temporary_epoch.clone()),
+            )),
+            temporary_operation: Mutex::new(()),
+            temporary_epoch,
+            temporary_auth_version: std::sync::atomic::AtomicU64::new(0),
             registration: RwLock::new(None),
             persistence: RwLock::new(None),
             signing_counter: std::sync::Mutex::new(None),
@@ -261,6 +274,10 @@ impl PublicConnectionState {
         );
         *cached = Some(counter.clone());
         Ok(Some(counter))
+    }
+    pub(crate) fn device_auth_version(&self) -> Option<u64> {
+        self.registration()
+            .and_then(|saved| crate::temporary_access::decoded_auth_version(&saved.access_token))
     }
     fn registration(&self) -> Option<Registration> {
         self.registration.read().unwrap().clone()
@@ -674,12 +691,14 @@ async fn start_stack(
 }
 
 pub struct PublicConnectionTask {
+    temporary: temporary::TemporaryTask,
     stop: oneshot::Sender<()>,
     join: JoinHandle<Result<()>>,
 }
 impl PublicConnectionTask {
     pub async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(());
+        self.temporary.shutdown().await;
         self.join
             .await
             .context("public connection supervisor failed")?
@@ -688,6 +707,7 @@ impl PublicConnectionTask {
 
 /// Always starts a supervisor, including while the device is waiting for enrollment.
 pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
+    let temporary = temporary::spawn(state.clone());
     let (stop, mut stopping) = oneshot::channel();
     if let Some(saved) = state.public_connection.registration() {
         state
@@ -859,7 +879,11 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
             None => Ok(()),
         }
     });
-    Ok(PublicConnectionTask { stop, join })
+    Ok(PublicConnectionTask {
+        stop,
+        join,
+        temporary,
+    })
 }
 
 #[cfg(test)]

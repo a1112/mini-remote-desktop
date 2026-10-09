@@ -21,6 +21,7 @@ from app.db.session import Base
 class SessionRequest(Base):
     __tablename__ = "session_requests"
     __table_args__ = (
+        CheckConstraint("(authority_kind = 'account' AND requester_user_id IS NOT NULL AND temporary_access_generation IS NULL AND target_auth_version IS NULL AND authority_expires_at IS NULL) OR (authority_kind = 'temporary_password' AND requester_user_id IS NULL AND requester_device_id IS NOT NULL AND temporary_access_generation IS NOT NULL AND target_auth_version IS NOT NULL AND temporary_access_generation >= 1 AND target_auth_version >= 1 AND authority_expires_at IS NOT NULL)", name="ck_session_requests_authority"),
         CheckConstraint(
             "length(tenant_id) BETWEEN 1 AND 64",
             name="ck_session_requests_tenant_id",
@@ -78,9 +79,13 @@ class SessionRequest(Base):
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
-    requester_user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True
+    requester_user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    authority_kind: Mapped[str] = mapped_column(String(24), nullable=False, default="account", server_default=text("'account'"))
+    temporary_access_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    target_auth_version: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    authority_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     requester_device_id: Mapped[str | None] = mapped_column(
         String(36),
         ForeignKey("devices.id", ondelete="CASCADE"),

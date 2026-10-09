@@ -5,6 +5,15 @@
  * This is the single source of truth for IPC command shapes.
  */
 
+export type TemporaryAccessStatus = {
+  enabled: boolean;
+  ready: boolean;
+  generation: number;
+  expires_at_ms: number | null;
+  reason: string | null;
+};
+export type TemporaryAccessSecret = { status: TemporaryAccessStatus; password: string | null };
+
 // ============================================================================
 // Test Workbench Unified Domain Model
 // ============================================================================

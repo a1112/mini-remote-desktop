@@ -31,3 +31,5 @@ __all__ = [
     "RelayReservation",
     "RelayAccessGeneration",
 ]
+
+from app.models.device_temporary_access import DeviceTemporaryAccess, GuestAccessAttempt

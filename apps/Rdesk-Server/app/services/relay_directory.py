@@ -335,6 +335,13 @@ class RelayAccessService:
             generation=generation,
         )
 
+    async def permits_unbound_guest_target(self, device, session_id):
+        grant = await self._session.scalar(select(SessionRequest).where(
+            SessionRequest.id == session_id, SessionRequest.authority_kind == "temporary_password",
+            SessionRequest.target_device_id == device.id, SessionRequest.status == "approved"))
+        return bool(device.principal_kind == "physical" and device.auth_revoked_at is None
+            and grant is not None and await browser_authority_valid(self._session, grant, now=self._now()))
+
     async def issue_authenticated_access(
         self,
         *,
@@ -519,10 +526,11 @@ class RelayAccessService:
             grant is None
             or grant.requester_device_id != controller.id
             or grant.target_device_id != target.id
-            or users_by_id.get(controller.bound_user_id) is None
-            or users_by_id.get(target.bound_user_id) is None
-            or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
-            or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id
+            or (grant.authority_kind != "temporary_password" and (
+                users_by_id.get(controller.bound_user_id) is None
+                or users_by_id.get(target.bound_user_id) is None
+                or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
+                or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id))
         ):
             _deny_access()
         if not await browser_authority_valid(self._session, grant, now=self._now()):
@@ -542,17 +550,16 @@ class RelayAccessService:
         requested_generation: int,
         now: datetime,
     ) -> None:
+        guest = getattr(grant, "authority_kind", "account") == "temporary_password"
         participant_ids = {grant.requester_device_id, grant.target_device_id}
         valid = (
             controller is not None
             and target is not None
             and caller is not None
-            and _matches_auth_snapshot(caller, auth_snapshot)
+            and _matches_auth_snapshot(caller, auth_snapshot, allow_unbound=guest)
             and caller.id in participant_ids
             and controller.id != target.id
-            and controller.is_bound
-            and target.is_bound
-            and caller.is_bound
+            and ((controller.is_bound and target.is_bound and caller.is_bound) or guest)
             and controller.auth_revoked_at is None
             and target.auth_revoked_at is None
             and caller.auth_revoked_at is None
@@ -683,7 +690,7 @@ class RelayAccessService:
         try:
             reservations = await self._repository.reserve_capacity(
                 session_id=grant.id,
-                user_id=grant.requester_user_id,
+                user_id=_wan_reservation_subject(grant),
                 ordered_node_ids=[item.node_id for item in ordered_candidates],
                 now=now,
                 ttl_seconds=reservation_ttl,
@@ -955,7 +962,7 @@ class RelayAccessService:
             if (
                 reservation is None
                 or reservation.session_id != grant.id
-                or reservation.user_id != grant.requester_user_id
+                or reservation.user_id != _wan_reservation_subject(grant)
                 or reservation.node_id != candidate.node_id
                 or reservation.directory_generation != persisted.directory_id
                 or reservation.reserved_egress_bps != required_egress_bps
@@ -1713,11 +1720,11 @@ def _signed_endpoint_host(host: str) -> str:
 
 
 def _matches_auth_snapshot(
-    device: Device, snapshot: DeviceAuthSnapshot
+    device: Device, snapshot: DeviceAuthSnapshot, *, allow_unbound: bool = False
 ) -> bool:
     return (
         snapshot.auth_revoked_at is None
-        and snapshot.is_bound
+        and (snapshot.is_bound or allow_unbound)
         and device.id == snapshot.row_id
         and device.device_id == snapshot.device_id
         and device.auth_version == snapshot.auth_version
@@ -2071,3 +2078,9 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _wan_reservation_subject(grant):
+    if getattr(grant, "authority_kind", "account") == "temporary_password":
+        return "guest-session-" + grant.id
+    return grant.requester_user_id

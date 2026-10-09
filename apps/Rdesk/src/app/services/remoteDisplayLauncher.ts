@@ -100,6 +100,8 @@ export type RemoteDisplayLaunchOptions = {
   routePreference?: RemoteRoutePreference;
   requestedProfile?: MediaProfile;
   captureSourceId?: string;
+  temporaryPassword?: string;
+  signal?: AbortSignal;
 };
 
 type RemoteApplicationCatalogOptions = Omit<
@@ -155,6 +157,8 @@ export async function launchRemoteDisplayForDevice(
         ...(options?.targetIp ? { targetIp: options.targetIp } : {}),
         ...(options?.requestedProfile ? { requestedProfile: options.requestedProfile } : {}),
         ...(options?.routePreference ? { routePreference: options.routePreference } : {}),
+        ...(options?.temporaryPassword !== undefined ? { temporaryPassword: options.temporaryPassword } : {}),
+        ...(options?.signal ? { signal: options.signal } : {}),
       });
       return {
         sessionId: browserSession.sessionId,

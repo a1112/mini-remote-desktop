@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     device_enrollment_token_pepper: SecretStr = SecretStr("")
     device_serial_pepper: SecretStr = SecretStr("")
     device_enrollment_ttl_seconds: int = 300
+    guest_browser_enabled: bool = False
+    guest_browser_global_per_minute: int = Field(default=300, ge=1, le=3000)
+    guest_browser_ip_per_minute: int = Field(default=10, ge=1, le=100)
+    guest_browser_device_per_minute: int = Field(default=5, ge=1, le=50)
     device_self_enrollment_enabled: bool = False
     device_self_enrollment_ttl_seconds: int = Field(default=60, ge=10, le=120)
     device_self_enrollment_global_per_minute: int = Field(default=1000, ge=1, le=5000)

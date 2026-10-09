@@ -18,8 +18,19 @@ pub struct VerifiedBackendToken {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSignalingAuthority {
+    Account {
+        user_id: String,
+    },
+    TemporaryPassword {
+        temporary_access_generation: u64,
+        target_auth_version: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserSignalingRestriction {
-    pub user_id: String,
+    pub authority: BrowserSignalingAuthority,
     pub tenant_id: String,
     pub session_id: SessionId,
     pub target_device_id: DeviceId,

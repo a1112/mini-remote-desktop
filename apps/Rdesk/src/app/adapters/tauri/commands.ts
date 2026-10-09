@@ -10,6 +10,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import type {
+  TemporaryAccessStatus,
+  TemporaryAccessSecret,
   AdapterResult,
   AutostartStatus,
   CloseBehavior,
@@ -130,6 +132,35 @@ async function invokeAdapter<T>(
     return { ok: false, error: { message, ...(code ? { code } : {}) } };
   }
 }
+
+function validTemporaryAccessStatus(value: unknown): value is TemporaryAccessStatus {
+  if (!value || typeof value !== 'object') return false;
+  const status = value as TemporaryAccessStatus;
+  return typeof status.enabled === 'boolean' && typeof status.ready === 'boolean'
+    && Number.isSafeInteger(status.generation) && status.generation >= 0
+    && (status.expires_at_ms === null || Number.isSafeInteger(status.expires_at_ms) && status.expires_at_ms > 0)
+    && (status.reason === null || typeof status.reason === 'string')
+    && (!status.ready || status.enabled && status.generation > 0 && status.expires_at_ms !== null);
+}
+
+async function invokeLocalTemporaryAccess<T>(command: string, validate: (value: unknown) => value is T): Promise<AdapterResult<T>> {
+  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+    return { ok: false, error: { code: 'E_NATIVE_REQUIRED', message: '本机临时密码仅可在安装的客户端中管理' } };
+  }
+  const result = await invokeAdapter<T>(command);
+  if (!result.ok || validate(result.value)) return result;
+  return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: '本机临时密码状态无效' } };
+}
+
+export const getTemporaryAccessStatus = () => invokeLocalTemporaryAccess('ipc_temporary_access_status', validTemporaryAccessStatus);
+export const rotateTemporaryAccessPassword = () => invokeLocalTemporaryAccess('ipc_temporary_access_rotate', validTemporaryAccessStatus);
+export const disableTemporaryAccess = () => invokeLocalTemporaryAccess('ipc_temporary_access_disable', validTemporaryAccessStatus);
+export const readTemporaryAccessPassword = () => invokeLocalTemporaryAccess('ipc_temporary_access_secret', (value): value is TemporaryAccessSecret => {
+  if (!value || typeof value !== 'object') return false;
+  const secret = value as TemporaryAccessSecret;
+  return validTemporaryAccessStatus(secret.status) && (secret.password === null || typeof secret.password === 'string'
+    && /^[A-Za-z0-9]{8}$/.test(secret.password) && secret.status.ready && secret.status.expires_at_ms! > Date.now());
+});
 
 async function invokeBridgeOrTauri<T>(
   command: string,

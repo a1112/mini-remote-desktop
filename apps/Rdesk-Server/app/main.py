@@ -18,6 +18,7 @@ from app.db.migrate_add_browser_controllers import migrate as migrate_browser_co
 from app.db.migrate_add_device_self_enrollment import (
     SELF_ENROLLMENT_TABLES, migrate as migrate_device_self_enrollment,
 )
+from app.db.migrate_add_guest_temporary_access import GUEST_TABLES, migrate as migrate_guest_temporary_access
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
@@ -34,12 +35,13 @@ async def lifespan(_: FastAPI):
         # migration, including on the first fresh database startup.
         await conn.run_sync(lambda sync: Base.metadata.create_all(
             sync, tables=[table for table in Base.metadata.sorted_tables
-                          if table.name not in SELF_ENROLLMENT_TABLES],
+                          if table.name not in SELF_ENROLLMENT_TABLES | GUEST_TABLES],
         ))
         await migrate_relay_access(conn, serial_pepper=settings.device_serial_pepper)
         await migrate_relay_redundancy(conn)
         await migrate_browser_controllers(conn)
         await migrate_device_self_enrollment(conn)
+        await migrate_guest_temporary_access(conn)
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.

@@ -1069,7 +1069,9 @@ pub async fn bind_and_spawn_wan_session_service(
         .map(|(device_id, _)| device_id.clone())
         .ok_or(ServiceWanSessionStartError::LocalIdentityUnavailable)?;
     let local_identity = app_state.device_identities.machine_identity();
-    let workflow_backend = Arc::new(ServiceWanSessionWorkflowBackend::new(backend));
+    let workflow_backend = Arc::new(
+        ServiceWanSessionWorkflowBackend::new(backend).with_temporary_authority(&app_state),
+    );
     let signaling = Arc::new(ServiceWanSessionWorkflowSignaling::new(Arc::clone(
         &app_state.relay_signaling,
     )));

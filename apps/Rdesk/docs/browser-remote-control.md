@@ -1,6 +1,6 @@
 # 独立网页远程控制
 
-网页控制端不依赖控制电脑上的 Rdesk、mrd-service 或本地 Web Bridge。受控设备运行驻留服务，用户登录后选择账户可访问的设备，目标端同意并批准 `screen.view` 后才显示远端 H.264 画面。键鼠分别要求 `input.pointer`、`input.keyboard`。
+网页控制端不依赖控制电脑上的 Rdesk、mrd-service 或本地 Web Bridge。受控设备运行驻留服务并取得设备码。使用设备码和临时密码时，双方无需登录；已有账号也可选择账户可访问的设备。目标端同意并批准 `screen.view` 后才显示远端 H.264 画面，键鼠分别要求 `input.pointer`、`input.keyboard`。
 
 ## 服务部署与配置
 
@@ -16,12 +16,17 @@
 - `RDESK_RELAY_DIRECTORY_SIGNING_PRIVATE_KEY`：继续通过既有受保护配置提供，不放入前端环境或静态文件。
 - `RDESK_REALTIME_PRESENCE_URL` 和既有私有 presence 鉴权 secret：后端通过同一信任边界调用 sidecar 的 `/internal/identities`，取得当前在线物理目标的已验证公钥。
 - `RDESK_CORS_ORIGINS`：精确配置网页 Origin。跨域部署需 API/信令可信证书；前端使用 `VITE_RDESK_SERVER_URL` 指向该 API。
+- `RDESK_GUEST_BROWSER_ENABLED=true`：在配套后端、信令与原生目标端完成升级后启用临时密码访客入口。默认关闭，不会通过旧账号或设备凭据替代访客权限。
 
 缺少 pin、目标离线或身份无法验证时，API 返回明确错误，不使用首次连接信任、不导出机器 Device token、不从本机预览冒充远端画面。
 
 网页部署在子路径时，构建需传入相同的 Vite base，例如 `VITE_RDESK_SERVER_URL=https://175.178.16.90/rdesk/api/v1 pnpm build --base /apps/rdesk/`。路由使用构建的 `BASE_URL`，静态服务器需将该前缀下的页面请求回退至同一 `index.html`，并直接提供资源文件；原生客户端和根路径开发保持默认 `/`。
 
 ## 浏览器链路
+
+临时密码入口使用 `POST /api/v1/guest-browser-sessions`，仅提交设备码、临时密码、临时公钥和本次规范请求。目标可未绑定账号。后续 GET、close、relay-access 使用该会话独立的短 HTTP 凭据，信令使用不同用途的 guest 凭据；密码及这些凭据不写入 URL 或浏览器持久存储。具体发布签名、验证算法及访客授权边界见 `apps/Rdesk-Server/docs/guest-browser-temporary-access.md`。
+
+本机临时密码由驻留服务生成，默认十分钟，提供显示、隐藏、复制、刷新和关闭。刷新使旧密码和待批准请求失效；已批准会话保留原有效期。关闭临时访问会立即阻止本机输入与媒体，并撤销访客会话。明文仅通过受保护的本机客户端命令读取，不通过网页桥接或普通状态输出。正确密码仍需目标端现场确认，不会自动批准。
 
 `POST /api/v1/browser-sessions` 使用当前用户 JWT、临时公钥、目标及请求权限创建有人值守会话。浏览器身份最多持续十分钟，只能作为 Controller 操作本次 session/target；物理设备接口不接受这种身份。
 

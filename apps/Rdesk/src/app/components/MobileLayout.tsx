@@ -14,6 +14,8 @@ import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher"
 import { ServiceStatusPanel } from "./ServiceStatusPanel";
 import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
 import { isTauriRuntime } from '../utils/runtime';
+import { GuestRemoteConnectForm } from './GuestRemoteConnectForm';
+import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
 
 type MobileLayoutProps = { onOpenAuth: () => void };
 
@@ -75,11 +77,11 @@ function MobileHomePage() {
     <div className="mobile-intro">
       <p className="mobile-eyebrow">安全远程访问</p>
       <h1>连接远程设备</h1>
-      <p>输入 10 位远程设备码，发起连接请求</p>
+      <p>{isTauriRuntime() ? '输入远程设备码，发起连接请求' : '设备码与临时密码连接，无需登录'}</p>
     </div>
 
     <section className="mobile-card mobile-connect-card" aria-label="连接远程设备">
-      <label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
+      {isTauriRuntime() ? <><label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
       <div className="mobile-input-wrap">
         <Monitor size={20} aria-hidden="true" />
         <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 10 位设备码"
@@ -92,7 +94,7 @@ function MobileHomePage() {
         {busy ? "连接中…" : "发起连接"}
         {!busy ? <ArrowRight size={20} aria-hidden="true" /> : null}
       </button>
-      {error ? <p className="mobile-error" role="alert">{error}</p> : null}
+      {error ? <p className="mobile-error" role="alert">{error}</p> : null}</> : <GuestRemoteConnectForm />}
     </section>
 
     <section className="mobile-card mobile-recent-card" aria-labelledby="mobile-recent-heading">
@@ -114,12 +116,12 @@ function MobileHomePage() {
       })}</div>}
     </section>
 
-    {isTauriRuntime() ? <section className="mobile-local-device" aria-label="本机设备">
+    {isTauriRuntime() ? <><section className="mobile-local-device" aria-label="本机设备">
       <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>
-    </section> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。登录后连接远端设备，由对方确认画面和键鼠权限。</p></section>}
+    </section><section className="mobile-card"><TemporaryAccessPasswordCard /></section></> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。设备码和临时密码连接无需登录，由对方确认画面和键鼠权限。</p></section>}
   </div>;
 }
 

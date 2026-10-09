@@ -40,10 +40,15 @@ struct Fixture {
     target: DeviceIdentity,
     browser_connection: ConnectionId,
     target_connection: ConnectionId,
+    guest_authority: bool,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::new_for_authority(false)
+    }
+
+    fn new_for_authority(guest_authority: bool) -> Self {
         let data = browser_fixture::fixture();
         let browser = browser_fixture::identity(data["browser"]["seed_hex"].as_str().unwrap());
         let target = browser_fixture::identity(data["target"]["seed_hex"].as_str().unwrap());
@@ -74,6 +79,7 @@ impl Fixture {
             target,
             browser_connection: ConnectionId::from_bytes([1; 16]).unwrap(),
             target_connection: ConnectionId::from_bytes([2; 16]).unwrap(),
+            guest_authority,
         };
         result.register(false, result.target_connection, 1).unwrap();
         result.register(true, result.browser_connection, 1).unwrap();
@@ -118,7 +124,15 @@ impl Fixture {
         };
         let mut payload = json!({"sub":id.0,"device_id":id.0,"device_key_id":identity.key_id(),"role":role,"token_type":if browser{"browser_signaling"}else{"signaling"},"iss":"rdesk-backend","aud":"rdesk-signaling","iat":NOW/1000,"exp":NOW/1000+300});
         if browser {
-            payload["user_id"] = json!("user-1");
+            if self.guest_authority {
+                payload["token_type"] = json!("guest_browser_signaling");
+                payload["authority_kind"] = json!("temporary_password");
+                payload["temporary_access_generation"] = json!(1);
+                payload["target_auth_version"] = json!(2);
+                payload["user_id"] = json!(null);
+            } else {
+                payload["user_id"] = json!("user-1");
+            }
             payload["tenant_id"] = json!("tenant-1");
             payload["session_id"] = self.data["request"]["session_id"].clone();
             payload["target_device_id"] = self.data["target"]["device_id"].clone();
@@ -361,4 +375,80 @@ fn browser_expiry_is_checked_for_every_message_and_prune_cleans_its_route() {
         .contains(&fixture.browser_connection));
     assert!(!fixture.core.is_present(&fixture.device_id(true)));
     assert_eq!(fixture.core.route_count(), 0);
+}
+
+#[test]
+fn guest_temporary_authority_routes_signed_v3_without_account_or_wire_changes() {
+    let mut fixture = Fixture::new_for_authority(true);
+    fixture.open_route();
+    let offer: WebRtcOfferV3 = serde_json::from_value(fixture.data["offer"].clone()).unwrap();
+    let deliveries = fixture
+        .core
+        .handle(
+            fixture.browser_connection,
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(offer)),
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        deliveries[0].target,
+        realtime_server::DeliveryTarget::Connection(fixture.target_connection)
+    );
+}
+
+#[test]
+fn guest_temporary_authority_cannot_escape_session_target_or_approved_scopes() {
+    for change in ["session", "target", "scope"] {
+        let mut fixture = Fixture::new_for_authority(true);
+        let mut intent = fixture.intent();
+        match change {
+            "session" => intent.payload.request.session_id = SessionId("other-session".into()),
+            "target" => {
+                intent.payload.request.target_device_id = DeviceId("other-target".into());
+                intent.payload.claims.intended_peer_device_id = DeviceId("other-target".into());
+            }
+            "scope" => intent
+                .payload
+                .request
+                .requested_scopes
+                .insert(0, WanPermissionScopeV3::FileWrite),
+            _ => unreachable!(),
+        }
+        intent.payload.request_commitment = intent.payload.request.commitment().unwrap();
+        let intent = SessionIntentV3::sign(&fixture.browser, intent.payload).unwrap();
+        assert_eq!(
+            fixture
+                .core
+                .handle(
+                    fixture.browser_connection,
+                    SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(intent)),
+                    NOW + 2
+                )
+                .unwrap_err()
+                .reason_code(),
+            ProtocolReasonCode::UnauthorizedRoute,
+            "{change}"
+        );
+        assert_eq!(fixture.core.route_count(), 0);
+    }
+}
+
+#[test]
+fn guest_temporary_authority_close_removes_browser_and_tombstones_its_credential() {
+    for browser_closes in [true, false] {
+        let mut fixture = Fixture::new_for_authority(true);
+        fixture.open_route();
+        fixture.close(browser_closes);
+        assert!(!fixture.core.is_present(&fixture.device_id(true)));
+        assert!(fixture.core.is_present(&fixture.device_id(false)));
+        assert_eq!(fixture.core.route_count(), 0);
+        let another = ConnectionId::from_bytes([9; 16]).unwrap();
+        assert_eq!(
+            fixture
+                .register(true, another, 9)
+                .unwrap_err()
+                .reason_code(),
+            ProtocolReasonCode::UnauthorizedRoute
+        );
+    }
 }

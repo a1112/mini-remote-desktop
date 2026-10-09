@@ -22,6 +22,7 @@ fn token(
     browser: bool,
     session: &SessionId,
     lifetime_s: u64,
+    guest_authority: bool,
 ) -> String {
     let browser_principal = browser && device.0.starts_with("browser_");
     let role = if browser_principal {
@@ -39,7 +40,15 @@ fn token(
         "iat": now_ms()/1000, "exp": now_ms()/1000+lifetime_s,
     });
     if browser_principal {
-        claims["user_id"] = json!("lifecycle-user");
+        if guest_authority {
+            claims["token_type"] = json!("guest_browser_signaling");
+            claims["authority_kind"] = json!("temporary_password");
+            claims["user_id"] = json!(null);
+            claims["temporary_access_generation"] = json!(1);
+            claims["target_auth_version"] = json!(2);
+        } else {
+            claims["user_id"] = json!("lifecycle-user");
+        }
         claims["tenant_id"] = json!("lifecycle-tenant");
         claims["session_id"] = json!(session.0);
         claims["target_device_id"] = json!("target-lifecycle");
@@ -119,6 +128,14 @@ impl Fixture {
     }
 
     async fn start_with_options(browser_suffix: u8, browser_lifetime_s: u64) -> Self {
+        Self::start_with_authority(browser_suffix, browser_lifetime_s, false).await
+    }
+
+    async fn start_with_authority(
+        browser_suffix: u8,
+        browser_lifetime_s: u64,
+        guest_authority: bool,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bind_addr = listener.local_addr().unwrap();
         let core_config = CoreConfig {
@@ -160,8 +177,16 @@ impl Fixture {
         });
         let url = format!("ws://{bind_addr}/ws");
         let session = SessionId("browser-lifecycle-session".into());
-        let target = connect_peer(&url, false, &session, 1, 300).await;
-        let browser = connect_peer(&url, true, &session, browser_suffix, browser_lifetime_s).await;
+        let target = connect_peer(&url, false, &session, 1, 300, false).await;
+        let browser = connect_peer(
+            &url,
+            true,
+            &session,
+            browser_suffix,
+            browser_lifetime_s,
+            guest_authority,
+        )
+        .await;
         let mut fixture = Self {
             state,
             url,
@@ -265,6 +290,7 @@ async fn connect_peer(
     session: &SessionId,
     suffix: u8,
     lifetime_s: u64,
+    guest_authority: bool,
 ) -> Peer {
     let (mut socket, _) = connect_async(url).await.unwrap();
     let challenge = match receive(&mut socket).await.message {
@@ -279,7 +305,14 @@ async fn connect_peer(
     } else {
         "target-lifecycle".into()
     });
-    let jwt = token(&identity, &device, browser, session, lifetime_s);
+    let jwt = token(
+        &identity,
+        &device,
+        browser,
+        session,
+        lifetime_s,
+        guest_authority,
+    );
     let connection = register(&mut socket, &identity, &device, &jwt, browser, challenge, 1)
         .await
         .unwrap();
@@ -371,7 +404,11 @@ async fn wait_for_cleanup(state: &RealtimeAppState, browser: ConnectionId) {
 }
 
 async fn close_lifecycle(browser_closes: bool, future_wait: bool) {
-    let mut fixture = Fixture::start().await;
+    close_lifecycle_authority(browser_closes, future_wait, false).await;
+}
+
+async fn close_lifecycle_authority(browser_closes: bool, future_wait: bool, guest_authority: bool) {
+    let mut fixture = Fixture::start_with_authority(2, 300, guest_authority).await;
     let old_outbound = fixture
         .state
         .peers
@@ -439,7 +476,15 @@ async fn close_lifecycle(browser_closes: bool, future_wait: bool) {
     })
     .await
     .expect("rejected registration transport is released after the client close");
-    let mut replacement = connect_peer(&fixture.url, true, &fixture.session, 3, 300).await;
+    let mut replacement = connect_peer(
+        &fixture.url,
+        true,
+        &fixture.session,
+        3,
+        300,
+        guest_authority,
+    )
+    .await;
     let (mut overflow, _) = connect_async(&fixture.url).await.unwrap();
     assert_closed(&mut overflow).await;
     assert_eq!(fixture.state.peers.lock().await.len(), 2);
@@ -614,4 +659,11 @@ async fn terminated_browser_retains_capacity_until_transport_disconnect() {
         .open_connection(extra, now_ms())
         .is_ok());
     fixture.state.core.lock().await.disconnect(extra);
+}
+
+#[tokio::test]
+async fn guest_temporary_signed_close_preserves_real_transport_order_capacity_and_target_socket() {
+    for browser_closes in [true, false] {
+        close_lifecycle_authority(browser_closes, false, true).await;
+    }
 }
