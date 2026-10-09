@@ -1,0 +1,21 @@
+{
+  "official_commit": "de0c9b28f22281a0251d7e98aa8a097895a5b185",
+  "official_archive_url": "https://codeload.github.com/coturn/coturn/tar.gz/de0c9b28f22281a0251d7e98aa8a097895a5b185",
+  "archive_sha256": "3d6fa86bb713379e735342ef640b93f64272b79af0318ad70a6a871cff0ccc93",
+  "patch_sha256": "9d5d75e01088952e8f065a890d1e8410ef1af60d25e9806c3e6a8d70648e6bcb",
+  "changed_files": {
+    "src/apps/relay/prom_server.c": {
+      "before": "606e4d956ae912c4b589115530391813b1581f579f6cf1a05fb3e8469e5a26b5",
+      "after": "aca498e4830433227dbc55f1289f7478879e95086285d7e19a05f20d1e3362f1"
+    },
+    "src/apps/relay/prom_server.h": {
+      "before": "0ebb9778a50c65f737ff0de7086c750a103cd4b357d1bc8ded09773726f4f297",
+      "after": "9fa44122f7877317d1425aa70b1d71e75f70f06749702072754aed1133a4a292"
+    },
+    "src/apps/relay/mainrelay.c": {
+      "before": "64d9ca4ba0d0f1c6ecfbe6dbc0300a767f19c2c543aa2634ce520fd6fd10c7ed",
+      "after": "fc52927742b98256400cb8880e187bb63f396e6eccfa5133ba309e1a8deedbc3"
+    }
+  },
+  "prom_c_sha256": "4026e55301150263df36ac6bd548ebfb2e3d4bd162d2154c0fa318ae3f6a4677"
+}
