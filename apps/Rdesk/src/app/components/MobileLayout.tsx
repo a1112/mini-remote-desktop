@@ -29,7 +29,7 @@ const tabs = [
 function MobileHomePage() {
   const navigate = useNavigate();
   const { devices } = useDevices();
-  const { deviceId: myDeviceId, deviceName: myDeviceName } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const history = useConnectionHistory();
   const [targetId, setTargetId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -121,7 +121,7 @@ function MobileHomePage() {
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>
-    </section><section className="mobile-card"><TemporaryAccessPasswordCard /></section></> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。设备码和临时密码连接无需登录，由对方确认画面和键鼠权限。</p></section>}
+    </section>{registrationError ? <p className="mobile-error" role="alert">{registrationError}</p> : null}{serviceManagedRegistration && !myDeviceId ? <button className="mobile-primary-button" onClick={() => { void reregister(); }}>刷新登记状态</button> : null}<section className="mobile-card"><TemporaryAccessPasswordCard /></section></> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。设备码和临时密码连接无需登录，由对方确认画面和键鼠权限。</p></section>}
   </div>;
 }
 

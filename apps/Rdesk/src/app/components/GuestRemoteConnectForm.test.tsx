@@ -9,6 +9,14 @@ vi.mock('../services/remoteDisplayLauncher', () => ({ launchRemoteDisplayForDevi
 beforeEach(() => { vi.clearAllMocks(); mocks.launch.mockResolvedValue({ sessionId: 'guest-session', mode: 'route', routePath: '/browser-session/guest-session' }); });
 
 describe('guest remote connection form', () => {
+  it.each(['abcd2345', 'ABCD2340', 'ABCD2341', 'ABCD23I5', 'ABCD23O5'])('shows a local format error instead of sending a password outside the issued alphabet: %s', async (password) => {
+    const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
+    await user.type(screen.getByLabelText('远程设备码'), '753662296');
+    await user.type(screen.getByLabelText('远端临时密码'), password);
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent('8 位临时密码');
+  });
   it('submits an existing nine digit code and password without requiring account login', async () => {
     const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
     await user.type(screen.getByLabelText('远程设备码'), '753 662 296');

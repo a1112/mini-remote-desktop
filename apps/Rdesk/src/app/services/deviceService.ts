@@ -176,7 +176,7 @@ class DeviceRegistrationService {
       const status = result.value;
       if (!status.device_registered || !status.device_id) {
         this.deviceInfo = null;
-        this.registrationError = "需要设备登记码，请向服务器管理员获取一次性登记码后注册";
+        this.registrationError = "等待本机服务自动登记设备，无需登录账号";
         return null;
       }
       const info: StoredDeviceInfo = {
@@ -196,6 +196,10 @@ class DeviceRegistrationService {
       this.deviceInfo = stored?.access_token === SERVICE_MANAGED_TOKEN ? stored : null;
       return this.deviceInfo;
     }
+  }
+
+  isServiceManagedRegistration(): boolean {
+    return isTauriRuntime() && this.shouldUseServiceManagedRegistration();
   }
 
   getRegistrationError(): string | null {
@@ -588,13 +592,41 @@ export function useDeviceRegistration() {
   };
 
   useEffect(() => {
-    const onBindingChanged = () => updateInfo(deviceService.getDeviceInfo());
-    window.addEventListener("rdesk:device-binding-changed", onBindingChanged);
-    deviceService.initialize().then((info) => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let attempts = 0;
+    const deadline = Date.now() + 60_000;
+    const run = async () => {
+      if (cancelled) return;
+      if (attempts > 0 && Date.now() >= deadline) {
+        setRegistrationError("自动登记暂未完成，请检查网络后刷新登记状态重试；无需登录账号");
+        return;
+      }
+      attempts += 1;
+      const info = await deviceService.initialize();
+      if (cancelled) return;
       updateInfo(info);
       setIsLoading(false);
-    });
-    return () => window.removeEventListener("rdesk:device-binding-changed", onBindingChanged);
+      if (!info && deviceService.isServiceManagedRegistration()) {
+        if (attempts < 30 && Date.now() < deadline) {
+          timer = window.setTimeout(() => { void run(); }, 2000);
+        } else {
+          setRegistrationError("自动登记暂未完成，请检查网络后刷新登记状态重试；无需登录账号");
+        }
+      }
+    };
+    const onBindingChanged = () => {
+      const info = deviceService.getDeviceInfo();
+      if (info && timer !== undefined) window.clearTimeout(timer);
+      updateInfo(info);
+    };
+    window.addEventListener("rdesk:device-binding-changed", onBindingChanged);
+    void run();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+      window.removeEventListener("rdesk:device-binding-changed", onBindingChanged);
+    };
   }, []);
 
   return {
@@ -605,6 +637,11 @@ export function useDeviceRegistration() {
     registrationError,
     refresh: () => updateInfo(deviceService.getDeviceInfo()),
     getAccessToken: () => deviceService.getAccessToken(),
-    reregister: () => deviceService.reregister(),
+    serviceManagedRegistration: deviceService.isServiceManagedRegistration(),
+    reregister: async () => {
+      const info = await deviceService.reregister();
+      updateInfo(info);
+      return info;
+    },
   };
 }

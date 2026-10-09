@@ -3361,11 +3361,16 @@ dependencies = [
 name = "mrd-device-registration"
 version = "0.1.0"
 dependencies = [
+ "mrd-identity",
+ "rcgen 0.13.2",
  "reqwest 0.12.28",
+ "ring",
+ "rustls",
  "security-framework",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "winreg 0.52.0",
  "zeroize",
 ]

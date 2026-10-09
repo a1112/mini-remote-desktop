@@ -1,3 +1,4 @@
+import { TEMPORARY_PASSWORD_PATTERN } from '../utils/temporaryPassword';
 import type { ControlInputEvent, MediaProfile, RemoteRoutePreference } from '../adapters/tauri/types';
 import { SERVER_API_URL } from './serverConfig';
 import {
@@ -129,7 +130,7 @@ export async function createBrowserRemoteSession(
 ): Promise<{ sessionId: string }> {
   const guest = options?.temporaryPassword !== undefined;
   let password = options?.temporaryPassword ?? '';
-  if (guest && !/^[A-Za-z0-9]{8}$/.test(password)) throw new Error('请输入设备上显示的 8 位临时密码');
+  if (guest && !TEMPORARY_PASSWORD_PATTERN.test(password)) throw new Error('请输入设备上显示的 8 位临时密码');
   const token = guest ? undefined : localStorage.getItem('rdesk_access_token')?.trim();
   if (!guest && !token) throw new Error('请先登录后连接远端设备，或使用设备码和临时密码');
   if (!globalThis.isSecureContext || !globalThis.crypto?.subtle) throw new Error('网页远控需要 HTTPS 安全连接（开发环境可使用 localhost）');

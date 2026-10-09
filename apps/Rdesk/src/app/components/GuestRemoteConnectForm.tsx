@@ -1,3 +1,4 @@
+import { TEMPORARY_PASSWORD_PATTERN } from '../utils/temporaryPassword';
 import { useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { ArrowRight, Eye, EyeOff, Loader2 } from 'lucide-react';
@@ -24,7 +25,7 @@ export function GuestRemoteConnectForm() {
     if (inFlight.current) return;
     const target = parseRemoteDeviceInput(deviceCode);
     if (!target) { setError(DEVICE_CODE_INPUT_ERROR); return; }
-    if (!/^[A-Za-z0-9]{8}$/.test(password)) { setError('请输入远端设备显示的 8 位临时密码'); return; }
+    if (!TEMPORARY_PASSWORD_PATTERN.test(password)) { setError('请输入远端设备显示的 8 位临时密码（大写字母和 2–9 数字，不含 I/O）'); return; }
     const cancellation = new AbortController();
     inFlight.current = cancellation;
     setBusy(true); setError(null); setPassword(''); setRevealed(false);
@@ -53,7 +54,7 @@ export function GuestRemoteConnectForm() {
     </label>
     <div className="text-sm"><label htmlFor={passwordId}>远端临时密码</label>
       <span className="relative mt-1.5 block">
-        <input id={passwordId} aria-label="远端临时密码" type={revealed ? 'text' : 'password'} placeholder="输入 8 位临时密码" autoComplete="off" autoCapitalize="none" spellCheck={false}
+        <input id={passwordId} aria-label="远端临时密码" type={revealed ? 'text' : 'password'} placeholder="输入 8 位临时密码" autoComplete="off" autoCapitalize="characters" spellCheck={false}
           value={password} onChange={event => setPassword(event.target.value)} disabled={busy} maxLength={8}
           className="w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5 pr-12 outline-none focus:ring-2 focus:ring-blue-500/30" />
         <button type="button" onClick={() => setRevealed(value => !value)} disabled={busy} aria-label={revealed ? '隐藏输入密码' : '显示输入密码'} className="absolute inset-y-0 right-0 px-3 opacity-60 hover:opacity-100">

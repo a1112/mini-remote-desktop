@@ -38,6 +38,11 @@ async function successfulGuestBootstrap(init: RequestInit) {
 }
 
 describe('temporary password guest browser access', () => {
+  it.each(['abcd2345', 'ABCD2340', 'ABCD2341', 'ABCD23I5', 'ABCD23O5'])('rejects a password outside the issued alphabet before network access: %s', async (temporaryPassword) => {
+    const request = vi.fn(); vi.stubGlobal('fetch', request);
+    await expect(createBrowserRemoteSession('753662296', { temporaryPassword })).rejects.toThrow('临时密码');
+    expect(request).not.toHaveBeenCalled();
+  });
   it('connects without account login and sends the password only to the guest create endpoint', async () => {
     const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
     vi.stubGlobal('fetch', request);

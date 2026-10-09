@@ -26,6 +26,7 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod binding;
+mod initial;
 pub(crate) mod temporary;
 pub(crate) use binding::change_device_binding;
 
@@ -437,7 +438,34 @@ pub async fn recover(
 async fn apply_registration(
     state: &Arc<AppState>,
     api_url: &str,
+    value: DeviceRegistrationResponse,
+) -> Result<(), &'static str> {
+    apply_registration_inner(state, api_url, value, false).await
+}
+
+// Only a successful durable machine-key challenge may restore a historical
+// nine-digit code when the local credential file is absent. Ordinary OTP
+// allocation retains its ten-digit requirement, and an existing code never changes.
+async fn apply_self_registration(
+    state: &Arc<AppState>,
+    api_url: &str,
+    value: DeviceRegistrationResponse,
+) -> Result<(), &'static str> {
+    if state.public_connection.registration().is_some()
+        || !matches!(value.device_id.len(), 9 | 10)
+        || !value.device_id.bytes().all(|byte| byte.is_ascii_digit())
+        || value.refresh_token.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("public_self_enrollment_response_invalid");
+    }
+    apply_registration_inner(state, api_url, value, true).await
+}
+
+async fn apply_registration_inner(
+    state: &Arc<AppState>,
+    api_url: &str,
     mut value: DeviceRegistrationResponse,
+    verified_self_enrollment: bool,
 ) -> Result<(), &'static str> {
     let previous = state.public_connection.registration();
     if previous
@@ -453,6 +481,9 @@ async fn apply_registration(
             .registration()
             .as_ref()
             .is_none_or(|saved| saved.device_id != value.device_id)
+            && !(verified_self_enrollment
+                && value.device_id.len() == 9
+                && value.device_id.bytes().all(|byte| byte.is_ascii_digit()))
         {
             value.access_token.zeroize();
             return Err("服务器未返回有效的10位设备码");
@@ -721,6 +752,7 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
         let mut stack: Option<Stack> = None;
         let mut credential: Option<Arc<DeviceCredential>> = None;
         let mut last_refresh: Option<tokio::time::Instant> = None;
+        let mut initial_retry = initial::EnrollmentRetry::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(30));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -769,6 +801,29 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
                     Some("public_api_unreachable" | "public_configuration_unavailable")
                 ) {
                     *error = None;
+                }
+            }
+            if state.public_connection.registration().is_none() {
+                if !initial_retry.can_attempt(tokio::time::Instant::now()) {
+                    continue;
+                }
+                let enrolled = tokio::select! {
+                    biased;
+                    _ = &mut stopping => break,
+                    result = initial::ensure_registration(&state,&api_url) => result,
+                };
+                match enrolled {
+                    Ok(created) => {
+                        initial_retry.succeeded();
+                        if created {
+                            last_refresh = Some(tokio::time::Instant::now());
+                        }
+                    }
+                    Err(code) => {
+                        initial_retry.failed(tokio::time::Instant::now(), code);
+                        *state.public_connection.last_error.write().unwrap() = Some(code.into());
+                        continue;
+                    }
                 }
             }
             let _operation = tokio::select! {

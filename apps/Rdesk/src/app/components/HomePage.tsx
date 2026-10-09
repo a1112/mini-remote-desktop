@@ -44,7 +44,7 @@ export function HomePage() {
         lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
       };
     });
-  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
   const [copied, setCopied] = useState(false);
@@ -259,8 +259,11 @@ export function HomePage() {
               </button>
             </div>
             {registrationError && <p role="alert" className="mb-3 text-sm text-amber-600">{registrationError}</p>}
+            {serviceManagedRegistration && <button onClick={() => { void reregister(); }} className={`mb-2 w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
+              刷新登记状态
+            </button>}
             <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
-              登记到服务器
+              {serviceManagedRegistration ? "管理员登记或恢复" : "登记到服务器"}
             </button>
             <TemporaryAccessPasswordCard />
           </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。使用设备码和临时密码即可发起连接，双方无需登录；对方确认后查看画面并控制已授权的键鼠。</p></section>}
