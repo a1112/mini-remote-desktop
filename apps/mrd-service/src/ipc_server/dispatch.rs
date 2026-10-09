@@ -216,6 +216,39 @@ impl IpcServer {
                 identity::list_trusted_devices(&self.app_state, include_revoked).await
             }
 
+            IpcRequest::ListLanPairingCandidates => {
+                crate::lan_discovery::pairing_approval::list_candidates(&self.app_state).await
+            }
+
+            IpcRequest::ApproveLanPairing { approval } => {
+                #[cfg(windows)]
+                {
+                    if self.validate_first_pairing_caller().is_err() {
+                        IpcResponse::Error {
+                            code: "E_PRODUCT_CALLER_DENIED".to_owned(),
+                            message: "请在当前桌面的正式客户端中确认配对".to_owned(),
+                        }
+                    } else {
+                        let server = self.clone();
+                        crate::lan_discovery::pairing_approval::approve_candidate(
+                            &self.app_state,
+                            approval,
+                            move || server.validate_first_pairing_caller(),
+                        )
+                        .await
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = approval;
+                    IpcResponse::Error {
+                        code: "E_PRODUCT_CALLER_DENIED".to_owned(),
+                        message: "First pairing requires a supported verified installed desktop UI"
+                            .to_owned(),
+                    }
+                }
+            }
+
             IpcRequest::ApproveTrustedDevice { .. } => IpcResponse::Error {
                 code: "E_AUTHENTICATED_PEER_REQUIRED".to_string(),
                 message: "trusted-device approval requires an authenticated pending peer key"
@@ -247,7 +280,12 @@ impl IpcServer {
             }
 
             IpcRequest::GetRemoteSession { session_id } => {
-                session::get_remote_session(&self.app_state, session_id).await
+                let result = session::get_remote_session(&self.app_state, session_id).await;
+                #[cfg(windows)]
+                if let IpcResponse::RemoteSession { session } = &result {
+                    self.observe_owned_product_session(session).await;
+                }
+                result
             }
 
             IpcRequest::GetRouteEvidence { session_id } => {
@@ -255,13 +293,44 @@ impl IpcServer {
             }
 
             IpcRequest::GetAuditEventsV2 { query } => {
+                #[cfg(windows)]
+                if self.product_only {
+                    return self.read_product_audit(query).await;
+                }
                 telemetry::audit_events_v2(&self.app_state, query).await
             }
 
             IpcRequest::RespondToConsent { response } => {
                 #[cfg(windows)]
                 let session_id = response.session_id.clone();
+                #[cfg(windows)]
+                let audit_cursor = match self.product_audit_cursor().await {
+                    Ok(cursor) => cursor,
+                    Err(denial) => {
+                        self.app_state
+                            .console_capture
+                            .stop(&self.app_state, &session_id)
+                            .await;
+                        return denial;
+                    }
+                };
+                #[cfg(windows)]
+                let previous_instance = self
+                    .app_state
+                    .session_authorizations
+                    .product_audit_binding(&session_id)
+                    .await
+                    .map(|(instance, _)| instance);
                 let result = session::respond_to_consent(&self.app_state, response).await;
+                #[cfg(windows)]
+                self.remember_product_response(
+                    &session_id,
+                    &result,
+                    mrd_ipc::RemoteSessionRole::Agent,
+                    audit_cursor,
+                    previous_instance.map(super::product::ProductAuditOwnerProof::Consent),
+                )
+                .await;
                 #[cfg(windows)]
                 if !matches!(result, IpcResponse::ConsentRecorded { .. }) {
                     self.app_state
@@ -278,6 +347,20 @@ impl IpcServer {
 
             IpcRequest::RequestRemoteSession { request } => {
                 let session_id = request.session_id.clone();
+                #[cfg(windows)]
+                let outgoing_birth = if self.product_only {
+                    self.app_state
+                        .session_authorizations
+                        .observe_outgoing_birth(&session_id)
+                        .await
+                } else {
+                    None
+                };
+                #[cfg(windows)]
+                let audit_cursor = match self.product_audit_cursor().await {
+                    Ok(cursor) => cursor,
+                    Err(denial) => return denial,
+                };
                 let target_device_id = request.target_device_id.clone();
                 let mut details = vec![(
                     "requested_scopes".to_string(),
@@ -338,14 +421,25 @@ impl IpcServer {
                     crate::wan_session::media::WanRouteSelection::Lan => SessionStartKind::Lan,
                     crate::wan_session::media::WanRouteSelection::WanRelay => SessionStartKind::Wan,
                 };
-                self.finish_session_start_audit(
-                    response,
-                    session_id,
-                    target_device_id,
-                    session_kind,
-                    details,
+                let result = self
+                    .finish_session_start_audit(
+                        response,
+                        session_id.clone(),
+                        target_device_id,
+                        session_kind,
+                        details,
+                    )
+                    .await;
+                #[cfg(windows)]
+                self.remember_product_response(
+                    &session_id,
+                    &result,
+                    mrd_ipc::RemoteSessionRole::Controller,
+                    audit_cursor,
+                    outgoing_birth.map(super::product::ProductAuditOwnerProof::Outgoing),
                 )
-                .await
+                .await;
+                result
             }
 
             IpcRequest::EnableUnattendedAccess { policy } => {
@@ -1180,6 +1274,7 @@ fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
         IpcRequest::RegisterDevice { .. }
             | IpcRequest::RequestRemoteSession { .. }
             | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::ApproveLanPairing { .. }
             | IpcRequest::EnableUnattendedAccess { .. }
             | IpcRequest::DisableUnattendedAccess { .. }
             | IpcRequest::RotateUnattendedAccess { .. }

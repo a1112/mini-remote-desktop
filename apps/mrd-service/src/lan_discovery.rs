@@ -59,6 +59,7 @@ mod capture_sources;
 mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
+mod first_pairing;
 pub(crate) mod lan_control_input;
 mod local_network_identity;
 mod media_access_unit;
@@ -82,6 +83,7 @@ pub(crate) mod media_sender;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
+pub(crate) mod pairing_approval;
 mod peer_format;
 mod peer_lookup;
 mod peer_registry;
@@ -438,6 +440,7 @@ pub struct LanDiscoveryState {
     running: AtomicBool,
     last_probe_ms: AtomicU64,
     peers: Mutex<LanPeerRegistry>,
+    first_pairing: Mutex<first_pairing::LanPairingCandidates>,
     signed_replays: Mutex<LanSignedReplayCache>,
     pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
@@ -501,6 +504,7 @@ impl LanDiscoveryState {
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
             peers: Mutex::new(LanPeerRegistry::default()),
+            first_pairing: Mutex::new(first_pairing::LanPairingCandidates::default()),
             signed_replays: Mutex::new(LanSignedReplayCache::default()),
             pending_sessions: Arc::new(StdMutex::new(HashSet::new())),
             recent_control_inputs: Mutex::new(HashMap::new()),
@@ -997,6 +1001,7 @@ pub async fn ingest_signed_lan_announcement(
     addr: SocketAddr,
     observed_at_ms: u64,
 ) -> Result<()> {
+    let received_at = std::time::Instant::now();
     signed.verify(observed_at_ms)?;
     if signed.payload.discovery_endpoint != addr {
         anyhow::bail!(
@@ -1010,6 +1015,9 @@ pub async fn ingest_signed_lan_announcement(
     {
         return Ok(());
     }
+    // Pairing/revocation and ingestion must not publish a cached pre-transition
+    // trust classification after another operation commits its durable state.
+    let _security_guard = app_state.authorization_security_gate.lock().await;
     let trust = resolve_authenticated_peer_trust(
         app_state,
         &signed.payload.signer_key_id,
@@ -1029,6 +1037,27 @@ pub async fn ingest_signed_lan_announcement(
         signed.payload.expires_at_ms,
         observed_at_ms,
     )?;
+    if trust == AuthenticatedPeerTrust::Untrusted {
+        app_state
+            .lan_discovery
+            .first_pairing
+            .lock()
+            .await
+            .observe_verified(
+                &signed,
+                trust,
+                observed_at_ms,
+                received_at,
+                app_state.lan_discovery.config.peer_ttl,
+            )?;
+    } else {
+        app_state
+            .lan_discovery
+            .first_pairing
+            .lock()
+            .await
+            .remove_peer(&signed.payload.signer_key_id);
+    }
     app_state
         .lan_discovery
         .upsert_signed_peer(&signed, trust)
@@ -1091,6 +1120,21 @@ async fn resolve_authenticated_peer_trust(
         Err(error) => {
             app_state.mark_security_unhealthy();
             Err(anyhow::Error::new(error).context("LAN trust lookup task failed"))
+        }
+    }
+}
+
+async fn resolve_authenticated_peer_permission_ceiling(
+    app_state: &Arc<AppState>,
+    peer_key_id: &str,
+) -> Result<Vec<RemotePermissionScope>> {
+    let registry = app_state.device_identities();
+    let key = peer_key_id.to_owned();
+    match tokio::task::spawn_blocking(move || registry.permission_ceiling(&key)).await {
+        Ok(Ok(scopes)) => Ok(scopes),
+        _ => {
+            app_state.mark_security_unhealthy();
+            anyhow::bail!("authoritative peer permission policy is unavailable")
         }
     }
 }
@@ -1285,7 +1329,7 @@ async fn begin_outgoing_authorization_under_security_gate(
     peer_key_id: &str,
     peer_public_key: &[u8],
     peer_key_epoch: u64,
-    request: crate::session_authorization::VerifiedIncomingAuthorizationRequest,
+    mut request: crate::session_authorization::VerifiedIncomingAuthorizationRequest,
 ) -> Result<()> {
     let _admission_guard = app_state.authorization_security_gate.lock().await;
     let admission_trust =
@@ -1294,6 +1338,11 @@ async fn begin_outgoing_authorization_under_security_gate(
     if !admission_trust.is_controllable() {
         anyhow::bail!("LAN peer trust changed before session admission");
     }
+    let peer_ceiling =
+        resolve_authenticated_peer_permission_ceiling(app_state, peer_key_id).await?;
+    request
+        .peer_permission_ceiling
+        .retain(|scope| peer_ceiling.contains(scope));
     if app_state.sessions.lock().await.get(session_id).is_some() {
         anyhow::bail!(
             "session id became occupied before secure LAN admission: {}",
@@ -2704,6 +2753,9 @@ async fn handle_signed_remote_session_request(
         app_state.security_is_healthy() && app_state.control_input().lock().await.is_available();
     let authorization_capabilities =
         lan_authorization_capabilities_with_input_control(input_control_available);
+    let durable_peer_ceiling =
+        resolve_authenticated_peer_permission_ceiling(app_state, &request.payload.source_key_id)
+            .await?;
     let _pending_authorization = match app_state
         .session_authorizations
         .begin_verified_incoming(
@@ -2714,7 +2766,7 @@ async fn handle_signed_remote_session_request(
                 peer_key_epoch: request.payload.source_key_epoch,
                 access_mode: request.payload.access_mode,
                 requested_scopes: request.payload.requested_scopes.clone(),
-                peer_permission_ceiling: authorization_capabilities.clone(),
+                peer_permission_ceiling: durable_peer_ceiling,
                 machine_permission_ceiling: authorization_capabilities.clone(),
                 runtime_capabilities: authorization_capabilities,
                 transport_kind: request.payload.transport_kind.clone(),
@@ -7682,6 +7734,8 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
     true
 }
 
+#[cfg(test)]
+mod first_pairing_integration_tests;
 #[cfg(test)]
 mod security_negative_evidence_tests;
 #[cfg(test)]

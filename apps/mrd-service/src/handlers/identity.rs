@@ -122,10 +122,19 @@ pub async fn get_device_identity_snapshot(app_state: &Arc<AppState>) -> IpcRespo
 /// List durable public-key-pinned trust records without exposing pinned key bytes.
 pub async fn list_trusted_devices(app_state: &Arc<AppState>, include_revoked: bool) -> IpcResponse {
     let registry = app_state.device_identities.clone();
-    match tokio::task::spawn_blocking(move || registry.trusted_records(include_revoked)).await {
-        Ok(Ok(records)) => IpcResponse::TrustedDeviceList {
-            devices: records.into_iter().map(project_trust_record).collect(),
-        },
+    match tokio::task::spawn_blocking(move || {
+        registry
+            .trusted_records(include_revoked)?
+            .into_iter()
+            .map(|record| {
+                let scopes = registry.permission_ceiling(&record.peer_key_id)?;
+                Ok(project_trust_record_with_policy(record, scopes))
+            })
+            .collect::<Result<Vec<_>, DeviceIdentityRegistryError>>()
+    })
+    .await
+    {
+        Ok(Ok(devices)) => IpcResponse::TrustedDeviceList { devices },
         Ok(Err(error)) => identity_registry_error_response(app_state, error),
         Err(_) => security_store_error(app_state),
     }
@@ -207,7 +216,7 @@ async fn transition_trusted_device(
     .await;
     match result {
         Ok(Ok(AuditedTrustTransition::Applied(applied))) => {
-            let device = project_trust_record(applied.record);
+            let device = project_trust_record_with_policy(applied.record, Vec::new());
             let revoked_session_ids = app_state
                 .session_authorizations
                 .revoke_peer_authorizations(&peer_key_id, now_unix_ms())
@@ -274,9 +283,10 @@ async fn transition_trusted_device(
     }
 }
 
-fn project_trust_record(record: TrustRecord) -> TrustedDeviceSnapshot {
-    // Store format v2 pins identity/state only. Empty scopes are a deny-all projection;
-    // optional presentation/approval metadata remains unknown rather than fabricated.
+pub(crate) fn project_trust_record_with_policy(
+    record: TrustRecord,
+    permission_ceiling: Vec<mrd_ipc::RemotePermissionScope>,
+) -> TrustedDeviceSnapshot {
     TrustedDeviceSnapshot {
         peer_key_id: record.peer_key_id,
         display_name: None,
@@ -286,7 +296,7 @@ fn project_trust_record(record: TrustRecord) -> TrustedDeviceSnapshot {
             TrustState::Suspended => TrustedDeviceState::Suspended,
             TrustState::Revoked => TrustedDeviceState::Revoked,
         },
-        permission_ceiling: Vec::new(),
+        permission_ceiling,
         trust_revision: DecimalU64::from(record.revision),
         approved_at_ms: None,
         updated_at_ms: record.updated_at_ms,

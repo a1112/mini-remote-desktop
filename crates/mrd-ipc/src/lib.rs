@@ -1881,6 +1881,33 @@ mod wire {
         pub permission_ceiling: Vec<RemotePermissionScope>,
     }
 
+    /// Public binding of one current, server-verified first-pairing candidate.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct LanPairingCandidate {
+        pub candidate_id: String,
+        pub device_id: DeviceId,
+        pub device_name: String,
+        pub peer_key_id: String,
+        pub key_epoch: DecimalU64,
+        pub discovery_endpoint: String,
+        pub expires_at_ms: u64,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+    }
+
+    /// Exact displayed peer binding confirmed by the verified installed UI.
+    /// Public keys are resolved from signed discovery, never supplied by a client.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct LanPairingApproval {
+        pub candidate_id: String,
+        pub device_id: DeviceId,
+        pub peer_key_id: String,
+        pub key_epoch: DecimalU64,
+        pub discovery_endpoint: String,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+    }
+
     /// Approval metadata for an already verified key-rotation transition.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct TrustedDeviceRotation {
@@ -2188,6 +2215,10 @@ mod wire {
         },
         /// List public-key-pinned trusted device projections.
         ListTrustedDevices { include_revoked: bool },
+        /// Inspect current signed LAN candidates without granting any authority.
+        ListLanPairingCandidates,
+        /// Explicit first pairing; requires the verified installed product caller.
+        ApproveLanPairing { approval: LanPairingApproval },
         /// Approve an already authenticated pending peer key.
         ApproveTrustedDevice { approval: TrustedDeviceApproval },
         /// Suspend a trusted peer key.
@@ -2424,6 +2455,8 @@ mod wire {
                     | Self::RotateUnattendedAccess { .. }
                     | Self::ListTrustedDevices { .. }
                     | Self::ApproveTrustedDevice { .. }
+                    | Self::ListLanPairingCandidates
+                    | Self::ApproveLanPairing { .. }
                     | Self::SuspendTrustedDevice { .. }
                     | Self::RevokeTrustedDevice { .. }
                     | Self::RotateTrustedDevice { .. }
@@ -2494,6 +2527,10 @@ mod wire {
         UnattendedAccessUpdated { access: UnattendedAccessSnapshot },
         /// Trusted device projections.
         TrustedDeviceList { devices: Vec<TrustedDeviceSnapshot> },
+        /// Current signed first-pairing candidates, with public metadata only.
+        LanPairingCandidateList {
+            candidates: Vec<LanPairingCandidate>,
+        },
         /// Trusted device projection after a state transition.
         TrustedDeviceUpdated { device: TrustedDeviceSnapshot },
         /// Session snapshot after a permission transition.

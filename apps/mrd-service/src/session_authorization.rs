@@ -10,6 +10,11 @@ use mrd_ipc::{
 use mrd_proto::{DeviceId, SessionId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+#[cfg(any(windows, test))]
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Weak,
+};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 
@@ -49,6 +54,8 @@ pub struct VerifiedIncomingAuthorizationRequest {
 
 #[derive(Debug, Clone)]
 struct AuthorizationRecord {
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    instance_id: u64,
     request: VerifiedIncomingAuthorizationRequest,
     snapshot: RemoteSessionSnapshot,
     grant: Option<VerifiedSessionGrant>,
@@ -94,9 +101,11 @@ impl SessionAuthorizationLease {
 fn new_authorization_record(
     request: VerifiedIncomingAuthorizationRequest,
     snapshot: RemoteSessionSnapshot,
+    instance_id: u64,
 ) -> AuthorizationRecord {
     let (cancellation, _) = watch::channel(false);
     AuthorizationRecord {
+        instance_id,
         request,
         snapshot,
         grant: None,
@@ -135,7 +144,31 @@ struct AuthorizationRegistryInner {
     records: HashMap<SessionId, AuthorizationRecord>,
     events: VecDeque<RemoteSessionEventEnvelope>,
     next_sequence: u64,
+    next_instance_id: u64,
+    #[cfg(any(windows, test))]
+    outgoing_birth_observers: HashMap<SessionId, Vec<Weak<AtomicU64>>>,
 }
+
+/// Correlates one empty slot's first birth with its local request. This private
+/// receipt never grants a permission and cannot be constructed from an IPC ID.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+pub(crate) struct OutgoingBirthReceipt {
+    instance: Arc<AtomicU64>,
+}
+
+#[cfg(any(windows, test))]
+impl OutgoingBirthReceipt {
+    pub(crate) fn instance_id(&self) -> Option<u64> {
+        let instance = self.instance.load(Ordering::Acquire);
+        (instance != 0).then_some(instance)
+    }
+}
+
+#[cfg(any(windows, test))]
+const MAX_OUTGOING_BIRTH_OBSERVERS: usize = 128;
+#[cfg(any(windows, test))]
+const MAX_OUTGOING_BIRTH_OBSERVERS_PER_SESSION: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct SessionAuthorizationRegistry {
@@ -334,9 +367,17 @@ impl SessionAuthorizationRegistry {
             updated_at_ms: request.created_at_ms,
             authorization_expires_at_ms: Some(request.expires_at_ms),
         };
+        let instance_id = next_authorization_instance(&mut inner)?;
+        #[cfg(any(windows, test))]
+        {
+            prune_outgoing_birth_observers(&mut inner);
+            // An incoming aggregate consumed this empty slot. It may not later
+            // be mistaken for the observed outgoing request's original birth.
+            inner.outgoing_birth_observers.remove(&request.session_id);
+        }
         inner.records.insert(
             request.session_id.clone(),
-            new_authorization_record(request.clone(), snapshot.clone()),
+            new_authorization_record(request.clone(), snapshot.clone(), instance_id),
         );
         if request.access_mode == RemoteAccessMode::Attended {
             push_event(
@@ -395,10 +436,27 @@ impl SessionAuthorizationRegistry {
             updated_at_ms: request.created_at_ms,
             authorization_expires_at_ms: Some(request.expires_at_ms),
         };
+        let instance_id = next_authorization_instance(&mut inner)?;
+        #[cfg(any(windows, test))]
+        let session_id = request.session_id.clone();
         inner.records.insert(
             request.session_id.clone(),
-            new_authorization_record(request, snapshot.clone()),
+            new_authorization_record(request, snapshot.clone(), instance_id),
         );
+        #[cfg(any(windows, test))]
+        {
+            prune_outgoing_birth_observers(&mut inner);
+            if let Some(observers) = inner.outgoing_birth_observers.remove(&session_id) {
+                for observer in observers.into_iter().filter_map(|weak| weak.upgrade()) {
+                    let _ = observer.compare_exchange(
+                        0,
+                        instance_id,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+            }
+        }
         drop(inner);
         self.changed.notify_waiters();
         Ok(snapshot)
@@ -406,6 +464,54 @@ impl SessionAuthorizationRegistry {
 
     pub async fn snapshot(&self, session_id: &SessionId) -> Option<RemoteSessionSnapshot> {
         self.snapshot_at(session_id, unix_time_ms()).await
+    }
+
+    /// Private aggregate identity. A reused public session ID is never the same
+    /// authorization instance, even with a frozen clock or matching peer fields.
+    #[cfg(any(windows, test))]
+    pub(crate) async fn product_audit_binding(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<(u64, RemoteSessionSnapshot)> {
+        self.inner
+            .lock()
+            .await
+            .records
+            .get(session_id)
+            .map(|record| (record.instance_id, record.snapshot.clone()))
+    }
+
+    /// Subscribe before the request and before taking its audit cursor. The
+    /// first insertion consumes the group under the same registry lock; later
+    /// same-ID aggregates can never update an already issued receipt.
+    #[cfg(any(windows, test))]
+    pub(crate) async fn observe_outgoing_birth(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<OutgoingBirthReceipt> {
+        let mut inner = self.inner.lock().await;
+        prune_outgoing_birth_observers(&mut inner);
+        if inner.records.contains_key(session_id)
+            || inner
+                .outgoing_birth_observers
+                .values()
+                .map(Vec::len)
+                .sum::<usize>()
+                >= MAX_OUTGOING_BIRTH_OBSERVERS
+            || inner
+                .outgoing_birth_observers
+                .get(session_id)
+                .is_some_and(|group| group.len() >= MAX_OUTGOING_BIRTH_OBSERVERS_PER_SESSION)
+        {
+            return None;
+        }
+        let instance = Arc::new(AtomicU64::new(0));
+        inner
+            .outgoing_birth_observers
+            .entry(session_id.clone())
+            .or_default()
+            .push(Arc::downgrade(&instance));
+        Some(OutgoingBirthReceipt { instance })
     }
 
     pub(crate) async fn transport_kind(&self, session_id: &SessionId) -> Option<String> {
@@ -760,10 +866,12 @@ impl SessionAuthorizationRegistry {
         }
         let scope_binding_is_valid = if record.snapshot.role == RemoteSessionRole::Controller {
             !grant.granted_scopes.is_empty()
-                && grant
-                    .granted_scopes
-                    .iter()
-                    .all(|scope| record.snapshot.requested_scopes.contains(scope))
+                && grant.granted_scopes.iter().all(|scope| {
+                    record.snapshot.requested_scopes.contains(scope)
+                        && record.request.peer_permission_ceiling.contains(scope)
+                        && record.request.machine_permission_ceiling.contains(scope)
+                        && record.request.runtime_capabilities.contains(scope)
+                })
         } else {
             grant.granted_scopes == record.snapshot.granted_scopes
         };
@@ -1471,6 +1579,27 @@ fn build_subscription(
     }
 }
 
+fn next_authorization_instance(
+    inner: &mut AuthorizationRegistryInner,
+) -> Result<u64, RemoteFailure> {
+    let next = inner.next_instance_id.checked_add(1).ok_or_else(|| {
+        failure(
+            RemoteReasonCode::CredentialLocked,
+            "authorization instance capacity is exhausted",
+        )
+    })?;
+    inner.next_instance_id = next;
+    Ok(next)
+}
+
+#[cfg(any(windows, test))]
+fn prune_outgoing_birth_observers(inner: &mut AuthorizationRegistryInner) {
+    inner.outgoing_birth_observers.retain(|_, group| {
+        group.retain(|observer| observer.strong_count() > 0);
+        !group.is_empty()
+    });
+}
+
 fn effective_scopes(
     requested: &[RemotePermissionScope],
     peer_ceiling: &[RemotePermissionScope],
@@ -1951,6 +2080,287 @@ mod tests {
     const CREATED_AT_MS: u64 = 1_000;
     const EXPIRES_AT_MS: u64 = 20_000;
 
+    #[tokio::test]
+    async fn outgoing_birth_receipts_capture_only_the_first_real_insert() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("observed-outgoing", &[7; 32]);
+        let first = registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .unwrap();
+        let concurrent = registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .unwrap();
+        assert_eq!(first.instance_id(), None);
+        registry.begin_outgoing(request.clone()).await.unwrap();
+        assert_eq!(first.instance_id(), Some(1));
+        assert_eq!(concurrent.instance_id(), Some(1));
+        assert!(registry.begin_outgoing(request.clone()).await.is_err());
+        registry
+            .record_failure(
+                &request.session_id,
+                RemoteAuthorizationState::Revoked,
+                failure(RemoteReasonCode::GrantRevoked, "fixture cleanup"),
+                CREATED_AT_MS,
+            )
+            .await;
+        prune_authorization_records(
+            &mut *registry.inner.lock().await,
+            CREATED_AT_MS + TERMINAL_RECORD_RETENTION_MS + 1,
+        );
+        let later = registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .unwrap();
+        registry.begin_outgoing(request).await.unwrap();
+        assert_eq!(later.instance_id(), Some(2));
+        assert_eq!(first.instance_id(), Some(1));
+        assert_eq!(concurrent.instance_id(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn outgoing_birth_observation_cannot_adopt_an_existing_or_retained_terminal_record() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("existing-outgoing", &[7; 32]);
+        registry.begin_outgoing(request.clone()).await.unwrap();
+        assert!(registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .is_none());
+        registry
+            .record_failure(
+                &request.session_id,
+                RemoteAuthorizationState::Revoked,
+                failure(RemoteReasonCode::GrantRevoked, "fixture cleanup"),
+                CREATED_AT_MS,
+            )
+            .await;
+        assert!(registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn incoming_birth_consumes_the_empty_slot_without_filling_outgoing_receipts() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("incoming-consumed-slot", &[7; 32]);
+        let receipt = registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .unwrap();
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .unwrap();
+        assert!(registry
+            .inner
+            .lock()
+            .await
+            .outgoing_birth_observers
+            .is_empty());
+        assert_eq!(receipt.instance_id(), None);
+        registry
+            .record_failure(
+                &request.session_id,
+                RemoteAuthorizationState::Revoked,
+                failure(RemoteReasonCode::GrantRevoked, "fixture cleanup"),
+                CREATED_AT_MS,
+            )
+            .await;
+        prune_authorization_records(
+            &mut *registry.inner.lock().await,
+            CREATED_AT_MS + TERMINAL_RECORD_RETENTION_MS + 1,
+        );
+        let fresh = registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .unwrap();
+        registry.begin_outgoing(request).await.unwrap();
+        assert_eq!(
+            receipt.instance_id(),
+            None,
+            "the earlier incoming lifetime can never become this request's outgoing proof"
+        );
+        assert_eq!(fresh.instance_id(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn outgoing_birth_observers_bound_each_slot_without_evicting_live_receipts() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("bounded-outgoing-slot", &[7; 32]);
+        let mut live = Vec::new();
+        for _ in 0..MAX_OUTGOING_BIRTH_OBSERVERS_PER_SESSION {
+            live.push(
+                registry
+                    .observe_outgoing_birth(&request.session_id)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(registry
+            .observe_outgoing_birth(&request.session_id)
+            .await
+            .is_none());
+        live.remove(0);
+        live.push(
+            registry
+                .observe_outgoing_birth(&request.session_id)
+                .await
+                .unwrap(),
+        );
+        registry.begin_outgoing(request).await.unwrap();
+        assert!(live.iter().all(|receipt| receipt.instance_id() == Some(1)));
+    }
+
+    #[tokio::test]
+    async fn outgoing_birth_observers_bound_live_keys_and_reclaim_dead_weak_references() {
+        let registry = SessionAuthorizationRegistry::default();
+        let mut live = Vec::new();
+        for i in 0..MAX_OUTGOING_BIRTH_OBSERVERS {
+            live.push(
+                registry
+                    .observe_outgoing_birth(&SessionId(format!("observer-{i}")))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(registry
+            .observe_outgoing_birth(&SessionId("over-capacity".into()))
+            .await
+            .is_none());
+        assert_eq!(
+            registry.inner.lock().await.outgoing_birth_observers.len(),
+            MAX_OUTGOING_BIRTH_OBSERVERS
+        );
+        live.remove(0);
+        assert!(registry
+            .observe_outgoing_birth(&SessionId("reclaimed-slot".into()))
+            .await
+            .is_some());
+        assert!(live.iter().all(|receipt| receipt.instance_id().is_none()));
+    }
+
+    #[tokio::test]
+    async fn outgoing_birth_insert_reclaims_dead_observers_for_other_slots() {
+        let registry = SessionAuthorizationRegistry::default();
+        drop(
+            registry
+                .observe_outgoing_birth(&SessionId("dead-observer".into()))
+                .await
+                .unwrap(),
+        );
+        let still_live = registry
+            .observe_outgoing_birth(&SessionId("live-observer".into()))
+            .await
+            .unwrap();
+        registry
+            .begin_outgoing(control_request("actual-birth", &[7; 32]))
+            .await
+            .unwrap();
+        let inner = registry.inner.lock().await;
+        assert_eq!(inner.outgoing_birth_observers.len(), 1);
+        assert!(inner
+            .outgoing_birth_observers
+            .contains_key(&SessionId("live-observer".into())));
+        assert_eq!(still_live.instance_id(), None);
+    }
+
+    #[tokio::test]
+    async fn audit_instance_distinguishes_reuse_with_a_frozen_clock() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("audit-frozen-clock", &[7; 32]);
+        let first = registry.begin_outgoing(request.clone()).await.unwrap();
+        let first_instance = registry
+            .product_audit_binding(&request.session_id)
+            .await
+            .unwrap()
+            .0;
+        registry
+            .record_failure(
+                &request.session_id,
+                RemoteAuthorizationState::Revoked,
+                failure(RemoteReasonCode::GrantRevoked, "fixture cleanup"),
+                CREATED_AT_MS,
+            )
+            .await;
+        prune_authorization_records(
+            &mut *registry.inner.lock().await,
+            CREATED_AT_MS + TERMINAL_RECORD_RETENTION_MS + 1,
+        );
+        let second = registry.begin_outgoing(request.clone()).await.unwrap();
+        assert_eq!(
+            first, second,
+            "a frozen clock can produce identical public snapshots"
+        );
+        assert!(
+            registry
+                .product_audit_binding(&request.session_id)
+                .await
+                .unwrap()
+                .0
+                > first_instance
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_instance_is_shared_by_both_birth_paths_and_changes_only_on_birth() {
+        let registry = SessionAuthorizationRegistry::default();
+        let outgoing = control_request("audit-outgoing", &[7; 32]);
+        let incoming = control_request("audit-incoming", &[7; 32]);
+        registry.begin_outgoing(outgoing.clone()).await.unwrap();
+        registry
+            .begin_verified_incoming(incoming.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .product_audit_binding(&outgoing.session_id)
+                .await
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(
+            registry
+                .product_audit_binding(&incoming.session_id)
+                .await
+                .unwrap()
+                .0,
+            2
+        );
+        assert!(registry.begin_outgoing(outgoing.clone()).await.is_err());
+        assert_eq!(
+            registry
+                .product_audit_binding(&outgoing.session_id)
+                .await
+                .unwrap()
+                .0,
+            1
+        );
+        assert_eq!(registry.inner.lock().await.next_instance_id, 2);
+    }
+
+    #[tokio::test]
+    async fn audit_instance_exhaustion_rejects_both_birth_paths_without_mutation() {
+        for incoming in [false, true] {
+            let registry = SessionAuthorizationRegistry::default();
+            registry.inner.lock().await.next_instance_id = u64::MAX;
+            let request = control_request("audit-exhausted", &[7; 32]);
+            let result = if incoming {
+                registry.begin_verified_incoming(request).await
+            } else {
+                registry.begin_outgoing(request).await
+            };
+            assert!(result.is_err());
+            let inner = registry.inner.lock().await;
+            assert!(inner.records.is_empty());
+            assert!(inner.events.is_empty());
+            assert_eq!(inner.next_instance_id, u64::MAX);
+        }
+    }
+
     fn control_request(
         session_id: &str,
         peer_public_key: &[u8; 32],
@@ -1999,6 +2409,106 @@ mod tests {
             route_constraint: "quic".to_string(),
             transport_fingerprint_sha256: [9; 32],
         }
+    }
+
+    fn screen_and_pointer_request(session_id: &str) -> VerifiedIncomingAuthorizationRequest {
+        let mut request = control_request(session_id, &[7; 32]);
+        let scopes = vec![
+            RemotePermissionScope::ScreenView,
+            RemotePermissionScope::InputPointer,
+        ];
+        request.requested_scopes = scopes.clone();
+        request.peer_permission_ceiling = scopes.clone();
+        request.machine_permission_ceiling = scopes.clone();
+        request.runtime_capabilities = scopes;
+        request
+    }
+
+    async fn assert_controller_grant_exceeding_ceiling_is_rejected(
+        request: VerifiedIncomingAuthorizationRequest,
+    ) {
+        let registry = SessionAuthorizationRegistry::default();
+        let session_id = request.session_id.clone();
+        let mut grant = control_grant(&session_id);
+        grant.granted_scopes = request.requested_scopes.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing authorization with a narrower effective ceiling");
+        let before = registry
+            .bind_authenticated_peer_key(&session_id, &[7; 32], CREATED_AT_MS + 1)
+            .await
+            .expect("bind the authenticated peer");
+
+        let rejection = registry
+            .install_verified_grant(grant, CREATED_AT_MS + 2)
+            .await
+            .expect_err("a verified grant must respect every local permission ceiling");
+        assert_eq!(rejection.code, RemoteReasonCode::PolicyChanged);
+        let after = registry
+            .snapshot_at(&session_id, CREATED_AT_MS + 2)
+            .await
+            .expect("rejected authorization remains queryable");
+        assert_eq!(
+            after, before,
+            "rejecting an overbroad grant must not mutate authorization"
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_grant_installation_rejects_peer_ceiling_expansion() {
+        let mut request = screen_and_pointer_request("controller-peer-ceiling");
+        request.peer_permission_ceiling = vec![RemotePermissionScope::ScreenView];
+        assert_controller_grant_exceeding_ceiling_is_rejected(request).await;
+    }
+
+    #[tokio::test]
+    async fn controller_grant_installation_rejects_machine_ceiling_expansion() {
+        let mut request = screen_and_pointer_request("controller-machine-ceiling");
+        request.machine_permission_ceiling = vec![RemotePermissionScope::ScreenView];
+        assert_controller_grant_exceeding_ceiling_is_rejected(request).await;
+    }
+
+    #[tokio::test]
+    async fn controller_grant_installation_rejects_runtime_capability_expansion() {
+        let mut request = screen_and_pointer_request("controller-runtime-ceiling");
+        request.runtime_capabilities = vec![RemotePermissionScope::ScreenView];
+        assert_controller_grant_exceeding_ceiling_is_rejected(request).await;
+    }
+
+    #[tokio::test]
+    async fn controller_grant_installation_accepts_screen_view_within_all_ceilings() {
+        let registry = SessionAuthorizationRegistry::default();
+        let mut request = screen_and_pointer_request("controller-screen-view-only");
+        request.peer_permission_ceiling = vec![RemotePermissionScope::ScreenView];
+        request.machine_permission_ceiling = vec![RemotePermissionScope::ScreenView];
+        request.runtime_capabilities = vec![RemotePermissionScope::ScreenView];
+        let session_id = request.session_id.clone();
+        registry
+            .begin_outgoing(request)
+            .await
+            .expect("begin outgoing request with screen-only effective permissions");
+        registry
+            .bind_authenticated_peer_key(&session_id, &[7; 32], CREATED_AT_MS + 1)
+            .await
+            .expect("bind the authenticated peer");
+        let mut grant = control_grant(&session_id);
+        grant.granted_scopes = vec![RemotePermissionScope::ScreenView];
+
+        let authorized = registry
+            .install_verified_grant(grant, CREATED_AT_MS + 2)
+            .await
+            .expect("a verified screen-view-only grant remains valid");
+        assert_eq!(
+            authorized.granted_scopes,
+            vec![RemotePermissionScope::ScreenView]
+        );
+        assert_eq!(
+            authorized.authorization_state,
+            RemoteAuthorizationState::Granted
+        );
+        assert_eq!(authorized.route_state, RemoteRouteState::Connecting);
+        assert_eq!(authorized.route_kind, Some(RemoteRouteKind::LanQuic));
     }
 
     #[tokio::test]

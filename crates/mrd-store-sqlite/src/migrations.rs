@@ -46,7 +46,7 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), StoreError> {
          );
          CREATE TABLE IF NOT EXISTS store_meta (
            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-           format_version INTEGER NOT NULL CHECK (format_version = 2),
+           format_version INTEGER NOT NULL CHECK (format_version = 3),
            store_id BLOB NOT NULL CHECK (length(store_id) = 16),
            generation INTEGER NOT NULL CHECK (generation > 0),
            schema_commitment BLOB NOT NULL CHECK (length(schema_commitment) = 32),
@@ -98,8 +98,9 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), StoreError> {
            previous_hash BLOB NOT NULL,
            event_hash BLOB NOT NULL
          );
-         INSERT INTO schema_migrations(version) VALUES (2);",
+         INSERT INTO schema_migrations(version) VALUES (2), (3);",
     )?;
+    create_permission_schema(connection)?;
     connection.pragma_update(None, "user_version", STORE_FORMAT_VERSION)?;
     Ok(())
 }
@@ -117,14 +118,67 @@ pub(crate) fn validate_schema(connection: &Connection) -> Result<(), StoreError>
             rusqlite::Error::QueryReturnedNoRows => StoreError::StoreIntegrity,
             other => StoreError::Database(other),
         })?;
-    let migration_count: u64 = connection.query_row(
-        "SELECT COUNT(*) FROM schema_migrations WHERE version = 2",
-        [],
-        |row| row.get(0),
-    )?;
-    if migration_count != 1 {
+    let version = schema_version(connection)?;
+    let versions: Vec<u32> = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    let expected = match version {
+        2 => &[2][..],
+        STORE_FORMAT_VERSION => &[2, STORE_FORMAT_VERSION][..],
+        _ => return Err(StoreError::StoreIntegrity),
+    };
+    if versions != expected {
         return Err(StoreError::StoreIntegrity);
     }
+    Ok(())
+}
+
+fn create_permission_schema(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "CREATE TABLE trust_permissions (
+           peer_key_id TEXT NOT NULL REFERENCES trusted_devices(peer_key_id),
+           permission_scope TEXT NOT NULL CHECK (permission_scope IN (
+             'audio.listen', 'audio.talk', 'clipboard.read', 'clipboard.write',
+             'display.multi_view', 'display.switch', 'file.read', 'file.write',
+             'input.keyboard', 'input.pointer', 'power.restart', 'power.shutdown',
+             'privacy.blank_screen', 'privacy.block_local_input', 'screen.view',
+             'secure_desktop.control', 'secure_desktop.view', 'terminal.open'
+           )),
+           PRIMARY KEY (peer_key_id, permission_scope)
+         );",
+    )?;
+    Ok(())
+}
+
+/// Called only after the entire sealed v2 snapshot has been verified, inside
+/// the opener's Immediate transaction. No legacy trust row gains a scope.
+pub(crate) fn upgrade_verified_v2_schema(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "ALTER TABLE store_meta RENAME TO store_meta_v2;
+         CREATE TABLE store_meta (
+           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+           format_version INTEGER NOT NULL CHECK (format_version = 3),
+           store_id BLOB NOT NULL CHECK (length(store_id) = 16),
+           generation INTEGER NOT NULL CHECK (generation > 0),
+           schema_commitment BLOB NOT NULL CHECK (length(schema_commitment) = 32),
+           identity_initialized INTEGER NOT NULL CHECK (identity_initialized IN (0, 1)),
+           identity_commitment BLOB NOT NULL CHECK (length(identity_commitment) = 32),
+           trust_count INTEGER NOT NULL CHECK (trust_count >= 0),
+           trust_commitment BLOB NOT NULL CHECK (length(trust_commitment) = 32),
+           audit_initialized INTEGER NOT NULL CHECK (audit_initialized = 1),
+           audit_commitment BLOB NOT NULL CHECK (length(audit_commitment) = 32),
+           manifest_seal BLOB NOT NULL CHECK (length(manifest_seal) = 32)
+         );
+         INSERT INTO store_meta SELECT singleton, 3, store_id, generation,
+           schema_commitment, identity_initialized, identity_commitment,
+           trust_count, trust_commitment, audit_initialized, audit_commitment,
+           manifest_seal FROM store_meta_v2;
+         DROP TABLE store_meta_v2;
+         INSERT INTO schema_migrations(version) VALUES (3);",
+    )?;
+    create_permission_schema(connection)?;
+    connection.pragma_update(None, "user_version", STORE_FORMAT_VERSION)?;
     Ok(())
 }
 

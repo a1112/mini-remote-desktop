@@ -1,6 +1,6 @@
 use super::now_unix_ms;
 use mrd_identity::DeviceIdentity;
-use mrd_ipc::PairedDeviceIdentity;
+use mrd_ipc::{PairedDeviceIdentity, RemotePermissionScope};
 use mrd_proto::DeviceId;
 use mrd_store_sqlite::{
     AuditDraft, AuditRecord, AuditedTrustTransition, PersistentStore, StoreError, TrustRecord,
@@ -22,6 +22,7 @@ enum DeviceIdentityBackend {
         paired_devices: Mutex<HashMap<DeviceId, PairedDeviceIdentity>>,
         machine_identity: Arc<DeviceIdentity>,
         authenticated_peers: Mutex<HashMap<String, TrustRecord>>,
+        authenticated_permission_ceilings: Mutex<HashMap<String, Vec<RemotePermissionScope>>>,
     },
     Persistent {
         store: Arc<PersistentStore>,
@@ -95,6 +96,7 @@ impl Default for DeviceIdentityRegistry {
                 paired_devices: Mutex::new(HashMap::new()),
                 machine_identity: Arc::new(machine_identity),
                 authenticated_peers: Mutex::new(HashMap::new()),
+                authenticated_permission_ceilings: Mutex::new(HashMap::new()),
             },
         }
     }
@@ -242,6 +244,80 @@ impl DeviceIdentityRegistry {
             .map_err(Into::into)
     }
 
+    /// Atomic first-pairing policy insertion, after the product caller and
+    /// signed discovery have been validated by the service admission path.
+    pub(crate) fn approve_lan_peer_with_policy_guarded(
+        &self,
+        peer_key_id: &str,
+        public_key: &[u8],
+        epoch: u64,
+        scopes: &[RemotePermissionScope],
+        audit: AuditDraft,
+        before_insert: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(TrustRecord, AuditRecord), DeviceIdentityRegistryError> {
+        let DeviceIdentityBackend::Persistent { store, .. } = &self.backend else {
+            return Err(DeviceIdentityRegistryError::AuthenticatedPeerRequired);
+        };
+        let scopes = scopes
+            .iter()
+            .map(|scope| {
+                serde_json::to_value(scope)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .ok_or(StoreError::StoreIntegrity)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        store
+            .insert_trusted_device_with_policy_and_audit_guarded(
+                peer_key_id,
+                public_key,
+                epoch,
+                &scopes,
+                audit,
+                before_insert,
+            )
+            .map_err(Into::into)
+    }
+
+    /// Current authoritative permission policy; missing and inactive peers
+    /// have no permissions, including legacy v2 rows after migration.
+    pub fn permission_ceiling(
+        &self,
+        peer_key_id: &str,
+    ) -> Result<Vec<RemotePermissionScope>, DeviceIdentityRegistryError> {
+        match &self.backend {
+            DeviceIdentityBackend::Persistent { store, .. } => store
+                .trust_permission_ceiling(peer_key_id)?
+                .into_iter()
+                .map(|scope| {
+                    serde_json::from_value(serde_json::Value::String(scope))
+                        .map_err(|_| DeviceIdentityRegistryError::Store(StoreError::StoreIntegrity))
+                })
+                .collect(),
+            DeviceIdentityBackend::InMemory {
+                authenticated_peers,
+                authenticated_permission_ceilings,
+                ..
+            } => {
+                let peers = authenticated_peers
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if !peers
+                    .get(peer_key_id)
+                    .is_some_and(|record| record.state == TrustState::Trusted)
+                {
+                    return Ok(Vec::new());
+                }
+                Ok(authenticated_permission_ceilings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(peer_key_id)
+                    .cloned()
+                    .unwrap_or_default())
+            }
+        }
+    }
+
     pub fn transition_authenticated_peer(
         &self,
         peer_key_id: &str,
@@ -341,6 +417,7 @@ impl DeviceIdentityRegistry {
     ) {
         let DeviceIdentityBackend::InMemory {
             authenticated_peers,
+            authenticated_permission_ceilings,
             ..
         } = &self.backend
         else {
@@ -359,6 +436,34 @@ impl DeviceIdentityRegistry {
                     revision: 1,
                     updated_at_ms: now_unix_ms(),
                 },
+            );
+        // Existing in-memory security fixtures explicitly exercise these
+        // permissions. This helper is absent from release production builds.
+        authenticated_permission_ceilings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                identity.key_id().to_string(),
+                vec![
+                    RemotePermissionScope::ScreenView,
+                    RemotePermissionScope::InputPointer,
+                    RemotePermissionScope::InputKeyboard,
+                    RemotePermissionScope::ClipboardRead,
+                    RemotePermissionScope::ClipboardWrite,
+                    RemotePermissionScope::FileRead,
+                    RemotePermissionScope::FileWrite,
+                    RemotePermissionScope::AudioListen,
+                    RemotePermissionScope::AudioTalk,
+                    RemotePermissionScope::DisplaySwitch,
+                    RemotePermissionScope::DisplayMultiView,
+                    RemotePermissionScope::PowerRestart,
+                    RemotePermissionScope::PowerShutdown,
+                    RemotePermissionScope::TerminalOpen,
+                    RemotePermissionScope::PrivacyBlockLocalInput,
+                    RemotePermissionScope::PrivacyBlankScreen,
+                    RemotePermissionScope::SecureDesktopView,
+                    RemotePermissionScope::SecureDesktopControl,
+                ],
             );
     }
 }

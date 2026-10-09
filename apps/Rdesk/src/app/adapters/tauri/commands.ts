@@ -54,6 +54,8 @@ import type {
   SessionEventSubscriptionQuery,
   SessionPermissionChange,
   TrustedDeviceApproval,
+  LanPairingApproval,
+  LanPairingCandidate,
   TrustedDeviceRotation,
   TrustedDeviceSnapshot,
   UnattendedAccessPolicy,
@@ -1425,6 +1427,30 @@ export async function ipcListTrustedDevices(
     { type: 'ListTrustedDevices', include_revoked: includeRevoked },
     'TrustedDeviceList',
     'devices'
+  );
+}
+
+export async function ipcListLanPairingCandidates(): Promise<AdapterResult<LanPairingCandidate[]>> {
+  return invokeSecureRemoteContract<LanPairingCandidate[]>(
+    { type: 'ListLanPairingCandidates' },
+    'LanPairingCandidateList',
+    'candidates'
+  );
+}
+
+export async function ipcApproveLanPairing(
+  approval: LanPairingApproval
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  if (shouldUseServiceBridge()) {
+    return {
+      ok: false,
+      error: { code: 'E_INSTALLED_UI_REQUIRED', message: '请在本机已安装的客户端中确认局域网配对' },
+    };
+  }
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    { type: 'ApproveLanPairing', approval },
+    'TrustedDeviceUpdated',
+    'device'
   );
 }
 

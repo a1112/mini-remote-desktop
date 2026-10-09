@@ -50,7 +50,57 @@ enum RunMode {
     WindowsService,
 }
 
+#[cfg(windows)]
+fn requests_existing_store_verification(arguments: &[std::ffi::OsString]) -> Result<bool> {
+    const FLAG: &str = "--verify-existing-store";
+    if !arguments
+        .iter()
+        .any(|argument| argument.to_string_lossy().starts_with(FLAG))
+    {
+        return Ok(false);
+    }
+    if arguments.len() != 1 || arguments[0] != FLAG {
+        anyhow::bail!("--verify-existing-store accepts no additional arguments");
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn run_existing_store_verification() -> Result<()> {
+    let verified = (|| -> Result<mrd_store_sqlite::ExistingStoreVerification> {
+        let policy =
+            security::ProductDirectoryAclPolicy::installed_service(MRD_WINDOWS_SERVICE_SID)
+                .map_err(anyhow::Error::msg)?;
+        let product_data =
+            security::verify_protected_product_data_dir(&policy).map_err(anyhow::Error::msg)?;
+        let protector = security::platform_secret_protector().map_err(anyhow::Error::msg)?;
+        Ok(
+            mrd_store_sqlite::PersistentStore::verify_existing_read_only(
+                product_data.join("security-state-v2.sqlite3"),
+                protector,
+            )?,
+        )
+    })()
+    .map_err(|_| anyhow::anyhow!("existing protected store verification failed"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "format_version": verified.format_version,
+            "identity_initialized": verified.identity_initialized,
+        })
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+        if requests_existing_store_verification(&arguments)? {
+            return run_existing_store_verification();
+        }
+    }
+
     // Set the process creation policy before the multi-thread runtime starts:
     // SQLite, WAL/SHM and service-owned state must remain private to this user.
     #[cfg(target_os = "macos")]
@@ -945,6 +995,37 @@ mod scm_host {
             let _ =
                 unsafe { ReportEventW(handle, event_type, 0, 1, None, 0, Some(&strings), None) };
             let _ = unsafe { DeregisterEventSource(handle) };
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod existing_store_preflight_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn existing_store_preflight_accepts_only_the_exact_sole_argument() {
+        assert!(requests_existing_store_verification(&args(&["--verify-existing-store"])).unwrap());
+        for arguments in [
+            vec!["--verify-existing-store", "--service"],
+            vec!["--service", "--verify-existing-store"],
+            vec!["--verify-existing-store", "arbitrary.sqlite"],
+            vec!["--verify-existing-store", "--verify-existing-store"],
+            vec!["--verify-existing-store=arbitrary.sqlite"],
+        ] {
+            assert!(requests_existing_store_verification(&args(&arguments)).is_err());
+        }
+    }
+
+    #[test]
+    fn existing_store_preflight_preserves_ordinary_console_and_service_routing() {
+        for arguments in [vec![], vec!["--service"], vec!["--console"]] {
+            assert!(!requests_existing_store_verification(&args(&arguments)).unwrap());
         }
     }
 }
