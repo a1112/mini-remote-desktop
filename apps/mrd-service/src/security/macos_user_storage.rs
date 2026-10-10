@@ -136,6 +136,37 @@ pub fn verify_owner_only_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Read the existing master key with the foreground process's system interaction policy.
+/// This path never initializes state or creates a missing Keychain item.
+pub(super) fn authorize_existing_master_key() -> Result<(), String> {
+    verify_protected_product_data_dir()?;
+    if !SecKeychain::user_interaction_allowed()
+        .map_err(|_| "macOS Keychain interaction policy could not be read".to_owned())?
+    {
+        return Err("run Keychain authorization in a fresh foreground process".to_owned());
+    }
+    let keychain =
+        SecKeychain::default().map_err(|_| "macOS login Keychain is unavailable".to_owned())?;
+    let (password, _) = keychain
+        .find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|error| {
+            if error.code() == ITEM_NOT_FOUND {
+                "macOS Keychain master key is missing; authorization cannot initialize it"
+                    .to_owned()
+            } else {
+                "macOS Keychain authorization was denied or the login Keychain is locked".to_owned()
+            }
+        })?;
+    let bytes = Zeroizing::new(password.to_vec());
+    drop(password);
+    let valid = bytes.len() == 32;
+    drop(bytes);
+    if !valid {
+        return Err("macOS Keychain master key is invalid".to_owned());
+    }
+    Ok(())
+}
+
 pub(super) fn load_master_key() -> Result<Zeroizing<[u8; 32]>, String> {
     let directory = ensure_protected_product_data_dir()?;
     // Background services must fail promptly when the login Keychain is locked.
@@ -169,7 +200,12 @@ pub(super) fn load_master_key() -> Result<Zeroizing<[u8; 32]>, String> {
                 load().map_err(|_| "macOS Keychain master key readback failed".to_owned())?;
             Zeroizing::new(password.to_vec())
         }
-        Err(_) => return Err("macOS Keychain master key cannot be accessed".to_owned()),
+        Err(_) => {
+            return Err(
+                "macOS Keychain master key cannot be accessed; run mrd-service --authorize-keychain in the logged-in user's foreground session"
+                    .to_owned(),
+            )
+        }
     };
     if bytes.len() != 32 {
         return Err("macOS Keychain master key is invalid".to_owned());

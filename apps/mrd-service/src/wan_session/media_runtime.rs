@@ -525,11 +525,41 @@ async fn create_target_capture(
     let source_id = selected_capture_source_id(app_state, session_id)
         .await
         .map_err(|_| WanMediaRuntimeError::Capture)?;
-    create_software_frame_capture(&source_id, profile)
+    let capture = create_software_frame_capture(&source_id, profile)
         .await
         .map(Box::new)
         .map(WanFrameCapture::Platform)
-        .map_err(|_| WanMediaRuntimeError::Capture)
+        .map_err(|_| WanMediaRuntimeError::Capture)?;
+    #[cfg(target_os = "macos")]
+    {
+        // Bind pointer geometry only to the source that actually created this
+        // capture. Source/profile changes during capture startup invalidate it.
+        let mut profiles = app_state.media_profiles.lock().await;
+        let sources = app_state.capture_sources.lock().await;
+        let selection = sources
+            .get(session_id)
+            .ok_or(WanMediaRuntimeError::Evidence)?;
+        let mut negotiation = profiles
+            .get(session_id)
+            .ok_or(WanMediaRuntimeError::Evidence)?;
+        bind_macos_capture_profile(&mut negotiation, &source_id, &selection.source.id, profile)?;
+        profiles.set(session_id.clone(), negotiation);
+    }
+    Ok(capture)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bind_macos_capture_profile(
+    negotiation: &mut MediaProfileNegotiation,
+    captured_source_id: &str,
+    selected_source_id: &str,
+    captured_profile: &MediaProfile,
+) -> Result<(), WanMediaRuntimeError> {
+    if captured_source_id != selected_source_id || &negotiation.selected != captured_profile {
+        return Err(WanMediaRuntimeError::Evidence);
+    }
+    negotiation.selected_source_id = Some(captured_source_id.to_owned());
+    Ok(())
 }
 
 async fn publish_ready(
@@ -608,6 +638,34 @@ fn now_unix_us() -> u64 {
 #[cfg(test)]
 mod capture_profile_tests {
     use super::*;
+
+    #[test]
+    fn macos_pointer_profile_is_bound_to_the_actual_wan_capture() {
+        let profile = default_wan_media_profile();
+        let mut negotiation = MediaProfileNegotiation {
+            requested: profile.clone(),
+            selected: profile.clone(),
+            status: "accepted".into(),
+            reason: None,
+            selected_source_id: None,
+            selected_width: Some(profile.width),
+            selected_height: Some(profile.height),
+            downgrade_reason: None,
+        };
+        assert!(
+            bind_macos_capture_profile(&mut negotiation, "display:1", "display:2", &profile)
+                .is_err()
+        );
+        let mut resized = profile.clone();
+        resized.width += 2;
+        assert!(
+            bind_macos_capture_profile(&mut negotiation, "display:1", "display:1", &resized)
+                .is_err()
+        );
+        assert!(negotiation.selected_source_id.is_none());
+        bind_macos_capture_profile(&mut negotiation, "display:1", "display:1", &profile).unwrap();
+        assert_eq!(negotiation.selected_source_id.as_deref(), Some("display:1"));
+    }
 
     #[test]
     fn wide_desktop_wan_capture_encodes_and_decodes_the_exact_approved_profile() {

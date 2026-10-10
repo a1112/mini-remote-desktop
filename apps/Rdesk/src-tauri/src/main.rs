@@ -3466,6 +3466,11 @@ async fn register_device(
             },
             _ => return Err("请提供一次性设备登记码或管理员恢复凭据".into()),
         };
+        // Enrollment belongs to the core endpoint on macOS. The management
+        // endpoint rejects it before the signed UI caller can be checked.
+        #[cfg(target_os = "macos")]
+        let mut client = mrd_ipc::client::IpcClient::new();
+        #[cfg(not(target_os = "macos"))]
         let mut client = mrd_ipc::client::IpcClient::trusted_management();
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(25),

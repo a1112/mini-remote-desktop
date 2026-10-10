@@ -144,6 +144,26 @@ pub fn create_frame_capture(source_id: &str) -> Result<mrd_capture_macos::MacosS
     Ok(capture)
 }
 
+#[cfg(target_os = "macos")]
+pub fn macos_input_bounds(source: &CaptureSource) -> Result<mrd_capture_macos::MacosCaptureBounds> {
+    if source.platform != "macos" {
+        anyhow::bail!("selected capture source is not a macOS source");
+    }
+    let bounds = match (
+        parse_macos_capture_source_ref(&source.id)?,
+        source.source_kind.as_str(),
+    ) {
+        (MacosCaptureSourceRef::Display { display_id }, "display") => {
+            mrd_capture_macos::display_input_bounds(display_id)
+        }
+        (MacosCaptureSourceRef::Window { window_id }, "window") => {
+            mrd_capture_macos::window_input_bounds(window_id)
+        }
+        _ => anyhow::bail!("selected macOS capture source kind does not match its id"),
+    };
+    bounds.map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
 #[cfg(target_os = "linux")]
 pub fn create_frame_capture(
     source_id: &str,

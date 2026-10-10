@@ -109,8 +109,52 @@ fn main() -> Result<()> {
     }
     initialize_logging();
 
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--check-macos-permissions")
+    {
+        anyhow::ensure!(
+            arguments.len() == 1,
+            "--check-macos-permissions must be run on its own"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            // Probe this signed executable, rather than a shell/helper with a
+            // different TCC identity. Never prompt, capture, inject, or open DB.
+            println!(
+                "{}",
+                serde_json::json!({
+                    "screen_recording": mrd_capture_macos::screen_capture_access_is_granted(),
+                    "accessibility": mrd_input::macos::is_accessibility_trusted(),
+                })
+            );
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("--check-macos-permissions is only supported on macOS");
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--authorize-keychain")
+    {
+        anyhow::ensure!(
+            arguments.len() == 1,
+            "--authorize-keychain must be run on its own"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            eprintln!("正在请求 macOS 登录钥匙串授权；请在系统对话框中确认当前 mrd-service。");
+            security::authorize_keychain_access().map_err(anyhow::Error::msg)?;
+            eprintln!("钥匙串授权检查成功，可以重新启动后台服务。");
+            return Ok(());
+        }
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("--authorize-keychain is only supported on macOS");
+    }
+
     #[cfg(windows)]
-    if std::env::args_os().any(|argument| argument == "--service") {
+    if arguments.iter().any(|argument| argument == "--service") {
         info!("mrd-service dispatching to Windows SCM");
         return scm_host::run().context("Windows service dispatcher failed");
     }

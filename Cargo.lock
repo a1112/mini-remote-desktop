@@ -3276,6 +3276,7 @@ dependencies = [
 name = "mrd-capture-macos"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.9.4",
  "core-graphics 0.23.2",
  "mrd-observability",
  "mrd-pipeline-core",
@@ -3472,6 +3473,8 @@ dependencies = [
 name = "mrd-input"
 version = "0.1.0"
 dependencies = [
+ "core-graphics 0.25.0",
+ "objc2-app-kit",
  "thiserror 1.0.69",
  "windows 0.62.2",
 ]

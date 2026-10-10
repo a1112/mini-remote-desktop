@@ -88,6 +88,28 @@ pub fn apply_control_input_capability_status(
     snapshot: &mut CapabilitySnapshot,
     input_injector_available: bool,
 ) {
+    if matches!(snapshot.platform, CapabilityPlatform::Macos) {
+        if let Some(item) = snapshot
+            .capabilities
+            .iter_mut()
+            .find(|item| item.id == "control.keyboard_mouse")
+        {
+            item.status = if input_injector_available {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::PermissionMissing
+            };
+            item.reason = Some(
+                if input_injector_available {
+                    "macOS Quartz input permission checks passed for the running service."
+                } else {
+                    "macOS Accessibility and event-posting permission is required for mrd-service."
+                }
+                .to_string(),
+            );
+        }
+        return;
+    }
     if input_injector_available {
         return;
     }
@@ -351,7 +373,7 @@ fn local_capabilities(
 ) -> Vec<CapabilityItem> {
     let mut items = Vec::new();
 
-    add_capture_capabilities(&mut items, &platform);
+    add_capture_capabilities(&mut items, &platform, probe_mode);
     add_capture_source_capabilities(&mut items, &platform);
     add_encode_capabilities(&mut items, &platform, probe_mode);
     add_decode_capabilities(&mut items, &platform, probe_mode);
@@ -366,7 +388,11 @@ fn local_capabilities(
     items
 }
 
-fn add_capture_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_capture_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    _probe_mode: CapabilityProbeMode,
+) {
     match platform {
         CapabilityPlatform::Windows => {
             push_available(
@@ -385,13 +411,35 @@ fn add_capture_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             );
         }
         CapabilityPlatform::Macos => {
+            #[cfg(target_os = "macos")]
+            if matches!(_probe_mode, CapabilityProbeMode::Runtime) {
+                let granted = mrd_capture_macos::screen_capture_access_is_granted();
+                push_item(
+                    items,
+                    platform,
+                    CapabilityDomain::Capture,
+                    "capture.macos",
+                    "ScreenCaptureKit",
+                    if granted {
+                        CapabilityStatus::Available
+                    } else {
+                        CapabilityStatus::PermissionMissing
+                    },
+                    Some(if granted {
+                        "Screen Recording permission check passed for the running service."
+                    } else {
+                        "Screen Recording permission is required for mrd-service."
+                    }),
+                );
+                return;
+            }
             push_supported(
                 items,
                 platform,
                 CapabilityDomain::Capture,
                 "capture.macos",
                 "ScreenCaptureKit",
-                "macOS capture is available through the Rdesk harness path.",
+                "Screen Recording permission is required for the running macOS capture service.",
             );
         }
         CapabilityPlatform::Linux => {
@@ -1753,6 +1801,15 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             "control.keyboard_mouse",
             "Keyboard and mouse control",
         );
+    } else if matches!(platform, CapabilityPlatform::Macos) {
+        push_supported(
+            items,
+            platform,
+            CapabilityDomain::Control,
+            "control.keyboard_mouse",
+            "Keyboard and mouse control",
+            "macOS Quartz input requires an Accessibility permission check for the running service.",
+        );
     } else {
         push_item(
             items,
@@ -2842,6 +2899,28 @@ mod tests {
             .expect("keyboard/mouse control capability");
 
         assert_eq!(control.status, CapabilityStatus::Available);
+    }
+
+    #[test]
+    fn macos_control_capability_requires_native_permission_check() {
+        let mut snapshot = local_capability_snapshot_static();
+        snapshot.platform = CapabilityPlatform::Macos;
+        snapshot.capabilities =
+            local_capabilities(CapabilityPlatform::Macos, CapabilityProbeMode::Static);
+        let item = |snapshot: &CapabilitySnapshot| {
+            snapshot
+                .capabilities
+                .iter()
+                .find(|item| item.id == "control.keyboard_mouse")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(item(&snapshot).status, CapabilityStatus::Supported);
+        apply_control_input_capability_status(&mut snapshot, false);
+        assert_eq!(item(&snapshot).status, CapabilityStatus::PermissionMissing);
+        assert!(item(&snapshot).reason.unwrap().contains("Accessibility"));
+        apply_control_input_capability_status(&mut snapshot, true);
+        assert_eq!(item(&snapshot).status, CapabilityStatus::Available);
     }
 
     #[test]

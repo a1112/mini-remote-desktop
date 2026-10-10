@@ -1,5 +1,10 @@
 #![cfg(target_os = "macos")]
 
+use core_foundation::{
+    base::{CFType, TCFType},
+    dictionary::CFDictionary,
+    number::CFNumber,
+};
 use core_graphics::{
     display::CGDisplay,
     geometry::{CGPoint, CGRect as CgRect, CGSize},
@@ -29,6 +34,111 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_millis(1_000);
 const NEXT_FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 const CV_RETURN_SUCCESS: CVReturn = 0;
 const CV_TIME_IS_INDEFINITE: CVTimeFlags = 1 << 0;
+
+/// Check Screen Recording access for the current process without opening a prompt.
+/// Do not cache this value: the user can grant or revoke access while the service runs.
+pub fn screen_capture_access_is_granted() -> bool {
+    core_graphics::access::ScreenCaptureAccess.preflight()
+}
+
+/// Global Quartz coordinates in logical points, including negative display origins.
+/// These are the coordinates accepted by CGEvent; video frame pixels may have a
+/// different scale because of Retina backing resolution or encoder resizing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MacosCaptureBounds {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl MacosCaptureBounds {
+    fn from_rect(rect: CgRect) -> Result<Self, PipelineError> {
+        let bounds = Self {
+            origin_x: rect.origin.x,
+            origin_y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        };
+        if !bounds.origin_x.is_finite()
+            || !bounds.origin_y.is_finite()
+            || !bounds.width.is_finite()
+            || !bounds.height.is_finite()
+            || bounds.width <= 0.0
+            || bounds.height <= 0.0
+            || !(bounds.origin_x + bounds.width).is_finite()
+            || !(bounds.origin_y + bounds.height).is_finite()
+        {
+            return Err(PipelineError::message(
+                "macOS capture target has invalid input bounds",
+            ));
+        }
+        Ok(bounds)
+    }
+}
+
+/// Query an existing, active display without silently substituting the main display.
+pub fn display_input_bounds(display_id: u32) -> Result<MacosCaptureBounds, PipelineError> {
+    let active_displays = CGDisplay::active_displays().map_err(|error| {
+        PipelineError::message(format!("list active macOS displays failed: {error}"))
+    })?;
+    if display_id == 0 || !active_displays.contains(&display_id) {
+        return Err(PipelineError::message(
+            "selected macOS display is no longer active",
+        ));
+    }
+    MacosCaptureBounds::from_rect(CGDisplay::new(display_id).bounds())
+}
+
+/// Query the selected window directly through Quartz. ScreenCaptureKit's
+/// synchronous shareable-content enumeration is too expensive for pointer moves.
+pub fn window_input_bounds(window_id: u32) -> Result<MacosCaptureBounds, PipelineError> {
+    use core_graphics::window::{
+        copy_window_info, kCGWindowBounds, kCGWindowListOptionIncludingWindow, kCGWindowNumber,
+    };
+
+    if window_id == 0 {
+        return Err(PipelineError::message(
+            "selected macOS window id is invalid",
+        ));
+    }
+    let info = copy_window_info(kCGWindowListOptionIncludingWindow, window_id)
+        .ok_or_else(|| PipelineError::message("query selected macOS window failed"))?;
+    for item in info.iter() {
+        // Quartz returns retained Core Foundation objects. Check their runtime
+        // types before interpreting a dictionary, number, or rectangle.
+        let item = unsafe { CFType::wrap_under_get_rule(*item) };
+        let Some(dictionary) = item.downcast::<CFDictionary>() else {
+            continue;
+        };
+        let number_key = unsafe { kCGWindowNumber.cast::<c_void>() };
+        let Some(number) = dictionary.find(number_key) else {
+            continue;
+        };
+        let number = unsafe { CFType::wrap_under_get_rule(*number) };
+        if number
+            .downcast::<CFNumber>()
+            .and_then(|number| number.to_i64())
+            != Some(i64::from(window_id))
+        {
+            continue;
+        }
+        let bounds_key = unsafe { kCGWindowBounds.cast::<c_void>() };
+        let bounds = dictionary
+            .find(bounds_key)
+            .ok_or_else(|| PipelineError::message("selected macOS window has no input bounds"))?;
+        let bounds = unsafe { CFType::wrap_under_get_rule(*bounds) };
+        let bounds = bounds
+            .downcast::<CFDictionary>()
+            .ok_or_else(|| PipelineError::message("selected macOS window bounds are invalid"))?;
+        let rect = CgRect::from_dict_representation(&bounds)
+            .ok_or_else(|| PipelineError::message("selected macOS window bounds are invalid"))?;
+        return MacosCaptureBounds::from_rect(rect);
+    }
+    Err(PipelineError::message(
+        "selected macOS window is no longer available",
+    ))
+}
 
 type CVDisplayLinkRef = *mut c_void;
 type CVReturn = i32;
