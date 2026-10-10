@@ -26,18 +26,33 @@ struct PinnedUiIdentity {
 impl PinnedUiIdentity {
     fn from_bundle(path: &Path) -> anyhow::Result<Self> {
         let executable_path = configured_ui_executable_path(path)?;
-        let bundle = executable_bundle(&executable_path)
-            .ok_or_else(|| anyhow!("Rdesk must be an app bundle"))?;
-        let bundle = std::fs::canonicalize(bundle)?;
+        let bundle = executable_bundle(&executable_path).ok_or_else(|| {
+            tracing::warn!(stage = "ui_bundle_layout_invalid");
+            anyhow!("Rdesk must be an app bundle")
+        })?;
+        let bundle = std::fs::canonicalize(bundle).inspect_err(|_| {
+            tracing::warn!(stage = "ui_bundle_canonicalize_failed");
+        })?;
         let expected_executable = configured_ui_executable_path(&bundle)?;
-        if !std::fs::symlink_metadata(&expected_executable)?.is_file()
-            || std::fs::canonicalize(&executable_path)? != expected_executable
+        let executable_is_file = std::fs::symlink_metadata(&expected_executable)
+            .inspect_err(|_| {
+                tracing::warn!(stage = "ui_executable_metadata_failed");
+            })?
+            .is_file();
+        if !executable_is_file
+            || std::fs::canonicalize(&executable_path).inspect_err(|_| {
+                tracing::warn!(stage = "ui_executable_canonicalize_failed");
+            })? != expected_executable
         {
+            tracing::warn!(stage = "ui_executable_layout_invalid", executable_is_file);
             return Err(anyhow!(
                 "Rdesk executable must remain inside its app bundle"
             ));
         }
-        let requirement = validated_cdhash_requirement(&bundle, UI_IDENTIFIER)?;
+        let requirement =
+            validated_cdhash_requirement(&bundle, UI_IDENTIFIER).inspect_err(|_| {
+                tracing::warn!(stage = "ui_current_static_failed");
+            })?;
         Ok(Self {
             executable_path: expected_executable,
             requirement,
@@ -60,7 +75,11 @@ impl MacosUiLauncher {
             .filter_map(|key| std::env::var(key).ok())
             .find(|value| !value.trim().is_empty())
             .map(PathBuf::from);
-        let current_exe = std::env::current_exe().ok();
+        let current_exe = std::env::current_exe()
+            .inspect_err(|_| {
+                tracing::warn!(stage = "ui_startup_current_exe_failed");
+            })
+            .ok();
         Self::from_startup_paths(
             app_name.into(),
             configured_path,
@@ -75,13 +94,30 @@ impl MacosUiLauncher {
         current_exe: Option<&Path>,
         _development: bool,
     ) -> Self {
-        let embedded_bundle = current_exe.and_then(|path| embedded_ui_bundle(path).ok());
+        let embedded_bundle = current_exe.and_then(|path| {
+            embedded_ui_bundle(path)
+                .inspect_err(|_| {
+                    tracing::warn!(stage = "ui_startup_embedded_bundle_failed");
+                })
+                .ok()
+        });
         // Configuration may choose what to launch, but cannot create a trust
         // anchor. Debug and release peers require the same verified sealed
         // outer UI bundle containing this running service.
-        let pinned_ui = embedded_bundle
-            .as_deref()
-            .and_then(|path| PinnedUiIdentity::from_bundle(path).ok());
+        let pinned_ui = embedded_bundle.as_deref().and_then(|path| {
+            PinnedUiIdentity::from_bundle(path)
+                .inspect_err(|_| {
+                    tracing::warn!(stage = "ui_startup_pin_failed");
+                })
+                .ok()
+        });
+        tracing::info!(
+            stage = "ui_startup_identity",
+            service_pid = std::process::id(),
+            current_exe_present = current_exe.is_some(),
+            embedded_bundle_present = embedded_bundle.is_some(),
+            startup_pin_present = pinned_ui.is_some(),
+        );
         Self {
             app_name,
             ui_path: Arc::new(Mutex::new(configured_path.or(embedded_bundle))),
@@ -141,26 +177,46 @@ impl UiLauncherPort for MacosUiLauncher {
     }
 
     fn get_ui_pid(&self) -> anyhow::Result<Option<u32>> {
-        let mut candidates = pids_from_command("pgrep", &["-x", self.app_name.as_str()])?;
+        let mut candidates = pgrep_pids(&["-x", self.app_name.as_str()])?;
         if let Some(path) = self.configured_ui_path() {
-            candidates.extend(pids_from_command("pgrep", &["-f", path_to_str(&path)?])?);
+            candidates.extend(pgrep_pids(&["-f", path_to_str(&path)?])?);
         }
         if let Some(pin) = &self.pinned_ui {
-            candidates.extend(pids_from_command(
-                "pgrep",
-                &[
-                    "-x",
-                    path_to_str(Path::new(pin.executable_path.file_name().unwrap()))?,
-                ],
-            )?);
+            candidates.extend(pgrep_pids(&[
+                "-x",
+                path_to_str(Path::new(pin.executable_path.file_name().unwrap()))?,
+            ])?);
         }
         candidates.sort_unstable();
         candidates.dedup();
+        let candidates_present = !candidates.is_empty();
         for pid in candidates {
             let Some(path) = live_code(pid)
-                .and_then(|code| code.path(CodeSigningFlags::NONE).ok())
-                .and_then(|url| url.to_path())
-                .and_then(|path| configured_ui_executable_path(&path).ok())
+                .and_then(|code| {
+                    code.path(CodeSigningFlags::NONE)
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                stage = "ui_pid_code_path_failed",
+                                pid,
+                                status = error.code()
+                            );
+                        })
+                        .ok()
+                })
+                .and_then(|url| {
+                    let path = url.to_path();
+                    if path.is_none() {
+                        tracing::warn!(stage = "ui_pid_path_conversion_failed", pid);
+                    }
+                    path
+                })
+                .and_then(|path| {
+                    configured_ui_executable_path(&path)
+                        .inspect_err(|_| {
+                            tracing::warn!(stage = "ui_pid_executable_resolution_failed", pid);
+                        })
+                        .ok()
+                })
             else {
                 continue;
             };
@@ -168,6 +224,7 @@ impl UiLauncherPort for MacosUiLauncher {
                 return Ok(Some(pid));
             }
         }
+        tracing::warn!(stage = "ui_pid_not_found", candidates_present);
         Ok(None)
     }
 
@@ -205,6 +262,7 @@ impl UiLauncherPort for MacosUiLauncher {
         // The PID and image path come from the kernel-bound socket peer. The
         // request's declared PID/path is intentionally never used here.
         let Some(peer_executable_path) = peer_executable_path else {
+            tracing::warn!(stage = "ui_peer_path_missing", peer_pid);
             return Ok(false);
         };
 
@@ -212,26 +270,47 @@ impl UiLauncherPort for MacosUiLauncher {
         // then require the signed Rdesk bundle identity. This binds consent
         // to macOS's code identity instead of a forgeable same-UID path.
         let Some(guest) = live_code(peer_pid) else {
+            tracing::warn!(stage = "ui_peer_guest_lookup_failed", peer_pid);
             return Ok(false);
         };
         // Every signed peer, including Apple-anchored code, must match the
         // immutable startup pin. A mutable launch path cannot grant access.
         // Release startup verifies the sealed outer UI and embedded service.
         let Some(pin) = &self.pinned_ui else {
+            tracing::warn!(stage = "ui_peer_startup_pin_missing", peer_pid);
             return Ok(false);
         };
         if !paths_refer_to_same_file(&pin.executable_path, peer_executable_path) {
+            tracing::warn!(stage = "ui_peer_path_mismatch", peer_pid);
             return Ok(false);
         }
         let Ok(current) = PinnedUiIdentity::from_bundle(&pin.executable_path) else {
+            tracing::warn!(stage = "ui_peer_current_pin_failed", peer_pid);
             return Ok(false);
         };
         if current.requirement != pin.requirement {
+            tracing::warn!(stage = "ui_peer_pin_changed", peer_pid);
             return Ok(false);
         }
-        let requirement: SecRequirement = pin.requirement.parse()?;
+        let requirement: SecRequirement =
+            pin.requirement
+                .parse::<SecRequirement>()
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        stage = "ui_peer_requirement_parse_failed",
+                        peer_pid,
+                        status = error.code()
+                    );
+                })?;
         Ok(guest
             .check_validity(CodeSigningFlags::NONE, &requirement)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    stage = "ui_peer_dynamic_validity_failed",
+                    peer_pid,
+                    status = error.code()
+                );
+            })
             .is_ok())
     }
 }
@@ -240,7 +319,11 @@ fn live_code(pid: u32) -> Option<SecCode> {
     let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
     let mut attributes = GuestAttributes::new();
     attributes.set_pid(pid);
-    SecCode::copy_guest_with_attribues(None, &attributes, CodeSigningFlags::NONE).ok()
+    SecCode::copy_guest_with_attribues(None, &attributes, CodeSigningFlags::NONE)
+        .inspect_err(|error| {
+            tracing::warn!(stage = "ui_guest_lookup_failed", pid, status = error.code());
+        })
+        .ok()
 }
 
 fn configured_ui_executable_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -249,11 +332,17 @@ fn configured_ui_executable_path(path: &Path) -> anyhow::Result<PathBuf> {
             .args(["-c", "Print :CFBundleExecutable"])
             .arg(path.join("Contents/Info.plist"))
             .output()
+            .inspect_err(|_| {
+                tracing::warn!(stage = "ui_plistbuddy_spawn_failed");
+            })
             .context("read Rdesk CFBundleExecutable")?;
         if !output.status.success() {
+            tracing::warn!(stage = "ui_plistbuddy_read_failed");
             return Err(anyhow!("Rdesk CFBundleExecutable is unavailable"));
         }
-        let executable = String::from_utf8(output.stdout)?;
+        let executable = String::from_utf8(output.stdout).inspect_err(|_| {
+            tracing::warn!(stage = "ui_plistbuddy_output_invalid");
+        })?;
         bundle_executable_path(path, executable.trim())
     } else {
         Ok(path.to_path_buf())
@@ -267,6 +356,7 @@ fn bundle_executable_path(bundle: &Path, executable: &str) -> anyhow::Result<Pat
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
     {
+        tracing::warn!(stage = "ui_bundle_executable_invalid");
         return Err(anyhow!("Rdesk CFBundleExecutable is invalid"));
     }
     Ok(bundle.join("Contents/MacOS").join(executable))
@@ -281,25 +371,56 @@ fn executable_bundle(executable: &Path) -> Option<PathBuf> {
 }
 
 fn embedded_ui_bundle(service_executable: &Path) -> anyhow::Result<PathBuf> {
-    let service_executable = std::fs::canonicalize(service_executable)?;
+    let service_executable = std::fs::canonicalize(service_executable).inspect_err(|_| {
+        tracing::warn!(stage = "ui_startup_service_canonicalize_failed");
+    })?;
     let outer = service_executable
         .ancestors()
         .nth(6)
         .filter(|path| path.file_name().is_some_and(|name| name == "Rdesk.app"))
-        .ok_or_else(|| anyhow!("service is not embedded in Rdesk.app"))?;
+        .ok_or_else(|| {
+            tracing::warn!(stage = "ui_startup_outer_layout_invalid");
+            anyhow!("service is not embedded in Rdesk.app")
+        })?;
     let expected_service =
         outer.join("Contents/Resources/MrdService.app/Contents/MacOS/mrd-service");
     if service_executable != expected_service {
+        tracing::warn!(stage = "ui_startup_service_location_invalid");
         return Err(anyhow!("unexpected embedded service location"));
     }
     // Checking the outer resource envelope before trusting its UI also seals
     // the relationship to the embedded service. Bind the running service to
     // that verified image, rather than merely inspecting a nearby app.
-    validated_cdhash_requirement(outer, UI_IDENTIFIER)?;
+    validated_cdhash_requirement(outer, UI_IDENTIFIER).inspect_err(|_| {
+        tracing::warn!(stage = "ui_startup_outer_static_failed");
+    })?;
     let service_bundle = executable_bundle(&service_executable).unwrap();
-    let requirement = validated_cdhash_requirement(&service_bundle, SERVICE_IDENTIFIER)?;
-    SecCode::for_self(CodeSigningFlags::NONE)?
-        .check_validity(CodeSigningFlags::NONE, &requirement.parse()?)?;
+    let requirement = validated_cdhash_requirement(&service_bundle, SERVICE_IDENTIFIER)
+        .inspect_err(|_| {
+            tracing::warn!(stage = "ui_startup_nested_static_failed");
+        })?;
+    SecCode::for_self(CodeSigningFlags::NONE)
+        .inspect_err(|error| {
+            tracing::warn!(
+                stage = "ui_startup_service_self_lookup_failed",
+                status = error.code()
+            );
+        })?
+        .check_validity(
+            CodeSigningFlags::NONE,
+            &requirement.parse::<SecRequirement>().inspect_err(|error| {
+                tracing::warn!(
+                    stage = "ui_startup_service_requirement_parse_failed",
+                    status = error.code()
+                );
+            })?,
+        )
+        .inspect_err(|error| {
+            tracing::warn!(
+                stage = "ui_startup_service_self_validity_failed",
+                status = error.code()
+            );
+        })?;
     Ok(outer.to_path_buf())
 }
 
@@ -353,6 +474,7 @@ struct OwnedCf(CfRef);
 impl OwnedCf {
     fn new(object: CfRef) -> anyhow::Result<Self> {
         if object.is_null() {
+            tracing::warn!(stage = "ui_signing_cf_object_unavailable");
             Err(anyhow!("macOS code-signing object is unavailable"))
         } else {
             Ok(Self(object))
@@ -379,6 +501,7 @@ fn validated_cdhash_requirement(path: &Path, identifier: &str) -> anyhow::Result
         let mut code = std::ptr::null();
         let result = SecStaticCodeCreateWithPath(url.0, 0, &mut code);
         if result != 0 {
+            tracing::warn!(stage = "ui_static_code_lookup_failed", status = result);
             return Err(anyhow!("macOS static code lookup failed: {result}"));
         }
         let code = OwnedCf::new(code)?;
@@ -390,6 +513,7 @@ fn validated_cdhash_requirement(path: &Path, identifier: &str) -> anyhow::Result
         let mut requirement = std::ptr::null();
         let result = SecRequirementCreateWithString(text.0, 0, &mut requirement);
         if result != 0 {
+            tracing::warn!(stage = "ui_static_requirement_failed", status = result);
             return Err(anyhow!(
                 "macOS static identity requirement failed: {result}"
             ));
@@ -398,6 +522,7 @@ fn validated_cdhash_requirement(path: &Path, identifier: &str) -> anyhow::Result
         let flags = CodeSigningFlags::STRICT_VALIDATE | CodeSigningFlags::CHECK_NESTED_CODE;
         let result = SecStaticCodeCheckValidity(code.0, flags.bits(), requirement.0);
         if result != 0 {
+            tracing::warn!(stage = "ui_static_validity_failed", status = result);
             return Err(anyhow!(
                 "macOS static signature validation failed: {result}"
             ));
@@ -405,15 +530,18 @@ fn validated_cdhash_requirement(path: &Path, identifier: &str) -> anyhow::Result
         let mut information = std::ptr::null();
         let result = SecCodeCopySigningInformation(code.0, 0, &mut information);
         if result != 0 {
+            tracing::warn!(stage = "ui_signing_information_failed", status = result);
             return Err(anyhow!("macOS signing information lookup failed: {result}"));
         }
         let information = OwnedCf::new(information)?;
         let hash = CFDictionaryGetValue(information.0, kSecCodeInfoUnique);
         if hash.is_null() || CFGetTypeID(hash) != CFDataGetTypeID() || CFDataGetLength(hash) != 20 {
+            tracing::warn!(stage = "ui_signing_cdhash_unavailable");
             return Err(anyhow!("macOS code directory hash is unavailable"));
         }
         let bytes = CFDataGetBytePtr(hash);
         if bytes.is_null() {
+            tracing::warn!(stage = "ui_signing_cdhash_bytes_unavailable");
             return Err(anyhow!("macOS code directory hash is unavailable"));
         }
         let hash: String = std::slice::from_raw_parts(bytes, 20)
@@ -649,11 +777,16 @@ fn run_command_status(program: &str, args: &[&str]) -> anyhow::Result<()> {
     ))
 }
 
-fn pids_from_command(program: &str, args: &[&str]) -> anyhow::Result<Vec<u32>> {
-    let output = Command::new(program)
+fn pgrep_pids(args: &[&str]) -> anyhow::Result<Vec<u32>> {
+    // BSD pgrep excludes ancestors by default; the bootstrapping UI is our parent.
+    let output = Command::new("/usr/bin/pgrep")
+        .arg("-a")
         .args(args)
         .output()
-        .with_context(|| format!("run {program}"))?;
+        .inspect_err(|_| {
+            tracing::warn!(stage = "ui_pid_scan_spawn_failed");
+        })
+        .context("run macOS pgrep")?;
 
     if !output.status.success() {
         return Ok(Vec::new());
@@ -834,6 +967,23 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn pid_scan_includes_the_calling_ancestor() {
+        let executable = std::env::current_exe().unwrap();
+        let mut pattern = String::new();
+        for character in path_to_str(&executable).unwrap().chars() {
+            if ".^$*+?()[]{}|\\".contains(character) {
+                pattern.push('\\');
+            }
+            pattern.push(character);
+        }
+        let candidates = pgrep_pids(&["-f", &pattern]).unwrap();
+        assert!(
+            candidates.contains(&std::process::id()),
+            "the pgrep child must discover its calling ancestor"
+        );
     }
 
     #[test]

@@ -1011,23 +1011,66 @@ impl IpcServer {
             (Some(pid), Some(path)) if pid != 0 && !path.as_os_str().is_empty() => self
                 .ui_launcher
                 .lock()
+                .inspect_err(|_| {
+                    tracing::warn!(stage = "ui_peer_verifier_lock_failed");
+                })
                 .ok()
-                .and_then(|launcher| launcher.is_trusted_ui_peer(pid, Some(path)).ok())
+                .and_then(|launcher| {
+                    launcher
+                        .is_trusted_ui_peer(pid, Some(path))
+                        .inspect_err(|_| {
+                            tracing::warn!(stage = "ui_peer_verifier_failed", peer_pid = pid);
+                        })
+                        .ok()
+                })
                 .unwrap_or(false),
             _ => false,
         };
         let trusted_pid = self
             .ui_launcher
             .lock()
+            .inspect_err(|_| {
+                tracing::warn!(stage = "ui_pid_verifier_lock_failed");
+            })
             .ok()
-            .and_then(|launcher| launcher.get_ui_pid().ok().flatten());
-        macos_sensitive_request_policy_denial(
+            .and_then(|launcher| {
+                launcher
+                    .get_ui_pid()
+                    .inspect_err(|_| {
+                        tracing::warn!(stage = "ui_pid_verifier_failed");
+                    })
+                    .ok()
+                    .flatten()
+            });
+        let denial = macos_sensitive_request_policy_denial(
             request,
             self.peer_pid,
             peer_executable_path,
             trusted_peer,
             trusted_pid,
-        )
+        );
+        if denial.is_some() {
+            let request_kind = match request {
+                IpcRequest::UiAttached { .. } => "ui_attached",
+                IpcRequest::UiDetached { .. } => "ui_detached",
+                IpcRequest::RespondToConsent { .. } => "respond_to_consent",
+                IpcRequest::ReadTemporaryAccessPassword => "read_temporary_access_password",
+                IpcRequest::RotateTemporaryAccessPassword => "rotate_temporary_access_password",
+                IpcRequest::DisableTemporaryAccess => "disable_temporary_access",
+                _ => "other_sensitive_request",
+            };
+            tracing::warn!(
+                stage = "ui_sensitive_request_denied",
+                request_kind,
+                peer_pid = self.peer_pid.unwrap_or(0),
+                peer_path_present =
+                    peer_executable_path.is_some_and(|path| !path.as_os_str().is_empty()),
+                trusted_peer,
+                trusted_pid = trusted_pid.unwrap_or(0),
+                peer_equals_trusted_pid = trusted_pid == self.peer_pid,
+            );
+        }
+        denial
     }
 }
 
