@@ -50,7 +50,7 @@ enum RunMode {
     WindowsService,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn requests_existing_store_verification(arguments: &[std::ffi::OsString]) -> Result<bool> {
     const FLAG: &str = "--verify-existing-store";
     if !arguments
@@ -92,8 +92,33 @@ fn run_existing_store_verification() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn run_existing_store_verification() -> Result<()> {
+    let verified = (|| -> Result<mrd_store_sqlite::ExistingStoreVerification> {
+        let product_data =
+            security::verify_protected_product_data_dir().map_err(anyhow::Error::msg)?;
+        let protector =
+            security::existing_secret_protector_read_only().map_err(anyhow::Error::msg)?;
+        Ok(
+            mrd_store_sqlite::PersistentStore::verify_existing_read_only(
+                product_data.join("security-state-v2.sqlite3"),
+                protector,
+            )?,
+        )
+    })()
+    .map_err(|_| anyhow::anyhow!("existing protected store verification failed"))?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "format_version": verified.format_version,
+            "identity_initialized": verified.identity_initialized,
+        })
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let arguments: Vec<_> = std::env::args_os().skip(1).collect();
         if requests_existing_store_verification(&arguments)? {
@@ -1043,7 +1068,7 @@ mod scm_host {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 mod existing_store_preflight_tests {
     use super::*;
     use std::ffi::OsString;
@@ -1061,6 +1086,8 @@ mod existing_store_preflight_tests {
             vec!["--verify-existing-store", "arbitrary.sqlite"],
             vec!["--verify-existing-store", "--verify-existing-store"],
             vec!["--verify-existing-store=arbitrary.sqlite"],
+            vec!["--verify-existing-store", "--authorize-keychain"],
+            vec!["--verify-existing-store", "--check-macos-permissions"],
         ] {
             assert!(requests_existing_store_verification(&args(&arguments)).is_err());
         }
@@ -1068,7 +1095,13 @@ mod existing_store_preflight_tests {
 
     #[test]
     fn existing_store_preflight_preserves_ordinary_console_and_service_routing() {
-        for arguments in [vec![], vec!["--service"], vec!["--console"]] {
+        for arguments in [
+            vec![],
+            vec!["--service"],
+            vec!["--console"],
+            vec!["--authorize-keychain"],
+            vec!["--check-macos-permissions"],
+        ] {
             assert!(!requests_existing_store_verification(&args(&arguments)).unwrap());
         }
     }

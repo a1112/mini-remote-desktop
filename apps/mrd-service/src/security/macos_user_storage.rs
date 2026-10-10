@@ -167,6 +167,26 @@ pub(super) fn authorize_existing_master_key() -> Result<(), String> {
     Ok(())
 }
 
+/// Read the existing master key without prompts or initializing protected state.
+pub(super) fn load_existing_master_key_noninteractive() -> Result<Zeroizing<[u8; 32]>, String> {
+    verify_protected_product_data_dir()?;
+    let _interaction = SecKeychain::disable_user_interaction()
+        .map_err(|_| "macOS Keychain interaction policy could not be set".to_owned())?;
+    let keychain =
+        SecKeychain::default().map_err(|_| "macOS login Keychain is unavailable".to_owned())?;
+    let (password, _) = keychain
+        .find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|_| "existing macOS Keychain master key is unavailable".to_owned())?;
+    let bytes = Zeroizing::new(password.to_vec());
+    drop(password);
+    if bytes.len() != 32 {
+        return Err("macOS Keychain master key is invalid".to_owned());
+    }
+    let mut key = Zeroizing::new([0_u8; 32]);
+    key.copy_from_slice(bytes.as_slice());
+    Ok(key)
+}
+
 pub(super) fn load_master_key() -> Result<Zeroizing<[u8; 32]>, String> {
     let directory = ensure_protected_product_data_dir()?;
     // Background services must fail promptly when the login Keychain is locked.
