@@ -1,7 +1,7 @@
 import type { ControlInputEvent } from '../adapters/tauri/types';
 import type { BrowserRemoteContext, BrowserRemoteHandle, BrowserRemoteObserver, BrowserRemoteState } from './browserRemoteSessionService';
 import { BrowserRemoteControl } from './browserRemoteControl';
-import { verifyBrowserRelayAccess } from './browserRelayDirectory';
+import { verifyBrowserRelayAccess, waitUntilRelayDirectoryIssued, BrowserRelayDirectoryValidityError } from './browserRelayDirectory';
 import {
   byteArray, canonicalProfile, canonicalWanRequest, candidateFingerprint, randomBytes,
   safeInteger, signalEnvelope, signSignal, signedSignalCommitment, strictObject, verifySignedSignal, parseBoundedJson,
@@ -63,6 +63,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private fail(error: unknown, phase: 'failed' | 'denied' = 'failed'): void {
     if (this.closing) return;
     if (error instanceof BrowserSignalValidityError) console.warn('[rdesk] signed signal rejected', error.diagnostics);
+    if (error instanceof BrowserRelayDirectoryValidityError) console.warn('[rdesk] relay directory rejected', error.diagnostics);
     this.publish({ phase, grantedScopes: [], error: error instanceof Error ? error.message : '网页远程连接失败' });
     void this.close('connection_failed').catch(() => undefined);
   }
@@ -249,6 +250,8 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   }
   private async negotiate(grant: WireObject): Promise<void> {
     const access = await this.context.getRelayAccess();
+    if (this.closing) return;
+    await waitUntilRelayDirectoryIssued(access, this.signalWaitAbort.signal);
     if (this.closing) return;
     const config = await verifyBrowserRelayAccess(access, {
       grant, targetDeviceId: this.targetId, keyId: this.context.bootstrap.relay_directory_key_id,

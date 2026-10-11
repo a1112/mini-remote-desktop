@@ -2,6 +2,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { BrowserRemotePeer } from './browserRemotePeer';
 import type { BrowserRemoteContext, BrowserRemoteState } from './browserRemoteSessionService';
 import * as protocol from './browserRemoteProtocol';
+import { canonicalRelayDirectoryBytes, verifyBrowserRelayAccess } from './browserRelayDirectory';
 import fixture from '../../../../realtime-server/tests/fixtures/browser_protocol_v3.json';
 import relayFixture from './__fixtures__/browser-relay-directory.json';
 const cryptoModuleName = 'node:crypto';
@@ -145,6 +146,42 @@ async function approvedPeer(gathering = false, candidateFutureMs = 0): Promise<{
   return { peer, pc, socket, candidate };
 }
 
+async function relayDirectoryPeer(futureMs: number, customize: (access: typeof relayFixture.access) => void = () => undefined) {
+  const relaySigner = await protocol.createBrowserSigningIdentity();
+  context.bootstrap.relay_directory_key_id = relaySigner.keyId;
+  context.bootstrap.relay_directory_public_key = relaySigner.publicKey;
+  const access = structuredClone(relayFixture.access);
+  access.directory.payload.issued_at_ms = Date.now() + futureMs;
+  access.directory.signing_key_id = relaySigner.keyId;
+  customize(access);
+  const signature = await crypto.subtle.sign('Ed25519', relaySigner.privateKey,
+    protocol.exactBuffer(canonicalRelayDirectoryBytes(access.directory.payload)));
+  access.directory.signature_b64 = btoa(String.fromCharCode(...new Uint8Array(signature)));
+  const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+  try {
+    const socket = await beginRegistration(peer);
+    socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered() } });
+    await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3'));
+    const intent = JSON.parse(socket.sent.find(text => JSON.parse(text).message.type === 'session_intent_v3')!).message.payload;
+    const target = await fixtureIdentity(fixture.target);
+    const grantPayload = { ...fixture.grant.payload, intent_commitment: await protocol.signedSignalCommitment('intent', intent) };
+    const grant = await protocol.signSignal(target, 'session_grant_v3', grantPayload);
+    context.getBootstrap = vi.fn(async () => ({ ...context.bootstrap, session: {
+      ...context.bootstrap.session, status: 'approved', approved_scopes: grantPayload.approved_scopes, approved_profile: grantPayload.approved_profile,
+      policy_revision: grantPayload.backend_policy_revision, active_relay_generation: 0,
+      policy_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(), grant_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(),
+    } }));
+    context.getRelayAccess = vi.fn(async () => access);
+    socket.receive({ version: 3, message: { type: 'session_grant_v3', payload: grant } });
+    await until(() => vi.mocked(context.getRelayAccess).mock.calls.length === 1);
+    await pause(20);
+    return { peer, socket, access, binding: {
+      grant: grantPayload, targetDeviceId: fixture.target.device_id, keyId: relaySigner.keyId,
+      publicKey: relaySigner.publicKey, nowMs: access.directory.payload.issued_at_ms,
+    } };
+  } catch (error) { await peer.close('test_cleanup'); throw error; }
+}
+
 beforeEach(async () => {
   vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   Socket.sockets = []; PeerConnection.peers = []; PeerConnection.initialIceState = 'complete';
@@ -170,6 +207,135 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('independent browser peer lifecycle', () => {
+  it.each([1, 1500, 2000])('waits for a genuinely signed relay directory issued %i ms ahead after registered and grant verification', async futureMs => {
+    const clock = controlledClock();
+    const { peer, socket, access, binding } = await relayDirectoryPeer(futureMs);
+    try {
+      // The real directory verifier succeeds at its issue time; its signature and all bindings are valid.
+      await expect(verifyBrowserRelayAccess(access, binding)).resolves.toHaveProperty('iceTransportPolicy', 'all');
+      expect(onState.mock.calls.filter(([state]) => state.phase === 'failed').map(([state]) => state.error)).toEqual([]);
+      expect(PeerConnection.peers).toHaveLength(0);
+      await clock.advance(futureMs - 1);
+      expect(PeerConnection.peers).toHaveLength(0);
+      await clock.advance(1);
+      await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3'));
+      expect(PeerConnection.peers).toHaveLength(1);
+      expect(access.directory.payload.issued_at_ms).toBe(fixture.now_ms + futureMs);
+      expect(context.getRelayAccess).toHaveBeenCalledTimes(1);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+    } finally { await peer.close('test_cleanup'); }
+  });
+
+  it('rejects a relay directory more than 2000 ms ahead without waiting and logs only safe diagnostics', async () => {
+    controlledClock();
+    const { peer, socket, access, binding } = await relayDirectoryPeer(2001);
+    try {
+      await expect(verifyBrowserRelayAccess(access, binding)).resolves.toHaveProperty('iceTransportPolicy', 'all');
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(performance.now()).toBe(0);
+      expect(console.warn).toHaveBeenCalledWith('[rdesk] relay directory rejected', {
+        message_type: 'relay_directory', generation_matches: true, directory_matches: true,
+        session_matches: true, policy_matches: true, key_pin_matches: true, route_allowed: true,
+        issued_delta_ms: 2001, expiry_remaining_ms: access.directory.payload.expires_at_ms - fixture.now_ms,
+      });
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('does not renew the relay directory monotonic budget when the wall clock moves backward', async () => {
+    const clock = controlledClock();
+    const { peer, socket } = await relayDirectoryPeer(1500);
+    try {
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await clock.advance(1000);
+      clock.set(fixture.now_ms + 500);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(performance.now()).toBe(2000);
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('rejects a relay directory that expires during its issue-time wait', async () => {
+    const clock = controlledClock();
+    const { peer } = await relayDirectoryPeer(1500, access => {
+      access.directory.payload.expires_at_ms = fixture.now_ms + 1501;
+      access.directory.payload.candidates.forEach(candidate => { candidate.reservation.expires_at_ms = fixture.now_ms + 1501; });
+    });
+    try {
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      clock.set(fixture.now_ms + 1502);
+      await vi.advanceTimersByTimeAsync(1500);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(vi.mocked(console.warn).mock.calls[0]?.[1]).toMatchObject({ issued_delta_ms: -2, expiry_remaining_ms: -1 });
+    } finally { await peer.close(); }
+  });
+
+  it('still rejects a bad relay directory signature after the bounded wait', async () => {
+    const clock = controlledClock();
+    const { peer, access } = await relayDirectoryPeer(1500);
+    try {
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      const signature = Uint8Array.from(atob(access.directory.signature_b64), char => char.charCodeAt(0));
+      signature[0] = signature[0]! ^ 1;
+      access.directory.signature_b64 = btoa(String.fromCharCode(...signature));
+      await clock.advance(1500);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(onState.mock.calls.find(([state]) => state.phase === 'failed')?.[0].error).toBe('中继目录签名验证失败');
+      expect(PeerConnection.peers).toHaveLength(0);
+    } finally { await peer.close(); }
+  });
+
+  it.each(['session', 'directory', 'policy', 'target'])('still rejects a genuinely signed directory with a wrong %s binding after the bounded wait', async condition => {
+    const clock = controlledClock();
+    const { peer } = await relayDirectoryPeer(1500, access => {
+      if (condition === 'session') access.directory.payload.session_id = 'another-session';
+      if (condition === 'directory') access.directory.payload.directory_id = 'another-directory';
+      if (condition === 'policy') access.directory.payload.policy_revision++;
+      if (condition === 'target') access.directory.payload.intended_peer_digest = 'peer-sha256-' + '0'.repeat(64);
+    });
+    try {
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await clock.advance(1500);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(PeerConnection.peers).toHaveLength(0);
+      if (condition !== 'target') expect(vi.mocked(console.warn).mock.calls[0]?.[1]).toMatchObject({ [`${condition}_matches`]: false, issued_delta_ms: 0 });
+    } finally { await peer.close(); }
+  });
+
+  it.each(['key id', 'public key'])('still enforces the trusted relay %s after the bounded wait', async condition => {
+    const clock = controlledClock();
+    const { peer } = await relayDirectoryPeer(1500);
+    try {
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      if (condition === 'key id') context.bootstrap.relay_directory_key_id = '0'.repeat(64);
+      else context.bootstrap.relay_directory_public_key = [...fixture.target.public_key];
+      await clock.advance(1500);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(PeerConnection.peers).toHaveLength(0);
+      if (condition === 'key id') expect(vi.mocked(console.warn).mock.calls[0]?.[1]).toMatchObject({ key_pin_matches: false, issued_delta_ms: 0 });
+    } finally { await peer.close(); }
+  });
+
+  it('cancels a pending relay directory wait on close without creating a peer or sending an offer', async () => {
+    const clock = controlledClock();
+    const { peer, socket } = await relayDirectoryPeer(1500);
+    expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+    await peer.close('user_cancel');
+    expect(performance.now()).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await clock.advance(31000);
+    expect(PeerConnection.peers).toHaveLength(0);
+    expect(socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3')).toBe(false);
+    expect(context.closeBackend).toHaveBeenCalledTimes(1);
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'closed', grantedScopes: [] }));
+  });
+
   it.each([1, 1500, 2000])('waits for a registered reply issued %i ms ahead before sending the session intent', async futureMs => {
     const clock = controlledClock();
     const peer = new BrowserRemotePeer(context, { onState, onVideoStream });

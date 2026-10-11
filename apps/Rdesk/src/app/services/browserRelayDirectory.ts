@@ -1,8 +1,19 @@
-import { boundedText, byteArray, exactBuffer, safeInteger, sha256Hex, strictObject, type WireObject } from './browserRemoteProtocol';
+import { boundedText, byteArray, exactBuffer, safeInteger, sha256Hex, strictObject, waitUntilIssued, type WireObject } from './browserRemoteProtocol';
 
 const encoder = new TextEncoder();
 const transportCode: Record<string, number> = { udp: 1, tcp: 2, tls: 3 };
 function invalid(): never { throw new Error('远程中继目录无效或不属于当前会话'); }
+type RelayDirectoryValidityDiagnostics = Readonly<{
+  message_type: 'relay_directory'; generation_matches: boolean; directory_matches: boolean; session_matches: boolean;
+  policy_matches: boolean; key_pin_matches: boolean; route_allowed: boolean; issued_delta_ms: number; expiry_remaining_ms: number;
+}>;
+export class BrowserRelayDirectoryValidityError extends Error {
+  constructor(readonly diagnostics: RelayDirectoryValidityDiagnostics) {
+    super('远程中继目录无效或不属于当前会话');
+    this.name = 'BrowserRelayDirectoryValidityError';
+    Object.freeze(diagnostics);
+  }
+}
 class Writer {
   parts: Uint8Array[] = [];
   bytes(value: Uint8Array) { this.parts.push(value); }
@@ -46,7 +57,8 @@ function directoryPayload(raw: unknown): WireObject {
     if (!Array.isArray(candidate.endpoints) || !candidate.endpoints.length || candidate.endpoints.length > 4) return invalid();
     candidate.endpoints = candidate.endpoints.map((rawEndpoint: unknown, index: number) => {
       const endpoint = strictObject(rawEndpoint, ['transport', 'host', 'port']);
-      if (!transportCode[endpoint.transport] || !/^[A-Za-z0-9_.:-]+$/.test(boundedText(endpoint.host))) return invalid();
+      if (typeof endpoint.transport !== 'string' || !Object.prototype.hasOwnProperty.call(transportCode, endpoint.transport)
+        || !/^[A-Za-z0-9_.:-]+$/.test(boundedText(endpoint.host))) return invalid();
       safeInteger(endpoint.port, 1, 65535);
       if (index > 0) {
         const prior = candidate.endpoints[index - 1];
@@ -86,42 +98,78 @@ function endpointUrl(endpoint: WireObject): string {
   const host = endpoint.host.includes(':') ? `[${endpoint.host}]` : endpoint.host;
   return `${endpoint.transport === 'tls' ? 'turns' : 'turn'}:${host}:${endpoint.port}?transport=${endpoint.transport === 'udp' ? 'udp' : 'tcp'}`;
 }
-export async function verifyBrowserRelayAccess(raw: unknown, binding: {
-  grant: WireObject; targetDeviceId: string; keyId: string; publicKey: number[]; nowMs: number;
-}): Promise<RTCConfiguration> {
-  const access = strictObject(raw, ['generation', 'directory_id', 'relay_url_digest', 'directory', 'credentials']);
-  const signed = strictObject(access.directory, ['payload', 'signing_key_id', 'signature_b64']);
-  const payload = directoryPayload(signed.payload), grant = binding.grant;
-  if (access.generation !== 0 || grant.relay_generation !== 0 || access.directory_id !== grant.relay_directory_id
-    || payload.directory_id !== access.directory_id || payload.session_id !== grant.session_id
-    || payload.policy_revision !== grant.backend_policy_revision || binding.nowMs < payload.issued_at_ms
-    || binding.nowMs >= payload.expires_at_ms || signed.signing_key_id !== binding.keyId
-    || !['relay_only', 'direct_first'].includes(grant.route_policy)) return invalid();
-  const publicKey = new Uint8Array(byteArray(binding.publicKey, 32));
-  if (await sha256Hex(publicKey) !== binding.keyId) return invalid();
-  const peerBytes = encoder.encode(`MRD_RELAY_PEER_V1\0${binding.targetDeviceId}`);
-  if (payload.intended_peer_digest !== `peer-sha256-${await sha256Hex(peerBytes)}`) return invalid();
-  if (typeof signed.signature_b64 !== 'string') return invalid();
+function hexDigest(raw: unknown): string {
+  if (typeof raw !== 'string' || !/^[0-9a-f]{64}$/.test(raw)) return invalid();
+  return raw;
+}
+function signatureBytes(raw: unknown): Uint8Array {
+  if (typeof raw !== 'string' || raw.length !== 88 || !/^[A-Za-z0-9+/]{86}==$/.test(raw)) return invalid();
   let signature: Uint8Array;
-  try { signature = Uint8Array.from(atob(signed.signature_b64), char => char.charCodeAt(0)); }
+  try { signature = Uint8Array.from(atob(raw), char => char.charCodeAt(0)); }
   catch { return invalid(); }
-  if (signature.length !== 64 || btoa(String.fromCharCode(...signature)) !== signed.signature_b64) return invalid();
-  const key = await crypto.subtle.importKey('raw', exactBuffer(publicKey), 'Ed25519', false, ['verify']);
-  if (!await crypto.subtle.verify('Ed25519', key, exactBuffer(signature), exactBuffer(canonicalRelayDirectoryBytes(payload)))) throw new Error('中继目录签名验证失败');
+  if (signature.length !== 64 || btoa(String.fromCharCode(...signature)) !== raw) return invalid();
+  return signature;
+}
+function relayAccess(raw: unknown) {
+  const access = strictObject(raw, ['generation', 'directory_id', 'relay_url_digest', 'directory', 'credentials']);
+  safeInteger(access.generation);
+  boundedText(access.directory_id);
+  hexDigest(access.relay_url_digest);
+  const signed = strictObject(access.directory, ['payload', 'signing_key_id', 'signature_b64']);
+  hexDigest(signed.signing_key_id);
+  const signature = signatureBytes(signed.signature_b64);
+  const payload = directoryPayload(signed.payload);
+  const canonicalBytes = canonicalRelayDirectoryBytes(payload);
   if (!Array.isArray(access.credentials) || access.credentials.length !== payload.candidates.length) return invalid();
   const credentials = new Map<string, WireObject>();
   for (const rawCredential of access.credentials) {
     const credential = strictObject(rawCredential, ['node_id', 'urls', 'username', 'credential', 'expires_at_unix_seconds']);
-    if (credentials.has(credential.node_id)) return invalid();
     boundedText(credential.node_id);
+    if (credentials.has(credential.node_id)) return invalid();
     for (const field of ['username', 'credential']) {
       boundedText(credential[field], 512);
       if (/[\u0000-\u001f\u007f]/.test(credential[field])) return invalid();
     }
-    safeInteger(credential.expires_at_unix_seconds, Math.floor(binding.nowMs / 1000) + 1);
+    safeInteger(credential.expires_at_unix_seconds, 1);
     if (!Array.isArray(credential.urls) || credential.urls.length < 1 || credential.urls.length > 4
       || new Set(credential.urls).size !== credential.urls.length) return invalid();
+    for (const url of credential.urls) {
+      boundedText(url, 512);
+      if (!/^turns?:[A-Za-z0-9_.:\[\]-]+:[1-9][0-9]{0,4}\?transport=(udp|tcp)$/.test(url)) return invalid();
+    }
     credentials.set(credential.node_id, credential);
+  }
+  return { access, signed, payload, signature, canonicalBytes, credentials };
+}
+export async function waitUntilRelayDirectoryIssued(raw: unknown, signal: AbortSignal): Promise<void> {
+  await waitUntilIssued(relayAccess(raw).payload.issued_at_ms as number, signal);
+}
+export async function verifyBrowserRelayAccess(raw: unknown, binding: {
+  grant: WireObject; targetDeviceId: string; keyId: string; publicKey: number[]; nowMs: number;
+}): Promise<RTCConfiguration> {
+  const { access, signed, payload, signature, canonicalBytes, credentials } = relayAccess(raw);
+  const grant = binding.grant;
+  if (access.generation !== 0 || grant.relay_generation !== 0 || access.directory_id !== grant.relay_directory_id
+    || payload.directory_id !== access.directory_id || payload.session_id !== grant.session_id
+    || payload.policy_revision !== grant.backend_policy_revision || binding.nowMs < payload.issued_at_ms
+    || binding.nowMs >= payload.expires_at_ms || signed.signing_key_id !== binding.keyId
+    || !['relay_only', 'direct_first'].includes(grant.route_policy)) {
+    throw new BrowserRelayDirectoryValidityError({
+      message_type: 'relay_directory', generation_matches: access.generation === 0 && grant.relay_generation === 0,
+      directory_matches: access.directory_id === grant.relay_directory_id && payload.directory_id === access.directory_id,
+      session_matches: payload.session_id === grant.session_id, policy_matches: payload.policy_revision === grant.backend_policy_revision,
+      key_pin_matches: signed.signing_key_id === binding.keyId, route_allowed: ['relay_only', 'direct_first'].includes(grant.route_policy),
+      issued_delta_ms: payload.issued_at_ms - binding.nowMs, expiry_remaining_ms: payload.expires_at_ms - binding.nowMs,
+    });
+  }
+  const publicKey = new Uint8Array(byteArray(binding.publicKey, 32));
+  if (await sha256Hex(publicKey) !== binding.keyId) return invalid();
+  const peerBytes = encoder.encode(`MRD_RELAY_PEER_V1\0${binding.targetDeviceId}`);
+  if (payload.intended_peer_digest !== `peer-sha256-${await sha256Hex(peerBytes)}`) return invalid();
+  const key = await crypto.subtle.importKey('raw', exactBuffer(publicKey), 'Ed25519', false, ['verify']);
+  if (!await crypto.subtle.verify('Ed25519', key, exactBuffer(signature), exactBuffer(canonicalBytes))) throw new Error('中继目录签名验证失败');
+  for (const credential of credentials.values()) {
+    safeInteger(credential.expires_at_unix_seconds, Math.floor(binding.nowMs / 1000) + 1);
   }
   for (const candidate of payload.candidates) {
     if (candidate.reservation.expires_at_ms <= binding.nowMs) return invalid();

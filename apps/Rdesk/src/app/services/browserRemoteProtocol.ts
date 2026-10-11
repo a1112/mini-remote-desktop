@@ -269,11 +269,15 @@ export async function verifyContext(publicKey: number[], signature: number[], pi
 }
 export const MAX_FUTURE_MESSAGE_WAIT_MS = 2000;
 
+export async function waitUntilSignalIssued(type: SignalType, value: unknown, signal: AbortSignal): Promise<void> {
+  await waitUntilIssued(signedObject(type, value).payload.claims.issued_at_ms as number, signal);
+}
+
 // Like mrd-signal-client/issued_time.rs, this only delays an early message.
 // It never authenticates it or changes its signed timestamps. The caller must
 // reread Date.now() and perform all strict checks after the bounded wait.
-export async function waitUntilSignalIssued(type: SignalType, value: unknown, signal: AbortSignal): Promise<void> {
-  const issuedAtMs = signedObject(type, value).payload.claims.issued_at_ms as number;
+export async function waitUntilIssued(issuedAtMs: number, signal: AbortSignal): Promise<void> {
+  safeInteger(issuedAtMs);
   const deadline = performance.now() + MAX_FUTURE_MESSAGE_WAIT_MS;
   while (true) {
     if (signal.aborted) throw new Error('网页连接已取消');
