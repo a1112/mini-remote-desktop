@@ -43,7 +43,7 @@
       "source_mode": "100644",
       "source_git_blob": "c36df6f6cf281889bb97155d45a2b55fe4eea878",
       "target_path": "prototypes/rdesk/package.json",
-      "target_git_blob": "0d785cd9b1dac822e351557347a3b1534b0a86fa",
+      "target_git_blob": "31497ea8d67a2f39773b2667e0d19f05db768fe9",
       "disposition": "migrated_with_adjustment",
       "archive_path": "docs/repository-consolidation/Rdesk/originals/package.json.source.txt"
     },
