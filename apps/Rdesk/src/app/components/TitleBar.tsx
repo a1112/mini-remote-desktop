@@ -42,6 +42,7 @@ import { useDetailBar } from "./DetailBarContext";
 import { withTauriWindow } from "../utils/tauriWindow";
 import { useAuth } from './AuthContext';
 import { useFileTransfers, transferName, formatTransferBytes, transferStatusLabel } from "../services/fileTransferListService";
+import { PermissionStatus } from "./PermissionStatus";
 
 interface TitleBarProps {
   onOpenConnections?: () => void;
@@ -195,7 +196,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
     >
       {logoutError && <p role="alert" className="absolute right-3 top-12 z-50 max-w-sm rounded-lg border border-red-400/30 bg-red-950 px-4 py-3 text-xs leading-relaxed text-red-100 shadow-lg">{logoutError}</p>}
       {/* Left: Sidebar toggle + Quick search */}
-      <div className="flex-1 flex items-center px-2 gap-2">
+      <div className="flex-1 min-w-0 flex items-center px-2 gap-2">
         <button
           onClick={onToggleSidebar}
           className={`flex items-center justify-center w-8 h-8 rounded-md transition-colors shrink-0 ${
@@ -214,7 +215,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
         </button>
 
         <div
-          className={`flex items-center gap-2 px-3 py-1 rounded-md transition-all cursor-text ${
+          className={`flex min-w-0 max-w-full items-center gap-2 px-3 py-1 rounded-md transition-all cursor-text ${
             searchFocused
               ? isDark
                 ? "bg-[#2a2a2a] border border-blue-500 shadow-sm ring-2 ring-blue-500/20 w-80"
@@ -321,6 +322,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
       {/* Right: Status indicators + actions + window controls */}
       <div className="flex items-center h-full shrink-0" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
         {/* Quick action buttons: Connections + Settings */}
+        <PermissionStatus />
         <button
           onClick={onOpenConnections}
           className={iconBtn}
