@@ -8,6 +8,6 @@ overrides:
   picomatch: 4.0.4
   postcss: 8.5.23
   tar: 7.5.22
-  vite: 6.4.3
+  vite: 6.4.4
   ws: 8.21.1
   yaml: 1.10.3
