@@ -74,13 +74,24 @@ async function until(check: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) { if (check()) return; await pause(); }
   throw new Error('Expected peer behavior did not occur');
 }
-async function serverRegistered(): Promise<protocol.SignedSignal> {
-  return protocol.signSignal(await fixtureIdentity(fixture.target), 'registered', {
-    claims: { issuer_device_id: 'signal-server', issuer_key_id: fixture.target.key_id,
-      intended_peer_device_id: fixture.browser.device_id, issued_at_ms: Date.now(), expires_at_ms: Date.now() + 10000,
+async function serverRegistered(issuedAtMs = Date.now(), expiresAtMs = issuedAtMs + 10000, identity?: protocol.BrowserSigningIdentity): Promise<protocol.SignedSignal> {
+  const signer = identity ?? await fixtureIdentity(fixture.target);
+  return protocol.signSignal(signer, 'registered', {
+    claims: { issuer_device_id: 'signal-server', issuer_key_id: signer.keyId,
+      intended_peer_device_id: fixture.browser.device_id, issued_at_ms: issuedAtMs, expires_at_ms: expiresAtMs,
       counter: 1, nonce: Array(16).fill(4) },
     registered_device_id: fixture.browser.device_id, connection_id: Array(16).fill(8), heartbeat_interval_ms: 30000,
   });
+}
+function controlledClock() {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'performance'] });
+  let now = fixture.now_ms;
+  vi.mocked(Date.now).mockImplementation(() => now);
+  context.getBootstrap = vi.fn(async () => context.bootstrap);
+  return {
+    set: (value: number) => { now = value; },
+    advance: async (milliseconds: number) => { now += milliseconds; await vi.advanceTimersByTimeAsync(milliseconds); },
+  };
 }
 async function beginRegistration(peer: BrowserRemotePeer): Promise<Socket> {
   await peer.start();
@@ -91,7 +102,7 @@ async function beginRegistration(peer: BrowserRemotePeer): Promise<Socket> {
   await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'register'));
   return socket;
 }
-async function approvedPeer(gathering = false): Promise<{ peer: BrowserRemotePeer; pc: PeerConnection; socket: Socket }> {
+async function approvedPeer(gathering = false, candidateFutureMs = 0): Promise<{ peer: BrowserRemotePeer; pc: PeerConnection; socket: Socket; candidate?: protocol.SignedSignal }> {
   if (gathering) PeerConnection.initialIceState = 'gathering';
   const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
   const socket = await beginRegistration(peer);
@@ -115,7 +126,8 @@ async function approvedPeer(gathering = false): Promise<{ peer: BrowserRemotePee
   await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_candidate_v3'));
   const commitment = await protocol.signedSignalCommitment('grant', grant);
   const candidatePayload = { ...fixture.candidate.payload,
-    claims: { ...grantPayload.claims, counter: 4, nonce: Array(16).fill(5) },
+    claims: { ...grantPayload.claims, counter: 4, nonce: Array(16).fill(5),
+      issued_at_ms: Date.now() + candidateFutureMs, expires_at_ms: Date.now() + candidateFutureMs + 10000 },
     grant_commitment: commitment, description_role: 'answer',
     candidate: 'candidate:2 1 UDP 2130706431 192.0.2.2 6000 typ host', username_fragment: 'target-ufrag' };
   candidatePayload.candidate_fingerprint = await protocol.candidateFingerprint(candidatePayload);
@@ -130,10 +142,11 @@ async function approvedPeer(gathering = false): Promise<{ peer: BrowserRemotePee
   socket.receive({ version: 3, message: { type: 'webrtc_answer_v3', payload: answer } });
   const pc = PeerConnection.peers[0]!;
   await until(() => Boolean(pc.remoteDescription));
-  return { peer, pc, socket };
+  return { peer, pc, socket, candidate };
 }
 
 beforeEach(async () => {
+  vi.spyOn(console, 'warn').mockImplementation(() => undefined);
   Socket.sockets = []; PeerConnection.peers = []; PeerConnection.initialIceState = 'complete';
   vi.spyOn(Date, 'now').mockReturnValue(fixture.now_ms);
   vi.stubGlobal('crypto', webcrypto);
@@ -157,6 +170,159 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('independent browser peer lifecycle', () => {
+  it.each([1, 1500, 2000])('waits for a registered reply issued %i ms ahead before sending the session intent', async futureMs => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      const serverIdentity = await protocol.createBrowserSigningIdentity();
+      context.bootstrap.signaling_server_key_id = serverIdentity.keyId;
+      expect(serverIdentity.keyId).not.toBe(context.bootstrap.target_key_id);
+      const registered = await serverRegistered(Date.now() + futureMs, Date.now() + futureMs + 10000, serverIdentity);
+      socket.receive({ version: 2, message: { type: 'registered', payload: registered } });
+      await pause(20);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+      await clock.advance(futureMs - 1);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+      await clock.advance(1);
+      await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3'));
+      expect(registered.payload.claims.issued_at_ms).toBe(fixture.now_ms + futureMs);
+    } finally { await peer.close(); }
+  });
+
+  it('rejects a registered reply more than 2000 ms ahead without waiting', async () => {
+    controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered(Date.now() + 2001) } });
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(performance.now()).toBe(0);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('does not renew the 2000 ms monotonic budget when the wall clock moves backward', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered(Date.now() + 1500) } });
+      await pause(20);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await clock.advance(1000);
+      clock.set(fixture.now_ms + 500);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await vi.advanceTimersByTimeAsync(499);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(performance.now()).toBe(2000);
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('still rejects a reply that expires while its issue-time wait is pending', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered(Date.now() + 100, Date.now() + 101) } });
+      await pause(20);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      clock.set(fixture.now_ms + 102);
+      await vi.advanceTimersByTimeAsync(100);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('still checks the signature after waiting for the actual issue time', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      const registered = await serverRegistered(Date.now() + 100);
+      registered.signature[0] = registered.signature[0]! ^ 1;
+      socket.receive({ version: 2, message: { type: 'registered', payload: registered } });
+      await pause(20);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+      await clock.advance(100);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(onState.mock.calls.find(([state]) => state.phase === 'failed')?.[0].error).toBe('远端消息签名无效');
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('still rejects a replayed registered reply after its bounded wait succeeds', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      const registered = await serverRegistered(Date.now() + 100);
+      socket.receive({ version: 2, message: { type: 'registered', payload: registered } });
+      await pause(20);
+      await clock.advance(100);
+      await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3'));
+      socket.receive({ version: 2, message: { type: 'registered', payload: registered } });
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(socket.sent.filter(text => JSON.parse(text).message.type === 'session_intent_v3')).toHaveLength(1);
+      expect(onState.mock.calls.find(([state]) => state.phase === 'failed')?.[0].error).toBe('重复的会话身份注册');
+    } finally { await peer.close(); }
+  });
+
+  it('rejects replay of the same authenticated candidate after waiting for its issue time', async () => {
+    const clock = controlledClock();
+    const wait = vi.spyOn(protocol, 'waitUntilSignalIssued');
+    const preparing = approvedPeer(false, 100);
+    await until(() => wait.mock.calls.some(([type]) => type === 'webrtc_candidate_v3'));
+    expect(PeerConnection.peers[0]?.remoteDescription).toBeUndefined();
+    await clock.advance(100);
+    const { peer, pc, socket, candidate } = await preparing;
+    try {
+      expect(pc.remoteDescription).toBeDefined();
+      socket.receive({ version: 3, message: { type: 'webrtc_candidate_v3', payload: candidate } });
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(onState.mock.calls.find(([state]) => state.phase === 'failed')?.[0].error).toBe('重复的远程认证消息');
+      expect(PeerConnection.peers).toHaveLength(1);
+    } finally { await peer.close(); }
+  });
+
+  it('still rejects the wrong trusted identity and logs no raw identity or signed message', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    try {
+      const socket = await beginRegistration(peer);
+      context.bootstrap.signaling_server_device_id = 'different-trusted-server';
+      socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered(Date.now() + 100) } });
+      await pause(20);
+      await clock.advance(100);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(console.warn).toHaveBeenCalledWith('[rdesk] signed signal rejected', {
+        message_type: 'registered', issuer_matches: false, intended_peer_matches: true, key_pin_matches: true,
+        issued_delta_ms: 0, expiry_remaining_ms: 10000,
+      });
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
+    } finally { await peer.close(); }
+  });
+
+  it('cancels the pending issue-time wait on close without sending an intent or heartbeat', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    const socket = await beginRegistration(peer);
+    socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered(Date.now() + 1500) } });
+    await pause(20);
+    expect(onState.mock.calls.some(([state]) => state.phase === 'failed')).toBe(false);
+    await peer.close();
+    await clock.advance(31000);
+    expect(socket.sent.map(text => JSON.parse(text).message.type)).toEqual(['register']);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(context.closeBackend).toHaveBeenCalledTimes(1);
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'closed' }));
+  });
+
   it('opens the configured signaling connection without a token in its URL or a localhost bridge', async () => {
     const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
     await peer.start();

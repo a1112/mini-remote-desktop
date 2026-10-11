@@ -5,6 +5,7 @@ import { verifyBrowserRelayAccess } from './browserRelayDirectory';
 import {
   byteArray, canonicalProfile, canonicalWanRequest, candidateFingerprint, randomBytes,
   safeInteger, signalEnvelope, signSignal, signedSignalCommitment, strictObject, verifySignedSignal, parseBoundedJson,
+  waitUntilSignalIssued, BrowserSignalValidityError,
   type SignedSignal, type SignalType, type WireObject,
 } from './browserRemoteProtocol';
 
@@ -44,6 +45,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private routeVerified = false;
   private frame?: { width: number; height: number };
   private negotiationDeadline?: ReturnType<typeof setTimeout>;
+  private signalWaitAbort = new AbortController();
 
   constructor(private context: BrowserRemoteContext, private observer: BrowserRemoteObserver) {}
   private get sessionId(): string { return this.context.bootstrap.session.session_id; }
@@ -60,6 +62,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   }
   private fail(error: unknown, phase: 'failed' | 'denied' = 'failed'): void {
     if (this.closing) return;
+    if (error instanceof BrowserSignalValidityError) console.warn('[rdesk] signed signal rejected', error.diagnostics);
     this.publish({ phase, grantedScopes: [], error: error instanceof Error ? error.message : '网页远程连接失败' });
     void this.close('connection_failed').catch(() => undefined);
   }
@@ -211,6 +214,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   }
   private async verified(type: SignalType, signed: SignedSignal, server = false): Promise<WireObject> {
     const bootstrap = this.context.bootstrap;
+    await waitUntilSignalIssued(type, signed, this.signalWaitAbort.signal);
     const payload = await verifySignedSignal(type, signed, {
       peerDeviceId: this.controllerId,
       signerDeviceId: server ? bootstrap.signaling_server_device_id : this.targetId,
@@ -399,6 +403,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   close(_reason?: string): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    this.signalWaitAbort.abort();
     this.routeVerified = false;
     for (const cancel of [...this.cancelWaits]) cancel();
     this.cancelWaits.clear();

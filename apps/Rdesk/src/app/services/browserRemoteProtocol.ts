@@ -267,10 +267,53 @@ export async function verifyContext(publicKey: number[], signature: number[], pi
   const key = await crypto.subtle.importKey('raw', exactBuffer(raw), 'Ed25519', false, ['verify']);
   if (!await crypto.subtle.verify('Ed25519', key, exactBuffer(new Uint8Array(byteArray(signature, 64))), exactBuffer(contextSignatureBytes(context, payload)))) throw new Error('远端消息签名无效');
 }
+export const MAX_FUTURE_MESSAGE_WAIT_MS = 2000;
+
+// Like mrd-signal-client/issued_time.rs, this only delays an early message.
+// It never authenticates it or changes its signed timestamps. The caller must
+// reread Date.now() and perform all strict checks after the bounded wait.
+export async function waitUntilSignalIssued(type: SignalType, value: unknown, signal: AbortSignal): Promise<void> {
+  const issuedAtMs = signedObject(type, value).payload.claims.issued_at_ms as number;
+  const deadline = performance.now() + MAX_FUTURE_MESSAGE_WAIT_MS;
+  while (true) {
+    if (signal.aborted) throw new Error('网页连接已取消');
+    const futureMs = issuedAtMs - Date.now();
+    const remainingMs = deadline - performance.now();
+    if (futureMs <= 0 || futureMs > MAX_FUTURE_MESSAGE_WAIT_MS || remainingMs <= 0) return;
+    await new Promise<void>((resolve, reject) => {
+      const finish = () => { signal.removeEventListener('abort', cancel); resolve(); };
+      const timer = setTimeout(finish, Math.min(futureMs, remainingMs));
+      const cancel = () => {
+        clearTimeout(timer); signal.removeEventListener('abort', cancel);
+        reject(new Error('网页连接已取消'));
+      };
+      signal.addEventListener('abort', cancel, { once: true });
+    });
+  }
+}
+
+type SignalValidityDiagnostics = Readonly<{
+  message_type: SignalType; issuer_matches: boolean; intended_peer_matches: boolean; key_pin_matches: boolean;
+  issued_delta_ms: number; expiry_remaining_ms: number;
+}>;
+export class BrowserSignalValidityError extends Error {
+  constructor(readonly diagnostics: SignalValidityDiagnostics) {
+    super('远端消息身份或有效期不匹配');
+    this.name = 'BrowserSignalValidityError';
+    Object.freeze(diagnostics);
+  }
+}
 export async function verifySignedSignal(type: SignalType, value: unknown, expected: { peerDeviceId: string; signerDeviceId: string; signerKeyId: string; nowMs: number }): Promise<WireObject> {
   const signed = signedObject(type, value);
   const claims = signed.payload.claims;
-  if (claims.issuer_device_id !== expected.signerDeviceId || claims.intended_peer_device_id !== expected.peerDeviceId || claims.issuer_key_id !== expected.signerKeyId || claims.issued_at_ms > expected.nowMs || claims.expires_at_ms <= expected.nowMs) throw new Error('远端消息身份或有效期不匹配');
+  if (claims.issuer_device_id !== expected.signerDeviceId || claims.intended_peer_device_id !== expected.peerDeviceId || claims.issuer_key_id !== expected.signerKeyId || claims.issued_at_ms > expected.nowMs || claims.expires_at_ms <= expected.nowMs) {
+    throw new BrowserSignalValidityError({
+      message_type: type, issuer_matches: claims.issuer_device_id === expected.signerDeviceId,
+      intended_peer_matches: claims.intended_peer_device_id === expected.peerDeviceId,
+      key_pin_matches: claims.issuer_key_id === expected.signerKeyId,
+      issued_delta_ms: claims.issued_at_ms - expected.nowMs, expiry_remaining_ms: claims.expires_at_ms - expected.nowMs,
+    });
+  }
   await verifyContext(signed.signer_public_key, signed.signature, expected.signerKeyId, CONTEXTS[type], encoder.encode(JSON.stringify(signed.payload)));
   return signed.payload;
 }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fixture from '../../../../realtime-server/tests/fixtures/browser_protocol_v3.json';
 import * as wireModule from './browserRemoteProtocol';
 
-const wire = wireModule as Record<string, (...args: any[]) => any>;
+const wire = wireModule;
 const bytes = (value: Uint8Array | undefined) => value && Array.from(value);
 const cryptoModuleName = 'node:crypto';
 const { webcrypto } = await import(/* @vite-ignore */ cryptoModuleName) as { webcrypto: Crypto };
@@ -60,6 +60,34 @@ describe('browser v3 interoperability', () => {
       signerKeyId: fixture.grant.payload.claims.issuer_key_id,
       nowMs: fixture.now_ms,
     })).toEqual(fixture.grant.payload);
+  });
+
+  it.each(['issuer', 'peer', 'pin', 'future', 'expired'])('reports only bounded identity/time diagnostics for a %s rejection', async reason => {
+    const claims = fixture.grant.payload.claims;
+    const expected = {
+      peerDeviceId: reason === 'peer' ? 'unexpected-peer' : fixture.request.controller_device_id,
+      signerDeviceId: reason === 'issuer' ? 'unexpected-issuer' : fixture.request.target_device_id,
+      signerKeyId: reason === 'pin' ? '0'.repeat(64) : claims.issuer_key_id,
+      nowMs: reason === 'future' ? claims.issued_at_ms - 1 : reason === 'expired' ? claims.expires_at_ms : fixture.now_ms,
+    };
+    try {
+      await wire.verifySignedSignal!('session_grant_v3', fixture.grant, expected);
+      expect.fail('Expected strict identity/time rejection');
+    } catch (error) {
+      expect(error).toMatchObject({
+        message: '远端消息身份或有效期不匹配',
+        diagnostics: {
+          message_type: 'session_grant_v3', issuer_matches: reason !== 'issuer',
+          intended_peer_matches: reason !== 'peer', key_pin_matches: reason !== 'pin',
+          issued_delta_ms: claims.issued_at_ms - expected.nowMs,
+          expiry_remaining_ms: claims.expires_at_ms - expected.nowMs,
+        },
+      });
+      const diagnostics = (error as { diagnostics: Record<string, unknown> }).diagnostics;
+      expect(Object.keys(diagnostics).sort()).toEqual([
+        'expiry_remaining_ms', 'intended_peer_matches', 'issued_delta_ms', 'issuer_matches', 'key_pin_matches', 'message_type',
+      ]);
+    }
   });
 
   it('rejects a modified signed grant and an unexpected signer key', async () => {
