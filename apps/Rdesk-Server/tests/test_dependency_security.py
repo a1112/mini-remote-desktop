@@ -23,6 +23,9 @@ def _requirement_pin(package: str) -> str:
 class DependencySecurityTests(unittest.TestCase):
     def test_backend_security_dependencies_stay_above_advisory_floors(self) -> None:
         self.assertGreaterEqual(
+            _version_tuple(_requirement_pin("PyJWT")), (2, 14, 0)
+        )
+        self.assertGreaterEqual(
             _version_tuple(_requirement_pin("cryptography")), (50, 0, 0)
         )
         self.assertGreaterEqual(
