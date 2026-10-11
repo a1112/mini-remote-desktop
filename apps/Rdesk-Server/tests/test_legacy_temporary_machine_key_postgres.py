@@ -5,7 +5,7 @@ cases are skipped when no explicit test database is configured; SQLite results
 are not evidence for PostgreSQL advisory or row locking.
 """
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select, text
@@ -106,6 +106,61 @@ async def test_postgres_first_pin_races_have_one_durable_identity(scenario):
                 assert device.tenant_id == "tenant-a" and device.auth_version == 7
                 assert device.active_refresh_jti_hash == "41" * 32
                 assert device.device_id in {"1501515771", "1501515772"}
+
+
+@pytest.mark.parametrize("first_kind", ["renewal", "disable"])
+async def test_postgres_renewal_and_explicit_disable_are_serialized(first_kind):
+    async with _postgres_sessions() as (sessions, _, _):
+        await _seed(sessions)
+        expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
+        async with sessions.begin() as db:
+            device = await db.get(Device, "legacy-row-1")
+            await _publish(db, payload=_payload(device, expires_at_ms=expires_ms))
+            renewal = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=expires_ms + 60_000))
+            disable = TemporaryAccessPublishIn(**_payload(device, generation=2, enabled=False))
+            snapshot = capture_device_auth_snapshot(device)
+        async def renew(db):
+            status = await _temporary(db).publish(snapshot=snapshot, payload=renewal)
+            assert status.ready and status.generation == 1
+        async def turn_off(db):
+            status = await _temporary(db).publish(snapshot=snapshot, payload=disable)
+            assert not status.ready and not status.enabled and status.generation == 2
+        operations = (renew, turn_off) if first_kind == "renewal" else (turn_off, renew)
+        results = await _parallel(sessions, operations, first_wins_key=KEY_ID)
+        assert results == (["published", "published"] if first_kind == "renewal" else ["published", "guest_access_invalid"])
+        async with sessions() as db:
+            row = (await db.scalars(select(DeviceTemporaryAccess))).one()
+            assert row.generation == 2 and not row.enabled
+            assert row.expires_at is None and row.salt is None and row.verifier_hmac is None
+            assert row.allowed_scopes == []
+            assert (await db.scalars(select(DeviceMachineIdentity))).one().key_id == KEY_ID
+
+
+@pytest.mark.parametrize("first_kind", ["shorter", "longer"])
+async def test_postgres_same_generation_renewals_keep_the_latest_expiry(first_kind):
+    async with _postgres_sessions() as (sessions, _, _):
+        await _seed(sessions)
+        expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
+        async with sessions.begin() as db:
+            device = await db.get(Device, "legacy-row-1")
+            await _publish(db, payload=_payload(device, expires_at_ms=expires_ms))
+            shorter = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=expires_ms + 60_000))
+            longer = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=expires_ms + 120_000))
+            snapshot = capture_device_auth_snapshot(device)
+            before = await db.get(DeviceTemporaryAccess, device.id)
+            material = (before.salt, before.verifier_hmac)
+        async def publish_shorter(db):
+            await _temporary(db).publish(snapshot=snapshot, payload=shorter)
+        async def publish_longer(db):
+            await _temporary(db).publish(snapshot=snapshot, payload=longer)
+        operations = (publish_shorter, publish_longer) if first_kind == "shorter" else (publish_longer, publish_shorter)
+        results = await _parallel(sessions, operations, first_wins_key=KEY_ID)
+        assert results == (["published", "published"] if first_kind == "shorter" else ["published", "guest_access_invalid"])
+        async with sessions() as db:
+            row = (await db.scalars(select(DeviceTemporaryAccess))).one()
+            assert row.generation == 1 and row.enabled
+            assert int(row.expires_at.timestamp() * 1000) == expires_ms + 120_000
+            assert (row.salt, row.verifier_hmac) == material
 
 
 @pytest.mark.parametrize("first_kind", ["temporary", "browser"])

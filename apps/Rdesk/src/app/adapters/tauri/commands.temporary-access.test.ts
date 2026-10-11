@@ -36,4 +36,26 @@ describe('local temporary access IPC boundary', () => {
     expect(result).toMatchObject({ ok: false, error: { code: 'E_INVALID_RESPONSE' } });
     expect(JSON.stringify(result)).not.toContain('ABCD2345');
   });
+
+  it.each(['manual', 'automatic'] as const)('preserves the %s refresh mode from the native service', async refresh_mode => {
+    nativeWindow.__TAURI_INTERNALS__ = {};
+    const response = { ...status, refresh_mode };
+    getMockInvoke().mockResolvedValue(response);
+    expect(await commands.getTemporaryAccessStatus()).toEqual({ ok: true, value: response });
+    getMockInvoke().mockResolvedValue({ status: response, password: 'ABCD2345' });
+    expect(await commands.readTemporaryAccessPassword()).toEqual({ ok: true, value: { status: response, password: 'ABCD2345' } });
+  });
+
+  it.each(['hourly', '', null, 1, true])('rejects unsupported refresh mode %s without exposing a secret', async refresh_mode => {
+    nativeWindow.__TAURI_INTERNALS__ = {};
+    const response = { ...status, refresh_mode };
+    for (const operation of [commands.getTemporaryAccessStatus, commands.rotateTemporaryAccessPassword, commands.disableTemporaryAccess]) {
+      getMockInvoke().mockResolvedValue(response);
+      expect(await operation()).toMatchObject({ ok: false, error: { code: 'E_INVALID_RESPONSE' } });
+    }
+    getMockInvoke().mockResolvedValue({ status: response, password: 'ABCD2345' });
+    const result = await commands.readTemporaryAccessPassword();
+    expect(result).toMatchObject({ ok: false, error: { code: 'E_INVALID_RESPONSE' } });
+    expect(JSON.stringify(result)).not.toContain('ABCD2345');
+  });
 });

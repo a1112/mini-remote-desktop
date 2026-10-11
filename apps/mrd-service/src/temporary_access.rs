@@ -1,5 +1,8 @@
 //! Ephemeral password custody and publication fences. No transport, logs or disk secrets.
-use mrd_ipc::{TemporaryAccessPassword, TemporaryAccessSecret, TemporaryAccessStatus};
+use mrd_ipc::{
+    TemporaryAccessPassword, TemporaryAccessRefreshMode, TemporaryAccessSecret,
+    TemporaryAccessStatus,
+};
 use ring::{
     pbkdf2,
     rand::{SecureRandom, SystemRandom},
@@ -82,7 +85,9 @@ impl TemporaryOperationEpoch {
 
 use zeroize::Zeroizing;
 
+/// Maximum publication lease; the resident password itself refreshes only manually.
 pub const TEMPORARY_PASSWORD_TTL_MS: u64 = 600_000;
+const PUBLICATION_RENEWAL_MARGIN_MS: u64 = 60_000;
 const PASSWORD_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const PASSWORD_ITERATIONS: u32 = 600_000;
 
@@ -94,6 +99,7 @@ pub struct TemporaryAccessState {
     rotation_requested: bool,
     generation: u64,
     published_generation: Option<u64>,
+    published_expires_at_ms: Option<u64>,
     expires_at_ms: Option<u64>,
     password: Option<Zeroizing<String>>,
     salt: Option<[u8; 16]>,
@@ -110,6 +116,7 @@ impl Default for TemporaryAccessState {
             rotation_requested: false,
             generation: 0,
             published_generation: None,
+            published_expires_at_ms: None,
             expires_at_ms: None,
             password: None,
             salt: None,
@@ -180,6 +187,7 @@ impl TemporaryAccessState {
         self.rotation_requested = false;
         self.generation = generation;
         self.published_generation = None;
+        self.published_expires_at_ms = None;
         self.expires_at_ms = Some(expiry);
         Ok(())
     }
@@ -194,6 +202,7 @@ impl TemporaryAccessState {
         self.enabled = false;
         self.rotation_requested = false;
         self.published_generation = None;
+        self.published_expires_at_ms = None;
         self.expires_at_ms = None;
         self.password = None;
         self.salt = None;
@@ -209,16 +218,45 @@ impl TemporaryAccessState {
     pub fn invalidate_publication(&mut self) {
         self.rotation_requested = true;
         self.published_generation = None;
+        self.published_expires_at_ms = None;
     }
-    pub fn mark_published(&mut self, generation: u64) -> bool {
+    pub fn mark_published(&mut self, generation: u64, expires_at_ms: Option<u64>) -> bool {
         if generation != self.generation
+            || expires_at_ms != self.expires_at_ms
             || self.rotation_requested
             || !self.publication_epoch_current()
         {
             return false;
         }
         self.published_generation = Some(generation);
+        self.published_expires_at_ms = expires_at_ms;
         true
+    }
+    /// Renew only the signed lease, preserving all password material and authority.
+    pub(crate) fn renew_publication(&mut self, now: u64) -> Result<bool, &'static str> {
+        if !self.enabled() || self.needs_rotation(now) {
+            return Ok(false);
+        }
+        if !self.publication_epoch_current() {
+            return Err("temporary_publication_superseded");
+        }
+        if self
+            .expires_at_ms
+            .is_some_and(|expiry| expiry.saturating_sub(now) > PUBLICATION_RENEWAL_MARGIN_MS)
+        {
+            return Ok(false);
+        }
+        let expiry = now
+            .checked_add(TEMPORARY_PASSWORD_TTL_MS)
+            .ok_or("temporary_expiry_invalid")?;
+        if self
+            .expires_at_ms
+            .is_some_and(|previous| expiry <= previous)
+        {
+            return Err("temporary_expiry_invalid");
+        }
+        self.expires_at_ms = Some(expiry);
+        Ok(true)
     }
     pub fn status(&mut self, now: u64, online: bool) -> TemporaryAccessStatus {
         // All response fields describe one linearized user intent, even if a new
@@ -226,13 +264,14 @@ impl TemporaryAccessState {
         let intent = self.operation_epoch.snapshot();
         let enabled = self.enabled && intent.is_some_and(|intent| intent.enabled);
         let epoch_current = intent.is_some_and(|intent| intent.current == self.applied_epoch);
-        let expired = self.expires_at_ms.is_some_and(|expires| now >= expires);
-        if expired {
-            self.password = None;
-            self.salt = None;
-            self.verifier = None;
-            self.published_generation = None;
-        }
+        // A renewal proposal is not authority. Reads/admission retain only the
+        // last acknowledged lease, and expiry hides rather than rotates the secret.
+        let expires_at_ms = if self.published_generation == Some(self.generation) {
+            self.published_expires_at_ms
+        } else {
+            self.expires_at_ms
+        };
+        let expired = expires_at_ms.is_some_and(|expires| now >= expires);
         let ready = enabled
             && epoch_current
             && !self.rotation_requested
@@ -257,8 +296,9 @@ impl TemporaryAccessState {
             enabled,
             ready,
             generation: self.generation,
-            expires_at_ms: self.expires_at_ms,
+            expires_at_ms,
             reason: reason.map(str::to_owned),
+            refresh_mode: Some(TemporaryAccessRefreshMode::Manual),
         }
     }
     pub fn secret(&mut self, now: u64, online: bool) -> TemporaryAccessSecret {
@@ -315,14 +355,13 @@ impl TemporaryAccessState {
     pub fn enabled(&self) -> bool {
         self.enabled && self.operation_epoch.permits_enabled()
     }
-    pub fn needs_rotation(&self, now: u64) -> bool {
-        self.enabled
-            && (self.rotation_requested
-                || self.password.is_none()
-                || self.expires_at_ms.is_none_or(|expires| now >= expires))
+    pub fn needs_rotation(&self, _now: u64) -> bool {
+        self.enabled && (self.rotation_requested || self.password.is_none())
     }
     pub fn needs_publication(&self) -> bool {
-        self.generation > 0 && self.published_generation != Some(self.generation)
+        self.generation > 0
+            && (self.published_generation != Some(self.generation)
+                || self.published_expires_at_ms != self.expires_at_ms)
     }
 }
 fn password_verifier(password: &[u8], salt: &[u8]) -> [u8; 32] {
@@ -519,12 +558,203 @@ mod tests {
     use super::*;
 
     #[test]
+    fn elapsed_publication_lease_keeps_manual_password_material_and_generation() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let password = state.password.as_ref().unwrap().clone();
+        let salt = state.salt;
+        let verifier = state.verifier;
+        assert!(!state.status(601_000, true).ready);
+        assert!(state.secret(601_000, true).password.is_none());
+        assert!(
+            state
+                .password
+                .as_ref()
+                .is_some_and(|current| current == &password),
+            "elapsed publication must retain the resident manual password"
+        );
+        assert!(state.salt == salt, "elapsed publication changed salt");
+        assert!(
+            state.verifier == verifier,
+            "elapsed publication changed verifier"
+        );
+        assert_eq!(state.generation(), 1);
+        assert!(
+            !state.needs_rotation(601_000),
+            "elapsed time must not rotate the password"
+        );
+    }
+
+    #[test]
+    fn offline_publication_gap_keeps_manual_password_for_recovery() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let password = state.password.as_ref().unwrap().clone();
+        assert!(state.secret(700_000, false).password.is_none());
+        assert!(
+            state
+                .password
+                .as_ref()
+                .is_some_and(|current| current == &password),
+            "offline publication expiry must not discard the manual password"
+        );
+        assert!(!state.needs_rotation(700_000));
+    }
+
+    #[test]
+    fn old_same_generation_ack_cannot_make_a_renewed_lease_ready() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let old_expiry = state.expires_at_ms.unwrap();
+        state.expires_at_ms = Some(old_expiry + TEMPORARY_PASSWORD_TTL_MS);
+        assert!(!state.mark_published(1, Some(old_expiry)));
+        assert!(
+            !state.status(old_expiry + 1, true).ready,
+            "an ACK for the old lease must not authorize the renewed lease"
+        );
+    }
+
+    #[test]
+    fn publication_renewal_preserves_material_and_requires_exact_expiry_ack() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let original = state.access_document("0123456789", 2).unwrap();
+        let password = state.password.as_ref().unwrap().clone();
+        assert!(!state.renew_publication(540_999).unwrap());
+        assert!(state.renew_publication(541_000).unwrap());
+        let renewed = state.access_document("0123456789", 2).unwrap();
+        assert_eq!(renewed.generation, original.generation);
+        assert!(renewed.salt == original.salt, "renewal changed salt");
+        assert!(
+            renewed.verifier == original.verifier,
+            "renewal changed verifier"
+        );
+        assert_eq!(renewed.allowed_scopes, original.allowed_scopes);
+        assert_eq!(renewed.auth_version, original.auth_version);
+        assert_eq!(renewed.expires_at_ms, Some(1_141_000));
+        assert!(state
+            .password
+            .as_ref()
+            .is_some_and(|current| current == &password));
+        assert!(state.needs_publication());
+        assert_eq!(
+            state.status(541_001, true).expires_at_ms,
+            original.expires_at_ms
+        );
+        assert!(state.status(541_001, true).ready);
+        assert!(
+            !state.renew_publication(541_002).unwrap(),
+            "retry must preserve the pending document"
+        );
+        assert!(!state.mark_published(1, original.expires_at_ms));
+        assert!(!state.status(601_000, true).ready);
+        assert!(state.secret(601_000, true).password.is_none());
+        assert!(state.mark_published(1, renewed.expires_at_ms));
+        assert!(state.status(601_001, true).ready);
+        assert!(!state.needs_publication());
+        assert!(state
+            .secret(601_001, true)
+            .password
+            .as_ref()
+            .is_some_and(|current| current.secret() == password.as_str()));
+        assert_eq!(
+            state.status(601_001, true).refresh_mode,
+            Some(TemporaryAccessRefreshMode::Manual)
+        );
+        assert!(!state.mark_published(1, original.expires_at_ms));
+        assert!(
+            state.status(601_001, true).ready,
+            "stale ACK must not downgrade a current lease"
+        );
+    }
+
+    #[test]
+    fn offline_recovery_renews_same_generation_without_secret_reads_before_ack() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let password = state.password.as_ref().unwrap().clone();
+        assert!(state.secret(700_000, false).password.is_none());
+        assert!(state.renew_publication(700_000).unwrap());
+        assert!(state.needs_publication());
+        assert_eq!(
+            state.status(700_001, true).reason.as_deref(),
+            Some("expired")
+        );
+        assert!(state.secret(700_001, true).password.is_none());
+        assert_eq!(state.generation(), 1);
+        assert!(!state.needs_rotation(700_001));
+        assert!(state.mark_published(1, Some(1_300_000)));
+        assert!(state.secret(700_001, false).password.is_none());
+        assert!(state
+            .secret(700_001, true)
+            .password
+            .as_ref()
+            .is_some_and(|current| current.secret() == password.as_str()));
+    }
+
+    #[test]
+    fn explicit_refresh_and_disable_fence_pending_renewals() {
+        let epoch = Arc::new(TemporaryOperationEpoch::default());
+        let mut state = TemporaryAccessState::default().with_operation_epoch(epoch.clone());
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        assert!(state.renew_publication(541_000).unwrap());
+        let renewal_expiry = state.expires_at_ms;
+        let rotate = epoch.begin(false).unwrap();
+        assert!(!state.mark_published(1, renewal_expiry));
+        assert!(state.renew_publication(1_200_000).is_err());
+        state.apply_operation_epoch(rotate).unwrap();
+        state.invalidate_publication();
+        assert!(!state.renew_publication(1_200_000).unwrap());
+        assert!(state.needs_rotation(1_200_000));
+        state.rotate(2, 1_200_000).unwrap();
+        assert!(!state.mark_published(1, renewal_expiry));
+        assert!(state.mark_published(2, state.expires_at_ms));
+        let disable = epoch.begin(true).unwrap();
+        assert!(!state.mark_published(2, state.expires_at_ms));
+        assert!(!state.renew_publication(2_000_000).unwrap());
+        state.apply_operation_epoch(disable).unwrap();
+        state.disable(3).unwrap();
+        assert!(state.password.is_none() && state.salt.is_none() && state.verifier.is_none());
+        assert!(!state.renew_publication(2_000_000).unwrap());
+        assert!(!state.status(2_000_000, true).enabled);
+        assert!(state.mark_published(3, None));
+    }
+
+    #[test]
+    fn publication_renewal_overflow_does_not_replace_material_or_authority() {
+        let mut state = TemporaryAccessState::default();
+        state
+            .rotate(1, u64::MAX - TEMPORARY_PASSWORD_TTL_MS - 100)
+            .unwrap();
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let old_expiry = state.expires_at_ms;
+        let password = state.password.as_ref().unwrap().clone();
+        assert_eq!(
+            state.renew_publication(u64::MAX - 1),
+            Err("temporary_expiry_invalid")
+        );
+        assert_eq!(state.expires_at_ms, old_expiry);
+        assert_eq!(state.generation(), 1);
+        assert!(state
+            .password
+            .as_ref()
+            .is_some_and(|current| current == &password));
+        assert!(state.secret(u64::MAX - 1, true).password.is_none());
+    }
+
+    #[test]
     fn temporary_access_status_fields_share_one_concurrent_intent_snapshot() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let epoch = Arc::new(TemporaryOperationEpoch::default());
         let mut state = TemporaryAccessState::default().with_operation_epoch(epoch.clone());
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         let stop = Arc::new(AtomicBool::new(false));
         let writer_epoch = epoch.clone();
         let writer_stop = stop.clone();
@@ -556,7 +786,7 @@ mod tests {
         let epoch = Arc::new(TemporaryOperationEpoch::default());
         let mut state = TemporaryAccessState::default().with_operation_epoch(epoch.clone());
         state.rotate(1, 1000).unwrap();
-        assert!(state.mark_published(1));
+        assert!(state.mark_published(1, state.expires_at_ms));
         let authority = TemporaryGuestAuthority {
             generation: 1,
             target_auth_version: 2,
@@ -566,7 +796,7 @@ mod tests {
         let disabled = epoch.begin(true).unwrap();
         assert!(state.secret(1001, true).password.is_none());
         assert!(!state.status(1001, true).enabled);
-        assert!(!state.mark_published(1));
+        assert!(!state.mark_published(1, state.expires_at_ms));
         assert!(!state.authorize_guest(
             "new-after-disable",
             authority,
@@ -582,7 +812,7 @@ mod tests {
         assert!(state.apply_operation_epoch(disabled).is_err());
         state.apply_operation_epoch(rotate).unwrap();
         state.rotate(2, 1002).unwrap();
-        state.mark_published(2);
+        state.mark_published(2, state.expires_at_ms);
         assert!(state.status(1003, true).ready);
         assert!(!state.authorize_guest("approved-old", authority, "bound", true, 1003, true, 2));
         let current = TemporaryGuestAuthority {
@@ -609,7 +839,7 @@ mod tests {
         let epoch = Arc::new(TemporaryOperationEpoch::default());
         let mut state = TemporaryAccessState::default().with_operation_epoch(epoch.clone());
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         let authority = TemporaryGuestAuthority {
             generation: 1,
             target_auth_version: 2,
@@ -625,7 +855,7 @@ mod tests {
         state.apply_operation_epoch(rotate).unwrap();
         state.invalidate_publication();
         state.rotate(2, 1002).unwrap();
-        state.mark_published(2);
+        state.mark_published(2, state.expires_at_ms);
         assert!(state.authorize_guest("approved", authority, "bound", true, 1003, true, 2));
         assert!(!state.authorize_guest("pending", authority, "bound", true, 1003, true, 2));
     }
@@ -636,8 +866,8 @@ mod tests {
         state.rotate(7, 1_000).unwrap();
         assert!(!state.status(1_001, true).ready);
         assert!(state.secret(1_001, true).password.is_none());
-        assert!(!state.mark_published(6));
-        assert!(state.mark_published(7));
+        assert!(!state.mark_published(6, state.expires_at_ms));
+        assert!(state.mark_published(7, state.expires_at_ms));
         assert!(!state.status(1_001, false).ready);
         assert!(state.status(1_001, true).ready);
         assert_eq!(
@@ -652,15 +882,15 @@ mod tests {
     }
 
     #[test]
-    fn temporary_access_rotation_freezes_old_password_and_expiry_erases_secret() {
+    fn temporary_access_rotation_freezes_old_password_and_expiry_hides_secret() {
         let mut state = TemporaryAccessState::default();
         state.rotate(1, 1_000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         let old = state.secret(1_001, true).password.unwrap().into_secret();
         state.rotate(2, 2_000).unwrap();
         assert!(!state.status(2_001, true).ready);
-        assert!(!state.mark_published(1));
-        state.mark_published(2);
+        assert!(!state.mark_published(1, state.expires_at_ms));
+        state.mark_published(2, state.expires_at_ms);
         let secret = state.secret(2_001, true);
         assert_ne!(old, secret.password.as_ref().unwrap().secret());
         assert!(!format!("{secret:?}").contains(secret.password.as_ref().unwrap().secret()));
@@ -710,7 +940,7 @@ mod tests {
             target_auth_version: 2,
         };
         assert!(!state.authorize_guest("s", authority, "commitment", false, 1001, true, 2));
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         assert!(state.authorize_guest("s", authority, "commitment", false, 1001, true, 2));
         assert!(state.authorize_guest("s", authority, "commitment", true, 1001, true, 2));
         state.rotate(2, 2000).unwrap();
@@ -725,7 +955,7 @@ mod tests {
     fn guest_approved_authority_cannot_be_created_without_local_admission() {
         let mut state = TemporaryAccessState::default();
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         assert!(!state.authorize_guest(
             "unknown",
             TemporaryGuestAuthority {
@@ -799,7 +1029,7 @@ mod tests {
     fn rotating_password_cannot_promote_an_old_pending_session_to_approved() {
         let mut state = TemporaryAccessState::default();
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         let authority = TemporaryGuestAuthority {
             generation: 1,
             target_auth_version: 2,
@@ -813,7 +1043,7 @@ mod tests {
     fn requested_rotation_is_retried_after_network_failure_instead_of_republishing_old_password() {
         let mut state = TemporaryAccessState::default();
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         state.invalidate_publication();
         assert!(state.needs_rotation(1001));
         assert!(!state.status(1001, true).ready);
@@ -846,9 +1076,9 @@ mod tests {
     fn old_publication_ack_cannot_reveal_password_while_rotation_is_pending() {
         let mut state = TemporaryAccessState::default();
         state.rotate(1, 1000).unwrap();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         state.invalidate_publication();
-        state.mark_published(1);
+        state.mark_published(1, state.expires_at_ms);
         assert!(!state.status(1001, true).ready);
         assert!(state.secret(1001, true).password.is_none());
     }

@@ -202,6 +202,183 @@ def test_exact_retry_keeps_one_pin_and_later_disable_keeps_that_pin(device_sessi
     assert _post(api, payload=payload).status_code == 401
 
 
+def test_signed_same_generation_renewal_only_updates_publication_lease(device_sessions_api):
+    api = device_sessions_api
+    device = api.devices["unbound-1"]
+    expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
+    first_payload = _payload(device, expires_at_ms=expires_ms)
+    assert _post(api, payload=first_payload).status_code == 200
+    row = api.session.get(DeviceTemporaryAccess, device.id)
+    before = {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns}
+    mapping = api.session.get(DeviceMachineIdentity, KEY_ID)
+    pin_before = (mapping.key_id, mapping.public_key, mapping.device_row_id, mapping.created_at)
+
+    renewal = _payload(device, expires_at_ms=expires_ms + 60_000)
+    response = _post(api, payload=renewal)
+    assert response.status_code == 200, response.text
+    assert response.json()["ready"] is True
+    assert response.json()["generation"] == 1
+    assert response.json()["expires_at_ms"] == expires_ms + 60_000
+    api.session.refresh(row)
+    after = {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns}
+    mutable = {"expires_at", "publication_digest", "updated_at"}
+    assert {key: value for key, value in after.items() if key not in mutable} == {
+        key: value for key, value in before.items() if key not in mutable
+    }
+    assert after["publication_digest"] != before["publication_digest"]
+    assert after["updated_at"] >= before["updated_at"]
+    assert after["publication_digest"] != hashlib.sha256(renewal["access_json"].encode()).hexdigest()
+    api.session.refresh(mapping)
+    assert (mapping.key_id, mapping.public_key, mapping.device_row_id, mapping.created_at) == pin_before
+    assert _post(api, payload=renewal).json() == response.json()
+    # An old publication/late acknowledgement cannot replace the newer lease.
+    assert _post(api, payload=first_payload).status_code == 401
+    api.session.refresh(row)
+    assert row.expires_at == after["expires_at"]
+
+
+@pytest.mark.parametrize("change", [
+    "salt", "verifier", "scopes", "auth_version", "device_id", "key",
+    "disabled", "shorter", "equal_different_json", "expired", "overlong",
+    "signature", "stored_auth", "stored_key",
+])
+def test_same_generation_renewal_rejects_material_identity_and_lease_changes(device_sessions_api, change):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    api = device_sessions_api
+    device = api.devices["unbound-1"]
+    expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
+    assert _post(api, payload=_payload(device, expires_at_ms=expires_ms)).status_code == 200
+    row = api.session.get(DeviceTemporaryAccess, device.id)
+    if change == "stored_auth":
+        row.target_auth_version += 1
+    elif change == "stored_key":
+        row.key_id = "93" * 32
+    api.session.commit()
+    before = {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns}
+    changes = {"expires_at_ms": expires_ms + 60_000}
+    if change == "salt":
+        changes["salt"] = "74" * 16
+    elif change == "verifier":
+        changes["verifier"] = "75" * 32
+    elif change == "scopes":
+        changes["allowed_scopes"] = ["screen.view"]
+    elif change == "auth_version":
+        changes["auth_version"] = device.auth_version + 1
+    elif change == "device_id":
+        changes["device_id"] = "another-device"
+    elif change == "shorter":
+        changes["expires_at_ms"] = expires_ms - 1
+    elif change == "equal_different_json":
+        changes["expires_at_ms"] = expires_ms
+    elif change == "expired":
+        changes["expires_at_ms"] = 1
+    elif change == "overlong":
+        changes["expires_at_ms"] = int((datetime.now(UTC) + timedelta(seconds=601)).timestamp() * 1000)
+    if change == "disabled":
+        payload = _payload(device, enabled=False)
+    else:
+        key = Ed25519PrivateKey.from_private_bytes(bytes([92]) * 32) if change == "key" else KEY
+        payload = _payload(device, key=key, **changes)
+    if change == "equal_different_json":
+        # The same expiry accepts only its exact signed publication retry.
+        payload["access_json"] += " "
+        canonical = "\n".join(("POST", settings.public_api_url + "/devices/temporary-access", KEY_ID, hashlib.sha256(payload["access_json"].encode()).hexdigest())).encode()
+        domain = b"MRD_DEVICE_TEMPORARY_ACCESS_V1"
+        message = b"MRD_CONTEXT_SIGNATURE_V1" + struct.pack(">H", len(domain)) + domain + struct.pack(">Q", len(canonical)) + canonical
+        payload["signature"] = KEY.sign(message).hex()
+    elif change == "signature":
+        payload["signature"] = "00" * 64
+    response = _post(api, payload=payload)
+    assert response.status_code == 401, response.text
+    assert response.json()["detail"]["code"] == "guest_access_invalid"
+    api.session.refresh(row)
+    assert {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns} == before
+    assert api.session.get(DeviceMachineIdentity, KEY_ID).public_key == PUBLIC.hex()
+
+
+def test_same_generation_renewal_recovers_after_offline_gap_but_expired_retry_fails(device_sessions_api):
+    import asyncio
+    from app.core.security import capture_device_auth_snapshot
+    from app.schemas.guest_browser import TemporaryAccessPublishIn
+    from app.services.temporary_access import TemporaryAccessService
+    from app.services.device_sessions import DeviceSessionError
+    from test_relay_node_api import AsyncSessionShim
+    api = device_sessions_api
+    device = api.devices["unbound-1"]
+    clock = [datetime.now(UTC)]
+    service = TemporaryAccessService(AsyncSessionShim(api.session), api_url=settings.public_api_url, pepper=bytes.fromhex("a1" * 32), now=lambda: clock[0])
+    snapshot = capture_device_auth_snapshot(device)
+    deadline = clock[0] + timedelta(seconds=5)
+    first = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=int(deadline.timestamp() * 1000)))
+    assert asyncio.run(service.publish(snapshot=snapshot, payload=first)).ready
+    api.session.commit()
+    row = api.session.get(DeviceTemporaryAccess, device.id)
+    secret_before = (row.salt, row.verifier_hmac, row.generation)
+    clock[0] = deadline + timedelta(seconds=1)
+    assert service.status(row, device).ready is False
+    with pytest.raises(DeviceSessionError) as rejected:
+        asyncio.run(service.publish(snapshot=snapshot, payload=first))
+    assert rejected.value.code == "guest_access_invalid"
+    expires_ms = int((clock[0] + timedelta(seconds=600)).timestamp() * 1000)
+    renewal = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=expires_ms))
+    status = asyncio.run(service.publish(snapshot=snapshot, payload=renewal))
+    assert status.ready and status.expires_at_ms == expires_ms
+    assert (row.salt, row.verifier_hmac, row.generation) == secret_before
+
+
+def test_same_generation_renewal_cannot_resurrect_explicitly_disabled_state(device_sessions_api):
+    api = device_sessions_api
+    device = api.devices["unbound-1"]
+    assert _post(api).status_code == 200
+    assert _post(api, payload=_payload(device, generation=2, enabled=False)).status_code == 200
+    row = api.session.get(DeviceTemporaryAccess, device.id)
+    before = {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns}
+    response = _post(api, payload=_payload(device, generation=2))
+    assert response.status_code == 401, response.text
+    api.session.refresh(row)
+    assert {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns} == before
+
+
+@pytest.mark.parametrize("stage", ["principal", "device", "temporary"])
+def test_renewal_rechecks_expiry_after_database_lock_waits(device_sessions_api, monkeypatch, stage):
+    import asyncio
+    from contextlib import asynccontextmanager
+    from app.core.security import capture_device_auth_snapshot
+    from app.schemas.guest_browser import TemporaryAccessPublishIn
+    from app.services import temporary_access as domain
+    from test_relay_node_api import AsyncSessionShim
+    api = device_sessions_api
+    device = api.devices["unbound-1"]
+    clock = [datetime.now(UTC)]
+    original_ms = int((clock[0] + timedelta(seconds=2)).timestamp() * 1000)
+    assert _post(api, payload=_payload(device, expires_at_ms=original_ms)).status_code == 200
+    row = api.session.get(DeviceTemporaryAccess, device.id)
+    before = {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns}
+    deadline = clock[0] + timedelta(seconds=5)
+    payload = TemporaryAccessPublishIn(**_payload(device, expires_at_ms=int(deadline.timestamp() * 1000)))
+    if stage == "principal":
+        delegate = domain.principal_key_lock
+        @asynccontextmanager
+        async def delayed_lock(db, key_id):
+            async with delegate(db, key_id):
+                clock[0] = deadline
+                yield
+        monkeypatch.setattr(domain, "principal_key_lock", delayed_lock)
+    class WaitingSession(AsyncSessionShim):
+        async def scalar(self, statement, *args, **kwargs):
+            result = await super().scalar(statement, *args, **kwargs)
+            selected = statement.column_descriptions[0].get("entity")
+            if (stage == "device" and selected is Device) or (stage == "temporary" and selected is DeviceTemporaryAccess):
+                clock[0] = deadline
+            return result
+    service = domain.TemporaryAccessService(WaitingSession(api.session), api_url=settings.public_api_url, pepper=bytes.fromhex("a1" * 32), now=lambda: clock[0])
+    with pytest.raises(domain.DeviceSessionError) as rejected:
+        asyncio.run(service.publish(snapshot=capture_device_auth_snapshot(device), payload=payload))
+    assert rejected.value.code == "guest_access_invalid"
+    api.session.refresh(row)
+    assert {column.key: getattr(row, column.key) for column in DeviceTemporaryAccess.__table__.columns} == before
+
+
 def test_missing_pin_with_existing_publication_is_storage_inconsistency(device_sessions_api):
     api = device_sessions_api
     _pin(api, api.devices["unbound-1"])

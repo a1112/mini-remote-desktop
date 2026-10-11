@@ -11,6 +11,7 @@ export type TemporaryAccessStatus = {
   generation: number;
   expires_at_ms: number | null;
   reason: string | null;
+  refresh_mode?: 'manual' | 'automatic';
 };
 export type TemporaryAccessSecret = { status: TemporaryAccessStatus; password: string | null };
 

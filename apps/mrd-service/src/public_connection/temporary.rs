@@ -116,7 +116,7 @@ async fn update(
             && !remote.enabled
         {
             local.disable(remote.generation)?;
-            local.mark_published(remote.generation);
+            local.mark_published(remote.generation, remote.expires_at_ms);
             public.temporary_auth_version.store(auth, Ordering::Release);
             return Ok(());
         }
@@ -135,6 +135,7 @@ async fn update(
         let mut local = public.temporary.lock().await;
         check_epoch(public, epoch)?;
         local.apply_operation_epoch(epoch)?;
+        local.renew_publication(now)?;
         if !local.needs_publication() {
             return Ok(());
         }
@@ -155,7 +156,9 @@ async fn update(
     }
     let mut local = public.temporary.lock().await;
     check_epoch(public, epoch)?;
-    if local.enabled() != document.enabled || !local.mark_published(document.generation) {
+    if local.enabled() != document.enabled
+        || !local.mark_published(document.generation, document.expires_at_ms)
+    {
         return Err("temporary_publication_superseded");
     }
     public.temporary_auth_version.store(auth, Ordering::Release);

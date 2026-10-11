@@ -97,6 +97,16 @@ mod wire {
         }
     }
 
+    /// How the resident service refreshes its temporary password.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TemporaryAccessRefreshMode {
+        /// Password material changes only after explicit local refresh.
+        Manual,
+        /// Legacy services rotate password material on a timer.
+        Automatic,
+    }
+
     /// Temporary access state without its locally held password.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(deny_unknown_fields)]
@@ -106,6 +116,8 @@ mod wire {
         pub generation: u64,
         pub expires_at_ms: Option<u64>,
         pub reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_mode: Option<TemporaryAccessRefreshMode>,
     }
 
     /// Memory-only local password; formatting always redacts its contents.
@@ -2957,6 +2969,26 @@ pub use wire::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_access_refresh_mode_preserves_legacy_wire_and_accepts_known_modes() {
+        let legacy = serde_json::json!({
+            "enabled": true, "ready": true, "generation": 1,
+            "expires_at_ms": 600000, "reason": null,
+        });
+        let status: TemporaryAccessStatus = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), legacy);
+        for mode in ["manual", "automatic"] {
+            let mut current = legacy.clone();
+            current["refresh_mode"] = serde_json::json!(mode);
+            let decoded = serde_json::from_value::<TemporaryAccessStatus>(current.clone());
+            assert!(decoded.is_ok(), "known refresh modes must decode");
+            assert_eq!(serde_json::to_value(decoded.unwrap()).unwrap(), current);
+        }
+        let mut invalid = legacy;
+        invalid["refresh_mode"] = serde_json::json!("unbounded");
+        assert!(serde_json::from_value::<TemporaryAccessStatus>(invalid).is_err());
+    }
 
     #[test]
     fn public_binding_credentials_are_bounded_redacted_and_require_minor() {

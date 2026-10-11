@@ -215,7 +215,33 @@ class TemporaryAccessService:
                 and digest == row.publication_digest
             ):
                 return self.status(row, device)
-            invalid()
+            if (
+                document.generation != row.generation
+                or not document.enabled
+                or not row.enabled
+                or row.target_auth_version != device.auth_version
+                or row.key_id != payload.key_id
+                or row.expires_at is None
+                or expires <= utc(row.expires_at)
+                or row.salt is None
+                or not hmac.compare_digest(row.salt, bytes.fromhex(document.salt))
+                or row.verifier_hmac is None
+                or not hmac.compare_digest(
+                    row.verifier_hmac,
+                    self.verifier_hmac(bytes.fromhex(document.verifier)),
+                )
+                or row.allowed_scopes != document.allowed_scopes
+            ):
+                invalid()
+            # The resident retains its password in manual mode. Its signed
+            # publication can renew the bounded lease without rotating material
+            # or changing any existing session authority, grant or reservation.
+            # Device and temporary-access row locks fence disable/rotation races.
+            row.expires_at = expires
+            row.publication_digest = digest
+            row.updated_at = now
+            await self.db.flush()
+            return self.status(row, device)
         affected = list(
             await self.db.scalars(
                 select(SessionRequest)

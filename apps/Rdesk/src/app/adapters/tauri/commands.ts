@@ -142,6 +142,7 @@ function validTemporaryAccessStatus(value: unknown): value is TemporaryAccessSta
     && Number.isSafeInteger(status.generation) && status.generation >= 0
     && (status.expires_at_ms === null || Number.isSafeInteger(status.expires_at_ms) && status.expires_at_ms > 0)
     && (status.reason === null || typeof status.reason === 'string')
+    && (status.refresh_mode === undefined || status.refresh_mode === 'manual' || status.refresh_mode === 'automatic')
     && (!status.ready || status.enabled && status.generation > 0 && status.expires_at_ms !== null);
 }
 

@@ -225,6 +225,47 @@ def test_rotation_invalidates_pending_and_disable_revokes_all(device_sessions_ap
     assert _guest(api, session_id="guest-session-3").status_code == 401
 
 
+def _durable_fields(row):
+    return {column.key: getattr(row, column.key) for column in row.__table__.columns}
+
+
+def test_renewal_preserves_pending_guest_deadline_and_credentials(device_sessions_api):
+    from app.models.browser_controller import BrowserController
+    from app.models.device_temporary_access import DeviceTemporaryAccess
+    api = device_sessions_api
+    expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
+    assert _publish(api, expires_at_ms=expires_ms).status_code == 200
+    response = _guest(api)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
+    row = api.session.get(SessionRequest, "guest-session-1")
+    principal = api.session.scalar(select(BrowserController))
+    request_before, principal_before = _durable_fields(row), _durable_fields(principal)
+    assert row.authority_expires_at.replace(tzinfo=UTC) == datetime.fromtimestamp(expires_ms / 1000, UTC)
+
+    renewed = _publish(api, expires_at_ms=expires_ms + 60_000)
+    assert renewed.status_code == 200, renewed.text
+    api.session.refresh(row)
+    api.session.refresh(principal)
+    assert _durable_fields(row) == request_before
+    assert _durable_fields(principal) == principal_before
+    assert api.session.scalar(select(DeviceTemporaryAccess)).expires_at.replace(tzinfo=UTC) > row.authority_expires_at.replace(tzinfo=UTC)
+    inspected = api.client.get("/api/v1/guest-browser-sessions/guest-session-1", headers=auth)
+    assert inspected.status_code == 200, inspected.text
+    assert inspected.json()["session"]["status"] == "requested"
+    # A new request may use the renewed publication; the original request and
+    # the credentials returned for it keep their own immutable deadlines.
+    claims_before = jwt.decode(body["credential"]["token"], options={"verify_signature": False})
+    claims_after = jwt.decode(inspected.json()["credential"]["token"], options={"verify_signature": False})
+    assert claims_after["exp"] == claims_before["exp"]
+    assert body["http_credential"]["expires_at_ms"] <= expires_ms
+    fresh = _guest(api, session_id="guest-session-2", controller_public_key=list(Ed25519PrivateKey.from_private_bytes(bytes([93]) * 32).public_key().public_bytes_raw()))
+    assert fresh.status_code == 200, fresh.text
+    new_request = api.session.get(SessionRequest, "guest-session-2")
+    assert new_request.authority_expires_at.replace(tzinfo=UTC) > row.authority_expires_at.replace(tzinfo=UTC)
+
+
 from test_wan_relay_access import wan_relay_api
 
 
@@ -297,6 +338,38 @@ def test_guest_approval_keeps_local_consent_and_issues_real_scoped_relay(wan_rel
         },
     )
     assert physical.status_code == 200, physical.text
+
+
+def test_renewal_preserves_approved_guest_grants_and_relay_reservations(wan_relay_api):
+    from app.models.browser_controller import BrowserController
+    from app.models.device_temporary_access import DeviceTemporaryAccess
+    from app.models.relay_reservation import RelayReservation
+    api = wan_relay_api
+    body = _unbound_relay_guest(api)
+    auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
+    relay = api.client.post("/api/v1/guest-browser-sessions/guest-session-1/relay-access", headers=auth, json={})
+    assert relay.status_code == 200, relay.text
+    row = api.session.get(SessionRequest, "guest-session-1")
+    principal = api.session.scalar(select(BrowserController))
+    reservations = list(api.session.scalars(select(RelayReservation)))
+    assert row.status == "approved" and reservations
+    request_before, principal_before = _durable_fields(row), _durable_fields(principal)
+    reservations_before = [_durable_fields(reservation) for reservation in reservations]
+    access = api.session.scalar(select(DeviceTemporaryAccess))
+    expires_ms = int(access.expires_at.replace(tzinfo=UTC).timestamp() * 1000) + 1000
+
+    renewal = _publish(api, target="controller-1", expires_at_ms=expires_ms)
+    assert renewal.status_code == 200, renewal.text
+    api.session.refresh(row)
+    api.session.refresh(principal)
+    for reservation in reservations:
+        api.session.refresh(reservation)
+    assert _durable_fields(row) == request_before
+    assert _durable_fields(principal) == principal_before
+    assert [_durable_fields(reservation) for reservation in reservations] == reservations_before
+    inspected = api.client.get("/api/v1/guest-browser-sessions/guest-session-1", headers=auth)
+    assert inspected.status_code == 200, inspected.text
+    assert inspected.json()["session"]["status"] == "approved"
 
 
 def test_approved_guest_survives_rotation_only_until_original_ttl_and_disable_revokes(

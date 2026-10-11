@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
@@ -12,6 +12,66 @@ const ready = () => ({ enabled: true, ready: true, generation: 1, expires_at_ms:
 beforeEach(() => { vi.clearAllMocks(); mocks.status.mockResolvedValue(ready()); mocks.secret.mockResolvedValue({ status: ready(), password: 'ABCD2345' }); mocks.rotate.mockResolvedValue({ ...ready(), generation: 2 }); mocks.disable.mockResolvedValue({ ...ready(), ready: false, enabled: false }); });
 
 describe('local temporary password controls', () => {
+  it('shows manual refresh instructions without a password rotation countdown', async () => {
+    mocks.status.mockResolvedValue({ ...ready(), refresh_mode: 'manual' });
+    render(<TemporaryAccessPasswordCard />);
+    await screen.findByText('临时密码可用');
+    expect(screen.getByText('手动刷新，刷新后旧密码失效。')).toBeInTheDocument();
+    expect(screen.getByText('服务重启后会生成新密码。')).toBeInTheDocument();
+    expect(screen.queryByText(/剩余 \d+:\d+/)).not.toBeInTheDocument();
+    expect(mocks.secret).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'automatic'])('keeps the countdown for an unchanged service with mode %s', async refresh_mode => {
+    mocks.status.mockResolvedValue({ ...ready(), ...(refresh_mode ? { refresh_mode } : {}) });
+    render(<TemporaryAccessPasswordCard />);
+    await screen.findByText('临时密码可用');
+    expect(screen.getByText(/剩余 \d+:\d+/)).toBeInTheDocument();
+    expect(screen.queryByText('手动刷新，刷新后旧密码失效。')).not.toBeInTheDocument();
+  });
+
+  it('keeps polling through the former rotation deadline without reading or rotating the password', async () => {
+    vi.useFakeTimers();
+    mocks.status.mockImplementation(async () => ({ ...ready(), refresh_mode: 'manual' }));
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      await act(async () => { view = render(<TemporaryAccessPasswordCard />); });
+      expect(screen.getByText('临时密码可用')).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(660000); });
+      expect(mocks.status.mock.calls.length).toBeGreaterThan(1);
+      expect(mocks.rotate).not.toHaveBeenCalled();
+      expect(mocks.secret).not.toHaveBeenCalled();
+      expect(screen.getByText('临时密码可用')).toBeInTheDocument();
+      expect(screen.queryByText(/剩余 \d+:\d+/)).not.toBeInTheDocument();
+    } finally { view?.unmount(); vi.useRealTimers(); }
+  });
+
+  it('hides a revealed secret at its original deadline even when a manual publication renews', async () => {
+    vi.useFakeTimers();
+    const initial = { ...ready(), refresh_mode: 'manual', expires_at_ms: Date.now() + 6000 };
+    mocks.status.mockResolvedValueOnce(initial).mockImplementation(async () => ({ ...ready(), refresh_mode: 'manual' }));
+    mocks.secret.mockResolvedValue({ status: initial, password: 'ABCD2345' });
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      await act(async () => { view = render(<TemporaryAccessPasswordCard />); });
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '显示临时密码' })); });
+      expect(screen.getByText('ABCD2345')).toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+      expect(screen.getByText('临时密码可用')).toBeInTheDocument();
+      expect(screen.queryByText('ABCD2345')).not.toBeInTheDocument();
+      expect(mocks.secret).toHaveBeenCalledTimes(1);
+      expect(mocks.rotate).not.toHaveBeenCalled();
+    } finally { view?.unmount(); vi.useRealTimers(); }
+  });
+
+  it('marks expired manual access unavailable without claiming the unchanged password expired', async () => {
+    mocks.status.mockResolvedValue({ ...ready(), refresh_mode: 'manual', ready: false, expires_at_ms: Date.now() - 1 });
+    render(<TemporaryAccessPasswordCard />);
+    expect(await screen.findByText('临时访问暂不可用')).toBeInTheDocument();
+    expect(screen.queryByText('临时密码已过期')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '复制临时密码' })).toBeDisabled();
+  });
+
   it('shows a hidden usable password without reading a secret until reveal is requested', async () => {
     render(<TemporaryAccessPasswordCard />);
     expect(await screen.findByText('临时密码可用')).toBeInTheDocument();
@@ -30,6 +90,9 @@ describe('local temporary password controls', () => {
   });
 
   it('drops a previously displayed password when refresh changes its generation', async () => {
+    mocks.status.mockResolvedValue({ ...ready(), refresh_mode: 'manual' });
+    mocks.secret.mockResolvedValue({ status: { ...ready(), refresh_mode: 'manual' }, password: 'ABCD2345' });
+    mocks.rotate.mockResolvedValue({ ...ready(), refresh_mode: 'manual', generation: 2 });
     render(<TemporaryAccessPasswordCard />); await screen.findByText('临时密码可用');
     await userEvent.click(screen.getByRole('button', { name: '显示临时密码' })); await screen.findByText('ABCD2345');
     await userEvent.click(screen.getByRole('button', { name: '刷新临时密码' }));

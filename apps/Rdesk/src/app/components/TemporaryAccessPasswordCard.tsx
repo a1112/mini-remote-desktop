@@ -45,9 +45,10 @@ export function TemporaryAccessPasswordCard() {
   useEffect(() => { if (secret && secret.expires <= now) setSecret(null); }, [now, secret]);
 
   const ready = !!status?.enabled && status.ready && status.expires_at_ms !== null && status.expires_at_ms > now && !loadError;
+  const manualRefresh = status?.refresh_mode === 'manual';
   const seconds = ready ? Math.max(0, Math.ceil((status!.expires_at_ms! - now) / 1000)) : 0;
   const label = loadError ? '无法读取本机临时密码状态' : !status ? '正在读取临时密码状态' : !status.enabled ? '临时访问已关闭'
-    : status.expires_at_ms !== null && status.expires_at_ms <= now ? '临时密码已过期' : ready ? '临时密码可用'
+    : status.expires_at_ms !== null && status.expires_at_ms <= now ? manualRefresh ? '临时访问暂不可用' : '临时密码已过期' : ready ? '临时密码可用'
       : /offline|signaling/.test(status.reason ?? '') ? '公网连接未就绪' : '正在准备临时密码';
 
   const act = async (kind: 'reveal' | 'copy' | 'rotate' | 'disable') => {
@@ -88,8 +89,9 @@ export function TemporaryAccessPasswordCard() {
       <button type="button" disabled={!ready || busy} aria-label="复制临时密码" onClick={() => void act('copy')} className="rounded p-2 opacity-70 hover:bg-current/10 disabled:opacity-30">{copied ? <Check className="h-4 w-4 text-emerald-600" /> : <Copy className="h-4 w-4" />}</button>
       <button type="button" disabled={busy} aria-label="刷新临时密码" onClick={() => void act('rotate')} className="rounded p-2 opacity-70 hover:bg-current/10 disabled:opacity-30">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}</button>
     </div>
-    <p className="text-xs leading-relaxed opacity-60">{ready ? `剩余 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}。` : ''}无需登录即可被控，连接时仍需本机确认权限。</p>
-    <div className="flex items-center justify-between gap-2 text-xs"><span className="opacity-60">刷新后旧密码失效。</span>
+    <p className="text-xs leading-relaxed opacity-60">{ready && !manualRefresh ? `剩余 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}。` : ''}无需登录即可被控，连接时仍需本机确认权限。</p>
+    {manualRefresh && <p className="text-xs leading-relaxed opacity-60">服务重启后会生成新密码。</p>}
+    <div className="flex items-center justify-between gap-2 text-xs"><span className="opacity-60">{manualRefresh ? '手动刷新，刷新后旧密码失效。' : '刷新后旧密码失效。'}</span>
       {status?.enabled ? <button type="button" disabled={busy} onClick={() => void act('disable')} className="rounded px-2 py-1 text-red-500 hover:bg-red-500/10 disabled:opacity-30">关闭临时访问</button>
         : <button type="button" disabled={busy} onClick={() => void act('rotate')} className="rounded px-2 py-1 text-blue-500 hover:bg-blue-500/10 disabled:opacity-30">启用临时访问</button>}
     </div>
