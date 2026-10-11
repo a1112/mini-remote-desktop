@@ -103,6 +103,15 @@ async function beginRegistration(peer: BrowserRemotePeer): Promise<Socket> {
   await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'register'));
   return socket;
 }
+async function pendingPeer(): Promise<{ peer: BrowserRemotePeer; socket: Socket; intent: protocol.SignedSignal }> {
+  const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+  const socket = await beginRegistration(peer);
+  socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered() } });
+  await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3'));
+  const intent = JSON.parse(socket.sent.find(text => JSON.parse(text).message.type === 'session_intent_v3')!).message.payload;
+  await pause();
+  return { peer, socket, intent };
+}
 async function approvedPeer(gathering = false, candidateFutureMs = 0): Promise<{ peer: BrowserRemotePeer; pc: PeerConnection; socket: Socket; candidate?: protocol.SignedSignal }> {
   if (gathering) PeerConnection.initialIceState = 'gathering';
   const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
@@ -207,6 +216,192 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('independent browser peer lifecycle', () => {
+  it.each([600000, 20000])('expires pending consent at the signed intent deadline with a %i ms credential and a longer requested bootstrap', async credentialTtl => {
+    const clock = controlledClock();
+    context.bootstrap.credential.expires_at_ms = Date.now() + credentialTtl;
+    const { peer, socket, intent } = await pendingPeer();
+    try {
+      const expiresAtMs = intent.payload.claims.expires_at_ms;
+      expect(expiresAtMs).toBe(fixture.now_ms + Math.min(60000, credentialTtl));
+      expect(context.bootstrap.expires_at_ms).toBeGreaterThan(expiresAtMs);
+      await clock.advance(expiresAtMs - Date.now() - 1);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'waiting_consent', grantedScopes: [] }));
+      expect(context.getBootstrap).toHaveBeenCalled();
+      expect(context.bootstrap.session.status).toBe('requested');
+      await clock.advance(1);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '等待远端确认超时，请重新连接' }));
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      expect(socket.readyState).toBe(3);
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(context.getRelayAccess).not.toHaveBeenCalled();
+      await expect(peer.sendInput({ kind: 'key', key: { kind: 'virtual_key', code: 65 }, pressed: true })).rejects.toThrow('授权');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { await peer.close('test_cleanup'); }
+  });
+
+  it.each(['backend', 'grant_commitment', 'unfired_grant_commitment'] as const)('does not accept a late signed grant while %s completion crosses the consent deadline', async stage => {
+    const clock = controlledClock();
+    context.bootstrap.credential.expires_at_ms = Date.now() + 20000;
+    const { peer, socket, intent } = await pendingPeer();
+    const target = await fixtureIdentity(fixture.target);
+    const grantPayload = { ...fixture.grant.payload, policy_expires_at_ms: intent.payload.claims.expires_at_ms,
+      intent_commitment: await protocol.signedSignalCommitment('intent', intent) };
+    const grant = await protocol.signSignal(target, 'session_grant_v3', grantPayload);
+    const approved = { ...context.bootstrap, session: {
+      ...context.bootstrap.session, status: 'approved', approved_scopes: grantPayload.approved_scopes, approved_profile: grantPayload.approved_profile,
+      policy_revision: grantPayload.backend_policy_revision, active_relay_generation: 0,
+      policy_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(), grant_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(),
+    } };
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let bootstrapCalls = 0;
+    context.getBootstrap = vi.fn(async () => {
+      if (stage === 'backend') { entered = true; await gate; }
+      else if (++bootstrapCalls > 1) await gate;
+      return approved;
+    });
+    if (stage !== 'backend') {
+      const actual = protocol.signedSignalCommitment;
+      vi.spyOn(protocol, 'signedSignalCommitment').mockImplementation(async (...args) => {
+        const commitment = await actual(...args);
+        if (args[0] === 'grant') { entered = true; await gate; }
+        return commitment;
+      });
+    }
+    try {
+      socket.receive({ version: 3, message: { type: 'session_grant_v3', payload: grant } });
+      await until(() => entered);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'waiting_consent', grantedScopes: [] }));
+      if (stage === 'unfired_grant_commitment') clock.set(intent.payload.claims.expires_at_ms);
+      else {
+        await clock.advance(intent.payload.claims.expires_at_ms - Date.now());
+        expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '等待远端确认超时，请重新连接' }));
+      }
+      release();
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      await pause();
+      expect(onState.mock.calls.some(([state]) => state.phase === 'negotiating' || state.grantedScopes.length > 0)).toBe(false);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '等待远端确认超时，请重新连接' }));
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(context.getRelayAccess).not.toHaveBeenCalled();
+      expect(socket.readyState).toBe(3);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); await peer.close('test_cleanup'); }
+  });
+
+  it('immediately expires an intent whose real signature finishes at its original deadline', async () => {
+    const clock = controlledClock();
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    const socket = await beginRegistration(peer);
+    const actual = protocol.signSignal;
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(protocol, 'signSignal').mockImplementation(async (...args) => {
+      const signed = await actual(...args);
+      if (args[1] === 'session_intent_v3') { entered = true; await gate; }
+      return signed;
+    });
+    try {
+      socket.receive({ version: 2, message: { type: 'registered', payload: await serverRegistered() } });
+      await until(() => entered);
+      clock.set(fixture.now_ms + 60000);
+      release();
+      await until(() => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3'));
+      await pause();
+      const intent = JSON.parse(socket.sent.find(text => JSON.parse(text).message.type === 'session_intent_v3')!).message.payload;
+      expect(intent.payload.claims.expires_at_ms).toBe(Date.now());
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '等待远端确认超时，请重新连接' }));
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      expect(context.getRelayAccess).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); await peer.close('test_cleanup'); }
+  });
+
+  it('does not accept a grant when its shorter policy expires during the real commitment calculation', async () => {
+    const clock = controlledClock();
+    const { peer, socket, intent } = await pendingPeer();
+    const target = await fixtureIdentity(fixture.target);
+    const grantPayload = { ...fixture.grant.payload, intent_commitment: await protocol.signedSignalCommitment('intent', intent) };
+    const grant = await protocol.signSignal(target, 'session_grant_v3', grantPayload);
+    context.getBootstrap = vi.fn(async () => ({ ...context.bootstrap, session: {
+      ...context.bootstrap.session, status: 'approved', approved_scopes: grantPayload.approved_scopes, approved_profile: grantPayload.approved_profile,
+      policy_revision: grantPayload.backend_policy_revision, active_relay_generation: 0,
+      policy_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(), grant_expires_at: new Date(grantPayload.policy_expires_at_ms).toISOString(),
+    } }));
+    const actual = protocol.signedSignalCommitment;
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(protocol, 'signedSignalCommitment').mockImplementation(async (...args) => {
+      const commitment = await actual(...args);
+      if (args[0] === 'grant') { entered = true; await gate; }
+      return commitment;
+    });
+    try {
+      socket.receive({ version: 3, message: { type: 'session_grant_v3', payload: grant } });
+      await until(() => entered);
+      expect(grantPayload.policy_expires_at_ms).toBeLessThan(intent.payload.claims.expires_at_ms);
+      clock.set(grantPayload.policy_expires_at_ms);
+      release();
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'negotiating' || state.grantedScopes.length > 0)).toBe(false);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '远端授权不符合服务器当前会话策略' }));
+      expect(context.getRelayAccess).not.toHaveBeenCalled();
+      expect(PeerConnection.peers).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release(); await peer.close('test_cleanup'); }
+  });
+
+  it('clears the pending consent deadline on explicit close without a later timeout', async () => {
+    const clock = controlledClock();
+    const { peer, socket, intent } = await pendingPeer();
+    await peer.close('user_cancel');
+    const callsAtClose = onState.mock.calls.length;
+    await clock.advance(intent.payload.claims.expires_at_ms - Date.now());
+    expect(onState.mock.calls).toHaveLength(callsAtClose);
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'closed', grantedScopes: [] }));
+    expect(context.closeBackend).toHaveBeenCalledTimes(1);
+    expect(socket.readyState).toBe(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('disposes the consent timer after a complete signed grant while keeping the grant policy deadline', async () => {
+    const clock = controlledClock();
+    context.bootstrap.credential.expires_at_ms = Date.now() + 30000;
+    const { peer, pc } = await approvedPeer();
+    const track = Object.assign(new EventTarget(), { kind: 'video', stop: vi.fn() });
+    pc.dispatchEvent(Object.assign(new Event('track'), { track, streams: [{ getTracks: () => [track] }] }));
+    pc.connectionState = 'connected'; pc.dispatchEvent(new Event('connectionstatechange'));
+    await until(() => onState.mock.calls.some(([state]) => state.route === 'direct'));
+    peer.markVideoReady(1280, 720);
+    pc.channels.forEach(channel => channel.open());
+    try {
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'streaming', grantedScopes: fixture.grant.payload.approved_scopes }));
+      // Registration, identity, heartbeat, policy polling and grant policy remain;
+      // the completed consent and negotiation timers do not retain the session.
+      expect(vi.getTimerCount()).toBe(5);
+      pc.channels.forEach(channel => { channel.readyState = 'closed'; });
+      await clock.advance(fixture.grant.payload.policy_expires_at_ms - Date.now());
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [] }));
+      expect(onState.mock.calls.some(([state]) => state.error === '等待远端确认超时，请重新连接')).toBe(false);
+      expect(pc.connectionState).toBe('closed');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { pc.channels.forEach(channel => { channel.readyState = 'closed'; }); await peer.close('test_cleanup'); }
+  });
+
+  it('keeps local consent expiry terminal when the backend close cannot be confirmed', async () => {
+    const clock = controlledClock();
+    context.closeBackend = vi.fn(async () => { throw new Error('Temporary access is unavailable'); });
+    const { peer, socket, intent } = await pendingPeer();
+    await clock.advance(intent.payload.claims.expires_at_ms - Date.now());
+    await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+    await expect(peer.close()).rejects.toThrow('Temporary access is unavailable');
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '本地连接已关闭，未能确认远端会话已关闭' }));
+    expect(socket.readyState).toBe(3);
+    expect(PeerConnection.peers).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([1, 1500, 2000])('waits for a genuinely signed relay directory issued %i ms ahead after registered and grant verification', async futureMs => {
     const clock = controlledClock();
     const { peer, socket, access, binding } = await relayDirectoryPeer(futureMs);

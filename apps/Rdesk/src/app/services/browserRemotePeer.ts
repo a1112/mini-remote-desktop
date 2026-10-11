@@ -14,6 +14,7 @@ const terminalPhases = new Set(['failed', 'denied', 'closed']);
 const MAX_MESSAGE_BYTES = 512 * 1024;
 const MAX_QUEUED_BYTES = 2 * 1024 * 1024;
 const MAX_CANDIDATES = 256;
+const CONSENT_TIMEOUT_ERROR = '等待远端确认超时，请重新连接';
 
 export class BrowserRemotePeer implements BrowserRemoteHandle {
   private state: BrowserRemoteState = { phase: 'waiting_consent', grantedScopes: [] };
@@ -44,6 +45,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private polling = false;
   private routeVerified = false;
   private frame?: { width: number; height: number };
+  private consentDeadline?: ReturnType<typeof setTimeout>;
   private negotiationDeadline?: ReturnType<typeof setTimeout>;
   private signalWaitAbort = new AbortController();
 
@@ -59,6 +61,9 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     const timer = setTimeout(() => { this.timers.delete(timer); callback(); }, Math.max(1, ms));
     this.timers.add(timer);
     return timer;
+  }
+  private assertConsentDeadline(): void {
+    if (!this.intent || this.intent.payload.claims.expires_at_ms <= Date.now()) throw new Error(CONSENT_TIMEOUT_ERROR);
   }
   private fail(error: unknown, phase: 'failed' | 'denied' = 'failed'): void {
     if (this.closing) return;
@@ -151,6 +156,11 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
       const intent = await this.send('session_intent_v3', { request: this.context.bootstrap.session.request, request_commitment: this.context.bootstrap.session.request_commitment });
       if (this.closing) return;
       this.intent = intent;
+      this.assertConsentDeadline();
+      this.consentDeadline = this.deadline(() => {
+        this.consentDeadline = undefined;
+        if (!this.grant && !this.closing) this.fail(new Error(CONSENT_TIMEOUT_ERROR));
+      }, intent.payload.claims.expires_at_ms - Date.now());
       return;
     }
     if (!this.registered || !this.intent) throw new Error('远程会话身份尚未注册');
@@ -182,10 +192,17 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
         || grant.policy_expires_at_ms > this.context.bootstrap.expires_at_ms) throw new Error('远端会话授权与本次请求不匹配');
       const fresh = await this.context.getBootstrap();
       if (this.closing) return;
+      this.assertConsentDeadline();
+      this.assertApprovedPolicy(grant, fresh.session);
+      const commitment = await signedSignalCommitment('grant', message.payload);
+      if (this.closing) return;
+      this.assertConsentDeadline();
       this.assertApprovedPolicy(grant, fresh.session);
       this.grant = message.payload;
-      this.grantCommitment = await signedSignalCommitment('grant', this.grant!);
-      if (this.closing) return;
+      this.grantCommitment = commitment;
+      if (this.consentDeadline) {
+        clearTimeout(this.consentDeadline); this.timers.delete(this.consentDeadline); this.consentDeadline = undefined;
+      }
       this.publish({ phase: 'negotiating', grantedScopes: [...grant.approved_scopes] });
       this.deadline(() => this.fail(new Error('远端会话授权已到期')), grant.policy_expires_at_ms - Date.now());
       await this.negotiate(grant);
@@ -413,6 +430,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     if (!terminalPhases.has(this.state.phase)) this.publish({ phase: 'closed', grantedScopes: [] });
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
+    this.consentDeadline = undefined;
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.poll) clearInterval(this.poll);
     this.closePromise = (async () => {
