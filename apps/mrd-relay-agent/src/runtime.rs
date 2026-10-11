@@ -38,6 +38,10 @@ const MAX_RESTART_ATTEMPTS: u8 = 3;
 const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCAL_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+// A rotation includes serial apply, live probe and backend operations, rather
+// than one local sample. Bound the transaction attempt separately; cancellation
+// retains the durable Applied/CommitUnknown phase for recovery.
+const SECRET_ROTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const ALLOCATION_PROOF_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -710,7 +714,7 @@ where
             runtime.advance_secret_rotation(identity).await?
         } else {
             tokio::time::timeout(
-                LOCAL_SAMPLE_TIMEOUT,
+                SECRET_ROTATION_TIMEOUT,
                 runtime.advance_secret_rotation(identity),
             )
             .await
@@ -750,7 +754,7 @@ where
         let _ = runtime.advance_secret_rotation(identity).await?;
     } else {
         match tokio::time::timeout(
-            LOCAL_SAMPLE_TIMEOUT,
+            SECRET_ROTATION_TIMEOUT,
             runtime.advance_secret_rotation(identity),
         )
         .await
@@ -1011,7 +1015,7 @@ where
 
         if runtime.rotation_requires_reconcile_before_heartbeat() {
             let reconciled = tokio::time::timeout(
-                LOCAL_SAMPLE_TIMEOUT,
+                SECRET_ROTATION_TIMEOUT,
                 runtime.advance_secret_rotation(identity),
             )
             .await
@@ -1106,7 +1110,7 @@ where
 
         if heartbeat_succeeded {
             match tokio::time::timeout(
-                LOCAL_SAMPLE_TIMEOUT,
+                SECRET_ROTATION_TIMEOUT,
                 runtime.advance_secret_rotation(identity),
             )
             .await
@@ -3235,6 +3239,10 @@ impl From<ProcessError> for RuntimeError {
         Self::Process(value)
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_rotation_deadline_tests.rs"]
+mod rotation_deadline_tests;
 
 #[cfg(test)]
 mod identifier_tests {
