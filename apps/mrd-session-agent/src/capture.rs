@@ -57,11 +57,180 @@ impl CaptureAdapter for UnavailableCaptureAdapter {
     }
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureEncoderBackend {
+    Nvenc,
+    OpenH264,
+}
+
+#[cfg(windows)]
+impl CaptureEncoderBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Nvenc => "nvenc",
+            Self::OpenH264 => "openh264",
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum CaptureEncoderPreference {
+    Software,
+    PreferNvenc,
+}
+
+#[cfg(windows)]
+fn initialize_preferred_encoder<E, N, S>(
+    profile: mrd_agent_ipc::AgentCaptureProfile,
+    nvenc: N,
+    software: S,
+) -> Result<(CaptureEncoderBackend, E), mrd_pipeline_core::PipelineError>
+where
+    N: FnOnce(mrd_agent_ipc::AgentCaptureProfile) -> Result<E, mrd_pipeline_core::PipelineError>,
+    S: FnOnce(mrd_agent_ipc::AgentCaptureProfile) -> Result<E, mrd_pipeline_core::PipelineError>,
+{
+    if !profile.is_valid() {
+        return Err(mrd_pipeline_core::PipelineError::message(
+            "capture_encoder_profile_invalid",
+        ));
+    }
+    match nvenc(profile) {
+        Ok(encoder) => Ok((CaptureEncoderBackend::Nvenc, encoder)),
+        Err(_) => software(profile).map(|encoder| (CaptureEncoderBackend::OpenH264, encoder)),
+    }
+}
+
+#[cfg(windows)]
+fn initialize_capture_encoder(
+    profile: mrd_agent_ipc::AgentCaptureProfile,
+    preference: CaptureEncoderPreference,
+) -> Result<
+    (
+        CaptureEncoderBackend,
+        Box<dyn mrd_pipeline_core::VideoEncoder>,
+    ),
+    mrd_pipeline_core::PipelineError,
+> {
+    let software = |approved: mrd_agent_ipc::AgentCaptureProfile| {
+        mrd_encode_openh264::OpenH264Encoder::new_with_bitrate(
+            approved.width as usize,
+            approved.height as usize,
+            approved.fps,
+            approved.bitrate_bps,
+        )
+        .map(|encoder| Box::new(encoder) as Box<dyn mrd_pipeline_core::VideoEncoder>)
+    };
+    match preference {
+        CaptureEncoderPreference::Software => {
+            if !profile.is_valid() {
+                return Err(mrd_pipeline_core::PipelineError::message(
+                    "capture_encoder_profile_invalid",
+                ));
+            }
+            software(profile).map(|encoder| (CaptureEncoderBackend::OpenH264, encoder))
+        }
+        CaptureEncoderPreference::PreferNvenc => initialize_preferred_encoder(
+            profile,
+            |approved| {
+                // The real Windows constructor configures H.264 Baseline, P1,
+                // UltraLowLatency, no B-frame reordering and the exact profile.
+                // CPU BGRA submissions complete synchronously; this adapter
+                // does not opt into the separate queued shared-texture path.
+                mrd_encode_nvenc::NvencH264Encoder::new_max_speed_with_bitrate(
+                    approved.width as usize,
+                    approved.height as usize,
+                    approved.fps,
+                    approved.bitrate_bps,
+                )
+                .map(|encoder| Box::new(encoder) as Box<dyn mrd_pipeline_core::VideoEncoder>)
+            },
+            software,
+        ),
+    }
+}
+
+/// Production Windows capture: prefer low-latency NVENC in each authorized
+/// resource, using OpenH264 when hardware initialization is unavailable.
+/// Both choices use the same CPU capture, profile scaling, ownership and
+/// bounded publication lifecycle as the software adapter.
+#[cfg(windows)]
+pub struct WindowsDxgiCaptureAdapter {
+    inner: WindowsDxgiOpenH264CaptureAdapter,
+}
+
+#[cfg(windows)]
+impl WindowsDxgiCaptureAdapter {
+    /// Creates an idle NVENC-preferred adapter with no live desktop resources.
+    pub fn new() -> Self {
+        Self {
+            inner: WindowsDxgiOpenH264CaptureAdapter::with_encoder_preference(
+                CaptureEncoderPreference::PreferNvenc,
+            ),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Default for WindowsDxgiCaptureAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+impl CaptureAdapter for WindowsDxgiCaptureAdapter {
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn start(&mut self, resource: &MediaResource, session_id: &SessionId) -> bool {
+        self.inner.start(resource, session_id)
+    }
+
+    fn start_with_profile(
+        &mut self,
+        resource: &MediaResource,
+        session_id: &SessionId,
+        profile: Option<mrd_agent_ipc::AgentCaptureProfile>,
+    ) -> bool {
+        self.inner.start_with_profile(resource, session_id, profile)
+    }
+
+    fn poll_encoded(
+        &mut self,
+        resource_id: &[u8; 16],
+    ) -> Option<crate::media::EncodedMediaAccessUnit> {
+        self.inner.poll_encoded(resource_id)
+    }
+
+    fn is_resource_running(&self, resource_id: &[u8; 16]) -> bool {
+        self.inner.is_resource_running(resource_id)
+    }
+
+    fn stop(&mut self, resource_id: &[u8; 16], session_id: &SessionId) -> bool {
+        self.inner.stop(resource_id, session_id)
+    }
+}
+
+#[cfg(windows)]
+const CAPTURE_MAX_ACCESS_UNIT_BYTES: usize = 128 * 1024;
+
+#[cfg(windows)]
+fn report_capture_failure(reason: &'static str) {
+    tracing::warn!(reason);
+    // The launcher binary has no global tracing subscriber. Keep the same
+    // static category observable on its diagnostic stderr without native text.
+    eprintln!("mrd-session-agent: {reason}");
+}
+
 /// Windows CPU capture plus OpenH264 adapter used when a shared-GPU transport
 /// is not yet available. Encoded units remain in an explicitly bounded queue;
 /// raw desktop pixels never cross the adapter boundary.
 #[cfg(windows)]
 pub struct WindowsDxgiOpenH264CaptureAdapter {
+    encoder_preference: CaptureEncoderPreference,
     workers: std::collections::HashMap<[u8; 16], CaptureWorker>,
     queues: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<[u8; 16], crate::media::MediaAccessUnitQueue>>,
@@ -80,7 +249,12 @@ impl WindowsDxgiOpenH264CaptureAdapter {
     /// Creates an idle adapter. Capture workers are created per authorized
     /// resource and are never shared across sessions.
     pub fn new() -> Self {
+        Self::with_encoder_preference(CaptureEncoderPreference::Software)
+    }
+
+    fn with_encoder_preference(encoder_preference: CaptureEncoderPreference) -> Self {
         Self {
+            encoder_preference,
             workers: std::collections::HashMap::new(),
             queues: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
@@ -140,7 +314,7 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
             3,
             // JSON encodes each byte as up to four characters. Keep payload
             // comfortably below the authenticated IPC frame's one-MiB bound.
-            128 * 1024,
+            CAPTURE_MAX_ACCESS_UNIT_BYTES,
         ) else {
             return false;
         };
@@ -156,36 +330,49 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
         let thread_stop = std::sync::Arc::clone(&stop);
         let worker_session_id = session_id.clone();
         let display_id = resource.display_id();
+        let encoder_preference = self.encoder_preference;
         let join = std::thread::Builder::new()
             .name("mrd-agent-dxgi-capture".to_owned())
             .spawn(move || {
                 use mrd_capture_dxgi::DxgiDesktopCapture;
-                use mrd_encode_openh264::OpenH264Encoder;
-                use mrd_pipeline_core::{FrameCapture, VideoEncoder};
+                use mrd_pipeline_core::FrameCapture;
 
                 let Ok(mut capture) = DxgiDesktopCapture::new_for_index(display_id) else {
+                    report_capture_failure("capture_initialization_failed");
                     return;
                 };
-                let Ok(mut encoder) = OpenH264Encoder::new_with_bitrate(
-                    profile.width as usize,
-                    profile.height as usize,
-                    profile.fps,
-                    profile.bitrate_bps,
-                ) else {
+                let Ok((backend, mut encoder)) =
+                    initialize_capture_encoder(profile, encoder_preference)
+                else {
+                    report_capture_failure("capture_encoder_initialization_failed");
                     return;
                 };
+                tracing::info!(
+                    encoder_backend = backend.as_str(),
+                    width = profile.width,
+                    height = profile.height,
+                    fps = profile.fps,
+                    bitrate_bps = profile.bitrate_bps,
+                    "capture_encoder_initialized"
+                );
+                eprintln!(
+                    "mrd-session-agent: capture_encoder_initialized backend={} width={} height={} fps={} bitrate_bps={}",
+                    backend.as_str(), profile.width, profile.height, profile.fps, profile.bitrate_bps
+                );
                 let interval =
                     std::time::Duration::from_nanos(1_000_000_000 / u64::from(profile.fps));
                 let mut sequence = 0_u64;
                 while !thread_stop.load(Ordering::Acquire) {
                     let next_frame = std::time::Instant::now() + interval;
                     let Ok(frame) = capture.capture_frame() else {
+                        report_capture_failure("capture_frame_failed");
                         break;
                     };
                     if thread_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let Ok(bounds) = capture.source_bounds() else {
+                        report_capture_failure("capture_source_bounds_failed");
                         break;
                     };
                     let (Ok(width), Ok(height)) =
@@ -200,12 +387,36 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                         height,
                     };
                     let Some(frame) = prepare_profile_frame(frame, profile) else {
+                        report_capture_failure("capture_profile_frame_invalid");
                         break;
                     };
                     let Ok(units) = encoder.encode(&frame) else {
+                        // Runtime encoder failure ends the resource rather
+                        // than swapping codec state after signed admission.
+                        tracing::warn!(
+                            reason = "capture_encode_failed",
+                            encoder_backend = backend.as_str()
+                        );
+                        eprintln!("mrd-session-agent: capture_encode_failed backend={}", backend.as_str());
                         break;
                     };
                     for unit in units {
+                        if unit.codec != mrd_pipeline_core::VideoCodec::H264 {
+                            report_capture_failure("capture_encoded_codec_invalid");
+                            return;
+                        }
+                        if unit.bytes.len() > CAPTURE_MAX_ACCESS_UNIT_BYTES {
+                            tracing::warn!(
+                                reason = "capture_encoded_unit_oversized",
+                                payload_bytes = unit.bytes.len(),
+                                max_payload_bytes = CAPTURE_MAX_ACCESS_UNIT_BYTES
+                            );
+                            eprintln!(
+                                "mrd-session-agent: capture_encoded_unit_oversized payload_bytes={} max_payload_bytes={}",
+                                unit.bytes.len(), CAPTURE_MAX_ACCESS_UNIT_BYTES
+                            );
+                            return;
+                        }
                         let Some(next) = sequence.checked_add(1) else {
                             return;
                         };
@@ -219,12 +430,14 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                             unit.bytes,
                         )
                         .and_then(|unit| unit.with_source_bounds(bounds)) else {
+                            report_capture_failure("capture_encoded_unit_invalid");
                             return;
                         };
                         let accepted = queues.lock().ok().and_then(|mut all| {
                             all.get_mut(&resource_id).map(|queue| queue.push(unit))
                         });
                         if accepted != Some(true) {
+                            report_capture_failure("capture_encoded_unit_rejected");
                             return;
                         }
                     }
@@ -348,9 +561,208 @@ fn prepare_profile_frame(
 
 #[cfg(all(windows, test))]
 mod tests {
-    use super::{CaptureAdapter, WindowsDxgiOpenH264CaptureAdapter};
+    use super::{CaptureAdapter, WindowsDxgiCaptureAdapter, WindowsDxgiOpenH264CaptureAdapter};
     use crate::media::{MediaResourceKind, MediaResourceRegistry};
     use mrd_proto::SessionId;
+
+    fn encoder_profile() -> mrd_agent_ipc::AgentCaptureProfile {
+        mrd_agent_ipc::AgentCaptureProfile {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_bps: 20_000_000,
+        }
+    }
+
+    #[test]
+    fn available_nvenc_is_selected_without_initializing_software() {
+        let profile = encoder_profile();
+        let (backend, encoder) = super::initialize_preferred_encoder(
+            profile,
+            |approved| {
+                assert_eq!(approved, profile);
+                Ok("hardware")
+            },
+            |_| panic!("software must not initialize when NVENC is available"),
+        )
+        .unwrap();
+        assert_eq!(backend, super::CaptureEncoderBackend::Nvenc);
+        assert_eq!(encoder, "hardware");
+    }
+
+    #[test]
+    fn unavailable_nvenc_falls_back_without_changing_the_approved_profile() {
+        let profile = encoder_profile();
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let (backend, encoder) = super::initialize_preferred_encoder(
+            profile,
+            |approved| {
+                assert_eq!(approved, profile);
+                attempts.borrow_mut().push("nvenc");
+                Err(mrd_pipeline_core::PipelineError::message("unavailable"))
+            },
+            |approved| {
+                assert_eq!(approved, profile);
+                attempts.borrow_mut().push("openh264");
+                Ok("software")
+            },
+        )
+        .unwrap();
+        assert_eq!(*attempts.borrow(), ["nvenc", "openh264"]);
+        assert_eq!(backend, super::CaptureEncoderBackend::OpenH264);
+        assert_eq!(encoder, "software");
+    }
+
+    #[test]
+    fn invalid_profile_is_rejected_before_either_encoder_initializes() {
+        let mut profile = encoder_profile();
+        profile.fps = 121;
+        let result = super::initialize_preferred_encoder::<(), _, _>(
+            profile,
+            |_| panic!("invalid grant profile reached NVENC"),
+            |_| panic!("invalid grant profile reached OpenH264"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn both_encoder_initialization_failures_reject_the_resource() {
+        let result = super::initialize_preferred_encoder::<(), _, _>(
+            encoder_profile(),
+            |_| {
+                Err(mrd_pipeline_core::PipelineError::message(
+                    "hardware unavailable",
+                ))
+            },
+            |_| {
+                Err(mrd_pipeline_core::PipelineError::message(
+                    "software unavailable",
+                ))
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn software_fallback_produces_decodable_h264_at_the_approved_dimensions() {
+        use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoDecoder, VideoEncoder};
+        let profile = mrd_agent_ipc::AgentCaptureProfile {
+            width: 128,
+            height: 72,
+            fps: 60,
+            bitrate_bps: 1_000_000,
+        };
+        let (backend, mut encoder) = super::initialize_preferred_encoder(
+            profile,
+            |_| {
+                Err(mrd_pipeline_core::PipelineError::message(
+                    "hardware unavailable",
+                ))
+            },
+            |approved| {
+                mrd_encode_openh264::OpenH264Encoder::new_with_bitrate(
+                    approved.width as usize,
+                    approved.height as usize,
+                    approved.fps,
+                    approved.bitrate_bps,
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(backend, super::CaptureEncoderBackend::OpenH264);
+        let frame = CapturedFrame::from_cpu(
+            profile.width as usize,
+            profile.height as usize,
+            FramePixelFormat::Bgra32,
+            1000,
+            [67, 120, 199, 255].repeat(profile.width as usize * profile.height as usize),
+        );
+        let units = encoder.encode(&frame).unwrap();
+        assert!(!units.is_empty());
+        let mut decoder = mrd_decode::H264SoftwareDecoder::new().unwrap();
+        for unit in units {
+            assert_eq!(unit.codec, mrd_pipeline_core::VideoCodec::H264);
+            assert_eq!(unit.timestamp_us, 1000);
+            decoder.push_access_unit(&unit.bytes).unwrap();
+        }
+        let decoded = decoder.drain_decoded_frames();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!((decoded[0].width, decoded[0].height), (128, 72));
+    }
+
+    #[test]
+    fn oversized_keyframe_cannot_cross_the_capture_ipc_queue() {
+        let session = SessionId("capture-payload-bound".to_owned());
+        let id = [0x43; 16];
+        let mut queue = crate::media::MediaAccessUnitQueue::new(
+            id,
+            session.clone(),
+            3,
+            super::CAPTURE_MAX_ACCESS_UNIT_BYTES,
+        )
+        .unwrap();
+        let unit = crate::media::EncodedMediaAccessUnit::new(
+            id,
+            session,
+            1,
+            1000,
+            true,
+            vec![0; super::CAPTURE_MAX_ACCESS_UNIT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(!queue.push(unit));
+        assert!(queue.is_empty());
+        assert_eq!(super::CAPTURE_MAX_ACCESS_UNIT_BYTES, 128 * 1024);
+    }
+
+    #[test]
+    #[ignore = "requires a Windows NVIDIA GPU; synthetic CPU frame only"]
+    fn native_nvenc_cpu_h264_is_baseline_and_preserves_the_approved_profile() {
+        use mrd_pipeline_core::{CapturedFrame, FramePixelFormat, VideoDecoder};
+        let profile = mrd_agent_ipc::AgentCaptureProfile {
+            width: 320,
+            height: 180,
+            fps: 60,
+            bitrate_bps: 2_000_000,
+        };
+        let (backend, mut encoder) = super::initialize_capture_encoder(
+            profile,
+            super::CaptureEncoderPreference::PreferNvenc,
+        )
+        .unwrap();
+        assert_eq!(backend, super::CaptureEncoderBackend::Nvenc);
+        let mut decoder = mrd_decode::H264SoftwareDecoder::new().unwrap();
+        for timestamp_us in [1000, 17_666, 34_332] {
+            let frame = CapturedFrame::from_cpu(
+                profile.width as usize,
+                profile.height as usize,
+                FramePixelFormat::Bgra32,
+                timestamp_us,
+                [67, 120, 199, 255].repeat(profile.width as usize * profile.height as usize),
+            );
+            let units = encoder.encode(&frame).unwrap();
+            // The chosen CPU submission is synchronous, with one output for
+            // every frame and no queued shared-texture tail to flush on stop.
+            assert_eq!(units.len(), 1);
+            let unit = &units[0];
+            assert_eq!(unit.codec, mrd_pipeline_core::VideoCodec::H264);
+            assert_eq!(unit.timestamp_us, timestamp_us);
+            assert!(!unit.bytes.is_empty());
+            if timestamp_us == 1000 {
+                assert!(unit.is_keyframe);
+                assert!(
+                    unit.bytes
+                        .windows(5)
+                        .any(|nal| { nal[0..3] == [0, 0, 1] && nal[3] & 31 == 7 && nal[4] == 66 }),
+                    "NVENC must emit a Baseline SPS compatible with the approved WAN codec"
+                );
+            }
+            decoder.push_access_unit(&unit.bytes).unwrap();
+            let decoded = decoder.drain_decoded_frames();
+            assert_eq!(decoded.len(), 1);
+            assert_eq!((decoded[0].width, decoded[0].height), (320, 180));
+        }
+    }
 
     #[test]
     fn approved_frame_geometry_keeps_full_display_pointer_mapping() {
@@ -408,7 +820,7 @@ mod tests {
         let id = [0x42; 16];
         let mut registry = MediaResourceRegistry::new();
         registry.start(id, session.clone(), 0, MediaResourceKind::Capture, None);
-        let mut adapter = WindowsDxgiOpenH264CaptureAdapter::new();
+        let mut adapter = WindowsDxgiCaptureAdapter::new();
         let profile = mrd_agent_ipc::AgentCaptureProfile {
             width: 320,
             height: 180,
@@ -419,7 +831,7 @@ mod tests {
         let mut decoder = mrd_decode::H264SoftwareDecoder::new().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let decoded = loop {
-            if let Some(unit) = adapter.pop_encoded(&id) {
+            if let Some(unit) = adapter.poll_encoded(&id) {
                 let bounds = unit
                     .source_bounds()
                     .expect("real capture must bind physical source geometry");

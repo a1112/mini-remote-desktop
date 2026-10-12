@@ -3761,6 +3761,7 @@ dependencies = [
  "mrd-agent-ipc",
  "mrd-capture-dxgi",
  "mrd-decode",
+ "mrd-encode-nvenc",
  "mrd-encode-openh264",
  "mrd-input",
  "mrd-pipeline-core",

@@ -33,10 +33,10 @@ use mrd_service::wan_session::{
 };
 use mrd_signal_proto::{
     webrtc_candidate_fingerprint_v3, AuthClaims, SessionGrantV3, SessionGrantV3Payload,
-    SessionIntentV3, SessionIntentV3Payload, SignedSignal, WanAccessModeV3, WanPermissionScopeV3,
-    WanRoutePolicyV3, WanSessionRequestV3, WebRtcAnswerV3, WebRtcAnswerV3Payload,
-    WebRtcCandidateV3, WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3, WebRtcOfferV3,
-    WebRtcOfferV3Payload,
+    SessionIntentV3, SessionIntentV3Payload, SignedSignal, WanAccessModeV3, WanMediaProfileV3,
+    WanPermissionScopeV3, WanRoutePolicyV3, WanSessionRequestV3, WebRtcAnswerV3,
+    WebRtcAnswerV3Payload, WebRtcCandidateV3, WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3,
+    WebRtcOfferV3, WebRtcOfferV3Payload,
 };
 use mrd_transport_webrtc::{IceCandidate, PeerConnectionConfig, SessionDescription};
 use ring::digest::{digest, SHA256};
@@ -109,6 +109,16 @@ fn state_at_access_bound_with_policy(
     bind_commitment: bool,
     policy: WanRoutePolicyV3,
 ) -> WanSessionState {
+    state_at_access_bound_with_profile(session_id, role, bind_commitment, policy, None)
+}
+
+fn state_at_access_bound_with_profile(
+    session_id: &SessionId,
+    role: WanSessionRole,
+    bind_commitment: bool,
+    policy: WanRoutePolicyV3,
+    profile: Option<WanMediaProfileV3>,
+) -> WanSessionState {
     let mut state = WanSessionState::new(role, identity_for_session(role, session_id));
     state
         .apply(
@@ -126,9 +136,10 @@ fn state_at_access_bound_with_policy(
             1_001,
         )
         .unwrap();
-    let grant = GrantBinding::new(
+    let grant = GrantBinding::with_profile(
         REQUEST_COMMITMENT.into(),
         vec![WanPermissionScopeV3::ScreenView],
+        profile,
         7,
         10_000,
         9_000,
@@ -331,6 +342,74 @@ async fn primary_only_signed_relay_url_is_used_for_generation_zero() {
     assert_eq!(
         config.ice_servers[0].urls[0],
         "turn:relay-primary.example.test:3478?transport=udp"
+    );
+}
+
+#[tokio::test]
+async fn primary_peer_rtp_clock_uses_the_approved_video_frame_rate() {
+    for role in [WanSessionRole::Controller, WanSessionRole::Target] {
+        for policy in [WanRoutePolicyV3::RelayOnly, WanRoutePolicyV3::DirectFirst] {
+            for fps in [30, 60, 120] {
+                let session_id = test_session_id();
+                let peer = match role {
+                    WanSessionRole::Controller => "target-device",
+                    WanSessionRole::Target => "controller-device",
+                };
+                let access = relay_access(&session_id, peer).await;
+                let profile = WanMediaProfileV3 {
+                    width: 2560,
+                    height: 1440,
+                    fps,
+                    bitrate_mbps: 40,
+                    codec: "h264".into(),
+                    codec_profile: None,
+                    bit_depth: Some(8),
+                    chroma_subsampling: None,
+                    pixel_format: None,
+                    hdr_enabled: Some(false),
+                    color_mode: None,
+                    color_pipeline: None,
+                };
+                let state = state_at_access_bound_with_profile(
+                    &session_id,
+                    role,
+                    true,
+                    policy,
+                    Some(profile),
+                );
+                let context = GenerationZeroNegotiationContext::from_state(
+                    &state,
+                    GRANT_COMMITMENT.into(),
+                    1_000,
+                )
+                .unwrap();
+                let config = context.primary_peer_config(&access).unwrap();
+                assert_eq!(config.fps, fps, "approved fps must drive RTP timestamps");
+                assert_eq!(
+                    config.role,
+                    match role {
+                        WanSessionRole::Controller =>
+                            mrd_transport_webrtc::PeerConnectionRole::Offerer,
+                        WanSessionRole::Target =>
+                            mrd_transport_webrtc::PeerConnectionRole::Answerer,
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn primary_peer_without_video_profile_keeps_the_transport_default_clock() {
+    let session_id = test_session_id();
+    let access = relay_access(&session_id, "target-device").await;
+    let state = state_at_access_bound(&session_id, WanSessionRole::Controller, true);
+    let context =
+        GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
+            .unwrap();
+    assert_eq!(
+        context.primary_peer_config(&access).unwrap().fps,
+        PeerConnectionConfig::default().fps,
     );
 }
 

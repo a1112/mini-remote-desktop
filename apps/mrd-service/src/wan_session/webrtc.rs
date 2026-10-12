@@ -934,10 +934,13 @@ impl GenerationZeroNegotiationContext {
             WanSessionRole::Controller => PeerConnectionRole::Offerer,
             WanSessionRole::Target => PeerConnectionRole::Answerer,
         };
-        let config = PeerConnectionConfig {
+        let mut config = PeerConnectionConfig {
             role,
             ..PeerConnectionConfig::default()
         };
+        if let Some(profile) = self.grant.approved_profile() {
+            config.fps = profile.fps;
+        }
         Ok(match self.grant.route_policy() {
             WanRoutePolicyV3::RelayOnly => credential.apply_relay_only(config),
             WanRoutePolicyV3::DirectFirst => credential.apply_direct_first(config),

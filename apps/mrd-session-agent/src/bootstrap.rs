@@ -122,11 +122,11 @@ impl RegistrationSigner for OneShotEd25519Signer {
 
 #[cfg(windows)]
 fn build_windows_media_executor() -> crate::media::MediaExecutor<
-    crate::capture::WindowsDxgiOpenH264CaptureAdapter,
+    crate::capture::WindowsDxgiCaptureAdapter,
     crate::windows_render::WindowsRenderAdapter,
 > {
     crate::media::MediaExecutor::new(
-        crate::capture::WindowsDxgiOpenH264CaptureAdapter::new(),
+        crate::capture::WindowsDxgiCaptureAdapter::new(),
         crate::windows_render::WindowsRenderAdapter::new(),
     )
 }

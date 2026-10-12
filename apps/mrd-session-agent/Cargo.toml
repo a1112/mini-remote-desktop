@@ -27,6 +27,7 @@ zeroize.workspace = true
 [target.'cfg(windows)'.dependencies]
 mrd-capture-dxgi = { path = "../../crates/mrd-capture-dxgi" }
 mrd-decode = { path = "../../crates/mrd-decode" }
+mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-encode-openh264 = { path = "../../crates/mrd-encode-openh264" }
 mrd-pipeline-core = { path = "../../crates/mrd-pipeline-core" }
 mrd-render = { path = "../../crates/mrd-render" }

@@ -9,6 +9,41 @@ vi.mock('../services/remoteDisplayLauncher', () => ({ launchRemoteDisplayForDevi
 beforeEach(() => { vi.clearAllMocks(); mocks.launch.mockResolvedValue({ sessionId: 'guest-session', mode: 'route', routePath: '/browser-session/guest-session' }); });
 
 describe('guest remote connection form', () => {
+  it.each([
+    { preset: null, profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 10, codec: 'h264' } },
+    { preset: '1080p60', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: 'h264' } },
+    { preset: '1440p120', profile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' } },
+  ])('requests the selected picture profile before connecting: $preset', async ({ preset, profile }) => {
+    const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
+    if (preset) await user.selectOptions(screen.getByRole('combobox', { name: '画面档位' }), preset);
+    await user.type(screen.getByLabelText('远程设备码'), '1501515774');
+    await user.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).toHaveBeenCalledWith('1501515774', expect.objectContaining({
+      requestedProfile: profile, temporaryPassword: 'ABCD2345', transportKind: 'webrtc', routePreference: 'auto',
+    }));
+    expect(mocks.navigate).toHaveBeenCalledWith('/browser-session/guest-session');
+  });
+
+  it('locks the picture profile while its connection request is pending', async () => {
+    let resolve!: (value: unknown) => void;
+    mocks.launch.mockImplementation(() => new Promise(done => { resolve = done; }));
+    const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
+    const preset = screen.getByRole('combobox', { name: '画面档位' });
+    expect(preset).toHaveValue('1080p30');
+    await user.selectOptions(preset, '1440p120');
+    await user.type(screen.getByLabelText('远程设备码'), '1501515774');
+    await user.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(preset).toBeDisabled();
+    expect(mocks.launch).toHaveBeenCalledTimes(1);
+    expect(mocks.launch).toHaveBeenCalledWith('1501515774', expect.objectContaining({
+      requestedProfile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' },
+    }));
+    await act(async () => resolve({ sessionId: 'guest-session', mode: 'route', routePath: '/browser-session/guest-session' }));
+    expect(preset).toBeEnabled();
+  });
+
   it.each(['abcd2345', 'ABCD2340', 'ABCD2341', 'ABCD23I5', 'ABCD23O5'])('shows a local format error instead of sending a password outside the issued alphabet: %s', async (password) => {
     const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
     await user.type(screen.getByLabelText('远程设备码'), '753662296');

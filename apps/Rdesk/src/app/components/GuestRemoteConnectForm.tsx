@@ -5,12 +5,21 @@ import { ArrowRight, Eye, EyeOff, Loader2 } from 'lucide-react';
 import { launchRemoteDisplayForDevice } from '../services/remoteDisplayLauncher';
 import { closeBrowserRemoteSession } from '../services/browserRemoteSessionService';
 import { DEVICE_CODE_INPUT_ERROR, parseRemoteDeviceInput } from '../utils/deviceCode';
+import type { MediaProfile } from '../adapters/tauri/types';
+
+const DEFAULT_PICTURE_PRESET = { value: '1080p30', label: '标准（1080p · 30帧）', profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 10, codec: 'h264' } };
+const PICTURE_PRESETS = [
+  DEFAULT_PICTURE_PRESET,
+  { value: '1080p60', label: '流畅（1080p · 60帧）', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: 'h264' } },
+  { value: '1440p120', label: '高性能（1440p · 120帧）', profile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' } },
+] satisfies Array<{ value: string; label: string; profile: MediaProfile }>;
 
 export function GuestRemoteConnectForm() {
   const navigate = useNavigate();
   const passwordId = useId();
   const [deviceCode, setDeviceCode] = useState('');
   const [password, setPassword] = useState('');
+  const [picturePreset, setPicturePreset] = useState(DEFAULT_PICTURE_PRESET);
   const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +42,7 @@ export function GuestRemoteConnectForm() {
       const result = await launchRemoteDisplayForDevice(target.deviceId, {
         temporaryPassword: password, signal: cancellation.signal,
         transportKind: 'webrtc', routePreference: 'auto', targetDeviceName: '远程设备',
+        requestedProfile: { ...picturePreset.profile },
       });
       if (!alive.current || cancellation.signal.aborted) {
         await closeBrowserRemoteSession(result.sessionId, 'connection_form_left'); return;
@@ -62,6 +72,13 @@ export function GuestRemoteConnectForm() {
         </button>
       </span>
     </div>
+    <label className="block text-sm">画面档位
+      <select aria-label="画面档位" value={picturePreset.value} disabled={busy}
+        onChange={event => { const next = PICTURE_PRESETS.find(preset => preset.value === event.target.value); if (next) setPicturePreset(next); }}
+        className="mt-1.5 w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500/30">
+        {PICTURE_PRESETS.map(preset => <option key={preset.value} value={preset.value}>{preset.label}</option>)}
+      </select>
+    </label>
     <p className="text-xs leading-relaxed opacity-65">双方无需登录。输入设备码和临时密码后，请在远端确认画面与键鼠权限；已有的 9 位设备码仍可使用。</p>
     <button type="submit" disabled={!deviceCode.trim() || !password || busy} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2.5 text-sm text-white hover:bg-blue-500 disabled:opacity-40">
       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}{busy ? '正在验证…' : '立即连接'}
