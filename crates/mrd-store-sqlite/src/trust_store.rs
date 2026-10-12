@@ -454,7 +454,7 @@ fn trust_commitment_for_version(
     ))
 }
 
-fn insert_record(
+pub(crate) fn insert_record(
     connection: &Connection,
     peer_key_id: &str,
     public_key: &[u8],
@@ -561,7 +561,7 @@ fn query_all_records(connection: &Connection) -> Result<Vec<StoredTrustRecord>, 
     Ok(records)
 }
 
-fn query_record(
+pub(crate) fn query_record(
     connection: &Connection,
     peer_key_id: &str,
 ) -> Result<Option<TrustRecord>, StoreError> {
@@ -599,7 +599,7 @@ fn query_record(
     .transpose()
 }
 
-fn validate_pinned_identity(
+pub(crate) fn validate_pinned_identity(
     peer_key_id: &str,
     public_key: &[u8],
     epoch: u64,

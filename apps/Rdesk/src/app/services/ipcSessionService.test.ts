@@ -88,6 +88,11 @@ describe("requestRemoteSession", () => {
     });
   });
 
+  it('sends explicit paired mode through the authoritative IPC contract', async () => {
+    await requestRemoteSession('session-1', 'target-1', 'webrtc', undefined, 'wan_relay', 'paired');
+    expect(adapter.requestRemoteSession).toHaveBeenCalledWith(expect.objectContaining({ access_mode: 'paired', route_preference: 'wan_relay' }));
+  });
+
   it("forwards only the selected route preference enum", async () => {
     await requestRemoteSession(
       "session-1",

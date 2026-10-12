@@ -5,6 +5,7 @@ import * as protocol from './browserRemoteProtocol';
 import { canonicalRelayDirectoryBytes, verifyBrowserRelayAccess } from './browserRelayDirectory';
 import fixture from '../../../../realtime-server/tests/fixtures/browser_protocol_v3.json';
 import relayFixture from './__fixtures__/browser-relay-directory.json';
+import { IDBFactory } from 'fake-indexeddb';
 const cryptoModuleName = 'node:crypto';
 const { webcrypto } = await import(/* @vite-ignore */ cryptoModuleName) as { webcrypto: Crypto };
 
@@ -196,6 +197,7 @@ beforeEach(async () => {
   Socket.sockets = []; PeerConnection.peers = []; PeerConnection.initialIceState = 'complete';
   vi.spyOn(Date, 'now').mockReturnValue(fixture.now_ms);
   vi.stubGlobal('crypto', webcrypto);
+  vi.stubGlobal('indexedDB', new IDBFactory());
   vi.stubGlobal('WebSocket', Socket);
   vi.stubGlobal('RTCPeerConnection', PeerConnection);
   vi.stubGlobal('RTCRtpReceiver', { getCapabilities: () => ({ codecs: [{ mimeType: 'video/H264', clockRate: 90000,
@@ -212,10 +214,54 @@ beforeEach(async () => {
     },
     getBootstrap: vi.fn(), getRelayAccess: vi.fn(), closeBackend: vi.fn(async () => undefined),
   };
+  // Public protocol fixture identity, persisted through the same IDB schema as
+  // production, so lifecycle tests exercise the actual atomic reservations.
+  await new Promise<void>((resolve, reject) => {
+    const request = indexedDB.open('mrd-browser-controller-identity-v1', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('identity').add({
+      schema_version: 1, signal_counter: 0, ...context.identity,
+    }, 'controller');
+    request.onsuccess = () => { request.result.close(); resolve(); };
+    request.onerror = () => reject(request.error);
+  });
 });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('independent browser peer lifecycle', () => {
+  it('shares persistent registration and intent counters across concurrent sessions and reload', async () => {
+    const peers = [new BrowserRemotePeer(context, { onState, onVideoStream }), new BrowserRemotePeer(context, { onState, onVideoStream })];
+    try {
+      await Promise.all(peers.map(peer => peer.start()));
+      const sockets = [...Socket.sockets];
+      for (const socket of sockets) socket.receive({ version: 2, message: { type: 'server_challenge', payload: {
+        challenge_id: Array(16).fill(7), challenge_nonce: Array(32).fill(9), issued_at_ms: Date.now(), expires_at_ms: Date.now() + 10000,
+      } } });
+      await until(() => sockets.every(socket => socket.sent.some(text => JSON.parse(text).message.type === 'register')));
+      const registrationCounters = sockets.map(socket => JSON.parse(socket.sent[0]!).message.payload.payload.claims.counter);
+      expect(registrationCounters.sort((a, b) => a - b)).toEqual([1, 2]);
+      const registered = await serverRegistered();
+      for (const socket of sockets) socket.receive({ version: 2, message: { type: 'registered', payload: registered } });
+      await until(() => sockets.every(socket => socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')));
+      const counters = sockets.flatMap(socket => socket.sent.map(text => JSON.parse(text).message.payload.payload.claims.counter));
+      expect(counters.sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+      vi.resetModules();
+      const reloaded = await import('./browserRemoteProtocol');
+      expect(await reloaded.reserveBrowserSignalCounter(context.identity.keyId)).toBe(5);
+    } finally { await Promise.all(peers.map(peer => peer.close('test_cleanup'))); }
+  });
+  it('stops registration when persistent reservation fails without sending a reset counter', async () => {
+    const peer = new BrowserRemotePeer(context, { onState, onVideoStream });
+    await peer.start();
+    vi.stubGlobal('indexedDB', undefined);
+    Socket.sockets[0]!.receive({ version: 2, message: { type: 'server_challenge', payload: {
+      challenge_id: Array(16).fill(7), challenge_nonce: Array(32).fill(9), issued_at_ms: Date.now(), expires_at_ms: Date.now() + 10000,
+    } } });
+    try {
+      await until(() => Socket.sockets[0]!.sent.length > 0 || onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(Socket.sockets[0]!.sent).toHaveLength(0);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', error: expect.stringContaining('计数') }));
+    } finally { await peer.close('test_cleanup'); }
+  });
   it.each([600000, 20000])('expires pending consent at the signed intent deadline with a %i ms credential and a longer requested bootstrap', async credentialTtl => {
     const clock = controlledClock();
     context.bootstrap.credential.expires_at_ms = Date.now() + credentialTtl;

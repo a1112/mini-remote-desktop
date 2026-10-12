@@ -1053,7 +1053,10 @@ fn parse_record(
             )
         };
         if !browser_id
-            || raw.request.access_mode != WanAccessModeV3::Attended
+            || !matches!(
+                raw.request.access_mode,
+                WanAccessModeV3::Attended | WanAccessModeV3::Paired
+            )
             || !raw
                 .request
                 .requested_scopes

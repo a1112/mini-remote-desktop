@@ -186,7 +186,16 @@ impl Authenticator {
         }
         // Replay state is committed only after the backend token and all
         // signed identity bindings have been accepted.
-        replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        if let Some(browser) = &token.browser {
+            replay.accept_browser_session(
+                &metadata,
+                &browser.session_id,
+                token.expires_at_ms,
+                now_ms,
+            )?;
+        } else {
+            replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        }
         Ok(AuthenticatedRegistration { token, metadata })
     }
 

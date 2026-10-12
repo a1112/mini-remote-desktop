@@ -6,7 +6,7 @@ from app.schemas.session import DeviceSessionCreateIn, DeviceSessionOut, WanMedi
 
 
 class BrowserSessionCreateIn(DeviceSessionCreateIn):
-    access_mode: Literal["attended"] = "attended"
+    access_mode: Literal["attended", "paired"] = "attended"
     route_policy: Literal["direct_first", "relay_only"] = "direct_first"
     controller_public_key: list[int] = Field(min_length=32, max_length=32, repr=False)
     requested_profile: WanMediaProfileV3 | None = Field(default_factory=lambda: WanMediaProfileV3(

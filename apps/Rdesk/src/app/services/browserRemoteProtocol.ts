@@ -1,4 +1,5 @@
 import type { ControlInputEvent } from '../adapters/tauri/types';
+export { loadBrowserSigningIdentity, reserveBrowserSignalCounter } from './browserSigningIdentity';
 
 export type WireObject = Record<string, any>;
 export type SignedSignal = { payload: WireObject; signer_public_key: number[]; signature: number[] };
@@ -137,7 +138,7 @@ function requestObject(value: unknown): WireObject {
   const request = strictObject(value, REQUEST_FIELDS);
   for (const field of ['session_id', 'controller_device_id', 'target_device_id']) boundedText(request[field]);
   request.idempotency_key = byteArray(request.idempotency_key, 16);
-  if (!request.idempotency_key.some((v: number) => v !== 0) || request.controller_device_id === request.target_device_id || request.access_mode !== 'attended' || !['direct_first', 'relay_only'].includes(request.route_policy)) return malformed();
+  if (!request.idempotency_key.some((v: number) => v !== 0) || request.controller_device_id === request.target_device_id || !['attended', 'paired'].includes(request.access_mode) || !['direct_first', 'relay_only'].includes(request.route_policy)) return malformed();
   request.requested_scopes = sortedStrings(request.requested_scopes);
   request.requested_profile = canonicalProfile(request.requested_profile);
   return request;

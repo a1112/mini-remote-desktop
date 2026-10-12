@@ -47,6 +47,7 @@ export function HomePage() {
   const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
+  const [accessMode, setAccessMode] = useState<'attended' | 'paired'>('attended');
   const [copied, setCopied] = useState(false);
   const [connectingDeviceId, setConnectingDeviceId] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -128,6 +129,7 @@ export function HomePage() {
         targetDeviceName: target.name,
         targetOs: target.os,
         routePreference: "auto",
+        accessMode,
       });
       navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
@@ -299,11 +301,18 @@ export function HomePage() {
                     : "border-blue-100 bg-blue-50 text-blue-700"
                 }`}
               >
+                <label htmlFor="native-connection-access-mode" className="block mb-1.5 text-xs">连接授权方式</label>
+                <select id="native-connection-access-mode" value={accessMode}
+                  onChange={event => setAccessMode(event.target.value as 'attended' | 'paired')}
+                  disabled={connectingDeviceId !== null} className={`w-full px-2 py-1.5 mb-2 rounded border ${inputBg}`}>
+                  <option value="attended">首次连接或仅允许本次</option>
+                  <option value="paired">已配对，免重复确认</option>
+                </select>
                 <div className="font-medium" style={{ fontSize: 12 }}>
                   目标设备确认授权
                 </div>
                 <div className="mt-1 opacity-75" style={{ fontSize: 11 }}>
-                  当前安全会话仅支持目标端现场确认；不会使用密码绕过确认。
+                  首次连接可在目标端选择配对并记住此控制端；以后选择已配对连接。密码刷新或访问凭据变更后需重新本机确认和配对。
                 </div>
               </div>
 

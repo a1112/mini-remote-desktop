@@ -3,6 +3,7 @@ import { attachBrowserRemoteSession, closeAllBrowserRemoteSessions, createBrowse
 import * as protocol from './browserRemoteProtocol';
 import protocolFixture from '../../../../realtime-server/tests/fixtures/browser_protocol_v3.json';
 import relayFixture from './__fixtures__/browser-relay-directory.json';
+import { IDBFactory } from 'fake-indexeddb';
 const cryptoModuleName = 'node:crypto';
 const { webcrypto } = await import(/* @vite-ignore */ cryptoModuleName) as { webcrypto: Crypto };
 
@@ -10,6 +11,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.stubGlobal('crypto', webcrypto);
   vi.stubGlobal('isSecureContext', true);
+  vi.stubGlobal('indexedDB', new IDBFactory());
 });
 afterEach(async () => { await closeAllBrowserRemoteSessions('test_cleanup').catch(() => undefined); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
 const timerModuleName = 'node:timers';
@@ -38,6 +40,27 @@ async function successfulGuestBootstrap(init: RequestInit) {
 }
 
 describe('temporary password guest browser access', () => {
+  it('keeps guest password authentication and reuses the first pairing key for explicit paired reconnect', async () => {
+    const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    const stable = await protocol.loadBrowserSigningIdentity();
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    await closeAllBrowserRemoteSessions();
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345', accessMode: 'paired' });
+    const creates = request.mock.calls.filter(([url]) => url.endsWith('/guest-browser-sessions'));
+    expect(creates).toHaveLength(2);
+    const bodies = creates.map(([, init]) => JSON.parse(init.body as string));
+    expect(bodies[0].controller_public_key).toEqual(stable.publicKey);
+    expect(bodies[1]).toMatchObject({ controller_public_key: stable.publicKey, access_mode: 'paired', temporary_password: 'ABCD2345' });
+    expect(creates[1]![1].headers).not.toHaveProperty('Authorization');
+  });
+  it('does not retry a rejected unknown paired key as an attended request', async () => {
+    const request = vi.fn(async (_url: string, _init: RequestInit) => new Response(JSON.stringify({ detail: '此控制端尚未配对' }), { status: 403 }));
+    vi.stubGlobal('fetch', request);
+    await expect(createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345', accessMode: 'paired' })).rejects.toThrow('尚未配对');
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(request.mock.calls[0]![1].body as string).access_mode).toBe('paired');
+  });
   it.each(['abcd2345', 'ABCD2340', 'ABCD2341', 'ABCD23I5', 'ABCD23O5'])('rejects a password outside the issued alphabet before network access: %s', async (temporaryPassword) => {
     const request = vi.fn(); vi.stubGlobal('fetch', request);
     await expect(createBrowserRemoteSession('753662296', { temporaryPassword })).rejects.toThrow('临时密码');
@@ -117,7 +140,7 @@ describe('independent browser remote session bootstrap', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it('sends only a temporary public key and scoped H264 request with the user credential', async () => {
+  it('sends only the stable public key and scoped H264 request with the user credential', async () => {
     localStorage.setItem('rdesk_access_token', 'user-session-credential');
     const request = vi.fn(async () => new Response(JSON.stringify({ detail: { code: 'target_denied', message: '目标不可访问' } }), { status: 403 }));
     vi.stubGlobal('fetch', request);
@@ -171,10 +194,10 @@ describe('independent browser remote session bootstrap', () => {
 
   it('does not submit a new browser principal when logout happens during key generation', async () => {
     localStorage.setItem('rdesk_access_token', 'user-session-credential');
-    const actual = protocol.createBrowserSigningIdentity;
+    const actual = protocol.loadBrowserSigningIdentity;
     let entered = false, release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    vi.spyOn(protocol, 'createBrowserSigningIdentity').mockImplementationOnce(async () => { const identity = await actual(); entered = true; await gate; return identity; });
+    vi.spyOn(protocol, 'loadBrowserSigningIdentity').mockImplementationOnce(async () => { const identity = await actual(); entered = true; await gate; return identity; });
     const request = vi.fn(async () => new Response(JSON.stringify({ detail: 'unexpected request' }), { status: 403 }));
     vi.stubGlobal('fetch', request);
     const creating = createBrowserRemoteSession(protocolFixture.request.target_device_id);

@@ -151,6 +151,7 @@ struct Target {
     resource: Option<Resource>,
     input: HashMap<PermissionScope, InputResource>,
     closing: bool,
+    paired_authority_id: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -359,6 +360,7 @@ impl ConsoleCaptureState {
             resource: None,
             input: HashMap::new(),
             closing: false,
+            paired_authority_id: None,
         };
         self.validate_target(state, &target)
             .context(ConsoleConsentFailure::TargetChanged)?;
@@ -385,6 +387,166 @@ impl ConsoleCaptureState {
             targets.insert(response.session_id.clone(), target);
         }
         Ok(())
+    }
+
+    /// Install independent paired-policy authority after the exact backend grant.
+    /// The caller holds the service authorization security gate across this await.
+    pub(crate) async fn prepare_paired_session(
+        &self,
+        state: &AppState,
+        session_id: &SessionId,
+    ) -> Result<()> {
+        let _operation = self.operation.lock().await;
+        crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
+            state, session_id,
+        )
+        .await
+        .map_err(|failure| anyhow!(failure.message))?;
+        let now = now_ms();
+        let snapshot = state
+            .session_authorizations
+            .snapshot_at(session_id, now)
+            .await
+            .context("Paired session missing")?;
+        ensure!(
+            snapshot.role == RemoteSessionRole::Agent
+                && snapshot.authorization_state == RemoteAuthorizationState::Granted,
+            "Paired desktop requires the exact active grant"
+        );
+        let grant = state
+            .session_authorizations
+            .active_grant(session_id)
+            .await
+            .context("Paired grant missing")?;
+        ensure!(
+            grant
+                .granted_scopes
+                .contains(&RemotePermissionScope::ScreenView),
+            "Paired desktop requires screen.view"
+        );
+        let active = active_console()?;
+        let observed = state
+            .agent_registry
+            .active_for_session_at(active, now)
+            .context("Paired Agent unavailable")?;
+        ensure!(
+            observed.identity.protocol_minor
+                >= mrd_agent_ipc::AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR,
+            "Paired Agent protocol changed"
+        );
+        let binding =
+            state
+                .agent_registry
+                .bind_active_session(active, AgentCapability::Capture, now)?;
+        let expires = grant
+            .expires_at_ms
+            .min(now.saturating_add(mrd_agent_ipc::AGENT_PAIRED_AUTHORITY_MAX_LIFETIME_MS));
+        ensure!(expires > now, "Paired grant expired");
+        let authority_id = random_id()?;
+        let authority =
+            self.issuer()?
+                .issue_paired_authority(mrd_agent_ipc::PairedSessionAuthorityClaims {
+                    authority_id,
+                    registration_id: *binding.registration_id(),
+                    registration_epoch: binding.registration_epoch(),
+                    session_id: session_id.clone(),
+                    peer: PeerBinding {
+                        device_id: snapshot.peer_device_id,
+                        key_id: decode_peer_key(&snapshot.peer_key_id)?,
+                    },
+                    scopes: grant
+                        .granted_scopes
+                        .iter()
+                        .copied()
+                        .map(PermissionScope::from)
+                        .collect(),
+                    policy_revision: grant.policy_revision,
+                    windows_session_id: active,
+                    desktop_epoch: binding.desktop_epoch(),
+                    desktop_kind: DesktopKind::Default,
+                    issued_at_ms: now,
+                    not_before_ms: now,
+                    expires_at_ms: expires,
+                    audience: mrd_agent_ipc::GrantAudience::SessionAgent,
+                })?;
+        let server = state
+            .console_agent_server()
+            .context("Paired Agent server unavailable")?;
+        {
+            let mut targets = self.targets.lock().await;
+            ensure!(
+                targets.len() < MAX_CONSOLE_TARGETS && !targets.contains_key(session_id),
+                "Paired desktop target already exists or capacity exhausted"
+            );
+            targets.insert(
+                session_id.clone(),
+                Target {
+                    binding: binding.clone(),
+                    logon_hash: observed.identity.logon_sid_hash,
+                    authorization_expires_at_ms: expires,
+                    resource: None,
+                    input: HashMap::new(),
+                    closing: false,
+                    paired_authority_id: Some(authority_id),
+                },
+            );
+        }
+        let result = server.request_paired_authority(&binding, authority).await;
+        if !matches!(result, Ok(ref ack) if ack.outcome == mrd_agent_ipc::PairedSessionAuthorityOutcome::Installed)
+        {
+            self.finish_failed_paired_install(state, session_id, &result)
+                .await;
+            anyhow::bail!("Paired desktop authority was not installed");
+        }
+        let target = self
+            .targets
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .context("Paired target disappeared")?;
+        if self.validate_target(state, &target).is_err()
+            || crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
+                state, session_id,
+            )
+            .await
+            .is_err()
+        {
+            self.stop_inner(state, session_id).await;
+            anyhow::bail!("Paired policy or desktop changed during installation");
+        }
+        Ok(())
+    }
+
+    async fn finish_failed_paired_install(
+        &self,
+        state: &AppState,
+        session_id: &SessionId,
+        result: &std::result::Result<
+            mrd_agent_ipc::PairedSessionAuthorityResult,
+            AgentRequestError,
+        >,
+    ) {
+        if let Ok(ack) = result {
+            if ack.outcome == mrd_agent_ipc::PairedSessionAuthorityOutcome::Rejected
+                && &ack.session_id == session_id
+            {
+                if let Some(target) = self.targets.lock().await.get_mut(session_id) {
+                    // Only an exact rejection of this still-empty installation
+                    // proves that no authority needs a later revoke. Unknown
+                    // outcomes retain the target until cleanup is confirmed.
+                    if target.paired_authority_id == Some(ack.authority_id)
+                        && target.binding.registration_id() == &ack.registration_id
+                        && target.binding.registration_epoch() == ack.registration_epoch
+                        && target.resource.is_none()
+                        && target.input.is_empty()
+                    {
+                        target.paired_authority_id = None;
+                    }
+                }
+            }
+        }
+        self.stop_inner(state, session_id).await;
     }
 
     /// Resolve the approved exact target, start its capture resource, and keep
@@ -429,7 +591,7 @@ impl ConsoleCaptureState {
             .await
             .get(session_id)
             .cloned()
-            .context("Attended consent did not bind a target desktop")?;
+            .context("Session authority did not bind a target desktop")?;
         self.validate_target(state, &target)?;
         ensure!(
             !target.closing && !target.input.values().any(|input| input.cleanup_pending),
@@ -700,11 +862,42 @@ impl ConsoleCaptureState {
                 }
             }
         }
-        let mut targets = self.targets.lock().await;
-        if targets
+        let resources_cleared = self
+            .targets
+            .lock()
+            .await
             .get(session_id)
-            .is_some_and(|current| current.resource.is_none() && current.input.is_empty())
-        {
+            .is_some_and(|current| current.resource.is_none() && current.input.is_empty());
+        if resources_cleared {
+            if let Some(authority_id) = target.paired_authority_id {
+                let result = match state.console_agent_server() {
+                    Some(server) => {
+                        server
+                            .request_revoke_paired_authority(
+                                &target.binding,
+                                authority_id,
+                                session_id.clone(),
+                            )
+                            .await
+                    }
+                    None => Err(AgentRequestError::ConnectionUnavailable),
+                };
+                if matches!(result, Ok(ref ack) if ack.outcome == mrd_agent_ipc::PairedSessionAuthorityOutcome::Revoked)
+                {
+                    if let Some(current) = self.targets.lock().await.get_mut(session_id) {
+                        current.paired_authority_id = None;
+                    }
+                } else {
+                    tracing::warn!("Paired desktop authority cleanup was not acknowledged");
+                }
+            }
+        }
+        let mut targets = self.targets.lock().await;
+        if targets.get(session_id).is_some_and(|current| {
+            current.resource.is_none()
+                && current.input.is_empty()
+                && current.paired_authority_id.is_none()
+        }) {
             targets.remove(session_id);
         }
     }

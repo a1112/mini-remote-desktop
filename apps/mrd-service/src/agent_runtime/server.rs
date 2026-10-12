@@ -8,13 +8,15 @@ use mrd_agent_ipc::{
     decode_frame, validate_consent_result, write_frame, AgentCapability, AgentHeartbeat,
     AgentStopping, AgentToService, CancelConsent, CommandResult, ConsentCancelReason,
     ConsentDecision, ConsentRequest, ConsentResult, ConsentValidationError, ExecuteCommand,
-    FrameError, InputAck, InputEventEnvelope, InputRejection, MediaAccessUnit,
-    RegisteredAgentIdentity, RenderAccessUnit, RenderBoundaryMetrics, ServiceToAgent, StopAgent,
-    StopReason, ValidatedConsent, AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR,
-    AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, AGENT_IPC_FRAME_HEADER_BYTES,
-    AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
-    AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR,
-    AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
+    FrameError, InputAck, InputEventEnvelope, InputRejection, InstallPairedSessionAuthority,
+    MediaAccessUnit, PairedSessionAuthority, PairedSessionAuthorityOutcome,
+    PairedSessionAuthorityResult, RegisteredAgentIdentity, RenderAccessUnit, RenderBoundaryMetrics,
+    RevokePairedSessionAuthority, ServiceToAgent, StopAgent, StopReason, ValidatedConsent,
+    AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR,
+    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR,
+    AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR,
+    AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR, AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR,
 };
 use mrd_proto::SessionId;
 use std::{
@@ -136,6 +138,9 @@ pub enum AgentServerError {
 /// Failures for one exact, response-bearing request to a session agent.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AgentRequestError {
+    /// A paired request does not match its exact immutable Agent binding.
+    #[error("paired authority request is invalid")]
+    InvalidPairedAuthority,
     /// The persisted agent binding is no longer routable.
     #[error(transparent)]
     Route(#[from] AgentRouteError),
@@ -204,6 +209,8 @@ impl InputCorrelationKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RequestCorrelationKey {
+    PairedInstall(u64),
+    PairedRevoke(u64),
     Input(u64),
     Consent(u64),
     Execute(u64),
@@ -211,12 +218,19 @@ enum RequestCorrelationKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RequestSemanticKey {
+    PairedInstall([u8; 32]),
+    PairedRevoke([u8; 32]),
     Input(InputCorrelationKey),
     Consent([u8; 16]),
     Execute([u8; 16]),
 }
 
 enum PendingReply {
+    Paired {
+        request: RevokePairedSessionAuthority,
+        installing: bool,
+        reply: oneshot::Sender<Result<PairedSessionAuthorityResult, AgentRequestError>>,
+    },
     Input {
         registration_id: [u8; 16],
         registration_epoch: u64,
@@ -237,6 +251,9 @@ enum PendingReply {
 impl PendingReply {
     fn fail(self, error: AgentRequestError) {
         match self {
+            Self::Paired { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Input { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -286,6 +303,7 @@ struct RequestCorrelationState {
 struct ConnectionControl {
     outbound: mpsc::Sender<OutboundMessage>,
     requests: Arc<Mutex<RequestCorrelationState>>,
+    paired_abort: watch::Sender<bool>,
 }
 
 impl ConnectionControl {
@@ -293,6 +311,7 @@ impl ConnectionControl {
         Self {
             outbound,
             requests: Arc::new(Mutex::new(RequestCorrelationState::default())),
+            paired_abort: watch::channel(false).0,
         }
     }
 
@@ -357,6 +376,16 @@ impl ConnectionControl {
     }
 
     fn queue_consent_cancel(&self, reply: &PendingReply, reason: RequestCancellation) {
+        if matches!(
+            reply,
+            PendingReply::Paired {
+                installing: true,
+                ..
+            }
+        ) {
+            self.paired_abort.send_replace(true);
+            return;
+        }
         let PendingReply::Consent { request, .. } = reply else {
             return;
         };
@@ -375,6 +404,10 @@ impl ConnectionControl {
         message: &ServiceToAgent,
         reason: RequestCancellation,
     ) {
+        if matches!(message, ServiceToAgent::InstallPairedSessionAuthority(_)) {
+            self.paired_abort.send_replace(true);
+            return;
+        }
         let ServiceToAgent::ConsentRequest(request) = message else {
             return;
         };
@@ -497,6 +530,45 @@ impl ConnectionControl {
         }
     }
 
+    fn resolve_paired_result(&self, result: PairedSessionAuthorityResult) {
+        let pending = {
+            let Ok(mut requests) = self.requests.lock() else {
+                return;
+            };
+            let found = [RequestCorrelationKey::PairedInstall(result.request_token), RequestCorrelationKey::PairedRevoke(result.request_token)]
+                .into_iter().find(|key| requests.pending.get(key).is_some_and(|pending| {
+                    pending.sent && matches!(&pending.reply, PendingReply::Paired {request, installing, ..}
+                        if request.authority_id == result.authority_id
+                        && request.registration_id == result.registration_id
+                        && request.registration_epoch == result.registration_epoch
+                        && request.session_id == result.session_id
+                        && (result.outcome == PairedSessionAuthorityOutcome::Rejected
+                            || (*installing && result.outcome == PairedSessionAuthorityOutcome::Installed)
+                            || (!*installing && result.outcome == PairedSessionAuthorityOutcome::Revoked)))
+                }));
+            found.and_then(|key| remove_pending_request(&mut requests, &key))
+        };
+        if let Some(PendingRequest {
+            reply: PendingReply::Paired { reply, .. },
+            ..
+        }) = pending
+        {
+            let _ = reply.send(Ok(result));
+        }
+    }
+
+    async fn wait_paired_abort(&self) {
+        let mut signal = self.paired_abort.subscribe();
+        loop {
+            if *signal.borrow_and_update() {
+                return;
+            }
+            if signal.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     fn fail_all(&self, error: AgentRequestError) {
         let reason = if error == AgentRequestError::Revoked {
             RequestCancellation::PolicyChanged
@@ -553,6 +625,12 @@ impl PendingRequestGuard {
     fn cancel(&mut self, reason: RequestCancellation) {
         if self.armed {
             self.armed = false;
+            // The Agent may already have installed authority and its reply may
+            // already be buffered after pending correlation was removed. Until
+            // the caller receives the API result, abort still revokes ownership.
+            if matches!(self.key, RequestCorrelationKey::PairedInstall(_)) {
+                self.control.paired_abort.send_replace(true);
+            }
             self.control.cancel_request(&self.key, reason);
         }
     }
@@ -1006,6 +1084,162 @@ impl AgentServer {
         }
     }
 
+    /// Install one independently signed authority and wait for its exact acknowledgement.
+    pub async fn request_paired_authority(
+        &self,
+        binding: &AgentBinding,
+        authority: PairedSessionAuthority,
+    ) -> Result<PairedSessionAuthorityResult, AgentRequestError> {
+        let claims = &authority.claims;
+        if mrd_agent_ipc::validate_paired_authority_claims(claims).is_err()
+            || claims.registration_id != *binding.registration_id()
+            || claims.registration_epoch != binding.registration_epoch()
+            || claims.windows_session_id != binding.windows_session_id()
+            || claims.desktop_epoch != binding.desktop_epoch()
+            || self.clock.now_ms() < claims.not_before_ms
+            || self.clock.now_ms() >= claims.expires_at_ms
+        {
+            return Err(AgentRequestError::InvalidPairedAuthority);
+        }
+        let request = RevokePairedSessionAuthority {
+            request_token: 0,
+            authority_id: claims.authority_id,
+            registration_id: claims.registration_id,
+            registration_epoch: claims.registration_epoch,
+            session_id: claims.session_id.clone(),
+        };
+        self.request_paired_change(binding, request, Some(authority))
+            .await
+    }
+
+    /// Revoke one exact authority, including an expired authority retained as a tombstone.
+    pub async fn request_revoke_paired_authority(
+        &self,
+        binding: &AgentBinding,
+        authority_id: [u8; 32],
+        session_id: SessionId,
+    ) -> Result<PairedSessionAuthorityResult, AgentRequestError> {
+        if authority_id == [0; 32]
+            || session_id.0.is_empty()
+            || session_id.0.len() > mrd_agent_ipc::AGENT_IPC_MAX_IDENTIFIER_BYTES
+        {
+            return Err(AgentRequestError::InvalidPairedAuthority);
+        }
+        let request = RevokePairedSessionAuthority {
+            request_token: 0,
+            authority_id,
+            session_id,
+            registration_id: *binding.registration_id(),
+            registration_epoch: binding.registration_epoch(),
+        };
+        self.request_paired_change(binding, request, None).await
+    }
+
+    async fn request_paired_change(
+        &self,
+        binding: &AgentBinding,
+        mut request: RevokePairedSessionAuthority,
+        authority: Option<PairedSessionAuthority>,
+    ) -> Result<PairedSessionAuthorityResult, AgentRequestError> {
+        let installing = authority.is_some();
+        let capability = AgentCapability::Capture;
+        if binding.required_capability() != capability {
+            return Err(AgentRouteError::CapabilityBindingMismatch.into());
+        }
+        let minimum = AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR;
+        let route = if installing {
+            self.registry.resolve_exact_with_minimum_minor(
+                binding,
+                capability,
+                minimum,
+                self.clock.now_ms(),
+            )
+        } else {
+            self.registry.resolve_cleanup_with_minimum_minor(
+                binding,
+                capability,
+                minimum,
+                self.clock.now_ms(),
+            )
+        }?;
+        let control = self
+            .controls
+            .lock()
+            .map_err(|_| AgentRequestError::ConnectionUnavailable)?
+            .get(&route.connection_id())
+            .cloned()
+            .ok_or(AgentRequestError::ConnectionUnavailable)?;
+        let token = self.next_request_token()?;
+        request.request_token = token;
+        let (key, semantic) = if installing {
+            (
+                RequestCorrelationKey::PairedInstall(token),
+                RequestSemanticKey::PairedInstall(request.authority_id),
+            )
+        } else {
+            (
+                RequestCorrelationKey::PairedRevoke(token),
+                RequestSemanticKey::PairedRevoke(request.authority_id),
+            )
+        };
+        let message = match authority {
+            Some(authority) => ServiceToAgent::InstallPairedSessionAuthority(Box::new(
+                InstallPairedSessionAuthority {
+                    request_token: token,
+                    authority,
+                },
+            )),
+            None => ServiceToAgent::RevokePairedSessionAuthority(request.clone()),
+        };
+        let (reply, response) = oneshot::channel();
+        let (cancellation, cancelled) = watch::channel(None);
+        control.register_request(
+            key.clone(),
+            PendingRequest {
+                semantic,
+                sent: false,
+                cancellation,
+                reply: PendingReply::Paired {
+                    request,
+                    installing,
+                    reply,
+                },
+            },
+        )?;
+        let mut pending_guard = PendingRequestGuard {
+            control: control.clone(),
+            key: key.clone(),
+            armed: true,
+        };
+        let mut lease = route.into_lease();
+        if lease.is_revoked() {
+            return Err(AgentRequestError::Revoked);
+        }
+        control
+            .outbound
+            .try_send(OutboundMessage::Request {
+                message,
+                key,
+                binding: binding.clone(),
+                required_capability: capability,
+                minimum_protocol_minor: minimum,
+                cancellation: cancelled,
+            })
+            .map_err(|_| AgentRequestError::OutboundUnavailable)?;
+        let response_lease = lease.clone();
+        let result = tokio::select! { biased;
+            response=response => match response {Ok(Ok(_)) if response_lease.is_revoked()=>Err(AgentRequestError::Revoked),Ok(result)=>result,Err(_)=>Err(AgentRequestError::Disconnected)},
+            _=lease.wait_revoked()=>Err(AgentRequestError::Revoked),
+            _=tokio::time::sleep(self.request_timeout)=>Err(AgentRequestError::Timeout),
+        };
+        // Returning a validated reply transfers ownership to the service's
+        // recorded target. No await occurs between disarming and returning.
+        if result.is_ok() {
+            pending_guard.armed = false;
+        }
+        result
+    }
+
     fn next_request_token(&self) -> Result<u64, AgentRequestError> {
         self.next_request_token
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |token| {
@@ -1112,6 +1346,10 @@ impl AgentServer {
         loop {
             tokio::select! {
                 biased;
+                _ = control.wait_paired_abort() => {
+                    control.fail_all(AgentRequestError::Revoked);
+                    return Ok(AgentConnectionExit::Disconnected);
+                }
                 _ = lease.wait_revoked() => {
                     control.fail_all(AgentRequestError::Revoked);
                     return self
@@ -1187,6 +1425,10 @@ impl AgentServer {
                         Some(InboundEvent::Message(AgentToService::CommandResult(result))) => {
                             control.resolve_command_result(result);
                         }
+                        Some(InboundEvent::Message(AgentToService::PairedSessionAuthorityResult(result))) => {
+                            if identity.protocol_minor < AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR { return Err(AgentServerError::UnsupportedRegisteredMessage); }
+                            control.resolve_paired_result(result);
+                        }
                         Some(InboundEvent::Message(AgentToService::AgentStopping(stopping))) => {
                             let heartbeat = AgentHeartbeat { context: stopping.context };
                             match self.registry.record_heartbeat(
@@ -1260,7 +1502,8 @@ impl AgentServer {
                             {
                                 continue;
                             }
-                            let cleanup = matches!(&message, ServiceToAgent::Execute(execute) if execute.command.is_cleanup());
+                            let cleanup = matches!(&message, ServiceToAgent::Execute(execute) if execute.command.is_cleanup())
+                                || matches!(&message, ServiceToAgent::RevokePairedSessionAuthority(_));
                             let revalidated_route = if cleanup {
                                 self.registry.resolve_cleanup_with_minimum_minor(&binding, required_capability, minimum_protocol_minor, self.clock.now_ms())
                             } else {
@@ -1606,6 +1849,148 @@ mod tests {
         io::{duplex, AsyncReadExt},
         sync::oneshot,
     };
+
+    #[tokio::test]
+    async fn paired_ack_requires_sent_token_action_and_every_immutable_binding() {
+        let (outbound, _) = mpsc::channel(1);
+        let control = ConnectionControl::new(outbound);
+        let request = RevokePairedSessionAuthority {
+            request_token: 17,
+            authority_id: [1; 32],
+            registration_id: [2; 16],
+            registration_epoch: 3,
+            session_id: SessionId("paired".into()),
+        };
+        let good = PairedSessionAuthorityResult {
+            request_token: 17,
+            authority_id: request.authority_id,
+            registration_id: request.registration_id,
+            registration_epoch: 3,
+            session_id: request.session_id.clone(),
+            outcome: PairedSessionAuthorityOutcome::Installed,
+        };
+        let (reply, mut response) = oneshot::channel();
+        let key = RequestCorrelationKey::PairedInstall(17);
+        control
+            .register_request(
+                key.clone(),
+                PendingRequest {
+                    semantic: RequestSemanticKey::PairedInstall(request.authority_id),
+                    sent: false,
+                    cancellation: watch::channel(None).0,
+                    reply: PendingReply::Paired {
+                        request,
+                        installing: true,
+                        reply,
+                    },
+                },
+            )
+            .unwrap();
+        control.resolve_paired_result(good.clone());
+        assert!(response.try_recv().is_err());
+        control.mark_request_sent(&key);
+        for change in 0..6 {
+            let mut forged = good.clone();
+            match change {
+                0 => forged.request_token += 1,
+                1 => forged.authority_id[0] ^= 1,
+                2 => forged.registration_id[0] ^= 1,
+                3 => forged.registration_epoch += 1,
+                4 => forged.session_id.0.push('x'),
+                _ => forged.outcome = PairedSessionAuthorityOutcome::Revoked,
+            }
+            control.resolve_paired_result(forged);
+            assert!(response.try_recv().is_err());
+            assert!(control.is_request_pending(&key));
+        }
+        control.resolve_paired_result(good.clone());
+        assert_eq!(response.await.unwrap().unwrap(), good);
+    }
+
+    #[tokio::test]
+    async fn cancelling_written_paired_install_closes_connection_for_terminal_cleanup() {
+        let (outbound, _) = mpsc::channel(1);
+        let control = ConnectionControl::new(outbound);
+        let request = RevokePairedSessionAuthority {
+            request_token: 1,
+            authority_id: [1; 32],
+            registration_id: [2; 16],
+            registration_epoch: 3,
+            session_id: SessionId("paired".into()),
+        };
+        let key = RequestCorrelationKey::PairedInstall(1);
+        control
+            .register_request(
+                key.clone(),
+                PendingRequest {
+                    semantic: RequestSemanticKey::PairedInstall([1; 32]),
+                    sent: false,
+                    cancellation: watch::channel(None).0,
+                    reply: PendingReply::Paired {
+                        request,
+                        installing: true,
+                        reply: oneshot::channel().0,
+                    },
+                },
+            )
+            .unwrap();
+        control.mark_request_sent(&key);
+        control.cancel_request(&key, RequestCancellation::CallerAborted);
+        tokio::time::timeout(Duration::from_millis(100), control.wait_paired_abort())
+            .await
+            .unwrap();
+        assert!(!control.is_request_pending(&key));
+    }
+
+    #[tokio::test]
+    async fn paired_install_cancel_after_ack_publication_still_closes_connection() {
+        let (outbound, _) = mpsc::channel(1);
+        let control = ConnectionControl::new(outbound);
+        let request = RevokePairedSessionAuthority {
+            request_token: 1,
+            authority_id: [1; 32],
+            registration_id: [2; 16],
+            registration_epoch: 3,
+            session_id: SessionId("paired".into()),
+        };
+        let key = RequestCorrelationKey::PairedInstall(1);
+        let (reply, response) = oneshot::channel();
+        control
+            .register_request(
+                key.clone(),
+                PendingRequest {
+                    semantic: RequestSemanticKey::PairedInstall([1; 32]),
+                    sent: true,
+                    cancellation: watch::channel(None).0,
+                    reply: PendingReply::Paired {
+                        request,
+                        installing: true,
+                        reply,
+                    },
+                },
+            )
+            .unwrap();
+        let guard = PendingRequestGuard {
+            control: control.clone(),
+            key,
+            armed: true,
+        };
+        control.resolve_paired_result(PairedSessionAuthorityResult {
+            request_token: 1,
+            authority_id: [1; 32],
+            registration_id: [2; 16],
+            registration_epoch: 3,
+            session_id: SessionId("paired".into()),
+            outcome: PairedSessionAuthorityOutcome::Installed,
+        });
+        // ACK is buffered, but the caller has not polled the request future to
+        // completion. Abort must not orphan this independently installed grant.
+        drop(response);
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(30), control.wait_paired_abort())
+            .await
+            .expect("cancelled ACK delivery must fail-stop the connection");
+    }
 
     #[tokio::test]
     async fn revocation_cancels_a_stalled_outbound_frame() {

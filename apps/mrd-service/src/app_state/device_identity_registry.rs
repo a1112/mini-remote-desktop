@@ -103,6 +103,15 @@ impl Default for DeviceIdentityRegistry {
 }
 
 impl DeviceIdentityRegistry {
+    /// Production paired policy never falls back to an in-memory trust projection.
+    pub(crate) fn paired_policy_store(&self) -> Result<Arc<PersistentStore>, StoreError> {
+        match &self.backend {
+            DeviceIdentityBackend::Persistent { store, .. } => Ok(Arc::clone(store)),
+            DeviceIdentityBackend::InMemory { .. } => Err(StoreError::TrustTransition(
+                "paired access requires the sealed production store".to_owned(),
+            )),
+        }
+    }
     pub(crate) fn persistent(
         store: Arc<PersistentStore>,
         machine_identity: DeviceIdentity,

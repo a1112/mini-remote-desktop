@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use mrd_application::{AuthenticatedSessionSignal, VerifiedSignalingEvent};
 use mrd_identity::DeviceIdentity;
 use mrd_proto::SessionId;
-use mrd_signal_proto::{SignalReplayGuard, WanAccessModeV3, WanRoutePolicyV3, WanSessionRequestV3};
+use mrd_signal_proto::{SignalReplayGuard, WanRoutePolicyV3, WanSessionRequestV3};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -1691,9 +1691,7 @@ fn validate_request_identity(
     request
         .validate()
         .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
-    if request.access_mode != WanAccessModeV3::Attended
-        || !request_matches_identity(identity, request)
-    {
+    if !request_matches_identity(identity, request) {
         return Err(WanSessionCoordinatorError::BackendBindingMismatch);
     }
     Ok(())

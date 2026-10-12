@@ -17,7 +17,10 @@ pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 /// binds StartCapture to exact approved encoder settings. Minor 7 authenticates
 /// the actual physical capture rectangle for product input-coordinate mapping.
 /// Minor 8 binds every input event to an exclusive injection deadline.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 8;
+/// Minor 9 adds distinct signed paired-session authority installation and revocation.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 9;
+/// Minimum minor version that independently verifies paired-session authority.
+pub const AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR: u16 = 9;
 /// Minimum negotiated minor version that enforces input event deadlines.
 pub const AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR: u16 = 8;
 /// Minimum negotiated minor version that carries real capture-source bounds.

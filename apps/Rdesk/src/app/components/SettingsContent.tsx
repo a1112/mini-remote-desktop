@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { PairedAccessPolicyCard } from './PairedAccessPolicyCard';
 import { Bell, LogOut, Monitor, Palette, Shield, User, Volume2, Wifi } from 'lucide-react';
 import { useAuth } from './AuthContext';
 import { useTheme } from './ThemeContext';
@@ -150,7 +151,8 @@ export function SettingsContent() {
         </Row><Feedback {...quit} />
       </>}
       {active === 'security' && <>
-        <p className="mb-2 text-xs leading-relaxed text-gray-500">以下配置尚未接入后台。每次远程连接仍使用现有授权流程。</p>
+        <PairedAccessPolicyCard native={native} />
+        <p className="mb-2 text-xs leading-relaxed text-gray-500">以下配置尚未接入后台。</p>
         <Unsupported label="双因素认证" description="账户的额外验证" toggle />
         <Unsupported label="连接密码" description="连接密码策略设置" toggle />
         <Unsupported label="空闲自动锁定" description="空闲超时断开策略" toggle />

@@ -2,7 +2,7 @@ import { TEMPORARY_PASSWORD_PATTERN } from '../utils/temporaryPassword';
 import type { ControlInputEvent, MediaProfile, RemoteRoutePreference } from '../adapters/tauri/types';
 import { SERVER_API_URL } from './serverConfig';
 import {
-  byteArray, canonicalWanRequest, createBrowserSigningIdentity, normalizedH264Profile,
+  byteArray, canonicalWanRequest, loadBrowserSigningIdentity, normalizedH264Profile,
   randomBytes, safeInteger, wanRequestCommitment, type BrowserSigningIdentity, type WireObject,
 } from './browserRemoteProtocol';
 
@@ -26,6 +26,7 @@ export type BrowserRemoteHandle = {
   close: (reason?: string) => Promise<void>;
 };
 export type BrowserRemoteCreateOptions = {
+  accessMode?: 'attended' | 'paired';
   sessionId?: string;
   targetDeviceName?: string;
   targetOs?: string;
@@ -128,6 +129,8 @@ export async function createBrowserRemoteSession(
   targetDeviceId: string,
   options?: BrowserRemoteCreateOptions,
 ): Promise<{ sessionId: string }> {
+  const accessMode = options?.accessMode ?? 'attended';
+  if (accessMode !== 'attended' && accessMode !== 'paired') throw new Error('连接授权方式无效');
   const guest = options?.temporaryPassword !== undefined;
   let password = options?.temporaryPassword ?? '';
   if (guest && !TEMPORARY_PASSWORD_PATTERN.test(password)) throw new Error('请输入设备上显示的 8 位临时密码');
@@ -146,11 +149,11 @@ export async function createBrowserRemoteSession(
   let accessToken = token;
   let created = false;
   try {
-    const identity = await createBrowserSigningIdentity();
+    const identity = await loadBrowserSigningIdentity();
     if (!stillCurrent()) throw new Error('网页会话创建已取消');
     const body = {
       session_id: sessionId, idempotency_key: randomBytes(16), target_device_id: targetDeviceId,
-      access_mode: 'attended', requested_scopes: ['input.keyboard', 'input.pointer', 'screen.view'],
+      access_mode: accessMode, requested_scopes: ['input.keyboard', 'input.pointer', 'screen.view'],
       requested_profile: normalizedH264Profile(options?.requestedProfile),
       route_policy: options?.routePreference === 'wan_relay' ? 'relay_only' : 'direct_first',
       controller_public_key: identity.publicKey,

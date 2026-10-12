@@ -140,6 +140,16 @@ describe("launchRemoteDisplayForDevice", () => {
     );
   });
 
+  it('forwards explicitly selected paired access to the native authenticated session request', async () => {
+    await launchRemoteDisplayForDevice('remote-device', { sessionId: 'paired-native', accessMode: 'paired' });
+    expect(mocks.requestRemoteSession).toHaveBeenCalledWith('paired-native', 'remote-device', 'webrtc', undefined, 'auto', 'paired');
+  });
+  it('forwards explicitly selected paired access and password to the browser session endpoint', async () => {
+    mocks.runtime.isTauri = false;
+    await launchRemoteDisplayForDevice('remote-device', { accessMode: 'paired', temporaryPassword: 'ABCD2345' });
+    expect(mocks.createBrowserRemoteSession).toHaveBeenCalledWith('remote-device', { accessMode: 'paired', temporaryPassword: 'ABCD2345' });
+  });
+
   it("starts a local E2E display flow when the selected target is this device", async () => {
     const result = await launchRemoteDisplayForDevice("local-device", {
       sessionId: "local-display-test-explicit",

@@ -89,6 +89,7 @@ function isMacOsTarget(targetOs?: string): boolean {
 }
 
 export type RemoteDisplayLaunchOptions = {
+  accessMode?: 'attended' | 'paired';
   transportKind?: TransportKind;
   sessionId?: string;
   openWindow?: boolean;
@@ -151,6 +152,7 @@ export async function launchRemoteDisplayForDevice(
   if (!tauriRuntime) {
     if (!options?.localTest) {
       const browserSession = await createBrowserRemoteSession(targetDeviceId, {
+        ...(options?.accessMode ? { accessMode: options.accessMode } : {}),
         ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
         ...(options?.targetDeviceName ? { targetDeviceName: options.targetDeviceName } : {}),
         ...(options?.targetOs ? { targetOs: options.targetOs } : {}),
@@ -188,6 +190,7 @@ export async function launchRemoteDisplayForDevice(
         transportKind,
         lanRequestedProfile,
         options?.routePreference ?? (options?.lanP2P ? "lan" : "auto"),
+        ...(options?.accessMode ? [options.accessMode] as const : []),
       );
   const startedSessionId = targetIsLocal
     ? await startLocalTestSession(sessionId, targetDeviceId, transportKind)

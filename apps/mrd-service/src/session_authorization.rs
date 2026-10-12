@@ -60,6 +60,8 @@ struct AuthorizationRecord {
     snapshot: RemoteSessionSnapshot,
     grant: Option<VerifiedSessionGrant>,
     peer_public_key: Option<[u8; 32]>,
+    /// Target-local durable policy revision; independent of backend grant revision.
+    paired_policy_revision: Option<u64>,
     cancellation: watch::Sender<bool>,
 }
 
@@ -69,6 +71,11 @@ pub(crate) struct SessionAuthorizationLease {
 }
 
 impl SessionAuthorizationLease {
+    pub(crate) fn is_valid_at(&self, now_ms: u64) -> bool {
+        now_ms < self.expires_at_ms
+            && !*self.cancellation.borrow()
+            && !self.cancellation.has_changed().is_err()
+    }
     pub(crate) async fn wait_until_invalid(mut self) {
         let now_ms = unix_time_ms();
         if now_ms > self.expires_at_ms || *self.cancellation.borrow() {
@@ -110,6 +117,7 @@ fn new_authorization_record(
         snapshot,
         grant: None,
         peer_public_key: None,
+        paired_policy_revision: None,
         cancellation,
     }
 }
@@ -343,10 +351,12 @@ impl SessionAuthorizationRegistry {
         let authorization_state = match request.access_mode {
             RemoteAccessMode::Attended => RemoteAuthorizationState::AwaitingLocalConsent,
             RemoteAccessMode::Unattended => RemoteAuthorizationState::VerifyingUnattendedCredential,
+            RemoteAccessMode::Paired => RemoteAuthorizationState::Authenticating,
         };
         let presentation_state = match request.access_mode {
             RemoteAccessMode::Attended => RemotePresentationState::IncomingApprovalRequired,
             RemoteAccessMode::Unattended => RemotePresentationState::Authenticating,
+            RemoteAccessMode::Paired => RemotePresentationState::Authenticating,
         };
         let snapshot = RemoteSessionSnapshot {
             session_id: request.session_id.clone(),
@@ -624,6 +634,152 @@ impl SessionAuthorizationRegistry {
         Ok(snapshot)
     }
 
+    pub(crate) async fn paired_policy_revision(&self, session_id: &SessionId) -> Option<u64> {
+        self.inner
+            .lock()
+            .await
+            .records
+            .get(session_id)?
+            .paired_policy_revision
+    }
+
+    pub(crate) async fn authenticated_peer_key_at(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Option<[u8; 32]> {
+        let inner = self.inner.lock().await;
+        let record = inner.records.get(session_id)?;
+        if is_terminal_authorization_state(record.snapshot.authorization_state)
+            || now_ms >= record.request.expires_at_ms
+        {
+            return None;
+        }
+        record
+            .peer_public_key
+            .filter(|key| public_key_id(key) == record.request.peer_key_id)
+    }
+
+    /// A pending policy write can wait for SQLite; retain exact cancellation and
+    /// expiry while the security gate excludes concurrent local decisions.
+    pub(crate) async fn pending_pairing_lease_at(
+        &self,
+        session_id: &SessionId,
+        now_ms: u64,
+    ) -> Option<SessionAuthorizationLease> {
+        let inner = self.inner.lock().await;
+        let record = inner.records.get(session_id)?;
+        if record.snapshot.role != RemoteSessionRole::Agent
+            || record.request.access_mode != RemoteAccessMode::Attended
+            || record.request.transport_kind != "webrtc_relay"
+            || record.snapshot.authorization_state != RemoteAuthorizationState::AwaitingLocalConsent
+            || record.peer_public_key.is_none()
+            || now_ms >= record.request.expires_at_ms
+        {
+            return None;
+        }
+        Some(SessionAuthorizationLease {
+            cancellation: record.cancellation.subscribe(),
+            expires_at_ms: record.request.expires_at_ms,
+        })
+    }
+
+    /// Called only after the service verified a sealed local paired policy under
+    /// its security gate. A signed pending key is required independently of UI data.
+    pub(crate) async fn authorize_paired_policy_at(
+        &self,
+        session_id: &SessionId,
+        policy_revision: u64,
+        permission_ceiling: &[RemotePermissionScope],
+        now_ms: u64,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        let mut inner = self.inner.lock().await;
+        let record = inner.records.get_mut(session_id).ok_or_else(|| {
+            failure(
+                RemoteReasonCode::IdentityMismatch,
+                "paired authorization request does not exist",
+            )
+        })?;
+        let pending = match record.request.access_mode {
+            RemoteAccessMode::Attended => {
+                record.snapshot.authorization_state
+                    == RemoteAuthorizationState::AwaitingLocalConsent
+            }
+            RemoteAccessMode::Paired => {
+                record.snapshot.authorization_state == RemoteAuthorizationState::Authenticating
+            }
+            RemoteAccessMode::Unattended => false,
+        };
+        if !pending
+            || record.snapshot.role != RemoteSessionRole::Agent
+            || record.request.transport_kind != "webrtc_relay"
+            || policy_revision == 0
+            || now_ms < record.request.created_at_ms
+            || now_ms >= record.request.expires_at_ms
+            || !record
+                .peer_public_key
+                .is_some_and(|key| public_key_id(&key) == record.request.peer_key_id)
+        {
+            return Err(failure(
+                RemoteReasonCode::PolicyChanged,
+                "paired policy does not match an authenticated pending session",
+            ));
+        }
+        if permission_ceiling.is_empty()
+            || permission_ceiling.iter().any(|scope| {
+                !matches!(
+                    scope,
+                    RemotePermissionScope::ScreenView
+                        | RemotePermissionScope::InputPointer
+                        | RemotePermissionScope::InputKeyboard
+                )
+            })
+        {
+            return Err(failure(
+                RemoteReasonCode::ScopeDenied,
+                "paired policy permits only screen and input scopes",
+            ));
+        }
+        let mut scopes = record
+            .request
+            .requested_scopes
+            .iter()
+            .copied()
+            .filter(|scope| {
+                permission_ceiling.contains(scope)
+                    && record.request.peer_permission_ceiling.contains(scope)
+                    && record.request.machine_permission_ceiling.contains(scope)
+                    && record.request.runtime_capabilities.contains(scope)
+            })
+            .collect::<Vec<_>>();
+        normalize_scopes(&mut scopes);
+        if scopes.is_empty() {
+            return Err(failure(
+                RemoteReasonCode::ScopeDenied,
+                "paired policy has no permitted requested scope",
+            ));
+        }
+        record.paired_policy_revision = Some(policy_revision);
+        record.snapshot.granted_scopes = scopes;
+        record.snapshot.policy_revision = DecimalU64::new(policy_revision);
+        record.snapshot.authorization_state = RemoteAuthorizationState::Authorizing;
+        record.snapshot.presentation_state = RemotePresentationState::Authenticating;
+        record.snapshot.updated_at_ms = now_ms;
+        let snapshot = record.snapshot.clone();
+        push_event(
+            &mut inner,
+            now_ms,
+            session_id.clone(),
+            RemoteSessionEvent::AuthorizationChanged {
+                state: RemoteAuthorizationState::Authorizing,
+                failure: None,
+            },
+        );
+        drop(inner);
+        self.changed.notify_waiters();
+        Ok(snapshot)
+    }
+
     /// Bind the first independently verified peer key to a controller-side
     /// authorization that was created before signaling. A pending key marker
     /// can only be replaced once, for the exact requested device and while the
@@ -878,7 +1034,9 @@ impl SessionAuthorizationRegistry {
         let policy_binding_is_valid = match wan_local_policy_revision {
             Some(expected_revision) => {
                 record.snapshot.role == RemoteSessionRole::Agent
-                    && record.request.access_mode == RemoteAccessMode::Attended
+                    && (record.request.access_mode == RemoteAccessMode::Attended
+                        || (record.request.access_mode == RemoteAccessMode::Paired
+                            && record.paired_policy_revision.is_some()))
                     && record.request.transport_kind == "webrtc_relay"
                     && record.snapshot.policy_revision.get() == expected_revision
                     && record
@@ -1635,6 +1793,7 @@ fn is_pending_incoming_record(record: &AuthorizationRecord) -> bool {
         && matches!(
             record.snapshot.authorization_state,
             RemoteAuthorizationState::AwaitingLocalConsent
+                | RemoteAuthorizationState::Authenticating
                 | RemoteAuthorizationState::VerifyingUnattendedCredential
                 | RemoteAuthorizationState::Authorizing
         )
@@ -2393,6 +2552,139 @@ mod tests {
             created_at_ms: CREATED_AT_MS,
             expires_at_ms: EXPIRES_AT_MS,
         }
+    }
+
+    #[tokio::test]
+    async fn paired_policy_rejects_unbound_key_and_permission_expansion() {
+        let registry = SessionAuthorizationRegistry::default();
+        let mut request = control_request("paired-unbound", &[7; 32]);
+        request.access_mode = RemoteAccessMode::Paired;
+        request.transport_kind = "webrtc_relay".to_owned();
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .unwrap();
+        assert!(registry
+            .authorize_paired_policy_at(
+                &request.session_id,
+                2,
+                &request.requested_scopes,
+                CREATED_AT_MS + 1
+            )
+            .await
+            .is_err());
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &[7; 32], CREATED_AT_MS + 1)
+            .await
+            .unwrap();
+        assert!(registry
+            .authorize_paired_policy_at(
+                &request.session_id,
+                2,
+                &[RemotePermissionScope::TerminalOpen],
+                CREATED_AT_MS + 2
+            )
+            .await
+            .is_err());
+        let approved = registry
+            .authorize_paired_policy_at(
+                &request.session_id,
+                2,
+                &[RemotePermissionScope::InputPointer],
+                CREATED_AT_MS + 2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            approved.authorization_state,
+            RemoteAuthorizationState::Authorizing
+        );
+        assert_eq!(
+            approved.granted_scopes,
+            vec![RemotePermissionScope::InputPointer]
+        );
+        assert_eq!(approved.policy_revision.get(), 2);
+        assert_eq!(
+            registry.paired_policy_revision(&request.session_id).await,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn lan_pending_cannot_open_a_paired_policy_write_lease() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("lan-first-pair", &[7; 32]);
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .unwrap();
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &[7; 32], CREATED_AT_MS + 1)
+            .await
+            .unwrap();
+        assert!(
+            registry
+                .pending_pairing_lease_at(&request.session_id, CREATED_AT_MS + 2)
+                .await
+                .is_none(),
+            "a non-global request must be rejected before any durable policy write"
+        );
+        assert_eq!(
+            registry
+                .snapshot_at(&request.session_id, CREATED_AT_MS + 2)
+                .await
+                .unwrap()
+                .authorization_state,
+            RemoteAuthorizationState::AwaitingLocalConsent
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_first_pairing_preserves_signed_attended_mode_and_revocation() {
+        let registry = SessionAuthorizationRegistry::default();
+        let mut request = control_request("first-pair", &[7; 32]);
+        request.transport_kind = "webrtc_relay".to_owned();
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .unwrap();
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &[7; 32], CREATED_AT_MS + 1)
+            .await
+            .unwrap();
+        let lease = registry
+            .pending_pairing_lease_at(&request.session_id, CREATED_AT_MS + 1)
+            .await
+            .unwrap();
+        assert!(lease.is_valid_at(CREATED_AT_MS + 2));
+        assert!(!lease.is_valid_at(EXPIRES_AT_MS));
+        let approved = registry
+            .authorize_paired_policy_at(
+                &request.session_id,
+                3,
+                &request.requested_scopes,
+                CREATED_AT_MS + 2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.access_mode, RemoteAccessMode::Attended);
+        assert_eq!(
+            approved.authorization_state,
+            RemoteAuthorizationState::Authorizing
+        );
+        registry
+            .revoke_peer_authorizations(&request.peer_key_id, CREATED_AT_MS + 3)
+            .await;
+        assert!(!lease.is_valid_at(CREATED_AT_MS + 4));
+        assert!(registry
+            .authorize_paired_policy_at(
+                &request.session_id,
+                3,
+                &request.requested_scopes,
+                CREATED_AT_MS + 4
+            )
+            .await
+            .is_err());
     }
 
     fn control_grant(session_id: &SessionId) -> VerifiedSessionGrant {

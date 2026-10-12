@@ -15,6 +15,7 @@ from app.services.browser_authority import browser_authority_valid
 from app.services.device_sessions import DeviceSessionError, DeviceSessionService
 from app.services.session_grants import session_grant_identity_lock
 from app.services.device_principal_keys import key_is_physical_machine, principal_key_lock
+from app.services.paired_authority import machine_key_id
 
 
 BROWSER_LIFETIME_SECONDS = 600
@@ -72,7 +73,8 @@ class BrowserSessionService:
                     Device.is_bound.is_(True), Device.auth_revoked_at.is_(None))
                     .with_for_update().execution_options(populate_existing=True))
                 if (target is None or target.bound_user_id is None
-                    or (owner.role != "admin" and target.bound_user_id != owner.id)):
+                    or ((payload.access_mode == "paired" or owner.role != "admin")
+                        and target.bound_user_id != owner.id)):
                     self.unavailable()
                 shadow = Device(name="Web browser", device_id="browser_" + secrets.token_hex(16),
                     os="Web browser", principal_kind="browser_controller", tenant_id=owner.tenant_id,
@@ -81,7 +83,8 @@ class BrowserSessionService:
                 await self.db.flush()
             request = DeviceSessionCreateIn.model_validate(payload.model_dump(
                 exclude={"controller_public_key"}))
-            row = await DeviceSessionService(self.db).create(current_device=shadow, payload=request)
+            row = await DeviceSessionService(self.db).create(current_device=shadow, payload=request,
+                paired_browser_key_id=key_id if request.access_mode == "paired" else None)
             # The native service has now locked devices, then users. Recheck the
             # original bearer snapshot after those locks, without reversing their order.
             if owner.session_version != user_version or owner.role != user_role or owner.tenant_id != user_tenant:
@@ -155,6 +158,8 @@ class BrowserSessionService:
                 or principal.user_session_version != binding.user_session_version
                 or principal.device_row_id != binding.controller_row_id
                 or principal.key_id != binding.controller_key_id
+                or (row.access_mode == "paired"
+                    and await machine_key_id(self.db, target) != binding.target_key_id)
                 or not await browser_authority_valid(self.db, row)):
                 self.unavailable()
             return row, principal, shadow

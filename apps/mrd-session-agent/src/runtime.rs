@@ -6,15 +6,18 @@ use crate::consent::{
     ConsentManagerBeginOutcome, ConsentRegistryError, TrustedConsentContext, TrustedSessionBinding,
 };
 use crate::input::InputBackend;
+use crate::paired_authority::{PairedAuthorityRegistry, PairedSessionBinding};
 use mrd_agent_ipc::{
     decode_frame, registration_proof_signing_bytes, validate_execute_command, write_frame,
     AgentCapabilitySnapshot, AgentChallenge, AgentEventContext, AgentHeartbeat, AgentRegister,
     AgentRegistered, AgentStopping, AgentToService, AuthorizedCommand, CancelConsent,
     CommandOutcome, CommandResult, ConsentDecision, ConsentRequest, ConsentResult, DesktopKind,
-    ExecuteGrantVerifier, ExecutionContext, FrameError, InputAck, InputAckOutcome, PeerBinding,
-    RegisteredAgentIdentity, RenderBoundaryMetrics, ServiceToAgent, StoppingReason,
-    AGENT_IPC_FRAME_HEADER_BYTES, AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR,
-    AGENT_IPC_PROTOCOL_MINOR, AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
+    ExecuteGrantVerifier, ExecutionContext, FrameError, InputAck, InputAckOutcome,
+    InstallPairedSessionAuthority, PairedSessionAuthorityContext, PairedSessionAuthorityOutcome,
+    PairedSessionAuthorityResult, PeerBinding, RegisteredAgentIdentity, RenderBoundaryMetrics,
+    RevokePairedSessionAuthority, ServiceToAgent, StoppingReason, AGENT_IPC_FRAME_HEADER_BYTES,
+    AGENT_IPC_MAX_FRAME_BYTES, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+    AGENT_REGISTRATION_CHALLENGE_MAX_LIFETIME_MS,
 };
 use mrd_proto::SessionId;
 #[cfg(unix)]
@@ -718,11 +721,87 @@ struct AttendedAuthority {
     executor: Box<dyn AuthorizedCommandExecutor>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthorityOrigin {
+    Attended {
+        generation: u64,
+        request_id: [u8; 16],
+    },
+    Paired {
+        authority_id: [u8; 32],
+    },
+}
+
+/// Shared execution facts retain an explicit origin. A paired session never
+/// constructs a synthetic consent request, generation, or approved decision.
+#[derive(Debug, Clone)]
+struct RuntimeSessionBinding {
+    origin: AuthorityOrigin,
+    registration_id: [u8; 16],
+    registration_epoch: u64,
+    session_id: SessionId,
+    peer: PeerBinding,
+    approved_scopes: mrd_session::PermissionScopes,
+    policy_revision: u64,
+    windows_session_id: u32,
+    desktop_epoch: u64,
+    desktop_kind: DesktopKind,
+    authorization_expires_at_ms: u64,
+    authorization_deadline: Instant,
+    expected_issuer_key_id: [u8; 32],
+}
+
+impl From<TrustedSessionBinding> for RuntimeSessionBinding {
+    fn from(binding: TrustedSessionBinding) -> Self {
+        Self {
+            origin: AuthorityOrigin::Attended {
+                generation: binding.authority_generation,
+                request_id: binding.consent_request_id,
+            },
+            registration_id: binding.registration_id,
+            registration_epoch: binding.registration_epoch,
+            session_id: binding.session_id,
+            peer: binding.peer,
+            approved_scopes: binding.approved_scopes,
+            policy_revision: binding.policy_revision,
+            windows_session_id: binding.windows_session_id,
+            desktop_epoch: binding.desktop_epoch,
+            desktop_kind: binding.desktop_kind,
+            authorization_expires_at_ms: binding.authorization_expires_at_ms,
+            authorization_deadline: binding.authorization_deadline,
+            expected_issuer_key_id: binding.expected_issuer_key_id,
+        }
+    }
+}
+impl From<PairedSessionBinding> for RuntimeSessionBinding {
+    fn from(binding: PairedSessionBinding) -> Self {
+        let authority = binding.authority;
+        let claims = authority.claims;
+        Self {
+            origin: AuthorityOrigin::Paired {
+                authority_id: claims.authority_id,
+            },
+            registration_id: claims.registration_id,
+            registration_epoch: claims.registration_epoch,
+            session_id: claims.session_id,
+            peer: claims.peer,
+            approved_scopes: claims.scopes,
+            policy_revision: claims.policy_revision,
+            windows_session_id: claims.windows_session_id,
+            desktop_epoch: claims.desktop_epoch,
+            desktop_kind: claims.desktop_kind,
+            authorization_expires_at_ms: claims.expires_at_ms,
+            authorization_deadline: binding.deadline,
+            expected_issuer_key_id: authority.issuer_key_id,
+        }
+    }
+}
+
 /// A successful Start owns this identity for the rest of this registration.
 /// Only Stop may resolve the original authority after consent revocation, and
 /// only confirmed native cleanup permits an acknowledgement without execution.
 struct CleanupReceipt {
-    binding: TrustedSessionBinding,
+    binding: RuntimeSessionBinding,
     capability: mrd_agent_ipc::AgentCapability,
     grant_window: (u64, u64, u64),
     retained_until: Instant,
@@ -751,6 +830,7 @@ pub struct AgentRuntime {
     clock: Arc<dyn AgentClock>,
     signer: Arc<dyn RegistrationSigner>,
     authority: Option<AttendedAuthority>,
+    paired: PairedAuthorityRegistry,
     input: Option<Box<dyn InputBackend>>,
     last_desktop_state: Option<TrustedDesktopState>,
     replay: ReplayLedger,
@@ -771,6 +851,8 @@ impl Drop for AgentRuntime {
             }));
         }
         let _ = catch_unwind(AssertUnwindSafe(|| {
+            let invalidations = self.paired.drain();
+            let _ = self.release_paired_invalidations(invalidations);
             let _ = self.release_input();
         }));
     }
@@ -795,6 +877,7 @@ impl AgentRuntime {
             clock,
             signer,
             authority: None,
+            paired: PairedAuthorityRegistry::default(),
             input: None,
             last_desktop_state: None,
             replay: ReplayLedger::new(REPLAY_LEDGER_CAPACITY),
@@ -914,13 +997,14 @@ impl AgentRuntime {
                     Err(error) => Err(error),
                 };
             }
-            let consent_deadline = self
+            let attended_deadline = self
                 .authority
                 .as_ref()
                 .map(|authority| authority.manager.next_deadline())
                 .transpose()
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?
                 .flatten();
+            let consent_deadline=attended_deadline.into_iter().chain(self.paired.next_deadline()).min();
             let event = {
                 let capture_enabled = self.authority.as_ref().is_some_and(|authority| authority.executor.has_capture_resources());
                 let consent_completion = async {
@@ -1076,6 +1160,12 @@ impl AgentRuntime {
                         if !accepted {
                             return Err(AgentRuntimeError::InvalidRenderAccessUnit);
                         }
+                    }
+                    Some(InboundEvent::Message(ServiceToAgent::InstallPairedSessionAuthority(request))) => {
+                        self.handle_paired_install(&outbound,&identity,*request)?;
+                    }
+                    Some(InboundEvent::Message(ServiceToAgent::RevokePairedSessionAuthority(request))) => {
+                        self.handle_paired_revoke(&outbound,&identity,request)?;
                     }
                     Some(InboundEvent::Message(ServiceToAgent::AgentChallenge(_))) => {
                         return Err(AgentRuntimeError::UnsupportedMessage);
@@ -1283,6 +1373,148 @@ impl AgentRuntime {
         Ok(())
     }
 
+    fn resolve_session_binding(
+        &self,
+        session: &SessionId,
+        now_ms: u64,
+    ) -> Result<Option<RuntimeSessionBinding>, AgentRuntimeError> {
+        let attended = match self.authority.as_ref() {
+            Some(authority) => authority
+                .manager
+                .resolve_binding(session, now_ms)
+                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
+            None => return Ok(None),
+        };
+        Ok(match attended {
+            Some(binding) => Some(binding.into()),
+            None => self.paired.resolve(session, now_ms).map(Into::into),
+        })
+    }
+
+    fn handle_paired_install(
+        &mut self,
+        writer: &OutboundWriter,
+        identity: &RegisteredAgentIdentity,
+        request: InstallPairedSessionAuthority,
+    ) -> Result<(), AgentRuntimeError> {
+        let claims = &request.authority.claims;
+        let mut outcome = PairedSessionAuthorityOutcome::Rejected;
+        if request.request_token != 0
+            && identity.protocol_minor
+                >= mrd_agent_ipc::AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR
+        {
+            let desktop = self.current_desktop_state()?;
+            self.reconcile_desktop_authority(writer, desktop)?;
+            if let Some(authority) = self.authority.as_ref() {
+                let attended = authority
+                    .manager
+                    .resolve_binding(&claims.session_id, self.clock.now_ms())
+                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                let context = PairedSessionAuthorityContext {
+                    registration_id: identity.registration_id,
+                    registration_epoch: identity.registration_epoch,
+                    windows_session_id: identity.windows_session_id,
+                    desktop_epoch: desktop.desktop_epoch,
+                    desktop_kind: desktop.desktop_kind,
+                    now_ms: self.clock.now_ms(),
+                    expected_issuer_key_id: authority.expected_issuer_key_id,
+                };
+                if attended.is_none()
+                    && !authority.manager.has_active_prompt()
+                    && self.paired.install(
+                        &request.authority,
+                        &context,
+                        authority.verifier.as_ref(),
+                    )
+                {
+                    outcome = PairedSessionAuthorityOutcome::Installed;
+                }
+            }
+        }
+        writer.enqueue(AgentToService::PairedSessionAuthorityResult(
+            PairedSessionAuthorityResult {
+                request_token: request.request_token,
+                authority_id: claims.authority_id,
+                registration_id: identity.registration_id,
+                registration_epoch: identity.registration_epoch,
+                session_id: claims.session_id.clone(),
+                outcome,
+            },
+        ))
+    }
+
+    fn handle_paired_revoke(
+        &mut self,
+        writer: &OutboundWriter,
+        identity: &RegisteredAgentIdentity,
+        request: RevokePairedSessionAuthority,
+    ) -> Result<(), AgentRuntimeError> {
+        let mut outcome = PairedSessionAuthorityOutcome::Rejected;
+        if request.request_token != 0
+            && identity.protocol_minor
+                >= mrd_agent_ipc::AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR
+            && request.registration_id == identity.registration_id
+            && request.registration_epoch == identity.registration_epoch
+        {
+            if let Some((binding, was_active)) = self.paired.revoke(&request) {
+                if was_active {
+                    self.release_paired_invalidations(vec![binding])?;
+                }
+                outcome = PairedSessionAuthorityOutcome::Revoked;
+            }
+        }
+        writer.enqueue(AgentToService::PairedSessionAuthorityResult(
+            PairedSessionAuthorityResult {
+                request_token: request.request_token,
+                authority_id: request.authority_id,
+                registration_id: identity.registration_id,
+                registration_epoch: identity.registration_epoch,
+                session_id: request.session_id,
+                outcome,
+            },
+        ))
+    }
+
+    fn release_paired_invalidations(
+        &mut self,
+        invalidations: Vec<PairedSessionBinding>,
+    ) -> Result<(), AgentRuntimeError> {
+        let mut input_failed = false;
+        let mut media_failed = false;
+        for binding in invalidations {
+            let claims = &binding.authority.claims;
+            let input_error = self
+                .input
+                .as_mut()
+                .is_some_and(|input| input.release_session(&claims.session_id).is_err());
+            let media_error = self
+                .authority
+                .as_mut()
+                .is_some_and(|authority| !authority.executor.revoke_session(&claims.session_id));
+            input_failed |= input_error;
+            media_failed |= media_error;
+            if !input_error && !media_error {
+                for receipt in self.cleanup_receipts.values_mut() {
+                    if receipt.binding.session_id == claims.session_id
+                        && receipt.binding.origin
+                            == (AuthorityOrigin::Paired {
+                                authority_id: claims.authority_id,
+                            })
+                    {
+                        receipt.retired = true;
+                    }
+                }
+            }
+        }
+        if input_failed {
+            Err(AgentRuntimeError::InputCleanupFailed)
+        } else if media_failed {
+            Err(AgentRuntimeError::MediaCleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn handle_execute(
         &mut self,
         writer: &OutboundWriter,
@@ -1323,10 +1555,7 @@ impl AgentRuntime {
                     })
             } else {
                 (
-                    authority
-                        .manager
-                        .resolve_binding(&execute.grant.claims.session_id, now_ms)
-                        .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
+                    self.resolve_session_binding(&execute.grant.claims.session_id, now_ms)?,
                     false,
                 )
             };
@@ -1401,13 +1630,7 @@ impl AgentRuntime {
                     reason: mrd_agent_ipc::InputRejection::Grant,
                 }
             } else {
-                let binding = self
-                    .authority
-                    .as_ref()
-                    .ok_or(AgentRuntimeError::ConsentStateUnavailable)?
-                    .manager
-                    .resolve_binding(&envelope.session_id, now_ms)
-                    .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+                let binding = self.resolve_session_binding(&envelope.session_id, now_ms)?;
                 if let Some(binding) = binding {
                     if binding_matches_runtime(&binding, identity, desktop) {
                         // Resolve trusted binding state before sampling the time
@@ -1481,6 +1704,18 @@ impl AgentRuntime {
     ) -> Result<(), AgentRuntimeError> {
         if self.authority.is_none() {
             return self.handle_consent_without_manager(writer, request).await;
+        }
+        if self
+            .paired
+            .resolve(&request.session_id, self.clock.now_ms())
+            .is_some()
+        {
+            writer.enqueue(AgentToService::ConsentResult(coarse_consent_result(
+                &request,
+                ConsentDecision::Dismissed,
+                self.clock.now_ms(),
+            )))?;
+            return Ok(());
         }
         let context = self.trusted_consent_context(identity)?;
         let due = self
@@ -1701,6 +1936,10 @@ impl AgentRuntime {
         if let Err(error) = self.release_authority_invalidations(invalidations) {
             first_error.get_or_insert(error);
         }
+        let paired = self.paired.drain();
+        if let Err(error) = self.release_paired_invalidations(paired) {
+            first_error.get_or_insert(error);
+        }
         if self.release_input().is_err() {
             first_error.get_or_insert(AgentRuntimeError::InputCleanupFailed);
         }
@@ -1736,7 +1975,7 @@ impl AgentRuntime {
     fn execute_once(
         &mut self,
         authorized: AuthorizedCommand,
-        mut binding: TrustedSessionBinding,
+        mut binding: RuntimeSessionBinding,
         retired: bool,
         start_input_blocked: bool,
     ) -> Result<CommandOutcome, AgentRuntimeError> {
@@ -1875,8 +2114,11 @@ impl AgentRuntime {
             if !session_input_failed && !session_media_failed {
                 for receipt in self.cleanup_receipts.values_mut() {
                     if receipt.binding.session_id == invalidation.session_id
-                        && receipt.binding.authority_generation == invalidation.authority_generation
-                        && receipt.binding.consent_request_id == invalidation.consent_request_id
+                        && receipt.binding.origin
+                            == (AuthorityOrigin::Attended {
+                                generation: invalidation.authority_generation,
+                                request_id: invalidation.consent_request_id,
+                            })
                     {
                         receipt.retired = true;
                     }
@@ -1919,6 +2161,10 @@ impl AgentRuntime {
         };
         let prompt_invalidated = !prompt_results.is_empty();
         self.release_authority_invalidations(invalidations)?;
+        let paired = self
+            .paired
+            .take_desktop_mismatch(desktop.desktop_epoch, desktop.desktop_kind);
+        self.release_paired_invalidations(paired)?;
         if (desktop_changed && had_active_prompt) || prompt_invalidated {
             self.release_input()
                 .map_err(|_| AgentRuntimeError::InputCleanupFailed)?;
@@ -1938,11 +2184,18 @@ impl AgentRuntime {
                 .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?,
             None => Vec::new(),
         };
-        let sessions = invalidations
+        let mut sessions: Vec<_> = invalidations
             .iter()
             .map(|invalidation| invalidation.session_id.clone())
             .collect();
         self.release_authority_invalidations(invalidations)?;
+        let paired = self.paired.take_due(now_ms);
+        sessions.extend(
+            paired
+                .iter()
+                .map(|binding| binding.authority.claims.session_id.clone()),
+        );
+        self.release_paired_invalidations(paired)?;
         Ok(sessions)
     }
 
@@ -2001,13 +2254,7 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         for unit in units {
-            let binding = self
-                .authority
-                .as_ref()
-                .expect("capture authority")
-                .manager
-                .resolve_binding(unit.session_id(), self.clock.now_ms())
-                .map_err(|_| AgentRuntimeError::ConsentStateUnavailable)?;
+            let binding = self.resolve_session_binding(unit.session_id(), self.clock.now_ms())?;
             if !binding.as_ref().is_some_and(|binding| {
                 binding_matches_runtime(binding, identity, desktop)
                     && binding
@@ -2041,7 +2288,7 @@ impl AgentRuntime {
 }
 
 fn binding_matches_runtime(
-    binding: &TrustedSessionBinding,
+    binding: &RuntimeSessionBinding,
     identity: &RegisteredAgentIdentity,
     desktop: TrustedDesktopState,
 ) -> bool {
@@ -2072,7 +2319,7 @@ fn coarse_consent_result(
 }
 
 fn binding_matches_registration(
-    binding: &TrustedSessionBinding,
+    binding: &RuntimeSessionBinding,
     identity: &RegisteredAgentIdentity,
 ) -> bool {
     binding.registration_id == identity.registration_id
@@ -2355,6 +2602,10 @@ impl ReplayLedger {
 }
 
 #[cfg(test)]
+#[path = "runtime_paired_tests.rs"]
+mod paired_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mrd_proto::DeviceId;
@@ -2416,7 +2667,7 @@ mod tests {
             runtime.cleanup_receipts.insert(
                 id,
                 CleanupReceipt {
-                    binding: cleanup_test_binding(),
+                    binding: cleanup_test_binding().into(),
                     capability: mrd_agent_ipc::AgentCapability::Input,
                     grant_window: (1_000, 1_000, 2_000),
                     retained_until: now,
@@ -2531,7 +2782,7 @@ mod tests {
             runtime.cleanup_receipts.insert(
                 (seed as u128).to_le_bytes(),
                 CleanupReceipt {
-                    binding: binding.clone(),
+                    binding: binding.clone().into(),
                     capability: mrd_agent_ipc::AgentCapability::Input,
                     grant_window: (1_000, 1_000, 2_000),
                     retained_until: now,
@@ -2541,7 +2792,12 @@ mod tests {
         }
         assert_eq!(
             runtime
-                .execute_once(start(&binding, 1, [255; 16]), binding.clone(), false, false)
+                .execute_once(
+                    start(&binding, 1, [255; 16]),
+                    binding.clone().into(),
+                    false,
+                    false
+                )
                 .unwrap(),
             CommandOutcome::Rejected
         );
@@ -2551,7 +2807,12 @@ mod tests {
         runtime.started_resource_ids.insert([255; 16]);
         assert_eq!(
             runtime
-                .execute_once(start(&binding, 2, [255; 16]), binding.clone(), false, false)
+                .execute_once(
+                    start(&binding, 2, [255; 16]),
+                    binding.clone().into(),
+                    false,
+                    false
+                )
                 .unwrap(),
             CommandOutcome::Rejected
         );
@@ -2559,7 +2820,7 @@ mod tests {
         // New resource ownership is still allowed once retained receipts expire.
         assert_eq!(
             runtime
-                .execute_once(start(&binding, 3, [254; 16]), binding, false, false)
+                .execute_once(start(&binding, 3, [254; 16]), binding.into(), false, false)
                 .unwrap(),
             CommandOutcome::Completed
         );

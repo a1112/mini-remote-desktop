@@ -10,6 +10,7 @@ import type {
 const adapter = vi.hoisted(() => ({
   getRemoteSession: vi.fn(),
   respondToConsent: vi.fn(),
+  pairPendingSession: vi.fn(),
   showWindow: vi.fn(),
   subscribeSessionEvents: vi.fn(),
 }));
@@ -21,6 +22,7 @@ vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => true }));
 vi.mock("../adapters/tauri", () => ({
   ipcGetRemoteSession: adapter.getRemoteSession,
   ipcRespondToConsent: adapter.respondToConsent,
+  ipcPairPendingSession: adapter.pairPendingSession,
   ipcSubscribeSessionEvents: adapter.subscribeSessionEvents,
   showWindow: adapter.showWindow,
 }));
@@ -107,6 +109,7 @@ describe("IncomingSessionConsentHost", () => {
     localStorage.clear();
     adapter.getRemoteSession.mockReset();
     adapter.respondToConsent.mockReset();
+    adapter.pairPendingSession.mockReset();
     adapter.showWindow.mockReset();
     adapter.subscribeSessionEvents.mockReset();
     windowApi.getLabel.mockReset();
@@ -167,6 +170,17 @@ describe("IncomingSessionConsentHost", () => {
     await waitFor(() => {
       expect(adapter.subscribeSessionEvents).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('records first pairing through the formal policy IPC and closes the pending prompt', async () => {
+    adapter.subscribeSessionEvents.mockResolvedValueOnce({ ok: true, value: subscription() });
+    adapter.getRemoteSession.mockResolvedValueOnce({ ok: true, value: makeSession({ route_kind: null }) });
+    adapter.pairPendingSession.mockResolvedValueOnce({ ok: true, value: makeSession({ authorization_state: 'authorizing', route_kind: null }) });
+    render(<IncomingSessionConsentHost />);
+    await userEvent.click(await screen.findByRole('button', { name: '配对并记住此控制端' }));
+    expect(adapter.pairPendingSession).toHaveBeenCalledWith({ session_id: 'session-1', approved_scopes: ['screen.view'], expected_policy_revision: '7' });
+    expect(adapter.respondToConsent).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument());
   });
 
   it("closes a queued request when authorization changes before a response", async () => {

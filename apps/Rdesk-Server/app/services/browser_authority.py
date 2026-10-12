@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.models.browser_controller import BrowserController
 from app.models.device import Device
 from app.models.user import User
+from app.services.paired_authority import paired_session_authority_valid
 
 
 def utc(value):
@@ -16,6 +17,8 @@ async def browser_authority_valid(db, row, *, now=None, allow_terminal=False):
     controller = await db.scalar(select(Device).where(Device.id == row.requester_device_id)
                                  .execution_options(populate_existing=True))
     if controller is None:
+        return False
+    if row.access_mode == "paired" and not (allow_terminal and row.status in {"closed", "rejected", "revoked", "expired"}) and not await paired_session_authority_valid(db, row, controller=controller):
         return False
     if getattr(controller, "principal_kind", "physical") != "browser_controller":
         return True
@@ -64,7 +67,7 @@ async def browser_authority_valid(db, row, *, now=None, allow_terminal=False):
         and not target.device_id.startswith("browser_") and target.is_bound
         and target.auth_revoked_at is None and target.tenant_id == user.tenant_id
         and target.bound_user_id is not None
-        and (user.role == "admin" or target.bound_user_id == user.id)
+        and ((row.access_mode != "paired" and user.role == "admin") or target.bound_user_id == user.id)
         and principal.revoked_at is None and utc(principal.expires_at) > at
         and user.role in {"user", "admin"}
         and principal.session_id == row.id and principal.user_id == row.requester_user_id

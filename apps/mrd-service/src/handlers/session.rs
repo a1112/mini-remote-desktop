@@ -297,6 +297,9 @@ pub(crate) async fn resolve_remote_session_route(
     app_state: &Arc<AppState>,
     request: &RemoteSessionRequest,
 ) -> crate::wan_session::media::WanRouteSelection {
+    if request.access_mode == RemoteAccessMode::Paired {
+        return crate::wan_session::media::WanRouteSelection::WanRelay;
+    }
     // Auto is deliberately cache-only.  The security gate serializes this
     // read with trust changes, while `fresh_authenticated_lan_evidence` does
     // not issue a discovery probe or wait for a peer announcement.
@@ -489,7 +492,11 @@ async fn request_wan_remote_session(
         idempotency_key,
         controller_device_id: controller_device_id.clone(),
         target_device_id: target_device_id.clone(),
-        access_mode: WanAccessModeV3::Attended,
+        access_mode: if request.access_mode == RemoteAccessMode::Paired {
+            WanAccessModeV3::Paired
+        } else {
+            WanAccessModeV3::Attended
+        },
         requested_scopes,
         requested_profile,
         route_policy: if request.route_preference == RemoteRoutePreference::WanRelay {
@@ -526,7 +533,7 @@ async fn request_wan_remote_session(
                 &target_device_id,
             ),
             peer_key_epoch: 1,
-            access_mode: RemoteAccessMode::Attended,
+            access_mode: request.access_mode,
             requested_scopes: requested_authorization_scopes.clone(),
             peer_permission_ceiling: requested_authorization_scopes.clone(),
             machine_permission_ceiling: requested_authorization_scopes.clone(),

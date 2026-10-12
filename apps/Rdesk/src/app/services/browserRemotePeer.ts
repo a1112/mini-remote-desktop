@@ -5,7 +5,7 @@ import { verifyBrowserRelayAccess, waitUntilRelayDirectoryIssued, BrowserRelayDi
 import {
   byteArray, canonicalProfile, canonicalWanRequest, candidateFingerprint, randomBytes,
   safeInteger, signalEnvelope, signSignal, signedSignalCommitment, strictObject, verifySignedSignal, parseBoundedJson,
-  waitUntilSignalIssued, BrowserSignalValidityError,
+  waitUntilSignalIssued, BrowserSignalValidityError, reserveBrowserSignalCounter,
   type SignedSignal, type SignalType, type WireObject,
 } from './browserRemoteProtocol';
 
@@ -30,7 +30,6 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private outgoing: Promise<unknown> = Promise.resolve();
   private incoming: Promise<void> = Promise.resolve();
   private queuedBytes = 0;
-  private counter = 1;
   private connectionId?: number[];
   private intent?: SignedSignal;
   private grant?: SignedSignal;
@@ -99,7 +98,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     this.poll = setInterval(() => { void this.refreshAuthorization(); }, 2_000);
   }
 
-  private claims(peer: string): WireObject {
+  private claims(peer: string, counter: number): WireObject {
     const now = Date.now();
     return {
       issuer_device_id: this.controllerId,
@@ -107,7 +106,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
       intended_peer_device_id: peer,
       issued_at_ms: now,
       expires_at_ms: Math.min(now + 60_000, this.context.bootstrap.expires_at_ms, this.context.bootstrap.credential.expires_at_ms),
-      counter: safeInteger(this.counter++, 1),
+      counter: safeInteger(counter, 1),
       nonce: randomBytes(16),
     };
   }
@@ -115,7 +114,8 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     const result = this.outgoing.then(async () => {
       if (this.closing && type !== 'session_close') throw new Error('网页连接已取消');
       if (!this.socket || this.socket.readyState !== 1) throw new Error('信令连接尚未就绪');
-      const signed = await signSignal(this.context.identity, type, { claims: this.claims(peer), ...body });
+      const counter = await reserveBrowserSignalCounter(this.context.identity.keyId);
+      const signed = await signSignal(this.context.identity, type, { claims: this.claims(peer, counter), ...body });
       if (this.closing && type !== 'session_close') throw new Error('网页连接已取消');
       if (!this.socket || this.socket.readyState !== 1 || this.socket.bufferedAmount > MAX_QUEUED_BYTES) throw new Error('信令发送通道不可用');
       this.socket.send(signalEnvelope(type, signed));

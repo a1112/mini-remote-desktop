@@ -4,6 +4,7 @@ import type {
   ConsentResponse,
   RemotePermissionScope,
   RemoteSessionSnapshot,
+  PairPendingSessionRequest,
 } from "../adapters/tauri/types";
 import {
   AlertDialog,
@@ -19,6 +20,7 @@ export interface IncomingSessionDialogProps {
   session: RemoteSessionSnapshot | null;
   consentDeadlineMs: number;
   onRespond: (response: ConsentResponse) => Promise<void>;
+  onPair?: (request: PairPendingSessionRequest) => Promise<void>;
 }
 
 function defaultSelectedScopes(session: RemoteSessionSnapshot | null) {
@@ -31,6 +33,7 @@ export function IncomingSessionDialog({
   session,
   consentDeadlineMs,
   onRespond,
+  onPair,
 }: IncomingSessionDialogProps) {
   const [selectedScopes, setSelectedScopes] = useState<
     Set<RemotePermissionScope>
@@ -68,6 +71,15 @@ export function IncomingSessionDialog({
     return null;
   }
 
+  const canPair = Boolean(
+    onPair &&
+      session.role === "agent" &&
+      session.access_mode === "attended" &&
+      session.route_kind !== "lan_quic" &&
+      session.route_kind !== "webrtc_direct",
+  );
+  const hasScreenViewing = selectedScopes.has("screen.view");
+
   const toggleScope = (scope: RemotePermissionScope) => {
     setSelectedScopes((current) => {
       const next = new Set(current);
@@ -80,7 +92,7 @@ export function IncomingSessionDialog({
     });
   };
 
-  const submit = (response: ConsentResponse) => {
+  const submit = (operation: () => Promise<void>) => {
     if (submittingRef.current) {
       return;
     }
@@ -90,7 +102,7 @@ export function IncomingSessionDialog({
     setSubmissionError(null);
     let submission: Promise<void>;
     try {
-      submission = onRespond(response);
+      submission = operation();
     } catch (error) {
       setSubmissionError(
         error instanceof Error ? error.message : "Consent response failed.",
@@ -113,23 +125,23 @@ export function IncomingSessionDialog({
   };
 
   const approve = () => {
-    submit({
+    submit(() => onRespond({
       session_id: session.session_id,
       decision: "approve",
       approved_scopes: session.requested_scopes.filter((scope) =>
         selectedScopes.has(scope),
       ),
       expected_policy_revision: session.policy_revision,
-    });
+    }));
   };
 
   const deny = () => {
-    submit({
+    submit(() => onRespond({
       session_id: session.session_id,
       decision: "deny",
       approved_scopes: [],
       expected_policy_revision: session.policy_revision,
-    });
+    }));
   };
 
   return (
@@ -143,7 +155,9 @@ export function IncomingSessionDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>Incoming remote session</AlertDialogTitle>
           <AlertDialogDescription>
-            选择允许的权限后，在本机系统窗口中确认请求。
+            {canPair
+              ? "选择允许的权限。可仅允许本次连接，或配对并记住此控制端。"
+              : "选择允许的权限，确认后仅允许本次连接。"}
           </AlertDialogDescription>
         </AlertDialogHeader>
 
@@ -172,6 +186,12 @@ export function IncomingSessionDialog({
           ))}
         </div>
 
+        {canPair && !hasScreenViewing ? (
+          <p className="text-muted-foreground text-sm" role="status">
+            配对需要允许画面查看（screen.view）。
+          </p>
+        ) : null}
+
         {isExpired ? (
           <p className="text-destructive text-sm" role="status">
             This request has expired.
@@ -185,6 +205,12 @@ export function IncomingSessionDialog({
         ) : null}
 
         <AlertDialogFooter>
+          {canPair && onPair && <Button type="button" variant="outline"
+            disabled={isSubmitting || isExpired || !hasScreenViewing || [...selectedScopes].some(scope => !['screen.view', 'input.pointer', 'input.keyboard'].includes(scope))}
+            onClick={() => submit(() => onPair({ session_id: session.session_id,
+              approved_scopes: session.requested_scopes.filter(scope => selectedScopes.has(scope)), expected_policy_revision: session.policy_revision }))}>
+            配对并记住此控制端
+          </Button>}
           <Button
             disabled={isSubmitting}
             id={denyButtonId}

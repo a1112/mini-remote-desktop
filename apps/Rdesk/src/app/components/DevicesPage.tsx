@@ -52,6 +52,7 @@ export function DevicesPage() {
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupDescription, setNewGroupDescription] = useState("");
   const [launchingDeviceId, setLaunchingDeviceId] = useState<string | null>(null);
+  const [accessMode, setAccessMode] = useState<'attended' | 'paired'>('attended');
   const [lanPairingOpen, setLanPairingOpen] = useState(false);
 
   // 右键菜单状态
@@ -192,6 +193,7 @@ export function DevicesPage() {
     setLaunchingDeviceId(device.id);
     try {
       const result = await launchRemoteDisplayForDevice(device.deviceId, {
+        accessMode,
         transportKind: device.p2pAvailable
           ? "quic"
           : device.os.toLowerCase().includes("quic")
@@ -281,6 +283,16 @@ export function DevicesPage() {
           )}
 
           <div className="flex-1" />
+          <label className={`text-xs ${textPrimary}`}>
+            连接授权方式
+            <select aria-label="连接授权方式" value={accessMode}
+              onChange={event => setAccessMode(event.target.value as 'attended' | 'paired')}
+              disabled={launchingDeviceId !== null}
+              className={`ml-2 px-2 py-1.5 rounded border ${isDark ? 'bg-[#232323] border-gray-600' : 'bg-white border-gray-200'}`}>
+              <option value="attended">首次连接或仅允许本次</option>
+              <option value="paired">已配对，免重复确认</option>
+            </select>
+          </label>
           {lastUpdated && (
             <span
               className={`text-xs mr-2 ${isDark ? "text-gray-500" : "text-gray-400"}`}

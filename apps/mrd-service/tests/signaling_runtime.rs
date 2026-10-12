@@ -18,11 +18,12 @@ use mrd_service::{
 use mrd_signal_proto::{
     webrtc_candidate_fingerprint_v3, AuthClaims, AuthenticatedSignalMessage, ProtocolReasonCode,
     Registered, RegisteredPayload, RelayMigrationOffer, RelayMigrationOfferPayload,
-    ServerChallenge, SessionGrant, SessionGrantPayload, SessionGrantV3, SessionGrantV3Payload,
-    SessionIntent, SessionIntentPayload, SessionIntentV3, SessionIntentV3Payload, SignalEnvelope,
-    WanAccessModeV3, WanPermissionScopeV3, WanRoutePolicyV3, WanSessionRequestV3,
-    WebRtcAnswer as LegacyWebRtcAnswer, WebRtcAnswerPayload as LegacyWebRtcAnswerPayload,
-    WebRtcAnswerV3, WebRtcAnswerV3Payload, WebRtcCandidate as LegacyWebRtcCandidate,
+    ServerChallenge, SessionClose, SessionClosePayload, SessionGrant, SessionGrantPayload,
+    SessionGrantV3, SessionGrantV3Payload, SessionIntent, SessionIntentPayload, SessionIntentV3,
+    SessionIntentV3Payload, SignalEnvelope, WanAccessModeV3, WanPermissionScopeV3,
+    WanRoutePolicyV3, WanSessionRequestV3, WebRtcAnswer as LegacyWebRtcAnswer,
+    WebRtcAnswerPayload as LegacyWebRtcAnswerPayload, WebRtcAnswerV3, WebRtcAnswerV3Payload,
+    WebRtcCandidate as LegacyWebRtcCandidate,
     WebRtcCandidatePayload as LegacyWebRtcCandidatePayload, WebRtcCandidateV3,
     WebRtcCandidateV3Payload, WebRtcDescriptionRoleV3, WebRtcOffer as LegacyWebRtcOffer,
     WebRtcOfferPayload as LegacyWebRtcOfferPayload, WebRtcOfferV3, WebRtcOfferV3Payload,
@@ -175,6 +176,511 @@ fn inbound_v3_intent_from(
         },
     )
     .unwrap()
+}
+
+const BROWSER_A: &str = "browser_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const BROWSER_B: &str = "browser_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn browser_intent(
+    signer: &DeviceIdentity,
+    session: &str,
+    browser: &str,
+    counter: u64,
+    nonce: u8,
+) -> SignalEnvelope {
+    SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(
+        inbound_v3_intent_from(signer, session, browser, "local-device", counter, nonce),
+    ))
+}
+
+fn browser_close(
+    signer: &DeviceIdentity,
+    session: &str,
+    browser: &str,
+    counter: u64,
+    nonce: u8,
+) -> SignalEnvelope {
+    SignalEnvelope::new(AuthenticatedSignalMessage::SessionClose(
+        SessionClose::sign(
+            signer,
+            SessionClosePayload {
+                claims: claims(signer, browser, "local-device", counter, nonce),
+                session_id: SessionId(session.into()),
+                reason: ProtocolReasonCode::Conflict,
+            },
+        )
+        .unwrap(),
+    ))
+}
+
+#[test]
+fn browser_replay_cross_session_intents_and_close_keep_independent_strict_streams() {
+    let server = identity();
+    let browser = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+
+    // One persistent browser key signs independent JWT-bound browser principals.
+    // Network arrival reverses the globally reserved counters across sockets.
+    for envelope in [
+        browser_intent(&browser, "browser-session-a", BROWSER_A, 100, 91),
+        browser_intent(&browser, "browser-session-b", BROWSER_B, 2, 92),
+        browser_close(&browser, "browser-session-a", BROWSER_A, 101, 93),
+        browser_close(&browser, "browser-session-b", BROWSER_B, 3, 94),
+    ] {
+        assert!(matches!(
+            runtime.handle_inbound(envelope, NOW + 1).unwrap(),
+            InboundDisposition::Applied(_)
+        ));
+    }
+    assert!(matches!(
+        runtime.handle_inbound(
+            browser_close(&browser, "browser-session-b", BROWSER_B, 3, 95),
+            NOW + 2
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::CounterRollback
+        ))
+    ));
+    assert!(matches!(
+        runtime.handle_inbound(
+            browser_close(&browser, "browser-session-a", BROWSER_A, 102, 93),
+            NOW + 2
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::RepeatedNonce
+        ))
+    ));
+}
+
+#[test]
+fn browser_replay_reconnect_preserves_counter_and_nonce_while_other_session_proceeds() {
+    let server = identity();
+    let browser = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    let original = browser_intent(&browser, "browser-reconnect-a", BROWSER_A, 100, 91);
+    runtime.handle_inbound(original.clone(), NOW + 1).unwrap();
+    runtime.note_connection_failure(NOW + 2, &SignalingRuntimeError::Disconnected);
+    runtime
+        .accept_registered(registered_with_nonce(&server, 2, 32), NOW + 3)
+        .unwrap();
+    assert_eq!(
+        runtime.handle_inbound(original, NOW + 4).unwrap(),
+        InboundDisposition::Duplicate
+    );
+    assert!(matches!(
+        runtime.handle_inbound(
+            browser_intent(&browser, "browser-reconnect-a", BROWSER_A, 99, 92),
+            NOW + 4
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::CounterRollback
+        ))
+    ));
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                browser_intent(&browser, "browser-reconnect-b", BROWSER_B, 2, 93),
+                NOW + 4
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                browser_close(&browser, "browser-reconnect-a", BROWSER_A, 101, 94),
+                NOW + 4
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
+#[test]
+fn browser_replay_namespace_requires_pinned_registered_server_and_live_connection() {
+    let server = identity();
+    let browser = identity();
+    let intent = || browser_intent(&browser, "browser-auth-required", BROWSER_A, 1, 91);
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    assert!(runtime.handle_inbound(intent(), NOW + 1).is_err());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    assert!(matches!(
+        runtime.handle_inbound(intent(), NOW + 1).unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+    runtime.note_connection_failure(NOW + 2, &SignalingRuntimeError::Disconnected);
+    assert!(runtime
+        .handle_inbound(
+            browser_close(&browser, "browser-auth-required", BROWSER_A, 2, 92),
+            NOW + 3
+        )
+        .is_err());
+
+    let mut unpinned = SignalingRuntimeCore::new(unpinned_config(), identity());
+    unpinned
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    assert!(unpinned.handle_inbound(intent(), NOW + 1).is_err());
+}
+
+#[test]
+fn browser_replay_close_requires_verified_exact_session_key_and_target_binding() {
+    let server = identity();
+    let browser = identity();
+    let other_key = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    assert!(runtime
+        .handle_inbound(
+            browser_close(&browser, "browser-bound-a", BROWSER_A, 200, 90),
+            NOW + 1
+        )
+        .is_err());
+    runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-bound-a", BROWSER_A, 1, 91),
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(runtime
+        .handle_inbound(
+            browser_close(&browser, "browser-other-session", BROWSER_A, 200, 92),
+            NOW + 1
+        )
+        .is_err());
+    assert!(runtime
+        .handle_inbound(
+            browser_close(&other_key, "browser-bound-a", BROWSER_A, 200, 93),
+            NOW + 1
+        )
+        .is_err());
+    let mut wrong_target = browser_close(&browser, "browser-bound-a", BROWSER_A, 200, 94);
+    if let AuthenticatedSignalMessage::SessionClose(message) = &mut wrong_target.message {
+        message.payload.claims.intended_peer_device_id = DeviceId("other-target".into());
+        *message = SessionClose::sign(&browser, message.payload.clone()).unwrap();
+    }
+    assert!(runtime.handle_inbound(wrong_target, NOW + 1).is_err());
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                browser_close(&browser, "browser-bound-a", BROWSER_A, 2, 95),
+                NOW + 1
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
+#[test]
+fn browser_replay_invalid_intent_cannot_create_or_poison_namespace() {
+    let server = identity();
+    let browser = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    let mut invalid = browser_intent(&browser, "browser-intent-valid", BROWSER_A, 200, 90);
+    if let AuthenticatedSignalMessage::SessionIntentV3(message) = &mut invalid.message {
+        message.signature[0] ^= 1;
+    }
+    assert!(runtime.handle_inbound(invalid, NOW + 1).is_err());
+    let mut wrong_controller = browser_intent(&browser, "browser-intent-valid", BROWSER_A, 200, 90);
+    if let AuthenticatedSignalMessage::SessionIntentV3(message) = &mut wrong_controller.message {
+        message.payload.request.controller_device_id = DeviceId(BROWSER_B.into());
+    }
+    assert!(runtime.handle_inbound(wrong_controller, NOW + 1).is_err());
+    assert!(runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-malformed", "browser_unreserved", 200, 90),
+            NOW + 1
+        )
+        .is_err());
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                browser_intent(&browser, "browser-intent-valid", BROWSER_A, 1, 91),
+                NOW + 1
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+    assert!(runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-rebound", BROWSER_A, 2, 92),
+            NOW + 1
+        )
+        .is_err());
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                browser_close(&browser, "browser-intent-valid", BROWSER_A, 2, 93),
+                NOW + 1
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
+#[test]
+fn browser_replay_does_not_relax_physical_key_global_counter() {
+    let server = identity();
+    let physical = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    runtime
+        .handle_inbound(
+            browser_intent(&physical, "physical-a", "physical-controller-a", 100, 91),
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.handle_inbound(
+            browser_intent(&physical, "physical-b", "physical-controller-b", 2, 92),
+            NOW + 1
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::CounterRollback
+        ))
+    ));
+}
+
+#[test]
+fn browser_replay_live_generation_zero_message_retains_strict_intent_close_lane() {
+    let server = identity();
+    let browser = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-retained", BROWSER_A, 100, 91),
+            NOW + 1,
+        )
+        .unwrap();
+    let mut offer = inbound_v3_offer(&browser, "browser-retained").payload;
+    offer.controller_device_id = DeviceId(BROWSER_A.into());
+    offer.claims = claims(&browser, BROWSER_A, "local-device", 102, 92);
+    offer.claims.issued_at_ms = NOW + 15_000;
+    offer.claims.expires_at_ms = NOW + 45_000;
+    runtime
+        .handle_inbound(
+            SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(
+                WebRtcOfferV3::sign(&browser, offer).unwrap(),
+            )),
+            NOW + 15_001,
+        )
+        .unwrap();
+    let fresh_close = |counter, nonce| {
+        let AuthenticatedSignalMessage::SessionClose(mut close) =
+            browser_close(&browser, "browser-retained", BROWSER_A, counter, nonce).message
+        else {
+            unreachable!()
+        };
+        close.payload.claims.issued_at_ms = NOW + 31_000;
+        close.payload.claims.expires_at_ms = NOW + 61_000;
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionClose(
+            SessionClose::sign(&browser, close.payload).unwrap(),
+        ))
+    };
+    assert!(matches!(
+        runtime.handle_inbound(fresh_close(99, 93), NOW + 31_001),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::CounterRollback
+        ))
+    ));
+    assert!(matches!(
+        runtime
+            .handle_inbound(fresh_close(101, 94), NOW + 31_001)
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
+#[test]
+fn browser_replay_expired_binding_cannot_close_or_poison_new_session() {
+    let server = identity();
+    let old = identity();
+    let new = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    let old_intent = browser_intent(&old, "browser-expired-old", BROWSER_A, 100, 91);
+    runtime.handle_inbound(old_intent.clone(), NOW + 1).unwrap();
+    // Exact accepted digests are idempotent, but an expired altered signed
+    // envelope cannot revive the namespace.
+    let mut expired = old_intent;
+    if let AuthenticatedSignalMessage::SessionIntentV3(message) = &mut expired.message {
+        message.payload.claims.counter = 101;
+        message.payload.claims.nonce = [92; 16];
+        *message = SessionIntentV3::sign(&old, message.payload.clone()).unwrap();
+    }
+    assert!(runtime.handle_inbound(expired, NOW + 31_000).is_err());
+    let mut new_intent = browser_intent(&new, "browser-reused-new", BROWSER_A, 1, 93);
+    if let AuthenticatedSignalMessage::SessionIntentV3(message) = &mut new_intent.message {
+        message.payload.claims.issued_at_ms = NOW + 31_000;
+        message.payload.claims.expires_at_ms = NOW + 61_000;
+        *message = SessionIntentV3::sign(&new, message.payload.clone()).unwrap();
+    }
+    assert!(matches!(
+        runtime.handle_inbound(new_intent, NOW + 31_001).unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+    let fresh_close = |signer: &DeviceIdentity, session: &str, counter, nonce| {
+        let AuthenticatedSignalMessage::SessionClose(mut close) =
+            browser_close(signer, session, BROWSER_A, counter, nonce).message
+        else {
+            unreachable!()
+        };
+        close.payload.claims.issued_at_ms = NOW + 32_000;
+        close.payload.claims.expires_at_ms = NOW + 62_000;
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionClose(
+            SessionClose::sign(signer, close.payload).unwrap(),
+        ))
+    };
+    assert!(runtime
+        .handle_inbound(
+            fresh_close(&old, "browser-expired-old", 200, 94),
+            NOW + 32_001
+        )
+        .is_err());
+    assert!(runtime
+        .handle_inbound(
+            fresh_close(&new, "browser-expired-old", 200, 95),
+            NOW + 32_001
+        )
+        .is_err());
+    assert!(matches!(
+        runtime
+            .handle_inbound(fresh_close(&new, "browser-reused-new", 2, 96), NOW + 32_001)
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
+}
+
+#[test]
+fn browser_replay_replayed_sdp_cannot_extend_expiry_or_retire_another_live_pin() {
+    let server = identity();
+    let browser = identity();
+    let other_key = identity();
+    let mut runtime = SignalingRuntimeCore::new(config(&server), identity());
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-prune-a", BROWSER_A, 100, 91),
+            NOW + 1,
+        )
+        .unwrap();
+    runtime
+        .handle_inbound(
+            browser_intent(&browser, "browser-prune-b", BROWSER_B, 1, 92),
+            NOW + 1,
+        )
+        .unwrap();
+    let offer = |session: &str, device: &str, counter, nonce, issued, expires, sdp: &str| {
+        let mut payload = inbound_v3_offer(&browser, session).payload;
+        payload.controller_device_id = DeviceId(device.into());
+        payload.claims = claims(&browser, device, "local-device", counter, nonce);
+        payload.claims.issued_at_ms = NOW + issued;
+        payload.claims.expires_at_ms = NOW + expires;
+        payload.sdp = sdp.into();
+        SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(
+            WebRtcOfferV3::sign(&browser, payload).unwrap(),
+        ))
+    };
+    runtime
+        .handle_inbound(
+            offer(
+                "browser-prune-a",
+                BROWSER_A,
+                101,
+                93,
+                15_000,
+                45_000,
+                "sdp-original",
+            ),
+            NOW + 15_001,
+        )
+        .unwrap();
+    runtime
+        .handle_inbound(
+            offer(
+                "browser-prune-b",
+                BROWSER_B,
+                2,
+                94,
+                20_000,
+                70_000,
+                "sdp-live-b",
+            ),
+            NOW + 20_001,
+        )
+        .unwrap();
+    assert!(matches!(
+        runtime.handle_inbound(
+            offer(
+                "browser-prune-a",
+                BROWSER_A,
+                101,
+                93,
+                25_000,
+                85_000,
+                "sdp-altered-replay"
+            ),
+            NOW + 25_001
+        ),
+        Err(SignalingRuntimeError::Protocol(
+            mrd_signal_proto::SignalProtocolError::RepeatedNonce
+        ))
+    ));
+    let close = |signer: &DeviceIdentity, session: &str, device: &str, counter, nonce| {
+        let AuthenticatedSignalMessage::SessionClose(mut message) =
+            browser_close(signer, session, device, counter, nonce).message
+        else {
+            unreachable!()
+        };
+        message.payload.claims.issued_at_ms = NOW + 46_000;
+        message.payload.claims.expires_at_ms = NOW + 76_000;
+        SignalEnvelope::new(AuthenticatedSignalMessage::SessionClose(
+            SessionClose::sign(signer, message.payload).unwrap(),
+        ))
+    };
+    assert!(runtime
+        .handle_inbound(
+            close(&browser, "browser-prune-a", BROWSER_A, 102, 95),
+            NOW + 46_001
+        )
+        .is_err());
+    assert!(runtime
+        .handle_inbound(
+            close(&other_key, "browser-prune-b", BROWSER_B, 999, 96),
+            NOW + 46_001
+        )
+        .is_err());
+    assert!(matches!(
+        runtime
+            .handle_inbound(
+                close(&browser, "browser-prune-b", BROWSER_B, 3, 97),
+                NOW + 46_001
+            )
+            .unwrap(),
+        InboundDisposition::Applied(_)
+    ));
 }
 
 fn inbound_v3_grant(signer: &DeviceIdentity, session_id: &str) -> SessionGrantV3 {

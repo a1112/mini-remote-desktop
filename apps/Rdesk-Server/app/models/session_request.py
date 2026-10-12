@@ -58,8 +58,16 @@ class SessionRequest(Base):
         CheckConstraint(
             "requester_device_id IS NULL OR "
             "(requester_device_id <> target_device_id AND "
-            "access_mode = 'attended' AND route_policy IN ('relay_only', 'direct_first'))",
+            "access_mode IN ('attended', 'paired') AND route_policy IN ('relay_only', 'direct_first'))",
             name="ck_session_requests_wan_values",
+        ),
+        CheckConstraint(
+            "((access_mode IS NULL OR access_mode = 'attended') AND "
+            "paired_controller_key_id IS NULL AND paired_target_key_id IS NULL) OR "
+            "(access_mode = 'paired' AND paired_controller_key_id IS NOT NULL AND "
+            "paired_target_key_id IS NOT NULL AND length(paired_controller_key_id) = 64 "
+            "AND length(paired_target_key_id) = 64)",
+            name="ck_session_requests_paired_keys",
         ),
         CheckConstraint(
             "active_relay_generation IS NULL OR "
@@ -131,6 +139,8 @@ class SessionRequest(Base):
     )
     request_commitment: Mapped[str | None] = mapped_column(String(64), nullable=True)
     access_mode: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    paired_controller_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    paired_target_key_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     route_policy: Mapped[str | None] = mapped_column(String(24), nullable=True)
     requested_scopes: Mapped[list[str] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=True

@@ -29,6 +29,208 @@ use mrd_session_agent::{
 };
 use tokio::sync::watch;
 
+fn paired_cleanup_test_binding() -> AgentBinding {
+    use ed25519_dalek::{Signer, SigningKey};
+    use mrd_agent_ipc::{
+        registration_proof_signing_bytes, AgentCapabilitySnapshot, AgentRegister, AgentRegistered,
+    };
+    let registry = crate::agent_runtime::AgentRegistry::default();
+    let signing = SigningKey::from_bytes(&[29; 32]);
+    let public = signing.verifying_key().to_bytes();
+    let key_id = derive_registration_public_key(&[29; 32]).unwrap().key_id;
+    let observed = ObservedAgentIdentity {
+        caller_kind: AgentCallerKind::InteractiveUser,
+        process_id: 100,
+        process_creation_time: 1000,
+        logon_sid_hash: [7; 32],
+        windows_session_id: 1,
+    };
+    registry
+        .expect_session_at(
+            ExpectedAgentSession {
+                windows_session_id: 1,
+                logon_sid_hash: [7; 32],
+                process_id: 100,
+                process_creation_time: 1000,
+                agent_key_id: key_id,
+                expires_at_ms: 5000,
+                replacement_policy: ReplacementPolicy::RejectExisting,
+            },
+            Arc::new(BoundEd25519RegistrationVerifier::new(key_id, public).unwrap()),
+            1000,
+        )
+        .unwrap();
+    let connection = AgentConnectionId::from_bytes([8; 16]).unwrap();
+    let register = AgentRegister {
+        agent_instance_id: [1; 16],
+        process_id: 100,
+        process_creation_time: 1000,
+        logon_sid_hash: [7; 32],
+        windows_session_id: 1,
+        agent_key_id: key_id,
+        agent_nonce: [2; 32],
+    };
+    let challenge = registry
+        .begin_registration(connection, register.clone(), observed, 1000)
+        .unwrap();
+    let mut proof = AgentRegistered {
+        registration_id: challenge.registration_id,
+        registration_epoch: challenge.registration_epoch,
+        challenge_id: challenge.challenge_id,
+        agent_instance_id: [1; 16],
+        accepted_protocol_major: 1,
+        accepted_protocol_minor: 9,
+        signed_at_ms: 1001,
+        signature: [0; 64],
+    };
+    proof.signature = signing
+        .sign(&registration_proof_signing_bytes(
+            &register, &challenge, &proof,
+        ))
+        .to_bytes();
+    let identity = registry
+        .complete_registration(connection, proof, 1001)
+        .unwrap();
+    registry
+        .activate_registration(
+            connection,
+            AgentCapabilitySnapshot {
+                agent_instance_id: [1; 16],
+                registration_id: identity.registration_id,
+                windows_session_id: 1,
+                revision: 1,
+                desktop_epoch: 1,
+                observed_at_ms: 1002,
+                capabilities: [AgentCapability::Capture].into_iter().collect(),
+            },
+            1002,
+        )
+        .unwrap();
+    registry
+        .bind_active_session(1, AgentCapability::Capture, 1002)
+        .unwrap()
+}
+
+fn paired_cleanup_test_target(binding: &AgentBinding) -> Target {
+    Target {
+        binding: binding.clone(),
+        logon_hash: [7; 32],
+        authorization_expires_at_ms: 5000,
+        resource: None,
+        input: HashMap::new(),
+        closing: false,
+        paired_authority_id: Some([9; 32]),
+    }
+}
+
+fn paired_install_rejection(
+    binding: &AgentBinding,
+    session: &SessionId,
+) -> std::result::Result<mrd_agent_ipc::PairedSessionAuthorityResult, AgentRequestError> {
+    Ok(mrd_agent_ipc::PairedSessionAuthorityResult {
+        request_token: 1,
+        authority_id: [9; 32],
+        registration_id: *binding.registration_id(),
+        registration_epoch: binding.registration_epoch(),
+        session_id: session.clone(),
+        outcome: mrd_agent_ipc::PairedSessionAuthorityOutcome::Rejected,
+    })
+}
+
+#[tokio::test]
+async fn paired_definitive_install_rejection_releases_all_empty_target_slots() {
+    let state = AppState::new();
+    let capture = ConsoleCaptureState::default();
+    let binding = paired_cleanup_test_binding();
+    for index in 0..(MAX_CONSOLE_TARGETS * 2) {
+        let session = SessionId(format!("paired-rejected-{index}"));
+        capture
+            .targets
+            .lock()
+            .await
+            .insert(session.clone(), paired_cleanup_test_target(&binding));
+        capture
+            .finish_failed_paired_install(
+                &state,
+                &session,
+                &paired_install_rejection(&binding, &session),
+            )
+            .await;
+        assert!(
+            capture.targets.lock().await.is_empty(),
+            "a definitely rejected install must not retain any of the 64 slots"
+        );
+    }
+}
+
+#[tokio::test]
+async fn paired_unknown_install_outcome_retains_exact_cleanup_ownership_and_resources() {
+    let state = AppState::new();
+    let capture = ConsoleCaptureState::default();
+    let binding = paired_cleanup_test_binding();
+    for (index, result) in [
+        Err(AgentRequestError::Timeout),
+        Err(AgentRequestError::Disconnected),
+        Err(AgentRequestError::ConnectionUnavailable),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = SessionId(format!("paired-unknown-{index}"));
+        let mut target = paired_cleanup_test_target(&binding);
+        target.resource = Some(Resource {
+            id: [11; 16],
+            peer: PeerBinding {
+                device_id: DeviceId("peer".into()),
+                key_id: [12; 32],
+            },
+            policy_revision: 1,
+            expires_at_ms: 5000,
+            profile: profile(),
+            source_bounds: None,
+            stop_command: Arc::new(Mutex::new(None)),
+        });
+        capture.targets.lock().await.insert(session.clone(), target);
+        capture
+            .finish_failed_paired_install(&state, &session, &result)
+            .await;
+        let targets = capture.targets.lock().await;
+        let target = targets.get(&session).unwrap();
+        assert!(target.closing);
+        assert_eq!(target.paired_authority_id, Some([9; 32]));
+        assert_eq!(target.resource.as_ref().unwrap().id, [11; 16]);
+    }
+}
+
+#[tokio::test]
+async fn paired_mismatched_rejection_cannot_release_another_authority() {
+    let state = AppState::new();
+    let capture = ConsoleCaptureState::default();
+    let binding = paired_cleanup_test_binding();
+    for index in 0..4 {
+        let session = SessionId(format!("paired-mismatched-{index}"));
+        let mut result = paired_install_rejection(&binding, &session).unwrap();
+        match index {
+            0 => result.authority_id = [10; 32],
+            1 => result.registration_id = [10; 16],
+            2 => result.registration_epoch += 1,
+            _ => result.session_id = SessionId("another-session".into()),
+        }
+        capture
+            .targets
+            .lock()
+            .await
+            .insert(session.clone(), paired_cleanup_test_target(&binding));
+        capture
+            .finish_failed_paired_install(&state, &session, &Ok(result))
+            .await;
+        let targets = capture.targets.lock().await;
+        let target = targets.get(&session).unwrap();
+        assert!(target.closing);
+        assert_eq!(target.paired_authority_id, Some([9; 32]));
+    }
+}
+
 #[test]
 fn consent_diagnostics_only_expose_typed_static_causes() {
     let secret = "untrusted-error-with-private-path-and-credential";

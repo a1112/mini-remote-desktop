@@ -216,6 +216,80 @@ impl Fixture {
 }
 
 #[test]
+fn stable_browser_key_sessions_do_not_share_network_arrival_highwater() {
+    let mut fixture = Fixture::new();
+    let original = fixture.data.clone();
+    fixture.data["browser"]["device_id"] = json!("browser_22222222222222222222222222222222");
+    fixture.data["request"]["session_id"] = json!("browser-session-b");
+    let second_device = fixture.device_id(true);
+    let second = ConnectionId::from_bytes([3; 16]).unwrap();
+    fixture.register(true, second, 100).unwrap();
+    fixture.data = original;
+    // The lower counter arrives on an independently authenticated session socket.
+    let intent = fixture.intent();
+    assert!(fixture
+        .core
+        .handle(
+            second,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(intent.clone())),
+            NOW + 101
+        )
+        .is_err());
+    fixture
+        .core
+        .handle(
+            fixture.browser_connection,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(intent.clone())),
+            NOW + 101,
+        )
+        .unwrap();
+    let mut second_payload = intent.payload.clone();
+    second_payload.claims.issuer_device_id = second_device.clone();
+    second_payload.claims.counter = 101;
+    second_payload.claims.nonce = [101; 16];
+    second_payload.request.controller_device_id = second_device;
+    second_payload.request.session_id = SessionId("browser-session-b".into());
+    second_payload.request_commitment = second_payload.request.commitment().unwrap();
+    let second_intent = SessionIntentV3::sign(&fixture.browser, second_payload).unwrap();
+    fixture
+        .core
+        .handle(
+            second,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(second_intent)),
+            NOW + 102,
+        )
+        .unwrap();
+    assert!(fixture
+        .core
+        .handle(
+            fixture.browser_connection,
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionIntentV3(intent)),
+            NOW + 102
+        )
+        .is_err());
+}
+
+#[test]
+fn stable_browser_key_registers_distinct_short_principals_with_same_initial_counter() {
+    let mut fixture = Fixture::new();
+    fixture.data["browser"]["device_id"] = json!("browser_22222222222222222222222222222222");
+    fixture.data["request"]["session_id"] = json!("browser-session-b");
+    let second = ConnectionId::from_bytes([3; 16]).unwrap();
+    fixture.register(true, second, 1).unwrap();
+    assert_eq!(fixture.core.presence_count(), 3);
+}
+
+#[test]
+fn browser_reconnect_keeps_strict_counter_and_nonce_for_the_same_principal() {
+    let mut fixture = Fixture::new();
+    fixture.core.disconnect(fixture.browser_connection);
+    let next = ConnectionId::from_bytes([3; 16]).unwrap();
+    assert!(fixture.register(true, next, 1).is_err());
+    let next = ConnectionId::from_bytes([4; 16]).unwrap();
+    fixture.register(true, next, 2).unwrap();
+}
+
+#[test]
 fn browser_controller_routes_real_v3_intent_offer_and_candidate_without_wire_changes() {
     let mut fixture = Fixture::new();
     fixture.open_route();

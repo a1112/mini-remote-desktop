@@ -20,6 +20,7 @@ export function GuestRemoteConnectForm() {
   const [deviceCode, setDeviceCode] = useState('');
   const [password, setPassword] = useState('');
   const [picturePreset, setPicturePreset] = useState(DEFAULT_PICTURE_PRESET);
+  const [accessMode, setAccessMode] = useState<'attended' | 'paired'>('attended');
   const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +44,7 @@ export function GuestRemoteConnectForm() {
         temporaryPassword: password, signal: cancellation.signal,
         transportKind: 'webrtc', routePreference: 'auto', targetDeviceName: '远程设备',
         requestedProfile: { ...picturePreset.profile },
+        accessMode,
       });
       if (!alive.current || cancellation.signal.aborted) {
         await closeBrowserRemoteSession(result.sessionId, 'connection_form_left'); return;
@@ -79,7 +81,13 @@ export function GuestRemoteConnectForm() {
         {PICTURE_PRESETS.map(preset => <option key={preset.value} value={preset.value}>{preset.label}</option>)}
       </select>
     </label>
-    <p className="text-xs leading-relaxed opacity-65">双方无需登录。输入设备码和临时密码后，请在远端确认画面与键鼠权限；已有的 9 位设备码仍可使用。</p>
+    <label className="block text-sm">连接授权方式
+      <select aria-label="连接授权方式" value={accessMode} disabled={busy} onChange={event => setAccessMode(event.target.value as 'attended' | 'paired')}
+        className="mt-1.5 w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5">
+        <option value="attended">首次连接或仅允许本次</option><option value="paired">已配对，免重复确认</option>
+      </select>
+    </label>
+    <p className="text-xs leading-relaxed opacity-65">首次连接请在远端配对并记住所选权限，之后可选择已配对连接。每次仍需有效临时密码；密码刷新后需重新本机确认和配对。已有的 9 位设备码仍可使用。</p>
     <button type="submit" disabled={!deviceCode.trim() || !password || busy} className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-3 py-2.5 text-sm text-white hover:bg-blue-500 disabled:opacity-40">
       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}{busy ? '正在验证…' : '立即连接'}
     </button>

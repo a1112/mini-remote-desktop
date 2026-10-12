@@ -4967,6 +4967,14 @@ async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
             cert_der: bootstrap.cert_der,
         }),
     };
+    // Driver/codec probes may synchronously block a cold process. They are
+    // fixture setup, not part of the media-registry publication race below.
+    let capabilities_started = Instant::now();
+    let peer_media_capabilities = lan_media_capabilities();
+    eprintln!(
+        "receiver_fixture_capability_setup_ms={}",
+        capabilities_started.elapsed().as_millis()
+    );
     let server = tokio::spawn(async move {
         let endpoint = listener
             .accept()
@@ -4978,7 +4986,7 @@ async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
     let profile_guard = app_state.media_profiles.lock().await;
     let commit_state = app_state.clone();
     let commit_session_id = session_id.clone();
-    let commit = tokio::spawn(async move {
+    let mut commit = tokio::spawn(async move {
         start_lan_media_receiver_with_timeout(
             commit_state,
             commit_session_id,
@@ -4987,13 +4995,17 @@ async fn receiver_commit_and_stop_are_atomic_across_media_registry_awaits() {
             "127.0.0.1".parse().unwrap(),
             DeviceId("target-device".to_string()),
             default_media_profile_negotiation(),
-            lan_media_capabilities(),
+            peer_media_capabilities,
             None,
             Duration::from_secs(1),
         )
         .await
     });
-    wait_until_session_commit_reaches_locked_profile(&app_state, &session_id).await;
+    tokio::select! {
+        biased;
+        result = &mut commit => panic!("receiver commit ended before the media-profile barrier: {result:?}"),
+        _ = wait_until_session_commit_reaches_locked_profile(&app_state, &session_id) => {},
+    }
 
     let stop_state = app_state.clone();
     let stop_session_id = session_id.clone();

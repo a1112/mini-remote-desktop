@@ -20,6 +20,7 @@ pub mod media;
 /// Native attended-consent adapter and sanitized surface model.
 #[allow(dead_code)] // Production bootstrap consumes this adapter in Task 24.B3.5.
 pub(crate) mod native_consent;
+mod paired_authority;
 /// Grant-bound desktop render adapter boundary.
 pub mod render;
 /// Registration, control-loop, heartbeat, and shutdown runtime.

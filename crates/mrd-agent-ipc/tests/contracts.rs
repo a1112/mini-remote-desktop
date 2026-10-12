@@ -175,7 +175,7 @@ fn media_access_unit_round_trips_and_enforces_payload_bound() {
 #[test]
 fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 9);
     let unit = RenderAccessUnit {
         resource_id: RESOURCE_ID,
         session_id: "session-render".to_string(),
@@ -200,7 +200,7 @@ fn render_access_unit_round_trips_from_service_with_exact_resource_binding() {
 #[test]
 fn render_boundary_metrics_round_trip_with_protocol_minor_five() {
     assert_eq!(AGENT_IPC_RENDER_METRICS_PROTOCOL_MINOR, 5);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 9);
     let metrics = RenderBoundaryMetrics {
         context: AgentEventContext {
             registration_id: REGISTRATION_ID,
@@ -800,7 +800,7 @@ fn consent_request_keeps_prompt_and_authorization_expiry_distinct() {
 fn cancel_consent_round_trips_as_a_minor_two_cleanup_message() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
     assert_eq!(AGENT_IPC_CONSENT_CANCEL_PROTOCOL_MINOR, 2);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 9);
 
     for reason in [
         ConsentCancelReason::CallerAborted,
@@ -884,7 +884,7 @@ fn every_product_command_round_trips_with_an_execute_grant() {
 fn start_render_digest_binds_surface_identity_and_native_handle() {
     assert_eq!(AGENT_IPC_RENDER_ACCESS_UNIT_PROTOCOL_MINOR, 3);
     assert_eq!(AGENT_IPC_RENDER_SURFACE_PROTOCOL_MINOR, 4);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 9);
     let command = AgentCommand::StartRender {
         resource_id: RESOURCE_ID,
         display_id: 1,
@@ -1267,7 +1267,7 @@ fn execute_grant_digest_covers_the_command_id() {
 #[test]
 fn request_tokens_are_nonzero_transport_metadata_outside_the_execute_digest() {
     assert_eq!(AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR, 1);
-    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 8);
+    assert_eq!(AGENT_IPC_PROTOCOL_MINOR, 9);
 
     let mut execute = execute_command(AgentCommand::StartCapture {
         resource_id: RESOURCE_ID,

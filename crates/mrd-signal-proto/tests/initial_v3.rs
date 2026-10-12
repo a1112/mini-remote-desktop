@@ -176,6 +176,80 @@ fn attended_request_is_normalized_and_has_a_cross_language_golden_commitment() {
 }
 
 #[test]
+fn paired_mode_has_a_distinct_cross_language_commitment_and_signed_binding() {
+    let paired: WanAccessModeV3 = serde_json::from_str("\"paired\"").expect("paired mode");
+    assert_eq!(serde_json::to_string(&paired).unwrap(), "\"paired\"");
+    assert!(serde_json::from_str::<WanAccessModeV3>("\"unattended\"").is_err());
+    let mut request = request();
+    request.access_mode = paired;
+    assert_eq!(
+        request.commitment().unwrap(),
+        "ea69079ebeba95592015cbd595dc1e8add335405bc36641745ec2f16793272a2"
+    );
+    let controller = identity();
+    let target = identity();
+    let intent = SessionIntentV3::sign(
+        &controller,
+        SessionIntentV3Payload {
+            claims: claims(&controller, "controller-1", "target-1", 1),
+            request_commitment: request.commitment().unwrap(),
+            request,
+        },
+    )
+    .unwrap();
+    let grant = signed_grant(&target, &intent);
+    grant.verify_intent(&intent).unwrap();
+    let mut tampered = intent.clone();
+    tampered.payload.request.access_mode = WanAccessModeV3::Attended;
+    tampered.payload.request_commitment = tampered.payload.request.commitment().unwrap();
+    assert!(tampered
+        .verify_for(
+            &DeviceId("target-1".into()),
+            NOW_MS,
+            &mut SignalReplayGuard::new(16, 32)
+        )
+        .is_err());
+    assert!(grant.verify_intent(&tampered).is_err());
+}
+
+#[test]
+fn stable_browser_key_requires_global_counter_across_fresh_session_ids() {
+    let controller = identity();
+    let mut replay = SignalReplayGuard::new(16, 32);
+    let sign = |session: &str, device: &str, counter: u64, nonce: u8| {
+        let mut request = request();
+        request.session_id = SessionId(session.into());
+        request.controller_device_id = DeviceId(device.into());
+        request.access_mode = WanAccessModeV3::Paired;
+        let mut claims = claims(&controller, device, "target-1", counter);
+        claims.nonce = [nonce; 16];
+        SessionIntentV3::sign(
+            &controller,
+            SessionIntentV3Payload {
+                claims,
+                request_commitment: request.commitment().unwrap(),
+                request,
+            },
+        )
+        .unwrap()
+    };
+    sign("session-a", "browser_a", 1, 1)
+        .verify_for(&DeviceId("target-1".into()), NOW_MS, &mut replay)
+        .unwrap();
+    assert_eq!(
+        sign("session-b", "browser_b", 1, 2).verify_for(
+            &DeviceId("target-1".into()),
+            NOW_MS,
+            &mut replay
+        ),
+        Err(SignalProtocolError::CounterRollback)
+    );
+    sign("session-b", "browser_b", 2, 2)
+        .verify_for(&DeviceId("target-1".into()), NOW_MS, &mut replay)
+        .unwrap();
+}
+
+#[test]
 fn intent_rejects_non_normalized_profile_and_request_commitment_mismatch() {
     let controller = identity();
     let mut profile_request = request();

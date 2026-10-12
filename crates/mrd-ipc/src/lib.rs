@@ -1647,6 +1647,20 @@ mod wire {
     pub enum RemoteAccessMode {
         Attended,
         Unattended,
+        /// Explicit target-local, public-key-pinned paired policy.
+        Paired,
+    }
+
+    /// Non-secret projection of a durable paired controller policy.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct PairedAccessPolicySnapshot {
+        pub peer_key_id: String,
+        pub epoch: DecimalU64,
+        pub trust_revision: DecimalU64,
+        pub scopes: Vec<RemotePermissionScope>,
+        pub revision: DecimalU64,
+        pub enabled: bool,
     }
 
     /// Local role in the authoritative remote-session aggregate.
@@ -2120,7 +2134,7 @@ mod wire {
 
     /// IPC request from Rdesk to mrd-service
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-    #[serde(tag = "type")]
+    #[serde(tag = "type", deny_unknown_fields)]
     pub enum IpcRequest {
         /// Secret-free public registration and authenticated signaling health.
         GetPublicServerStatus,
@@ -2210,13 +2224,32 @@ mod wire {
         /// List all active sessions
         ListSessions,
         /// Get the authoritative authorization/route/media snapshot for a remote session.
-        GetRemoteSession { session_id: SessionId },
+        GetRemoteSession {
+            session_id: SessionId,
+        },
         /// Request a new authorized remote session without starting media early.
-        RequestRemoteSession { request: RemoteSessionRequest },
+        RequestRemoteSession {
+            request: RemoteSessionRequest,
+        },
         /// Record local attended consent for exact scopes and policy revision.
-        RespondToConsent { response: ConsentResponse },
+        RespondToConsent {
+            response: ConsentResponse,
+        },
+        /// Explicit local pairing of the authenticated key of a pending session.
+        PairPendingSession {
+            session_id: SessionId,
+            approved_scopes: Vec<RemotePermissionScope>,
+            expected_policy_revision: DecimalU64,
+        },
+        ListPairedAccessPolicies,
+        RevokePairedAccess {
+            peer_key_id: String,
+            expected_revision: DecimalU64,
+        },
         /// Enable unattended access under a non-secret local policy.
-        EnableUnattendedAccess { policy: UnattendedAccessPolicy },
+        EnableUnattendedAccess {
+            policy: UnattendedAccessPolicy,
+        },
         /// Disable unattended access with optimistic policy concurrency.
         DisableUnattendedAccess {
             expected_policy_revision: DecimalU64,
@@ -2226,13 +2259,19 @@ mod wire {
             expected_policy_revision: DecimalU64,
         },
         /// List public-key-pinned trusted device projections.
-        ListTrustedDevices { include_revoked: bool },
+        ListTrustedDevices {
+            include_revoked: bool,
+        },
         /// Inspect current signed LAN candidates without granting any authority.
         ListLanPairingCandidates,
         /// Explicit first pairing; requires the verified installed product caller.
-        ApproveLanPairing { approval: LanPairingApproval },
+        ApproveLanPairing {
+            approval: LanPairingApproval,
+        },
         /// Approve an already authenticated pending peer key.
-        ApproveTrustedDevice { approval: TrustedDeviceApproval },
+        ApproveTrustedDevice {
+            approval: TrustedDeviceApproval,
+        },
         /// Suspend a trusted peer key.
         SuspendTrustedDevice {
             peer_key_id: String,
@@ -2244,17 +2283,25 @@ mod wire {
             expected_trust_revision: DecimalU64,
         },
         /// Approve an already verified key rotation.
-        RotateTrustedDevice { rotation: TrustedDeviceRotation },
+        RotateTrustedDevice {
+            rotation: TrustedDeviceRotation,
+        },
         /// Replace desired session permissions under policy-revision concurrency.
-        ChangeSessionPermissions { change: SessionPermissionChange },
+        ChangeSessionPermissions {
+            change: SessionPermissionChange,
+        },
         /// Fetch one bounded long-poll batch of typed session events.
         SubscribeSessionEvents {
             query: SessionEventSubscriptionQuery,
         },
         /// Get evidence for actual route attempts and the selected route.
-        GetRouteEvidence { session_id: SessionId },
+        GetRouteEvidence {
+            session_id: SessionId,
+        },
         /// Query durable redacted audit events by monotonic cursor.
-        GetAuditEventsV2 { query: AuditEventsQueryV2 },
+        GetAuditEventsV2 {
+            query: AuditEventsQueryV2,
+        },
         /// Start the legacy runtime used only for a registered local self-test.
         /// Production remote access must use `RequestRemoteSession`.
         StartSession {
@@ -2297,7 +2344,9 @@ mod wire {
             source_id: String,
         },
         /// List display modes from the remote peer for a session.
-        ListRemoteDisplayModes { session_id: SessionId },
+        ListRemoteDisplayModes {
+            session_id: SessionId,
+        },
         /// Temporarily set a remote display mode.
         SetRemoteDisplayMode {
             session_id: SessionId,
@@ -2305,7 +2354,9 @@ mod wire {
             restore_after_session: bool,
         },
         /// Restore the display mode saved for a session.
-        RestoreRemoteDisplayMode { session_id: SessionId },
+        RestoreRemoteDisplayMode {
+            session_id: SessionId,
+        },
         /// Attach a native render surface to a session media pipeline.
         AttachRenderSurface {
             session_id: SessionId,
@@ -2327,24 +2378,36 @@ mod wire {
             source_device_id: DeviceId,
         },
         /// Start sending media (controller role)
-        StartSender { session_id: SessionId },
+        StartSender {
+            session_id: SessionId,
+        },
         /// Start receiving media (agent role)
-        StartReceiver { session_id: SessionId },
+        StartReceiver {
+            session_id: SessionId,
+        },
         /// Stop a session
-        StopSession { session_id: SessionId },
+        StopSession {
+            session_id: SessionId,
+        },
         /// Mark a session as failed and retain its failure reason.
         FailSession {
             session_id: SessionId,
             reason: String,
         },
         /// Recover a failed or closed session back to its role-appropriate startup state.
-        RecoverSession { session_id: SessionId },
+        RecoverSession {
+            session_id: SessionId,
+        },
         /// Get current session runtime snapshot
-        SessionRuntimeSnapshot { session_id: SessionId },
+        SessionRuntimeSnapshot {
+            session_id: SessionId,
+        },
         /// Get aggregated runtime snapshot
         RuntimeSnapshot,
         /// Query service-owned audit events.
-        AuditLog { query: AuditLogQuery },
+        AuditLog {
+            query: AuditLogQuery,
+        },
         /// Get structured local capability snapshot.
         CapabilitySnapshot,
         /// Evaluate a scenario/profile before starting a session.
@@ -2421,9 +2484,13 @@ mod wire {
             session_id: Option<SessionId>,
         },
         /// Get probe snapshot data
-        ProbeSnapshot { session_id: SessionId },
+        ProbeSnapshot {
+            session_id: SessionId,
+        },
         /// Get media pipeline snapshot data.
-        MediaPipelineSnapshot { session_id: SessionId },
+        MediaPipelineSnapshot {
+            session_id: SessionId,
+        },
         /// Stream probe events
         StreamProbeEvents,
         /// Health check for service
@@ -2431,7 +2498,9 @@ mod wire {
 
         // === Shell / Lifecycle Commands (Phase 2) ===
         /// Request to open/focus the UI
-        OpenUi { reason: OpenUiReason },
+        OpenUi {
+            reason: OpenUiReason,
+        },
         /// Request to focus an existing UI window
         FocusUi,
         /// Notify service that UI has attached
@@ -2440,15 +2509,22 @@ mod wire {
             executable_path: Option<String>,
         },
         /// Notify service that UI is detaching
-        UiDetached { pid: u32, reason: UiDetachReason },
+        UiDetached {
+            pid: u32,
+            reason: UiDetachReason,
+        },
         /// Get current shell/service status
         GetShellStatus,
         /// Set autostart enabled state
-        SetAutostart { enabled: bool },
+        SetAutostart {
+            enabled: bool,
+        },
         /// Get autostart status
         GetAutostartStatus,
         /// Request service shutdown
-        ShutdownService { mode: ShutdownMode },
+        ShutdownService {
+            mode: ShutdownMode,
+        },
     }
 
     impl IpcRequest {
@@ -2462,6 +2538,9 @@ mod wire {
                 Self::GetRemoteSession { .. }
                     | Self::RequestRemoteSession { .. }
                     | Self::RespondToConsent { .. }
+                    | Self::PairPendingSession { .. }
+                    | Self::ListPairedAccessPolicies
+                    | Self::RevokePairedAccess { .. }
                     | Self::EnableUnattendedAccess { .. }
                     | Self::DisableUnattendedAccess { .. }
                     | Self::RotateUnattendedAccess { .. }
@@ -2486,17 +2565,29 @@ mod wire {
     #[serde(tag = "type")]
     pub enum IpcResponse {
         /// Public server state without device credentials or privileged session data.
-        PublicServerStatus { status: PublicServerStatus },
+        PublicServerStatus {
+            status: PublicServerStatus,
+        },
         /// Temporary password state without any cleartext credential.
-        TemporaryAccessStatus { status: TemporaryAccessStatus },
+        TemporaryAccessStatus {
+            status: TemporaryAccessStatus,
+        },
         /// A memory-only response exclusively for the verified local UI.
-        TemporaryAccessSecret { secret: TemporaryAccessSecret },
+        TemporaryAccessSecret {
+            secret: TemporaryAccessSecret,
+        },
         /// Explicit support for the narrow own-device binding protocol.
-        PublicDeviceBindingProtocol { protocol_minor: u16 },
+        PublicDeviceBindingProtocol {
+            protocol_minor: u16,
+        },
         /// Device registration successful
-        DeviceRegistered { device_id: DeviceId },
+        DeviceRegistered {
+            device_id: DeviceId,
+        },
         /// List of available devices
-        DeviceList { devices: Vec<DeviceInfo> },
+        DeviceList {
+            devices: Vec<DeviceInfo>,
+        },
         /// Service-owned preference flags for known devices.
         DevicePreferences {
             /// Current preference records.
@@ -2528,35 +2619,63 @@ mod wire {
             action: RemoteDevicePowerAction,
         },
         /// List of active sessions
-        SessionList { sessions: Vec<SessionInfo> },
+        SessionList {
+            sessions: Vec<SessionInfo>,
+        },
         /// Authoritative secure remote-session snapshot.
-        RemoteSession { session: RemoteSessionSnapshot },
+        RemoteSession {
+            session: RemoteSessionSnapshot,
+        },
         /// Newly requested secure remote-session snapshot.
-        RemoteSessionRequested { session: RemoteSessionSnapshot },
+        RemoteSessionRequested {
+            session: RemoteSessionSnapshot,
+        },
         /// Snapshot after recording attended consent.
-        ConsentRecorded { session: RemoteSessionSnapshot },
+        ConsentRecorded {
+            session: RemoteSessionSnapshot,
+        },
+        PairedAccessPolicies {
+            policies: Vec<PairedAccessPolicySnapshot>,
+        },
+        PairedAccessPolicyUpdated {
+            policy: PairedAccessPolicySnapshot,
+        },
         /// Current unattended-access policy and non-secret metadata.
-        UnattendedAccessUpdated { access: UnattendedAccessSnapshot },
+        UnattendedAccessUpdated {
+            access: UnattendedAccessSnapshot,
+        },
         /// Trusted device projections.
-        TrustedDeviceList { devices: Vec<TrustedDeviceSnapshot> },
+        TrustedDeviceList {
+            devices: Vec<TrustedDeviceSnapshot>,
+        },
         /// Current signed first-pairing candidates, with public metadata only.
         LanPairingCandidateList {
             candidates: Vec<LanPairingCandidate>,
         },
         /// Trusted device projection after a state transition.
-        TrustedDeviceUpdated { device: TrustedDeviceSnapshot },
+        TrustedDeviceUpdated {
+            device: TrustedDeviceSnapshot,
+        },
         /// Session snapshot after a permission transition.
-        SessionPermissionsChanged { session: RemoteSessionSnapshot },
+        SessionPermissionsChanged {
+            session: RemoteSessionSnapshot,
+        },
         /// One bounded event subscription batch and continuation cursor.
         SessionEventsSubscribed {
             subscription: SessionEventSubscription,
         },
         /// One typed session event for transports that support unsolicited delivery.
-        SessionEvent { event: RemoteSessionEventEnvelope },
+        SessionEvent {
+            event: RemoteSessionEventEnvelope,
+        },
         /// Actual route-attempt evidence.
-        RouteEvidence { evidence: RouteEvidence },
+        RouteEvidence {
+            evidence: RouteEvidence,
+        },
         /// Durable redacted audit event page.
-        AuditEventsV2 { page: AuditEventPageV2 },
+        AuditEventsV2 {
+            page: AuditEventPageV2,
+        },
         /// Typed secure-remote rejection that preserves stable reason codes.
         RemoteAccessError {
             session_id: Option<SessionId>,
@@ -2564,19 +2683,33 @@ mod wire {
             failure: RemoteFailure,
         },
         /// Session started successfully
-        SessionStarted { session_id: SessionId },
+        SessionStarted {
+            session_id: SessionId,
+        },
         /// Session accepted successfully
-        SessionAccepted { session_id: SessionId },
+        SessionAccepted {
+            session_id: SessionId,
+        },
         /// Sender started
-        SenderStarted { session_id: SessionId },
+        SenderStarted {
+            session_id: SessionId,
+        },
         /// Receiver started
-        ReceiverStarted { session_id: SessionId },
+        ReceiverStarted {
+            session_id: SessionId,
+        },
         /// Session stopped
-        SessionStopped { session_id: SessionId },
+        SessionStopped {
+            session_id: SessionId,
+        },
         /// Session failed
-        SessionFailed { session_id: SessionId },
+        SessionFailed {
+            session_id: SessionId,
+        },
         /// Session recovered
-        SessionRecovered { session_id: SessionId },
+        SessionRecovered {
+            session_id: SessionId,
+        },
         /// Media profile switch completed.
         MediaProfileUpdated {
             session_id: SessionId,
@@ -2588,7 +2721,9 @@ mod wire {
             snapshot: MediaAdaptationSnapshot,
         },
         /// Local selectable capture sources returned by mrd-service.
-        LocalCaptureSourceList { sources: Vec<CaptureSource> },
+        LocalCaptureSourceList {
+            sources: Vec<CaptureSource>,
+        },
         /// Selectable capture sources returned by the remote peer.
         CaptureSourceList {
             session_id: SessionId,
@@ -2605,7 +2740,9 @@ mod wire {
             modes: Vec<DisplayMode>,
         },
         /// Directory listing returned by the local service host.
-        DirectoryList { listing: DirectoryList },
+        DirectoryList {
+            listing: DirectoryList,
+        },
         /// File transfer task accepted or completed by the local service host.
         FileTransferStarted {
             /// Current transfer snapshot.
@@ -2642,11 +2779,17 @@ mod wire {
             surface_id: String,
         },
         /// Session runtime snapshot
-        SessionSnapshot { snapshot: SessionRuntimeSnapshot },
+        SessionSnapshot {
+            snapshot: SessionRuntimeSnapshot,
+        },
         /// Aggregated runtime snapshot
-        RuntimeSnapshot { snapshot: RuntimeSnapshot },
+        RuntimeSnapshot {
+            snapshot: RuntimeSnapshot,
+        },
         /// Service-owned audit events.
-        AuditLog { events: Vec<AuditEvent> },
+        AuditLog {
+            events: Vec<AuditEvent>,
+        },
         /// Structured local capability snapshot.
         CapabilitySnapshot {
             /// Current local capability snapshot.
@@ -2705,15 +2848,21 @@ mod wire {
             bundle: TelemetryBundle,
         },
         /// Probe snapshot data
-        ProbeSnapshot { snapshot: ProbeSnapshot },
+        ProbeSnapshot {
+            snapshot: ProbeSnapshot,
+        },
         /// Media pipeline snapshot data.
-        MediaPipelineSnapshot { snapshot: MediaPipelineSnapshot },
+        MediaPipelineSnapshot {
+            snapshot: MediaPipelineSnapshot,
+        },
         /// Probe event data
         ProbeEvent {
             event: Vec<u8>, // Serialized probe event
         },
         /// Service health status
-        ServiceHealth { status: ServiceStatus },
+        ServiceHealth {
+            status: ServiceStatus,
+        },
 
         // === Shell / Lifecycle Responses (Phase 2) ===
         /// Result of UI open request
@@ -2722,13 +2871,21 @@ mod wire {
             pid: Option<u32>,
         },
         /// Shell/service status snapshot
-        ShellStatus { status: ShellStatusSnapshot },
+        ShellStatus {
+            status: ShellStatusSnapshot,
+        },
         /// Autostart status
-        AutostartStatus { enabled: bool, supported: bool },
+        AutostartStatus {
+            enabled: bool,
+            supported: bool,
+        },
         /// Generic acknowledgment
         Ack,
         /// Error response
-        Error { code: String, message: String },
+        Error {
+            code: String,
+            message: String,
+        },
     }
 
     /// Device information DTO

@@ -11,6 +11,15 @@ beforeEach(() => vi.stubGlobal('crypto', webcrypto));
 afterEach(() => vi.unstubAllGlobals());
 
 describe('browser v3 interoperability', () => {
+  it('binds explicit paired mode in canonical requests while preserving attended bytes', async () => {
+    const paired = { ...fixture.request, access_mode: 'paired' };
+    expect(wire.canonicalWanRequest(paired)).toBe(fixture.request_compact.replace('"attended"', '"paired"'));
+    expect(await wire.wanRequestCommitment(paired)).not.toBe(fixture.request_commitment);
+    expect(wire.canonicalWanRequest(fixture.request)).toBe(fixture.request_compact);
+  });
+  it.each(['unattended', 'unknown', '', null])('rejects unsupported signed access mode %s', access_mode => {
+    expect(() => wire.canonicalWanRequest({ ...fixture.request, access_mode })).toThrow();
+  });
   it('parses a bounded valid wire without changing signed values', () => {
     expect(wire.parseBoundedJson?.(fixture.intent_compact)).toEqual(fixture.intent);
   });

@@ -60,6 +60,8 @@ import type {
   TrustedDeviceSnapshot,
   UnattendedAccessPolicy,
   UnattendedAccessSnapshot,
+  PairPendingSessionRequest,
+  PairedAccessPolicySnapshot,
   CapabilitySnapshot,
   CaptureSource,
   CaptureSourceSelection,
@@ -1383,6 +1385,44 @@ export async function ipcRespondToConsent(
     'ConsentRecorded',
     'session'
   );
+}
+
+export async function ipcPairPendingSession(request: PairPendingSessionRequest): Promise<AdapterResult<RemoteSessionSnapshot>> {
+  const result = await invokeSecureRemoteContract<RemoteSessionSnapshot>({ type: 'PairPendingSession', ...request }, 'ConsentRecorded', 'session');
+  if (result.ok && (!result.value || result.value.session_id !== request.session_id)) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: '配对授权响应不属于本次会话' } };
+  }
+  return result;
+}
+
+function validPairedPolicy(value: unknown): value is PairedAccessPolicySnapshot {
+  if (!value || typeof value !== 'object') return false;
+  const policy = value as PairedAccessPolicySnapshot;
+  const decimal = (item: unknown) => typeof item === 'string' && /^[1-9][0-9]{0,19}$/.test(item) && BigInt(item) <= 18446744073709551615n;
+  return Object.keys(policy).sort().join(',') === 'enabled,epoch,peer_key_id,revision,scopes,trust_revision'
+    && typeof policy.peer_key_id === 'string' && policy.peer_key_id.length > 0 && policy.peer_key_id.length <= 256
+    && !policy.peer_key_id.includes('\0') && decimal(policy.epoch) && decimal(policy.trust_revision) && decimal(policy.revision)
+    && typeof policy.enabled === 'boolean' && Array.isArray(policy.scopes) && policy.scopes.length <= 3
+    && (!policy.enabled || policy.scopes.length > 0) && new Set(policy.scopes).size === policy.scopes.length
+    && policy.scopes.every(scope => ['screen.view', 'input.pointer', 'input.keyboard'].includes(scope));
+}
+
+export async function ipcListPairedAccessPolicies(): Promise<AdapterResult<PairedAccessPolicySnapshot[]>> {
+  const result = await invokeSecureRemoteContract<PairedAccessPolicySnapshot[]>({ type: 'ListPairedAccessPolicies' }, 'PairedAccessPolicies', 'policies');
+  if (result.ok && (!Array.isArray(result.value) || !result.value.every(validPairedPolicy)
+    || new Set(result.value.map(policy => policy.peer_key_id)).size !== result.value.length)) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: '已配对访问策略无效' } };
+  }
+  return result;
+}
+
+export async function ipcRevokePairedAccess(peerKeyId: string, expectedRevision: DecimalU64): Promise<AdapterResult<PairedAccessPolicySnapshot>> {
+  const result = await invokeSecureRemoteContract<PairedAccessPolicySnapshot>(
+    { type: 'RevokePairedAccess', peer_key_id: peerKeyId, expected_revision: expectedRevision }, 'PairedAccessPolicyUpdated', 'policy');
+  if (result.ok && (!validPairedPolicy(result.value) || result.value.peer_key_id !== peerKeyId || result.value.enabled)) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: '撤销访问策略响应不匹配' } };
+  }
+  return result;
 }
 
 export async function ipcEnableUnattendedAccess(

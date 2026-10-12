@@ -107,6 +107,21 @@ pub struct TemporaryAccessState {
     guest_sessions:
         std::collections::BTreeMap<String, (TemporaryGuestAuthority, String, bool, u64)>,
 }
+
+pub(crate) struct TemporaryPairedPasswordSnapshot {
+    pub(crate) generation: u64,
+    operation_epoch: Arc<TemporaryOperationEpoch>,
+    applied_epoch: u64,
+    expires_at_ms: u64,
+}
+
+impl TemporaryPairedPasswordSnapshot {
+    pub(crate) fn is_valid_at(&self, now: u64) -> bool {
+        now < self.expires_at_ms
+            && self.operation_epoch.is_current(self.applied_epoch)
+            && self.operation_epoch.permits_enabled()
+    }
+}
 impl Default for TemporaryAccessState {
     fn default() -> Self {
         Self {
@@ -148,6 +163,23 @@ pub struct TemporaryAccessDocument {
     pub allowed_scopes: Vec<String>,
 }
 impl TemporaryAccessState {
+    pub(crate) fn paired_password_snapshot(
+        &mut self,
+        now: u64,
+        online: bool,
+    ) -> Option<TemporaryPairedPasswordSnapshot> {
+        let status = self.status(now, online);
+        if !status.ready || self.needs_rotation(now) || !self.publication_epoch_current() {
+            return None;
+        }
+        let snapshot = TemporaryPairedPasswordSnapshot {
+            generation: status.generation,
+            operation_epoch: self.operation_epoch.clone(),
+            applied_epoch: self.applied_epoch,
+            expires_at_ms: status.expires_at_ms?,
+        };
+        snapshot.is_valid_at(now).then_some(snapshot)
+    }
     pub(crate) fn with_operation_epoch(mut self, epoch: Arc<TemporaryOperationEpoch>) -> Self {
         self.operation_epoch = epoch;
         self
@@ -556,6 +588,70 @@ fn decode_hex(input: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_password_snapshot_requires_ready_current_material() {
+        let mut state = TemporaryAccessState::default();
+        assert!(state.paired_password_snapshot(1_001, true).is_none());
+        state.rotate(1, 1_000).unwrap();
+        assert!(state.paired_password_snapshot(1_001, true).is_none());
+        assert!(state.mark_published(1, state.expires_at_ms));
+        let snapshot = state
+            .paired_password_snapshot(1_001, true)
+            .expect("published current material must bind explicit pairing");
+        assert_eq!(snapshot.generation, 1);
+        assert!(snapshot.is_valid_at(1_001));
+        assert!(state.paired_password_snapshot(1_001, false).is_none());
+        state.invalidate_publication();
+        assert!(state.paired_password_snapshot(1_002, true).is_none());
+    }
+
+    #[test]
+    fn paired_password_snapshot_survives_lease_renewal_but_not_rotation_or_disable() {
+        let epoch = Arc::new(TemporaryOperationEpoch::default());
+        let mut state = TemporaryAccessState::default().with_operation_epoch(epoch.clone());
+        state.rotate(4, 1_000).unwrap();
+        assert!(state.mark_published(4, state.expires_at_ms));
+        let first = state.paired_password_snapshot(1_001, true).unwrap();
+        assert!(state.renew_publication(550_000).unwrap());
+        assert!(state.mark_published(4, state.expires_at_ms));
+        let renewed = state.paired_password_snapshot(550_001, true).unwrap();
+        assert_eq!(first.generation, renewed.generation);
+        assert!(first.is_valid_at(550_001));
+        let rotation = epoch.begin(false).unwrap();
+        assert!(!first.is_valid_at(550_002));
+        assert!(!renewed.is_valid_at(550_002));
+        assert!(state.paired_password_snapshot(550_002, true).is_none());
+        state.apply_operation_epoch(rotation).unwrap();
+        state.rotate(5, 550_002).unwrap();
+        assert!(state.mark_published(5, state.expires_at_ms));
+        let rotated = state.paired_password_snapshot(550_003, true).unwrap();
+        assert_ne!(first.generation, rotated.generation);
+        epoch.begin(true).unwrap();
+        assert!(!rotated.is_valid_at(550_004));
+        assert!(state.paired_password_snapshot(550_004, true).is_none());
+    }
+
+    #[test]
+    fn paired_password_snapshot_cannot_survive_resident_restart_or_expired_publication() {
+        let mut state = TemporaryAccessState::default();
+        state.rotate(4, 1_000).unwrap();
+        assert!(state.mark_published(4, state.expires_at_ms));
+        let before = state.paired_password_snapshot(1_001, true).unwrap();
+        assert!(!before.is_valid_at(601_000));
+        assert!(state.paired_password_snapshot(601_000, true).is_none());
+        let mut restarted = TemporaryAccessState::default();
+        assert!(restarted.paired_password_snapshot(1_001, true).is_none());
+        restarted.rotate(5, 1_001).unwrap();
+        assert!(restarted.mark_published(5, restarted.expires_at_ms));
+        assert_ne!(
+            before.generation,
+            restarted
+                .paired_password_snapshot(1_002, true)
+                .unwrap()
+                .generation
+        );
+    }
 
     #[test]
     fn elapsed_publication_lease_keeps_manual_password_material_and_generation() {

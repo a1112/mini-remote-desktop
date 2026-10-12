@@ -3,12 +3,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ipcGetRemoteSession,
   ipcRespondToConsent,
+  ipcPairPendingSession,
   ipcSubscribeSessionEvents,
   showWindow,
 } from "../adapters/tauri";
 import type {
   ConsentResponse,
   RemoteSessionSnapshot,
+  PairPendingSessionRequest,
 } from "../adapters/tauri/types";
 import { IncomingSessionDialog } from "./IncomingSessionDialog";
 import { getTauriWindowLabel } from "../utils/tauriWindow";
@@ -187,6 +189,12 @@ export function IncomingSessionConsentHost() {
   }, []);
 
   const current = pendingSessions[0] ?? null;
+  const pair = useCallback(async (request: PairPendingSessionRequest) => {
+    const result = await ipcPairPendingSession(request);
+    if (!result.ok) throw new Error(result.error.message);
+    setPendingSessions(current => current.filter(session => session.session_id !== request.session_id));
+    seenSessionIds.current.delete(request.session_id);
+  }, []);
   const consentDeadlineMs = current
     ? (current.authorization_expires_at_ms ??
       current.created_at_ms + FALLBACK_CONSENT_LIFETIME_MS)
@@ -234,6 +242,7 @@ export function IncomingSessionConsentHost() {
     <IncomingSessionDialog
       consentDeadlineMs={consentDeadlineMs}
       onRespond={respond}
+      onPair={pair}
       session={current}
     />
   );

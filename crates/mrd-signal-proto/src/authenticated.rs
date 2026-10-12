@@ -386,7 +386,17 @@ impl VerifiedSignalMetadata {
 pub struct SignalReplayGuard {
     max_signers: usize,
     nonce_capacity: usize,
-    signers: HashMap<String, SignerReplayState>,
+    signers: HashMap<ReplayPrincipal, SignerReplayState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ReplayPrincipal {
+    Machine(String),
+    BrowserSession {
+        key_id: String,
+        device_id: DeviceId,
+        session_id: SessionId,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -394,6 +404,7 @@ struct SignerReplayState {
     highest_counter: Option<u64>,
     nonce_order: VecDeque<[u8; 16]>,
     nonces: HashSet<[u8; 16]>,
+    principal_expires_at_ms: Option<u64>,
 }
 
 impl SignalReplayGuard {
@@ -411,10 +422,93 @@ impl SignalReplayGuard {
         counter: u64,
         nonce: [u8; 16],
     ) -> Result<(), SignalProtocolError> {
-        if !self.signers.contains_key(issuer_key_id) && self.signers.len() >= self.max_signers {
+        self.accept_principal(
+            ReplayPrincipal::Machine(issuer_key_id.to_owned()),
+            counter,
+            nonce,
+            None,
+        )
+    }
+
+    /// Commit replay state only after a backend-authenticated browser principal
+    /// has been bound to this signed issuer and exact session. Never derive the
+    /// namespace solely from an untrusted message. Each browser stream retains
+    /// strict counters and nonce deduplication across websocket reconnections.
+    pub fn accept_browser_session(
+        &mut self,
+        metadata: &VerifiedSignalMetadata,
+        session_id: &SessionId,
+        principal_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), SignalProtocolError> {
+        if now_ms >= principal_expires_at_ms {
+            return Err(SignalProtocolError::Expired);
+        }
+        self.prune_browser_sessions(now_ms);
+        self.accept_principal(
+            ReplayPrincipal::BrowserSession {
+                key_id: metadata.issuer_key_id.clone(),
+                device_id: metadata.issuer_device_id.clone(),
+                session_id: session_id.clone(),
+            },
+            metadata.counter,
+            metadata.nonce,
+            Some(principal_expires_at_ms),
+        )
+    }
+
+    pub fn prune_browser_sessions(&mut self, now_ms: u64) {
+        self.signers.retain(|_, state| {
+            state
+                .principal_expires_at_ms
+                .is_none_or(|expires| now_ms < expires)
+        });
+    }
+
+    /// Extend cache retention for an existing exact browser namespace after a
+    /// fresh, cryptographically verified message passed its separate replay
+    /// check and authenticated issuer/session binding. This is not authority
+    /// renewal. It never creates a lane or changes counters/nonces; an expired
+    /// signed message cannot revive or extend any namespace.
+    pub fn extend_browser_session_retention(
+        &mut self,
+        metadata: &VerifiedSignalMetadata,
+        session_id: &SessionId,
+        signed_message_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<bool, SignalProtocolError> {
+        if now_ms >= signed_message_expires_at_ms {
+            return Err(SignalProtocolError::Expired);
+        }
+        self.prune_browser_sessions(now_ms);
+        let principal = ReplayPrincipal::BrowserSession {
+            key_id: metadata.issuer_key_id.clone(),
+            device_id: metadata.issuer_device_id.clone(),
+            session_id: session_id.clone(),
+        };
+        let Some(state) = self.signers.get_mut(&principal) else {
+            return Ok(false);
+        };
+        state.principal_expires_at_ms = Some(
+            state
+                .principal_expires_at_ms
+                .unwrap_or(signed_message_expires_at_ms)
+                .max(signed_message_expires_at_ms),
+        );
+        Ok(true)
+    }
+
+    fn accept_principal(
+        &mut self,
+        principal: ReplayPrincipal,
+        counter: u64,
+        nonce: [u8; 16],
+        expires_at_ms: Option<u64>,
+    ) -> Result<(), SignalProtocolError> {
+        if !self.signers.contains_key(&principal) && self.signers.len() >= self.max_signers {
             return Err(SignalProtocolError::ReplayCapacity);
         }
-        let state = self.signers.entry(issuer_key_id.to_owned()).or_default();
+        let state = self.signers.entry(principal).or_default();
         if state.nonces.contains(&nonce) {
             return Err(SignalProtocolError::RepeatedNonce);
         }
@@ -425,6 +519,10 @@ impl SignalReplayGuard {
             return Err(SignalProtocolError::CounterRollback);
         }
         state.highest_counter = Some(counter);
+        state.principal_expires_at_ms = match (state.principal_expires_at_ms, expires_at_ms) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (_, expiry) => expiry,
+        };
         state.nonces.insert(nonce);
         state.nonce_order.push_back(nonce);
         while state.nonce_order.len() > self.nonce_capacity {

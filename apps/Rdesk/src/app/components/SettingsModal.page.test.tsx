@@ -20,6 +20,21 @@ function commands(command: string) {
 }
 
 describe('SettingsModal page behavior', () => {
+  it('shows actual paired policies and revokes the selected revision through the formal service', async () => {
+    const policy = { peer_key_id: 'a'.repeat(64), epoch: '2', trust_revision: '3', scopes: ['screen.view'], revision: '9', enabled: true };
+    getMockInvoke().mockImplementation((command: string, args?: any) => {
+      if (command === 'ipc_secure_remote' && args.request.type === 'ListPairedAccessPolicies') return Promise.resolve({ type: 'PairedAccessPolicies', policies: [policy] });
+      if (command === 'ipc_secure_remote' && args.request.type === 'RevokePairedAccess') return Promise.resolve({ type: 'PairedAccessPolicyUpdated', policy: { ...policy, enabled: false, revision: '10' } });
+      return commands(command);
+    });
+    render(<SettingsModal open onClose={() => undefined} />);
+    await userEvent.click(screen.getByRole('button', { name: '安全' }));
+    expect(await screen.findByText(policy.peer_key_id)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: '撤销免确认访问' }));
+    expect(getMockInvoke()).toHaveBeenCalledWith('ipc_secure_remote', { request: { type: 'RevokePairedAccess', peer_key_id: policy.peer_key_id, expected_revision: '9' } });
+    expect(await screen.findByText('免确认已失效')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '撤销免确认访问' })).toBeDisabled();
+  });
   beforeEach(() => {
     localStorage.clear();
     Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });

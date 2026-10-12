@@ -1064,6 +1064,13 @@ pub struct SignalingRuntimeCore {
     accepted_order: VecDeque<[u8; 32]>,
     accepted: HashSet<[u8; 32]>,
     peer_keys: HashMap<mrd_proto::DeviceId, String>,
+    browser_bindings: HashMap<mrd_proto::DeviceId, BrowserReplayBinding>,
+}
+
+struct BrowserReplayBinding {
+    key_id: String,
+    session_id: mrd_proto::SessionId,
+    signed_messages_expires_at_ms: u64,
 }
 
 impl SignalingRuntimeCore {
@@ -1096,6 +1103,7 @@ impl SignalingRuntimeCore {
             accepted_order: VecDeque::new(),
             accepted: HashSet::new(),
             peer_keys: HashMap::new(),
+            browser_bindings: HashMap::new(),
         }
     }
 
@@ -1480,10 +1488,8 @@ impl SignalingRuntimeCore {
         // The protocol-level guard enforces signature, claims, time and peer
         // validation, but its monotonic counter rule is intentionally scoped
         // out for independently delivered generation-zero WebRTC messages.
-        let metadata = {
-            let mut single_message_replay = SignalReplayGuard::new(1, 1);
-            message.verify_for(self.config.device_id(), now_ms, &mut single_message_replay)?
-        };
+        let metadata = message.verify_for_without_replay(self.config.device_id(), now_ms)?;
+        let browser = self.check_browser_binding(&metadata, session_id, false, now_ms)?;
         self.generation_zero_replay.accept(
             session_id,
             &metadata.issuer_key_id,
@@ -1492,7 +1498,144 @@ impl SignalingRuntimeCore {
             now_ms,
             message.payload.claims().expires_at_ms,
         )?;
+        if browser {
+            // Generation-zero replay acceptance precedes retention extension:
+            // a replayed SDP/ICE message must never keep an old lane alive.
+            self.replay.extend_browser_session_retention(
+                &metadata,
+                session_id,
+                message.payload.claims().expires_at_ms,
+                now_ms,
+            )?;
+            self.remember_browser_binding(
+                &metadata,
+                session_id,
+                message.payload.claims().expires_at_ms,
+            );
+        }
         Ok(metadata)
+    }
+
+    fn verify_controller_signal<T: AuthenticatedPayload>(
+        &mut self,
+        message: &SignedSignal<T>,
+        session_id: &mrd_proto::SessionId,
+        initial_intent: bool,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, SignalingRuntimeError> {
+        // Cryptographic verification includes the V3 payload's exact signed
+        // issuer/controller/target binding before any namespace is selected.
+        let metadata = message.verify_for_without_replay(self.config.device_id(), now_ms)?;
+        if self.check_browser_binding(&metadata, session_id, initial_intent, now_ms)? {
+            self.replay.accept_browser_session(
+                &metadata,
+                session_id,
+                message.payload.claims().expires_at_ms,
+                now_ms,
+            )?;
+            self.remember_browser_binding(
+                &metadata,
+                session_id,
+                message.payload.claims().expires_at_ms,
+            );
+        } else {
+            // A physical machine key still has one globally monotonic stream.
+            self.replay
+                .accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        }
+        Ok(metadata)
+    }
+
+    fn check_browser_binding(
+        &mut self,
+        metadata: &VerifiedSignalMetadata,
+        session_id: &mrd_proto::SessionId,
+        initial_intent: bool,
+        now_ms: u64,
+    ) -> Result<bool, SignalingRuntimeError> {
+        let Some(suffix) = metadata.issuer_device_id.0.strip_prefix("browser_") else {
+            return Ok(false);
+        };
+        if suffix.len() != 32
+            || !suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(SignalingRuntimeError::BrowserSessionBinding);
+        }
+        // The runtime driver calls handle_inbound only for frames received on
+        // this authenticated socket. Config admits WSS or loopback WS only.
+        // A configured pin (rather than TOFU) is required for the realtime
+        // guarantee that physical JWTs cannot claim reserved browser IDs and
+        // browser JWTs are bound to exactly one controller/target/session.
+        if self.connection_id.is_none()
+            || self.status.snapshot().state != SignalingConnectionState::Authenticated
+            || self.config.trusted_server_key_id().is_none()
+            || self.config.trusted_server_key_id() != self.observed_server_key_id.as_deref()
+        {
+            return Err(SignalingRuntimeError::NotAuthenticated);
+        }
+        self.require_role(BackendRole::Agent)?;
+        self.prune_browser_bindings(now_ms);
+        match self.browser_bindings.get(&metadata.issuer_device_id) {
+            Some(binding)
+                if binding.key_id == metadata.issuer_key_id
+                    && binding.session_id == *session_id => {}
+            Some(_) => return Err(SignalingRuntimeError::BrowserSessionBinding),
+            None if initial_intent => {
+                if self.browser_bindings.len() >= PEER_KEY_LIMIT
+                    || (!self.peer_keys.contains_key(&metadata.issuer_device_id)
+                        && self.peer_keys.len() >= PEER_KEY_LIMIT)
+                {
+                    return Err(SignalingRuntimeError::PeerCapacity);
+                }
+            }
+            None => return Err(SignalingRuntimeError::BrowserSessionBinding),
+        }
+        if self
+            .peer_keys
+            .get(&metadata.issuer_device_id)
+            .is_some_and(|key_id| key_id != &metadata.issuer_key_id)
+        {
+            return Err(SignalingRuntimeError::BrowserSessionBinding);
+        }
+        Ok(true)
+    }
+
+    fn remember_browser_binding(
+        &mut self,
+        metadata: &VerifiedSignalMetadata,
+        session_id: &mrd_proto::SessionId,
+        expires_at_ms: u64,
+    ) {
+        self.browser_bindings
+            .entry(metadata.issuer_device_id.clone())
+            .and_modify(|binding| {
+                binding.signed_messages_expires_at_ms =
+                    binding.signed_messages_expires_at_ms.max(expires_at_ms);
+            })
+            .or_insert_with(|| BrowserReplayBinding {
+                key_id: metadata.issuer_key_id.clone(),
+                session_id: session_id.clone(),
+                signed_messages_expires_at_ms: expires_at_ms,
+            });
+    }
+
+    fn prune_browser_bindings(&mut self, now_ms: u64) {
+        // Retention follows the maximum expiry of every accepted signed
+        // message in this exact browser lane, including generation-zero SDP
+        // and ICE. It is not a principal/session authorization deadline: WAN
+        // inspect/approve, local pair policy, and the Agent remain mandatory.
+        self.browser_bindings.retain(|device_id, binding| {
+            if binding.signed_messages_expires_at_ms > now_ms {
+                return true;
+            }
+            if self.peer_keys.get(device_id) == Some(&binding.key_id) {
+                self.peer_keys.remove(device_id);
+            }
+            false
+        });
+        self.replay.prune_browser_sessions(now_ms);
     }
 
     /// Verify, bind and map one inbound session envelope.
@@ -1517,7 +1660,12 @@ impl SignalingRuntimeCore {
             AuthenticatedSignalMessage::SessionIntentV3(message) => (
                 {
                     self.require_role(BackendRole::Agent)?;
-                    message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?
+                    self.verify_controller_signal(
+                        message,
+                        &message.payload.request.session_id,
+                        true,
+                        now_ms,
+                    )?
                 },
                 message.signer_public_key.clone(),
                 AuthenticatedSessionSignal::SessionIntentV3 {
@@ -1631,7 +1779,7 @@ impl SignalingRuntimeCore {
                 },
             ),
             AuthenticatedSignalMessage::SessionClose(message) => (
-                message.verify_for(self.config.device_id(), now_ms, &mut self.replay)?,
+                self.verify_controller_signal(message, &message.payload.session_id, false, now_ms)?,
                 message.signer_public_key.clone(),
                 AuthenticatedSessionSignal::Closed {
                     session_id: message.payload.session_id.clone(),
@@ -2374,6 +2522,8 @@ pub enum SignalingRuntimeError {
     PeerIdentityChanged,
     #[error("signaling peer identity capacity is exhausted")]
     PeerCapacity,
+    #[error("signaling browser identity is not bound to this exact session")]
+    BrowserSessionBinding,
     #[error("signaling message is not valid for this connection role")]
     RoleMismatch,
     #[error("signaling message arrived in an invalid protocol phase")]
@@ -2448,6 +2598,7 @@ impl SignalingRuntimeError {
             Self::ServerIdentityMismatch => "signaling_server_identity_mismatch",
             Self::PeerIdentityChanged => "signaling_peer_identity_changed",
             Self::PeerCapacity => "signaling_peer_capacity",
+            Self::BrowserSessionBinding => "signaling_browser_session_binding",
             Self::RoleMismatch => "signaling_role_mismatch",
             Self::UnexpectedMessage => "signaling_unexpected_message",
             Self::NotAuthenticated => "signaling_not_authenticated",

@@ -16,6 +16,7 @@ mod accept_loop;
 mod audit;
 mod connection;
 mod dispatch;
+pub(crate) mod paired_access;
 #[cfg(windows)]
 mod product;
 

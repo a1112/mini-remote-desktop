@@ -4,11 +4,13 @@ mod audit_store;
 mod identity_store;
 mod integrity;
 mod migrations;
+mod paired_access_store;
 mod secret_protection;
 mod trust_store;
 
 pub use audit_store::{AuditDraft, AuditQuery, AuditRecord};
 pub use secret_protection::AeadSecretProtector;
+pub use paired_access_store::{PairedAccessEnrollment, PairedAccessPasswordBinding, PairedAccessPolicy};
 pub use trust_store::{
     AppliedTrustTransition, AuditedTrustTransition, TrustRecord, TrustState,
     TrustTransitionRejection,
@@ -273,6 +275,7 @@ fn verify_store_snapshot_connection(
     identity_store::verify_identity_snapshot(connection, protector, &meta)?;
     trust_store::verify_trust_snapshot(connection, &meta)?;
     audit_store::verify_audit_snapshot(connection, protector, &meta)?;
+    paired_access_store::verify_policy_snapshot(connection, protector, &meta)?;
     Ok((meta, store_key))
 }
 

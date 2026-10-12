@@ -3,8 +3,9 @@
 use super::AgentBinding;
 use ed25519_dalek::{Signer, SigningKey};
 use mrd_agent_ipc::{
-    derive_execute_grant_issuer_key_id, AgentCapability, AgentCommand, DesktopKind, ExecuteCommand,
-    ExecuteGrant, ExecuteGrantClaims, GrantAudience, PeerBinding,
+    derive_execute_grant_issuer_key_id, validate_paired_authority_claims, AgentCapability,
+    AgentCommand, DesktopKind, ExecuteCommand, ExecuteGrant, ExecuteGrantClaims, GrantAudience,
+    PairedSessionAuthority, PairedSessionAuthorityClaims, PeerBinding,
     AGENT_EXECUTE_GRANT_MAX_LIFETIME_MS,
 };
 use mrd_proto::SessionId;
@@ -132,6 +133,21 @@ impl std::fmt::Debug for ExecuteGrantIssuer {
 }
 
 impl ExecuteGrantIssuer {
+    /// Sign an independently bounded paired authority with the bootstrap-pinned issuer.
+    pub fn issue_paired_authority(
+        &self,
+        claims: PairedSessionAuthorityClaims,
+    ) -> Result<PairedSessionAuthority, ExecuteGrantIssueError> {
+        validate_paired_authority_claims(&claims)
+            .map_err(|_| ExecuteGrantIssueError::InvalidAuthority)?;
+        let mut authority = PairedSessionAuthority {
+            claims,
+            issuer_key_id: self.key_id,
+            signature: [0; 64],
+        };
+        authority.signature = self.signing_key.sign(&authority.signing_bytes()).to_bytes();
+        Ok(authority)
+    }
     /// Construct an issuer from protected 32-byte seed material.
     pub fn from_seed(seed: [u8; 32]) -> Option<Self> {
         if seed == [0; 32] {
@@ -231,5 +247,63 @@ fn validate_window(
         Err(ExecuteGrantIssueError::InvalidWindow)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod paired_tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+    use mrd_proto::DeviceId;
+    use mrd_session::PermissionScope;
+
+    #[test]
+    fn paired_issuer_uses_existing_pinned_key_and_independent_domain() {
+        let issuer = ExecuteGrantIssuer::from_seed([19; 32]).unwrap();
+        let claims = PairedSessionAuthorityClaims {
+            authority_id: [1; 32],
+            registration_id: [2; 16],
+            registration_epoch: 3,
+            session_id: SessionId("paired-session".into()),
+            peer: PeerBinding {
+                device_id: DeviceId("peer".into()),
+                key_id: [4; 32],
+            },
+            scopes: [PermissionScope::ScreenView].into_iter().collect(),
+            policy_revision: 5,
+            windows_session_id: 1,
+            desktop_epoch: 6,
+            desktop_kind: DesktopKind::Default,
+            issued_at_ms: 1000,
+            not_before_ms: 1000,
+            expires_at_ms: 2000,
+            audience: GrantAudience::SessionAgent,
+        };
+        let authority = issuer.issue_paired_authority(claims.clone()).unwrap();
+        assert_eq!(authority.issuer_key_id, issuer.key_id());
+        let public = ed25519_dalek::VerifyingKey::from_bytes(&issuer.public_key()).unwrap();
+        assert!(public
+            .verify(
+                &authority.signing_bytes(),
+                &Signature::from_bytes(&authority.signature)
+            )
+            .is_ok());
+        assert!(authority
+            .signing_bytes()
+            .starts_with(mrd_agent_ipc::AGENT_PAIRED_AUTHORITY_SIGNATURE_CONTEXT));
+        for change in 0..3 {
+            let mut invalid = claims.clone();
+            match change {
+                0 => invalid.desktop_kind = DesktopKind::Secure,
+                1 => invalid.expires_at_ms = 301001,
+                _ => {
+                    invalid.scopes.insert(PermissionScope::ClipboardRead);
+                }
+            }
+            assert_eq!(
+                issuer.issue_paired_authority(invalid),
+                Err(ExecuteGrantIssueError::InvalidAuthority)
+            );
+        }
     }
 }

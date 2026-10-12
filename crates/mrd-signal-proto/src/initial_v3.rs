@@ -1,4 +1,4 @@
-//! Authenticated protocol-v3 messages for initial attended WAN relay sessions.
+//! Authenticated protocol-v3 messages for attended and explicitly paired WAN sessions.
 
 use crate::{
     AuthClaims, AuthenticatedPayload, AuthenticatedSignalMessage, SignalProtocolError, SignedSignal,
@@ -17,6 +17,7 @@ const GRANT_COMMITMENT_CONTEXT: &[u8] = b"MRD_SIGNAL_SESSION_GRANT_COMMITMENT_V3
 #[serde(rename_all = "snake_case")]
 pub enum WanAccessModeV3 {
     Attended,
+    Paired,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

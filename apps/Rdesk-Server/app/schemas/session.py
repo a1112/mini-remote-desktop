@@ -142,7 +142,7 @@ class _WanRequestBase(BaseModel):
 
 class DeviceSessionCreateIn(_WanRequestBase):
     target_device_id: PublicDeviceId
-    access_mode: Literal["attended"]
+    access_mode: Literal["attended", "paired"]
     requested_scopes: list[WanPermissionScopeV3] = Field(min_length=1, max_length=32)
     requested_profile: WanMediaProfileV3 | None = None
     route_policy: Literal["relay_only", "direct_first"]
@@ -151,7 +151,7 @@ class DeviceSessionCreateIn(_WanRequestBase):
 class DeviceSessionCanonicalRequest(_WanRequestBase):
     controller_device_id: PublicDeviceId
     target_device_id: PublicDeviceId
-    access_mode: Literal["attended"]
+    access_mode: Literal["attended", "paired"]
     requested_scopes: list[WanPermissionScopeV3] = Field(min_length=1, max_length=32)
     requested_profile: WanMediaProfileV3 | None = None
     route_policy: Literal["relay_only", "direct_first"]

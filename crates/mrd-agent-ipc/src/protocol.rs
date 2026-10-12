@@ -1,6 +1,9 @@
 //! Wire messages and registration state for machine-service/session-agent IPC.
 
-use crate::{ExecuteGrant, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR};
+use crate::{
+    ExecuteGrant, InstallPairedSessionAuthority, PairedSessionAuthorityResult,
+    RevokePairedSessionAuthority, AGENT_IPC_PROTOCOL_MAJOR, AGENT_IPC_PROTOCOL_MINOR,
+};
 use mrd_proto::{DeviceId, SessionId};
 use mrd_session::{PermissionScope, PermissionScopes};
 use ring::digest::{Context as DigestContext, SHA256};
@@ -1452,6 +1455,8 @@ pub struct StopAgent {
     deny_unknown_fields
 )]
 pub enum AgentToService {
+    /// Correlated paired authority installation or revocation result.
+    PairedSessionAuthorityResult(PairedSessionAuthorityResult),
     /// Begin authenticated registration.
     AgentRegister(AgentRegister),
     /// Complete the challenge-response handshake.
@@ -1491,6 +1496,10 @@ pub enum AgentToService {
     deny_unknown_fields
 )]
 pub enum ServiceToAgent {
+    /// Independently install a fresh signed paired authority.
+    InstallPairedSessionAuthority(Box<InstallPairedSessionAuthority>),
+    /// Revoke one exact paired authority and its resources.
+    RevokePairedSessionAuthority(RevokePairedSessionAuthority),
     /// Challenge an agent registration.
     AgentChallenge(AgentChallenge),
     /// Ask the interactive user for consent.

@@ -196,6 +196,7 @@ export const requestRemoteSession = async (
   transportKind: TransportKind = "webrtc",
   requestedProfile?: MediaProfile,
   routePreference: RemoteRoutePreference = "auto",
+  accessMode: 'attended' | 'paired' = 'attended',
 ): Promise<RemoteSessionSnapshot> => {
   if (routePreference === "lan" && transportKind !== "quic") {
     throw new ServiceCommandError(
@@ -206,7 +207,7 @@ export const requestRemoteSession = async (
   const result = await tauriAdapter.ipcRequestRemoteSession({
     session_id: sessionId,
     target_device_id: targetDeviceId,
-    access_mode: "attended",
+    access_mode: accessMode,
     route_preference: routePreference,
     requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
     requested_profile: requestedProfile ?? null,

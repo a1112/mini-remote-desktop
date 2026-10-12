@@ -70,6 +70,56 @@ impl IpcServer {
             }
         }
         match request {
+            IpcRequest::PairPendingSession {
+                session_id,
+                approved_scopes,
+                expected_policy_revision,
+            } => {
+                #[cfg(windows)]
+                {
+                    self.pair_pending_session(session_id, approved_scopes, expected_policy_revision)
+                        .await
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (session_id, approved_scopes, expected_policy_revision);
+                    IpcResponse::Error {
+                        code: "E_PAIRED_PLATFORM_UNAVAILABLE".to_owned(),
+                        message: "paired local desktop authority requires Windows".to_owned(),
+                    }
+                }
+            }
+            IpcRequest::ListPairedAccessPolicies => {
+                #[cfg(windows)]
+                {
+                    self.list_paired_access().await
+                }
+                #[cfg(not(windows))]
+                {
+                    IpcResponse::Error {
+                        code: "E_PAIRED_PLATFORM_UNAVAILABLE".to_owned(),
+                        message: "paired local desktop authority requires Windows".to_owned(),
+                    }
+                }
+            }
+            IpcRequest::RevokePairedAccess {
+                peer_key_id,
+                expected_revision,
+            } => {
+                #[cfg(windows)]
+                {
+                    self.revoke_paired_access(peer_key_id, expected_revision)
+                        .await
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = (peer_key_id, expected_revision);
+                    IpcResponse::Error {
+                        code: "E_PAIRED_PLATFORM_UNAVAILABLE".to_owned(),
+                        message: "paired local desktop authority requires Windows".to_owned(),
+                    }
+                }
+            }
             IpcRequest::GetTemporaryAccessStatus => IpcResponse::TemporaryAccessStatus {
                 status: crate::public_connection::temporary::status(&self.app_state).await,
             },
@@ -1306,6 +1356,7 @@ fn allowed_when_security_unhealthy(request: &IpcRequest) -> bool {
             | IpcRequest::FailSession { .. }
             | IpcRequest::SuspendTrustedDevice { .. }
             | IpcRequest::RevokeTrustedDevice { .. }
+            | IpcRequest::RevokePairedAccess { .. }
             | IpcRequest::GetShellStatus
             | IpcRequest::ShutdownService { .. }
     )
@@ -1315,6 +1366,8 @@ fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::RegisterDevice { .. }
+            | IpcRequest::PairPendingSession { .. }
+            | IpcRequest::RevokePairedAccess { .. }
             | IpcRequest::RequestRemoteSession { .. }
             | IpcRequest::RespondToConsent { .. }
             | IpcRequest::ApproveLanPairing { .. }

@@ -105,6 +105,16 @@ describe("HomePage secure remote launch", () => {
     expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith("0123456789", expect.anything());
   });
 
+  it('requires an explicit paired choice before launching a remembered native controller connection', async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    expect(screen.getByRole('combobox', { name: '连接授权方式' })).toHaveValue('attended');
+    await user.selectOptions(screen.getByRole('combobox', { name: '连接授权方式' }), 'paired');
+    await user.type(screen.getByPlaceholderText('输入 10 位设备码'), '012 345 6789');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith('0123456789', expect.objectContaining({ accessMode: 'paired' }));
+  });
+
   it("copies all ten device digits without display separators", async () => {
     const user = userEvent.setup();
     const write = vi.spyOn(navigator.clipboard, "writeText").mockResolvedValue();

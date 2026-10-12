@@ -145,6 +145,20 @@ pub(crate) fn append_audit_in_transaction(
     draft: AuditDraft,
 ) -> Result<AuditRecord, StoreError> {
     validate_draft(&draft)?;
+    // Policy authority is written only by the typed policy transaction. Neither
+    // ordinary audit callers nor trust-audit callers may mint commitments.
+    if draft.action.starts_with("paired_access.policy.") {
+        return Err(StoreError::InvalidAuditEvent);
+    }
+    append_validated_audit(connection, protector, store_id, draft)
+}
+
+fn append_validated_audit(
+    connection: &Connection,
+    protector: &dyn SecretProtector,
+    store_id: &[u8],
+    draft: AuditDraft,
+) -> Result<AuditRecord, StoreError> {
     let key = load_audit_key(connection, protector, store_id)?;
     let (sequence, previous_hash): (u64, Vec<u8>) = connection.query_row(
         "SELECT next_sequence, head_hash FROM audit_head WHERE singleton = 1",
@@ -188,6 +202,34 @@ pub(crate) fn append_audit_in_transaction(
         draft,
         event_hash,
     })
+}
+
+/// Constructs policy authority internally, after the exact protected bytes have
+/// been written by the revision-checked policy transaction.
+pub(crate) fn append_paired_policy_audit(
+    connection: &Connection,
+    protector: &dyn SecretProtector,
+    store_id: &[u8],
+    policy: &crate::PairedAccessPolicy,
+    protected_blob: &[u8],
+    timestamp_ms: u64,
+) -> Result<AuditRecord, StoreError> {
+    let draft = AuditDraft {
+        timestamp_ms,
+        action: crate::paired_access_store::POLICY_ACTION.to_owned(),
+        outcome: if policy.enabled { "enabled" } else { "disabled" }.to_owned(),
+        session_id: None,
+        actor_device_id: None,
+        peer_device_id: Some(policy.peer_key_id.clone()),
+        transport_kind: None,
+        reason_code: None,
+        details: BTreeMap::from([
+            ("revision".to_owned(), policy.revision.to_string()),
+            ("blob_sha256".to_owned(), crate::paired_access_store::sha256_hex(protected_blob)),
+        ]),
+    };
+    validate_draft(&draft)?;
+    append_validated_audit(connection, protector, store_id, draft)
 }
 
 pub(crate) fn initialize_new_audit(

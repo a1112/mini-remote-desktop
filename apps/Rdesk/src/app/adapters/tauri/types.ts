@@ -973,7 +973,22 @@ export interface RemoteFailure {
   suggested_action?: string | null;
 }
 
-export type RemoteAccessMode = "attended" | "unattended";
+export type RemoteAccessMode = "attended" | "unattended" | "paired";
+
+export interface PairPendingSessionRequest {
+  session_id: string;
+  approved_scopes: RemotePermissionScope[];
+  expected_policy_revision: DecimalU64;
+}
+
+export interface PairedAccessPolicySnapshot {
+  peer_key_id: string;
+  epoch: DecimalU64;
+  trust_revision: DecimalU64;
+  scopes: RemotePermissionScope[];
+  revision: DecimalU64;
+  enabled: boolean;
+}
 export type RemoteSessionRole = "controller" | "agent";
 export type RemoteAuthorizationState =
   | "discovered"

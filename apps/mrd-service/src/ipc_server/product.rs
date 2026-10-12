@@ -129,6 +129,9 @@ fn product_request_is_allowed(request: &IpcRequest) -> bool {
             | IpcRequest::GetRemoteSession { .. }
             | IpcRequest::RequestRemoteSession { .. }
             | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::PairPendingSession { .. }
+            | IpcRequest::ListPairedAccessPolicies
+            | IpcRequest::RevokePairedAccess { .. }
             | IpcRequest::SubscribeSessionEvents { .. }
             | IpcRequest::GetRouteEvidence { .. }
             | IpcRequest::RuntimeSnapshot

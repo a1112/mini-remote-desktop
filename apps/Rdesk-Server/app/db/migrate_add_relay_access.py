@@ -24,7 +24,7 @@ _CHECK_CAST = re.compile(
     flags=re.IGNORECASE,
 )
 _LOCK_CONTEXT = b"MRD_RELAY_ACCESS_SCHEMA_MIGRATION_V1\x00"
-_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8)
+_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 8, 9)
 
 
 class RelayAccessMigrationError(RuntimeError):
@@ -123,6 +123,7 @@ async def _migrate_connection(
         {1, 2, 3, 4, 5},
         {1, 2, 3, 4, 5, 6},
         {1, 2, 3, 4, 5, 6, 7},
+        {1, 2, 3, 4, 5, 6, 7, 8},
     )
     if applied_versions not in supported_upgrade_states:
         # Versions 1-3 shipped as one atomic legacy migration. A partial legacy
@@ -138,6 +139,7 @@ async def _migrate_connection(
     apply_wan_session = 6 not in applied_versions
     apply_direct_first = 7 not in applied_versions
     apply_session_security = 8 not in applied_versions
+    apply_paired_access = 9 not in applied_versions
     required_tables = (
         "users", "devices", "session_requests", "relay_nodes",
         "relay_node_registrations", "relay_audit_events", "relay_reservations",
@@ -218,6 +220,10 @@ async def _migrate_connection(
         f"ALTER TABLE {users} ADD COLUMN IF NOT EXISTS session_version INTEGER",
         f"ALTER TABLE {devices} ADD COLUMN IF NOT EXISTS active_refresh_jti_hash VARCHAR(64)",
     )
+    paired_access_statements = (
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS paired_controller_key_id VARCHAR(64)",
+        f"ALTER TABLE {sessions} ADD COLUMN IF NOT EXISTS paired_target_key_id VARCHAR(64)",
+    )
     directory_lifecycle_statements = (
         f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
         f"ALTER TABLE {reservations} ADD COLUMN IF NOT EXISTS "
@@ -242,6 +248,7 @@ async def _migrate_connection(
         + (directory_lifecycle_statements if apply_directory_lifecycle else ())
         + (wan_session_statements if apply_wan_session else ())
         + (session_security_statements if apply_session_security else ())
+        + (paired_access_statements if apply_paired_access else ())
     ):
         await connection.execute(text(statement))
 
@@ -404,6 +411,16 @@ async def _migrate_connection(
                 f"ALTER TABLE {sessions} DROP CONSTRAINT ck_session_requests_wan_values"
             ))
 
+    if apply_paired_access:
+        # Only the exact shipped attended CHECK may be replaced. Unknown schema
+        # drift is rejected within this transaction; historical requests stay intact.
+        legacy_paired = await connection.run_sync(lambda sync:
+            _wan_paired_constraint_is_legacy(sync, schema,
+                allow_missing=apply_wan_session or apply_direct_first))
+        if legacy_paired:
+            await connection.execute(text(
+                f"ALTER TABLE {sessions} DROP CONSTRAINT ck_session_requests_wan_values"))
+
     checks = (
         (users, f"{effective_schema}.users", "ck_users_tenant_id", "length(tenant_id) BETWEEN 1 AND 64"),
         (users, f"{effective_schema}.users", "ck_users_tenant_id_canonical", "tenant_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'"),
@@ -419,7 +436,8 @@ async def _migrate_connection(
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_policy_revision", "policy_revision IS NULL OR policy_revision > 0"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_approved_bundle", "status <> 'approved' OR (grant_expires_at IS NOT NULL AND policy_revision IS NOT NULL AND policy_expires_at IS NOT NULL AND intended_peer_id IS NOT NULL AND relay_allowed_regions IS NOT NULL AND relay_preferred_regions IS NOT NULL AND relay_accepted_transports IS NOT NULL)"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_request_bundle", "(requester_device_id IS NULL AND request_payload IS NULL AND request_commitment IS NULL AND access_mode IS NULL AND route_policy IS NULL AND requested_scopes IS NULL AND requested_profile IS NULL AND approved_scopes IS NULL AND approved_profile IS NULL AND active_relay_generation IS NULL) OR (requester_device_id IS NOT NULL AND request_payload IS NOT NULL AND request_commitment IS NOT NULL AND length(request_commitment) = 64 AND access_mode IS NOT NULL AND route_policy IS NOT NULL AND requested_scopes IS NOT NULL)"),
-        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_values", "requester_device_id IS NULL OR (requester_device_id <> target_device_id AND access_mode = 'attended' AND route_policy IN ('relay_only', 'direct_first'))"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_values", "requester_device_id IS NULL OR (requester_device_id <> target_device_id AND access_mode IN ('attended', 'paired') AND route_policy IN ('relay_only', 'direct_first'))"),
+        (sessions, f"{effective_schema}.session_requests", "ck_session_requests_paired_keys", "((access_mode IS NULL OR access_mode = 'attended') AND paired_controller_key_id IS NULL AND paired_target_key_id IS NULL) OR (access_mode = 'paired' AND paired_controller_key_id IS NOT NULL AND paired_target_key_id IS NOT NULL AND length(paired_controller_key_id) = 64 AND length(paired_target_key_id) = 64)"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_wan_approval_bundle", "requester_device_id IS NULL OR status <> 'approved' OR (approved_scopes IS NOT NULL AND policy_expires_at IS NOT NULL AND active_relay_generation IS NOT NULL AND active_relay_generation >= 0)"),
         (sessions, f"{effective_schema}.session_requests", "ck_session_requests_active_relay_generation", "active_relay_generation IS NULL OR (requester_device_id IS NOT NULL AND active_relay_generation >= 0)"),
     )
@@ -429,6 +447,7 @@ async def _migrate_connection(
               or name == "ck_session_requests_active_relay_generation")
              and apply_wan_session)
             or (name == "ck_session_requests_wan_values" and apply_direct_first)
+            or (name in {"ck_session_requests_wan_values", "ck_session_requests_paired_keys"} and apply_paired_access)
             or (name == "ck_session_requests_status" and (
                 apply_legacy_access or apply_directory_lifecycle
             ))
@@ -444,6 +463,7 @@ async def _migrate_connection(
                 "ck_devices_plaintext_serial_cleared",
                 "ck_session_requests_wan_request_bundle",
                 "ck_session_requests_wan_values",
+                "ck_session_requests_paired_keys",
                 "ck_session_requests_wan_approval_bundle",
                 "ck_session_requests_active_relay_generation",
             } and apply_legacy_access)
@@ -570,7 +590,39 @@ def _wan_route_constraint_is_legacy(
         return True
     if actual == current:
         return False
+    # Fresh metadata may already include paired while older ledger steps are
+    # initialized. Admit the exact current expression, never a broader one.
+    if actual == _normalize_check_expression(_PAIRED_WAN_VALUES):
+        return False
     raise RelayAccessMigrationError("relay access WAN route policy constraint differs")
+
+
+_PAIRED_WAN_VALUES = (
+    "requester_device_id IS NULL OR requester_device_id <> target_device_id "
+    "AND (access_mode = ANY (ARRAY['attended', 'paired'])) AND "
+    "(route_policy = ANY (ARRAY['relay_only', 'direct_first']))"
+)
+_PAIRED_KEYS = (
+    "(access_mode IS NULL OR access_mode = 'attended') AND paired_controller_key_id IS NULL "
+    "AND paired_target_key_id IS NULL OR access_mode = 'paired' AND "
+    "paired_controller_key_id IS NOT NULL AND paired_target_key_id IS NOT NULL AND "
+    "length(paired_controller_key_id) = 64 AND length(paired_target_key_id) = 64"
+)
+
+
+def _wan_paired_constraint_is_legacy(connection, schema, *, allow_missing):
+    checks = {item["name"]: _normalize_check_expression(item["sqltext"])
+        for item in inspect(connection).get_check_constraints("session_requests", schema=schema)}
+    actual = checks.get("ck_session_requests_wan_values")
+    if actual is None and allow_missing:
+        return False
+    attended = ("requester_device_id IS NULL OR requester_device_id <> target_device_id "
+        "AND access_mode = 'attended' AND (route_policy = ANY (ARRAY['relay_only', 'direct_first']))")
+    if actual == _normalize_check_expression(attended):
+        return True
+    if actual == _normalize_check_expression(_PAIRED_WAN_VALUES):
+        return False
+    raise RelayAccessMigrationError("relay access WAN paired access constraint differs")
 
 
 def _session_status_constraint_is_legacy(
@@ -710,6 +762,8 @@ def _auth_specs() -> dict[str, dict[str, tuple[type[object], int | None, bool]]]
             "request_payload": (JSONB, None, True),
             "request_commitment": (String, 64, True),
             "access_mode": (String, 24, True),
+            "paired_controller_key_id": (String, 64, True),
+            "paired_target_key_id": (String, 64, True),
             "route_policy": (String, 24, True),
             "requested_scopes": (JSONB, None, True),
             "requested_profile": (JSONB, None, True),
@@ -1394,6 +1448,8 @@ def _verify(connection: object, schema: str | None) -> None:
                 "request_payload",
                 "request_commitment",
                 "access_mode",
+                "paired_controller_key_id",
+                "paired_target_key_id",
                 "route_policy",
                 "requested_scopes",
                 "requested_profile",
@@ -1471,12 +1527,8 @@ def _verify(connection: object, schema: str | None) -> None:
                 "access_mode IS NOT NULL AND route_policy IS NOT NULL AND "
                 "requested_scopes IS NOT NULL"
             ),
-            "ck_session_requests_wan_values": (
-                "requester_device_id IS NULL OR "
-                "requester_device_id <> target_device_id AND "
-                "access_mode = 'attended' AND (route_policy = ANY "
-                "(ARRAY['relay_only', 'direct_first']))"
-            ),
+            "ck_session_requests_wan_values": _PAIRED_WAN_VALUES,
+            "ck_session_requests_paired_keys": _PAIRED_KEYS,
             "ck_session_requests_wan_approval_bundle": (
                 "requester_device_id IS NULL OR status <> 'approved' OR "
                 "approved_scopes IS NOT NULL AND policy_expires_at IS NOT NULL AND "

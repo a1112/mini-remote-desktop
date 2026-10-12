@@ -128,6 +128,29 @@ def _guest(api, **changes):
     )
 
 
+def test_guest_paired_keeps_password_authority_and_per_session_stable_key(device_sessions_api):
+    api = device_sessions_api
+    assert _publish(api).status_code == 200
+    response = _guest(api, access_mode="paired")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["session"]["request"]["access_mode"] == "paired"
+    assert body["session"]["authority_kind"] == "temporary_password"
+    assert body["session"]["status"] == "requested"
+    row = api.session.get(SessionRequest, "guest-session-1")
+    assert row.paired_controller_key_id == body["controller_key_id"]
+    assert row.paired_target_key_id == KEY_ID
+    second = _guest(api, access_mode="paired", session_id="guest-session-2")
+    assert second.status_code == 200, second.text
+    assert second.json()["controller_key_id"] == body["controller_key_id"]
+    assert second.json()["controller_device_id"] != body["controller_device_id"]
+    assert _guest(api, access_mode="paired", session_id="guest-session-3",
+        temporary_password="ABCDEFG3").status_code == 401
+    assert api.client.get("/api/v1/device-sessions/guest-session-1",
+        headers=_headers(api, "unbound-1")).status_code == 200
+
+
+
 def test_physical_unbound_publishes_without_user_and_never_returns_password(
     device_sessions_api,
 ):
@@ -269,7 +292,7 @@ def test_renewal_preserves_pending_guest_deadline_and_credentials(device_session
 from test_wan_relay_access import wan_relay_api
 
 
-def _unbound_relay_guest(api):
+def _unbound_relay_guest(api, *, access_mode="attended"):
     from app.services.relay_signing import Ed25519RelayDirectorySigner
     from test_browser_session_api import DIRECTORY_KEY_ID, DIRECTORY_SEED
 
@@ -282,7 +305,7 @@ def _unbound_relay_guest(api):
         key_id=DIRECTORY_KEY_ID, private_key_seed=DIRECTORY_SEED
     )
     assert _publish(api, target="controller-1").status_code == 200
-    response = _guest(api, target_device_id="controller-1")
+    response = _guest(api, target_device_id="controller-1", access_mode=access_mode)
     assert response.status_code == 200, response.text
     approved = api.client.post(
         "/api/v1/device-sessions/guest-session-1/approve",
@@ -291,6 +314,26 @@ def _unbound_relay_guest(api):
     )
     assert approved.status_code == 200, approved.text
     return response.json()
+
+
+def test_guest_paired_approved_scopes_and_real_relay_remain_short_and_revocable(wan_relay_api):
+    api = wan_relay_api
+    body = _unbound_relay_guest(api, access_mode="paired")
+    auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
+    inspected = api.client.get("/api/v1/guest-browser-sessions/guest-session-1", headers=auth)
+    assert inspected.status_code == 200, inspected.text
+    claims = jwt.decode(inspected.json()["credential"]["token"],
+        settings.jwt_secret.get_secret_value(), algorithms=["HS256"], options={"verify_aud": False})
+    assert claims["allowed_scopes"] == ["screen.view"]
+    assert 0 < claims["exp"] - claims["iat"] <= 600
+    assert api.client.post("/api/v1/guest-browser-sessions/guest-session-1/relay-access",
+        headers=auth, json={}).status_code == 200
+    revoked = api.client.post("/api/v1/device-sessions/guest-session-1/revoke",
+        headers=_headers(api, "controller-1"), json={})
+    assert revoked.status_code == 200, revoked.text
+    assert api.client.get("/api/v1/guest-browser-sessions/guest-session-1", headers=auth).status_code == 404
+    assert api.client.post("/api/v1/guest-browser-sessions/guest-session-1/relay-access",
+        headers=auth, json={}).status_code == 404
 
 
 def test_guest_approval_keeps_local_consent_and_issues_real_scoped_relay(wan_relay_api):

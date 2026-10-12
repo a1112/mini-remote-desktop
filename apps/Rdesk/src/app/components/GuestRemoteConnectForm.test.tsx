@@ -9,6 +9,17 @@ vi.mock('../services/remoteDisplayLauncher', () => ({ launchRemoteDisplayForDevi
 beforeEach(() => { vi.clearAllMocks(); mocks.launch.mockResolvedValue({ sessionId: 'guest-session', mode: 'route', routePath: '/browser-session/guest-session' }); });
 
 describe('guest remote connection form', () => {
+  it('uses explicit paired reconnect while still requiring the temporary password', async () => {
+    const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
+    const mode = screen.getByRole('combobox', { name: '连接授权方式' });
+    expect(mode).toHaveValue('attended');
+    await user.selectOptions(mode, 'paired');
+    await user.type(screen.getByLabelText('远程设备码'), '753662296');
+    expect(screen.getByRole('button', { name: '立即连接' })).toBeDisabled();
+    await user.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).toHaveBeenCalledWith('753662296', expect.objectContaining({ accessMode: 'paired', temporaryPassword: 'ABCD2345' }));
+  });
   it.each([
     { preset: null, profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 10, codec: 'h264' } },
     { preset: '1080p60', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: 'h264' } },

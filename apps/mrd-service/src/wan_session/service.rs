@@ -758,7 +758,10 @@ impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
             peer_device_id: request.controller_device_id.clone(),
             peer_key_id: identity.controller_key_fingerprint().to_owned(),
             peer_key_epoch: 1,
-            access_mode: mrd_ipc::RemoteAccessMode::Attended,
+            access_mode: match request.access_mode {
+                mrd_signal_proto::WanAccessModeV3::Attended => mrd_ipc::RemoteAccessMode::Attended,
+                mrd_signal_proto::WanAccessModeV3::Paired => mrd_ipc::RemoteAccessMode::Paired,
+            },
             requested_scopes: scopes.clone(),
             peer_permission_ceiling: scopes.clone(),
             machine_permission_ceiling: scopes.clone(),
@@ -1178,6 +1181,12 @@ async fn run_wan_session_service(
     let _ = shutdown_active_wan_sessions(&app_state).await;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialEventOutcome {
+    StartGenerationZero,
+    RetainedExistingGrant,
+}
+
 async fn handle_initial_event(
     app_state: Arc<crate::AppState>,
     coordinator: Arc<WanSessionCoordinator>,
@@ -1213,12 +1222,17 @@ async fn handle_initial_event(
     } else {
         apply_verified_controller_grant(&app_state, &coordinator, event)
             .await
+            .map(|_| InitialEventOutcome::StartGenerationZero)
             .map_err(|_| ())
     };
     if result.is_err() {
         // Verification failures are ignored rather than terminalizing a valid
         // session: an attacker cannot turn a malformed frame into a close.
         let _ = reconcile_wan_session(&app_state, &session_id).await;
+        return;
+    }
+    if result == Ok(InitialEventOutcome::RetainedExistingGrant) {
+        // A validated duplicate owns no new workflow or negotiation resources.
         return;
     }
     let _ = reconcile_wan_session(&app_state, &session_id).await;
@@ -1241,7 +1255,7 @@ async fn handle_target_intent(
     event: VerifiedSignalingEvent,
     local_device_id: &DeviceId,
     local_identity: &mrd_identity::DeviceIdentity,
-) -> Result<(), ()> {
+) -> Result<InitialEventOutcome, ()> {
     let verified = VerifiedWanSessionIntent::verify_event(
         event,
         local_device_id,
@@ -1250,18 +1264,59 @@ async fn handle_target_intent(
     )
     .map_err(|_| ())?;
     let session_id = verified.identity().session_id().clone();
-    coordinator
+    let transition = coordinator
         .accept_verified_target_intent(verified.clone())
         .await
         .map_err(|_| ())?;
+    if transition == super::model::TransitionResult::Duplicate {
+        let _gate = app_state.authorization_security_gate.lock().await;
+        let existing = coordinator.snapshot(&session_id).await.map_err(|_| ())?;
+        if retains_exact_target_grant_under_security_gate(
+            app_state,
+            &existing,
+            &verified,
+            now_unix_ms(),
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(InitialEventOutcome::RetainedExistingGrant);
+        }
+    }
+    let bind = async {
+        let _gate = app_state.authorization_security_gate.lock().await;
+        app_state
+            .session_authorizations
+            .bind_authenticated_peer_key(
+                &session_id,
+                verified.controller_public_key(),
+                now_unix_ms(),
+            )
+            .await
+            .map_err(|_| ())?;
+        if verified.request().access_mode == mrd_signal_proto::WanAccessModeV3::Paired {
+            crate::ipc_server::paired_access::authorize_automatic_under_security_gate(
+                app_state,
+                &session_id,
+            )
+            .await
+            .map_err(|_| ())?;
+        }
+        Ok::<_, ()>(())
+    }
+    .await;
+    if bind.is_err() {
+        let _ = fail_wan_session(app_state, &session_id, WanSessionFailure::PolicyMismatch).await;
+        return Err(());
+    }
     // Capture the local consent policy before any backend approval/signaling
     // awaits. The server policy revision is independently versioned.
     let approval = async {
         let local = app_state
             .session_authorizations
-            .snapshot(&session_id)
+            .wait_for_authorization_decision(&session_id)
             .await
-            .ok_or(())?;
+            .map_err(|_| ())?;
         if local.role != mrd_ipc::RemoteSessionRole::Agent
             || local.peer_device_id != *verified.identity().controller_device_id()
             || local.peer_key_id != verified.identity().controller_key_fingerprint()
@@ -1284,17 +1339,23 @@ async fn handle_target_intent(
         // was revoked or changed. Terminalize and release every runtime port.
         let _ = fail_wan_session(app_state, &session_id, WanSessionFailure::PolicyMismatch).await;
     }
-    approval
+    approval.map(|_| InitialEventOutcome::StartGenerationZero)
 }
 
-async fn install_target_authorization(
+/// Derive the exact already signed target authorization. This shared proof does
+/// not consult current password enrollment or install any runtime resources.
+async fn expected_target_authorization_under_security_gate(
     app_state: &Arc<crate::AppState>,
     state: &WanSessionState,
     verified: &VerifiedWanSessionIntent,
-    expected_local_policy_revision: u64,
-) -> Result<(), RemoteFailure> {
-    let _authorization_guard = app_state.authorization_security_gate.lock().await;
-    let now = now_unix_ms();
+    now: u64,
+) -> Result<
+    (
+        mrd_ipc::RemoteSessionSnapshot,
+        crate::session_authorization::VerifiedSessionGrant,
+    ),
+    RemoteFailure,
+> {
     let identity = state.identity();
     let local_device = app_state
         .devices
@@ -1325,7 +1386,13 @@ async fn install_target_authorization(
         .grant_commitment()
         .ok_or_else(controller_grant_mismatch)?;
     if state.role() != WanSessionRole::Target
-        || state.phase() != WanSessionPhase::AccessBound
+        || !matches!(
+            state.phase(),
+            WanSessionPhase::AccessBound
+                | WanSessionPhase::Negotiating
+                | WanSessionPhase::RelayVerified
+                | WanSessionPhase::Streaming
+        )
         || identity != verified.identity()
         || identity.target_device_id() != &local_device
         || identity.target_key_fingerprint() != Some(local_identity.key_id())
@@ -1356,14 +1423,18 @@ async fn install_target_authorization(
         .await
         .ok_or_else(controller_grant_mismatch)?;
     if existing.role != mrd_ipc::RemoteSessionRole::Agent
-        || existing.access_mode != mrd_ipc::RemoteAccessMode::Attended
+        || existing.access_mode
+            != match verified.request().access_mode {
+                mrd_signal_proto::WanAccessModeV3::Attended => mrd_ipc::RemoteAccessMode::Attended,
+                mrd_signal_proto::WanAccessModeV3::Paired => mrd_ipc::RemoteAccessMode::Paired,
+            }
         || existing.peer_device_id != *identity.controller_device_id()
         || existing.peer_key_id != identity.controller_key_fingerprint()
         || existing.granted_scopes != scopes
     {
         return Err(controller_grant_mismatch());
     }
-    let mut authorization = crate::session_authorization::VerifiedSessionGrant {
+    let authorization = crate::session_authorization::VerifiedSessionGrant {
         grant_id: format!("sha256:{commitment}"),
         session_id: identity.session_id().clone(),
         granted_scopes: scopes,
@@ -1374,28 +1445,94 @@ async fn install_target_authorization(
         transport_fingerprint_sha256: decode_sha256(access.relay_url_digest())
             .ok_or_else(controller_grant_mismatch)?,
     };
+    Ok((existing, authorization))
+}
+
+/// Retain only the same live grant, never an approval or a new Agent install.
+/// Explicit revocation uses this same security gate and removes active grants.
+async fn retains_exact_target_grant_under_security_gate(
+    app_state: &Arc<crate::AppState>,
+    state: &WanSessionState,
+    verified: &VerifiedWanSessionIntent,
+    now: u64,
+) -> Result<(), RemoteFailure> {
+    let (existing, mut expected) =
+        expected_target_authorization_under_security_gate(app_state, state, verified, now).await?;
+    if existing.authorization_state != RemoteAuthorizationState::Granted
+        || app_state
+            .session_authorizations
+            .authenticated_peer_key_at(state.identity().session_id(), now)
+            .await
+            .as_ref()
+            != Some(verified.controller_public_key())
+        || (verified.request().access_mode == mrd_signal_proto::WanAccessModeV3::Paired
+            && app_state
+                .session_authorizations
+                .paired_policy_revision(state.identity().session_id())
+                .await
+                .is_none())
+    {
+        return Err(controller_grant_mismatch());
+    }
+    let current = app_state
+        .session_authorizations
+        .active_grant(state.identity().session_id())
+        .await
+        .ok_or_else(controller_grant_mismatch)?;
+    expected.issued_at_ms = current.issued_at_ms;
+    if current != expected || current.issued_at_ms > now || now >= current.expires_at_ms {
+        return Err(controller_grant_mismatch());
+    }
+    Ok(())
+}
+
+async fn install_target_authorization(
+    app_state: &Arc<crate::AppState>,
+    state: &WanSessionState,
+    verified: &VerifiedWanSessionIntent,
+    expected_local_policy_revision: u64,
+) -> Result<(), RemoteFailure> {
+    let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let now = now_unix_ms();
+    if state.phase() != WanSessionPhase::AccessBound {
+        return Err(controller_grant_mismatch());
+    }
+    let (existing, authorization) =
+        expected_target_authorization_under_security_gate(app_state, state, verified, now).await?;
+    if existing.authorization_state == RemoteAuthorizationState::Granted {
+        return retains_exact_target_grant_under_security_gate(app_state, state, verified, now)
+            .await;
+    }
+    let identity = state.identity();
     app_state
         .session_authorizations
         .bind_authenticated_peer_key(identity.session_id(), verified.controller_public_key(), now)
         .await?;
-    if existing.authorization_state == RemoteAuthorizationState::Granted {
-        let current = app_state
-            .session_authorizations
-            .active_grant(identity.session_id())
-            .await;
-        if let Some(current) = current.as_ref() {
-            authorization.issued_at_ms = current.issued_at_ms;
-        }
-        return if current.as_ref() == Some(&authorization) {
-            Ok(())
-        } else {
-            Err(controller_grant_mismatch())
-        };
+    let paired_basis = app_state
+        .session_authorizations
+        .paired_policy_revision(identity.session_id())
+        .await;
+    if paired_basis.is_some() {
+        crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
+            app_state,
+            identity.session_id(),
+        )
+        .await?;
+    } else if verified.request().access_mode == mrd_signal_proto::WanAccessModeV3::Paired {
+        return Err(controller_grant_mismatch());
     }
     app_state
         .session_authorizations
         .install_verified_wan_target_grant(authorization, expected_local_policy_revision, now)
         .await?;
+    #[cfg(windows)]
+    if paired_basis.is_some() {
+        app_state
+            .console_capture
+            .prepare_paired_session(app_state, identity.session_id())
+            .await
+            .map_err(|_| controller_grant_mismatch())?;
+    }
     Ok(())
 }
 

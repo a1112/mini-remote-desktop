@@ -36,6 +36,64 @@ function makeSession(
 }
 
 describe("IncomingSessionDialog", () => {
+  it('pairs only selected supported scopes through a distinct local policy action', async () => {
+    const user = userEvent.setup();
+    const onPair = vi.fn().mockResolvedValue(undefined);
+    const onRespond = vi.fn();
+    render(<IncomingSessionDialog session={makeSession({ route_kind: 'webrtc_relay' })} consentDeadlineMs={Date.now() + 30_000} onRespond={onRespond} onPair={onPair} />);
+    await user.click(screen.getByRole('checkbox', { name: 'input.pointer' }));
+    await user.click(screen.getByRole('button', { name: '配对并记住此控制端' }));
+    expect(onPair).toHaveBeenCalledWith({ session_id: 'session-1', approved_scopes: ['screen.view', 'input.pointer'], expected_policy_revision: '7' });
+    expect(onRespond).not.toHaveBeenCalled();
+  });
+  it('does not let pairing silently include unsupported requested scopes', async () => {
+    const user = userEvent.setup();
+    render(<IncomingSessionDialog session={makeSession({ route_kind: 'webrtc_relay' })} consentDeadlineMs={Date.now() + 30_000} onRespond={vi.fn()} onPair={vi.fn()} />);
+    await user.click(screen.getByRole('checkbox', { name: 'clipboard.read' }));
+    expect(screen.getByRole('button', { name: '配对并记住此控制端' })).toBeDisabled();
+  });
+  it('requires screen viewing when only pointer and keyboard permissions are selected for pairing', async () => {
+    const user = userEvent.setup();
+    const onPair = vi.fn();
+    render(<IncomingSessionDialog session={makeSession({ route_kind: 'webrtc_relay', requested_scopes: ['screen.view', 'input.pointer', 'input.keyboard'] })} consentDeadlineMs={Date.now() + 30_000} onRespond={vi.fn()} onPair={onPair} />);
+    await user.click(screen.getByRole('checkbox', { name: 'screen.view' }));
+    await user.click(screen.getByRole('checkbox', { name: 'input.pointer' }));
+    await user.click(screen.getByRole('checkbox', { name: 'input.keyboard' }));
+    const pair = screen.getByRole('button', { name: '配对并记住此控制端' });
+    expect(pair).toBeDisabled();
+    expect(screen.getByText('配对需要允许画面查看（screen.view）。')).toBeInTheDocument();
+    await user.click(pair);
+    expect(onPair).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '在本机确认' })).toBeEnabled();
+    await user.click(screen.getByRole('checkbox', { name: 'screen.view' }));
+    expect(pair).toBeEnabled();
+    expect(screen.queryByText('配对需要允许画面查看（screen.view）。')).not.toBeInTheDocument();
+  });
+  it.each(['lan_quic', 'webrtc_direct'] as const)(
+    'hides global pairing for a pending session with route %s',
+    (route_kind) => {
+      render(<IncomingSessionDialog session={makeSession({ route_kind })} consentDeadlineMs={Date.now() + 30_000} onRespond={vi.fn()} onPair={vi.fn()} />);
+      expect(screen.queryByRole('button', { name: '配对并记住此控制端' })).not.toBeInTheDocument();
+      expect(screen.queryByText(/或配对并记住此控制端/)).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '在本机确认' })).toBeEnabled();
+    },
+  );
+  it.each([null, undefined] as const)(
+    'preserves first pairing when the pending service snapshot has not selected a route (%s)',
+    async (route_kind) => {
+      const user = userEvent.setup();
+      const onPair = vi.fn().mockResolvedValue(undefined);
+      render(<IncomingSessionDialog session={makeSession({ route_kind })} consentDeadlineMs={Date.now() + 30_000} onRespond={vi.fn()} onPair={onPair} />);
+      const pair = screen.getByRole('button', { name: '配对并记住此控制端' });
+      expect(pair).toBeEnabled();
+      await user.click(pair);
+      expect(onPair).toHaveBeenCalledWith({ session_id: 'session-1', approved_scopes: ['screen.view'], expected_policy_revision: '7' });
+    },
+  );
+  it('hides pairing for a controller snapshot even when its route is global', () => {
+    render(<IncomingSessionDialog session={makeSession({ role: 'controller', route_kind: 'webrtc_relay' })} consentDeadlineMs={Date.now() + 30_000} onRespond={vi.fn()} onPair={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: '配对并记住此控制端' })).not.toBeInTheDocument();
+  });
   it("shows the exact peer identity and requested scope names", () => {
     render(
       <IncomingSessionDialog

@@ -1759,7 +1759,8 @@ def _wan_request_binding_valid(
         request.session_id == grant.id
         and request.controller_device_id == controller.device_id
         and request.target_device_id == target.device_id
-        and request.access_mode == "attended"
+        and request.access_mode in {"attended", "paired"}
+        and request.access_mode == grant.access_mode
         and request.route_policy in {"relay_only", "direct_first"}
         and normalized["requested_scopes"] == grant.requested_scopes
         and normalized["requested_profile"] == grant.requested_profile

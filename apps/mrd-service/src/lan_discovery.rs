@@ -2841,6 +2841,11 @@ async fn handle_signed_remote_session_request(
         }
 
         let authorization = match request.payload.access_mode {
+            RemoteAccessMode::Paired => Err(RemoteFailure {
+                code: RemoteReasonCode::PolicyChanged,
+                message: "paired access requires the signed global session protocol".to_owned(),
+                suggested_action: Some("connect through the public server".to_owned()),
+            }),
             RemoteAccessMode::Attended => {
                 app_state
                     .session_authorizations

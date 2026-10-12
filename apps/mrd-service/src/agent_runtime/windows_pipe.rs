@@ -240,6 +240,7 @@ pub struct VerifiedWindowsProcess {
     process_creation_time: u64,
     logon_sid: Vec<u8>,
     logon_sid_hash: [u8; 32],
+    user_sid_hash: [u8; 32],
     windows_session_id: u32,
     process: Owned<HANDLE>,
 }
@@ -269,6 +270,11 @@ impl VerifiedWindowsProcess {
         &self.logon_sid_hash
     }
 
+    /// Stable OS TokenUser digest, separate from the ephemeral logon SID.
+    pub fn user_sid_hash(&self) -> &[u8; 32] {
+        &self.user_sid_hash
+    }
+
     /// Primary-token Windows session id.
     pub fn windows_session_id(&self) -> u32 {
         self.windows_session_id
@@ -296,14 +302,43 @@ pub fn inspect_windows_process(
     let snapshot = token_snapshot(&token, false)?;
     let logon_sid_hash =
         hash_windows_logon_sid(&snapshot.logon_sid).ok_or(WindowsAgentPipeError::InvalidSid)?;
+    let user_sid_hash = hash_windows_user_sid(&snapshot.user_sid)?;
     Ok(VerifiedWindowsProcess {
         process_id,
         process_creation_time,
         logon_sid: snapshot.logon_sid,
         logon_sid_hash,
+        user_sid_hash,
         windows_session_id: snapshot.session_id,
         process,
     })
+}
+
+fn hash_windows_user_sid(sid: &[u8]) -> Result<[u8; 32], WindowsAgentPipeError> {
+    validate_sid_bytes(sid)?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"mrd-paired-owner-user-sid-v1\0");
+    context.update(sid);
+    Ok(context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 length"))
+}
+
+/// Reopen the observed OS process, checking its retained registration identity
+/// before using TokenUser as a durable owner. PID alone is never sufficient.
+pub(crate) fn paired_owner_for_observed_process(
+    observed: &ObservedAgentIdentity,
+) -> Result<[u8; 32], WindowsAgentPipeError> {
+    let process = inspect_windows_process(observed.process_id)?;
+    if process.process_creation_time() != observed.process_creation_time
+        || process.windows_session_id() != observed.windows_session_id
+        || process.logon_sid_hash() != &observed.logon_sid_hash
+    {
+        return Err(WindowsAgentPipeError::PeerIdentityMismatch);
+    }
+    Ok(*process.user_sid_hash())
 }
 
 impl VerifiedWindowsAgentPeer {
@@ -664,5 +699,32 @@ impl Drop for ImpersonationGuard {
 fn abort_impersonation() {
     if unsafe { RevertToSelf() }.is_err() {
         std::process::abort();
+    }
+}
+
+#[cfg(test)]
+mod paired_owner_tests {
+    use super::*;
+
+    #[test]
+    fn paired_owner_is_stable_but_rejects_a_stale_process_or_logon() {
+        let process = inspect_windows_process(std::process::id()).unwrap();
+        let mut observed = ObservedAgentIdentity {
+            caller_kind: AgentCallerKind::InteractiveUser,
+            process_id: process.process_id(),
+            process_creation_time: process.process_creation_time(),
+            logon_sid_hash: *process.logon_sid_hash(),
+            windows_session_id: process.windows_session_id(),
+        };
+        assert_eq!(
+            paired_owner_for_observed_process(&observed).unwrap(),
+            *process.user_sid_hash()
+        );
+        assert_ne!(process.user_sid_hash(), process.logon_sid_hash());
+        observed.process_creation_time = observed.process_creation_time.saturating_add(1);
+        assert!(paired_owner_for_observed_process(&observed).is_err());
+        observed.process_creation_time = process.process_creation_time();
+        observed.logon_sid_hash = [0; 32];
+        assert!(paired_owner_for_observed_process(&observed).is_err());
     }
 }

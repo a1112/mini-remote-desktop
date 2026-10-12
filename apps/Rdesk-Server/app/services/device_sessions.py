@@ -22,6 +22,7 @@ from app.schemas.session import (
 )
 from app.services.relay_directory import RelayAccessService
 from app.services.browser_authority import browser_authority_valid
+from app.services.paired_authority import machine_key_id
 from app.services.session_grants import (
     SessionGrantError,
     bind_session_grant_policy,
@@ -55,6 +56,7 @@ class DeviceSessionService:
         *,
         current_device: Device,
         payload: DeviceSessionCreateIn,
+        paired_browser_key_id: str | None = None,
     ) -> SessionRequest:
         if not _is_active_device(current_device):
             _deny()
@@ -136,6 +138,18 @@ class DeviceSessionService:
             ):
                 _deny()
 
+            controller_key = target_key = None
+            if canonical.access_mode == "paired":
+                if requester.bound_user_id != target.bound_user_id:
+                    _deny()
+                target_key = await machine_key_id(self._session, target)
+                if requester.principal_kind == "physical":
+                    controller_key = await machine_key_id(self._session, requester)
+                elif requester.principal_kind == "browser_controller":
+                    controller_key = paired_browser_key_id
+                if controller_key is None or target_key is None:
+                    _deny()
+
             row = SessionRequest(
                 id=canonical.session_id,
                 requester_user_id=requester_user.id,
@@ -147,6 +161,8 @@ class DeviceSessionService:
                 request_payload=normalized,
                 request_commitment=commitment,
                 access_mode=canonical.access_mode,
+                paired_controller_key_id=controller_key,
+                paired_target_key_id=target_key,
                 route_policy=canonical.route_policy,
                 requested_scopes=list(canonical.requested_scopes),
                 requested_profile=(
@@ -454,6 +470,8 @@ class DeviceSessionService:
         normalized: dict[str, object],
         commitment: str,
     ) -> bool:
+        if row.access_mode == "paired" and not await browser_authority_valid(self._session, row, now=self._now()):
+            return False
         if (
             row.requester_device_id == current_device.id
             and row.requester_user_id != current_device.bound_user_id
@@ -577,7 +595,7 @@ def _is_authorized_participant(row: SessionRequest, device: Device) -> bool:
                      and not device.is_bound and device.bound_user_id is None))))
         and row.tenant_id == device.tenant_id
         and row.requester_device_id is not None
-        and row.access_mode == "attended"
+        and row.access_mode in {"attended", "paired"}
         and row.route_policy in {"relay_only", "direct_first"}
         and device.id in {row.requester_device_id, row.target_device_id}
         and (

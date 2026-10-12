@@ -10,9 +10,9 @@ use auth::{AuthError, Authenticator, SystemChallengeSource};
 use mrd_identity::DeviceIdentity;
 use mrd_proto::{BackendRole, DeviceId};
 use mrd_signal_proto::{
-    AuthClaims, AuthenticatedSignalMessage, ProtocolReasonCode, Registered, RegisteredPayload,
-    SignalEnvelope, SignalProtocolError, SignalReplayGuard, VerifiedSignalMetadata,
-    WebRtcDescriptionRoleV3,
+    AuthClaims, AuthenticatedPayload, AuthenticatedSignalMessage, ProtocolReasonCode, Registered,
+    RegisteredPayload, SignalEnvelope, SignalProtocolError, SignalReplayGuard, SignedSignal,
+    VerifiedSignalMetadata, WebRtcDescriptionRoleV3,
 };
 use persistent_identity::{PersistentIdentityError, PersistentServerState, ServerSigningCounter};
 use presence::{PresenceEntry, PresenceError, PresenceRegistry};
@@ -224,11 +224,9 @@ impl RealtimeCore {
         self.authorize_browser_signal(&presence, &envelope.message)?;
         match &envelope.message {
             AuthenticatedSignalMessage::PresenceHeartbeat(heartbeat) => {
-                let metadata = heartbeat.verify_for(
-                    &self.config.server_device_id,
-                    now_ms,
-                    &mut self.replay,
-                )?;
+                let server_device_id = self.config.server_device_id.clone();
+                let metadata =
+                    self.verify_sender_signal(&presence, heartbeat, &server_device_id, now_ms)?;
                 self.bind_sender(&presence, &metadata)?;
                 if heartbeat.payload.connection_id != *connection_id.as_bytes() {
                     return Err(RealtimeError::SenderBinding);
@@ -245,8 +243,12 @@ impl RealtimeCore {
             }
             AuthenticatedSignalMessage::SessionIntentV3(intent) => {
                 let request = &intent.payload.request;
-                let metadata =
-                    intent.verify_for(&request.target_device_id, now_ms, &mut self.replay)?;
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    intent,
+                    &request.target_device_id,
+                    now_ms,
+                )?;
                 self.bind_sender(&presence, &metadata)?;
                 if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
@@ -272,10 +274,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(target.connection_id, envelope)])
             }
             AuthenticatedSignalMessage::SessionGrantV3(grant) => {
-                let metadata = grant.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    grant,
                     &grant.payload.controller_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 if !presence.role.has_capability(BackendRole::Agent) {
@@ -293,8 +296,12 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::WebrtcOfferV3(offer) => {
-                let metadata =
-                    offer.verify_for(&offer.payload.target_device_id, now_ms, &mut self.replay)?;
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    offer,
+                    &offer.payload.target_device_id,
+                    now_ms,
+                )?;
                 self.bind_sender(&presence, &metadata)?;
                 if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
@@ -308,10 +315,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::WebrtcAnswerV3(answer) => {
-                let metadata = answer.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    answer,
                     &answer.payload.controller_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 if !presence.role.has_capability(BackendRole::Agent) {
@@ -334,7 +342,8 @@ impl RealtimeCore {
                         (&candidate.payload.controller_device_id, BackendRole::Agent)
                     }
                 };
-                let metadata = candidate.verify_for(expected_peer, now_ms, &mut self.replay)?;
+                let metadata =
+                    self.verify_sender_signal(&presence, candidate, expected_peer, now_ms)?;
                 self.bind_sender(&presence, &metadata)?;
                 if !presence.role.has_capability(required_role) {
                     return Err(RealtimeError::UnauthorizedRoute);
@@ -348,8 +357,12 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::SessionDeny(deny) => {
-                let metadata =
-                    deny.verify_for(&deny.payload.controller_device_id, now_ms, &mut self.replay)?;
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    deny,
+                    &deny.payload.controller_device_id,
+                    now_ms,
+                )?;
                 self.bind_sender(&presence, &metadata)?;
                 let peer = self
                     .routes
@@ -357,10 +370,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::RelayMigrationOffer(offer) => {
-                let metadata = offer.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    offer,
                     &offer.payload.claims.intended_peer_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 let peer = self.routes.resolve_migration_offer(
@@ -379,10 +393,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::RelayMigrationAnswer(answer) => {
-                let metadata = answer.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    answer,
                     &answer.payload.claims.intended_peer_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 let peer = self.routes.resolve_migration_answer(
@@ -394,10 +409,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::RelayMigrationCandidate(candidate) => {
-                let metadata = candidate.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    candidate,
                     &candidate.payload.claims.intended_peer_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 let peer = self.routes.resolve_migration_candidate(
@@ -409,10 +425,11 @@ impl RealtimeCore {
                 Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
             }
             AuthenticatedSignalMessage::SessionClose(close) => {
-                let metadata = close.verify_for(
+                let metadata = self.verify_sender_signal(
+                    &presence,
+                    close,
                     &close.payload.claims.intended_peer_device_id,
                     now_ms,
-                    &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
                 let peer = self
@@ -548,6 +565,29 @@ impl RealtimeCore {
             return Err(RealtimeError::SenderBinding);
         }
         Ok(())
+    }
+
+    fn verify_sender_signal<T: AuthenticatedPayload>(
+        &mut self,
+        presence: &PresenceEntry,
+        message: &SignedSignal<T>,
+        expected_peer: &DeviceId,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, RealtimeError> {
+        let metadata = message.verify_for_without_replay(expected_peer, now_ms)?;
+        self.bind_sender(presence, &metadata)?;
+        if let Some(browser) = &presence.browser {
+            self.replay.accept_browser_session(
+                &metadata,
+                &browser.session_id,
+                presence.token_expires_at_ms,
+                now_ms,
+            )?;
+        } else {
+            self.replay
+                .accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        }
+        Ok(metadata)
     }
 
     fn require_intended_peer(
@@ -695,6 +735,7 @@ impl RealtimeCore {
     }
 
     pub fn prune(&mut self, now_ms: u64) -> Vec<ConnectionId> {
+        self.replay.prune_browser_sessions(now_ms);
         self.browser_revocations
             .retain(|_, expires| now_ms < *expires);
         let expired = self.presence.prune(now_ms, self.config.presence_ttl_ms);
