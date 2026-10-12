@@ -3,8 +3,9 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useNavigate } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { BrowserRemoteSessionPage } from './BrowserRemoteSessionPage';
+import type { BrowserRemoteState } from '../services/browserRemoteSessionService';
 
-type State = { phase: 'waiting_consent' | 'negotiating' | 'streaming' | 'denied' | 'failed' | 'closed'; grantedScopes: string[]; error?: string; route?: 'direct' | 'relay' | null };
+type State = BrowserRemoteState;
 type Observer = { onState: (state: State) => void; onVideoStream: (stream: MediaStream) => void };
 const mocks = vi.hoisted(() => ({
   attach: vi.fn(), sendInput: vi.fn(), sendPointerAction: vi.fn(), releaseInputs: vi.fn(), close: vi.fn(), markVideoReady: vi.fn(),
@@ -75,6 +76,36 @@ describe('independent browser remote desktop', () => {
     expect(screen.getByText(/远端同意后才会显示画面/)).toBeInTheDocument();
     expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
     for (const name of ['音频（暂不支持）', '文件传输（暂不支持）', '无人值守（暂不支持）', '远程应用（暂不支持）']) expect(screen.getByRole('button', { name })).toBeDisabled();
+  });
+
+  it('shows finite setup progress and keeps it visible on failure without enabling input', async () => {
+    show();
+    const setup = { stage: 'ice_gathering' as const, localCandidates: 2, localCandidatesSent: 0,
+      remoteCandidates: 0, remoteCandidatesExpected: 0, remoteCandidatesApplied: 0, offersSent: 0 as const };
+    await act(async () => mocks.observer?.onState({ phase: 'negotiating', grantedScopes: [], setup }));
+    const progress = screen.getByLabelText('WebRTC 建连进度');
+    expect(progress).toHaveTextContent('收集本地 ICE 候选');
+    expect(progress).toHaveTextContent('本地候选 2，已发 0');
+    expect(progress).toHaveTextContent('Offer 已发 0');
+    expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
+    await act(async () => mocks.observer?.onState({ phase: 'failed', grantedScopes: [], error: '连接已到期', setup }));
+    expect(progress).toHaveTextContent('收集本地 ICE 候选');
+    expect(progress).toHaveTextContent('Offer 已发 0');
+    expect(screen.getByRole('alert')).toHaveTextContent('连接已到期');
+  });
+
+  it('discards the old setup progress when the route session changes and ignores its late observer', async () => {
+    show();
+    const oldObserver = mocks.observer!;
+    const setup = { stage: 'offer_sent' as const, localCandidates: 1, localCandidatesSent: 0,
+      remoteCandidates: 0, remoteCandidatesExpected: 0, remoteCandidatesApplied: 0, offersSent: 1 as const };
+    await act(async () => oldObserver.onState({ phase: 'negotiating', grantedScopes: [], setup }));
+    expect(screen.getByLabelText('WebRTC 建连进度')).toHaveTextContent('Offer 已发 1');
+    await userEvent.setup().click(screen.getByRole('button', { name: '切换到会话 B' }));
+    expect(screen.queryByLabelText('WebRTC 建连进度')).not.toBeInTheDocument();
+    await act(async () => oldObserver.onState({ phase: 'failed', grantedScopes: [], setup }));
+    expect(screen.queryByLabelText('WebRTC 建连进度')).not.toBeInTheDocument();
+    expect(screen.getByText('等待远端同意')).toBeInTheDocument();
   });
 
   it('does not enable input on negotiation or a claimed streaming state before a real first frame', async () => {

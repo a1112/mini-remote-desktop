@@ -935,6 +935,149 @@ async fn target_executor_buffers_candidate_before_offer_and_skips_history_intent
     assert_eq!(host.close_count.load(Ordering::Acquire), 0);
 }
 
+struct DiagnosticClock(tokio::time::Instant);
+impl RelayClock for DiagnosticClock {
+    fn now_ms(&self) -> u64 {
+        1_000 + self.0.elapsed().as_millis() as u64
+    }
+}
+impl GenerationZeroClock for DiagnosticClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.now_ms()
+    }
+}
+
+async fn postapproval_target_diagnostic_case(
+    case: &str,
+) -> (&'static str, GenerationZeroNegotiationError) {
+    let session_id = test_session_id();
+    let clock = Arc::new(DiagnosticClock(tokio::time::Instant::now()));
+    let backend = Arc::new(FakeRelayBackend {
+        responses: Mutex::new(VecDeque::from([Ok(access_response_with_window(
+            &session_id.0,
+            "target-device",
+            999,
+            1_075,
+        ))])),
+    });
+    let access = RelayDirectoryClient::with_backend(relay_config(), backend, clock.clone())
+        .access(RelayAccessContext::for_generation(&session_id.0, 7, "target-device", 0).unwrap())
+        .await
+        .unwrap();
+    let (state, controller, _) = signed_state_at_access_bound(&session_id, WanSessionRole::Target);
+    let context =
+        GenerationZeroNegotiationContext::from_state(&state, GRANT_COMMITMENT.into(), 1_000)
+            .unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let proof = GenerationZeroRouteProof::for_test(
+        session_id.clone(),
+        "directory-zero".into(),
+        "relay-primary".into(),
+        primary_digest(),
+    )
+    .unwrap();
+    let mut host = ScriptedHost::target(
+        order.clone(),
+        proof,
+        if case == "answer_gather" {
+            vec![]
+        } else {
+            vec![local_candidate("target-candidate")]
+        },
+    );
+    host.pending_connected = case == "connectivity";
+    let host = Arc::new(host);
+    let installer = Arc::new(OrderedInstaller::new(order.clone()));
+    let (signaling, _commands) = ScriptedSignaling::with_order(order);
+    if case != "offer_wait" {
+        let candidate = signed_candidate_event_with_role(
+            &controller,
+            &session_id,
+            context.identity().controller_device_id(),
+            context.identity().target_device_id(),
+            GRANT_COMMITMENT,
+            CandidateFixture {
+                role: WebRtcDescriptionRoleV3::Offer,
+                candidate: "candidate:remote-controller 1 UDP 1 192.0.2.2 9 typ relay",
+                counter: 2,
+            },
+        );
+        let fingerprint = match &candidate.signal {
+            AuthenticatedSessionSignal::WebRtcCandidateV3 { message } => {
+                message.payload.candidate_fingerprint.clone()
+            }
+            _ => unreachable!(),
+        };
+        signaling.publish(candidate);
+        signaling.publish(signed_offer_event(
+            &controller,
+            &session_id,
+            context.identity().controller_device_id(),
+            context.identity().target_device_id(),
+            GRANT_COMMITMENT,
+            vec![fingerprint],
+            1,
+        ));
+    }
+    let negotiator = GenerationZeroNegotiator::new(
+        host.clone(),
+        signaling,
+        installer.clone(),
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_clock(clock.clone());
+    let result = negotiator
+        .failure_diagnostic_for_test(context, &access)
+        .await
+        .unwrap_err();
+    assert_eq!(installer.installs.load(Ordering::Acquire), 0);
+    assert_eq!(
+        host.close_count.load(Ordering::Acquire),
+        if case == "offer_wait" { 0 } else { 1 }
+    );
+    if case == "answer_gather" {
+        assert!(
+            clock.now_ms() < 1_075,
+            "invalid candidates reject before expiry"
+        );
+    } else {
+        assert_eq!(
+            clock.now_ms(),
+            1_075,
+            "the original strict directory expiry limits waiting"
+        );
+    }
+    result
+}
+
+#[tokio::test(start_paused = true)]
+async fn postapproval_diagnostic_offer_wait_preserves_the_directory_deadline_stage() {
+    assert_eq!(
+        postapproval_target_diagnostic_case("offer_wait").await,
+        ("offer_wait", GenerationZeroNegotiationError::Timeout)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn postapproval_diagnostic_answer_gather_keeps_candidate_rejection() {
+    assert_eq!(
+        postapproval_target_diagnostic_case("answer_gather").await,
+        (
+            "answer_gather",
+            GenerationZeroNegotiationError::CandidateManifestMismatch
+        )
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn postapproval_diagnostic_connectivity_preserves_the_directory_deadline_stage() {
+    assert_eq!(
+        postapproval_target_diagnostic_case("connectivity").await,
+        ("connectivity", GenerationZeroNegotiationError::Timeout)
+    );
+}
+
 #[tokio::test]
 async fn coordinator_commit_advances_success_to_relay_verified() {
     let session_id = test_session_id();
@@ -1633,6 +1776,7 @@ struct ScriptedHost {
     proof: GenerationZeroRouteProof,
     local_candidates: Mutex<VecDeque<IceCandidate>>,
     close_count: AtomicUsize,
+    pending_connected: bool,
 }
 
 impl ScriptedHost {
@@ -1647,6 +1791,7 @@ impl ScriptedHost {
             proof,
             local_candidates: Mutex::new(local_candidates.into()),
             close_count: AtomicUsize::new(0),
+            pending_connected: false,
         }
     }
 
@@ -1661,6 +1806,7 @@ impl ScriptedHost {
             proof,
             local_candidates: Mutex::new(local_candidates.into()),
             close_count: AtomicUsize::new(0),
+            pending_connected: false,
         }
     }
 
@@ -1751,6 +1897,9 @@ impl GenerationZeroWebRtcHost for ScriptedHost {
 
     async fn wait_connected(&self, _: &SessionId) -> Result<(), GenerationZeroWebRtcHostError> {
         self.record("wait_connected");
+        if self.pending_connected {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 
@@ -2710,14 +2859,23 @@ fn primary_digest() -> String {
 }
 
 fn access_response(session_id: &str, peer: &str) -> Vec<u8> {
+    access_response_with_window(session_id, peer, NOW - 1_000, NOW + 30_000)
+}
+
+fn access_response_with_window(
+    session_id: &str,
+    peer: &str,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+) -> Vec<u8> {
     let primary_url = "turn:relay-primary.example.test:3478?transport=udp".to_owned();
     let backup_url = "turn:relay-backup.example.test:3478?transport=udp".to_owned();
     let payload = RelayDirectoryPayload {
         format_version: RELAY_DIRECTORY_FORMAT_VERSION,
         policy_revision: 7,
         directory_id: "directory-zero".into(),
-        issued_at_ms: NOW - 1_000,
-        expires_at_ms: NOW + 30_000,
+        issued_at_ms,
+        expires_at_ms,
         session_id: session_id.into(),
         intended_peer_digest: relay_peer_digest(peer).unwrap(),
         candidates: vec![
@@ -2735,7 +2893,7 @@ fn access_response(session_id: &str, peer: &str) -> Vec<u8> {
                 selection_reason: "eligible".into(),
                 reservation: RelayReservation {
                     reservation_id: "reservation-backup".into(),
-                    expires_at_ms: NOW + 30_000,
+                    expires_at_ms,
                 },
             },
             RelayDirectoryCandidate {
@@ -2752,7 +2910,7 @@ fn access_response(session_id: &str, peer: &str) -> Vec<u8> {
                 selection_reason: "preferred-region".into(),
                 reservation: RelayReservation {
                     reservation_id: "reservation-primary".into(),
-                    expires_at_ms: NOW + 30_000,
+                    expires_at_ms,
                 },
             },
         ],

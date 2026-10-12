@@ -997,6 +997,38 @@ pub enum GenerationZeroNegotiationError {
     AlreadyOwned,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationZeroNegotiationStage {
+    Binding,
+    OfferWait,
+    PeerOpen,
+    AnswerGather,
+    Connectivity,
+    RouteProof,
+    Install,
+}
+
+impl GenerationZeroNegotiationStage {
+    #[cfg(any(test, debug_assertions))]
+    fn public_name(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::OfferWait => "offer_wait",
+            Self::PeerOpen => "peer_open",
+            Self::AnswerGather => "answer_gather",
+            Self::Connectivity => "connectivity",
+            Self::RouteProof => "route_proof",
+            Self::Install => "install",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenerationZeroNegotiationFailure {
+    pub(crate) stage: GenerationZeroNegotiationStage,
+    pub(crate) error: GenerationZeroNegotiationError,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct GenerationZeroNegotiationResult {
     proof: GenerationZeroRouteProof,
@@ -1208,7 +1240,19 @@ impl GenerationZeroNegotiator {
         &self,
         context: GenerationZeroNegotiationContext,
         relay_access: &VerifiedRelayAccess,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<GenerationZeroNegotiationResult, GenerationZeroNegotiationError> {
+        let mut stage = GenerationZeroNegotiationStage::Binding;
+        self.negotiate_observed_with_cancellation(context, relay_access, cancellation, &mut stage)
+            .await
+    }
+
+    async fn negotiate_observed_with_cancellation(
+        &self,
+        context: GenerationZeroNegotiationContext,
+        relay_access: &VerifiedRelayAccess,
         mut cancellation: watch::Receiver<bool>,
+        stage: &mut GenerationZeroNegotiationStage,
     ) -> Result<GenerationZeroNegotiationResult, GenerationZeroNegotiationError> {
         let session_id = context.identity.session_id().clone();
         let effective_timeout = self.effective_timeout(&context, relay_access)?;
@@ -1242,12 +1286,13 @@ impl GenerationZeroNegotiator {
                 }
                 let proof = match context.role() {
                     WanSessionRole::Controller => {
+                        *stage = GenerationZeroNegotiationStage::PeerOpen;
                         self.host
                             .open_generation_zero(&session_id, config.clone())
                             .await
                             .map_err(|_| GenerationZeroNegotiationError::TransportUnavailable)?;
                         opened = true;
-                        self.negotiate_controller(&context, relay_access, inbound.as_mut())
+                        self.negotiate_controller(&context, relay_access, inbound.as_mut(), stage)
                             .await
                     }
                     WanSessionRole::Target => {
@@ -1257,6 +1302,7 @@ impl GenerationZeroNegotiator {
                             config,
                             inbound.as_mut(),
                             &mut opened,
+                            stage,
                         )
                         .await
                     }
@@ -1271,6 +1317,7 @@ impl GenerationZeroNegotiator {
                 {
                     return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
                 }
+                *stage = GenerationZeroNegotiationStage::Install;
                 let _authorization_guard = match &self.authorization_gate {
                     Some(gate) => Some(gate.lock().await),
                     None => None,
@@ -1378,6 +1425,32 @@ impl GenerationZeroNegotiator {
         result
     }
 
+    pub(crate) async fn negotiate_diagnosed_with_cancellation(
+        &self,
+        context: GenerationZeroNegotiationContext,
+        relay_access: &VerifiedRelayAccess,
+        cancellation: watch::Receiver<bool>,
+    ) -> Result<GenerationZeroNegotiationResult, GenerationZeroNegotiationFailure> {
+        let mut stage = GenerationZeroNegotiationStage::Binding;
+        self.negotiate_observed_with_cancellation(context, relay_access, cancellation, &mut stage)
+            .await
+            .map_err(|error| GenerationZeroNegotiationFailure { stage, error })
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub async fn failure_diagnostic_for_test(
+        &self,
+        context: GenerationZeroNegotiationContext,
+        relay_access: &VerifiedRelayAccess,
+    ) -> Result<GenerationZeroNegotiationResult, (&'static str, GenerationZeroNegotiationError)>
+    {
+        let (_, cancellation) = watch::channel(false);
+        self.negotiate_diagnosed_with_cancellation(context, relay_access, cancellation)
+            .await
+            .map_err(|failure| (failure.stage.public_name(), failure.error))
+    }
+
     fn effective_timeout(
         &self,
         context: &GenerationZeroNegotiationContext,
@@ -1411,7 +1484,9 @@ impl GenerationZeroNegotiator {
         context: &GenerationZeroNegotiationContext,
         relay_access: &VerifiedRelayAccess,
         inbound: &mut dyn GenerationZeroSignalingSubscription,
+        stage: &mut GenerationZeroNegotiationStage,
     ) -> Result<GenerationZeroRouteProof, GenerationZeroNegotiationError> {
+        *stage = GenerationZeroNegotiationStage::AnswerGather;
         let session_id = context.identity.session_id();
         let offer = self
             .host
@@ -1432,6 +1507,7 @@ impl GenerationZeroNegotiator {
         self.send_candidates(context, WebRtcDescriptionRoleV3::Offer, &local_candidates)
             .await?;
 
+        *stage = GenerationZeroNegotiationStage::OfferWait;
         let mut replay = GenerationZeroReplayWindow::new(MAX_GENERATION_ZERO_CANDIDATES * 4);
         let (answer, buffered) = self
             .receive_description_and_candidates(
@@ -1448,7 +1524,7 @@ impl GenerationZeroNegotiator {
             .await
             .map_err(|_| GenerationZeroNegotiationError::TransportUnavailable)?;
         self.apply_remote_candidates(context, buffered).await?;
-        self.finish_route_proof(context, relay_access).await
+        self.finish_route_proof(context, relay_access, stage).await
     }
 
     async fn negotiate_target(
@@ -1458,7 +1534,9 @@ impl GenerationZeroNegotiator {
         config: PeerConnectionConfig,
         inbound: &mut dyn GenerationZeroSignalingSubscription,
         opened: &mut bool,
+        stage: &mut GenerationZeroNegotiationStage,
     ) -> Result<GenerationZeroRouteProof, GenerationZeroNegotiationError> {
+        *stage = GenerationZeroNegotiationStage::OfferWait;
         let mut replay = GenerationZeroReplayWindow::new(MAX_GENERATION_ZERO_CANDIDATES * 4);
         let (offer, buffered) = self
             .receive_description_and_candidates(
@@ -1470,11 +1548,13 @@ impl GenerationZeroNegotiator {
             .await?;
         let offer = SessionDescription::from_wire(SessionDescriptionType::Offer, offer, 0, None)
             .map_err(|_| GenerationZeroNegotiationError::CandidateManifestMismatch)?;
+        *stage = GenerationZeroNegotiationStage::PeerOpen;
         self.host
             .open_generation_zero(context.identity().session_id(), config)
             .await
             .map_err(|_| GenerationZeroNegotiationError::TransportUnavailable)?;
         *opened = true;
+        *stage = GenerationZeroNegotiationStage::AnswerGather;
         let answer = self
             .host
             .accept_offer(context.identity().session_id(), offer)
@@ -1494,7 +1574,7 @@ impl GenerationZeroNegotiator {
         .await?;
         self.send_candidates(context, WebRtcDescriptionRoleV3::Answer, &local_candidates)
             .await?;
-        self.finish_route_proof(context, relay_access).await
+        self.finish_route_proof(context, relay_access, stage).await
     }
 
     async fn collect_local_candidates(
@@ -1946,11 +2026,14 @@ impl GenerationZeroNegotiator {
         &self,
         context: &GenerationZeroNegotiationContext,
         relay_access: &VerifiedRelayAccess,
+        stage: &mut GenerationZeroNegotiationStage,
     ) -> Result<GenerationZeroRouteProof, GenerationZeroNegotiationError> {
+        *stage = GenerationZeroNegotiationStage::Connectivity;
         self.host
             .wait_connected(context.identity().session_id())
             .await
             .map_err(|_| GenerationZeroNegotiationError::TransportUnavailable)?;
+        *stage = GenerationZeroNegotiationStage::RouteProof;
         let route = relay_access
             .route_evidence(context.access().primary_node_id(), 0)
             .map_err(|_| GenerationZeroNegotiationError::RouteEvidenceMismatch)?;

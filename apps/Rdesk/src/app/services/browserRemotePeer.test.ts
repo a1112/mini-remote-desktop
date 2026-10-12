@@ -856,6 +856,52 @@ describe('independent browser peer lifecycle', () => {
     expect(socket.sent.some(text => JSON.parse(text).message.type === 'session_intent_v3')).toBe(false);
   });
 
+  it('reports only bounded public setup progress after the real signed offer and answer', async () => {
+    const { peer, pc } = await approvedPeer();
+    try {
+      await pause(10);
+      const setup = onState.mock.lastCall?.[0].setup;
+      expect(setup).toEqual({ stage: 'answer_applied', localCandidates: 1, localCandidatesSent: 1,
+        remoteCandidates: 1, remoteCandidatesExpected: 1, remoteCandidatesApplied: 1, offersSent: 1 });
+      const projected = JSON.stringify(setup);
+      for (const secret of ['v=0', 'candidate:', 'browser-ufrag', 'target-ufrag',
+        context.bootstrap.credential.token, context.bootstrap.signaling_url, context.bootstrap.target_key_id]) {
+        expect(projected).not.toContain(secret);
+      }
+      pc.connectionState = 'connected'; pc.dispatchEvent(new Event('connectionstatechange'));
+      await until(() => onState.mock.lastCall?.[0].route === 'direct');
+      expect(onState.mock.lastCall?.[0].setup?.stage).toBe('route_verified');
+      expect(onState.mock.calls.some(([state]) => state.phase === 'streaming')).toBe(false);
+    } finally { pc.channels.forEach(channel => { channel.readyState = 'closed'; }); await peer.close('test_cleanup'); }
+  });
+
+  it('keeps relay expiry as the last setup stage without claiming an offer was sent', async () => {
+    const { peer, access } = await relayDirectoryPeer(1000);
+    try {
+      vi.mocked(Date.now).mockReturnValue(access.directory.payload.expires_at_ms);
+      await until(() => onState.mock.calls.some(([state]) => state.phase === 'failed'));
+      expect(onState.mock.lastCall?.[0].setup).toMatchObject({ stage: 'relay_verifying', offersSent: 0,
+        localCandidates: 0, localCandidatesSent: 0, remoteCandidates: 0 });
+      expect(PeerConnection.peers).toHaveLength(0);
+    } finally { await peer.close('test_cleanup'); }
+  });
+
+  it('keeps setup counts bounded and preserves the last stage at the existing candidate limit', async () => {
+    const { peer, pc, socket } = await approvedPeer(true);
+    try {
+      for (let index = 1; index <= 256; index += 1) {
+        pc.dispatchEvent(Object.assign(new Event('icecandidate'), { candidate: {
+          candidate: `candidate:${index + 1} 1 UDP 2130706431 192.0.2.1 5000 typ host`,
+          sdpMid: '0', sdpMLineIndex: 0, usernameFragment: 'browser-ufrag',
+        } }));
+      }
+      expect(onState.mock.lastCall?.[0]).toMatchObject({ phase: 'failed', setup: {
+        stage: 'ice_gathering', localCandidates: 256, localCandidatesSent: 0, offersSent: 0,
+      } });
+      expect(socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3')).toBe(false);
+    } finally { await peer.close('test_cleanup'); }
+  });
+
   it('keeps control disabled until signed negotiation, an actual track frame and required data channels are open', async () => {
     const { peer, pc } = await approvedPeer();
     const track = Object.assign(new EventTarget(), { kind: 'video', stop: vi.fn() });
@@ -880,11 +926,18 @@ describe('independent browser peer lifecycle', () => {
   it('settles the owned negotiation when closed during gathering without any further ICE events', async () => {
     const { peer, pc, socket } = await approvedPeer(true);
     expect(pc.iceGatheringState).toBe('gathering');
+    expect(onState.mock.lastCall?.[0].setup).toMatchObject({ stage: 'ice_gathering', localCandidates: 1, offersSent: 0 });
     const incoming = (peer as unknown as { incoming: Promise<void> }).incoming;
     await peer.close('user_cancel');
     const settled = await Promise.race([incoming.then(() => true), pause(75).then(() => false)]);
     expect(settled).toBe(true);
     expect(socket.sent.some(text => JSON.parse(text).message.type === 'webrtc_offer_v3')).toBe(false);
     expect(context.closeBackend).toHaveBeenCalledTimes(1);
+    const lastSetup = onState.mock.lastCall?.[0].setup;
+    expect(lastSetup).toMatchObject({ stage: 'ice_gathering', offersSent: 0 });
+    pc.dispatchEvent(new Event('connectionstatechange'));
+    pc.dispatchEvent(new Event('icegatheringstatechange'));
+    await pause(10);
+    expect(onState.mock.lastCall?.[0].setup).toEqual(lastSetup);
   });
 });

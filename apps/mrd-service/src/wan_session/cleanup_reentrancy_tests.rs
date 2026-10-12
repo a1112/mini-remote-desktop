@@ -76,6 +76,18 @@ async fn fixture_with_media(
     WanSessionState,
     Arc<StdMutex<Vec<InputEvent>>>,
 ) {
+    fixture_with_authorization(media_verified, media_verified).await
+}
+
+async fn fixture_with_authorization(
+    media_verified: bool,
+    authorization_installed: bool,
+) -> (
+    Arc<crate::AppState>,
+    Arc<WanSessionCoordinator>,
+    WanSessionState,
+    Arc<StdMutex<Vec<InputEvent>>>,
+) {
     let app = Arc::new(crate::AppState::default());
     let config = WanSessionBackendConfig::new(
         "https://unused.invalid/",
@@ -106,7 +118,14 @@ async fn fixture_with_media(
     let controller_key =
         mrd_identity::DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
     let request = WanSessionRequestV3 {
-        session_id: SessionId("browser-cleanup-sibling".into()),
+        session_id: {
+            static NEXT_SESSION: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            SessionId(format!(
+                "b6f8c513-8059-4a9c-8f52-{:012x}",
+                NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
+        },
         idempotency_key: [5; 16],
         controller_device_id: DeviceId("browser_0123456789abcdef".into()),
         target_device_id: DeviceId("physical-target".into()),
@@ -168,7 +187,7 @@ async fn fixture_with_media(
             .unwrap();
     }
     coordinator.begin(state.clone()).await.unwrap();
-    if media_verified {
+    if authorization_installed {
         let scopes = vec![
             RemotePermissionScope::ScreenView,
             RemotePermissionScope::InputKeyboard,
@@ -226,9 +245,11 @@ async fn fixture_with_media(
             )
             .await
             .unwrap();
-        reconcile_wan_session(&app, &request.session_id)
-            .await
-            .unwrap();
+        if media_verified {
+            reconcile_wan_session(&app, &request.session_id)
+                .await
+                .unwrap();
+        }
     }
     let input = Arc::new(StdMutex::new(Vec::new()));
     app.replace_control_input_for_test(RecordingInput(input.clone()))
@@ -372,6 +393,85 @@ async fn unexpected_live_negotiation_cancel_still_terminalizes_and_releases_inpu
 }
 
 #[tokio::test]
+async fn postapproval_diagnostic_retains_the_first_typed_failure_and_emits_once() {
+    let (app, coordinator, state, input) = fixture_with_authorization(false, true).await;
+    let session = state.identity().session_id();
+    let (_sender, cancellation) = watch::channel(false);
+    let failure = GenerationZeroNegotiationFailure {
+        stage: GenerationZeroNegotiationStage::OfferWait,
+        error: GenerationZeroNegotiationError::Timeout,
+    };
+    finish_negotiation_failure_diagnosed(&app, &coordinator, session, &cancellation, failure).await;
+    let authorization = app.session_authorizations.snapshot(session).await.unwrap();
+    let message = &authorization.failure.as_ref().unwrap().message;
+    assert!(
+        message.contains("stage=target_generation_zero_offer_wait, code=timeout"),
+        "first terminal failure must retain the typed stage: {message}"
+    );
+    let records = crate::wan_diagnostics::take_test_records(session);
+    assert_eq!(records.len(), 1);
+    let record: serde_json::Value = serde_json::from_str(&records[0]).unwrap();
+    assert_eq!(record.as_object().unwrap().len(), 5);
+    assert_eq!(record["session_id"], session.0);
+    assert_eq!(record["stage"], "target_generation_zero_offer_wait");
+    assert_eq!(record["code"], "timeout");
+    finish_negotiation_failure_diagnosed(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        GenerationZeroNegotiationFailure {
+            stage: GenerationZeroNegotiationStage::Connectivity,
+            error: GenerationZeroNegotiationError::TransportUnavailable,
+        },
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure,
+        authorization.failure
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+    assert_eq!(input.lock().unwrap().len(), 2, "input cleanup runs once");
+}
+
+#[tokio::test]
+async fn postapproval_diagnostic_owned_cancel_remains_silent() {
+    let (app, coordinator, state, input) = fixture_with_authorization(false, true).await;
+    let session = state.identity().session_id();
+    let (_sender, cancellation) = watch::channel(true);
+    finish_negotiation_failure_diagnosed(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        GenerationZeroNegotiationFailure {
+            stage: GenerationZeroNegotiationStage::Connectivity,
+            error: GenerationZeroNegotiationError::Cancelled,
+        },
+    )
+    .await;
+    assert!(!coordinator
+        .snapshot(session)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
+    assert!(app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure
+        .is_none());
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+    assert_eq!(input.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn owned_cancel_interrupts_a_negotiation_error_already_waiting_for_the_security_gate() {
     let (app, coordinator, state, _) = fixture().await;
     let session = state.identity().session_id().clone();
@@ -384,12 +484,15 @@ async fn owned_cancel_interrupts_a_negotiation_error_already_waiting_for_the_sec
         .spawn_owned_task(&session, move |cancellation| async move {
             let cancellation = cancellation.into_receiver();
             ready_tx.send(()).unwrap();
-            finish_negotiation_failure(
+            finish_negotiation_failure_diagnosed(
                 &sibling_app,
                 &sibling_coordinator,
                 &sibling_session,
                 &cancellation,
-                GenerationZeroNegotiationError::TransportUnavailable,
+                GenerationZeroNegotiationFailure {
+                    stage: GenerationZeroNegotiationStage::Connectivity,
+                    error: GenerationZeroNegotiationError::TransportUnavailable,
+                },
             )
             .await;
         })
@@ -409,6 +512,7 @@ async fn owned_cancel_interrupts_a_negotiation_error_already_waiting_for_the_sec
         matches!(completed, Ok(Ok(_))),
         "owned cancellation must interrupt a queued gate lock: {completed:?}"
     );
+    assert!(crate::wan_diagnostics::take_test_records(&session).is_empty());
 }
 
 use crate::wan_session::media::{

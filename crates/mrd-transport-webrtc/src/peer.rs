@@ -986,9 +986,16 @@ impl From<IceCandidate> for RTCIceCandidateInit {
     }
 }
 
+#[derive(Default)]
+struct LocalCandidateCompletion {
+    completed: AtomicBool,
+    changed: Notify,
+}
+
 pub struct WebRtcPeerConnection {
     config: PeerConnectionConfig,
     local_candidates: Mutex<mpsc::Receiver<IceCandidate>>,
+    local_candidates_completion: Arc<LocalCandidateCompletion>,
     h264_rx: Mutex<mpsc::Receiver<QueuedAccessUnit>>,
     reliable_rx: Mutex<mpsc::Receiver<QueuedBytes>>,
     realtime_rx: Mutex<mpsc::Receiver<QueuedBytes>>,
@@ -1272,13 +1279,21 @@ impl WebRtcPeerConnection {
         }
 
         let (candidate_tx, candidate_rx) = mpsc::channel(capacity);
+        let local_candidates_completion = Arc::new(LocalCandidateCompletion::default());
+        let callback_completion = Arc::clone(&local_candidates_completion);
         pc.on_ice_candidate(Box::new(move |candidate| {
             let candidate_tx = candidate_tx.clone();
+            let completion = Arc::clone(&callback_completion);
             Box::pin(async move {
                 if let Some(candidate) = candidate {
                     if let Ok(candidate) = candidate.to_json() {
                         let _ = candidate_tx.try_send(candidate.into());
                     }
+                } else {
+                    // Gathering completion must not compete with candidates for
+                    // bounded queue capacity. It is sticky for this physical peer.
+                    completion.completed.store(true, Ordering::Release);
+                    completion.changed.notify_waiters();
                 }
             })
         }));
@@ -1413,6 +1428,7 @@ impl WebRtcPeerConnection {
         Ok(Self {
             config,
             local_candidates: Mutex::new(candidate_rx),
+            local_candidates_completion,
             h264_rx: Mutex::new(h264_rx),
             reliable_rx: Mutex::new(reliable_rx),
             realtime_rx: Mutex::new(realtime_rx),
@@ -1584,7 +1600,30 @@ impl WebRtcPeerConnection {
     }
 
     async fn next_local_candidate_physical(&self) -> Option<IceCandidate> {
-        self.local_candidates.lock().await.recv().await
+        let mut candidates = self.local_candidates.lock().await;
+        loop {
+            let changed = self.local_candidates_completion.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match candidates.try_recv() {
+                Ok(candidate) => return Some(candidate),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+            if self
+                .local_candidates_completion
+                .completed
+                .load(Ordering::Acquire)
+            {
+                // The final candidate may have arrived between the first empty
+                // check and observing completion. Drain it before ending.
+                return candidates.try_recv().ok();
+            }
+            tokio::select! {
+                candidate = candidates.recv() => return candidate,
+                _ = &mut changed => {}
+            }
+        }
     }
 
     pub async fn add_ice_candidate(
@@ -3486,6 +3525,83 @@ mod tests {
     use super::*;
     use tokio::sync::Semaphore;
     use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    async fn native_peer_after_ice_gathering(capacity: usize) -> WebRtcPeerConnection {
+        let peer = WebRtcPeerConnection::new(PeerConnectionConfig {
+            include_loopback_candidates: true,
+            ice_transport_policy: IceTransportPolicy::All,
+            event_queue_capacity: capacity,
+            ..PeerConnectionConfig::default()
+        })
+        .await
+        .expect("native peer without external ICE servers");
+        let pc = peer.physical_snapshot().expect("physical peer").pc;
+        let mut complete = pc.gathering_complete_promise().await;
+        peer.create_offer().await.expect("native local offer");
+        tokio::time::timeout(Duration::from_secs(3), complete.recv())
+            .await
+            .expect("native ICE gathering completes before testing the adapter");
+        assert_eq!(
+            pc.ice_gathering_state(),
+            webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState::Complete
+        );
+        assert!(
+            !peer.local_candidates.lock().await.is_empty(),
+            "fixture must gather an actual local candidate"
+        );
+        peer
+    }
+
+    #[tokio::test]
+    async fn native_ice_completion_drains_candidates_and_ends_while_peer_is_open() {
+        let peer = native_peer_after_ice_gathering(64).await;
+        let queued = peer.local_candidates.lock().await.len();
+        let drain = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut count = 0;
+            while let Some(candidate) = peer.next_local_candidate().await {
+                assert_eq!(candidate.generation(), 0);
+                assert!(candidate.restart_route_token().is_none());
+                count += 1;
+            }
+            count
+        })
+        .await;
+        let peer_still_open = peer
+            .physical_snapshot()
+            .expect("physical peer retained")
+            .pc
+            .connection_state()
+            != RTCPeerConnectionState::Closed;
+        peer.close().await.expect("fixture cleanup");
+        assert!(
+            peer_still_open,
+            "completion must not require closing the peer"
+        );
+        assert_eq!(
+            drain.expect("ICE completion must end the adapter stream without timeout"),
+            queued
+        );
+    }
+
+    #[tokio::test]
+    async fn native_ice_completion_is_delivered_when_candidate_queue_is_full() {
+        let peer = native_peer_after_ice_gathering(1).await;
+        assert_eq!(peer.local_candidates.lock().await.len(), 1);
+        // One retained candidate fills this real capacity-one queue. Completion
+        // must remain observable even when it cannot be enqueued as an item.
+        let drain = tokio::time::timeout(Duration::from_secs(1), async {
+            let first = peer.next_local_candidate().await;
+            let end = peer.next_local_candidate().await;
+            let repeated_end = peer.next_local_candidate().await;
+            (first.is_some(), end.is_none(), repeated_end.is_none())
+        })
+        .await;
+        peer.close().await.expect("fixture cleanup");
+        assert_eq!(
+            drain.expect("full candidate queue must not lose ICE completion"),
+            (true, true, true)
+        );
+    }
 
     fn assert_zeroizing_owner<T: Zeroize + ZeroizeOnDrop>() {}
 

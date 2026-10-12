@@ -1,5 +1,5 @@
 import type { ControlInputEvent } from '../adapters/tauri/types';
-import type { BrowserRemoteContext, BrowserRemoteHandle, BrowserRemoteObserver, BrowserRemoteState } from './browserRemoteSessionService';
+import type { BrowserRemoteContext, BrowserRemoteHandle, BrowserRemoteObserver, BrowserRemoteState, BrowserRemoteSetupProgress, BrowserRemoteSetupStage } from './browserRemoteSessionService';
 import { BrowserRemoteControl } from './browserRemoteControl';
 import { verifyBrowserRelayAccess, waitUntilRelayDirectoryIssued, BrowserRelayDirectoryValidityError } from './browserRelayDirectory';
 import {
@@ -54,7 +54,23 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private get targetId(): string { return this.context.bootstrap.session.request.target_device_id; }
   private publish(change: Partial<BrowserRemoteState>): void {
     this.state = { ...this.state, ...change };
-    this.observer.onState({ ...this.state, grantedScopes: [...this.state.grantedScopes] });
+    this.observer.onState({ ...this.state, grantedScopes: [...this.state.grantedScopes],
+      ...(this.state.setup ? { setup: { ...this.state.setup } } : {}) });
+  }
+  private progress(stage?: BrowserRemoteSetupStage, counts: Partial<Omit<BrowserRemoteSetupProgress, 'stage'>> = {}): void {
+    if (this.closing || terminalPhases.has(this.state.phase)) return;
+    const previous = this.state.setup;
+    const bounded = (value: number | undefined, max = MAX_CANDIDATES) =>
+      Number.isSafeInteger(value) ? Math.max(0, Math.min(max, value!)) : 0;
+    this.publish({ setup: {
+      stage: stage ?? previous?.stage ?? 'relay_access',
+      localCandidates: bounded(counts.localCandidates ?? previous?.localCandidates),
+      localCandidatesSent: bounded(counts.localCandidatesSent ?? previous?.localCandidatesSent),
+      remoteCandidates: bounded(counts.remoteCandidates ?? previous?.remoteCandidates),
+      remoteCandidatesExpected: bounded(counts.remoteCandidatesExpected ?? previous?.remoteCandidatesExpected),
+      remoteCandidatesApplied: bounded(counts.remoteCandidatesApplied ?? previous?.remoteCandidatesApplied),
+      offersSent: bounded(counts.offersSent ?? previous?.offersSent, 1) as 0 | 1,
+    } });
   }
   private deadline(callback: () => void, ms: number): ReturnType<typeof setTimeout> {
     const timer = setTimeout(() => { this.timers.delete(timer); callback(); }, Math.max(1, ms));
@@ -210,6 +226,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     }
     if (type === 'webrtc_answer_v3' || type === 'webrtc_candidate_v3') {
       if (!this.grant || !this.pc || !this.grantCommitment) throw new Error('远端媒体授权尚未完成');
+      this.progress(type === 'webrtc_answer_v3' ? 'answer_verifying' : 'remote_candidate_verifying');
       const payload = await this.verified(type, message.payload);
       if (this.closing) return;
       if (payload.session_id !== this.sessionId || payload.controller_device_id !== this.controllerId || payload.target_device_id !== this.targetId
@@ -217,12 +234,14 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
       if (type === 'webrtc_answer_v3') {
         if (this.answer) throw new Error('重复的远端视频协商响应');
         this.answer = payload;
+        this.progress('answer_received', { remoteCandidatesExpected: payload.candidate_fingerprints.length });
       } else {
         const fingerprint = await candidateFingerprint(payload);
         if (this.closing) return;
         if (payload.description_role !== 'answer' || payload.candidate_fingerprint !== fingerprint
           || this.candidates.size >= MAX_CANDIDATES || this.candidates.has(payload.candidate_fingerprint)) throw new Error('远端候选验证失败');
         this.candidates.set(payload.candidate_fingerprint, payload);
+        this.progress(undefined, { remoteCandidates: this.candidates.size });
       }
       await this.applyAnswer();
       return;
@@ -266,15 +285,19 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     finally { this.polling = false; }
   }
   private async negotiate(grant: WireObject): Promise<void> {
+    this.progress('relay_access');
     const access = await this.context.getRelayAccess();
     if (this.closing) return;
+    this.progress('relay_issue_wait');
     await waitUntilRelayDirectoryIssued(access, this.signalWaitAbort.signal);
     if (this.closing) return;
+    this.progress('relay_verifying');
     const config = await verifyBrowserRelayAccess(access, {
       grant, targetDeviceId: this.targetId, keyId: this.context.bootstrap.relay_directory_key_id,
       publicKey: this.context.bootstrap.relay_directory_public_key, nowMs: Date.now(),
     });
     if (this.closing) return;
+    this.progress('relay_verified');
     this.pc = new RTCPeerConnection(config);
     const pc = this.pc;
     const video = pc.addTransceiver('video', { direction: 'recvonly' });
@@ -317,27 +340,39 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
         sdp_mid: event.candidate.sdpMid, sdp_mline_index: event.candidate.sdpMLineIndex,
         username_fragment: event.candidate.usernameFragment ?? null,
       });
+      this.progress(undefined, { localCandidates: candidates.length });
     });
-    await pc.setLocalDescription(await pc.createOffer());
+    this.progress('offer_creating');
+    const offer = await pc.createOffer();
+    this.progress('local_description');
+    await pc.setLocalDescription(offer);
+    this.progress('ice_gathering');
     await this.waitForIce(pc);
     if (this.closing) return;
     if (!candidates.length || !pc.localDescription?.sdp) throw new Error('浏览器未收集到有效连接候选');
     const fingerprints: string[] = [];
     for (const candidate of candidates) {
       if (this.closing) return;
+      this.progress('candidates_verifying');
       candidate.candidate_fingerprint = await candidateFingerprint(candidate);
       if (this.closing) return;
       fingerprints.push(candidate.candidate_fingerprint);
     }
     if (new Set(fingerprints).size !== fingerprints.length) throw new Error('浏览器收集到重复连接候选');
+    this.progress('offer_sending');
     await this.send('webrtc_offer_v3', {
       session_id: this.sessionId, controller_device_id: this.controllerId, target_device_id: this.targetId,
       grant_commitment: this.grantCommitment, sdp: pc.localDescription.sdp, candidate_fingerprints: fingerprints.sort(),
     });
+    this.progress('offer_sent', { offersSent: 1 });
+    let sent = 0;
     for (const candidate of candidates) {
       if (this.closing) return;
+      this.progress('local_candidates_sending');
       await this.send('webrtc_candidate_v3', candidate);
+      this.progress(undefined, { localCandidatesSent: ++sent });
     }
+    this.progress('waiting_answer');
   }
   private waitForIce(pc: RTCPeerConnection): Promise<void> {
     if (this.closing) return Promise.reject(new Error('网页连接已取消'));
@@ -361,20 +396,27 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     });
   }
   private async applyAnswer(): Promise<void> {
-    if (this.closing || !this.answer || !this.pc || this.pc.remoteDescription) return;
+    if (this.closing || !this.pc || this.pc.remoteDescription) return;
+    if (!this.answer) { this.progress('waiting_answer'); return; }
     const manifest = this.answer.candidate_fingerprints as string[];
     if ([...this.candidates.keys()].some(fingerprint => !manifest.includes(fingerprint))) throw new Error('远端 ICE 候选不属于签名描述');
-    if (this.candidates.size !== manifest.length) return;
+    if (this.candidates.size !== manifest.length) { this.progress('waiting_remote_candidates'); return; }
+    this.progress('answer_applying');
     await this.pc.setRemoteDescription({ type: 'answer', sdp: this.answer.sdp });
+    let applied = 0;
     for (const fingerprint of manifest) {
       if (this.closing) return;
       const candidate = this.candidates.get(fingerprint)!;
+      this.progress('remote_candidates_applying');
       await this.pc.addIceCandidate({ candidate: candidate.candidate, sdpMid: candidate.sdp_mid, sdpMLineIndex: candidate.sdp_mline_index, usernameFragment: candidate.username_fragment });
+      this.progress(undefined, { remoteCandidatesApplied: ++applied });
     }
+    this.progress('answer_applied');
   }
   private async verifySelectedRoute(): Promise<void> {
     const pc = this.pc;
     if (!pc || this.closing || !this.grant) return;
+    this.progress('route_verifying');
     const reports = await pc.getStats();
     if (this.closing) return;
     let pair: WireObject | undefined;
@@ -388,6 +430,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     const relay = local.candidateType === 'relay' || remote.candidateType === 'relay';
     if (this.grant.payload.route_policy === 'relay_only' && (local.candidateType !== 'relay' || remote.candidateType !== 'relay')) throw new Error('连接路径不满足已授权的中继策略');
     this.routeVerified = true;
+    this.progress('route_verified');
     this.publish({ route: relay ? 'relay' : 'direct' });
     this.presentStreaming();
   }

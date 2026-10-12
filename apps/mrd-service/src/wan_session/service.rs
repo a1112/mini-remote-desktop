@@ -18,7 +18,8 @@ use super::{
     model::{WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState},
     signaling::ServiceWanSessionWorkflowSignaling,
     webrtc::{
-        GenerationZeroNegotiationContext, GenerationZeroNegotiationError, GenerationZeroNegotiator,
+        GenerationZeroNegotiationContext, GenerationZeroNegotiationError,
+        GenerationZeroNegotiationFailure, GenerationZeroNegotiationStage, GenerationZeroNegotiator,
     },
 };
 use crate::wan_diagnostics::{TargetInstallCode, TargetInstallDiagnostic, TargetInstallStage};
@@ -1989,14 +1990,14 @@ async fn spawn_generation_zero(
         .spawn_owned_task(session_id, move |cancellation| async move {
             let owned_cancellation = cancellation.into_receiver();
             let outcome = negotiator
-                .negotiate_with_cancellation(
+                .negotiate_diagnosed_with_cancellation(
                     context,
                     verified_access.as_ref(),
                     owned_cancellation.clone(),
                 )
                 .await;
             if let Err(error) = outcome {
-                finish_negotiation_failure(
+                finish_negotiation_failure_diagnosed(
                     &failure_app_state,
                     &task_coordinator,
                     &owned_session_id,
@@ -2093,6 +2094,25 @@ async fn fail_owned_wan_session(
     owned_cancellation: &tokio::sync::watch::Receiver<bool>,
     failure: WanSessionFailure,
 ) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
+    fail_owned_wan_session_with_diagnostic(
+        app_state,
+        coordinator,
+        session_id,
+        owned_cancellation,
+        failure,
+        None,
+    )
+    .await
+}
+
+async fn fail_owned_wan_session_with_diagnostic(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    owned_cancellation: &tokio::sync::watch::Receiver<bool>,
+    failure: WanSessionFailure,
+    diagnostic: Option<TargetInstallDiagnostic>,
+) -> Result<Option<WanSessionState>, WanSessionCoordinatorError> {
     if *owned_cancellation.borrow()
         || coordinator
             .snapshot(session_id)
@@ -2105,23 +2125,50 @@ async fn fail_owned_wan_session(
     let Some(_guard) = owned_authorization_guard(app_state, owned_cancellation).await else {
         return Ok(None);
     };
-    if coordinator
-        .snapshot(session_id)
-        .await?
-        .phase()
-        .is_terminal()
-    {
+    let current = coordinator.snapshot(session_id).await?;
+    if current.phase().is_terminal() {
         return Ok(None);
     }
-    terminalize_wan_session_under_security_gate(
+    // Only the verified target identity can publish this diagnostic. The
+    // existing cancellation-aware gate still owns the entire terminalization.
+    let diagnostic = diagnostic.filter(|_| current.role() == WanSessionRole::Target);
+    let mut remote_failure = wan_remote_failure(failure);
+    let first_failure = if let Some(diagnostic) = diagnostic {
+        let mut diagnosed = diagnostic.remote_failure();
+        diagnosed.code = remote_failure.code;
+        remote_failure = diagnosed;
+        app_state
+            .session_authorizations
+            .snapshot(session_id)
+            .await
+            .is_some_and(|snapshot| !is_terminal_authorization_state(snapshot.authorization_state))
+    } else {
+        false
+    };
+    let operation = terminalize_wan_session_under_security_gate(
         app_state,
         session_id,
         ServiceWanTerminalRequest::Fail {
             failure,
-            remote_failure: wan_remote_failure(failure),
+            remote_failure: remote_failure.clone(),
         },
     )
-    .await
+    .await;
+    if let Some(diagnostic) = diagnostic {
+        if first_failure
+            && app_state
+                .session_authorizations
+                .snapshot(session_id)
+                .await
+                .is_some_and(|snapshot| {
+                    is_terminal_authorization_state(snapshot.authorization_state)
+                        && snapshot.failure.as_ref() == Some(&remote_failure)
+                })
+        {
+            diagnostic.emit_terminal(current.identity().session_id());
+        }
+    }
+    operation
 }
 
 async fn reconcile_owned_wan_session(
@@ -2135,6 +2182,7 @@ async fn reconcile_owned_wan_session(
     reconcile_wan_session_under_security_gate(app_state, session_id).await
 }
 
+#[cfg(test)]
 async fn finish_negotiation_failure(
     app_state: &Arc<crate::AppState>,
     coordinator: &WanSessionCoordinator,
@@ -2150,6 +2198,54 @@ async fn finish_negotiation_failure(
         negotiation_failure(error),
     )
     .await;
+}
+
+async fn finish_negotiation_failure_diagnosed(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    owned_cancellation: &tokio::sync::watch::Receiver<bool>,
+    failure: GenerationZeroNegotiationFailure,
+) {
+    let _ = fail_owned_wan_session_with_diagnostic(
+        app_state,
+        coordinator,
+        session_id,
+        owned_cancellation,
+        negotiation_failure(failure.error),
+        Some(negotiation_diagnostic(failure)),
+    )
+    .await;
+}
+
+fn negotiation_diagnostic(failure: GenerationZeroNegotiationFailure) -> TargetInstallDiagnostic {
+    use GenerationZeroNegotiationError as Error;
+    use GenerationZeroNegotiationStage as Stage;
+    let stage = match failure.stage {
+        Stage::Binding => TargetInstallStage::TargetGenerationZeroBinding,
+        Stage::OfferWait => TargetInstallStage::TargetGenerationZeroOfferWait,
+        Stage::PeerOpen => TargetInstallStage::TargetGenerationZeroPeerOpen,
+        Stage::AnswerGather => TargetInstallStage::TargetGenerationZeroAnswerGather,
+        Stage::Connectivity => TargetInstallStage::TargetGenerationZeroConnectivity,
+        Stage::RouteProof => TargetInstallStage::TargetGenerationZeroRouteProof,
+        Stage::Install => TargetInstallStage::TargetGenerationZeroInstall,
+    };
+    let code = match failure.error {
+        Error::NotReady => TargetInstallCode::StateUnavailable,
+        Error::InvalidBinding => TargetInstallCode::BindingMismatch,
+        Error::DeadlineExceeded => TargetInstallCode::Expired,
+        Error::Cancelled => TargetInstallCode::Disconnected,
+        Error::Timeout => TargetInstallCode::Timeout,
+        Error::SignalingUnavailable => TargetInstallCode::SignalingUnavailable,
+        Error::SignalingBackpressure => TargetInstallCode::OutboundUnavailable,
+        Error::CandidateManifestMismatch => TargetInstallCode::CandidateManifestMismatch,
+        Error::CandidateDuplicate | Error::AlreadyOwned => TargetInstallCode::DuplicateRequest,
+        Error::CandidateWrongRole => TargetInstallCode::CandidateRoleMismatch,
+        Error::TransportUnavailable => TargetInstallCode::ConnectionUnavailable,
+        Error::RouteEvidenceMismatch => TargetInstallCode::RouteEvidenceMismatch,
+        Error::InstallationFailed => TargetInstallCode::RuntimeInstallFailed,
+    };
+    TargetInstallDiagnostic::new(stage, code)
 }
 
 fn negotiation_failure(error: GenerationZeroNegotiationError) -> WanSessionFailure {

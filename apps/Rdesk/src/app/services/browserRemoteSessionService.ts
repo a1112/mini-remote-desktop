@@ -6,6 +6,21 @@ import {
   randomBytes, safeInteger, wanRequestCommitment, type BrowserSigningIdentity, type WireObject,
 } from './browserRemoteProtocol';
 
+export type BrowserRemoteSetupStage =
+  | 'relay_access' | 'relay_issue_wait' | 'relay_verifying' | 'relay_verified'
+  | 'offer_creating' | 'local_description' | 'ice_gathering' | 'candidates_verifying'
+  | 'offer_sending' | 'offer_sent' | 'local_candidates_sending' | 'waiting_answer'
+  | 'answer_verifying' | 'answer_received' | 'remote_candidate_verifying' | 'waiting_remote_candidates'
+  | 'answer_applying' | 'remote_candidates_applying' | 'answer_applied' | 'route_verifying' | 'route_verified';
+export type BrowserRemoteSetupProgress = {
+  stage: BrowserRemoteSetupStage;
+  localCandidates: number;
+  localCandidatesSent: number;
+  remoteCandidates: number;
+  remoteCandidatesExpected: number;
+  remoteCandidatesApplied: number;
+  offersSent: 0 | 1;
+};
 export type BrowserRemoteState = {
   phase: 'waiting_consent' | 'negotiating' | 'streaming' | 'denied' | 'failed' | 'closed';
   grantedScopes: string[];
@@ -13,6 +28,7 @@ export type BrowserRemoteState = {
   frameHeight?: number;
   error?: string;
   route?: 'direct' | 'relay' | null;
+  setup?: BrowserRemoteSetupProgress;
 };
 export type BrowserRemoteObserver = {
   onState: (state: BrowserRemoteState) => void;

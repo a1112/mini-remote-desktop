@@ -7,6 +7,13 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetInstallStage {
+    TargetGenerationZeroBinding,
+    TargetGenerationZeroOfferWait,
+    TargetGenerationZeroPeerOpen,
+    TargetGenerationZeroAnswerGather,
+    TargetGenerationZeroConnectivity,
+    TargetGenerationZeroRouteProof,
+    TargetGenerationZeroInstall,
     TargetConsentDecision,
     TargetBackendApprove,
     TargetStateSnapshot,
@@ -40,6 +47,11 @@ pub(crate) enum TargetInstallStage {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetInstallCode {
+    BindingMismatch,
+    CandidateManifestMismatch,
+    CandidateRoleMismatch,
+    RouteEvidenceMismatch,
+    RuntimeInstallFailed,
     GuardRejected,
     DirectoryNotYetValid,
     BackendUnavailable,
@@ -132,8 +144,30 @@ impl TargetInstallDiagnostic {
         #[cfg(all(not(windows), not(test)))]
         tracing::warn!(public_diagnostic = %record, "WAN target installation failed");
         #[cfg(test)]
-        let _ = record;
+        test_records().lock().unwrap().push(record);
     }
+}
+
+#[cfg(test)]
+fn test_records() -> &'static std::sync::Mutex<Vec<String>> {
+    static RECORDS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    RECORDS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn take_test_records(session_id: &SessionId) -> Vec<String> {
+    let mut records = test_records().lock().unwrap();
+    let mut matching = Vec::new();
+    records.retain(|record| {
+        if serde_json::from_str::<serde_json::Value>(record).unwrap()["session_id"] == session_id.0
+        {
+            matching.push(record.clone());
+            false
+        } else {
+            true
+        }
+    });
+    matching
 }
 
 // This helper accepts only the two finite enums above, never a request, error
@@ -197,6 +231,48 @@ fn write_windows_event(record: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postapproval_diagnostic_records_keep_only_finite_public_fields() {
+        use TargetInstallCode as Code;
+        use TargetInstallStage as Stage;
+        let session = SessionId("725a2774-b72e-4203-94a5-1929190550d4".into());
+        for stage in [
+            Stage::TargetGenerationZeroBinding,
+            Stage::TargetGenerationZeroOfferWait,
+            Stage::TargetGenerationZeroPeerOpen,
+            Stage::TargetGenerationZeroAnswerGather,
+            Stage::TargetGenerationZeroConnectivity,
+            Stage::TargetGenerationZeroRouteProof,
+            Stage::TargetGenerationZeroInstall,
+        ] {
+            for code in [
+                Code::BindingMismatch,
+                Code::CandidateManifestMismatch,
+                Code::CandidateRoleMismatch,
+                Code::RouteEvidenceMismatch,
+                Code::RuntimeInstallFailed,
+                Code::Timeout,
+            ] {
+                let record = TargetInstallDiagnostic::new(stage, code)
+                    .public_record(31500, &session)
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+                assert_eq!(value.as_object().unwrap().len(), 5);
+                assert!(record.len() <= 512);
+                assert_eq!(value["session_id"], session.0);
+                assert_eq!(value["service_pid"], 31500);
+                assert_eq!(value["event"], "wan_target_install_failed");
+                assert!(value["stage"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("target_generation_zero_"));
+                for forbidden in ["password", "credential", "token", "sdp", "private"] {
+                    assert!(!record.contains(forbidden));
+                }
+            }
+        }
+    }
 
     #[test]
     fn approval_diagnostic_public_codes_have_only_the_fixed_five_fields() {

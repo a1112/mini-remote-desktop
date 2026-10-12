@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { useNavigate, useParams } from 'react-router';
 import { ArrowLeft, Maximize2, Minimize2, Monitor, ShieldCheck } from 'lucide-react';
-import { attachBrowserRemoteSession, type BrowserRemoteHandle, type BrowserRemoteState } from '../services/browserRemoteSessionService';
+import { attachBrowserRemoteSession, type BrowserRemoteHandle, type BrowserRemoteState, type BrowserRemoteSetupStage } from '../services/browserRemoteSessionService';
 import type { ControlInputEvent } from '../adapters/tauri/types';
 import { browserRemotePoint, browserVirtualKey, browserWheelDelta } from '../utils/browserRemoteInput';
 import { BrowserVideoStatistics } from './BrowserVideoStatistics';
 
 const initialState: BrowserRemoteState = { phase: 'waiting_consent', grantedScopes: [] };
 const phaseLabels = { waiting_consent: '等待远端同意', negotiating: '建立安全连接', streaming: '等待首帧画面', denied: '远端已拒绝', failed: '连接失败', closed: '会话已结束' };
+const setupLabels: Record<BrowserRemoteSetupStage, string> = {
+  relay_access: '请求中继访问', relay_issue_wait: '等待中继目录生效', relay_verifying: '校验中继目录', relay_verified: '中继目录已校验',
+  offer_creating: '生成本地 Offer', local_description: '应用本地描述', ice_gathering: '收集本地 ICE 候选', candidates_verifying: '校验本地候选',
+  offer_sending: '发送本地 Offer', offer_sent: '本地 Offer 已发送', local_candidates_sending: '发送本地候选', waiting_answer: '等待远端 Answer',
+  answer_verifying: '校验远端 Answer', answer_received: '远端 Answer 已校验', remote_candidate_verifying: '校验远端候选', waiting_remote_candidates: '等待远端候选完整',
+  answer_applying: '应用远端 Answer', remote_candidates_applying: '应用远端候选', answer_applied: '远端 Answer 已应用', route_verifying: '校验实际连接路径', route_verified: '实际连接路径已校验',
+};
+const setupCount = (value: number, max = 256) => Number.isSafeInteger(value) ? Math.max(0, Math.min(max, value)) : 0;
 const inactive = (phase: BrowserRemoteState['phase']) => phase === 'denied' || phase === 'failed' || phase === 'closed';
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const pointerButtonMasks = [['left', 1], ['right', 2], ['middle', 4], ['x1', 8], ['x2', 16]] as const;
@@ -51,7 +59,7 @@ export function BrowserRemoteSessionPage() {
     keys.current.clear(); pointers.current.clear();
     hasStream.current = false;
     if (video.current) video.current.srcObject = null;
-    if (alive.current) { setFirstFrame(false); setState({ phase: 'closed', grantedScopes: [] }); }
+    if (alive.current) { setFirstFrame(false); setState(previous => ({ phase: 'closed', grantedScopes: [], setup: previous.setup })); }
     if (!owned) return Promise.resolve();
     void owned.releaseInputs(reason).catch(() => undefined);
     return owned.close(reason);
@@ -258,6 +266,12 @@ export function BrowserRemoteSessionPage() {
       <button type="button" onClick={() => void toggleFullscreen()} disabled={!firstFrame} aria-label={fullscreen ? '退出全屏' : '进入全屏'} className="flex min-h-10 items-center gap-2 rounded-lg border border-white/15 px-3 text-sm hover:bg-white/10 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-cyan-400">{fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}全屏</button>
     </header>
     {(state.error || actionError) && <p role="alert" className="break-words border-b border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-200">{state.error || actionError}</p>}
+    {state.setup && <p aria-label="WebRTC 建连进度" className="flex flex-wrap gap-x-4 gap-y-1 border-b border-white/10 px-4 py-2 text-xs text-slate-400">
+      <span>协商：{setupLabels[state.setup.stage] ?? '等待连接进度'}</span>
+      <span>本地候选 {setupCount(state.setup.localCandidates)}，已发 {setupCount(state.setup.localCandidatesSent)}</span>
+      <span>远端候选 {setupCount(state.setup.remoteCandidates)}/{setupCount(state.setup.remoteCandidatesExpected)}，已应用 {setupCount(state.setup.remoteCandidatesApplied)}</span>
+      <span>Offer 已发 {setupCount(state.setup.offersSent, 1)}</span>
+    </p>}
     <div className="flex flex-1 flex-col gap-4 p-3 sm:p-5">
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-xs text-slate-400"><span className="flex items-center gap-1.5"><ShieldCheck className="h-4 w-4 text-cyan-400" />远端同意后才会显示画面；权限由远端授权。</span><span>鼠标：{pointerEnabled ? '已授权' : '未启用'}</span><span>键盘：{keyboardEnabled ? '已授权' : '未启用'}</span>{state.route && <span>链路：{state.route === 'relay' ? '中继' : '直连'}</span>}</div>
       <div ref={surface} role="application" aria-label="远程桌面键鼠控制" aria-describedby="browser-input-help" aria-disabled={!pointerEnabled && !keyboardEnabled} tabIndex={0} className="relative flex min-h-[240px] w-full flex-1 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-black outline-none focus-visible:border-cyan-400 focus-visible:ring-2 focus-visible:ring-cyan-400/40" style={{ touchAction: pointerEnabled ? 'none' : 'auto' }}
