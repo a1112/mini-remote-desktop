@@ -1,0 +1,1180 @@
+{
+  "schema_version": 1,
+  "notes": "Source package numbers are preserved. A numeric source version does not claim a released/stable product. See VERSIONING.md for release history, native release owners and limitations.",
+  "units": {
+    "rust-workspace": {
+      "canonical": {
+        "path": "Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "workspace",
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-agent-ipc",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-application",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-capture-dxgi",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-capture-macos",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-capture-pipewire",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-capture-winrt",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-codec-videotoolbox",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-decode",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-decode-nvdec",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-device-registration",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-encode-nvenc",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-encode-nvenc-av1",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-encode-openh264",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-encode-vvenc",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-ffmpeg",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-file-transfer",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-identity",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-input",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-ipc",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-mobile-gateway",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-mobile-gateway-app",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-observability",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-pipeline-core",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-process",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-proto",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-quality-gate",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-relay-agent",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-relay-control",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-render-linux",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-render-macos",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-render-opengl",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-service",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-session",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-session-agent",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-signal-client",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-signal-proto",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-signal-server",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-store-sqlite",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-transport-quic-quinn",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-transport-webrtc",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "rdesk-legacy-harness",
+          "format": "semver"
+        },
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "realtime-server",
+          "format": "semver"
+        }
+      ],
+      "assertions": [
+        {
+          "path": "apps/mrd-mobile-gateway/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/mrd-relay-agent/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/mrd-service/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/mrd-session-agent/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/rdesk-legacy-harness/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "apps/realtime-server/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-agent-ipc/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-application/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-capture-dxgi/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-capture-macos/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-capture-pipewire/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-capture-winrt/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-codec-videotoolbox/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-decode-nvdec/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-decode/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-device-registration/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-encode-nvenc-av1/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-encode-nvenc/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-encode-openh264/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-encode-vvenc/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-ffmpeg/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-file-transfer/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-identity/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-input/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-ipc/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-mobile-gateway/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-observability/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-pipeline-core/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-process/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-proto/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-quality-gate/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-relay-control/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-render-linux/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-render-macos/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-render-opengl/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-session/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-signal-client/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-signal-proto/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-signal-server/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-store-sqlite/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-transport-quic-quinn/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        },
+        {
+          "path": "crates/mrd-transport-webrtc/Cargo.toml",
+          "adapter": "toml",
+          "table": [
+            "package",
+            "version"
+          ],
+          "key": "workspace",
+          "equals": true
+        }
+      ],
+      "notes": "Rust workspace package version; inherited crate declarations remain source bindings."
+    },
+    "crate-app": {
+      "canonical": {
+        "path": "apps/Rdesk/src-tauri/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "app",
+          "format": "semver"
+        },
+        {
+          "path": "apps/Rdesk/src-tauri/tauri.conf.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        },
+        {
+          "path": "apps/Rdesk/package.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred Tauri application packaging version is synchronized with its own Cargo package."
+    },
+    "crate-common-control-proto": {
+      "canonical": {
+        "path": "common-control-proto/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "common-control-proto",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-mrd-buffer-pool": {
+      "canonical": {
+        "path": "crates/mrd-buffer-pool/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-buffer-pool",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-mrd-hardware": {
+      "canonical": {
+        "path": "crates/mrd-hardware/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-hardware",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-mrd-render-d3d11": {
+      "canonical": {
+        "path": "crates/mrd-render-d3d11/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-render-d3d11",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-mrd-render": {
+      "canonical": {
+        "path": "crates/mrd-render/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-render",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-mrd-test-telemetry": {
+      "canonical": {
+        "path": "crates/mrd-test-telemetry/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-test-telemetry",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-heartbeat-server": {
+      "canonical": {
+        "path": "heartbeat-rs/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "heartbeat-server",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred."
+    },
+    "crate-cap-common": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/common/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/common/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "cap-common",
+          "format": "semver"
+        },
+        {
+          "path": "labs/capture-perf/rust/desktop-duplication/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "cap-common",
+          "format": "semver"
+        },
+        {
+          "path": "labs/capture-perf/rust/graphics-capture/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "cap-common",
+          "format": "semver"
+        },
+        {
+          "path": "labs/capture-perf/rust/shared-memory-dd/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "cap-common",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-desktop-duplication": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/desktop-duplication/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/desktop-duplication/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "desktop-duplication",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-graphics-capture": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/graphics-capture/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/graphics-capture/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "graphics-capture",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-shared-memory-dd": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/shared-memory-dd/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/shared-memory-dd/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "shared-memory-dd",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-test-gc-api": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/test-gc-api/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/test-gc-api/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "test-gc-api",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-viewer": {
+      "canonical": {
+        "path": "labs/capture-perf/rust/viewer/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "labs/capture-perf/rust/viewer/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "viewer",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-gpu-test": {
+      "canonical": {
+        "path": "subprojects/GPUTest/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "subprojects/GPUTest/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "gpu-test",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-gpu-test-2": {
+      "canonical": {
+        "path": "subprojects/GPU_Test_2/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-mrd-capture-render-demo": {
+      "canonical": {
+        "path": "tests/capture-render-demo/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-capture-render-demo",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-integration-tests": {
+      "canonical": {
+        "path": "tests/integration/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "integration-tests",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "crate-mrd-macos-native-surface-proof": {
+      "canonical": {
+        "path": "tests/macos-native-surface-proof/Cargo.toml",
+        "adapter": "toml",
+        "table": [
+          "package"
+        ],
+        "key": "version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "tests/macos-native-surface-proof/Cargo.lock",
+          "adapter": "cargo-lock",
+          "package": "mrd-macos-native-surface-proof",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Independent Rust package; no repository-wide release version is inferred. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "node-prototypes-rdesk": {
+      "canonical": {
+        "path": "prototypes/rdesk/package.json",
+        "adapter": "json",
+        "pointer": "/version",
+        "format": "semver"
+      },
+      "mirrors": [
+        {
+          "path": "prototypes/rdesk/package-lock.json",
+          "adapter": "json",
+          "pointer": "/version",
+          "format": "semver"
+        },
+        {
+          "path": "prototypes/rdesk/package-lock.json",
+          "adapter": "json",
+          "pointer": "/packages//version",
+          "format": "semver"
+        }
+      ],
+      "assertions": [],
+      "notes": "Node package version; independent unless explicitly coupled by the application package below. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    },
+    "cmake-labs-capture-perf-cpp": {
+      "canonical": {
+        "path": "labs/capture-perf/cpp/CMakeLists.txt",
+        "adapter": "line",
+        "syntax": "cmake-project",
+        "prefix": "project(CapTest VERSION ",
+        "suffix": " LANGUAGES CXX)",
+        "expected_occurrences": 1,
+        "format": "semver"
+      },
+      "mirrors": [],
+      "assertions": [],
+      "notes": "Qt/CMake numeric project version; Qt API/module, minimum CMake and SDK versions are excluded. Experimental/test-only independent unit; not a shipping application release.",
+      "read_only": true
+    }
+  },
+  "unmanaged": [
+    {
+      "name": "non-product versions",
+      "reason": "Dependency/toolchain/Swift tools/SDK, protocol, schema, database and generated/upstream versions are not application release versions.",
+      "paths": []
+    },
+    {
+      "name": "historical sources",
+      "reason": "Vendored code, generated Apple projects, docs/evidence and junk snapshots retain their original versions and are excluded from bump operations.",
+      "paths": []
+    }
+  ]
+}
