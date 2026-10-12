@@ -457,7 +457,11 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
         this.candidates.clear(); this.seenMessages.clear();
       }
       try { await this.context.closeBackend(); }
-      catch (error) { this.publish({ error: '本地连接已关闭，未能确认远端会话已关闭' }); throw error; }
+      catch (error) {
+        const hasConnectionError = (this.state.phase === 'failed' || this.state.phase === 'denied') && this.state.error !== undefined;
+        if (!hasConnectionError) this.publish({ error: '本地连接已关闭，未能确认远端会话已关闭' });
+        throw error;
+      }
     })();
     return this.closePromise;
   }

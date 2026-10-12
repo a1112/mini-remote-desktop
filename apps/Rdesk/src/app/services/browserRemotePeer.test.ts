@@ -435,16 +435,40 @@ describe('independent browser peer lifecycle', () => {
     } finally { pc.channels.forEach(channel => { channel.readyState = 'closed'; }); await peer.close('test_cleanup'); }
   });
 
-  it('keeps local consent expiry terminal when the backend close cannot be confirmed', async () => {
+  it('keeps the original consent timeout when the backend close cannot be confirmed', async () => {
     const clock = controlledClock();
     context.closeBackend = vi.fn(async () => { throw new Error('Temporary access is unavailable'); });
     const { peer, socket, intent } = await pendingPeer();
     await clock.advance(intent.payload.claims.expires_at_ms - Date.now());
     await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
     await expect(peer.close()).rejects.toThrow('Temporary access is unavailable');
-    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '本地连接已关闭，未能确认远端会话已关闭' }));
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '等待远端确认超时，请重新连接' }));
     expect(socket.readyState).toBe(3);
     expect(PeerConnection.peers).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('keeps the original denial when the backend close cannot be confirmed', async () => {
+    const clock = controlledClock();
+    context.closeBackend = vi.fn(async () => { throw new Error('Temporary access is unavailable'); });
+    const { peer, socket } = await pendingPeer();
+    context.getBootstrap = vi.fn(async () => ({ ...context.bootstrap, session: { ...context.bootstrap.session, status: 'rejected' } }));
+    await clock.advance(2000);
+    await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+    await expect(peer.close()).rejects.toThrow('Temporary access is unavailable');
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'denied', grantedScopes: [], error: '远端拒绝了连接' }));
+    expect(socket.readyState).toBe(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('reports cleanup failure on user close when the backend close cannot be confirmed', async () => {
+    controlledClock();
+    context.closeBackend = vi.fn(async () => { throw new Error('Temporary access is unavailable'); });
+    const { peer, socket } = await pendingPeer();
+    await expect(peer.close('user_cancel')).rejects.toThrow('Temporary access is unavailable');
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'closed', grantedScopes: [], error: '本地连接已关闭，未能确认远端会话已关闭' }));
+    expect(context.closeBackend).toHaveBeenCalledTimes(1);
+    expect(socket.readyState).toBe(3);
     expect(vi.getTimerCount()).toBe(0);
   });
 
