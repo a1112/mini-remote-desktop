@@ -247,6 +247,71 @@ fn consent_diagnostics_only_expose_typed_static_causes() {
 }
 
 #[test]
+fn paired_diagnostics_classify_route_request_and_ack_without_error_text() {
+    use crate::wan_diagnostics::{TargetInstallCode as Code, TargetInstallStage as Stage};
+    let secret = "private-password-token-key-body-never-log";
+    let cases = [
+        (
+            anyhow::Error::from(AgentRouteError::Unhealthy)
+                .context(PairedDesktopPreparationError::CaptureRoute)
+                .context(secret),
+            Stage::PairedAgentRoute,
+            Code::Unhealthy,
+        ),
+        (
+            anyhow::Error::from(AgentRequestError::Timeout)
+                .context(PairedDesktopPreparationError::AgentRequest)
+                .context(secret),
+            Stage::PairedAgentRequest,
+            Code::Timeout,
+        ),
+        (
+            anyhow::Error::from(AgentRequestError::Route(AgentRouteError::DesktopChanged))
+                .context(PairedDesktopPreparationError::AgentRequest)
+                .context(secret),
+            Stage::PairedAgentRequest,
+            Code::DesktopChanged,
+        ),
+        (
+            anyhow::Error::from(PairedDesktopPreparationError::AgentAckRejected).context(secret),
+            Stage::PairedAck,
+            Code::AckRejected,
+        ),
+    ];
+    for (error, stage, code) in cases {
+        let diagnostic = paired_failure_diagnostic(&error);
+        assert_eq!(diagnostic.stage, stage);
+        assert_eq!(diagnostic.code, code);
+        let projected = serde_json::to_string(&diagnostic.remote_failure()).unwrap();
+        assert!(!projected.contains(secret));
+        assert!(!projected.contains("private-password"));
+    }
+    let untyped = paired_failure_diagnostic(&anyhow!(secret));
+    assert_eq!(untyped.stage, Stage::PairedUnknown);
+    assert_eq!(untyped.code, Code::GuardRejected);
+    assert!(!untyped.remote_failure().message.contains(secret));
+}
+
+#[tokio::test]
+async fn paired_diagnostics_classify_the_real_policy_preparation_guard() {
+    use crate::wan_diagnostics::{TargetInstallCode as Code, TargetInstallStage as Stage};
+    let state = AppState::default();
+    let error = state
+        .console_capture
+        .prepare_paired_session(&state, &SessionId("missing-paired-session".into()))
+        .await
+        .unwrap_err()
+        .context("private-password-token-key-body-never-log");
+    let diagnostic = paired_failure_diagnostic(&error);
+    assert_eq!(diagnostic.stage, Stage::PairedPolicy);
+    assert_eq!(diagnostic.code, Code::GuardRejected);
+    assert!(!diagnostic
+        .remote_failure()
+        .message
+        .contains("private-password"));
+}
+
+#[test]
 fn consent_diagnostics_distinguish_capture_from_native_route_failures() {
     let capture = anyhow::Error::from(AgentRouteError::CapabilityUnavailable)
         .context(ConsoleConsentFailure::CaptureRoute);

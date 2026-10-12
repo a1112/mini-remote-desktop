@@ -81,6 +81,7 @@ struct Signaling {
     identity: Arc<DeviceIdentity>,
     commitment: std::sync::Mutex<Option<String>>,
     revoke: Option<Arc<crate::session_authorization::SessionAuthorizationRegistry>>,
+    change_local_target: Option<Arc<crate::AppState>>,
 }
 #[async_trait]
 impl WanSessionWorkflowSignaling for Signaling {
@@ -136,6 +137,12 @@ impl WanSessionWorkflowSignaling for Signaling {
                 now_unix_ms(),
             )
             .await;
+        }
+        if let Some(app) = &self.change_local_target {
+            app.devices.lock().await.register(
+                DeviceId("changed-local-target".into()),
+                "Changed target".into(),
+            );
         }
         let digest = signed.commitment().unwrap();
         *self.commitment.lock().unwrap() = Some(digest.clone());
@@ -220,6 +227,7 @@ async fn run_flow(
         identity: target_key.clone(),
         commitment: Default::default(),
         revoke: (case == "revoked_during_grant").then(|| app.session_authorizations.clone()),
+        change_local_target: (case == "target_changed_during_grant").then(|| app.clone()),
     });
     let coordinator = Arc::new(
         WanSessionCoordinator::with_workflow_ports(
@@ -461,6 +469,77 @@ async fn authorization_install_failure_terminalizes_an_approved_coordinator() {
     );
 }
 
+#[tokio::test]
+async fn target_install_diagnostic_survives_terminalization_and_query_reconciliation() {
+    let (app, coordinator, request, _, signaling, result) =
+        run_flow("target_changed_during_grant").await;
+    assert!(signaling.commitment.lock().unwrap().is_some());
+    assert!(result.is_err());
+    assert_eq!(
+        coordinator
+            .snapshot(&request.session_id)
+            .await
+            .unwrap()
+            .phase(),
+        WanSessionPhase::Failed
+    );
+    let expected =
+        "WAN target authorization failed (stage=target_expected_grant, code=guard_rejected).";
+    let snapshot = app
+        .session_authorizations
+        .snapshot(&request.session_id)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.failure.as_ref().unwrap().message, expected);
+    reconcile_wan_session(&app, &request.session_id)
+        .await
+        .unwrap();
+    let after = app
+        .session_authorizations
+        .snapshot(&request.session_id)
+        .await
+        .unwrap();
+    assert_eq!(after.failure.as_ref().unwrap().message, expected);
+    let events = app
+        .session_authorizations
+        .subscribe(mrd_ipc::SessionEventSubscriptionQuery {
+            session_id: Some(request.session_id.clone()),
+            after_sequence: Some(DecimalU64::new(0)),
+            limit: 64,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(events
+        .events
+        .iter()
+        .any(|envelope| matches!(&envelope.event,
+        mrd_ipc::RemoteSessionEvent::AuthorizationChanged { failure: Some(failure), .. }
+            if failure.message == expected)));
+    assert!(app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn target_install_diagnostics_do_not_terminalize_unverified_intents() {
+    for case in ["expired", "metadata_key", "wrong_target"] {
+        let (app, coordinator, request, _, _, result) = run_flow(case).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            coordinator.snapshot(&request.session_id).await,
+            Err(WanSessionCoordinatorError::SessionNotFound)
+        ));
+        assert!(app
+            .session_authorizations
+            .snapshot(&request.session_id)
+            .await
+            .is_none());
+    }
+}
+
 struct ActivePairedIntent {
     app: Arc<crate::AppState>,
     coordinator: Arc<WanSessionCoordinator>,
@@ -529,6 +608,7 @@ async fn active_paired_intent(install: bool) -> ActivePairedIntent {
         identity: target_key,
         commitment: Default::default(),
         revoke: None,
+        change_local_target: None,
     });
     let coordinator = Arc::new(
         WanSessionCoordinator::with_workflow_ports(

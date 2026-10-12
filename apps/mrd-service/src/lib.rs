@@ -31,6 +31,7 @@ pub mod temporary_access;
 mod temporary_access_http;
 pub mod transports;
 pub mod wake_on_lan;
+mod wan_diagnostics;
 pub mod wan_session;
 pub mod web_bridge;
 pub mod windows_service;

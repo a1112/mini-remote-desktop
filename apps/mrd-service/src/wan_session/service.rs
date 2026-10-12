@@ -21,6 +21,7 @@ use super::{
         GenerationZeroNegotiationContext, GenerationZeroNegotiationError, GenerationZeroNegotiator,
     },
 };
+use crate::wan_diagnostics::{TargetInstallCode, TargetInstallDiagnostic, TargetInstallStage};
 use async_trait::async_trait;
 #[cfg(any(test, debug_assertions))]
 use mrd_application::ports::TransportRouteKind;
@@ -1311,35 +1312,106 @@ async fn handle_target_intent(
     }
     // Capture the local consent policy before any backend approval/signaling
     // awaits. The server policy revision is independently versioned.
-    let approval = async {
+    let approval: Result<(), TargetInstallDiagnostic> = async {
         let local = app_state
             .session_authorizations
             .wait_for_authorization_decision(&session_id)
             .await
-            .map_err(|_| ())?;
+            .map_err(|_| {
+                TargetInstallDiagnostic::new(
+                    TargetInstallStage::TargetConsentDecision,
+                    TargetInstallCode::GuardRejected,
+                )
+            })?;
         if local.role != mrd_ipc::RemoteSessionRole::Agent
             || local.peer_device_id != *verified.identity().controller_device_id()
             || local.peer_key_id != verified.identity().controller_key_fingerprint()
         {
-            return Err(());
+            return Err(TargetInstallDiagnostic::new(
+                TargetInstallStage::TargetConsentDecision,
+                TargetInstallCode::GuardRejected,
+            ));
         }
         let local_policy_revision = local.policy_revision.get();
         coordinator
             .approve_target(&session_id)
             .await
-            .map_err(|_| ())?;
-        let state = coordinator.snapshot(&session_id).await.map_err(|_| ())?;
-        install_target_authorization(app_state, &state, &verified, local_policy_revision)
-            .await
-            .map_err(|_| ())
+            .map_err(|reason| {
+                TargetInstallDiagnostic::new(
+                    TargetInstallStage::TargetBackendApprove,
+                    match reason {
+                        WanSessionCoordinatorError::DeadlineExceeded => TargetInstallCode::Expired,
+                        WanSessionCoordinatorError::CapacityExceeded
+                        | WanSessionCoordinatorError::TaskCapacityExceeded
+                        | WanSessionCoordinatorError::BufferCapacityExceeded => {
+                            TargetInstallCode::CapacityExhausted
+                        }
+                        _ => TargetInstallCode::GuardRejected,
+                    },
+                )
+            })?;
+        let state = coordinator.snapshot(&session_id).await.map_err(|_| {
+            TargetInstallDiagnostic::new(
+                TargetInstallStage::TargetStateSnapshot,
+                TargetInstallCode::StateUnavailable,
+            )
+        })?;
+        install_target_authorization(app_state, &state, &verified, local_policy_revision).await
     }
     .await;
-    if approval.is_err() {
+    if let Err(diagnostic) = approval {
         // A published backend grant is insufficient if the local authorization
         // was revoked or changed. Terminalize and release every runtime port.
-        let _ = fail_wan_session(app_state, &session_id, WanSessionFailure::PolicyMismatch).await;
+        fail_target_install_with_diagnostic(app_state, coordinator, &session_id, diagnostic).await;
     }
-    approval.map(|_| InitialEventOutcome::StartGenerationZero)
+    approval
+        .map(|_| InitialEventOutcome::StartGenerationZero)
+        .map_err(|_| ())
+}
+
+/// Only called after a verified target intent has entered its owned workflow.
+/// Keep the domain failure/cleanup behavior and preserve the first public
+/// diagnosis in the ordinary registry event stream under the same security gate.
+async fn fail_target_install_with_diagnostic(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    diagnostic: TargetInstallDiagnostic,
+) {
+    let _gate = app_state.authorization_security_gate.lock().await;
+    let Ok(current) = coordinator.snapshot(session_id).await else {
+        return;
+    };
+    let failure = current
+        .failure()
+        .unwrap_or(WanSessionFailure::PolicyMismatch);
+    let mut public_failure = diagnostic.remote_failure();
+    public_failure.code = wan_remote_failure(failure).code;
+    let previous = app_state.session_authorizations.snapshot(session_id).await;
+    let first_failure = previous
+        .as_ref()
+        .is_some_and(|snapshot| !is_terminal_authorization_state(snapshot.authorization_state));
+    let _ = terminalize_wan_session_under_security_gate(
+        app_state,
+        session_id,
+        ServiceWanTerminalRequest::Fail {
+            failure,
+            remote_failure: public_failure.clone(),
+        },
+    )
+    .await;
+    if first_failure
+        && app_state
+            .session_authorizations
+            .snapshot(session_id)
+            .await
+            .is_some_and(|snapshot| {
+                is_terminal_authorization_state(snapshot.authorization_state)
+                    && snapshot.failure.as_ref() == Some(&public_failure)
+            })
+    {
+        diagnostic.emit_terminal(current.identity().session_id());
+    }
 }
 
 /// Derive the exact already signed target authorization. This shared proof does
@@ -1491,23 +1563,35 @@ async fn install_target_authorization(
     state: &WanSessionState,
     verified: &VerifiedWanSessionIntent,
     expected_local_policy_revision: u64,
-) -> Result<(), RemoteFailure> {
+) -> Result<(), TargetInstallDiagnostic> {
+    use TargetInstallStage as Stage;
+    let rejected = |stage| TargetInstallDiagnostic::new(stage, TargetInstallCode::GuardRejected);
     let _authorization_guard = app_state.authorization_security_gate.lock().await;
     let now = now_unix_ms();
     if state.phase() != WanSessionPhase::AccessBound {
-        return Err(controller_grant_mismatch());
+        return Err(rejected(Stage::TargetExpectedGrant));
     }
     let (existing, authorization) =
-        expected_target_authorization_under_security_gate(app_state, state, verified, now).await?;
+        expected_target_authorization_under_security_gate(app_state, state, verified, now)
+            .await
+            .map_err(|failure| {
+                rejected(if failure.code == RemoteReasonCode::TrustRequired {
+                    Stage::TargetTrust
+                } else {
+                    Stage::TargetExpectedGrant
+                })
+            })?;
     if existing.authorization_state == RemoteAuthorizationState::Granted {
         return retains_exact_target_grant_under_security_gate(app_state, state, verified, now)
-            .await;
+            .await
+            .map_err(|_| rejected(Stage::TargetExpectedGrant));
     }
     let identity = state.identity();
     app_state
         .session_authorizations
         .bind_authenticated_peer_key(identity.session_id(), verified.controller_public_key(), now)
-        .await?;
+        .await
+        .map_err(|_| rejected(Stage::TargetBindPeer))?;
     let paired_basis = app_state
         .session_authorizations
         .paired_policy_revision(identity.session_id())
@@ -1517,9 +1601,10 @@ async fn install_target_authorization(
             app_state,
             identity.session_id(),
         )
-        .await?;
+        .await
+        .map_err(|_| rejected(Stage::TargetPairedPolicy))?;
     } else if verified.request().access_mode == mrd_signal_proto::WanAccessModeV3::Paired {
-        return Err(controller_grant_mismatch());
+        return Err(rejected(Stage::TargetPairedPolicy));
     }
     app_state
         .session_authorizations
@@ -1527,17 +1612,30 @@ async fn install_target_authorization(
             authorization,
             state
                 .active_authority()
-                .ok_or_else(controller_grant_mismatch)?,
+                .ok_or_else(|| rejected(Stage::TargetBoundGrant))?,
             Some(expected_local_policy_revision),
         )
-        .await?;
+        .await
+        .map_err(|failure| {
+            TargetInstallDiagnostic::new(
+                Stage::TargetBoundGrant,
+                if matches!(
+                    failure.code,
+                    RemoteReasonCode::GrantExpired | RemoteReasonCode::AuthorizationTimeout
+                ) {
+                    TargetInstallCode::Expired
+                } else {
+                    TargetInstallCode::GuardRejected
+                },
+            )
+        })?;
     #[cfg(windows)]
     if paired_basis.is_some() {
         app_state
             .console_capture
             .prepare_paired_session(app_state, identity.session_id())
             .await
-            .map_err(|_| controller_grant_mismatch())?;
+            .map_err(|reason| crate::console_capture::paired_failure_diagnostic(&reason))?;
     }
     Ok(())
 }

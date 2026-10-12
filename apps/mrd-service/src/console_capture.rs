@@ -29,6 +29,131 @@ use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 
 const MAX_CONSOLE_TARGETS: usize = 64;
 
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub(crate) enum PairedDesktopPreparationError {
+    #[error("paired policy revalidation failed")]
+    PolicyVerification,
+    #[error("paired snapshot unavailable")]
+    SnapshotUnavailable,
+    #[error("paired active grant state required")]
+    GrantState,
+    #[error("paired grant unavailable")]
+    GrantUnavailable,
+    #[error("paired screen scope required")]
+    MissingScreenScope,
+    #[error("paired active console unavailable")]
+    NoActiveConsole,
+    #[error("paired Agent unavailable")]
+    AgentUnavailable,
+    #[error("paired Agent protocol unavailable")]
+    ProtocolOutdated,
+    #[error("paired Agent capture route failed")]
+    CaptureRoute,
+    #[error("paired grant expired")]
+    DeadlineExpired,
+    #[error("paired authority entropy unavailable")]
+    EntropyUnavailable,
+    #[error("paired peer key invalid")]
+    InvalidPeerKey,
+    #[error("paired issuer unavailable")]
+    IssuerUnavailable,
+    #[error("paired authority issuance failed")]
+    AuthorityIssue,
+    #[error("paired Agent server unavailable")]
+    AgentServerUnavailable,
+    #[error("paired target capacity exhausted")]
+    SessionCapacity,
+    #[error("paired target already exists")]
+    DuplicateTarget,
+    #[error("paired Agent request failed")]
+    AgentRequest,
+    #[error("paired Agent rejected authority")]
+    AgentAckRejected,
+    #[error("paired Agent returned an unexpected outcome")]
+    AgentAckUnexpected,
+    #[error("paired target disappeared")]
+    TargetMissing,
+    #[error("paired desktop changed after installation")]
+    DesktopRecheck,
+    #[error("paired policy changed after installation")]
+    PolicyRecheck,
+}
+
+pub(crate) fn paired_failure_diagnostic(
+    reason: &anyhow::Error,
+) -> crate::wan_diagnostics::TargetInstallDiagnostic {
+    use crate::wan_diagnostics::{
+        TargetInstallCode as Code, TargetInstallDiagnostic, TargetInstallStage as Stage,
+    };
+    use PairedDesktopPreparationError::*;
+    let Some(failure) = reason.downcast_ref::<PairedDesktopPreparationError>() else {
+        return TargetInstallDiagnostic::new(Stage::PairedUnknown, Code::GuardRejected);
+    };
+    let (stage, mut code) = match failure {
+        PolicyVerification => (Stage::PairedPolicy, Code::GuardRejected),
+        SnapshotUnavailable => (Stage::PairedSnapshot, Code::StateUnavailable),
+        GrantState => (Stage::PairedGrant, Code::GuardRejected),
+        GrantUnavailable => (Stage::PairedGrant, Code::StateUnavailable),
+        MissingScreenScope => (Stage::PairedScope, Code::GuardRejected),
+        NoActiveConsole => (Stage::PairedConsole, Code::SessionUnavailable),
+        AgentUnavailable => (Stage::PairedAgentSelection, Code::SessionUnavailable),
+        ProtocolOutdated => (Stage::PairedAgentProtocol, Code::ProtocolVersionUnavailable),
+        CaptureRoute => (Stage::PairedAgentRoute, Code::GuardRejected),
+        DeadlineExpired => (Stage::PairedGrant, Code::Expired),
+        EntropyUnavailable => (Stage::PairedEntropy, Code::StateUnavailable),
+        InvalidPeerKey => (Stage::PairedPeerKey, Code::InvalidPeerKey),
+        IssuerUnavailable => (Stage::PairedIssuer, Code::StateUnavailable),
+        AuthorityIssue => (Stage::PairedAuthorityIssue, Code::InvalidAuthority),
+        AgentServerUnavailable => (Stage::PairedServer, Code::ConnectionUnavailable),
+        SessionCapacity => (Stage::PairedTargetInsert, Code::CapacityExhausted),
+        DuplicateTarget => (Stage::PairedTargetInsert, Code::DuplicateRequest),
+        AgentRequest => (Stage::PairedAgentRequest, Code::GuardRejected),
+        AgentAckRejected => (Stage::PairedAck, Code::AckRejected),
+        AgentAckUnexpected => (Stage::PairedAck, Code::UnexpectedAck),
+        TargetMissing => (Stage::PairedTargetRead, Code::StateUnavailable),
+        DesktopRecheck => (Stage::PairedDesktopRecheck, Code::GuardRejected),
+        PolicyRecheck => (Stage::PairedPolicyRecheck, Code::GuardRejected),
+    };
+    if matches!(failure, CaptureRoute | DesktopRecheck) {
+        if let Some(route) = reason.downcast_ref::<AgentRouteError>() {
+            code = paired_route_diagnostic(*route);
+        }
+    } else if matches!(failure, AgentRequest) {
+        if let Some(request) = reason.downcast_ref::<AgentRequestError>() {
+            code = match request {
+                AgentRequestError::Route(route) => paired_route_diagnostic(*route),
+                AgentRequestError::InvalidPairedAuthority => Code::InvalidPairedAuthority,
+                AgentRequestError::InvalidInput(_) => Code::InvalidInput,
+                AgentRequestError::InvalidConsent(_) => Code::InvalidConsent,
+                AgentRequestError::InvalidRenderAccessUnit => Code::InvalidRenderAccessUnit,
+                AgentRequestError::ConnectionUnavailable => Code::ConnectionUnavailable,
+                AgentRequestError::OutboundUnavailable => Code::OutboundUnavailable,
+                AgentRequestError::DuplicateRequest => Code::DuplicateRequest,
+                AgentRequestError::CapacityExhausted => Code::CapacityExhausted,
+                AgentRequestError::Revoked => Code::Revoked,
+                AgentRequestError::Disconnected => Code::Disconnected,
+                AgentRequestError::Timeout => Code::Timeout,
+                AgentRequestError::StateUnavailable => Code::StateUnavailable,
+            };
+        }
+    }
+    TargetInstallDiagnostic::new(stage, code)
+}
+
+fn paired_route_diagnostic(route: AgentRouteError) -> crate::wan_diagnostics::TargetInstallCode {
+    use crate::wan_diagnostics::TargetInstallCode as Code;
+    match route {
+        AgentRouteError::SessionUnavailable => Code::SessionUnavailable,
+        AgentRouteError::Unhealthy => Code::Unhealthy,
+        AgentRouteError::CapabilityUnavailable => Code::CapabilityUnavailable,
+        AgentRouteError::CapabilityBindingMismatch => Code::CapabilityBindingMismatch,
+        AgentRouteError::BindingRevoked => Code::BindingRevoked,
+        AgentRouteError::DesktopChanged => Code::DesktopChanged,
+        AgentRouteError::StateUnavailable => Code::StateUnavailable,
+        AgentRouteError::ProtocolVersionUnavailable => Code::ProtocolVersionUnavailable,
+    }
+}
+
 // Only these fixed causes may cross the installed-product error boundary. The
 // attached anyhow chain remains internal and is never returned to the UI.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -397,87 +522,92 @@ impl ConsoleCaptureState {
         session_id: &SessionId,
     ) -> Result<()> {
         let _operation = self.operation.lock().await;
+        use PairedDesktopPreparationError as Failure;
         crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
             state, session_id,
         )
         .await
-        .map_err(|failure| anyhow!(failure.message))?;
+        .map_err(|_| anyhow!(Failure::PolicyVerification))?;
         let now = now_ms();
         let snapshot = state
             .session_authorizations
             .snapshot_at(session_id, now)
             .await
-            .context("Paired session missing")?;
+            .context(Failure::SnapshotUnavailable)?;
         ensure!(
             snapshot.role == RemoteSessionRole::Agent
                 && snapshot.authorization_state == RemoteAuthorizationState::Granted,
-            "Paired desktop requires the exact active grant"
+            Failure::GrantState
         );
         let grant = state
             .session_authorizations
             .active_grant(session_id)
             .await
-            .context("Paired grant missing")?;
+            .context(Failure::GrantUnavailable)?;
         ensure!(
             grant
                 .granted_scopes
                 .contains(&RemotePermissionScope::ScreenView),
-            "Paired desktop requires screen.view"
+            Failure::MissingScreenScope
         );
-        let active = active_console()?;
+        let active = active_console().context(Failure::NoActiveConsole)?;
         let observed = state
             .agent_registry
             .active_for_session_at(active, now)
-            .context("Paired Agent unavailable")?;
+            .context(Failure::AgentUnavailable)?;
         ensure!(
             observed.identity.protocol_minor
                 >= mrd_agent_ipc::AGENT_IPC_PAIRED_SESSION_AUTHORITY_PROTOCOL_MINOR,
-            "Paired Agent protocol changed"
+            Failure::ProtocolOutdated
         );
-        let binding =
-            state
-                .agent_registry
-                .bind_active_session(active, AgentCapability::Capture, now)?;
+        let binding = state
+            .agent_registry
+            .bind_active_session(active, AgentCapability::Capture, now)
+            .context(Failure::CaptureRoute)?;
         let expires = grant
             .expires_at_ms
             .min(now.saturating_add(mrd_agent_ipc::AGENT_PAIRED_AUTHORITY_MAX_LIFETIME_MS));
-        ensure!(expires > now, "Paired grant expired");
-        let authority_id = random_id()?;
-        let authority =
-            self.issuer()?
-                .issue_paired_authority(mrd_agent_ipc::PairedSessionAuthorityClaims {
-                    authority_id,
-                    registration_id: *binding.registration_id(),
-                    registration_epoch: binding.registration_epoch(),
-                    session_id: session_id.clone(),
-                    peer: PeerBinding {
-                        device_id: snapshot.peer_device_id,
-                        key_id: decode_peer_key(&snapshot.peer_key_id)?,
-                    },
-                    scopes: grant
-                        .granted_scopes
-                        .iter()
-                        .copied()
-                        .map(PermissionScope::from)
-                        .collect(),
-                    policy_revision: grant.policy_revision,
-                    windows_session_id: active,
-                    desktop_epoch: binding.desktop_epoch(),
-                    desktop_kind: DesktopKind::Default,
-                    issued_at_ms: now,
-                    not_before_ms: now,
-                    expires_at_ms: expires,
-                    audience: mrd_agent_ipc::GrantAudience::SessionAgent,
-                })?;
+        ensure!(expires > now, Failure::DeadlineExpired);
+        let authority_id = random_id().context(Failure::EntropyUnavailable)?;
+        let authority = self
+            .issuer()
+            .context(Failure::IssuerUnavailable)?
+            .issue_paired_authority(mrd_agent_ipc::PairedSessionAuthorityClaims {
+                authority_id,
+                registration_id: *binding.registration_id(),
+                registration_epoch: binding.registration_epoch(),
+                session_id: session_id.clone(),
+                peer: PeerBinding {
+                    device_id: snapshot.peer_device_id,
+                    key_id: decode_peer_key(&snapshot.peer_key_id)
+                        .context(Failure::InvalidPeerKey)?,
+                },
+                scopes: grant
+                    .granted_scopes
+                    .iter()
+                    .copied()
+                    .map(PermissionScope::from)
+                    .collect(),
+                policy_revision: grant.policy_revision,
+                windows_session_id: active,
+                desktop_epoch: binding.desktop_epoch(),
+                desktop_kind: DesktopKind::Default,
+                issued_at_ms: now,
+                not_before_ms: now,
+                expires_at_ms: expires,
+                audience: mrd_agent_ipc::GrantAudience::SessionAgent,
+            })
+            .context(Failure::AuthorityIssue)?;
         let server = state
             .console_agent_server()
-            .context("Paired Agent server unavailable")?;
+            .context(Failure::AgentServerUnavailable)?;
         {
             let mut targets = self.targets.lock().await;
             ensure!(
-                targets.len() < MAX_CONSOLE_TARGETS && !targets.contains_key(session_id),
-                "Paired desktop target already exists or capacity exhausted"
+                targets.len() < MAX_CONSOLE_TARGETS,
+                Failure::SessionCapacity
             );
+            ensure!(!targets.contains_key(session_id), Failure::DuplicateTarget);
             targets.insert(
                 session_id.clone(),
                 Target {
@@ -496,7 +626,15 @@ impl ConsoleCaptureState {
         {
             self.finish_failed_paired_install(state, session_id, &result)
                 .await;
-            anyhow::bail!("Paired desktop authority was not installed");
+            return match result {
+                Err(reason) => Err(anyhow::Error::new(reason).context(Failure::AgentRequest)),
+                Ok(ack)
+                    if ack.outcome == mrd_agent_ipc::PairedSessionAuthorityOutcome::Rejected =>
+                {
+                    Err(anyhow!(Failure::AgentAckRejected))
+                }
+                Ok(_) => Err(anyhow!(Failure::AgentAckUnexpected)),
+            };
         }
         let target = self
             .targets
@@ -504,16 +642,19 @@ impl ConsoleCaptureState {
             .await
             .get(session_id)
             .cloned()
-            .context("Paired target disappeared")?;
-        if self.validate_target(state, &target).is_err()
-            || crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
-                state, session_id,
-            )
-            .await
-            .is_err()
+            .context(Failure::TargetMissing)?;
+        if let Err(reason) = self.validate_target(state, &target) {
+            self.stop_inner(state, session_id).await;
+            return Err(reason.context(Failure::DesktopRecheck));
+        }
+        if crate::ipc_server::paired_access::verify_session_policy_under_security_gate(
+            state, session_id,
+        )
+        .await
+        .is_err()
         {
             self.stop_inner(state, session_id).await;
-            anyhow::bail!("Paired policy or desktop changed during installation");
+            anyhow::bail!(Failure::PolicyRecheck);
         }
         Ok(())
     }
