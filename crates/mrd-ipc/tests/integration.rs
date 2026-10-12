@@ -74,6 +74,7 @@ async fn isolated_server(requests: Vec<IpcRequest>) -> (IpcClient, tokio::task::
                         running: true,
                         healthy: true,
                         pid: Some(std::process::id()),
+                        agent_readiness: None,
                     },
                 },
                 other => panic!("unexpected fixture request: {other:?}"),
@@ -144,6 +145,7 @@ async fn ipc_client_sends_service_health_request() {
                 running: true,
                 healthy: true,
                 pid: Some(std::process::id()),
+                agent_readiness: None,
             },
         }
     );

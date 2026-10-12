@@ -504,7 +504,7 @@ impl IpcServer {
                 tracing::warn!("Local console consent could not be completed: {reason:#}");
                 return Some(error(
                     "E_PRODUCT_DESKTOP_CONSENT_DENIED",
-                    "Confirm this request in the active local desktop. The installed capture Agent must be running and unlocked.",
+                    crate::console_capture::consent_failure_message(&reason),
                 ));
             }
         }
@@ -589,6 +589,69 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn consent_diagnostics_preserve_denial_for_a_missing_request() {
+        let server = audit_test_server(1);
+        let request = IpcRequest::RespondToConsent {
+            response: mrd_ipc::ConsentResponse {
+                session_id: mrd_proto::SessionId("missing-consent-diagnostic".into()),
+                decision: mrd_ipc::ConsentDecision::Approve,
+                approved_scopes: vec![RemotePermissionScope::ScreenView],
+                expected_policy_revision: mrd_ipc::DecimalU64::new(1),
+            },
+        };
+        assert_eq!(
+            server.product_request_denial(&request).await,
+            Some(error(
+                "E_PRODUCT_DESKTOP_CONSENT_DENIED",
+                "The confirmation request no longer exists. Start a new connection.",
+            ))
+        );
+        assert!(server.product_audit_owners.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn consent_diagnostics_preserve_denial_for_an_unregistered_agent() {
+        let server = audit_test_server(1);
+        let at = now_ms();
+        let scopes = vec![RemotePermissionScope::ScreenView];
+        let pending = server
+            .app_state
+            .session_authorizations
+            .begin_verified_incoming(
+                crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+                    session_id: mrd_proto::SessionId("unregistered-consent-diagnostic".into()),
+                    peer_device_id: mrd_proto::DeviceId("fixture-controller".into()),
+                    peer_key_id: "12".repeat(32),
+                    peer_key_epoch: 1,
+                    access_mode: mrd_ipc::RemoteAccessMode::Attended,
+                    requested_scopes: scopes.clone(),
+                    peer_permission_ceiling: scopes.clone(),
+                    machine_permission_ceiling: scopes.clone(),
+                    runtime_capabilities: scopes.clone(),
+                    transport_kind: "quic".into(),
+                    request_nonce: [1; 16],
+                    created_at_ms: at,
+                    expires_at_ms: at + 60_000,
+                },
+            )
+            .await
+            .unwrap();
+        let request = IpcRequest::RespondToConsent {
+            response: mrd_ipc::ConsentResponse {
+                session_id: pending.session_id,
+                decision: mrd_ipc::ConsentDecision::Approve,
+                approved_scopes: scopes,
+                expected_policy_revision: pending.policy_revision,
+            },
+        };
+        assert_eq!(server.product_request_denial(&request).await, Some(error(
+            "E_PRODUCT_DESKTOP_CONSENT_DENIED",
+            "The capture Agent has not registered in this desktop. Reopen Rdesk after the Agent is ready.",
+        )));
+        assert!(server.product_audit_owners.lock().unwrap().is_empty());
+    }
 
     fn audit_test_server(logon: u8) -> IpcServer {
         let mut server = IpcServer::new(std::sync::Arc::new(crate::app_state::AppState::default()));

@@ -29,6 +29,80 @@ use mrd_session_agent::{
 };
 use tokio::sync::watch;
 
+#[test]
+fn consent_diagnostics_only_expose_typed_static_causes() {
+    let secret = "untrusted-error-with-private-path-and-credential";
+    let opaque = anyhow!(secret);
+    assert_eq!(consent_failure_message(&opaque), "Confirm this request in the active local desktop. The installed capture Agent must be running and unlocked.");
+    let typed = opaque
+        .context(ConsoleConsentFailure::RequestUnavailable)
+        .context(secret);
+    assert_eq!(
+        consent_failure_message(&typed),
+        "The confirmation request no longer exists. Start a new connection."
+    );
+    assert!(!consent_failure_message(&typed).contains(secret));
+}
+
+#[test]
+fn consent_diagnostics_distinguish_capture_from_native_route_failures() {
+    let capture = anyhow::Error::from(AgentRouteError::CapabilityUnavailable)
+        .context(ConsoleConsentFailure::CaptureRoute);
+    let consent = anyhow::Error::from(AgentRequestError::Route(
+        AgentRouteError::CapabilityUnavailable,
+    ))
+    .context(ConsoleConsentFailure::NativeRequest);
+    assert_eq!(
+        consent_failure_message(&capture),
+        "The capture Agent is not advertising screen capture for this desktop."
+    );
+    assert_eq!(
+        consent_failure_message(&consent),
+        "The capture Agent is not advertising native confirmation for this desktop."
+    );
+    let stale = anyhow::Error::from(AgentRouteError::Unhealthy)
+        .context(ConsoleConsentFailure::CaptureRoute);
+    assert_eq!(
+        consent_failure_message(&stale),
+        "The capture Agent heartbeat is stale. Wait for the Agent to become ready."
+    );
+}
+
+#[test]
+fn consent_diagnostics_distinguish_native_timeout_expiry_and_dismissal() {
+    let timeout = anyhow::Error::from(AgentRequestError::Timeout)
+        .context(ConsoleConsentFailure::NativeRequest);
+    assert_eq!(
+        consent_failure_message(&timeout),
+        "Native desktop confirmation timed out. Start a new connection."
+    );
+    let invalid_expiry = anyhow::Error::from(AgentRequestError::InvalidConsent(
+        mrd_agent_ipc::ConsentValidationError::Expired,
+    ))
+    .context(ConsoleConsentFailure::NativeRequest);
+    assert_eq!(
+        consent_failure_message(&invalid_expiry),
+        "The confirmation request expired. Start a new connection."
+    );
+    for (decision, expected) in [
+        (
+            mrd_agent_ipc::ConsentDecision::Denied,
+            "Native desktop confirmation was denied.",
+        ),
+        (
+            mrd_agent_ipc::ConsentDecision::Expired,
+            "Native desktop confirmation expired. Start a new connection.",
+        ),
+        (
+            mrd_agent_ipc::ConsentDecision::Dismissed,
+            "Native desktop confirmation was dismissed or unavailable. Start a new connection.",
+        ),
+    ] {
+        let error = anyhow::Error::from(ConsoleConsentFailure::NativeNotApproved(decision));
+        assert_eq!(consent_failure_message(&error), expected);
+    }
+}
+
 #[derive(Default)]
 struct ResponseFaults {
     drop_input_ack: std::sync::atomic::AtomicBool,

@@ -1059,7 +1059,8 @@ mod tests {
                 health_status_is_ready(&mrd_ipc::ServiceStatus {
                     running,
                     healthy,
-                    pid: Some(123)
+                    pid: Some(123),
+                    agent_readiness: None,
                 }),
                 ready
             );

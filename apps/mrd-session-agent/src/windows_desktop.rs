@@ -1680,6 +1680,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the current interactive Windows desktop to be unlocked"]
+    fn native_unlocked_desktop_advertises_default_desktop() {
+        let mut session_id = 0_u32;
+        unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) }
+            .expect("current process session");
+        let source =
+            WindowsTrustedDesktopStateSource::start(session_id).expect("native watcher start");
+        let baseline = source.current_state().expect("native baseline");
+        eprintln!(
+            "local_desktop_probe desktop_kind={:?} desktop_epoch={}",
+            baseline.desktop_kind, baseline.desktop_epoch
+        );
+        assert_eq!(baseline.desktop_kind, DesktopKind::Default);
+        drop(source);
+    }
+
+    #[test]
     fn native_watcher_rejects_zero_session_and_joins_startup_worker() {
         assert!(matches!(
             WindowsTrustedDesktopStateSource::start(0),

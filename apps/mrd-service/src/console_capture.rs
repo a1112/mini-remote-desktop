@@ -3,7 +3,8 @@
 
 use crate::{
     agent_runtime::{
-        AgentBinding, ExecuteGrantIssuer, ExecuteGrantTemplate, ObservedAgentIdentity,
+        AgentBinding, AgentRequestError, AgentRouteError, ExecuteGrantIssuer, ExecuteGrantTemplate,
+        ObservedAgentIdentity,
     },
     AppState,
 };
@@ -27,6 +28,120 @@ use tokio::sync::Mutex;
 use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 
 const MAX_CONSOLE_TARGETS: usize = 64;
+
+// Only these fixed causes may cross the installed-product error boundary. The
+// attached anyhow chain remains internal and is never returned to the UI.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+enum ConsoleConsentFailure {
+    #[error("The confirmation request no longer exists. Start a new connection.")]
+    RequestUnavailable,
+    #[error("This confirmation request does not belong to this target desktop.")]
+    WrongTarget,
+    #[error("This confirmation request is no longer pending. Start a new connection.")]
+    NotPending,
+    #[error("The confirmation policy changed. Start a new connection.")]
+    PolicyChanged,
+    #[error("No active local Windows desktop is available.")]
+    NoActiveDesktop,
+    #[error("Confirm this request in the currently active local desktop.")]
+    WrongConsole,
+    #[error("The capture Agent has not registered in this desktop. Reopen Rdesk after the Agent is ready.")]
+    AgentUnregistered,
+    #[error(
+        "The capture Agent belongs to another desktop logon. Reopen Rdesk in the active desktop."
+    )]
+    LogonChanged,
+    #[error("Update the capture Agent before confirming this connection.")]
+    ProtocolOutdated,
+    #[error("Selected permissions exceed the connection request.")]
+    ScopeExpansion,
+    #[error("The capture Agent is not ready for this desktop.")]
+    CaptureRoute,
+    #[error("The desktop has reached its capture session limit.")]
+    SessionLimit,
+    #[error("Previous desktop cleanup is still pending. Retry after cleanup completes.")]
+    CleanupPending,
+    #[error("The target desktop changed. Start a new connection.")]
+    TargetChanged,
+    #[error("The confirmation deadline is unavailable. Start a new connection.")]
+    DeadlineMissing,
+    #[error("The confirmation request expired. Start a new connection.")]
+    Expired,
+    #[error("The native confirmation service is unavailable.")]
+    NativeServerUnavailable,
+    #[error("Native desktop confirmation could not be completed.")]
+    NativeRequest,
+    #[error("The native confirmation request is invalid. Start a new connection.")]
+    InvalidNativeRequest,
+    #[error("Native desktop confirmation was not approved.")]
+    NativeNotApproved(mrd_agent_ipc::ConsentDecision),
+    #[error("Native confirmation did not approve all selected permissions.")]
+    IncompleteApproval,
+}
+
+/// A bounded diagnostic for the verified installed UI; never format the source
+/// error chain, which may contain identity, platform, or request information.
+pub(crate) fn consent_failure_message(reason: &anyhow::Error) -> &'static str {
+    use ConsoleConsentFailure::*;
+    let Some(failure) = reason.downcast_ref::<ConsoleConsentFailure>() else {
+        return "Confirm this request in the active local desktop. The installed capture Agent must be running and unlocked.";
+    };
+    if matches!(failure, CaptureRoute | NativeRequest) {
+        let route = reason
+            .downcast_ref::<AgentRouteError>()
+            .copied()
+            .or_else(|| match reason.downcast_ref::<AgentRequestError>() {
+                Some(AgentRequestError::Route(route)) => Some(*route),
+                _ => None,
+            });
+        if let Some(route) = route {
+            return match route {
+                AgentRouteError::SessionUnavailable => "The capture Agent has not registered in this desktop. Reopen Rdesk after the Agent is ready.",
+                AgentRouteError::Unhealthy => "The capture Agent heartbeat is stale. Wait for the Agent to become ready.",
+                AgentRouteError::CapabilityUnavailable if matches!(failure, CaptureRoute) => "The capture Agent is not advertising screen capture for this desktop.",
+                AgentRouteError::CapabilityUnavailable => "The capture Agent is not advertising native confirmation for this desktop.",
+                AgentRouteError::ProtocolVersionUnavailable => "Update the capture Agent before confirming this connection.",
+                AgentRouteError::BindingRevoked | AgentRouteError::DesktopChanged => "The target desktop changed. Start a new connection.",
+                _ => "The capture Agent routing state is unavailable.",
+            };
+        }
+        if let Some(request) = reason.downcast_ref::<AgentRequestError>() {
+            return match request {
+                AgentRequestError::Timeout => "Native desktop confirmation timed out. Start a new connection.",
+                AgentRequestError::Revoked | AgentRequestError::Disconnected => "The capture Agent disconnected or changed during confirmation. Start a new connection.",
+                AgentRequestError::InvalidConsent(mrd_agent_ipc::ConsentValidationError::Expired) => "The confirmation request expired. Start a new connection.",
+                AgentRequestError::InvalidConsent(_) => "The native confirmation request or response is invalid. Start a new connection.",
+                _ => "The native confirmation connection is unavailable. Retry after the Agent is ready.",
+            };
+        }
+    }
+    match failure {
+        RequestUnavailable => "The confirmation request no longer exists. Start a new connection.",
+        WrongTarget => "This confirmation request does not belong to this target desktop.",
+        NotPending => "This confirmation request is no longer pending. Start a new connection.",
+        PolicyChanged => "The confirmation policy changed. Start a new connection.",
+        NoActiveDesktop => "No active local Windows desktop is available.",
+        WrongConsole => "Confirm this request in the currently active local desktop.",
+        AgentUnregistered => "The capture Agent has not registered in this desktop. Reopen Rdesk after the Agent is ready.",
+        LogonChanged => "The capture Agent belongs to another desktop logon. Reopen Rdesk in the active desktop.",
+        ProtocolOutdated => "Update the capture Agent before confirming this connection.",
+        ScopeExpansion => "Selected permissions exceed the connection request.",
+        CaptureRoute => "The capture Agent is not ready for this desktop.",
+        SessionLimit => "The desktop has reached its capture session limit.",
+        CleanupPending => "Previous desktop cleanup is still pending. Retry after cleanup completes.",
+        TargetChanged => "The target desktop changed. Start a new connection.",
+        DeadlineMissing => "The confirmation deadline is unavailable. Start a new connection.",
+        Expired => "The confirmation request expired. Start a new connection.",
+        NativeServerUnavailable => "The native confirmation service is unavailable.",
+        NativeRequest => "Native desktop confirmation could not be completed.",
+        InvalidNativeRequest => "The native confirmation request is invalid. Start a new connection.",
+        NativeNotApproved(mrd_agent_ipc::ConsentDecision::Expired) => "Native desktop confirmation expired. Start a new connection.",
+        NativeNotApproved(mrd_agent_ipc::ConsentDecision::Denied) => "Native desktop confirmation was denied.",
+        NativeNotApproved(mrd_agent_ipc::ConsentDecision::Dismissed) => "Native desktop confirmation was dismissed or unavailable. Start a new connection.",
+        NativeNotApproved(_) => "Native desktop confirmation was not approved.",
+        IncompleteApproval => "Native confirmation did not approve all selected permissions.",
+    }
+}
 
 #[derive(Clone)]
 struct Target {
@@ -116,49 +231,49 @@ impl ConsoleCaptureState {
             .session_authorizations
             .snapshot(&response.session_id)
             .await
-            .context("Consent request no longer exists")?;
+            .context(ConsoleConsentFailure::RequestUnavailable)?;
         ensure!(
             snapshot.role == RemoteSessionRole::Agent
                 && snapshot.access_mode == RemoteAccessMode::Attended,
-            "Consent is not for this target desktop"
+            ConsoleConsentFailure::WrongTarget
         );
         ensure!(
             snapshot.authorization_state == RemoteAuthorizationState::AwaitingLocalConsent,
-            "Consent is no longer pending"
+            ConsoleConsentFailure::NotPending
         );
         ensure!(
             snapshot.policy_revision == response.expected_policy_revision,
-            "Consent policy changed"
+            ConsoleConsentFailure::PolicyChanged
         );
-        let active = active_console()?;
+        let active = active_console().context(ConsoleConsentFailure::NoActiveDesktop)?;
         ensure!(
             caller.windows_session_id == active,
-            "Consent caller is not in the active console"
+            ConsoleConsentFailure::WrongConsole
         );
         let observed = state
             .agent_registry
             .active_for_session_at(active, now_ms())
-            .context("No capture Agent owns this console")?;
+            .context(ConsoleConsentFailure::AgentUnregistered)?;
         ensure!(
             observed.identity.logon_sid_hash == caller.logon_sid_hash,
-            "Capture Agent belongs to another logon"
+            ConsoleConsentFailure::LogonChanged
         );
         ensure!(
             observed.identity.protocol_minor
                 >= mrd_agent_ipc::AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR,
-            "Capture Agent must be updated"
+            ConsoleConsentFailure::ProtocolOutdated
         );
         ensure!(
             response
                 .approved_scopes
                 .iter()
                 .all(|scope| snapshot.requested_scopes.contains(scope)),
-            "Consent cannot expand requested permissions"
+            ConsoleConsentFailure::ScopeExpansion
         );
-        let binding =
-            state
-                .agent_registry
-                .bind_active_session(active, AgentCapability::Capture, now_ms())?;
+        let binding = state
+            .agent_registry
+            .bind_active_session(active, AgentCapability::Capture, now_ms())
+            .context(ConsoleConsentFailure::CaptureRoute)?;
         {
             let mut targets = self.targets.lock().await;
             targets.retain(|_, target| {
@@ -168,36 +283,37 @@ impl ConsoleCaptureState {
             });
             ensure!(
                 targets.len() < MAX_CONSOLE_TARGETS || targets.contains_key(&response.session_id),
-                "Capture session limit reached"
+                ConsoleConsentFailure::SessionLimit
             );
             if let Some(existing) = targets.get(&response.session_id) {
                 ensure!(
                     !existing.closing
                         && !existing.input.values().any(|input| input.cleanup_pending),
-                    "Desktop cleanup is still pending"
+                    ConsoleConsentFailure::CleanupPending
                 );
                 ensure!(
                     existing.binding == binding && existing.logon_hash == caller.logon_sid_hash,
-                    "Consent cannot retarget an existing desktop"
+                    ConsoleConsentFailure::TargetChanged
                 );
             }
         }
         let now = now_ms();
         let expires = snapshot
             .authorization_expires_at_ms
-            .context("Consent deadline missing")?
+            .context(ConsoleConsentFailure::DeadlineMissing)?
             .min(now.saturating_add(15_000));
-        ensure!(expires > now, "Consent request expired");
+        ensure!(expires > now, ConsoleConsentFailure::Expired);
         let native = state
             .console_agent_server()
-            .context("Capture Agent server unavailable")?
+            .context(ConsoleConsentFailure::NativeServerUnavailable)?
             .request_consent(mrd_agent_ipc::ConsentRequest {
                 request_token: 1,
-                request_id: random_id()?,
+                request_id: random_id().context(ConsoleConsentFailure::InvalidNativeRequest)?,
                 session_id: response.session_id.clone(),
                 peer: PeerBinding {
                     device_id: snapshot.peer_device_id.clone(),
-                    key_id: decode_peer_key(&snapshot.peer_key_id)?,
+                    key_id: decode_peer_key(&snapshot.peer_key_id)
+                        .context(ConsoleConsentFailure::InvalidNativeRequest)?,
                 },
                 requested_scopes: response
                     .approved_scopes
@@ -212,10 +328,11 @@ impl ConsoleCaptureState {
                 authorization_expires_at_ms: now
                     .saturating_add(mrd_agent_ipc::AGENT_CONSENT_MAX_LIFETIME_MS),
             })
-            .await?;
+            .await
+            .context(ConsoleConsentFailure::NativeRequest)?;
         ensure!(
             native.consent().decision() == mrd_agent_ipc::ConsentDecision::Approved,
-            "Local desktop consent was not approved"
+            ConsoleConsentFailure::NativeNotApproved(native.consent().decision())
         );
         let approved: PermissionScopes = response
             .approved_scopes
@@ -225,7 +342,7 @@ impl ConsoleCaptureState {
             .collect();
         ensure!(
             native.consent().approved_scopes() == &approved,
-            "Local desktop approval did not include all selected permissions"
+            ConsoleConsentFailure::IncompleteApproval
         );
         let consent_binding = native.binding();
         ensure!(
@@ -233,7 +350,7 @@ impl ConsoleCaptureState {
                 && consent_binding.registration_epoch() == binding.registration_epoch()
                 && consent_binding.desktop_epoch() == binding.desktop_epoch()
                 && consent_binding.windows_session_id() == binding.windows_session_id(),
-            "Consent desktop changed while awaiting approval"
+            ConsoleConsentFailure::TargetChanged
         );
         let target = Target {
             binding,
@@ -243,7 +360,8 @@ impl ConsoleCaptureState {
             input: HashMap::new(),
             closing: false,
         };
-        self.validate_target(state, &target)?;
+        self.validate_target(state, &target)
+            .context(ConsoleConsentFailure::TargetChanged)?;
         let mut targets = self.targets.lock().await;
         targets.retain(|_, target| {
             target.resource.is_some()
@@ -252,16 +370,16 @@ impl ConsoleCaptureState {
         });
         ensure!(
             targets.len() < MAX_CONSOLE_TARGETS || targets.contains_key(&response.session_id),
-            "Capture session limit reached"
+            ConsoleConsentFailure::SessionLimit
         );
         if let Some(existing) = targets.get(&response.session_id) {
             ensure!(
                 !existing.closing && !existing.input.values().any(|input| input.cleanup_pending),
-                "Desktop cleanup is still pending"
+                ConsoleConsentFailure::CleanupPending
             );
             ensure!(
                 same_target(existing, &target),
-                "Consent cannot retarget an existing desktop"
+                ConsoleConsentFailure::TargetChanged
             );
         } else {
             targets.insert(response.session_id.clone(), target);

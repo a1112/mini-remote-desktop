@@ -2955,12 +2955,29 @@ mod wire {
         pub last_error: Option<String>,
     }
 
+    /// Bounded, read-only readiness of the active-console Agent registration.
+    ///
+    /// Advertised capabilities do not imply an unlocked desktop or local consent.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct AgentReadinessStatus {
+        pub console_active: bool,
+        pub registered: bool,
+        pub heartbeat_fresh: bool,
+        pub capture_advertised: bool,
+        pub consent_advertised: bool,
+        pub input_advertised: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol_minor: Option<u16>,
+    }
+
     /// Service status DTO
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ServiceStatus {
         pub running: bool,
         pub healthy: bool,
         pub pid: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub agent_readiness: Option<AgentReadinessStatus>,
     }
 }
 
@@ -2969,6 +2986,68 @@ pub use wire::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_health_agent_readiness_survives_wire_round_trip() {
+        let current = serde_json::json!({
+            "type": "ServiceHealth",
+            "status": {
+                "running": true, "healthy": true, "pid": 1234,
+                "agent_readiness": {
+                    "console_active": true, "registered": true,
+                    "heartbeat_fresh": false, "capture_advertised": true,
+                    "consent_advertised": false, "input_advertised": true,
+                    "protocol_minor": 5,
+                },
+            },
+        });
+        let decoded: IpcResponse = serde_json::from_value(current.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), current);
+    }
+
+    #[test]
+    fn legacy_service_health_omits_unavailable_agent_readiness() {
+        let legacy = serde_json::json!({
+            "type": "ServiceHealth",
+            "status": { "running": true, "healthy": false, "pid": 1234 },
+        });
+        let decoded: IpcResponse = serde_json::from_value(legacy.clone()).unwrap();
+        let IpcResponse::ServiceHealth { status } = &decoded else {
+            panic!("expected service health");
+        };
+        assert!(status.agent_readiness.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+    }
+
+    #[test]
+    fn legacy_service_status_readers_ignore_optional_readiness() {
+        #[derive(Deserialize)]
+        struct LegacyStatus {
+            running: bool,
+            healthy: bool,
+            pid: Option<u32>,
+        }
+        let status = ServiceStatus {
+            running: true,
+            healthy: false,
+            pid: Some(1234),
+            agent_readiness: Some(AgentReadinessStatus {
+                console_active: true,
+                registered: false,
+                heartbeat_fresh: false,
+                capture_advertised: false,
+                consent_advertised: false,
+                input_advertised: false,
+                protocol_minor: None,
+            }),
+        };
+        let value = serde_json::to_value(status).unwrap();
+        assert!(value["agent_readiness"].get("protocol_minor").is_none());
+        let old: LegacyStatus = serde_json::from_value(value).unwrap();
+        assert!(old.running);
+        assert!(!old.healthy);
+        assert_eq!(old.pid, Some(1234));
+    }
 
     #[test]
     fn temporary_access_refresh_mode_preserves_legacy_wire_and_accepts_known_modes() {
