@@ -10,6 +10,7 @@ mod device_info;
 mod frame_sink;
 mod ipc_client;
 mod platform;
+mod permission_settings;
 #[cfg(test)]
 mod quic_host;
 #[cfg(test)]
@@ -3304,6 +3305,12 @@ async fn ipc_audit_log(query: mrd_ipc::AuditLogQuery) -> Result<Vec<mrd_ipc::Aud
     }
 }
 
+/// Navigation only: this never requests or verifies the GUI's own TCC grant.
+#[tauri::command]
+async fn open_macos_permission_settings(permission: String) -> Result<(), String> {
+    permission_settings::open(&permission)
+}
+
 /// Get structured local capability snapshot via IPC.
 #[tauri::command]
 async fn ipc_capability_snapshot() -> Result<mrd_ipc::CapabilitySnapshot, String> {
@@ -5033,6 +5040,7 @@ fn main() {
             ipc_unbind_public_device,
             ipc_audit_log,
             ipc_capability_snapshot,
+            open_macos_permission_settings,
             ipc_peer_capability_snapshot,
             ipc_service_health,
             ipc_probe_snapshot,

@@ -119,6 +119,9 @@ pub async fn shell_status(app_state: &Arc<AppState>) -> IpcResponse {
     IpcResponse::ShellStatus {
         status: mrd_ipc::ShellStatusSnapshot {
             service_pid: std::process::id(),
+            service_executable_path: std::env::current_exe()
+                .ok()
+                .and_then(|path| path.to_str().map(str::to_owned)),
             ui_pid: shell.ui_pid,
             tray_available: shell.tray_available,
             autostart_enabled: shell.autostart_enabled,

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TitleBar } from './TitleBar';
 
 const mocks = vi.hoisted(() => ({ snapshot: vi.fn(), window: vi.fn() }));
-vi.mock('../adapters/tauri/commands', () => ({ ipcCapabilitySnapshot: mocks.snapshot }));
+vi.mock('../adapters/tauri/commands', () => ({ ipcCapabilitySnapshot: mocks.snapshot, shellGetStatus: async () => ({ ok: false }), openMacosPermissionSettings: vi.fn() }));
 vi.mock('./ThemeContext', () => ({ useTheme: () => ({ isDark: false }) }));
 vi.mock('./AuthContext', () => ({ useAuth: () => ({ logout: vi.fn(), logoutError: null }) }));
 vi.mock('./DetailBarContext', () => ({ useDetailBar: () => ({ collapsed: false, payload: null }) }));

@@ -24,6 +24,8 @@
   <true/>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Rdesk Service captures the screen you share during an approved remote desktop session.</string>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Rdesk needs local network access to discover devices and establish remote desktop sessions.</string>
 </dict>

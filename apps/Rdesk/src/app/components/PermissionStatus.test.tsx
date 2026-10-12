@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CapabilitySnapshot, CapabilityStatus } from '../adapters/tauri/types';
 import { PermissionStatus } from './PermissionStatus';
 
-const mocks = vi.hoisted(() => ({ snapshot: vi.fn() }));
-vi.mock('../adapters/tauri/commands', () => ({ ipcCapabilitySnapshot: mocks.snapshot }));
+const mocks = vi.hoisted(() => ({ snapshot: vi.fn(), service: vi.fn(), settings: vi.fn() }));
+vi.mock('../adapters/tauri/commands', () => ({ ipcCapabilitySnapshot: mocks.snapshot, shellGetStatus: mocks.service, openMacosPermissionSettings: mocks.settings }));
 vi.mock('./ThemeContext', () => ({ useTheme: () => ({ isDark: false }) }));
 
 function snapshot(capture: CapabilityStatus = 'available', input: CapabilityStatus = 'available'): CapabilitySnapshot {
@@ -24,6 +24,8 @@ function trigger() { return screen.getByRole('button', { name: /^本机系统权
 describe('local system permission status', () => {
   beforeEach(() => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-11T08:00:00Z')); native();
+    mocks.service.mockReset().mockResolvedValue({ ok: true, value: { service_pid: 412, service_executable_path: '/Applications/Rdesk.app/Contents/Resources/Rdesk Service.app/Contents/MacOS/mrd-service' } });
+    mocks.settings.mockReset().mockResolvedValue({ ok: true });
     mocks.snapshot.mockReset().mockImplementation(async () => ({ ok: true, value: snapshot() }));
   });
   afterEach(() => { cleanup(); native(false); vi.useRealTimers(); });
@@ -160,4 +162,66 @@ describe('local system permission status', () => {
     const view = render(<PermissionStatus />); await tick(); view.unmount(); await tick(10_000);
     expect(mocks.snapshot).toHaveBeenCalledTimes(1);
   });
+  it('identifies the running service and does not infer trust from the GUI', async () => {
+    mocks.snapshot.mockResolvedValue({ ok: true, value: snapshot('permission_missing', 'permission_missing') });
+    render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick(3_000);
+    expect(screen.getByText(/Contents\/MacOS\/mrd-service.*PID 412/)).toBeInTheDocument();
+    expect(screen.getByText(/仅授权 Rdesk 界面不能证明服务已获授权/)).toBeInTheDocument();
+    expect(screen.getByText(/缺少权限本身不代表必须重启/)).toBeInTheDocument();
+    expect(mocks.settings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '打开录屏设置' })); await tick();
+    expect(mocks.settings).toHaveBeenCalledWith('screen_capture');
+    expect(trigger()).toHaveAccessibleName('本机系统权限：录屏待授权，键鼠待授权');
+    fireEvent.click(screen.getByRole('button', { name: '打开辅助功能设置' })); await tick();
+    expect(mocks.settings).toHaveBeenLastCalledWith('accessibility');
+  });
+
+  it('rechecks service permission after returning from Settings', async () => {
+    mocks.snapshot.mockImplementation(async () => ({ ok: true, value: snapshot('permission_missing') }));
+    render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick(3_000);
+    fireEvent.click(screen.getByRole('button', { name: '打开录屏设置' })); await tick();
+    mocks.snapshot.mockImplementation(async () => ({ ok: true, value: snapshot() }));
+    fireEvent.focus(window); await tick(3_000);
+    expect(trigger()).toHaveAccessibleName('本机系统权限：录屏可用，键鼠可用');
+    // Revocation is reflected by the service, without requesting new grants.
+    mocks.snapshot.mockImplementation(async () => ({ ok: true, value: snapshot('permission_missing') }));
+    fireEvent.focus(window); await tick(3_000);
+    expect(trigger()).toHaveAccessibleName('本机系统权限：录屏待授权，键鼠可用');
+  });
+
+  it('does not invent an installed path when an older service omits identity', async () => {
+    mocks.service.mockResolvedValue({ ok: true, value: { service_pid: 412 } });
+    render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick(3_000);
+    expect(screen.getByText(/未能确认服务程序路径/)).toBeInTheDocument();
+    expect(screen.queryByText(/服务程序：/)).not.toBeInTheDocument();
+  });
+
+  it('retains manual navigation and status when opening Settings fails', async () => {
+    mocks.settings.mockRejectedValue(new Error('private internal failure'));
+    render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick(3_000);
+    fireEvent.click(screen.getByRole('button', { name: '打开辅助功能设置' })); await tick();
+    expect(screen.getByText(/未能打开系统设置，请按照上面的路径手动打开/)).toBeInTheDocument();
+    expect(screen.queryByText(/private internal failure/)).not.toBeInTheDocument();
+    expect(trigger()).toHaveAccessibleName('本机系统权限：录屏可用，键鼠可用');
+  });
+
+  it('coalesces repeated Settings clicks and safely completes after unmount', async () => {
+    let finish!: (value: unknown) => void;
+    mocks.settings.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const view = render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick(3_000);
+    const button = screen.getByRole('button', { name: '打开录屏设置' });
+    fireEvent.click(button); fireEvent.click(button); await tick();
+    expect(mocks.settings).toHaveBeenCalledTimes(1); expect(button).toBeDisabled();
+    view.unmount(); await act(async () => { finish({ ok: true }); });
+    expect(view.container).toBeEmptyDOMElement();
+  });
+
+  it('never shows macOS Settings actions for Windows', async () => {
+    const value = snapshot(); value.platform = 'windows';
+    mocks.snapshot.mockResolvedValue({ ok: true, value });
+    render(<PermissionStatus />); await tick(3_000); fireEvent.click(trigger()); await tick();
+    expect(screen.queryByRole('button', { name: '打开录屏设置' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Rdesk Service/)).not.toBeInTheDocument();
+  });
+
 });

@@ -1566,6 +1566,13 @@ export async function ipcAuditLog(
   return invokeAdapter<AuditEvent[]>('ipc_audit_log', { query });
 }
 
+/** Open a fixed macOS Settings destination. A successful open is not a grant. */
+export async function openMacosPermissionSettings(
+  permission: 'screen_capture' | 'accessibility',
+): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('open_macos_permission_settings', { permission });
+}
+
 /**
  * Get structured local capability snapshot from mrd-service.
  */

@@ -220,6 +220,9 @@ mod wire {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct ShellStatusSnapshot {
         pub service_pid: u32,
+        /// Executable reported by the running service, never inferred from the UI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_executable_path: Option<String>,
         pub ui_pid: Option<u32>,
         pub tray_available: bool,
         pub autostart_enabled: Option<bool>,

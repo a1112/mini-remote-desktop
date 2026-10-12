@@ -2006,3 +2006,17 @@ fn remote_session_event_tags_are_exhaustive_and_stable() {
         );
     }
 }
+
+#[test]
+fn shell_status_identity_is_optional_for_older_services() {
+    let old = serde_json::json!({
+        "service_pid": 42, "ui_pid": null, "tray_available": false,
+        "autostart_enabled": null, "active_session_count": 0, "last_error": null
+    });
+    let mut status: mrd_ipc::ShellStatusSnapshot = serde_json::from_value(old.clone()).unwrap();
+    assert!(status.service_executable_path.is_none());
+    assert_eq!(serde_json::to_value(&status).unwrap(), old);
+    status.service_executable_path = Some("/Applications/Rdesk Service.app/Contents/MacOS/mrd-service".into());
+    let encoded = serde_json::to_value(&status).unwrap();
+    assert_eq!(encoded["service_executable_path"], status.service_executable_path.unwrap());
+}

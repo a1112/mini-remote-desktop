@@ -635,6 +635,7 @@ export interface UiPreferences {
 
 export interface ShellStatusSnapshot {
   service_pid: number;
+  service_executable_path?: string | null;
   ui_pid: number | null;
   tray_available: boolean;
   autostart_enabled: boolean | null;
