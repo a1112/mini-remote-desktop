@@ -13,6 +13,7 @@ use rcgen::{
     date_time_ymd, BasicConstraints, CertificateParams, CertificateSigningRequestParams,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
 };
+use secrecy::ExposeSecret;
 use std::sync::atomic::AtomicUsize;
 
 const NOW: i64 = 1_800_000_000;
@@ -79,11 +80,23 @@ impl JitterPort for Jitter {
     }
 }
 
-struct Metrics;
+struct NativeState {
+    stopped: AtomicBool,
+    warmed: AtomicBool,
+    non_evidence: AtomicBool,
+    remain_cold: AtomicBool,
+    changed_generation: AtomicBool,
+    active_allocations: AtomicUsize,
+}
+
+struct Metrics(Arc<NativeState>);
 
 #[async_trait]
 impl MetricsPort for Metrics {
     async fn collect(&self) -> Result<CoturnMetrics, MetricsError> {
+        if self.0.stopped.load(Ordering::SeqCst) || !self.0.warmed.load(Ordering::SeqCst) {
+            return Err(MetricsError::Unavailable);
+        }
         Ok(CoturnMetrics::default())
     }
 }
@@ -91,12 +104,46 @@ impl MetricsPort for Metrics {
 struct Coturn {
     probe_delay: Option<Duration>,
     applied: Mutex<Vec<u64>>,
+    native: Arc<NativeState>,
+    drain_error: Mutex<Option<ProcessError>>,
+    apply_error: Mutex<Option<ProcessError>>,
+    drain_checks: AtomicUsize,
+    probes: AtomicUsize,
 }
 
 #[async_trait]
 impl CoturnRuntimePort for Coturn {
     async fn snapshot(&self) -> Result<CoturnSnapshot, ProcessError> {
-        Ok(CoturnSnapshot::healthy(0, 0).with_generation(7, 2))
+        let mut snapshot = CoturnSnapshot::healthy(0, 0).with_generation(7, 2);
+        if self.native.stopped.load(Ordering::SeqCst) {
+            snapshot.generation = 6;
+            snapshot.applied_secret_version = 1;
+            snapshot.health = ProcessHealth::Degraded;
+        } else if !self.native.warmed.load(Ordering::SeqCst) {
+            snapshot.health = ProcessHealth::Failed;
+        }
+        if self.native.changed_generation.load(Ordering::SeqCst)
+            && self.probes.load(Ordering::SeqCst) > 0
+        {
+            snapshot.generation += 1;
+        }
+        snapshot.active_allocations = self
+            .native
+            .active_allocations
+            .load(Ordering::SeqCst)
+            .try_into()
+            .unwrap();
+        Ok(snapshot)
+    }
+
+    async fn verify_completed_drain(&self, expected: &CoturnSnapshot) -> Result<(), ProcessError> {
+        self.drain_checks.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(expected.generation, 6);
+        assert_eq!(expected.applied_secret_version, 1);
+        if let Some(error) = self.drain_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn restart(&self) -> Result<(), ProcessError> {
@@ -105,6 +152,10 @@ impl CoturnRuntimePort for Coturn {
 
     async fn apply_secret(&self, version: u64, _secret: SecretBytes) -> Result<(), ProcessError> {
         self.applied.lock().unwrap().push(version);
+        if let Some(error) = self.apply_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        self.native.stopped.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -119,6 +170,13 @@ impl CoturnRuntimePort for Coturn {
         } else {
             return std::future::pending().await;
         }
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        if !self.native.remain_cold.load(Ordering::SeqCst) {
+            self.native.warmed.store(true, Ordering::SeqCst);
+        }
+        if self.native.non_evidence.load(Ordering::SeqCst) {
+            return Ok(AllocationProbeEvidence::NonEvidence);
+        }
         // This crate-private test constructor leaves the production evidence
         // boundary intact; the worker still checks generation and secret version.
         Ok(AllocationProbeEvidence::Live(
@@ -132,6 +190,8 @@ struct Backend {
     heartbeats: Mutex<Vec<SignedHeartbeat>>,
     commits: Mutex<Vec<SecretCommitRequest>>,
     statuses: Mutex<Vec<SecretRotationStatusRequest>>,
+    uploads: Mutex<Vec<SecretUploadRequest>>,
+    upload_error: Mutex<Option<BackendError>>,
     hang_commit: bool,
 }
 
@@ -180,8 +240,12 @@ impl RelayBackendPort for Backend {
         })
     }
 
-    async fn upload_secret(&self, _request: SecretUploadRequest) -> Result<(), BackendError> {
-        panic!("an uploaded rotation must not upload again")
+    async fn upload_secret(&self, request: SecretUploadRequest) -> Result<(), BackendError> {
+        self.uploads.lock().unwrap().push(request);
+        if let Some(error) = self.upload_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn commit_secret(&self, request: SecretCommitRequest) -> Result<(), BackendError> {
@@ -222,6 +286,7 @@ struct Fixture {
     slot: Arc<SwappableRelayBackend>,
     store: Arc<StateStore>,
     sampler: HeartbeatSampler<Metrics>,
+    native: Arc<NativeState>,
 }
 
 impl Fixture {
@@ -274,6 +339,14 @@ impl Fixture {
             pending_rotation: Some(pending),
             ..RuntimeStateSnapshot::default()
         })));
+        let native = Arc::new(NativeState {
+            stopped: AtomicBool::new(false),
+            warmed: AtomicBool::new(true),
+            non_evidence: AtomicBool::new(false),
+            remain_cold: AtomicBool::new(false),
+            changed_generation: AtomicBool::new(false),
+            active_allocations: AtomicUsize::new(0),
+        });
         let backend = Arc::new(Backend {
             heartbeat_successes: AtomicUsize::new(usize::from(
                 phase != SecretRotationPhase::CommitUnknown,
@@ -281,6 +354,8 @@ impl Fixture {
             heartbeats: Mutex::default(),
             commits: Mutex::default(),
             statuses: Mutex::default(),
+            uploads: Mutex::default(),
+            upload_error: Mutex::default(),
             hang_commit,
         });
         let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
@@ -289,6 +364,11 @@ impl Fixture {
             Arc::new(Coturn {
                 probe_delay,
                 applied: Mutex::default(),
+                native: native.clone(),
+                drain_error: Mutex::default(),
+                apply_error: Mutex::default(),
+                drain_checks: AtomicUsize::new(0),
+                probes: AtomicUsize::new(0),
             }),
             clock,
             Arc::new(Sleeper),
@@ -297,7 +377,7 @@ impl Fixture {
         )
         .unwrap();
         let sampler = HeartbeatSampler::new(
-            Arc::new(Metrics),
+            Arc::new(Metrics(native.clone())),
             vec!["turn:relay.example:3478?transport=udp".into()],
             100,
             1_000_000,
@@ -310,6 +390,7 @@ impl Fixture {
             slot,
             store,
             sampler,
+            native,
         }
     }
 
@@ -385,7 +466,7 @@ async fn production_slow_rotation_probe_commits_before_advertising_new_version()
     );
     fixture.assert_committed();
     assert_eq!(fixture.backend.commits.lock().unwrap().len(), 1);
-    assert_eq!(fixture.heartbeat_versions(), vec![1, 2]);
+    assert_eq!(fixture.heartbeat_versions(), vec![2, 2]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -452,7 +533,7 @@ async fn production_hung_rotation_probe_exits_with_applied_candidate_intact() {
     assert_eq!(pending.applied_generation, Some(7));
     assert_eq!(pending.probe_evidence_sha256, None);
     assert!(fixture.backend.commits.lock().unwrap().is_empty());
-    assert_eq!(fixture.heartbeat_versions(), vec![1]);
+    assert!(fixture.heartbeat_versions().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -474,7 +555,7 @@ async fn production_hung_rotation_commit_exits_with_unknown_outcome_intact() {
     assert_eq!(pending.probe_generation, Some(7));
     assert_eq!(pending.probe_evidence_sha256, Some([0x77; 32]));
     assert_eq!(fixture.backend.commits.lock().unwrap().len(), 1);
-    assert_eq!(fixture.heartbeat_versions(), vec![1]);
+    assert!(fixture.heartbeat_versions().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -491,5 +572,254 @@ async fn production_hung_rotation_reconciliation_never_advertises_old_version() 
     assert_eq!(state.secret_version, 1);
     assert_eq!(state.pending_rotation.unwrap(), original);
     assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+}
+
+fn stopped_uploaded_fixture() -> Fixture {
+    let fixture = Fixture::new(SecretRotationPhase::Uploaded, Some(Duration::ZERO), false);
+    fixture.native.stopped.store(true, Ordering::SeqCst);
+    fixture.native.warmed.store(false, Ordering::SeqCst);
+    fixture
+}
+
+#[tokio::test(start_paused = true)]
+async fn production_stopped_uploaded_rotation_resumes_before_native_metrics() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture
+        .backend
+        .heartbeat_successes
+        .store(0, Ordering::SeqCst);
+    let original = fixture.store.load().unwrap().pending_rotation.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(15), fixture.run(false)).await;
+    assert_eq!(
+        result,
+        Ok(Err(RuntimeError::Backend(BackendError::ProtocolInvalid))),
+        "pending Uploaded must not depend on a heartbeat whose native metrics are unavailable"
+    );
+    fixture.assert_committed();
+    let uploads = fixture.backend.uploads.lock().unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].identity_epoch, original.identity_epoch);
+    assert_eq!(uploads[0].rotation_id, original.rotation_id);
+    assert_eq!(uploads[0].secret_version, original.secret_version);
+    assert_eq!(
+        uploads[0].turn_rest_secret.expose_secret(),
+        original.turn_rest_secret.expose()
+    );
+    assert_eq!(
+        fixture.runtime.coturn.applied.lock().unwrap().as_slice(),
+        &[2]
+    );
+    assert_eq!(fixture.heartbeat_versions(), vec![2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn once_stopped_uploaded_rotation_resumes_before_native_metrics() {
+    let mut fixture = stopped_uploaded_fixture();
+    assert_eq!(fixture.run(true).await, Ok(()));
+    fixture.assert_committed();
+    assert_eq!(fixture.heartbeat_versions(), vec![2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_pending_rotation_rejects_revoked_identity_before_apply() {
+    let mut fixture = stopped_uploaded_fixture();
+    *fixture.backend.upload_error.lock().unwrap() = Some(BackendError::Unauthorized);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Backend(BackendError::Unauthorized))
+    );
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_pending_rotation_rejects_stale_upload_body_before_apply() {
+    let mut fixture = stopped_uploaded_fixture();
+    *fixture.backend.upload_error.lock().unwrap() = Some(BackendError::Conflict);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Backend(BackendError::Conflict))
+    );
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_pending_rotation_requires_verified_drain_before_physical_apply() {
+    let mut fixture = stopped_uploaded_fixture();
+    *fixture.runtime.coturn.drain_error.lock().unwrap() = Some(ProcessError::ProbeInvalid);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Process(ProcessError::ProbeInvalid))
+    );
+    assert_eq!(
+        fixture.runtime.coturn.drain_checks.load(Ordering::SeqCst),
+        1
+    );
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn already_bound_applied_cold_generation_warms_by_real_probe_without_apply() {
+    let mut fixture = Fixture::new(SecretRotationPhase::Applied, Some(Duration::ZERO), false);
+    fixture.native.warmed.store(false, Ordering::SeqCst);
+    fixture
+        .runtime
+        .pending_rotation
+        .as_mut()
+        .unwrap()
+        .applied_generation = Some(7);
+    assert_eq!(fixture.run(true).await, Ok(()));
+    fixture.assert_committed();
+    assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 1);
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.runtime.coturn.drain_checks.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unbound_same_version_cold_restart_verifies_material_then_real_probe() {
+    let mut fixture = Fixture::new(SecretRotationPhase::Applied, Some(Duration::ZERO), false);
+    fixture.native.warmed.store(false, Ordering::SeqCst);
+    assert_eq!(fixture.run(true).await, Ok(()));
+    fixture.assert_committed();
+    assert_eq!(
+        fixture.runtime.coturn.applied.lock().unwrap().as_slice(),
+        &[2]
+    );
+    assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.runtime.coturn.drain_checks.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn resumed_rotation_non_evidence_never_commits_or_advertises_candidate() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture.native.non_evidence.store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Process(ProcessError::ProbeInvalid))
+    );
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn resumed_rotation_generation_change_during_probe_never_commits() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture
+        .native
+        .changed_generation
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Process(ProcessError::ProbeInvalid))
+    );
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_rotation_does_not_turn_unavailable_metrics_into_a_heartbeat() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture
+        .runtime
+        .pending_rotation
+        .as_mut()
+        .unwrap()
+        .old_credential_deadline_unix_seconds = NOW + 30;
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::MetricsUnavailable)
+    );
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.runtime.coturn.drain_checks.load(Ordering::SeqCst),
+        0
+    );
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn live_allocations_still_delay_resumed_rotation() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture.native.active_allocations.store(1, Ordering::SeqCst);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::MetricsUnavailable)
+    );
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
+    assert!(fixture.backend.heartbeats.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.runtime.coturn.drain_checks.load(Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopped_intent_uses_existing_upload_before_resuming_rotation() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture.runtime.pending_rotation.as_mut().unwrap().phase = SecretRotationPhase::Intent;
+    assert_eq!(fixture.run(true).await, Ok(()));
+    fixture.assert_committed();
+    assert_eq!(fixture.backend.uploads.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unbound_same_version_bad_material_is_rejected_before_probe() {
+    let mut fixture = Fixture::new(SecretRotationPhase::Applied, Some(Duration::ZERO), false);
+    fixture.native.warmed.store(false, Ordering::SeqCst);
+    *fixture.runtime.coturn.apply_error.lock().unwrap() = Some(ProcessError::SecretApplyFailed);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Process(ProcessError::SecretApplyFailed))
+    );
+    assert_eq!(
+        fixture.runtime.coturn.applied.lock().unwrap().as_slice(),
+        &[2]
+    );
+    assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 0);
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn real_probe_without_healthy_native_snapshot_never_commits() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture.native.remain_cold.store(true, Ordering::SeqCst);
+    assert_eq!(
+        fixture.run(true).await,
+        Err(RuntimeError::Process(ProcessError::ProbeInvalid))
+    );
+    assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 1);
+    assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    assert_eq!(fixture.store.load().unwrap().secret_version, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_rotation_wrong_identity_epoch_is_rejected_before_upload() {
+    let mut fixture = stopped_uploaded_fixture();
+    fixture
+        .runtime
+        .pending_rotation
+        .as_mut()
+        .unwrap()
+        .identity_epoch = 2;
+    assert_eq!(fixture.run(true).await, Err(RuntimeError::DirectiveReplay));
+    assert!(fixture.backend.uploads.lock().unwrap().is_empty());
+    assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
     assert!(fixture.backend.commits.lock().unwrap().is_empty());
 }

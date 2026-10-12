@@ -1043,6 +1043,29 @@ impl CoturnRuntimePort for PlatformCoturnRuntime {
         Ok(observed.snapshot)
     }
 
+    async fn verify_completed_drain(&self, expected: &CoturnSnapshot) -> Result<(), ProcessError> {
+        if expected.generation == 0 || expected.active_allocations != 0 {
+            return Err(ProcessError::ProbeInvalid);
+        }
+        let mut challenge = [0_u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut challenge)
+            .map_err(|_| ProcessError::ProbeUnavailable)?;
+        let proof = self.drain_proof(challenge).await?;
+        if proof.generation != expected.generation
+            || proof.applied_secret_version != expected.applied_secret_version
+        {
+            return Err(ProcessError::ProbeInvalid);
+        }
+        let current = CoturnRuntimePort::snapshot(self).await?;
+        if current.generation != expected.generation
+            || current.applied_secret_version != expected.applied_secret_version
+            || current.active_allocations != 0
+        {
+            return Err(ProcessError::ProbeInvalid);
+        }
+        Ok(())
+    }
+
     async fn restart(&self) -> Result<(), ProcessError> {
         let observed = self
             .control_snapshot(BrokerRequest::restart(self.target))

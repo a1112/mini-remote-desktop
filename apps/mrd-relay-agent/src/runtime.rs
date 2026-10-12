@@ -46,6 +46,14 @@ const ALLOCATION_PROOF_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+fn rotation_resume_timeout(reconciliation_required: bool) -> RuntimeError {
+    if reconciliation_required {
+        RuntimeError::Backend(BackendError::Unavailable)
+    } else {
+        RuntimeError::Process(ProcessError::ProbeUnavailable)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate_pending_rotation(
     identity_epoch: u64,
@@ -709,18 +717,21 @@ where
     if let IdentityMaintenance::Renewed { identity_epoch } = maintenance {
         runtime.activate_identity_epoch(identity_epoch)?;
     }
-    if runtime.rotation_requires_reconcile_before_heartbeat() {
+    let reconciliation_required = runtime.rotation_requires_reconcile_before_heartbeat();
+    if runtime.has_pending_rotation() {
         let reconciled = if wait_for_deadline {
-            runtime.advance_secret_rotation(identity).await?
+            runtime
+                .resume_secret_rotation_before_heartbeat(identity)
+                .await?
         } else {
             tokio::time::timeout(
                 SECRET_ROTATION_TIMEOUT,
-                runtime.advance_secret_rotation(identity),
+                runtime.resume_secret_rotation_before_heartbeat(identity),
             )
             .await
-            .map_err(|_| RuntimeError::Backend(BackendError::Unavailable))??
+            .map_err(|_| rotation_resume_timeout(reconciliation_required))??
         };
-        if !reconciled {
+        if reconciliation_required && !reconciled {
             return Err(RuntimeError::Backend(BackendError::Unavailable));
         }
     }
@@ -1013,14 +1024,15 @@ where
             continue;
         }
 
-        if runtime.rotation_requires_reconcile_before_heartbeat() {
+        let reconciliation_required = runtime.rotation_requires_reconcile_before_heartbeat();
+        if runtime.has_pending_rotation() {
             let reconciled = tokio::time::timeout(
                 SECRET_ROTATION_TIMEOUT,
-                runtime.advance_secret_rotation(identity),
+                runtime.resume_secret_rotation_before_heartbeat(identity),
             )
             .await
-            .map_err(|_| RuntimeError::Backend(BackendError::Unavailable))??;
-            if !reconciled {
+            .map_err(|_| rotation_resume_timeout(reconciliation_required))??;
+            if reconciliation_required && !reconciled {
                 return Err(RuntimeError::Backend(BackendError::Unavailable));
             }
         }
@@ -2824,6 +2836,44 @@ where
         Ok(())
     }
 
+    async fn resume_secret_rotation_before_heartbeat<F: IdentityFsPort>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+    ) -> Result<bool, RuntimeError> {
+        if let Some(pending) = self.pending_rotation.as_ref() {
+            if pending.identity_epoch != self.identity_epoch
+                || identity.identity_epoch() != self.identity_epoch
+            {
+                return Err(RuntimeError::DirectiveReplay);
+            }
+            if !self.draining {
+                return Err(RuntimeError::SecretUpdateUnsafe);
+            }
+            if matches!(
+                pending.phase,
+                SecretRotationPhase::Uploaded
+                    | SecretRotationPhase::Applied
+                    | SecretRotationPhase::Probed
+            ) {
+                // A restart may outlive a remote revocation or a changed
+                // rotation. Reauthorize the exact sealed candidate through
+                // the existing authenticated, idempotent upload endpoint.
+                // CommitUnknown must instead use its existing status path.
+                let request = identity.prepare_secret_upload(
+                    self.clock.unix_seconds(),
+                    pending.rotation_id.clone(),
+                    pending.secret_version,
+                    SecretString::from(pending.turn_rest_secret.expose().to_owned()),
+                )?;
+                self.backend
+                    .upload_secret(request)
+                    .await
+                    .map_err(RuntimeError::Backend)?;
+            }
+        }
+        self.advance_secret_rotation(identity).await
+    }
+
     pub async fn advance_secret_rotation<F: IdentityFsPort>(
         &mut self,
         identity: &mut CertificateState<F>,
@@ -2970,9 +3020,19 @@ where
         }
         if pending.phase == SecretRotationPhase::Applied {
             let needs_apply = pending.applied_generation != Some(snapshot.generation)
-                || snapshot.applied_secret_version != pending.secret_version
-                || snapshot.health != ProcessHealth::Healthy;
+                || snapshot.applied_secret_version != pending.secret_version;
             if needs_apply {
+                if snapshot.applied_secret_version != pending.secret_version
+                    && snapshot.health != ProcessHealth::Healthy
+                {
+                    // An unavailable native scrape is represented as zero in
+                    // a broker snapshot. Only its existing challenge-bound
+                    // completed-drain proof can authorize this physical apply.
+                    self.coturn
+                        .verify_completed_drain(&snapshot)
+                        .await
+                        .map_err(RuntimeError::Process)?;
+                }
                 // Persist a replayable needs-apply state before changing coturn.
                 // A crash after apply will therefore repeat the idempotent
                 // versioned operation instead of trusting an unbound version.
@@ -2996,7 +3056,6 @@ where
                     .map_err(RuntimeError::Process)?;
                 if snapshot.generation == 0
                     || snapshot.applied_secret_version != pending.secret_version
-                    || snapshot.health != ProcessHealth::Healthy
                 {
                     return Err(RuntimeError::Process(ProcessError::ProbeInvalid));
                 }
@@ -3004,6 +3063,9 @@ where
                 self.persist_pending_rotation(pending.clone())?;
             }
 
+            // A cold native exporter may have no samples until this actual
+            // roundtrip. Exact material/generation is already verified; the
+            // post-probe and final Healthy checks remain mandatory.
             let before = snapshot;
             let evidence = self
                 .coturn
@@ -3972,5 +4034,18 @@ mod identifier_tests {
         let committed = state_store.0.lock().unwrap();
         assert_eq!(committed.secret_version, 2);
         assert!(committed.pending_rotation.is_none());
+    }
+
+    #[tokio::test]
+    async fn unsupported_coturn_adapter_cannot_verify_a_completed_drain() {
+        let coturn = TestCoturn::default();
+        assert_eq!(
+            coturn
+                .verify_completed_drain(&CoturnSnapshot::healthy(0, 0))
+                .await,
+            Err(ProcessError::ProbeInvalid)
+        );
+        assert!(coturn.snapshots.lock().unwrap().is_empty());
+        assert!(coturn.applied_secret_versions.lock().unwrap().is_empty());
     }
 }

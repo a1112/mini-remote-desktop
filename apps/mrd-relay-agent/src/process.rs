@@ -331,6 +331,12 @@ impl ProcessError {
 #[async_trait]
 pub trait CoturnRuntimePort: Send + Sync {
     async fn snapshot(&self) -> Result<CoturnSnapshot, ProcessError>;
+    /// A missing allocation scrape is not proof of zero allocations. Adapters
+    /// may authorize a degraded new-version apply only with a fresh, exact
+    /// broker proof of a completed drain. Unsupported adapters fail closed.
+    async fn verify_completed_drain(&self, _expected: &CoturnSnapshot) -> Result<(), ProcessError> {
+        Err(ProcessError::ProbeInvalid)
+    }
     async fn restart(&self) -> Result<(), ProcessError>;
     async fn apply_secret(&self, version: u64, secret: SecretBytes) -> Result<(), ProcessError>;
     async fn set_draining(&self, draining: bool) -> Result<(), ProcessError>;

@@ -32,7 +32,7 @@ use mrd_relay_agent::{
         BrokerAction, BrokerControlPort, BrokerRequest, CommandOutput, CommandPlan, CoturnTarget,
         PlatformCoturnRuntime, PlatformExpectation, TransportCapability,
     },
-    process::{CoturnRuntimePort, ProcessError, SecretBytes},
+    process::{CoturnRuntimePort, CoturnSnapshot, ProcessError, SecretBytes},
 };
 use sha2::{Digest as _, Sha256};
 
@@ -1624,4 +1624,138 @@ fn assert_literal_plan(plan: &CommandPlan) {
         matches!(argument.as_ref(), "-c" | "/c" | "/k" | "--command")
             || argument.contains(['*', '?', '[', ']'])
     }));
+}
+
+struct CompletedDrainBroker {
+    proof_generation: u64,
+    proof_version: u64,
+    current_generation: u64,
+    current_version: u64,
+    invalid_field: Option<(&'static str, &'static str)>,
+}
+
+#[async_trait]
+impl BrokerControlPort for CompletedDrainBroker {
+    async fn exchange(&self, request: BrokerRequest) -> Result<CommandOutput, ProcessError> {
+        assert_eq!(request.action(), BrokerAction::Snapshot);
+        let output = if let Some(challenge) = request.snapshot_challenge() {
+            drain_proof_response(
+                request.target(),
+                self.proof_generation,
+                self.proof_version,
+                challenge,
+            )
+        } else {
+            snapshot(
+                request.target(),
+                self.current_generation,
+                self.current_version,
+                true,
+            )
+        };
+        if let Some((old, new)) = self.invalid_field {
+            let body = String::from_utf8(output.stdout().to_vec())
+                .unwrap()
+                .replace(old, new);
+            Ok(CommandOutput::new(0, body.into_bytes()))
+        } else {
+            Ok(output)
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_drain_verifier_accepts_exact_challenge_bound_proof_and_fresh_snapshot() {
+    let broker = Arc::new(CompletedDrainBroker {
+        proof_generation: 12,
+        proof_version: 7,
+        current_generation: 12,
+        current_version: 7,
+        invalid_field: None,
+    });
+    let runtime =
+        PlatformCoturnRuntime::new(CoturnTarget::LinuxSystemd, broker, platform_expectation())
+            .unwrap();
+    let expected = CoturnSnapshot::healthy(0, 0).with_generation(12, 7);
+    assert_eq!(runtime.verify_completed_drain(&expected).await, Ok(()));
+}
+
+#[tokio::test]
+async fn completed_drain_verifier_rejects_stale_or_untrusted_proof_and_snapshot() {
+    let expected = CoturnSnapshot::healthy(0, 0).with_generation(12, 7);
+    for (name, proof_gen, proof_version, current_gen, current_version, invalid_field) in [
+        ("proof_generation", 11, 7, 12, 7, None),
+        ("proof_version", 12, 6, 12, 7, None),
+        ("changed_generation", 12, 7, 13, 7, None),
+        ("changed_version", 12, 7, 12, 8, None),
+        (
+            "not_draining",
+            12,
+            7,
+            12,
+            7,
+            Some(("\"draining\":true", "\"draining\":false")),
+        ),
+        (
+            "unclean_drain",
+            12,
+            7,
+            12,
+            7,
+            Some(("\"drain_completed\":true", "\"drain_completed\":false")),
+        ),
+        (
+            "live_allocations",
+            12,
+            7,
+            12,
+            7,
+            Some(("\"active_allocations\":0", "\"active_allocations\":1")),
+        ),
+        (
+            "wrong_target",
+            12,
+            7,
+            12,
+            7,
+            Some(("linux-systemd", "docker")),
+        ),
+        (
+            "wrong_scope",
+            12,
+            7,
+            12,
+            7,
+            Some(("\"scope\":\"local\"", "\"scope\":\"remote\"")),
+        ),
+    ] {
+        let broker = Arc::new(CompletedDrainBroker {
+            proof_generation: proof_gen,
+            proof_version,
+            current_generation: current_gen,
+            current_version,
+            invalid_field,
+        });
+        let runtime =
+            PlatformCoturnRuntime::new(CoturnTarget::LinuxSystemd, broker, platform_expectation())
+                .unwrap();
+        assert_eq!(
+            runtime.verify_completed_drain(&expected).await,
+            Err(ProcessError::ProbeInvalid),
+            "{name}"
+        );
+    }
+    let ordinary = Arc::new(FakeBroker::with_outputs([snapshot(
+        CoturnTarget::LinuxSystemd,
+        12,
+        7,
+        true,
+    )]));
+    let runtime =
+        PlatformCoturnRuntime::new(CoturnTarget::LinuxSystemd, ordinary, platform_expectation())
+            .unwrap();
+    assert_eq!(
+        runtime.verify_completed_drain(&expected).await,
+        Err(ProcessError::ProbeInvalid)
+    );
 }
