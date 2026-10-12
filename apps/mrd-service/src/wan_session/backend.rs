@@ -717,18 +717,23 @@ impl HttpWanSessionBackend {
         endpoint: Url,
         body: Option<&B>,
         allow_retry: bool,
+        fixed_deadline: Option<Instant>,
     ) -> Result<Zeroizing<Vec<u8>>, WanSessionBackendError> {
         let body = body
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|_| WanSessionBackendError::InvalidRequest)?;
-        let deadline = Instant::now() + self.config.operation_deadline();
+        let deadline =
+            fixed_deadline.unwrap_or_else(|| Instant::now() + self.config.operation_deadline());
         let max_attempts = if allow_retry {
             self.config.max_attempts()
         } else {
             1
         };
         for attempt in 1..=max_attempts {
+            if Instant::now() >= deadline {
+                return Err(WanSessionBackendError::DeadlineExceeded);
+            }
             let mut authorization =
                 Zeroizing::new(format!("Bearer {}", self.config.device_token().as_str()));
             let mut authorization_header = HeaderValue::from_str(&authorization)
@@ -761,9 +766,14 @@ impl HttpWanSessionBackend {
             if !status.is_success() {
                 return Err(map_status(status));
             }
-            return match timeout_at(deadline, self.read_bounded(response)).await {
+            let result = match timeout_at(deadline, self.read_bounded(response)).await {
                 Err(_) => Err(WanSessionBackendError::DeadlineExceeded),
                 Ok(result) => result,
+            };
+            return if Instant::now() >= deadline {
+                Err(WanSessionBackendError::DeadlineExceeded)
+            } else {
+                result
             };
         }
         Err(WanSessionBackendError::Unavailable)
@@ -801,7 +811,7 @@ impl HttpWanSessionBackend {
         allow_retry: bool,
     ) -> Result<WanSessionRecord, WanSessionBackendError> {
         let bytes = self
-            .execute_json(method, self.endpoint(relative)?, body, allow_retry)
+            .execute_json(method, self.endpoint(relative)?, body, allow_retry, None)
             .await?;
         let record = parse_record(&bytes, binding)?;
         if expected_status.is_some_and(|expected| record.status != expected) {
@@ -905,6 +915,7 @@ impl WanSessionBackend for HttpWanSessionBackend {
         &self,
         request: &WanRelayAccessRequest,
     ) -> Result<WanRelayAccess, WanSessionBackendError> {
+        let operation_deadline = Instant::now() + self.config.operation_deadline();
         let context = if request.refresh {
             RelayAccessContext::for_refresh(
                 request.binding.session_id.0.clone(),
@@ -927,24 +938,79 @@ impl WanSessionBackend for HttpWanSessionBackend {
                 self.endpoint("relays/access")?,
                 Some(&context),
                 false,
+                Some(operation_deadline),
             )
             .await?;
-        let verified = verify_relay_access_response(
+        let verified = verify_access_response_before(
             &context,
             self.config.trusted_directory_keys(),
             &body,
-            system_now_ms(),
+            system_now_ms,
+            operation_deadline,
         )
-        .map_err(map_relay_error)?;
-        Ok(WanRelayAccess {
+        .await?;
+        let access = WanRelayAccess {
             binding: request.binding.clone(),
             generation: verified
                 .generation()
                 .ok_or(WanSessionBackendError::BindingMismatch)?,
             verified: Arc::new(verified),
-        })
+        };
+        if Instant::now() >= operation_deadline {
+            return Err(WanSessionBackendError::DeadlineExceeded);
+        }
+        Ok(access)
     }
 }
+
+async fn verify_access_response_before<C: Fn() -> u64>(
+    context: &RelayAccessContext,
+    trusted_keys: &std::collections::BTreeMap<String, Vec<u8>>,
+    body: &[u8],
+    clock: C,
+    operation_deadline: Instant,
+) -> Result<VerifiedRelayAccess, WanSessionBackendError> {
+    const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+    const MAX_VALIDITY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+    let mut validity_deadline = None;
+    loop {
+        let before = Instant::now();
+        if before >= operation_deadline {
+            return Err(WanSessionBackendError::DeadlineExceeded);
+        }
+        if validity_deadline.is_some_and(|deadline| before >= deadline) {
+            return Err(WanSessionBackendError::DirectoryNotYetValid);
+        }
+        // NotYetValid precedes signature verification. It is only permission
+        // to wait briefly, never a proof or a trustworthy remote clock value.
+        // Reuse the original bounded bytes and repeat every strict check.
+        let result = verify_relay_access_response(context, trusted_keys, body, clock());
+        let after = Instant::now();
+        if after >= operation_deadline {
+            return Err(WanSessionBackendError::DeadlineExceeded);
+        }
+        if validity_deadline.is_some_and(|deadline| after >= deadline) {
+            return Err(WanSessionBackendError::DirectoryNotYetValid);
+        }
+        match result {
+            Ok(verified) => return Ok(verified),
+            Err(RelayClientError::Directory(
+                mrd_relay_control::RelayDirectoryError::NotYetValid,
+            )) => {
+                let validity_deadline = *validity_deadline.get_or_insert(after + MAX_VALIDITY_WAIT);
+                let next = (after + RECHECK_INTERVAL)
+                    .min(operation_deadline)
+                    .min(validity_deadline);
+                tokio::time::sleep_until(next).await;
+            }
+            Err(error) => return Err(map_relay_error(error)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "backend_nyv_tests.rs"]
+mod nyv_reverify_tests;
 
 impl HttpWanSessionBackend {
     async fn transition(

@@ -103,6 +103,7 @@ struct CapturedRequest {
 enum FakeMode {
     Normal,
     FutureRelayDirectory,
+    FutureRelayDirectoryAfterDelay(Duration),
     Delay(Duration),
     FailFirst(StatusCode),
     AlwaysStatus(StatusCode, String),
@@ -217,7 +218,9 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
     };
 
     match &state.mode {
-        FakeMode::Delay(duration) => tokio::time::sleep(*duration).await,
+        FakeMode::Delay(duration) | FakeMode::FutureRelayDirectoryAfterDelay(duration) => {
+            tokio::time::sleep(*duration).await
+        }
         FakeMode::FailFirst(status) if request_number == 1 => {
             return Response::builder()
                 .status(*status)
@@ -307,7 +310,10 @@ fn session_response(state: &FakeState, status: &str) -> Value {
 }
 
 fn relay_access_response(state: &FakeState, generation: u64) -> Value {
-    let issued_at_ms = if matches!(state.mode, FakeMode::FutureRelayDirectory) {
+    let issued_at_ms = if matches!(
+        state.mode,
+        FakeMode::FutureRelayDirectory | FakeMode::FutureRelayDirectoryAfterDelay(_)
+    ) {
         now_ms().saturating_add(30_000)
     } else {
         now_ms().saturating_sub(1_000)
@@ -519,26 +525,91 @@ async fn typed_operations_bind_ids_and_send_only_the_device_token_header() {
 async fn future_relay_directory_rejection_survives_the_production_workflow_adapter() {
     let canonical_request = request();
     let expected_binding = binding(&canonical_request);
-    let server = FakeBackend::spawn_with_mode(
-        canonical_request.clone(),
-        FakeMode::FutureRelayDirectory,
-    )
-    .await;
+    let server =
+        FakeBackend::spawn_with_mode(canonical_request.clone(), FakeMode::FutureRelayDirectory)
+            .await;
     let device_auth = private_material("future-directory-device-auth");
     let backend: Arc<dyn WanSessionBackend> = Arc::new(
-        HttpWanSessionBackend::new(client_config(&server.base_url, &device_auth)).unwrap(),
+        HttpWanSessionBackend::new(client_config_with(
+            &server.base_url,
+            &device_auth,
+            Duration::from_secs(3),
+            64 * 1024,
+            1,
+        ))
+        .unwrap(),
     );
     let adapter = ServiceWanSessionWorkflowBackend::new(backend);
     let error = adapter
         .access_generation_zero(&expected_binding, 29, now_ms() + 5_000)
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "WAN session relay directory is not yet valid");
-    assert!(adapter.relay_access(&canonical_request.session_id).is_none());
+    assert_eq!(
+        error.to_string(),
+        "WAN session relay directory is not yet valid"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "local re-verification must not repeat the POST"
+    );
+    assert!(adapter
+        .relay_access(&canonical_request.session_id)
+        .is_none());
     assert_no_sensitive_text(
         &format!("{error:?} {error}"),
-        &[&device_auth, &server.state.turn_username, &server.state.turn_credential],
+        &[
+            &device_auth,
+            &server.state.turn_username,
+            &server.state.turn_credential,
+        ],
     );
+}
+
+#[tokio::test]
+async fn relay_access_response_and_reverification_share_the_original_http_deadline() {
+    let canonical_request = request();
+    let expected_binding = binding(&canonical_request);
+    let server = FakeBackend::spawn_with_mode(
+        canonical_request.clone(),
+        FakeMode::FutureRelayDirectoryAfterDelay(Duration::from_millis(80)),
+    )
+    .await;
+    let device_auth = private_material("delayed-directory-device-auth");
+    let budget = Duration::from_millis(250);
+    let backend: Arc<dyn WanSessionBackend> = Arc::new(
+        HttpWanSessionBackend::new(client_config_with(
+            &server.base_url,
+            &device_auth,
+            budget,
+            64 * 1024,
+            1,
+        ))
+        .unwrap(),
+    );
+    let adapter = ServiceWanSessionWorkflowBackend::new(backend);
+    let started = tokio::time::Instant::now();
+    let error = adapter
+        .access_generation_zero(&expected_binding, 29, now_ms() + 5_000)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        mrd_service::wan_session::coordinator::WanSessionPortError::DeadlineExceeded
+    );
+    assert!(started.elapsed() >= budget);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "response parsing must not restart the operation budget"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "waiting for local validity must never repeat POST"
+    );
+    assert!(adapter
+        .relay_access(&canonical_request.session_id)
+        .is_none());
 }
 
 #[tokio::test]
@@ -561,8 +632,13 @@ async fn invalid_relay_response_keeps_a_fixed_rejection_without_body_text() {
         .await
         .unwrap_err();
     assert_eq!(error.to_string(), "WAN session port rejected the operation");
-    assert!(adapter.relay_access(&canonical_request.session_id).is_none());
-    assert_no_sensitive_text(&format!("{error:?} {error}"), &[&private_body, &device_auth]);
+    assert!(adapter
+        .relay_access(&canonical_request.session_id)
+        .is_none());
+    assert_no_sensitive_text(
+        &format!("{error:?} {error}"),
+        &[&private_body, &device_auth],
+    );
 }
 
 #[tokio::test]
