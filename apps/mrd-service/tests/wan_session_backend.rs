@@ -24,6 +24,11 @@ use mrd_service::{
         },
         config::WanSessionBackendConfig,
         coordinator::WanSessionWorkflowBackend,
+        model::{
+            GrantBinding, RelayAccessBinding, WanSessionEvent, WanSessionIdentity, WanSessionRole,
+            WanSessionState,
+        },
+        webrtc::GenerationZeroNegotiationContext,
     },
     AppState,
 };
@@ -415,6 +420,131 @@ fn assert_no_sensitive_text(text: &str, sensitive: &[&str]) {
             "observable WAN backend projection leaked sensitive material"
         );
     }
+}
+
+fn context_for_http_access(
+    request: &WanSessionRequestV3,
+    role: WanSessionRole,
+    access: &RelayAccessBinding,
+) -> GenerationZeroNegotiationContext {
+    let now = now_ms();
+    let commitment = request.commitment().unwrap();
+    let grant_commitment = "3".repeat(64);
+    let identity = WanSessionIdentity::new(
+        request.session_id.clone(),
+        request.controller_device_id.clone(),
+        request.target_device_id.clone(),
+        "1".repeat(64),
+        "2".repeat(64),
+        now + 60_000,
+    )
+    .unwrap();
+    let grant = GrantBinding::new(
+        commitment.clone(),
+        vec![WanPermissionScopeV3::ScreenView],
+        access.policy_revision(),
+        now + 30_000,
+        now + 30_000,
+        request.route_policy,
+    )
+    .unwrap()
+    .with_grant_commitment(grant_commitment.clone())
+    .unwrap();
+    let binding = RelayAccessBinding::generation_zero(
+        access.policy_revision(),
+        access.directory_id().to_owned(),
+        access.primary_node_id().to_owned(),
+        access.relay_url_digest().to_owned(),
+    )
+    .unwrap();
+    let mut state = WanSessionState::new(role, identity);
+    for event in [
+        WanSessionEvent::BackendBound {
+            request_commitment: commitment,
+        },
+        WanSessionEvent::AwaitingConsent {
+            intent_commitment: "4".repeat(64),
+        },
+        WanSessionEvent::Granted(grant),
+        WanSessionEvent::AccessBound(binding),
+    ] {
+        state.apply(event, now).unwrap();
+    }
+    GenerationZeroNegotiationContext::from_state(&state, grant_commitment, now).unwrap()
+}
+
+#[tokio::test]
+async fn canonical_session_target_directory_supports_both_negotiation_roles() {
+    let request = request();
+    let server = FakeBackend::spawn(request.clone()).await;
+    let backend = HttpWanSessionBackend::new(client_config(
+        &server.base_url,
+        &private_material("canonical-directory-auth"),
+    ))
+    .unwrap();
+    let adapter = ServiceWanSessionWorkflowBackend::new(Arc::new(backend));
+    let route = adapter
+        .access_generation_zero(&binding(&request), 29, now_ms() + 5_000)
+        .await
+        .unwrap();
+    let access = adapter.relay_access(&request.session_id).unwrap();
+    assert_eq!(
+        access.verified().directory().payload().intended_peer_digest,
+        relay_peer_digest(&request.target_device_id.0).unwrap()
+    );
+    for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+        let context = context_for_http_access(&request, role, &route);
+        let config = context
+            .primary_peer_config(access.verified())
+            .expect("canonical session target audience works for either participant");
+        assert_eq!(
+            config.role,
+            match role {
+                WanSessionRole::Controller => mrd_transport_webrtc::PeerConnectionRole::Offerer,
+                WanSessionRole::Target => mrd_transport_webrtc::PeerConnectionRole::Answerer,
+            }
+        );
+        assert_eq!(
+            context.peer_device_id(),
+            match role {
+                WanSessionRole::Controller => &request.target_device_id,
+                WanSessionRole::Target => &request.controller_device_id,
+            }
+        );
+    }
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn canonical_session_target_directory_matches_the_service_install_context() {
+    let request = request();
+    let server = FakeBackend::spawn(request.clone()).await;
+    let backend = HttpWanSessionBackend::new(client_config(
+        &server.base_url,
+        &private_material("canonical-install-auth"),
+    ))
+    .unwrap();
+    let adapter = ServiceWanSessionWorkflowBackend::new(Arc::new(backend));
+    let route = adapter
+        .access_generation_zero(&binding(&request), 29, now_ms() + 5_000)
+        .await
+        .unwrap();
+    let access = adapter.relay_access(&request.session_id).unwrap();
+    for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+        let context = context_for_http_access(&request, role, &route);
+        let install = context.relay_access_context().unwrap();
+        assert_eq!(install.session_id, request.session_id.0);
+        assert_eq!(install.policy_revision, route.policy_revision());
+        assert_eq!(install.generation(), Some(0));
+        assert_eq!(install.intended_peer_id, request.target_device_id.0);
+        assert_eq!(
+            install.intended_peer_digest(),
+            access.verified().directory().payload().intended_peer_digest
+        );
+        let posted: Value = serde_json::from_slice(&server.requests()[0].body).unwrap();
+        assert_eq!(serde_json::to_value(&install).unwrap(), posted);
+    }
+    assert_eq!(server.requests().len(), 1);
 }
 
 #[tokio::test]

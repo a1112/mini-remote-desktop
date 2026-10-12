@@ -346,16 +346,37 @@ async fn primary_only_signed_relay_url_is_used_for_generation_zero() {
 }
 
 #[tokio::test]
+async fn primary_peer_rejects_non_target_directory_audiences_for_both_roles() {
+    for audience in ["controller-device", "foreign-device"] {
+        let session_id = test_session_id();
+        // Full signatures validate for this foreign context, but they are not
+        // authority for the canonical target of this session.
+        let access = relay_access(&session_id, audience).await;
+        for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+            let state = state_at_access_bound(&session_id, role, true);
+            let context = GenerationZeroNegotiationContext::from_state(
+                &state,
+                GRANT_COMMITMENT.into(),
+                1_000,
+            )
+            .unwrap();
+            assert_eq!(
+                context.primary_peer_config(&access),
+                Err(GenerationZeroNegotiationError::InvalidBinding),
+                "{role:?}/{audience}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn primary_peer_rtp_clock_uses_the_approved_video_frame_rate() {
     for role in [WanSessionRole::Controller, WanSessionRole::Target] {
         for policy in [WanRoutePolicyV3::RelayOnly, WanRoutePolicyV3::DirectFirst] {
             for fps in [30, 60, 120] {
                 let session_id = test_session_id();
-                let peer = match role {
-                    WanSessionRole::Controller => "target-device",
-                    WanSessionRole::Target => "controller-device",
-                };
-                let access = relay_access(&session_id, peer).await;
+                // The backend signs the same target audience for both roles.
+                let access = relay_access(&session_id, "target-device").await;
                 let profile = WanMediaProfileV3 {
                     width: 2560,
                     height: 1440,
@@ -828,7 +849,7 @@ async fn controller_executor_orders_manifest_candidates_connection_proof_and_ins
 #[tokio::test]
 async fn target_executor_buffers_candidate_before_offer_and_skips_history_intent() {
     let session_id = test_session_id();
-    let access = relay_access(&session_id, "controller-device").await;
+    let access = relay_access(&session_id, "target-device").await;
     let (state, controller, _target) =
         signed_state_at_access_bound(&session_id, WanSessionRole::Target);
     let context =

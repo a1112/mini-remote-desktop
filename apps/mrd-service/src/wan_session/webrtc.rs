@@ -902,17 +902,32 @@ impl GenerationZeroNegotiationContext {
         }
     }
 
+    /// Both participants use the directory bound to the session's target.
+    /// The role-specific signaling peer is a separate audience and remains
+    /// available through `peer_device_id`.
+    pub fn relay_access_context(
+        &self,
+    ) -> Result<RelayAccessContext, GenerationZeroNegotiationError> {
+        RelayAccessContext::for_generation(
+            self.identity.session_id().0.clone(),
+            self.access.policy_revision(),
+            self.identity.target_device_id().0.clone(),
+            self.access.generation(),
+        )
+        .map_err(|_| GenerationZeroNegotiationError::InvalidBinding)
+    }
+
     /// Build a relay-only config from the verified primary node only.
     pub fn primary_peer_config(
         &self,
         access: &VerifiedRelayAccess,
     ) -> Result<PeerConnectionConfig, GenerationZeroNegotiationError> {
-        let expected_peer_digest = crate::relay::relay_peer_digest(&self.peer_device_id().0)
-            .map_err(|_| GenerationZeroNegotiationError::InvalidBinding)?;
+        let relay_context = self.relay_access_context()?;
         if access.generation() != Some(0)
             || access.directory().payload().session_id != self.identity.session_id().0
             || access.directory().payload().directory_id != self.access.directory_id()
-            || access.directory().payload().intended_peer_digest != expected_peer_digest
+            || access.directory().payload().intended_peer_digest
+                != relay_context.intended_peer_digest()
         {
             return Err(GenerationZeroNegotiationError::InvalidBinding);
         }

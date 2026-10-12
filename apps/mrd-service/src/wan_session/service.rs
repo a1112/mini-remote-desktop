@@ -1938,18 +1938,8 @@ async fn spawn_generation_zero(
     {
         return Err(());
     }
-    let peer_device_id = match state.role() {
-        WanSessionRole::Controller => state.identity().target_device_id(),
-        WanSessionRole::Target => state.identity().controller_device_id(),
-    };
     let access_binding = state.access().ok_or(())?;
-    let relay_context = crate::relay::RelayAccessContext::for_generation(
-        session_id.0.clone(),
-        access_binding.policy_revision(),
-        peer_device_id.0.clone(),
-        0,
-    )
-    .map_err(|_| ())?;
+    let relay_context = context.relay_access_context().map_err(|_| ())?;
     let verified_access = Arc::clone(raw_access.verified());
     let negotiator = GenerationZeroNegotiator::for_service(
         Arc::clone(&app_state),
