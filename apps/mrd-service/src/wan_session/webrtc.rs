@@ -739,7 +739,7 @@ impl GenerationZeroNegotiationAuthority for ImmutableGenerationZeroAuthority {
         context: &GenerationZeroNegotiationContext,
         now_unix_ms: u64,
     ) -> Result<(), GenerationZeroNegotiationError> {
-        if now_unix_ms >= context.identity().deadline_unix_ms()
+        if now_unix_ms >= context.deadline_unix_ms
             || context.grant().grant_expires_at_ms() <= now_unix_ms
             || context.grant().policy_expires_at_ms() <= now_unix_ms
             || context.access().generation() != 0
@@ -808,6 +808,7 @@ pub struct GenerationZeroNegotiationContext {
     grant: GrantBinding,
     access: RelayAccessBinding,
     grant_commitment: String,
+    deadline_unix_ms: u64,
 }
 
 impl fmt::Debug for GenerationZeroNegotiationContext {
@@ -834,7 +835,7 @@ impl GenerationZeroNegotiationContext {
         if state.phase() != WanSessionPhase::AccessBound {
             return Err(GenerationZeroNegotiationError::NotReady);
         }
-        if now_unix_ms >= state.identity().deadline_unix_ms() {
+        if now_unix_ms >= state.effective_deadline_unix_ms() {
             return Err(GenerationZeroNegotiationError::DeadlineExceeded);
         }
         if !is_sha256_hex(&grant_commitment) {
@@ -863,6 +864,7 @@ impl GenerationZeroNegotiationContext {
             grant,
             access,
             grant_commitment,
+            deadline_unix_ms: state.effective_deadline_unix_ms(),
         })
     }
 
@@ -1368,7 +1370,7 @@ impl GenerationZeroNegotiator {
     ) -> Result<Duration, GenerationZeroNegotiationError> {
         let now = self.clock.now_unix_ms();
         let deadlines = [
-            context.identity().deadline_unix_ms(),
+            context.deadline_unix_ms,
             context.grant().grant_expires_at_ms(),
             context.grant().policy_expires_at_ms(),
             relay_access.directory().payload().expires_at_ms,

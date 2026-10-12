@@ -962,7 +962,7 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
     }
 }
 
-fn ipc_scope(scope: WanPermissionScopeV3) -> RemotePermissionScope {
+pub(crate) fn ipc_scope(scope: WanPermissionScopeV3) -> RemotePermissionScope {
     match scope {
         WanPermissionScopeV3::ScreenView => RemotePermissionScope::ScreenView,
         WanPermissionScopeV3::InputPointer => RemotePermissionScope::InputPointer,
@@ -1405,8 +1405,8 @@ async fn expected_target_authorization_under_security_gate(
         || decode_sha256(commitment).is_none()
         || now >= grant.grant_expires_at_ms()
         || now >= grant.policy_expires_at_ms()
-        || grant.grant_expires_at_ms() > identity.deadline_unix_ms()
-        || grant.policy_expires_at_ms() > identity.deadline_unix_ms()
+        || state.active_authority().is_none()
+        || now >= state.effective_deadline_unix_ms()
     {
         return Err(controller_grant_mismatch());
     }
@@ -1523,7 +1523,13 @@ async fn install_target_authorization(
     }
     app_state
         .session_authorizations
-        .install_verified_wan_target_grant(authorization, expected_local_policy_revision, now)
+        .install_bound_wan_grant(
+            authorization,
+            state
+                .active_authority()
+                .ok_or_else(controller_grant_mismatch)?,
+            Some(expected_local_policy_revision),
+        )
         .await?;
     #[cfg(windows)]
     if paired_basis.is_some() {
@@ -1619,8 +1625,8 @@ async fn install_controller_authorization(
     state: &super::model::WanSessionState,
     verified: &VerifiedWanSessionGrant,
 ) -> Result<(), RemoteFailure> {
-    let installed_at_ms = now_unix_ms();
     let _authorization_guard = app_state.authorization_security_gate.lock().await;
+    let installed_at_ms = now_unix_ms();
     let result = async {
         let trust = app_state
             .device_identities
@@ -1646,8 +1652,9 @@ async fn install_controller_authorization(
             || identity.target_device_id() != verified.target_device_id()
             || identity.target_key_fingerprint() != Some(verified.target_key_fingerprint())
             || grant.grant_commitment() != Some(verified.grant_commitment())
-            || grant.policy_expires_at_ms() > verified.expires_at_ms()
-            || verified.expires_at_ms() > identity.deadline_unix_ms()
+            || installed_at_ms >= verified.expires_at_ms()
+            || state.active_authority().is_none()
+            || installed_at_ms >= state.effective_deadline_unix_ms()
         {
             return Err(controller_grant_mismatch());
         }
@@ -1699,7 +1706,13 @@ async fn install_controller_authorization(
             .await?;
         let snapshot = app_state
             .session_authorizations
-            .install_verified_grant(authorization_grant, installed_at_ms)
+            .install_bound_wan_grant(
+                authorization_grant,
+                state
+                    .active_authority()
+                    .ok_or_else(controller_grant_mismatch)?,
+                None,
+            )
             .await?;
         if snapshot.authorization_state == RemoteAuthorizationState::Granted
             && snapshot.peer_key_id == verified.target_key_fingerprint()

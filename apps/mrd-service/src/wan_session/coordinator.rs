@@ -24,6 +24,247 @@ use tokio::{
 };
 
 const CLEANUP_STEP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACTIVE_AUTHORITY_MS: u64 = 3_600_000;
+
+#[cfg(test)]
+#[path = "authority_deadline_tests.rs"]
+mod authority_deadline_tests;
+
+/// Service-only receipt of the authenticated backend + signed grant boundary.
+/// Its fields and constructor stay private to this coordinator: raw snapshots
+/// and model events cannot manufacture a longer session lease.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct WanActiveAuthorityProof {
+    role: WanSessionRole,
+    identity: WanSessionIdentity,
+    request: WanSessionRequestV3,
+    intent_commitment: String,
+    grant: GrantBinding,
+    access: RelayAccessBinding,
+    deadline_unix_ms: u64,
+    delivery_expires_at_ms: Option<u64>,
+}
+
+impl WanActiveAuthorityProof {
+    fn combine(
+        state: &WanSessionState,
+        snapshot: &WanBackendSessionSnapshot,
+        grant: GrantBinding,
+        access: RelayAccessBinding,
+        now: u64,
+    ) -> Result<Self, WanSessionCoordinatorError> {
+        let latest = now
+            .checked_add(MAX_ACTIVE_AUTHORITY_MS)
+            .ok_or(WanSessionCoordinatorError::BackendBindingMismatch)?;
+        let exact = snapshot.verify_approved(state.identity())?;
+        let signed_exact = exact
+            .clone()
+            .with_grant_commitment(
+                grant
+                    .grant_commitment()
+                    .ok_or(WanSessionCoordinatorError::BackendBindingMismatch)?
+                    .to_owned(),
+            )
+            .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
+        if state.phase() != WanSessionPhase::AwaitingConsent
+            || now >= state.identity().deadline_unix_ms()
+            || state.request_commitment() != Some(snapshot.request_commitment())
+            || state.intent_commitment().is_none()
+            || grant != signed_exact
+            || grant.grant_commitment().is_none()
+            || grant.grant_expires_at_ms() <= now
+            || grant.policy_expires_at_ms() <= now
+            || grant.grant_expires_at_ms() > latest
+            || grant.policy_expires_at_ms() > latest
+            || access.generation() != 0
+            || access.policy_revision() != grant.policy_revision()
+            || state.identity().target_key_fingerprint().is_none()
+        {
+            return Err(WanSessionCoordinatorError::BackendBindingMismatch);
+        }
+        Ok(Self {
+            role: state.role(),
+            identity: state.identity().clone(),
+            request: snapshot.request().clone(),
+            intent_commitment: state.intent_commitment().unwrap().to_owned(),
+            deadline_unix_ms: grant
+                .grant_expires_at_ms()
+                .min(grant.policy_expires_at_ms()),
+            grant,
+            access,
+            delivery_expires_at_ms: None,
+        })
+    }
+
+    pub(crate) fn role(&self) -> WanSessionRole {
+        self.role
+    }
+    pub(crate) fn identity(&self) -> &WanSessionIdentity {
+        &self.identity
+    }
+    pub(crate) fn request(&self) -> &WanSessionRequestV3 {
+        &self.request
+    }
+    pub(crate) fn grant(&self) -> &GrantBinding {
+        &self.grant
+    }
+    pub(crate) fn access(&self) -> &RelayAccessBinding {
+        &self.access
+    }
+    pub(crate) fn deadline_unix_ms(&self) -> u64 {
+        self.deadline_unix_ms
+    }
+    pub(crate) fn can_install_at(&self, now: u64) -> bool {
+        now < self.identity.deadline_unix_ms()
+            && now < self.deadline_unix_ms
+            && self
+                .delivery_expires_at_ms
+                .is_none_or(|expires| now < expires)
+    }
+    pub(super) fn matches_pending(&self, state: &WanSessionState) -> bool {
+        self.role == state.role()
+            && &self.identity == state.identity()
+            && state.request_commitment() == Some(self.grant.request_commitment())
+            && state.intent_commitment() == Some(self.intent_commitment.as_str())
+    }
+    pub(crate) fn matches_state(&self, state: &WanSessionState) -> bool {
+        self.matches_pending(state)
+            && state.grant() == Some(&self.grant)
+            && state.access() == Some(&self.access)
+    }
+
+    /// Test fixture still uses an actual signed grant and exact backend policy;
+    /// this constructor is absent from every production build.
+    #[cfg(test)]
+    pub(crate) fn registry_fixture_for_test(
+        role: WanSessionRole,
+        now: u64,
+        setup: u64,
+        delivery: u64,
+    ) -> (Self, [u8; 32]) {
+        use mrd_signal_proto::{
+            AuthClaims, SessionGrantV3, SessionGrantV3Payload, WanAccessModeV3,
+            WanPermissionScopeV3,
+        };
+        let controller = DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
+        let target = DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
+        let request = WanSessionRequestV3 {
+            session_id: SessionId("bound-wan-test".into()),
+            idempotency_key: [1; 16],
+            controller_device_id: mrd_proto::DeviceId("controller-device".into()),
+            target_device_id: mrd_proto::DeviceId("target-device".into()),
+            access_mode: WanAccessModeV3::Attended,
+            requested_scopes: vec![
+                WanPermissionScopeV3::InputKeyboard,
+                WanPermissionScopeV3::InputPointer,
+            ],
+            requested_profile: None,
+            route_policy: WanRoutePolicyV3::DirectFirst,
+        };
+        let identity = WanSessionIdentity::new(
+            request.session_id.clone(),
+            request.controller_device_id.clone(),
+            request.target_device_id.clone(),
+            controller.key_id().into(),
+            target.key_id().into(),
+            setup,
+        )
+        .unwrap();
+        let grant = GrantBinding::new(
+            request.commitment().unwrap(),
+            request.requested_scopes.clone(),
+            7,
+            now + 600_000,
+            now + 600_000,
+            request.route_policy,
+        )
+        .unwrap();
+        let access = RelayAccessBinding::generation_zero(
+            7,
+            "directory".into(),
+            "primary".into(),
+            "4".repeat(64),
+        )
+        .unwrap();
+        let signed = SessionGrantV3::sign(
+            &target,
+            SessionGrantV3Payload {
+                claims: AuthClaims {
+                    issuer_device_id: request.target_device_id.clone(),
+                    issuer_key_id: target.key_id().into(),
+                    intended_peer_device_id: request.controller_device_id.clone(),
+                    issued_at_ms: now,
+                    expires_at_ms: delivery,
+                    counter: 1,
+                    nonce: [2; 16],
+                },
+                session_id: request.session_id.clone(),
+                controller_device_id: request.controller_device_id.clone(),
+                target_device_id: request.target_device_id.clone(),
+                intent_commitment: "1".repeat(64),
+                approved_scopes: request.requested_scopes.clone(),
+                approved_profile: None,
+                backend_policy_revision: 7,
+                policy_expires_at_ms: now + 600_000,
+                relay_generation: 0,
+                relay_directory_id: "directory".into(),
+                primary_relay_node_id: "primary".into(),
+                route_policy: request.route_policy,
+            },
+        )
+        .unwrap();
+        signed
+            .verify_for(
+                &request.controller_device_id,
+                now,
+                &mut SignalReplayGuard::new(1, 1),
+            )
+            .unwrap();
+        let mut state = WanSessionState::new(role, identity);
+        state
+            .apply(
+                WanSessionEvent::BackendBound {
+                    request_commitment: request.commitment().unwrap(),
+                },
+                now,
+            )
+            .unwrap();
+        state
+            .apply(
+                WanSessionEvent::AwaitingConsent {
+                    intent_commitment: "1".repeat(64),
+                },
+                now,
+            )
+            .unwrap();
+        let snapshot = WanBackendSessionSnapshot::approved(
+            request.clone(),
+            request.commitment().unwrap(),
+            grant.clone(),
+        )
+        .unwrap();
+        let mut proof = Self::combine(
+            &state,
+            &snapshot,
+            grant
+                .with_grant_commitment(signed.commitment().unwrap())
+                .unwrap(),
+            access,
+            now,
+        )
+        .unwrap();
+        if role == WanSessionRole::Controller {
+            proof.delivery_expires_at_ms = Some(delivery);
+        }
+        (
+            proof,
+            match role {
+                WanSessionRole::Controller => target.public_key().try_into().unwrap(),
+                WanSessionRole::Target => controller.public_key().try_into().unwrap(),
+            },
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WanSessionCoordinatorConfig {
@@ -377,6 +618,17 @@ impl WanSessionCoordinator {
         let _operation = entry.operation.lock().await;
         let state = self.snapshot(session_id).await?;
         if state.role() == WanSessionRole::Target && state.phase() == WanSessionPhase::AccessBound {
+            let now = workflow.clock.now_unix_ms();
+            if now >= state.effective_deadline_unix_ms() {
+                let _ = self
+                    .apply(
+                        session_id,
+                        WanSessionEvent::Failed(WanSessionFailure::DeadlineExceeded),
+                        now,
+                    )
+                    .await;
+                return Err(WanSessionCoordinatorError::DeadlineExceeded);
+            }
             return Ok(TransitionResult::Duplicate);
         }
         if state.role() != WanSessionRole::Target
@@ -444,19 +696,14 @@ impl WanSessionCoordinator {
             let grant = grant
                 .with_grant_commitment(signed_grant_commitment)
                 .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
-            self.apply(
-                session_id,
-                WanSessionEvent::Granted(grant.clone()),
+            let proof = WanActiveAuthorityProof::combine(
+                &state,
+                &snapshot,
+                grant,
+                access,
                 workflow.clock.now_unix_ms(),
-            )
-            .await?;
-            self.apply(
-                session_id,
-                WanSessionEvent::AccessBound(access.clone()),
-                workflow.clock.now_unix_ms(),
-            )
-            .await?;
-            Ok(TransitionResult::Applied)
+            )?;
+            self.activate_authority(&entry, proof).await
         }
         .await;
         self.fail_workflow_if_needed(session_id, result, workflow.clock.now_unix_ms())
@@ -479,7 +726,8 @@ impl WanSessionCoordinator {
             && verified.target_device_id == *initial_state.identity().target_device_id()
             && verified.controller_key_fingerprint
                 == initial_state.identity().controller_key_fingerprint()
-            && verified.expires_at_ms <= initial_state.identity().deadline_unix_ms()
+            && verified.issued_at_ms <= workflow.clock.now_unix_ms()
+            && workflow.clock.now_unix_ms() < verified.expires_at_ms
             && initial_state
                 .identity()
                 .target_key_fingerprint()
@@ -517,6 +765,7 @@ impl WanSessionCoordinator {
                     && access.directory_id() == verified.directory_id
                     && access.primary_node_id() == verified.primary_node_id
             })
+            && workflow.clock.now_unix_ms() < state.effective_deadline_unix_ms()
         {
             return Ok(TransitionResult::Duplicate);
         }
@@ -578,18 +827,18 @@ impl WanSessionCoordinator {
                 .clone()
                 .with_grant_commitment(verified.grant_commitment.clone())
                 .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
-            self.apply(
-                session_id,
-                WanSessionEvent::Granted(backend_grant.clone()),
+            if workflow.clock.now_unix_ms() >= verified.expires_at_ms {
+                return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
+            }
+            let mut proof = WanActiveAuthorityProof::combine(
+                &state,
+                &snapshot,
+                backend_grant,
+                access,
                 workflow.clock.now_unix_ms(),
-            )
-            .await?;
-            self.apply(
-                session_id,
-                WanSessionEvent::AccessBound(access),
-                workflow.clock.now_unix_ms(),
-            )
-            .await
+            )?;
+            proof.delivery_expires_at_ms = Some(verified.expires_at_ms);
+            self.activate_authority(&entry, proof).await
         }
         .await;
         self.fail_workflow_if_needed(session_id, result, workflow.clock.now_unix_ms())
@@ -600,17 +849,28 @@ impl WanSessionCoordinator {
         &self,
         state: WanSessionState,
     ) -> Result<TransitionResult, WanSessionCoordinatorError> {
-        if self.clock.now_unix_ms() >= state.identity().deadline_unix_ms() {
-            return Err(WanSessionCoordinatorError::DeadlineExceeded);
-        }
         let session_id = state.identity().session_id().clone();
         let mut registry = self.registry.lock().await;
         if let Some(existing) = registry.sessions.get(&session_id) {
             let existing = existing.state.lock().await;
-            if existing.role() == state.role() && existing.identity() == state.identity() {
+            let same_initial_controller = existing.role() == WanSessionRole::Controller
+                && existing.active_authority().is_some()
+                && state.identity().target_key_fingerprint().is_none()
+                && existing.identity().binding() == state.identity().binding()
+                && existing.identity().controller_key_fingerprint()
+                    == state.identity().controller_key_fingerprint()
+                && existing.identity().deadline_unix_ms() == state.identity().deadline_unix_ms();
+            if existing.role() == state.role()
+                && (existing.identity() == state.identity() || same_initial_controller)
+                && (existing.phase().is_terminal()
+                    || self.clock.now_unix_ms() < existing.effective_deadline_unix_ms())
+            {
                 return Ok(TransitionResult::Duplicate);
             }
             return Err(WanSessionCoordinatorError::SessionConflict);
+        }
+        if self.clock.now_unix_ms() >= state.identity().deadline_unix_ms() {
+            return Err(WanSessionCoordinatorError::DeadlineExceeded);
         }
         if registry.active_sessions >= self.config.max_sessions {
             return Err(WanSessionCoordinatorError::CapacityExceeded);
@@ -666,7 +926,7 @@ impl WanSessionCoordinator {
             if state.phase() != WanSessionPhase::Negotiating || state.role() != role {
                 return Err(WanSessionCoordinatorError::RoleOrPhaseMismatch);
             }
-            if now >= identity.deadline_unix_ms()
+            if now >= state.effective_deadline_unix_ms()
                 || now >= grant.grant_expires_at_ms()
                 || now >= grant.policy_expires_at_ms()
             {
@@ -711,7 +971,7 @@ impl WanSessionCoordinator {
         let (transition, terminal, failed, invalidated_error) = {
             let mut state = entry.state.lock().await;
             let now = self.clock.now_unix_ms();
-            let deadline_invalidated = now >= identity.deadline_unix_ms()
+            let deadline_invalidated = now >= state.effective_deadline_unix_ms()
                 || now >= grant.grant_expires_at_ms()
                 || now >= grant.policy_expires_at_ms();
             let binding_invalidated = state.phase() != WanSessionPhase::Negotiating
@@ -785,9 +1045,8 @@ impl WanSessionCoordinator {
     }
 
     /// Expire all sessions whose effective authorization deadline has elapsed.
-    /// Once a grant is installed, its grant and policy deadlines can only
-    /// shorten the identity deadline. The service heartbeat should call this
-    /// even when no signaling arrives.
+    /// A proved active grant uses its immutable session lease; pending and raw
+    /// model states retain their original setup bound.
     pub async fn expire_due_sessions(&self) -> usize {
         let now = self.clock.now_unix_ms();
         let entries = self
@@ -802,16 +1061,7 @@ impl WanSessionCoordinator {
         for (session_id, entry) in entries {
             let due = {
                 let state = entry.state.lock().await;
-                let deadline = state.grant().map_or_else(
-                    || state.identity().deadline_unix_ms(),
-                    |grant| {
-                        state
-                            .identity()
-                            .deadline_unix_ms()
-                            .min(grant.grant_expires_at_ms())
-                            .min(grant.policy_expires_at_ms())
-                    },
-                );
+                let deadline = state.effective_deadline_unix_ms();
                 !state.phase().is_terminal() && now >= deadline
             };
             if due {
@@ -844,6 +1094,31 @@ impl WanSessionCoordinator {
             }
         }
         closed
+    }
+
+    async fn activate_authority(
+        &self,
+        entry: &Arc<SessionEntry>,
+        proof: WanActiveAuthorityProof,
+    ) -> Result<TransitionResult, WanSessionCoordinatorError> {
+        let session_id = proof.identity().session_id().clone();
+        let (transition, terminal, failed) = {
+            let mut state = entry.state.lock().await;
+            let transition = state.install_active_authority(proof, self.clock.now_unix_ms());
+            (
+                transition,
+                state.phase().is_terminal(),
+                state.phase() == WanSessionPhase::Failed,
+            )
+        };
+        let cleanup = if terminal {
+            self.finalize(&session_id, entry, failed).await
+        } else {
+            Ok(())
+        };
+        let transition = transition.map_err(WanSessionCoordinatorError::Transition)?;
+        cleanup?;
+        Ok(transition)
     }
 
     async fn apply_with_operation(
@@ -927,7 +1202,7 @@ impl WanSessionCoordinator {
         {
             let state = entry.state.lock().await;
             if state.phase().is_terminal()
-                || self.clock.now_unix_ms() >= state.identity().deadline_unix_ms()
+                || self.clock.now_unix_ms() >= state.effective_deadline_unix_ms()
             {
                 return Err(WanSessionCoordinatorError::SessionTerminal);
             }
@@ -1036,7 +1311,7 @@ impl WanSessionCoordinator {
         if state.phase().is_terminal() {
             return Err(WanSessionCoordinatorError::SessionTerminal);
         }
-        if now_unix_ms >= state.identity().deadline_unix_ms() {
+        if now_unix_ms >= state.effective_deadline_unix_ms() {
             return Err(WanSessionCoordinatorError::DeadlineExceeded);
         }
         drop(state);
@@ -1277,9 +1552,6 @@ impl VerifiedWanSessionGrant {
         let issued_at_ms = claims.issued_at_ms;
         let expires_at_ms = claims.expires_at_ms;
         let payload = message.payload;
-        if payload.policy_expires_at_ms > expires_at_ms {
-            return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
-        }
         Ok(Self {
             session_id: payload.session_id,
             controller_device_id: payload.controller_device_id,

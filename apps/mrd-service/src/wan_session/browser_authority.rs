@@ -52,11 +52,7 @@ pub(crate) async fn monitor_browser_authority(
             Some(grant) => grant,
             None => return Some(WanSessionFailure::PolicyMismatch),
         };
-        let deadline = state
-            .identity()
-            .deadline_unix_ms()
-            .min(grant.grant_expires_at_ms())
-            .min(grant.policy_expires_at_ms());
+        let deadline = state.effective_deadline_unix_ms();
         if state.phase().is_terminal() || now >= deadline {
             return Some(WanSessionFailure::PolicyMismatch);
         }
@@ -308,6 +304,31 @@ mod tests {
             8,
             now + 60_000,
             now + 60_000,
+            request.route_policy,
+        )
+        .unwrap();
+        let snapshot = WanBackendSessionSnapshot::approved(
+            request.clone(),
+            request.commitment().unwrap(),
+            changed,
+        )
+        .unwrap();
+        let backend = backend(vec![Ok(snapshot)]);
+        assert_eq!(
+            monitor(&backend, &state).await,
+            Some(WanSessionFailure::PolicyMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_backend_grant_expiry_never_renews_retained_authority() {
+        let (state, request, grant) = fixture("browser_0123456789abcdef");
+        let changed = GrantBinding::new(
+            request.commitment().unwrap(),
+            grant.approved_scopes().to_vec(),
+            grant.policy_revision(),
+            grant.policy_expires_at_ms(),
+            grant.grant_expires_at_ms().saturating_sub(1),
             request.route_policy,
         )
         .unwrap();

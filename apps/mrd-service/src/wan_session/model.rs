@@ -496,6 +496,7 @@ pub struct WanSessionState {
     access: Option<RelayAccessBinding>,
     route_proof: Option<RelayRouteProof>,
     failure: Option<WanSessionFailure>,
+    active_authority: Option<super::coordinator::WanActiveAuthorityProof>,
 }
 
 impl fmt::Debug for WanSessionState {
@@ -527,6 +528,7 @@ impl WanSessionState {
             access: None,
             route_proof: None,
             failure: None,
+            active_authority: None,
         }
     }
 
@@ -583,6 +585,49 @@ impl WanSessionState {
         self.failure
     }
 
+    /// Pending requests retain the immutable setup cutoff. A private,
+    /// authenticated authority receipt can establish the active session lease.
+    pub fn effective_deadline_unix_ms(&self) -> u64 {
+        self.active_authority.as_ref().map_or_else(
+            || {
+                self.grant
+                    .as_ref()
+                    .map_or(self.identity.deadline_unix_ms(), |grant| {
+                        self.identity
+                            .deadline_unix_ms()
+                            .min(grant.grant_expires_at_ms())
+                            .min(grant.policy_expires_at_ms())
+                    })
+            },
+            |proof| proof.deadline_unix_ms(),
+        )
+    }
+
+    pub(crate) fn active_authority(&self) -> Option<&super::coordinator::WanActiveAuthorityProof> {
+        self.active_authority
+            .as_ref()
+            .filter(|proof| proof.matches_state(self))
+    }
+
+    pub(super) fn install_active_authority(
+        &mut self,
+        proof: super::coordinator::WanActiveAuthorityProof,
+        now: u64,
+    ) -> Result<TransitionResult, WanSessionTransitionError> {
+        if self.phase != WanSessionPhase::AwaitingConsent
+            || self.active_authority.is_some()
+            || !proof.can_install_at(now)
+            || !proof.matches_pending(self)
+        {
+            return self.fail(WanSessionFailure::PolicyMismatch);
+        }
+        let grant = proof.grant().clone();
+        let access = proof.access().clone();
+        self.active_authority = Some(proof);
+        self.apply(WanSessionEvent::Granted(grant), now)?;
+        self.apply(WanSessionEvent::AccessBound(access), now)
+    }
+
     pub fn apply(
         &mut self,
         event: WanSessionEvent,
@@ -595,7 +640,7 @@ impl WanSessionState {
         if self.phase.is_terminal() {
             return Err(WanSessionTransitionError::Terminal);
         }
-        if now_unix_ms >= self.identity.deadline_unix_ms {
+        if now_unix_ms >= self.effective_deadline_unix_ms() {
             return self.fail(WanSessionFailure::DeadlineExceeded);
         }
         if target <= self.phase {
@@ -635,7 +680,10 @@ impl WanSessionState {
                 if self.request_commitment.as_deref() == Some(grant.request_commitment())
                     && now_unix_ms < grant.grant_expires_at_ms()
                     && now_unix_ms < grant.policy_expires_at_ms()
-                    && grant.grant_expires_at_ms() <= self.identity.deadline_unix_ms
+                    && (grant.grant_expires_at_ms() <= self.identity.deadline_unix_ms
+                        || self.active_authority.as_ref().is_some_and(|proof| {
+                            proof.matches_pending(self) && proof.grant() == grant
+                        }))
                 {
                     self.grant = Some(grant.clone());
                     Ok(())

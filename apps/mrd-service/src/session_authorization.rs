@@ -183,6 +183,8 @@ pub struct SessionAuthorizationRegistry {
     inner: Mutex<AuthorizationRegistryInner>,
     unattended: Mutex<UnattendedAuthorizationState>,
     changed: Notify,
+    #[cfg(test)]
+    wan_test_clock: Option<Arc<AtomicU64>>,
 }
 
 #[derive(Debug)]
@@ -210,6 +212,13 @@ impl Default for UnattendedAuthorizationState {
 }
 
 impl SessionAuthorizationRegistry {
+    fn current_wan_time_ms(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = &self.wan_test_clock {
+            return clock.load(Ordering::SeqCst);
+        }
+        unix_time_ms()
+    }
     // Retained as the service-owned primitive for Task 40 enrollment. Task 18
     // production IPC deliberately does not expose credential enrollment.
     #[allow(dead_code)]
@@ -979,13 +988,14 @@ impl SessionAuthorizationRegistry {
         grant: VerifiedSessionGrant,
         installed_at_ms: u64,
     ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
-        self.install_verified_grant_inner(grant, installed_at_ms, None)
+        self.install_verified_grant_inner(grant, installed_at_ms, None, None)
             .await
     }
 
     /// A WAN target has an independently versioned backend policy. Only the
     /// service verified-intent boundary may exchange the exact local consent
     /// revision for that policy after binding the authenticated controller key.
+    #[cfg(test)]
     pub(crate) async fn install_verified_wan_target_grant(
         &self,
         grant: VerifiedSessionGrant,
@@ -996,8 +1006,21 @@ impl SessionAuthorizationRegistry {
             grant,
             installed_at_ms,
             Some(expected_local_policy_revision),
+            None,
         )
         .await
+    }
+
+    /// Only a coordinator receipt can exchange a still-current WAN setup
+    /// request for its exact authenticated backend + signed policy lease.
+    pub(crate) async fn install_bound_wan_grant(
+        &self,
+        grant: VerifiedSessionGrant,
+        proof: &crate::wan_session::coordinator::WanActiveAuthorityProof,
+        expected_local_policy_revision: Option<u64>,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        self.install_verified_grant_inner(grant, 0, expected_local_policy_revision, Some(proof))
+            .await
     }
 
     async fn install_verified_grant_inner(
@@ -1005,9 +1028,20 @@ impl SessionAuthorizationRegistry {
         mut grant: VerifiedSessionGrant,
         installed_at_ms: u64,
         wan_local_policy_revision: Option<u64>,
+        wan_authority: Option<&crate::wan_session::coordinator::WanActiveAuthorityProof>,
     ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
         normalize_scopes(&mut grant.granted_scopes);
         let mut inner = self.inner.lock().await;
+        // Re-read after the final lock; no pre-await timestamp may approve
+        // WAN authority after its immutable confirmation cutoff.
+        let installed_at_ms = if wan_authority.is_some()
+            || wan_local_policy_revision.is_some()
+            || grant.route_constraint == "webrtc_relay"
+        {
+            self.current_wan_time_ms()
+        } else {
+            installed_at_ms
+        };
         let Some(record) = inner.records.get_mut(&grant.session_id) else {
             return Err(failure(
                 RemoteReasonCode::IdentityMismatch,
@@ -1031,26 +1065,87 @@ impl SessionAuthorizationRegistry {
         } else {
             grant.granted_scopes == record.snapshot.granted_scopes
         };
-        let policy_binding_is_valid = match wan_local_policy_revision {
-            Some(expected_revision) => {
-                record.snapshot.role == RemoteSessionRole::Agent
-                    && (record.request.access_mode == RemoteAccessMode::Attended
-                        || (record.request.access_mode == RemoteAccessMode::Paired
-                            && record.paired_policy_revision.is_some()))
-                    && record.request.transport_kind == "webrtc_relay"
-                    && record.snapshot.policy_revision.get() == expected_revision
-                    && record
-                        .peer_public_key
-                        .is_some_and(|key| public_key_id(&key) == record.request.peer_key_id)
-                    && installed_at_ms < record.request.expires_at_ms
-                    && grant.expires_at_ms <= record.request.expires_at_ms
-                    && grant.policy_revision > 0
-            }
-            None => {
-                record.snapshot.role == RemoteSessionRole::Controller
-                    || grant.policy_revision == record.snapshot.policy_revision.get()
-            }
-        };
+        let proved_binding_is_valid = wan_authority.is_none_or(|proof| {
+            let identity = proof.identity();
+            let (role, peer, key) = match proof.role() {
+                crate::wan_session::model::WanSessionRole::Controller => (
+                    RemoteSessionRole::Controller,
+                    identity.target_device_id(),
+                    identity.target_key_fingerprint().unwrap_or(""),
+                ),
+                crate::wan_session::model::WanSessionRole::Target => (
+                    RemoteSessionRole::Agent,
+                    identity.controller_device_id(),
+                    identity.controller_key_fingerprint(),
+                ),
+            };
+            let mut scopes = proof
+                .grant()
+                .approved_scopes()
+                .iter()
+                .copied()
+                .map(crate::wan_session::service::ipc_scope)
+                .collect::<Vec<_>>();
+            normalize_scopes(&mut scopes);
+            let fingerprint = grant
+                .transport_fingerprint_sha256
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            proof.can_install_at(installed_at_ms)
+                && identity.session_id() == &grant.session_id
+                && record.snapshot.role == role
+                && &record.request.peer_device_id == peer
+                && record.request.peer_key_id == key
+                && record.request.expires_at_ms == identity.deadline_unix_ms()
+                && record.request.request_nonce == proof.request().idempotency_key
+                && record.request.access_mode
+                    == match proof.request().access_mode {
+                        mrd_signal_proto::WanAccessModeV3::Attended => RemoteAccessMode::Attended,
+                        mrd_signal_proto::WanAccessModeV3::Paired => RemoteAccessMode::Paired,
+                    }
+                && record.request.transport_kind == "webrtc_relay"
+                && installed_at_ms < record.request.expires_at_ms
+                && grant.granted_scopes == scopes
+                && grant.grant_id
+                    == format!("sha256:{}", proof.grant().grant_commitment().unwrap_or(""))
+                && grant.policy_revision == proof.grant().policy_revision()
+                && grant.expires_at_ms == proof.deadline_unix_ms()
+                && fingerprint == proof.access().relay_url_digest()
+                && record
+                    .peer_public_key
+                    .is_some_and(|public_key| public_key_id(&public_key) == key)
+                && ((role == RemoteSessionRole::Agent && wan_local_policy_revision.is_some())
+                    || (role == RemoteSessionRole::Controller
+                        && wan_local_policy_revision.is_none()))
+        });
+        let raw_wan_binding_is_valid = record.request.transport_kind != "webrtc_relay"
+            || wan_authority.is_some()
+            || (installed_at_ms < record.request.expires_at_ms
+                && grant.expires_at_ms <= record.request.expires_at_ms);
+        let policy_binding_is_valid = proved_binding_is_valid
+            && raw_wan_binding_is_valid
+            && match wan_local_policy_revision {
+                Some(expected_revision) => {
+                    record.snapshot.role == RemoteSessionRole::Agent
+                        && (record.request.access_mode == RemoteAccessMode::Attended
+                            || (record.request.access_mode == RemoteAccessMode::Paired
+                                && record.paired_policy_revision.is_some()))
+                        && record.request.transport_kind == "webrtc_relay"
+                        && record.snapshot.policy_revision.get() == expected_revision
+                        && record
+                            .peer_public_key
+                            .is_some_and(|key| public_key_id(&key) == record.request.peer_key_id)
+                        && installed_at_ms < record.request.expires_at_ms
+                        && (wan_authority.is_some()
+                            || grant.expires_at_ms <= record.request.expires_at_ms)
+                        && grant.policy_revision > 0
+                }
+                None => {
+                    record.snapshot.role == RemoteSessionRole::Controller
+                        || grant.policy_revision == record.snapshot.policy_revision.get()
+                }
+            };
         let Some(route_kind) = remote_route_kind(&record.request.transport_kind) else {
             return Err(failure(
                 RemoteReasonCode::PolicyChanged,
@@ -2555,6 +2650,287 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_wan_registry_requires_exact_current_local_authority() {
+        use crate::wan_session::model::WanSessionRole;
+        for case in [
+            "valid",
+            "revision",
+            "role",
+            "key",
+            "nonce",
+            "mode",
+            "scope",
+            "commitment",
+            "expiry",
+            "route",
+        ] {
+            let (registry, proof, mut grant, _) =
+                bound_wan_fixture(WanSessionRole::Target, 30_000, 30_000).await;
+            {
+                let mut inner = registry.inner.lock().await;
+                let record = inner.records.get_mut(&grant.session_id).unwrap();
+                match case {
+                    "role" => record.snapshot.role = RemoteSessionRole::Controller,
+                    "key" => record.request.peer_key_id = "9".repeat(64),
+                    "nonce" => record.request.request_nonce = [9; 16],
+                    "mode" => {
+                        record.request.access_mode = RemoteAccessMode::Paired;
+                        record.paired_policy_revision = Some(1);
+                    }
+                    "scope" => grant.granted_scopes.pop().map(|_| ()).unwrap(),
+                    "commitment" => grant.grant_id = format!("sha256:{}", "9".repeat(64)),
+                    "expiry" => grant.expires_at_ms += 1,
+                    "route" => grant.transport_fingerprint_sha256 = [9; 32],
+                    _ => {}
+                }
+            }
+            let result = registry
+                .install_bound_wan_grant(
+                    grant,
+                    &proof,
+                    Some(if case == "revision" { 2 } else { 1 }),
+                )
+                .await;
+            assert_eq!(result.is_ok(), case == "valid", "{case}");
+        }
+        let (registry, proof, grant, _) =
+            bound_wan_fixture(WanSessionRole::Controller, 30_000, 30_000).await;
+        assert!(registry
+            .install_bound_wan_grant(grant, &proof, None)
+            .await
+            .is_ok());
+    }
+
+    async fn bound_wan_fixture(
+        role: crate::wan_session::model::WanSessionRole,
+        setup_ms: u64,
+        delivery_ms: u64,
+    ) -> (
+        Arc<SessionAuthorizationRegistry>,
+        crate::wan_session::coordinator::WanActiveAuthorityProof,
+        VerifiedSessionGrant,
+        Arc<AtomicU64>,
+    ) {
+        let now = unix_time_ms();
+        let clock = Arc::new(AtomicU64::new(now));
+        let registry = Arc::new(SessionAuthorizationRegistry {
+            wan_test_clock: Some(clock.clone()),
+            ..Default::default()
+        });
+        let (proof, key) =
+            crate::wan_session::coordinator::WanActiveAuthorityProof::registry_fixture_for_test(
+                role,
+                now,
+                now + setup_ms,
+                now + delivery_ms,
+            );
+        let mut request = control_request(&proof.identity().session_id().0, &key);
+        request.transport_kind = "webrtc_relay".into();
+        request.created_at_ms = now;
+        request.expires_at_ms = now + setup_ms;
+        request.peer_device_id = match role {
+            crate::wan_session::model::WanSessionRole::Controller => {
+                proof.identity().target_device_id()
+            }
+            crate::wan_session::model::WanSessionRole::Target => {
+                proof.identity().controller_device_id()
+            }
+        }
+        .clone();
+        if role == crate::wan_session::model::WanSessionRole::Controller {
+            registry.begin_outgoing(request.clone()).await.unwrap();
+        } else {
+            registry
+                .begin_verified_incoming(request.clone())
+                .await
+                .unwrap();
+            registry
+                .respond_to_consent(
+                    ConsentResponse {
+                        session_id: request.session_id.clone(),
+                        decision: ConsentDecision::Approve,
+                        approved_scopes: request.requested_scopes.clone(),
+                        expected_policy_revision: DecimalU64::new(1),
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        }
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &key, now)
+            .await
+            .unwrap();
+        let grant = VerifiedSessionGrant {
+            grant_id: format!("sha256:{}", proof.grant().grant_commitment().unwrap()),
+            session_id: request.session_id,
+            granted_scopes: request.requested_scopes,
+            issued_at_ms: now,
+            expires_at_ms: proof.deadline_unix_ms(),
+            policy_revision: 7,
+            route_constraint: "webrtc_relay".into(),
+            transport_fingerprint_sha256: [0x44; 32],
+        };
+        (registry, proof, grant, clock)
+    }
+
+    #[tokio::test]
+    async fn bound_wan_install_rechecks_setup_and_delivery_under_the_final_registry_lock() {
+        use crate::wan_session::model::WanSessionRole;
+        for (role, advance) in [
+            (WanSessionRole::Target, 30_000),
+            (WanSessionRole::Controller, 30_000),
+            (WanSessionRole::Controller, 500),
+        ] {
+            let (registry, proof, grant, clock) = bound_wan_fixture(role, 30_000, 500).await;
+            let session_id = grant.session_id.clone();
+            let guard = registry.inner.lock().await;
+            let install_registry = registry.clone();
+            let (started, received) = tokio::sync::oneshot::channel();
+            let pending = tokio::spawn(async move {
+                started.send(()).unwrap();
+                install_registry
+                    .install_bound_wan_grant(
+                        grant,
+                        &proof,
+                        (role == WanSessionRole::Target).then_some(1),
+                    )
+                    .await
+            });
+            received.await.unwrap();
+            tokio::task::yield_now().await;
+            clock.fetch_add(advance, Ordering::SeqCst);
+            drop(guard);
+            assert!(
+                pending.await.unwrap().is_err(),
+                "role={role:?}, advance={advance}"
+            );
+            assert!(registry.active_grant(&session_id).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn wan_raw_grants_cannot_exchange_or_reopen_a_pending_lease() {
+        for controller in [false, true] {
+            for expired in [false, true] {
+                let registry = SessionAuthorizationRegistry::default();
+                let key = [7; 32];
+                let now = unix_time_ms();
+                let mut request = control_request("raw-wan-lease", &key);
+                request.transport_kind = "webrtc_relay".into();
+                request.created_at_ms = now;
+                request.expires_at_ms = now + 100;
+                if controller {
+                    registry.begin_outgoing(request.clone()).await.unwrap();
+                } else {
+                    registry
+                        .begin_verified_incoming(request.clone())
+                        .await
+                        .unwrap();
+                    registry
+                        .respond_to_consent(
+                            ConsentResponse {
+                                session_id: request.session_id.clone(),
+                                decision: ConsentDecision::Approve,
+                                approved_scopes: request.requested_scopes.clone(),
+                                expected_policy_revision: DecimalU64::new(1),
+                            },
+                            now,
+                        )
+                        .await
+                        .unwrap();
+                }
+                registry
+                    .bind_authenticated_peer_key(&request.session_id, &key, now)
+                    .await
+                    .unwrap();
+                if expired {
+                    tokio::time::sleep(Duration::from_millis(125)).await;
+                }
+                let grant = VerifiedSessionGrant {
+                    grant_id: "raw-wan".into(),
+                    session_id: request.session_id.clone(),
+                    granted_scopes: request.requested_scopes.clone(),
+                    issued_at_ms: now,
+                    expires_at_ms: if expired {
+                        request.expires_at_ms
+                    } else {
+                        now + 600_000
+                    },
+                    policy_revision: 1,
+                    route_constraint: "webrtc_relay".into(),
+                    transport_fingerprint_sha256: [3; 32],
+                };
+                assert!(
+                    registry.install_verified_grant(grant, now).await.is_err(),
+                    "raw WAN controller={controller}, expired={expired}"
+                );
+                assert!(registry.active_grant(&request.session_id).await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wan_target_install_rechecks_confirmation_time_after_waiting_for_registry_lock() {
+        let registry = Arc::new(SessionAuthorizationRegistry::default());
+        let now = unix_time_ms();
+        let key = [7; 32];
+        let mut request = control_request("wan-lock-expired", &key);
+        request.transport_kind = "webrtc_relay".into();
+        request.created_at_ms = now;
+        request.expires_at_ms = now + 200;
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .unwrap();
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &key, now)
+            .await
+            .unwrap();
+        registry
+            .respond_to_consent(
+                ConsentResponse {
+                    session_id: request.session_id.clone(),
+                    decision: ConsentDecision::Approve,
+                    approved_scopes: request.requested_scopes.clone(),
+                    expected_policy_revision: DecimalU64::new(1),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let guard = registry.inner.lock().await;
+        let installer = registry.clone();
+        let session_id = request.session_id.clone();
+        let retained_id = session_id.clone();
+        let pending = tokio::spawn(async move {
+            installer
+                .install_verified_wan_target_grant(
+                    VerifiedSessionGrant {
+                        grant_id: "sha256:lock-test".into(),
+                        session_id,
+                        granted_scopes: request.requested_scopes,
+                        issued_at_ms: now,
+                        expires_at_ms: request.expires_at_ms,
+                        policy_revision: 7,
+                        route_constraint: "webrtc_relay".into(),
+                        transport_fingerprint_sha256: [3; 32],
+                    },
+                    1,
+                    now,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(guard);
+        assert!(
+            pending.await.unwrap().is_err(),
+            "stale pre-lock timestamp must never install expired WAN authority"
+        );
+        assert!(registry.active_grant(&retained_id).await.is_none());
+    }
+
+    #[tokio::test]
     async fn paired_policy_rejects_unbound_key_and_permission_expansion() {
         let registry = SessionAuthorizationRegistry::default();
         let mut request = control_request("paired-unbound", &[7; 32]);
@@ -2986,7 +3362,10 @@ mod tests {
 
     #[tokio::test]
     async fn mark_streaming_preserves_the_verified_wan_route_kind() {
-        let registry = SessionAuthorizationRegistry::default();
+        let registry = SessionAuthorizationRegistry {
+            wan_test_clock: Some(Arc::new(AtomicU64::new(CREATED_AT_MS + 2))),
+            ..Default::default()
+        };
         let peer_public_key = [7; 32];
         let mut request = control_request("active-wan-control", &peer_public_key);
         request.transport_kind = "webrtc_relay".to_string();

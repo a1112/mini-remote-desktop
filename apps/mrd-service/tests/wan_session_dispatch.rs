@@ -295,6 +295,7 @@ struct ControllerAuthorizationFixture {
     signed_expires_at_ms: u64,
     policy_expires_at_ms: u64,
     grant_expires_at_ms: u64,
+    backend: Arc<ControllerRequestBackend>,
 }
 
 async fn controller_authorization_fixture(suffix: &str) -> ControllerAuthorizationFixture {
@@ -375,6 +376,7 @@ async fn controller_authorization_fixture(suffix: &str) -> ControllerAuthorizati
         signed_expires_at_ms,
         policy_expires_at_ms,
         grant_expires_at_ms,
+        backend,
     }
 }
 
@@ -421,12 +423,12 @@ fn controller_grant_event(
         issuer_device_id: target_device_id.clone(),
         issuer_key_id: fixture.target_identity.key_id().to_owned(),
         intended_peer_device_id: fixture.controller_device_id.clone(),
-        issued_at_ms: now_unix_ms(),
-        expires_at_ms: if matches!(mutation, ControllerGrantMutation::Deadline) {
-            fixture.identity.deadline_unix_ms().saturating_add(1)
+        issued_at_ms: if matches!(mutation, ControllerGrantMutation::Deadline) {
+            now_unix_ms().saturating_sub(1_000)
         } else {
-            fixture.signed_expires_at_ms
+            now_unix_ms()
         },
+        expires_at_ms: fixture.signed_expires_at_ms,
         counter: 1,
         nonce: [0x65; 16],
     };
@@ -445,7 +447,11 @@ fn controller_grant_event(
             approved_scopes,
             approved_profile,
             backend_policy_revision: 7,
-            policy_expires_at_ms: fixture.policy_expires_at_ms,
+            policy_expires_at_ms: if matches!(mutation, ControllerGrantMutation::Deadline) {
+                now_unix_ms().saturating_sub(1)
+            } else {
+                fixture.policy_expires_at_ms
+            },
             relay_generation: 0,
             relay_directory_id: "controller-authorization-directory".to_owned(),
             primary_relay_node_id: "controller-authorization-relay".to_owned(),
@@ -608,6 +614,88 @@ fn public_discovery_snapshot_cannot_mint_authenticated_route_evidence() {
         select_route(RemoteRoutePreference::Auto, Some(evidence)),
         WanRouteSelection::WanRelay
     );
+}
+
+#[tokio::test]
+async fn controller_service_installs_an_exact_ten_minute_lease_from_a_fresh_short_message() {
+    let mut fixture = controller_authorization_fixture("long-authority").await;
+    let now = now_unix_ms();
+    fixture.signed_expires_at_ms = now + 30_000;
+    fixture.policy_expires_at_ms = now + 600_000;
+    fixture.grant_expires_at_ms = now + 600_000;
+    fixture
+        .backend
+        .configure_grant_deadlines(fixture.policy_expires_at_ms, fixture.grant_expires_at_ms);
+    apply_verified_controller_grant_for_service(
+        &fixture.app_state,
+        &fixture.coordinator,
+        controller_grant_event(&fixture, ControllerGrantMutation::Valid),
+    )
+    .await
+    .unwrap();
+    let grant = fixture
+        .app_state
+        .session_authorizations
+        .active_grant(&fixture.session_id)
+        .await
+        .unwrap();
+    assert_eq!(grant.expires_at_ms, fixture.grant_expires_at_ms);
+    assert!(grant.expires_at_ms > fixture.identity.deadline_unix_ms());
+}
+
+#[tokio::test]
+async fn controller_service_rechecks_delivery_freshness_after_waiting_for_the_security_gate() {
+    let mut fixture = controller_authorization_fixture("gate-delivery-expired").await;
+    let now = now_unix_ms();
+    fixture.signed_expires_at_ms = now + 500;
+    fixture.policy_expires_at_ms = now + 600_000;
+    fixture.grant_expires_at_ms = now + 600_000;
+    fixture
+        .backend
+        .configure_grant_deadlines(fixture.policy_expires_at_ms, fixture.grant_expires_at_ms);
+    let gate = fixture.app_state.authorization_security_gate.lock().await;
+    let app = fixture.app_state.clone();
+    let coordinator = fixture.coordinator.clone();
+    let event = controller_grant_event(&fixture, ControllerGrantMutation::Valid);
+    let pending = tokio::spawn(async move {
+        apply_verified_controller_grant_for_service(&app, &coordinator, event).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if fixture
+                .coordinator
+                .snapshot(&fixture.session_id)
+                .await
+                .unwrap()
+                .phase()
+                == WanSessionPhase::AccessBound
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("coordinator proof must precede the blocked registry install");
+    tokio::time::sleep(Duration::from_millis(
+        fixture.signed_expires_at_ms.saturating_sub(now_unix_ms()) + 50,
+    ))
+    .await;
+    drop(gate);
+    assert!(pending.await.unwrap().is_err());
+    assert!(fixture
+        .app_state
+        .session_authorizations
+        .active_grant(&fixture.session_id)
+        .await
+        .is_none());
+    assert!(fixture
+        .coordinator
+        .snapshot(&fixture.session_id)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ use ring::rand::SystemRandom;
 struct Backend {
     request: WanSessionRequestV3,
     now: u64,
+    lease_ms: u64,
 }
 #[async_trait]
 impl WanSessionWorkflowBackend for Backend {
@@ -53,8 +54,8 @@ impl WanSessionWorkflowBackend for Backend {
                 self.request.commitment().unwrap(),
                 approval.approved_scopes().to_vec(),
                 7,
-                self.now + 50_000,
-                self.now + 50_000,
+                self.now + self.lease_ms,
+                self.now + self.lease_ms,
                 self.request.route_policy,
             )
             .unwrap(),
@@ -228,6 +229,11 @@ async fn run_flow(
                 Arc::new(Backend {
                     request: request.clone(),
                     now,
+                    lease_ms: if case == "long_lease" {
+                        600_000
+                    } else {
+                        50_000
+                    },
                 }),
                 signaling.clone(),
                 Arc::new(ServiceWanSessionConsentPublisher::new(
@@ -292,6 +298,78 @@ async fn run_flow(
         approval.await.unwrap();
     }
     (app, coordinator, request, controller_key, signaling, result)
+}
+
+#[tokio::test]
+async fn fresh_target_grant_establishes_a_ten_minute_lease_after_one_minute_setup() {
+    let (app, coordinator, request, _, _, result) = run_flow("long_lease").await;
+    assert!(
+        result.is_ok(),
+        "a signed grant and exact backend lease must establish authority: {:?}",
+        coordinator.snapshot(&request.session_id).await
+    );
+    let state = coordinator.snapshot(&request.session_id).await.unwrap();
+    assert_eq!(state.phase(), WanSessionPhase::AccessBound);
+    let grant = app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .unwrap();
+    assert!(grant.expires_at_ms > state.identity().deadline_unix_ms());
+}
+
+#[test]
+fn fresh_grant_message_verifies_a_longer_signed_policy_lease() {
+    let controller = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    let target = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    let now = now_unix_ms();
+    let claims = AuthClaims {
+        issuer_device_id: DeviceId("lease-target".into()),
+        issuer_key_id: target.key_id().into(),
+        intended_peer_device_id: DeviceId("lease-controller".into()),
+        issued_at_ms: now,
+        expires_at_ms: now + 30_000,
+        counter: 1,
+        nonce: [4; 16],
+    };
+    let signed = SessionGrantV3::sign(
+        &target,
+        SessionGrantV3Payload {
+            claims: claims.clone(),
+            session_id: SessionId("lease-message".into()),
+            controller_device_id: claims.intended_peer_device_id.clone(),
+            target_device_id: claims.issuer_device_id.clone(),
+            intent_commitment: "1".repeat(64),
+            approved_scopes: vec![WanPermissionScopeV3::ScreenView],
+            approved_profile: None,
+            backend_policy_revision: 7,
+            policy_expires_at_ms: now + 600_000,
+            relay_generation: 0,
+            relay_directory_id: "directory".into(),
+            primary_relay_node_id: "primary".into(),
+            route_policy: WanRoutePolicyV3::DirectFirst,
+        },
+    )
+    .unwrap();
+    let event = VerifiedSignalingEvent {
+        sender: VerifiedSignalingIdentity {
+            device_id: claims.issuer_device_id,
+            key_id: claims.issuer_key_id,
+            public_key: target.public_key().to_vec(),
+            counter: claims.counter,
+            nonce: claims.nonce,
+            issued_at_ms: claims.issued_at_ms,
+            expires_at_ms: claims.expires_at_ms,
+        },
+        signal: AuthenticatedSessionSignal::SessionGrantV3 { message: signed },
+    };
+    assert!(VerifiedWanSessionGrant::verify_event(
+        event,
+        &claims.intended_peer_device_id,
+        &controller,
+        now
+    )
+    .is_ok());
 }
 
 #[tokio::test]
@@ -460,6 +538,7 @@ async fn active_paired_intent(install: bool) -> ActivePairedIntent {
                 Arc::new(Backend {
                     request: request.clone(),
                     now,
+                    lease_ms: 50_000,
                 }),
                 signaling,
                 Arc::new(ServiceWanSessionConsentPublisher::new(
