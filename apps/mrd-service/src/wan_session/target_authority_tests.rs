@@ -20,6 +20,7 @@ struct Backend {
     request: WanSessionRequestV3,
     now: u64,
     lease_ms: u64,
+    approval_error: Option<WanSessionPortError>,
 }
 #[async_trait]
 impl WanSessionWorkflowBackend for Backend {
@@ -47,6 +48,9 @@ impl WanSessionWorkflowBackend for Backend {
         approval: &WanSessionApproval,
         _: u64,
     ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
+        if let Some(error) = self.approval_error {
+            return Err(error);
+        }
         Ok(WanBackendSessionSnapshot::approved(
             self.request.clone(),
             self.request.commitment().unwrap(),
@@ -82,6 +86,7 @@ struct Signaling {
     commitment: std::sync::Mutex<Option<String>>,
     revoke: Option<Arc<crate::session_authorization::SessionAuthorizationRegistry>>,
     change_local_target: Option<Arc<crate::AppState>>,
+    grant_error: Option<WanSessionPortError>,
 }
 #[async_trait]
 impl WanSessionWorkflowSignaling for Signaling {
@@ -102,6 +107,9 @@ impl WanSessionWorkflowSignaling for Signaling {
         access: &RelayAccessBinding,
         deadline: u64,
     ) -> Result<String, WanSessionPortError> {
+        if let Some(error) = self.grant_error {
+            return Err(error);
+        }
         let signed = SessionGrantV3::sign(
             &self.identity,
             SessionGrantV3Payload {
@@ -147,6 +155,36 @@ impl WanSessionWorkflowSignaling for Signaling {
         let digest = signed.commitment().unwrap();
         *self.commitment.lock().unwrap() = Some(digest.clone());
         Ok(digest)
+    }
+}
+
+struct Consent {
+    inner: ServiceWanSessionConsentPublisher,
+    approval_error: Option<WanSessionPortError>,
+}
+
+#[async_trait]
+impl WanSessionConsentPublisher for Consent {
+    async fn publish_attended_request(
+        &self,
+        identity: &WanSessionIdentity,
+        request: &WanSessionRequestV3,
+        deadline: u64,
+    ) -> Result<(), WanSessionPortError> {
+        self.inner
+            .publish_attended_request(identity, request, deadline)
+            .await
+    }
+
+    async fn load_attended_approval(
+        &self,
+        identity: &WanSessionIdentity,
+        deadline: u64,
+    ) -> Result<WanSessionApproval, WanSessionPortError> {
+        if let Some(error) = self.approval_error {
+            return Err(error);
+        }
+        self.inner.load_attended_approval(identity, deadline).await
     }
 }
 
@@ -228,6 +266,11 @@ async fn run_flow(
         commitment: Default::default(),
         revoke: (case == "revoked_during_grant").then(|| app.session_authorizations.clone()),
         change_local_target: (case == "target_changed_during_grant").then(|| app.clone()),
+        grant_error: match case {
+            "signaling_unavailable" => Some(WanSessionPortError::Unavailable),
+            "signaling_rejected" => Some(WanSessionPortError::Rejected),
+            _ => None,
+        },
     });
     let coordinator = Arc::new(
         WanSessionCoordinator::with_workflow_ports(
@@ -242,11 +285,24 @@ async fn run_flow(
                     } else {
                         50_000
                     },
+                    approval_error: match case {
+                        "directory_not_yet_valid" => Some(WanSessionPortError::DirectoryNotYetValid),
+                        "backend_unavailable" => Some(WanSessionPortError::Unavailable),
+                        "backend_rejected" => Some(WanSessionPortError::Rejected),
+                        _ => None,
+                    },
                 }),
                 signaling.clone(),
-                Arc::new(ServiceWanSessionConsentPublisher::new(
-                    app.session_authorizations.clone(),
-                )),
+                Arc::new(Consent {
+                    inner: ServiceWanSessionConsentPublisher::new(
+                        app.session_authorizations.clone(),
+                    ),
+                    approval_error: match case {
+                        "consent_unavailable" => Some(WanSessionPortError::Unavailable),
+                        "consent_rejected" => Some(WanSessionPortError::Rejected),
+                        _ => None,
+                    },
+                }),
                 Arc::new(SystemWanSessionClock),
             ),
         )
@@ -306,6 +362,129 @@ async fn run_flow(
         approval.await.unwrap();
     }
     (app, coordinator, request, controller_key, signaling, result)
+}
+
+async fn assert_approval_diagnostic(case: &str) {
+    let (app, coordinator, request, _, signaling, result) = run_flow(case).await;
+    assert!(result.is_err(), "{case} must not install authority");
+    assert!(coordinator
+        .snapshot(&request.session_id)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
+    let snapshot = app
+        .session_authorizations
+        .snapshot(&request.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.failure.as_ref().unwrap().message,
+        format!("WAN target authorization failed (stage=target_backend_approve, code={case}).")
+    );
+    assert!(app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .is_none());
+    assert!(signaling.commitment.lock().unwrap().is_none());
+    reconcile_wan_session(&app, &request.session_id).await.unwrap();
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(&request.session_id)
+            .await
+            .unwrap()
+            .failure,
+        snapshot.failure
+    );
+}
+
+#[tokio::test]
+async fn approval_diagnostic_directory_not_yet_valid() {
+    assert_approval_diagnostic("directory_not_yet_valid").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_backend_unavailable() {
+    assert_approval_diagnostic("backend_unavailable").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_backend_rejected() {
+    assert_approval_diagnostic("backend_rejected").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_signaling_unavailable() {
+    assert_approval_diagnostic("signaling_unavailable").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_signaling_rejected() {
+    assert_approval_diagnostic("signaling_rejected").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_consent_unavailable() {
+    assert_approval_diagnostic("consent_unavailable").await;
+}
+
+#[tokio::test]
+async fn approval_diagnostic_consent_rejected() {
+    assert_approval_diagnostic("consent_rejected").await;
+}
+
+#[test]
+fn approval_diagnostic_binding_deadline_and_unknown_categories_are_finite() {
+    for (reason, expected) in [
+        (
+            WanSessionCoordinatorError::BackendBindingMismatch,
+            "backend_binding_mismatch",
+        ),
+        (WanSessionCoordinatorError::DeadlineExceeded, "expired"),
+        (
+            WanSessionCoordinatorError::Backend(WanSessionPortError::DeadlineExceeded),
+            "expired",
+        ),
+        (
+            WanSessionCoordinatorError::Signaling(WanSessionPortError::DeadlineExceeded),
+            "expired",
+        ),
+        (
+            WanSessionCoordinatorError::Consent(WanSessionPortError::DeadlineExceeded),
+            "expired",
+        ),
+        (
+            WanSessionCoordinatorError::CapacityExceeded,
+            "capacity_exhausted",
+        ),
+        (
+            WanSessionCoordinatorError::TaskCapacityExceeded,
+            "capacity_exhausted",
+        ),
+        (
+            WanSessionCoordinatorError::BufferCapacityExceeded,
+            "capacity_exhausted",
+        ),
+        (
+            WanSessionCoordinatorError::InvalidConfiguration,
+            "guard_rejected",
+        ),
+        (WanSessionCoordinatorError::CleanupFailed, "guard_rejected"),
+        (
+            WanSessionCoordinatorError::Signaling(WanSessionPortError::DirectoryNotYetValid),
+            "guard_rejected",
+        ),
+        (
+            WanSessionCoordinatorError::Consent(WanSessionPortError::DirectoryNotYetValid),
+            "guard_rejected",
+        ),
+    ] {
+        assert_eq!(
+            target_approval_diagnostic(&reason).remote_failure().message,
+            format!("WAN target authorization failed (stage=target_backend_approve, code={expected}).")
+        );
+    }
 }
 
 #[tokio::test]
@@ -609,6 +788,7 @@ async fn active_paired_intent(install: bool) -> ActivePairedIntent {
         commitment: Default::default(),
         revoke: None,
         change_local_target: None,
+        grant_error: None,
     });
     let coordinator = Arc::new(
         WanSessionCoordinator::with_workflow_ports(
@@ -619,6 +799,7 @@ async fn active_paired_intent(install: bool) -> ActivePairedIntent {
                     request: request.clone(),
                     now,
                     lease_ms: 50_000,
+                    approval_error: None,
                 }),
                 signaling,
                 Arc::new(ServiceWanSessionConsentPublisher::new(

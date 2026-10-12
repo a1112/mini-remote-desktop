@@ -659,9 +659,28 @@ impl SessionAuthorizationRegistry {
     ) -> Option<[u8; 32]> {
         let inner = self.inner.lock().await;
         let record = inner.records.get(session_id)?;
-        if is_terminal_authorization_state(record.snapshot.authorization_state)
-            || now_ms >= record.request.expires_at_ms
+        if is_terminal_authorization_state(record.snapshot.authorization_state) {
+            return None;
+        }
+        // The pending request cutoff remains immutable. Once a WAN grant has
+        // been installed, authenticate its peer for that exact active lease.
+        // Only the private proved installer can extend it beyond setup.
+        let expires_at_ms = if record.request.transport_kind == "webrtc_relay"
+            && record.snapshot.authorization_state == RemoteAuthorizationState::Granted
         {
+            let grant = record.grant.as_ref()?;
+            if grant.session_id != *session_id
+                || grant.route_constraint != record.request.transport_kind
+                || grant.issued_at_ms > now_ms
+                || record.snapshot.authorization_expires_at_ms != Some(grant.expires_at_ms)
+            {
+                return None;
+            }
+            grant.expires_at_ms
+        } else {
+            record.request.expires_at_ms
+        };
+        if now_ms >= expires_at_ms {
             return None;
         }
         record
@@ -2772,6 +2791,198 @@ mod tests {
             transport_fingerprint_sha256: [0x44; 32],
         };
         (registry, proof, grant, clock)
+    }
+
+    #[tokio::test]
+    async fn authenticated_proved_wan_peer_key_survives_setup_until_the_installed_lease() {
+        use crate::wan_session::model::WanSessionRole;
+        for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+            let (registry, proof, grant, _) = bound_wan_fixture(role, 60_000, 30_000).await;
+            let session = grant.session_id.clone();
+            let installed_at = grant.issued_at_ms;
+            let expires_at = grant.expires_at_ms;
+            let key = registry
+                .authenticated_peer_key_at(&session, installed_at)
+                .await
+                .unwrap();
+            registry
+                .install_bound_wan_grant(
+                    grant,
+                    &proof,
+                    (role == WanSessionRole::Target).then_some(1),
+                )
+                .await
+                .unwrap();
+            let after_setup = proof.identity().deadline_unix_ms() + 1;
+            assert_eq!(
+                registry
+                    .snapshot_at(&session, after_setup)
+                    .await
+                    .unwrap()
+                    .authorization_state,
+                RemoteAuthorizationState::Granted
+            );
+            assert_eq!(
+                registry
+                    .authenticated_peer_key_at(&session, after_setup)
+                    .await,
+                Some(key),
+                "a proved live WAN lease retains its original authenticated key"
+            );
+            assert_eq!(
+                registry
+                    .authenticated_peer_key_at(&session, expires_at - 1)
+                    .await,
+                Some(key)
+            );
+            assert!(registry
+                .authenticated_peer_key_at(&session, expires_at)
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_pending_wan_peer_key_never_uses_an_uninstalled_proof() {
+        use crate::wan_session::model::WanSessionRole;
+        for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+            let (registry, proof, grant, _) = bound_wan_fixture(role, 60_000, 30_000).await;
+            assert!(registry
+                .authenticated_peer_key_at(&grant.session_id, grant.issued_at_ms)
+                .await
+                .is_some());
+            assert!(registry
+                .authenticated_peer_key_at(&grant.session_id, proof.identity().deadline_unix_ms())
+                .await
+                .is_none());
+            assert!(registry.active_grant(&grant.session_id).await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_active_wan_peer_key_rejects_terminal_revoked_and_foreign_bindings() {
+        use crate::wan_session::model::WanSessionRole;
+        for role in [WanSessionRole::Target, WanSessionRole::Controller] {
+            for case in [
+                "expired",
+                "terminal",
+                "revoked",
+                "foreign_key",
+                "missing_grant",
+            ] {
+                let (registry, proof, grant, _) = bound_wan_fixture(role, 60_000, 30_000).await;
+                let session = grant.session_id.clone();
+                let now = grant.issued_at_ms;
+                let expires_at = grant.expires_at_ms;
+                registry
+                    .install_bound_wan_grant(
+                        grant,
+                        &proof,
+                        (role == WanSessionRole::Target).then_some(1),
+                    )
+                    .await
+                    .unwrap();
+                match case {
+                    "expired" => {
+                        registry
+                            .snapshot_at(&session, expires_at + 1)
+                            .await
+                            .unwrap();
+                    }
+                    "terminal" | "revoked" => {
+                        registry
+                            .record_failure(
+                                &session,
+                                if case == "terminal" {
+                                    RemoteAuthorizationState::Denied
+                                } else {
+                                    RemoteAuthorizationState::Revoked
+                                },
+                                failure(RemoteReasonCode::GrantRevoked, "test authority ended"),
+                                now,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "foreign_key" => {
+                        let mut inner = registry.inner.lock().await;
+                        inner
+                            .records
+                            .get_mut(&session)
+                            .unwrap()
+                            .peer_public_key
+                            .as_mut()
+                            .unwrap()[0] ^= 1;
+                    }
+                    "missing_grant" => {
+                        registry
+                            .inner
+                            .lock()
+                            .await
+                            .records
+                            .get_mut(&session)
+                            .unwrap()
+                            .grant = None;
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    registry
+                        .authenticated_peer_key_at(&session, now + 1)
+                        .await
+                        .is_none(),
+                    "role={role:?}, case={case}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_wan_peer_key_rejects_a_short_grant_before_setup_expires() {
+        let now = unix_time_ms();
+        let registry = SessionAuthorizationRegistry {
+            wan_test_clock: Some(Arc::new(AtomicU64::new(now))),
+            ..Default::default()
+        };
+        let key = [7; 32];
+        let mut request = control_request("short-wan-peer-key", &key);
+        request.transport_kind = "webrtc_relay".into();
+        request.created_at_ms = now;
+        request.expires_at_ms = now + 60_000;
+        registry.begin_outgoing(request.clone()).await.unwrap();
+        registry
+            .bind_authenticated_peer_key(&request.session_id, &key, now)
+            .await
+            .unwrap();
+        registry
+            .install_verified_grant(
+                VerifiedSessionGrant {
+                    grant_id: format!("sha256:{}", "1".repeat(64)),
+                    session_id: request.session_id.clone(),
+                    granted_scopes: request.requested_scopes,
+                    issued_at_ms: now,
+                    expires_at_ms: now + 1_000,
+                    policy_revision: 1,
+                    route_constraint: "webrtc_relay".into(),
+                    transport_fingerprint_sha256: [3; 32],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .authenticated_peer_key_at(&request.session_id, now + 999)
+                .await,
+            Some(key)
+        );
+        assert!(
+            registry
+                .authenticated_peer_key_at(&request.session_id, now + 1_000)
+                .await
+                .is_none(),
+            "the active grant cutoff is strict even before setup ends"
+        );
     }
 
     #[tokio::test]

@@ -1253,6 +1253,9 @@ fn map_relay_error(error: RelayClientError) -> WanSessionBackendError {
         RelayClientError::BackendUnavailable => WanSessionBackendError::Unavailable,
         RelayClientError::Unauthorized => WanSessionBackendError::Unauthorized,
         RelayClientError::InvalidResponse => WanSessionBackendError::InvalidResponse,
+        RelayClientError::Directory(mrd_relay_control::RelayDirectoryError::NotYetValid) => {
+            WanSessionBackendError::DirectoryNotYetValid
+        }
         RelayClientError::CredentialBinding | RelayClientError::Directory(_) => {
             WanSessionBackendError::BindingMismatch
         }
@@ -1265,6 +1268,9 @@ fn map_workflow_error(error: WanSessionBackendError) -> super::coordinator::WanS
             super::coordinator::WanSessionPortError::DeadlineExceeded
         }
         WanSessionBackendError::Unavailable => super::coordinator::WanSessionPortError::Unavailable,
+        WanSessionBackendError::DirectoryNotYetValid => {
+            super::coordinator::WanSessionPortError::DirectoryNotYetValid
+        }
         WanSessionBackendError::InvalidConfiguration
         | WanSessionBackendError::InvalidRequest
         | WanSessionBackendError::Unauthorized
@@ -1310,4 +1316,31 @@ pub enum WanSessionBackendError {
     InvalidResponse,
     #[error("WAN session backend response does not match the requested binding")]
     BindingMismatch,
+    #[error("WAN session relay directory is not yet valid")]
+    DirectoryNotYetValid,
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    use crate::wan_session::coordinator::WanSessionPortError;
+
+    #[test]
+    fn other_relay_directory_errors_keep_the_existing_fixed_rejection() {
+        use mrd_relay_control::RelayDirectoryError as Error;
+        for reason in [
+            Error::InvalidJson,
+            Error::UntrustedSigningKey,
+            Error::UnsupportedFormatVersion { version: 2 },
+            Error::EmptyField {
+                field: "private-field",
+            },
+        ] {
+            let error = map_relay_error(RelayClientError::Directory(reason));
+            assert_eq!(error, WanSessionBackendError::BindingMismatch);
+            let port = map_workflow_error(error);
+            assert_eq!(port, WanSessionPortError::Rejected);
+            assert!(!format!("{port:?} {port}").contains("private-field"));
+        }
+    }
 }

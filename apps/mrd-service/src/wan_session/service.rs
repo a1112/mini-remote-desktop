@@ -1336,20 +1336,7 @@ async fn handle_target_intent(
         coordinator
             .approve_target(&session_id)
             .await
-            .map_err(|reason| {
-                TargetInstallDiagnostic::new(
-                    TargetInstallStage::TargetBackendApprove,
-                    match reason {
-                        WanSessionCoordinatorError::DeadlineExceeded => TargetInstallCode::Expired,
-                        WanSessionCoordinatorError::CapacityExceeded
-                        | WanSessionCoordinatorError::TaskCapacityExceeded
-                        | WanSessionCoordinatorError::BufferCapacityExceeded => {
-                            TargetInstallCode::CapacityExhausted
-                        }
-                        _ => TargetInstallCode::GuardRejected,
-                    },
-                )
-            })?;
+            .map_err(|reason| target_approval_diagnostic(&reason))?;
         let state = coordinator.snapshot(&session_id).await.map_err(|_| {
             TargetInstallDiagnostic::new(
                 TargetInstallStage::TargetStateSnapshot,
@@ -1367,6 +1354,34 @@ async fn handle_target_intent(
     approval
         .map(|_| InitialEventOutcome::StartGenerationZero)
         .map_err(|_| ())
+}
+
+/// Preserve only typed, finite rejection categories. In particular a directory
+/// validity failure must cross both backend adapters without error text, signed
+/// payloads, credentials, or timestamps entering the public diagnostic.
+fn target_approval_diagnostic(reason: &WanSessionCoordinatorError) -> TargetInstallDiagnostic {
+    use TargetInstallCode as Code;
+    use WanSessionCoordinatorError as Error;
+    use WanSessionPortError as Port;
+    let code = match reason {
+        Error::Backend(Port::DirectoryNotYetValid) => Code::DirectoryNotYetValid,
+        Error::Backend(Port::Unavailable) => Code::BackendUnavailable,
+        Error::Backend(Port::Rejected) => Code::BackendRejected,
+        Error::Signaling(Port::Unavailable) => Code::SignalingUnavailable,
+        Error::Signaling(Port::Rejected) => Code::SignalingRejected,
+        Error::Consent(Port::Unavailable) => Code::ConsentUnavailable,
+        Error::Consent(Port::Rejected) => Code::ConsentRejected,
+        Error::BackendBindingMismatch => Code::BackendBindingMismatch,
+        Error::DeadlineExceeded
+        | Error::Backend(Port::DeadlineExceeded)
+        | Error::Signaling(Port::DeadlineExceeded)
+        | Error::Consent(Port::DeadlineExceeded) => Code::Expired,
+        Error::CapacityExceeded | Error::TaskCapacityExceeded | Error::BufferCapacityExceeded => {
+            Code::CapacityExhausted
+        }
+        _ => Code::GuardRejected,
+    };
+    TargetInstallDiagnostic::new(TargetInstallStage::TargetBackendApprove, code)
 }
 
 /// Only called after a verified target intent has entered its owned workflow.

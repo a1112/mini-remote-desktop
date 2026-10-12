@@ -41,6 +41,14 @@ pub(crate) enum TargetInstallStage {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetInstallCode {
     GuardRejected,
+    DirectoryNotYetValid,
+    BackendUnavailable,
+    BackendRejected,
+    SignalingUnavailable,
+    SignalingRejected,
+    ConsentUnavailable,
+    ConsentRejected,
+    BackendBindingMismatch,
     StateUnavailable,
     SessionUnavailable,
     Unhealthy,
@@ -189,6 +197,38 @@ fn write_windows_event(record: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_diagnostic_public_codes_have_only_the_fixed_five_fields() {
+        use TargetInstallCode as Code;
+        let session = SessionId("3b100535-939e-48e7-af24-45cdd6e82d11".into());
+        for (code, name) in [
+            (Code::DirectoryNotYetValid, "directory_not_yet_valid"),
+            (Code::BackendUnavailable, "backend_unavailable"),
+            (Code::BackendRejected, "backend_rejected"),
+            (Code::SignalingUnavailable, "signaling_unavailable"),
+            (Code::SignalingRejected, "signaling_rejected"),
+            (Code::ConsentUnavailable, "consent_unavailable"),
+            (Code::ConsentRejected, "consent_rejected"),
+            (Code::BackendBindingMismatch, "backend_binding_mismatch"),
+        ] {
+            let diagnostic =
+                TargetInstallDiagnostic::new(TargetInstallStage::TargetBackendApprove, code);
+            let record = diagnostic.public_record(31500, &session).unwrap();
+            assert!(record.len() <= 512);
+            let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "event": "wan_target_install_failed",
+                    "service_pid": 31500,
+                    "session_id": session.0,
+                    "stage": "target_backend_approve",
+                    "code": name,
+                })
+            );
+        }
+    }
 
     #[test]
     fn target_diagnostic_public_record_contains_only_approved_fields() {

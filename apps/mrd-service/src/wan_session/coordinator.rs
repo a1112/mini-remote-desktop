@@ -1952,6 +1952,8 @@ pub enum WanSessionPortError {
     Unavailable,
     #[error("WAN session port rejected the operation")]
     Rejected,
+    #[error("WAN session relay directory is not yet valid")]
+    DirectoryNotYetValid,
     #[error("WAN session port deadline exceeded")]
     DeadlineExceeded,
 }
