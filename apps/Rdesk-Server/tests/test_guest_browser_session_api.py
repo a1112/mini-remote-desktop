@@ -252,13 +252,16 @@ def _durable_fields(row):
     return {column.key: getattr(row, column.key) for column in row.__table__.columns}
 
 
-def test_renewal_preserves_pending_guest_deadline_and_credentials(device_sessions_api):
+@pytest.mark.parametrize("access_mode", ["attended", "paired"])
+def test_renewal_preserves_pending_guest_deadline_and_credentials(
+    device_sessions_api, access_mode
+):
     from app.models.browser_controller import BrowserController
     from app.models.device_temporary_access import DeviceTemporaryAccess
     api = device_sessions_api
     expires_ms = int((datetime.now(UTC) + timedelta(seconds=120)).timestamp() * 1000)
     assert _publish(api, expires_at_ms=expires_ms).status_code == 200
-    response = _guest(api)
+    response = _guest(api, access_mode=access_mode)
     assert response.status_code == 200, response.text
     body = response.json()
     auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
@@ -269,6 +272,7 @@ def test_renewal_preserves_pending_guest_deadline_and_credentials(device_session
 
     renewed = _publish(api, expires_at_ms=expires_ms + 60_000)
     assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["generation"] == body["session"]["temporary_access_generation"]
     api.session.refresh(row)
     api.session.refresh(principal)
     assert _durable_fields(row) == request_before
@@ -283,8 +287,9 @@ def test_renewal_preserves_pending_guest_deadline_and_credentials(device_session
     claims_after = jwt.decode(inspected.json()["credential"]["token"], options={"verify_signature": False})
     assert claims_after["exp"] == claims_before["exp"]
     assert body["http_credential"]["expires_at_ms"] <= expires_ms
-    fresh = _guest(api, session_id="guest-session-2", controller_public_key=list(Ed25519PrivateKey.from_private_bytes(bytes([93]) * 32).public_key().public_bytes_raw()))
+    fresh = _guest(api, session_id="guest-session-2", access_mode=access_mode)
     assert fresh.status_code == 200, fresh.text
+    assert fresh.json()["controller_key_id"] == body["controller_key_id"]
     new_request = api.session.get(SessionRequest, "guest-session-2")
     assert new_request.authority_expires_at.replace(tzinfo=UTC) > row.authority_expires_at.replace(tzinfo=UTC)
 
@@ -383,12 +388,15 @@ def test_guest_approval_keeps_local_consent_and_issues_real_scoped_relay(wan_rel
     assert physical.status_code == 200, physical.text
 
 
-def test_renewal_preserves_approved_guest_grants_and_relay_reservations(wan_relay_api):
+@pytest.mark.parametrize("access_mode", ["attended", "paired"])
+def test_renewal_preserves_approved_guest_grants_and_relay_reservations(
+    wan_relay_api, access_mode
+):
     from app.models.browser_controller import BrowserController
     from app.models.device_temporary_access import DeviceTemporaryAccess
     from app.models.relay_reservation import RelayReservation
     api = wan_relay_api
-    body = _unbound_relay_guest(api)
+    body = _unbound_relay_guest(api, access_mode=access_mode)
     auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
     relay = api.client.post("/api/v1/guest-browser-sessions/guest-session-1/relay-access", headers=auth, json={})
     assert relay.status_code == 200, relay.text
@@ -413,6 +421,143 @@ def test_renewal_preserves_approved_guest_grants_and_relay_reservations(wan_rela
     inspected = api.client.get("/api/v1/guest-browser-sessions/guest-session-1", headers=auth)
     assert inspected.status_code == 200, inspected.text
     assert inspected.json()["session"]["status"] == "approved"
+
+
+def test_paired_actual_password_rotation_revokes_pending_and_reissues_unapproved_authority(
+    device_sessions_api,
+):
+    from app.models.browser_controller import BrowserController
+
+    api = device_sessions_api
+    assert _publish(api).status_code == 200
+    response = _guest(api, access_mode="paired")
+    assert response.status_code == 200
+    body = response.json()
+    auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
+    pending = api.session.get(SessionRequest, "guest-session-1")
+    principal = api.session.scalar(
+        select(BrowserController).where(BrowserController.session_id == pending.id)
+    )
+    original_binding = (
+        pending.paired_controller_key_id,
+        pending.paired_target_key_id,
+        pending.target_auth_version,
+    )
+    password = "BCDEFGH3"
+    salt = bytes([17]) * 16
+    verifier = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600000).hex()
+
+    rotated = _publish(api, generation=2, salt=salt.hex(), verifier=verifier)
+    assert rotated.status_code == 200
+    assert rotated.json()["generation"] == 2
+    api.session.refresh(pending)
+    api.session.refresh(principal)
+    assert pending.status == "revoked"
+    assert principal.revoked_at is not None
+    assert api.client.get(
+        "/api/v1/guest-browser-sessions/guest-session-1", headers=auth
+    ).status_code == 404
+    assert _guest(api, access_mode="paired", session_id="old-password-request").status_code == 401
+    assert api.session.get(SessionRequest, "old-password-request") is None
+
+    fresh = _guest(
+        api,
+        access_mode="paired",
+        session_id="guest-session-2",
+        temporary_password=password,
+    )
+    assert fresh.status_code == 200
+    current = api.session.get(SessionRequest, "guest-session-2")
+    assert fresh.json()["controller_key_id"] == body["controller_key_id"]
+    assert current.temporary_access_generation == 2
+    assert (
+        current.paired_controller_key_id,
+        current.paired_target_key_id,
+        current.target_auth_version,
+    ) == original_binding
+    # Target-local sealed pairing is outside this API: a current password and
+    # stable key cannot inherit approval or scopes from the revoked request.
+    assert current.access_mode == "paired"
+    assert current.status == "requested"
+    assert not current.approved_scopes
+    assert current.grant_expires_at is None
+    assert api.client.get(
+        "/api/v1/device-sessions/guest-session-2", headers=_headers(api, "unbound-1")
+    ).json()["status"] == "requested"
+
+
+def test_paired_actual_rotation_preserves_original_authority_until_its_first_deadline(
+    wan_relay_api, monkeypatch
+):
+    from app.models.browser_controller import BrowserController
+    from app.models.relay_reservation import RelayReservation
+    from app.services import guest_browser_sessions
+
+    api = wan_relay_api
+    body = _unbound_relay_guest(api, access_mode="paired")
+    path = "/api/v1/guest-browser-sessions/guest-session-1"
+    auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
+    assert api.client.post(path + "/relay-access", headers=auth, json={}).status_code == 200
+    row = api.session.get(SessionRequest, "guest-session-1")
+    principal = api.session.scalar(
+        select(BrowserController).where(BrowserController.session_id == row.id)
+    )
+    reservations = list(api.session.scalars(select(RelayReservation)))
+    assert reservations
+    request_before, principal_before = _durable_fields(row), _durable_fields(principal)
+    reservations_before = [_durable_fields(reservation) for reservation in reservations]
+    deadline = min(
+        expiry.replace(tzinfo=UTC)
+        for expiry in (
+            row.authority_expires_at,
+            principal.expires_at,
+            row.grant_expires_at,
+            row.policy_expires_at,
+        )
+    )
+    password = "BCDEFGH3"
+    salt = bytes([17]) * 16
+    verifier = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 600000).hex()
+
+    assert _publish(
+        api, target="controller-1", generation=2, salt=salt.hex(), verifier=verifier
+    ).status_code == 200
+    api.session.refresh(row)
+    api.session.refresh(principal)
+    for reservation in reservations:
+        api.session.refresh(reservation)
+    assert _durable_fields(row) == request_before
+    assert _durable_fields(principal) == principal_before
+    assert [_durable_fields(reservation) for reservation in reservations] == reservations_before
+
+    # Inject time through the existing authority function's explicit `now`
+    # parameter, preserving every persisted deadline and normal JWT validation.
+    authority_valid = guest_browser_sessions.browser_authority_valid
+    at = deadline - timedelta(microseconds=1)
+
+    async def authority_at_original_deadline(db, session_row, **kwargs):
+        return await authority_valid(db, session_row, **{**kwargs, "now": at})
+
+    monkeypatch.setattr(
+        guest_browser_sessions, "browser_authority_valid", authority_at_original_deadline
+    )
+    issued_access = []
+    issue_authenticated_access = api.service.issue_authenticated_access
+
+    async def counted_issue(*args, **kwargs):
+        issued_access.append(True)
+        return await issue_authenticated_access(*args, **kwargs)
+
+    monkeypatch.setattr(api.service, "issue_authenticated_access", counted_issue)
+    assert api.client.get(path, headers=auth).status_code == 200
+    assert api.client.post(path + "/relay-access", headers=auth, json={}).status_code == 200
+    assert len(issued_access) == 1
+    issuer_calls = len(api.credential_calls)
+    at = deadline
+    assert api.client.get(path, headers=auth).status_code == 404
+    assert api.client.post(path + "/relay-access", headers=auth, json={}).status_code == 404
+    assert len(issued_access) == 1
+    assert len(api.credential_calls) == issuer_calls
 
 
 def test_approved_guest_survives_rotation_only_until_original_ttl_and_disable_revokes(
@@ -544,10 +689,11 @@ def test_guest_target_pin_must_match_published_physical_machine(
     assert api.session.query(SessionRequest).count() == 0
 
 
-def test_guest_expiry_auth_version_and_close_fail_closed(device_sessions_api):
+@pytest.mark.parametrize("access_mode", ["attended", "paired"])
+def test_guest_expiry_auth_version_and_close_fail_closed(device_sessions_api, access_mode):
     api = device_sessions_api
     assert _publish(api).status_code == 200
-    body = _guest(api).json()
+    body = _guest(api, access_mode=access_mode).json()
     auth = {"Authorization": "Bearer " + body["http_credential"]["token"]}
     assert (
         api.client.post(
@@ -563,8 +709,8 @@ def test_guest_expiry_auth_version_and_close_fail_closed(device_sessions_api):
         ).status_code
         == 404
     )
-    assert _guest(api).status_code in (401, 409)
-    fresh = _guest(api, session_id="guest-session-2").json()
+    assert _guest(api, access_mode=access_mode).status_code in (401, 409)
+    fresh = _guest(api, session_id="guest-session-2", access_mode=access_mode).json()
     auth = {"Authorization": "Bearer " + fresh["http_credential"]["token"]}
     api.devices["unbound-1"].auth_version += 1
     api.session.commit()
