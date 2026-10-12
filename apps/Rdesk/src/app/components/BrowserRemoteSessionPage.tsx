@@ -4,6 +4,7 @@ import { ArrowLeft, Maximize2, Minimize2, Monitor, ShieldCheck } from 'lucide-re
 import { attachBrowserRemoteSession, type BrowserRemoteHandle, type BrowserRemoteState } from '../services/browserRemoteSessionService';
 import type { ControlInputEvent } from '../adapters/tauri/types';
 import { browserRemotePoint, browserVirtualKey, browserWheelDelta } from '../utils/browserRemoteInput';
+import { BrowserVideoStatistics } from './BrowserVideoStatistics';
 
 const initialState: BrowserRemoteState = { phase: 'waiting_consent', grantedScopes: [] };
 const phaseLabels = { waiting_consent: '等待远端同意', negotiating: '建立安全连接', streaming: '等待首帧画面', denied: '远端已拒绝', failed: '连接失败', closed: '会话已结束' };
@@ -267,6 +268,7 @@ export function BrowserRemoteSessionPage() {
         <video ref={video} aria-label="远端屏幕" autoPlay playsInline muted onLoadedData={markReady} onPlaying={markReady} className="absolute inset-0 h-full w-full object-contain" />
         {!firstFrame && <div className="pointer-events-none relative max-w-md px-6 py-12 text-center"><Monitor className="mx-auto mb-4 h-10 w-10 text-slate-600" /><p className="text-sm text-slate-300">{state.phase === 'waiting_consent' ? '请在远端设备上确认本次连接请求' : state.phase === 'negotiating' || state.phase === 'streaming' ? '正在等待远端的首帧画面' : '当前没有远端画面'}</p></div>}
       </div>
+      <BrowserVideoStatistics key={id} videoRef={video} ready={ready} />
       <footer className="flex flex-wrap items-center justify-between gap-3"><p id="browser-input-help" className="text-xs text-slate-400">点击画面或按 Tab 聚焦后控制键鼠；Esc 退出控制焦点。离开页面会停止本地控制，并请求结束本次会话。</p><div className="flex flex-wrap gap-2">{['音频', '文件传输', '无人值守', '远程应用'].map(feature => <button key={feature} type="button" disabled aria-label={`${feature}（暂不支持）`} className="rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-slate-600">{feature} · 暂不支持</button>)}</div></footer>
     </div>
   </main>;
