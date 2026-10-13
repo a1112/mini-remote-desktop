@@ -1,5 +1,6 @@
 import type { ControlInputEvent } from '../adapters/tauri/types';
 import type { BrowserRemoteContext, BrowserRemoteHandle, BrowserRemoteObserver, BrowserRemoteState, BrowserRemoteSetupProgress, BrowserRemoteSetupStage } from './browserRemoteSessionService';
+import { boundedInboundVideoStatistics, type BrowserInboundVideoStatistics } from './browserRemoteSessionService';
 import { BrowserRemoteControl } from './browserRemoteControl';
 import { verifyBrowserRelayAccess, waitUntilRelayDirectoryIssued, BrowserRelayDirectoryValidityError } from './browserRelayDirectory';
 import {
@@ -15,6 +16,23 @@ const MAX_MESSAGE_BYTES = 512 * 1024;
 const MAX_QUEUED_BYTES = 2 * 1024 * 1024;
 const MAX_CANDIDATES = 256;
 const CONSENT_TIMEOUT_ERROR = '等待远端确认超时，请重新连接';
+
+
+/** A single video source is required: multiple RTP streams have ambiguous deltas. */
+export function selectInboundVideoStatistics(reports: Iterable<unknown>): BrowserInboundVideoStatistics | null {
+  let selected: unknown;
+  let count = 0;
+  for (const value of reports) {
+    if (++count > 2048) return null;
+    if (!value || typeof value !== 'object') continue;
+    const report = value as Record<string, unknown>;
+    if (report.type !== 'inbound-rtp'
+      || !(report.kind === 'video' || (report.kind === undefined && report.mediaType === 'video'))) continue;
+    if (selected !== undefined) return null;
+    selected = value;
+  }
+  return selected === undefined ? null : boundedInboundVideoStatistics(selected);
+}
 
 export class BrowserRemotePeer implements BrowserRemoteHandle {
   private state: BrowserRemoteState = { phase: 'waiting_consent', grantedScopes: [] };
@@ -43,6 +61,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
   private poll?: ReturnType<typeof setInterval>;
   private polling = false;
   private routeVerified = false;
+  private inboundStatsPending = false;
   private frame?: { width: number; height: number };
   private consentDeadline?: ReturnType<typeof setTimeout>;
   private negotiationDeadline?: ReturnType<typeof setTimeout>;
@@ -453,6 +472,25 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     safeInteger(width, 1, 16384); safeInteger(height, 1, 16384);
     this.frame = { width, height };
     this.presentStreaming();
+  }
+  private canSampleInboundVideo(pc: RTCPeerConnection): boolean {
+    return !this.closing && this.pc === pc && pc.connectionState === 'connected'
+      && this.socket?.readyState === 1 && this.state.phase === 'streaming'
+      && this.routeVerified && Boolean(this.frame) && Boolean(this.grant)
+      && this.grant!.payload.policy_expires_at_ms > Date.now()
+      && this.grant!.payload.approved_scopes.includes('screen.view');
+  }
+  async sampleInboundVideoStats(): Promise<BrowserInboundVideoStatistics | null> {
+    const pc = this.pc;
+    if (!pc || this.inboundStatsPending || !this.canSampleInboundVideo(pc)) return null;
+    const grant = this.grant;
+    this.inboundStatsPending = true;
+    try {
+      const reports = await pc.getStats();
+      if (this.grant !== grant || !this.canSampleInboundVideo(pc)) return null;
+      return selectInboundVideoStatistics(reports.values());
+    } catch { return null; }
+    finally { this.inboundStatsPending = false; }
   }
   async sendInput(input: ControlInputEvent): Promise<void> {
     if (this.closing || !this.control || this.state.phase !== 'streaming' || !this.routeVerified || !this.controlReady()) throw new Error('远端控制授权或媒体连接尚未就绪');

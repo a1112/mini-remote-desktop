@@ -157,3 +157,82 @@ describe('browser video playback statistics', () => {
     expect(quality).toHaveBeenCalledTimes(2);
   });
 });
+
+
+describe('inbound video statistics', () => {
+  let clock = 1000;
+  const raw = (n = 0) => ({ framesReceived: 100 + n, framesDecoded: 90 + n, framesDropped: 2,
+    packetsLost: 0, totalDecodeTime: 0.5 + n / 100, bytesReceived: 100000 + n * 1000,
+    jitter: 0.004, jitterBufferDelay: 0.8 + n / 50, jitterBufferEmittedCount: 90 + n });
+  beforeEach(() => { vi.useFakeTimers(); clock = 1000; vi.spyOn(performance, 'now').mockImplementation(() => clock); });
+  afterEach(() => { cleanup(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it('derives only consecutive counters and resets on rollback or nonmonotonic time', async () => {
+    const module = await import('./BrowserVideoStatistics');
+    const rates = (module as unknown as { inboundVideoRates: (previous: unknown, current: unknown) => unknown }).inboundVideoRates;
+    const first = { sampledAtMs: 1000, counters: raw() };
+    const second = { sampledAtMs: 2000, counters: raw(60) };
+    expect(rates(null, first)).toBeNull();
+    expect(rates(first, second)).toEqual({ receiveFps: 60, decodeFps: 60, decodeMs: expect.closeTo(10, 8), jitterBufferMs: 20, receiveMbps: 0.48 });
+    expect(rates(second, { sampledAtMs: 3000, counters: raw(2) })).toBeNull();
+    expect(rates(first, { ...second, sampledAtMs: 1000 })).toBeNull();
+    expect(rates(first, { ...second, sampledAtMs: 500 })).toBeNull();
+    expect(rates(first, { ...second, counters: { ...raw(60), jitter: 0.001 } })).toEqual(
+      { receiveFps: 60, decodeFps: 60, decodeMs: expect.closeTo(10, 8), jitterBufferMs: 20, receiveMbps: 0.48 });
+    expect(rates(first, { sampledAtMs: 2000, counters: raw() })).toEqual(
+      { receiveFps: 0, decodeFps: 0, decodeMs: null, jitterBufferMs: null, receiveMbps: 0 });
+  });
+
+  it('samples only expanded ready, does not overlap, and ignores late data after collapse or unmount', async () => {
+    const { videoRef } = videoFixture();
+    let resolve!: (value: unknown) => void;
+    const sample = vi.fn(() => new Promise(done => { resolve = done; }));
+    const Component = BrowserVideoStatistics as unknown as React.ComponentType<{videoRef: typeof videoRef; ready: boolean; sampleInboundVideoStats: typeof sample}>;
+    const view = render(<Component videoRef={videoRef} ready={false} sampleInboundVideoStats={sample} />);
+    toggle(true); await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(sample).not.toHaveBeenCalled();
+    view.rerender(<Component videoRef={videoRef} ready sampleInboundVideoStats={sample} />);
+    expect(sample).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(sample).toHaveBeenCalledTimes(1);
+    toggle(false);
+    await act(async () => resolve(raw()));
+    expect(panel()).not.toHaveAttribute('data-rtp-frames-received');
+    sample.mockResolvedValue(raw());
+    toggle(true);
+    await act(async () => Promise.resolve());
+    expect(panel()).toHaveAttribute('data-rtp-frames-received', '100');
+    expect(panel()).not.toHaveAttribute('data-rtp-receive-fps');
+    clock = 2000; sample.mockResolvedValue(raw(60));
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(panel()).toHaveAttribute('data-rtp-receive-fps', '60');
+    expect(panel()).toHaveAttribute('data-rtp-decode-fps', '60');
+    expect(screen.getByLabelText('平均解码耗时（毫秒/帧）')).toHaveTextContent('10.00');
+    view.rerender(<Component videoRef={videoRef} ready={false} sampleInboundVideoStats={sample} />);
+    const calls = sample.mock.calls.length;
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(sample).toHaveBeenCalledTimes(calls);
+    expect(panel()).not.toHaveAttribute('data-rtp-frames-received');
+    view.unmount();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(sample).toHaveBeenCalledTimes(calls);
+  });
+  it('does not inspect a late result after readiness loss or unmount', async () => {
+    const { videoRef } = videoFixture();
+    let resolve!: (value: unknown) => void;
+    const sample = vi.fn(() => new Promise(done => { resolve = done; }));
+    const Component = BrowserVideoStatistics as unknown as React.ComponentType<{videoRef: typeof videoRef; ready: boolean; sampleInboundVideoStats: typeof sample}>;
+    const view = render(<Component videoRef={videoRef} ready sampleInboundVideoStats={sample} />);
+    toggle(true);
+    expect(sample).toHaveBeenCalledTimes(1);
+    const read = vi.fn(() => { throw new Error('late results must not be inspected'); });
+    const late = Object.defineProperty({}, 'framesReceived', { get: read });
+    view.rerender(<Component videoRef={videoRef} ready={false} sampleInboundVideoStats={sample} />);
+    view.unmount();
+    await act(async () => resolve(late));
+    expect(read).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(sample).toHaveBeenCalledTimes(1);
+  });
+
+});

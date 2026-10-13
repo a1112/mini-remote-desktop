@@ -941,3 +941,59 @@ describe('independent browser peer lifecycle', () => {
     expect(onState.mock.lastCall?.[0].setup).toEqual(lastSetup);
   });
 });
+
+
+describe('inbound video statistics', () => {
+  it('selects only one video inbound report and copies only bounded numeric fields', async () => {
+    const module = await import('./browserRemotePeer');
+    const select = (module as unknown as { selectInboundVideoStatistics: (reports: Iterable<unknown>) => unknown }).selectInboundVideoStatistics;
+    const report = { type: 'inbound-rtp', kind: 'video', framesReceived: 120, framesDecoded: 100,
+      framesDropped: 2, packetsLost: 3, totalDecodeTime: 0.5, bytesReceived: 200000,
+      jitter: 0.002, jitterBufferDelay: 0.8, jitterBufferEmittedCount: 100 };
+    Object.defineProperties(report, {
+      id: { get: () => { throw new Error('private field access'); } },
+      ssrc: { get: () => { throw new Error('private field access'); } },
+      address: { get: () => { throw new Error('private field access'); } },
+    });
+    expect(select([{ type: 'inbound-rtp', kind: 'audio' }, report, { type: 'candidate-pair' }])).toEqual({
+      framesReceived: 120, framesDecoded: 100, framesDropped: 2, packetsLost: 3,
+      totalDecodeTime: 0.5, bytesReceived: 200000, jitter: 0.002, jitterBufferDelay: 0.8, jitterBufferEmittedCount: 100,
+    });
+    expect(select([report, { ...report }])).toBeNull();
+    expect(select([{ type: 'outbound-rtp', kind: 'video' }])).toBeNull();
+    expect(select([{ ...report, framesReceived: NaN, framesDecoded: 1.5, framesDropped: -1,
+      packetsLost: Infinity, totalDecodeTime: '2', bytesReceived: Number.MAX_SAFE_INTEGER + 1,
+      jitter: -0.1, jitterBufferDelay: Infinity, jitterBufferEmittedCount: undefined }])).toEqual({
+      framesReceived: null, framesDecoded: null, framesDropped: null, packetsLost: null,
+      totalDecodeTime: null, bytesReceived: null, jitter: null, jitterBufferDelay: null, jitterBufferEmittedCount: null,
+    });
+  });
+
+  it('does not query stats before verified ready media, and ignores a result after close', async () => {
+    const { peer, pc } = await approvedPeer();
+    const sample = () => (peer as unknown as { sampleInboundVideoStats: () => Promise<unknown> }).sampleInboundVideoStats();
+    try {
+      const query = vi.spyOn(pc, 'getStats');
+      await expect(sample()).resolves.toBeNull();
+      expect(query).not.toHaveBeenCalled();
+      const track = Object.assign(new EventTarget(), { kind: 'video', stop: vi.fn() });
+      pc.dispatchEvent(Object.assign(new Event('track'), { track, streams: [{ getTracks: () => [track] }] }));
+      pc.connectionState = 'connected'; pc.dispatchEvent(new Event('connectionstatechange'));
+      await until(() => onState.mock.calls.some(([state]) => state.route === 'direct'));
+      peer.markVideoReady(1280, 720); pc.channels.forEach(channel => channel.open());
+      await until(() => onState.mock.lastCall?.[0].phase === 'streaming');
+      let resolve!: (report: Map<string, Record<string, unknown>>) => void;
+      query.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+      const pending = sample();
+      await expect(sample()).resolves.toBeNull(); // No overlapping getStats.
+      const calls = query.mock.calls.length;
+      pc.channels.forEach(channel => { channel.readyState = 'closed'; });
+      const closing = peer.close('test_cleanup');
+      resolve(new Map([['video', { type: 'inbound-rtp', kind: 'video', framesReceived: 77 }]]));
+      await expect(pending).resolves.toBeNull();
+      await closing;
+      await expect(sample()).resolves.toBeNull();
+      expect(query).toHaveBeenCalledTimes(calls);
+    } finally { pc.channels.forEach(channel => { channel.readyState = 'closed'; }); await peer.close('test_cleanup'); }
+  });
+});

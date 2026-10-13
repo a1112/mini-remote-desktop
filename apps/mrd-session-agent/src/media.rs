@@ -20,6 +20,10 @@ use std::collections::{HashMap, VecDeque};
 #[path = "capture_queue.rs"]
 pub(crate) mod capture_queue;
 
+// Match the production capture queue's depth without growing queue or writer
+// capacity. A timer wake can release several frames accumulated between ticks.
+const CAPTURE_PUMP_BATCH_PER_RESOURCE: usize = 3;
+
 /// Desktop-bound media operation represented by a live agent resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaResourceKind {
@@ -482,10 +486,13 @@ where
             .values()
             .filter(|resource| resource.kind == MediaResourceKind::Capture)
         {
-            if !self.capture.is_resource_running(&resource.resource_id) {
-                return Err(CaptureAccessUnitsError);
-            }
-            if let Some(unit) = self.capture.poll_encoded(&resource.resource_id) {
+            for _ in 0..CAPTURE_PUMP_BATCH_PER_RESOURCE {
+                if !self.capture.is_resource_running(&resource.resource_id) {
+                    return Err(CaptureAccessUnitsError);
+                }
+                let Some(unit) = self.capture.poll_encoded(&resource.resource_id) else {
+                    break;
+                };
                 if unit.resource_id != resource.resource_id
                     || unit.session_id != resource.session_id
                 {
@@ -605,6 +612,10 @@ impl MediaResourceRegistry {
         self.resources.is_empty()
     }
 }
+
+#[cfg(test)]
+#[path = "media_capture_batch_tests.rs"]
+mod capture_batch_tests;
 
 #[cfg(test)]
 mod tests {

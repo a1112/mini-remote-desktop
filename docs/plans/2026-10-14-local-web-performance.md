@@ -46,3 +46,21 @@ Use the existing active worktree and `--target-dir L:\project\mini-remote-deskto
 ## Guest create diagnostics
 
 The existing finite rejection logger already leaves admission and masked HTTP errors unchanged. A three-way split of its combined first guard distinguishes absent target, absent access and invalid password after the same existing password-verification work. This diagnostic change does not establish the cause of earlier intermittent HTTP401. Password values in the browser automation's read-only password DOM are redacted; their apparent `<redacted>` length is not evidence of a product input defect.
+
+## Actual installed verification and remaining throughput limit
+
+The c24475f2 Agent was installed with original identity/configuration and unchanged UI/service binaries. Native UI was restarted normally to reattach to the service; its original minimize-to-tray preference was restored. Browser video, pointer, Ctrl+A/Backspace, text typing and Enter worked in the dedicated Notepad. Paired reconnect worked without another request dialog.
+
+The 1440p120 direct run `5839e294-b256-4936-bb7e-99b58b13d5db` measured 63.81 received frames/s, 63.83 decoded frames/s and 55.66 non-dropped playback counts/s over 41 seconds. RTP packet/frame loss was zero; decode averaged 0.360 ms/frame. Agent remained the same process. The later disconnect followed the exact public grant deadline (19:44:53 UTC) and session revocation, with zero matching Agent failure events.
+
+The 1080p30 direct run `238eb0b9-8981-45a1-b118-aea2c07d85b5` measured 29.33 received/decoded frames/s and 29.28 non-dropped playback counts/s over 40 seconds. Playback drops increased by two; RTP drops/loss remained zero. The native source painted about 57 updates/s; none of these counters proves end-to-end latency or 120 unique display updates.
+
+An isolated three-second timing probe reproduced Tokio interval+Skip at about 64.3 wakes/s for both 8 ms and 4 ms on this Windows host. Native Rust sleep and an explicit high-resolution timer both achieved about 116.7 waits/s for 8.333 ms, so replacing Rust sleep or merely lowering the Tokio interval is unsupported by the evidence. This probe is separate from installed Agent timing.
+
+### Task 5: Bounded media drain per pump
+
+The Agent previously took one AU per owned resource per Tokio tick. Allow up to three FIFO units per owned resource per pump, matching the existing capture queue depth. Check worker health before every poll and retain exact owner/session checks per unit; later invalid units return no partial batch. Preserve runtime per-unit authority/codec/bounds/payload/sequence checks, capture and outbound queue capacities, and deadline/control event behavior. The service already drains up to eight units per tick and needs no change for this step.
+
+Real regression: five focused cases failed with the original one-unit path, then passed after the bounded loop. The 120-producer/64-pump synthetic model now drains the full stream without increasing any queue bound. Full integrated Agent library: 191 passed, 12 ignored. Independent source review found no must-fix. Live throughput after this change still requires another installed run.
+
+The browser exposes nine strictly numeric inbound-video counters only while expanded and ready. It ignores late results after close/collapse and resets non-monotonic sample baselines. Focused peer/service/page/statistics tests: 116 passed; type checking and build passed. Actual browser sampling above validated the displayed statistics.

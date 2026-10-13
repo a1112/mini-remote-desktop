@@ -34,11 +34,42 @@ export type BrowserRemoteObserver = {
   onState: (state: BrowserRemoteState) => void;
   onVideoStream: (stream: MediaStream) => void;
 };
+
+export type BrowserInboundVideoStatistics = {
+  framesReceived: number | null;
+  framesDecoded: number | null;
+  framesDropped: number | null;
+  packetsLost: number | null;
+  totalDecodeTime: number | null;
+  bytesReceived: number | null;
+  jitter: number | null;
+  jitterBufferDelay: number | null;
+  jitterBufferEmittedCount: number | null;
+};
+export const inboundVideoStatisticKeys = [
+  'framesReceived', 'framesDecoded', 'framesDropped', 'packetsLost', 'totalDecodeTime',
+  'bytesReceived', 'jitter', 'jitterBufferDelay', 'jitterBufferEmittedCount',
+] as const;
+const inboundTimeFields = new Set<string>(['totalDecodeTime', 'jitter', 'jitterBufferDelay']);
+/** Copy only public numeric diagnostics, never an RTC report or identifiers. */
+export function boundedInboundVideoStatistics(value: unknown): BrowserInboundVideoStatistics {
+  const input = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const result = {} as BrowserInboundVideoStatistics;
+  for (const key of inboundVideoStatisticKeys) {
+    const number = input[key];
+    result[key] = typeof number === 'number' && Number.isFinite(number) && number >= 0
+      && number <= Number.MAX_SAFE_INTEGER && (inboundTimeFields.has(key) || Number.isSafeInteger(number))
+      ? number : null;
+  }
+  return result;
+}
+
 export type BrowserRemoteHandle = {
   sendInput: (input: ControlInputEvent) => Promise<void>;
   sendPointerAction: (position: { x: number; y: number }, input: ControlInputEvent) => Promise<void>;
   releaseInputs: (reason?: string) => Promise<void>;
   markVideoReady: (width: number, height: number) => void;
+  sampleInboundVideoStats?: () => Promise<BrowserInboundVideoStatistics | null>;
   close: (reason?: string) => Promise<void>;
 };
 export type BrowserRemoteCreateOptions = {
@@ -223,6 +254,11 @@ export function attachBrowserRemoteSession(sessionId: string, observer: BrowserR
     sendPointerAction: (position, input) => peer ? peer.sendPointerAction(position, input) : Promise.reject(new Error('远端控制通道尚未就绪')),
     releaseInputs: reason => peer ? peer.releaseInputs(reason) : Promise.resolve(),
     markVideoReady: (width, height) => peer?.markVideoReady(width, height),
+    sampleInboundVideoStats: async () => {
+      if (closed || !peer) return null;
+      const sample = await peer.sampleInboundVideoStats?.();
+      return closed ? null : sample ?? null;
+    },
     close: reason => {
       if (closePromise) return closePromise;
       closed = true; entry.closed = true; ownedSessions.delete(sessionId);

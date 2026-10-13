@@ -1,8 +1,10 @@
-import { useEffect, useState, type RefObject } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
+import { boundedInboundVideoStatistics, inboundVideoStatisticKeys, type BrowserInboundVideoStatistics } from '../services/browserRemoteSessionService';
 
 type BrowserVideoStatisticsProps = {
   videoRef: RefObject<HTMLVideoElement | null>;
   ready: boolean;
+  sampleInboundVideoStats?: () => Promise<BrowserInboundVideoStatistics | null>;
 };
 
 type Counters = { total: number; dropped: number; corrupted: number };
@@ -24,9 +26,40 @@ const count = (value: number) => Number.isSafeInteger(value) && value >= 0 ? val
 const nonnegative = (value: number) => Number.isFinite(value) && value >= 0 ? value : null;
 const display = (value: number | null | undefined, decimals?: number) => value == null ? '不可用' : decimals === undefined ? String(value) : value.toFixed(decimals);
 
-export function BrowserVideoStatistics({ videoRef, ready }: BrowserVideoStatisticsProps) {
+
+type InboundSample = { sampledAtMs: number | null; counters: BrowserInboundVideoStatistics };
+type InboundRates = { receiveFps: number | null; decodeFps: number | null; decodeMs: number | null; jitterBufferMs: number | null; receiveMbps: number | null };
+const safeDiagnosticNumber = (value: number) => Number.isFinite(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER ? value : null;
+export function inboundVideoRates(previous: InboundSample | null, current: InboundSample): InboundRates | null {
+  if (!previous || previous.sampledAtMs === null || current.sampledAtMs === null) return null;
+  const elapsedMs = current.sampledAtMs - previous.sampledAtMs;
+  if (safeDiagnosticNumber(elapsedMs) === null || elapsedMs <= 0) return null;
+  // Jitter is an instantaneous gauge; the other fields are cumulative counters.
+  for (const key of inboundVideoStatisticKeys) {
+    if (key === 'jitter') continue;
+    const before = previous.counters[key], after = current.counters[key];
+    if (before !== null && after !== null && after < before) return null;
+  }
+  const delta = (key: keyof BrowserInboundVideoStatistics) => {
+    const before = previous.counters[key], after = current.counters[key];
+    return before === null || after === null ? null : safeDiagnosticNumber(after - before);
+  };
+  const ratio = (numerator: number | null, denominator: number | null, scale: number) =>
+    numerator === null || denominator === null || denominator <= 0 ? null : safeDiagnosticNumber(numerator / denominator * scale);
+  return {
+    receiveFps: ratio(delta('framesReceived'), elapsedMs, 1000),
+    decodeFps: ratio(delta('framesDecoded'), elapsedMs, 1000),
+    decodeMs: ratio(delta('totalDecodeTime'), delta('framesDecoded'), 1000),
+    jitterBufferMs: ratio(delta('jitterBufferDelay'), delta('jitterBufferEmittedCount'), 1000),
+    receiveMbps: ratio(delta('bytesReceived'), elapsedMs, 0.008),
+  };
+}
+
+export function BrowserVideoStatistics({ videoRef, ready, sampleInboundVideoStats }: BrowserVideoStatisticsProps) {
   const [expanded, setExpanded] = useState(false);
   const [sample, setSample] = useState<Sample | null>(null);
+  const [inbound, setInbound] = useState<{ sample: InboundSample; rates: InboundRates | null } | null>(null);
+  const inboundPending = useRef(false);
 
   useEffect(() => {
     setSample(null);
@@ -74,6 +107,49 @@ export function BrowserVideoStatistics({ videoRef, ready }: BrowserVideoStatisti
     return () => window.clearInterval(timer);
   }, [expanded, ready, videoRef]);
 
+
+  useEffect(() => {
+    setInbound(null);
+    if (!expanded || !ready || !sampleInboundVideoStats) return;
+    let active = true;
+    let previous: InboundSample | null = null;
+    const poll = async () => {
+      if (!active || inboundPending.current) return;
+      inboundPending.current = true;
+      try {
+        const raw = await sampleInboundVideoStats();
+        if (!active) return;
+        if (raw === null) { previous = null; setInbound(null); return; }
+        const current = { sampledAtMs: safeDiagnosticNumber(performance.now()), counters: boundedInboundVideoStatistics(raw) };
+        const rates = inboundVideoRates(previous, current);
+        previous = current.sampledAtMs === null ? null : current;
+        setInbound({ sample: current, rates });
+      } catch {
+        if (active) { previous = null; setInbound(null); }
+      } finally { inboundPending.current = false; }
+    };
+    void poll();
+    const timer = window.setInterval(() => { void poll(); }, 1000);
+    return () => { active = false; previous = null; window.clearInterval(timer); };
+  }, [expanded, ready, sampleInboundVideoStats]);
+  const visibleInbound = expanded && ready ? inbound : null;
+  const inboundFields = [
+    ['RTP 接收帧数', display(visibleInbound?.sample.counters.framesReceived)],
+    ['RTP 解码帧数', display(visibleInbound?.sample.counters.framesDecoded)],
+    ['RTP 丢弃帧数', display(visibleInbound?.sample.counters.framesDropped)],
+    ['RTP 丢包数', display(visibleInbound?.sample.counters.packetsLost)],
+    ['累计解码时间（秒）', display(visibleInbound?.sample.counters.totalDecodeTime, 6)],
+    ['接收字节数', display(visibleInbound?.sample.counters.bytesReceived)],
+    ['当前抖动（秒）', display(visibleInbound?.sample.counters.jitter, 6)],
+    ['累计抖动缓冲时间（秒）', display(visibleInbound?.sample.counters.jitterBufferDelay, 6)],
+    ['抖动缓冲输出计数', display(visibleInbound?.sample.counters.jitterBufferEmittedCount)],
+    ['RTP 接收帧/秒', display(visibleInbound?.rates?.receiveFps, 2)],
+    ['RTP 解码帧/秒', display(visibleInbound?.rates?.decodeFps, 2)],
+    ['平均解码耗时（毫秒/帧）', display(visibleInbound?.rates?.decodeMs, 2)],
+    ['平均抖动缓冲停留（毫秒）', display(visibleInbound?.rates?.jitterBufferMs, 2)],
+    ['接收速率（Mbps）', display(visibleInbound?.rates?.receiveMbps, 3)],
+  ];
+
   const fields = sample ? [
     ['分辨率', sample.width === null || sample.height === null ? '不可用' : `${sample.width} × ${sample.height}`],
     ['播放时间（秒）', display(sample.currentTime, 3)],
@@ -90,6 +166,21 @@ export function BrowserVideoStatistics({ videoRef, ready }: BrowserVideoStatisti
   return <details open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}
     className="rounded-lg border border-white/10 px-3 py-2 text-xs text-slate-400"
     data-browser-video-statistics="true" data-state={expanded ? ready ? 'sampling' : 'waiting' : 'collapsed'}
+    data-rtp-sampled-at-ms={visibleInbound?.sample.sampledAtMs ?? undefined}
+    data-rtp-frames-received={visibleInbound?.sample.counters.framesReceived ?? undefined}
+    data-rtp-frames-decoded={visibleInbound?.sample.counters.framesDecoded ?? undefined}
+    data-rtp-frames-dropped={visibleInbound?.sample.counters.framesDropped ?? undefined}
+    data-rtp-packets-lost={visibleInbound?.sample.counters.packetsLost ?? undefined}
+    data-rtp-total-decode-time={visibleInbound?.sample.counters.totalDecodeTime ?? undefined}
+    data-rtp-bytes-received={visibleInbound?.sample.counters.bytesReceived ?? undefined}
+    data-rtp-jitter={visibleInbound?.sample.counters.jitter ?? undefined}
+    data-rtp-jitter-buffer-delay={visibleInbound?.sample.counters.jitterBufferDelay ?? undefined}
+    data-rtp-jitter-buffer-emitted-count={visibleInbound?.sample.counters.jitterBufferEmittedCount ?? undefined}
+    data-rtp-receive-fps={visibleInbound?.rates?.receiveFps ?? undefined}
+    data-rtp-decode-fps={visibleInbound?.rates?.decodeFps ?? undefined}
+    data-rtp-decode-ms={visibleInbound?.rates?.decodeMs ?? undefined}
+    data-rtp-jitter-buffer-ms={visibleInbound?.rates?.jitterBufferMs ?? undefined}
+    data-rtp-receive-mbps={visibleInbound?.rates?.receiveMbps ?? undefined}
     data-quality-status={sample?.qualityStatus} data-sampled-at-ms={sample?.sampledAtMs ?? undefined}
     data-video-width={sample?.width ?? undefined} data-video-height={sample?.height ?? undefined}
     data-current-time={sample?.currentTime ?? undefined} data-ready-state={sample?.readyState ?? undefined}
@@ -106,6 +197,9 @@ export function BrowserVideoStatistics({ videoRef, ready }: BrowserVideoStatisti
       {sample && <dl className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3 lg:grid-cols-4">
         {fields.map(([label, value]) => <div key={label}><dt>{label}</dt><dd className="mt-1 font-mono text-slate-200"><output aria-label={label}>{value}</output></dd></div>)}
       </dl>}
+      <div><p className="mb-2">视频接收与解码统计</p><dl className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3 lg:grid-cols-4">
+        {inboundFields.map(([label, value]) => <div key={label}><dt>{label}</dt><dd className="mt-1 font-mono text-slate-200"><output aria-label={label}>{value}</output></dd></div>)}
+      </dl><p className="mt-2">接收、解码和播放使用各自计数。解码耗时与抖动缓冲停留按连续样本计算，不代表端到端延迟。</p></div>
       <p>这些是浏览器播放计数，不代表独立源画面、RTP 帧数或网络延迟。帧计数/秒需要两个有效连续样本。</p>
     </div>}
   </details>;
