@@ -297,6 +297,7 @@ pub fn parse_native_coturn_scrape(
     let mut result = NativeCoturnScrape::default();
     let mut seen_series = BTreeSet::new();
     let mut declarations = BTreeSet::new();
+    let mut allocation_gauge_declared = false;
     let mut recognized_fields = 0usize;
     let mut line_count = 0usize;
     for raw_line in text.lines() {
@@ -310,6 +311,9 @@ pub fn parse_native_coturn_scrape(
         }
         if line.starts_with('#') {
             validate_prometheus_comment(line, &mut declarations)?;
+            allocation_gauge_declared |=
+                line.split_ascii_whitespace()
+                    .eq(["#", "TYPE", "turn_total_allocations", "gauge"]);
             continue;
         }
         let (series, value) = split_sample(line)?;
@@ -371,9 +375,13 @@ pub fn parse_native_coturn_scrape(
             _ => unreachable!(),
         }
     }
+    // Coturn declares its labeled gauge before the first allocation creates a
+    // sample. An empty, declared gauge is valid native diagnostic data; the
+    // production allocation count still comes from the target traffic broker.
     if !seen_series
         .iter()
         .any(|series| series.starts_with("turn_total_allocations"))
+        && !(allocation_gauge_declared && declarations.contains("HELP:turn_total_allocations"))
     {
         return Err(MetricsError::Invalid);
     }

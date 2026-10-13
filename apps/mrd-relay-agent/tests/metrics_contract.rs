@@ -21,6 +21,92 @@ fn native_coturn_scrape_sums_bounded_labeled_gauges_without_calling_counters_bps
 }
 
 #[test]
+fn native_scrape_cold_declared_allocation_gauge_keeps_real_diagnostic_counts() {
+    let input = concat!(
+        "# HELP turn_total_allocations Represents current allocations number\n",
+        "# TYPE turn_total_allocations gauge\n",
+        "# HELP turn_packet_dropped Incoming packet dropped\n",
+        "# TYPE turn_packet_dropped counter\n",
+        "turn_packet_dropped 7\n",
+    );
+
+    assert_eq!(
+        parse_native_coturn_scrape(input.as_bytes(), MetricsLimits::default()),
+        Ok(NativeCoturnScrape {
+            active_allocations: 0,
+            errors_total: 7,
+            ..NativeCoturnScrape::default()
+        })
+    );
+}
+
+#[test]
+fn native_scrape_cold_allocation_gauge_requires_help_declaration() {
+    let input = "# TYPE turn_total_allocations gauge\nturn_packet_dropped 7\n";
+    assert_eq!(
+        parse_native_coturn_scrape(input.as_bytes(), MetricsLimits::default()),
+        Err(MetricsError::Invalid)
+    );
+}
+
+#[test]
+fn native_scrape_cold_allocation_gauge_requires_type_declaration() {
+    let input = concat!(
+        "# HELP turn_total_allocations Represents current allocations number\n",
+        "turn_packet_dropped 7\n",
+    );
+    assert_eq!(
+        parse_native_coturn_scrape(input.as_bytes(), MetricsLimits::default()),
+        Err(MetricsError::Invalid)
+    );
+}
+
+#[test]
+fn native_scrape_cold_allocation_gauge_rejects_wrong_type() {
+    for wrong_type in ["counter", "untyped"] {
+        let input = format!(
+            "# HELP turn_total_allocations Represents current allocations number\n\
+             # TYPE turn_total_allocations {wrong_type}\n\
+             turn_packet_dropped 7\n"
+        );
+        assert_eq!(
+            parse_native_coturn_scrape(input.as_bytes(), MetricsLimits::default()),
+            Err(MetricsError::Invalid),
+            "an empty allocation family must be declared as a gauge"
+        );
+    }
+}
+
+#[test]
+fn native_scrape_cold_allocation_gauge_rejects_duplicate_declarations() {
+    for duplicate in [
+        "# HELP turn_total_allocations Represents current allocations number\n",
+        "# TYPE turn_total_allocations gauge\n",
+    ] {
+        let input = format!(
+            "# HELP turn_total_allocations Represents current allocations number\n\
+             # TYPE turn_total_allocations gauge\n\
+             {duplicate}\
+             turn_packet_dropped 7\n"
+        );
+        assert_eq!(
+            parse_native_coturn_scrape(input.as_bytes(), MetricsLimits::default()),
+            Err(MetricsError::Invalid)
+        );
+    }
+}
+
+#[test]
+fn native_scrape_cold_empty_response_is_invalid() {
+    for input in [b"".as_slice(), b" \n".as_slice()] {
+        assert_eq!(
+            parse_native_coturn_scrape(input, MetricsLimits::default()),
+            Err(MetricsError::Invalid)
+        );
+    }
+}
+
+#[test]
 fn target_counters_require_two_monotonic_samples_in_the_same_epoch() {
     let mut normalizer = TrafficRateNormalizer::default();
     assert_eq!(
