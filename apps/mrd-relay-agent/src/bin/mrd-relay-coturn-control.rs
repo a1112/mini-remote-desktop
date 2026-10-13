@@ -20,7 +20,11 @@ fn main() -> ExitCode {
             .build()
         {
             Ok(runtime) => runtime,
-            Err(_) => {
+            Err(error) => {
+                mrd_relay_agent::broker::report_broker_io_failure(
+                    mrd_relay_agent::broker::BrokerIoStage::RuntimeBuild,
+                    Some(&error),
+                );
                 eprintln!("relay_broker_io_failed");
                 return ExitCode::from(70);
             }

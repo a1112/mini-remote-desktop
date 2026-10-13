@@ -192,7 +192,13 @@ struct LinuxDrainCompletionObservation<'a> {
 pub async fn run_linux_socket_activated() -> Result<(), BrokerRuntimeError> {
     tokio::time::timeout(REQUEST_TIMEOUT, run_linux_socket_activated_inner())
         .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)?
+        .map_err(|_| {
+            super::io_diagnostics::report_broker_io_failure(
+                super::io_diagnostics::BrokerIoStage::SocketRequestTimeout,
+                None,
+            );
+            BrokerRuntimeError::IoFailed
+        })?
 }
 
 pub async fn run_linux_wsl_broker(
@@ -200,7 +206,13 @@ pub async fn run_linux_wsl_broker(
 ) -> Result<(), BrokerRuntimeError> {
     tokio::time::timeout(REQUEST_TIMEOUT, run_linux_wsl_broker_inner(arguments))
         .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)?
+        .map_err(|_| {
+            super::io_diagnostics::report_broker_io_failure(
+                super::io_diagnostics::BrokerIoStage::WslRequestTimeout,
+                None,
+            );
+            BrokerRuntimeError::IoFailed
+        })?
 }
 
 async fn run_linux_wsl_broker_inner(
@@ -219,14 +231,20 @@ async fn run_linux_wsl_broker_inner(
     };
     let payload = relabel_wsl_snapshot(&payload)?;
     let mut stdout = tokio::io::stdout();
-    stdout
-        .write_all(&payload)
-        .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)?;
-    stdout
-        .flush()
-        .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)
+    stdout.write_all(&payload).await.map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::WslResponseWrite,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })?;
+    stdout.flush().await.map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::WslResponseFlush,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })
 }
 
 fn parse_wsl_action(
@@ -430,10 +448,20 @@ async fn run_linux_socket_activated_inner() -> Result<(), BrokerRuntimeError> {
     // SAFETY: systemd promised exactly one owned descriptor at FD 3 and all
     // socket shape checks above completed before ownership is transferred.
     let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(FIRST_SOCKET_FD) };
-    std_stream
-        .set_nonblocking(true)
-        .map_err(|_| BrokerRuntimeError::IoFailed)?;
-    let mut stream = UnixStream::from_std(std_stream).map_err(|_| BrokerRuntimeError::IoFailed)?;
+    std_stream.set_nonblocking(true).map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::SocketNonblocking,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })?;
+    let mut stream = UnixStream::from_std(std_stream).map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::SocketFromStd,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })?;
     let credential = stream
         .peer_cred()
         .map_err(|_| BrokerRuntimeError::PeerRejected)?;
@@ -454,14 +482,20 @@ async fn run_linux_socket_activated_inner() -> Result<(), BrokerRuntimeError> {
     let _lock = acquire_global_lock()?;
     let payload = handle_request(request).await?;
     let response = encode_response_frame(&payload).map_err(|_| BrokerRuntimeError::StateInvalid)?;
-    stream
-        .write_all(&response)
-        .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|_| BrokerRuntimeError::IoFailed)
+    stream.write_all(&response).await.map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::SocketResponseWrite,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })?;
+    stream.shutdown().await.map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::SocketResponseShutdown,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })
 }
 
 fn socket_activation_claim() -> Result<SocketActivationClaim, BrokerRuntimeError> {
@@ -1858,7 +1892,13 @@ fn remove_private_file(path: &Path) -> Result<(), BrokerRuntimeError> {
                 Err(error)
             }
         })
-        .map_err(|_| BrokerRuntimeError::IoFailed)?
+        .map_err(|error| {
+            super::io_diagnostics::io_failed(
+                super::io_diagnostics::BrokerIoStage::PrivateMetadata,
+                &error,
+                BrokerRuntimeError::IoFailed,
+            )
+        })?
     else {
         return Ok(());
     };
@@ -1870,7 +1910,13 @@ fn remove_private_file(path: &Path) -> Result<(), BrokerRuntimeError> {
     {
         return Err(BrokerRuntimeError::StateInvalid);
     }
-    std::fs::remove_file(path).map_err(|_| BrokerRuntimeError::IoFailed)?;
+    std::fs::remove_file(path).map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::PrivateUnlink,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })?;
     sync_directory(path.parent().ok_or(BrokerRuntimeError::StateInvalid)?)
 }
 
@@ -1892,10 +1938,20 @@ fn sync_directory(path: &Path) -> Result<(), BrokerRuntimeError> {
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(path)
-        .map_err(|_| BrokerRuntimeError::IoFailed)?;
-    directory
-        .sync_all()
-        .map_err(|_| BrokerRuntimeError::IoFailed)
+        .map_err(|error| {
+            super::io_diagnostics::io_failed(
+                super::io_diagnostics::BrokerIoStage::DirectoryOpen,
+                &error,
+                BrokerRuntimeError::IoFailed,
+            )
+        })?;
+    directory.sync_all().map_err(|error| {
+        super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::DirectorySync,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        )
+    })
 }
 
 fn file_sha256(path: &Path, max_bytes: usize) -> Result<Option<String>, BrokerRuntimeError> {
@@ -1928,10 +1984,19 @@ fn monotonic_ns() -> Result<u64, BrokerRuntimeError> {
     // SAFETY: zero is a valid initial representation and clock_gettime writes
     // exactly one timespec to the live output pointer.
     let mut value: libc::timespec = unsafe { std::mem::zeroed() };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0
-        || value.tv_sec < 0
-        || value.tv_nsec < 0
-    {
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(super::io_diagnostics::io_failed(
+            super::io_diagnostics::BrokerIoStage::MonotonicRead,
+            &error,
+            BrokerRuntimeError::IoFailed,
+        ));
+    }
+    if value.tv_sec < 0 || value.tv_nsec < 0 {
+        super::io_diagnostics::report_broker_io_failure(
+            super::io_diagnostics::BrokerIoStage::MonotonicInvalid,
+            None,
+        );
         return Err(BrokerRuntimeError::IoFailed);
     }
     u64::try_from(value.tv_sec)
@@ -1939,7 +2004,95 @@ fn monotonic_ns() -> Result<u64, BrokerRuntimeError> {
         .and_then(|seconds| seconds.checked_mul(1_000_000_000))
         .and_then(|nanos| nanos.checked_add(value.tv_nsec as u64))
         .filter(|value| *value != 0)
-        .ok_or(BrokerRuntimeError::IoFailed)
+        .ok_or_else(|| {
+            super::io_diagnostics::report_broker_io_failure(
+                super::io_diagnostics::BrokerIoStage::MonotonicOverflow,
+                None,
+            );
+            BrokerRuntimeError::IoFailed
+        })
+}
+
+#[cfg(test)]
+mod io_diagnostic_branch_tests {
+    use super::super::io_diagnostics::take_test_records;
+    use super::*;
+
+    struct TemporaryDirectory(std::path::PathBuf);
+
+    impl TemporaryDirectory {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mrd-broker-io-diagnostic-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0.join("regular"));
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    fn assert_record(stage: &str, errno: i32) {
+        let records = take_test_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].as_object().unwrap().len(), 4);
+        assert_eq!(records[0]["event"], "relay_broker_io_failed");
+        assert_eq!(records[0]["pid"], std::process::id());
+        assert_eq!(records[0]["stage"], stage);
+        assert_eq!(records[0]["errno"], errno);
+    }
+
+    #[test]
+    fn broker_io_diagnostic_linux_directory_open_error_keeps_iofailed() {
+        let directory = TemporaryDirectory::new();
+        assert!(matches!(
+            sync_directory(&directory.0.join("missing")),
+            Err(BrokerRuntimeError::IoFailed)
+        ));
+        assert_record("directory_open", libc::ENOENT);
+        std::fs::write(directory.0.join("regular"), []).unwrap();
+        assert!(matches!(
+            sync_directory(&directory.0.join("regular")),
+            Err(BrokerRuntimeError::IoFailed)
+        ));
+        assert_record("directory_open", libc::ENOTDIR);
+    }
+
+    #[test]
+    fn broker_io_diagnostic_linux_private_metadata_error_keeps_iofailed() {
+        let directory = TemporaryDirectory::new();
+        std::fs::write(directory.0.join("regular"), []).unwrap();
+        assert!(matches!(
+            remove_private_file(&directory.0.join("regular").join("child")),
+            Err(BrokerRuntimeError::IoFailed)
+        ));
+        assert_record("private_metadata", libc::ENOTDIR);
+    }
+
+    #[test]
+    fn broker_io_diagnostic_linux_missing_private_file_is_successful_and_silent() {
+        let directory = TemporaryDirectory::new();
+        remove_private_file(&directory.0.join("missing")).unwrap();
+        assert!(take_test_records().is_empty());
+    }
+
+    #[test]
+    fn broker_io_diagnostic_linux_successful_directory_sync_and_clock_are_silent() {
+        let directory = TemporaryDirectory::new();
+        sync_directory(&directory.0).unwrap();
+        assert!(monotonic_ns().unwrap() > 0);
+        assert!(take_test_records().is_empty());
+    }
 }
 
 #[cfg(test)]

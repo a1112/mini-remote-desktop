@@ -25,6 +25,10 @@ use crate::{
 #[cfg(target_os = "linux")]
 mod linux_runtime;
 
+mod io_diagnostics;
+#[doc(hidden)]
+pub use io_diagnostics::{report_broker_io_failure, BrokerIoStage};
+
 #[cfg(target_os = "linux")]
 pub use linux_runtime::{run_linux_socket_activated, run_linux_wsl_broker, BrokerRuntimeError};
 
