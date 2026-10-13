@@ -22,7 +22,9 @@ use super::{
         GenerationZeroNegotiationFailure, GenerationZeroNegotiationStage, GenerationZeroNegotiator,
     },
 };
-use crate::wan_diagnostics::{TargetInstallCode, TargetInstallDiagnostic, TargetInstallStage};
+use crate::wan_diagnostics::{
+    TargetInstallCode, TargetInstallDiagnostic, TargetInstallStage, WanMediaFailureContext,
+};
 use async_trait::async_trait;
 #[cfg(any(test, debug_assertions))]
 use mrd_application::ports::TransportRouteKind;
@@ -825,6 +827,8 @@ impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
 /// registries only after `WanMediaAuthority` has proven RelayVerified.
 pub struct ServiceWanMediaActivationPort {
     app_state: Weak<crate::AppState>,
+    failure_context: WanMediaFailureContext,
+    owned_cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     #[cfg(any(test, debug_assertions))]
     test_mux: Option<(SessionId, Arc<dyn TransportMuxPort>)>,
 }
@@ -833,8 +837,20 @@ impl ServiceWanMediaActivationPort {
     pub fn new(app_state: &Arc<crate::AppState>) -> Self {
         Self {
             app_state: Arc::downgrade(app_state),
+            failure_context: WanMediaFailureContext::default(),
+            owned_cancellation: None,
             #[cfg(any(test, debug_assertions))]
             test_mux: None,
+        }
+    }
+
+    fn new_owned(
+        app_state: &Arc<crate::AppState>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            owned_cancellation: Some(cancellation),
+            ..Self::new(app_state)
         }
     }
 
@@ -846,6 +862,8 @@ impl ServiceWanMediaActivationPort {
     ) -> Self {
         Self {
             app_state: Arc::downgrade(app_state),
+            failure_context: WanMediaFailureContext::default(),
+            owned_cancellation: None,
             test_mux: Some((session_id, mux)),
         }
     }
@@ -900,13 +918,35 @@ impl WanMediaActivationPort for ServiceWanMediaActivationPort {
             .app_state
             .upgrade()
             .ok_or(WanMediaActivationError::StartupFailed)?;
-        let mux = self.resolve_mux(authority).await?;
-        bind_verified_mux(&app_state, authority.clone(), Arc::clone(&mux)).await?;
+        let mux = self.resolve_mux(authority).await.map_err(|error| {
+            self.failure_context.record(TargetInstallDiagnostic::new(
+                TargetInstallStage::TargetMediaInitMux,
+                TargetInstallCode::TransportUnavailable,
+            ));
+            error
+        })?;
+        bind_verified_mux(&app_state, authority.clone(), Arc::clone(&mux))
+            .await
+            .map_err(|error| {
+                self.failure_context.record(TargetInstallDiagnostic::new(
+                    TargetInstallStage::TargetMediaInitMux,
+                    TargetInstallCode::BindingMismatch,
+                ));
+                error
+            })?;
         #[cfg(any(test, debug_assertions))]
         let test_synthetic_capture = self.test_mux.is_some();
         #[cfg(not(any(test, debug_assertions)))]
         let test_synthetic_capture = false;
-        start_target_runtime(app_state, authority.clone(), mux, test_synthetic_capture).await
+        start_target_runtime(
+            app_state,
+            authority.clone(),
+            mux,
+            test_synthetic_capture,
+            self.failure_context.clone(),
+            self.owned_cancellation.clone(),
+        )
+        .await
     }
 
     async fn start_controller_receive_render(
@@ -1969,7 +2009,7 @@ async fn spawn_generation_zero(
                 )
                 .await
                 {
-                    let _ = fail_owned_wan_session(
+                    finish_browser_authority_failure(
                         &watch_app,
                         &watch_coordinator,
                         &watch_session,
@@ -1982,7 +2022,6 @@ async fn spawn_generation_zero(
             .await
             .map_err(|_| ())?;
     }
-    let media = Arc::new(ServiceWanMediaActivationPort::new(&app_state));
     let failure_app_state = Arc::clone(&app_state);
     let owned_session_id = session_id.clone();
     let task_coordinator = Arc::clone(&coordinator);
@@ -2010,6 +2049,10 @@ async fn spawn_generation_zero(
             if *owned_cancellation.borrow() {
                 return;
             }
+            let media = ServiceWanMediaActivationPort::new_owned(
+                &failure_app_state,
+                owned_cancellation.clone(),
+            );
             if let Ok(state) = task_coordinator.snapshot(&owned_session_id).await {
                 let authority = WanMediaAuthority::from_relay_verified(&state);
                 let activation = async {
@@ -2017,7 +2060,7 @@ async fn spawn_generation_zero(
                     start_verified_media_owned(
                         task_coordinator.as_ref(),
                         &state,
-                        media.as_ref(),
+                        &media,
                         &owned_cancellation,
                         &failure_app_state.authorization_security_gate,
                     )
@@ -2035,18 +2078,33 @@ async fn spawn_generation_zero(
                     {
                         let input = ServiceWanControlInputPort::new(&failure_app_state);
                         let barrier = ServiceWanControlEvidenceBarrier::new(&failure_app_state);
-                        enable_input_after_control_evidence(&authority, &barrier, &input).await?;
+                        enable_input_after_control_evidence(&authority, &barrier, &input)
+                            .await
+                            .map_err(|error| {
+                                let diagnostic =
+                                    if error == WanMediaActivationError::ControlEvidenceRequired {
+                                        media_activation_diagnostic(&error)
+                                    } else {
+                                        TargetInstallDiagnostic::new(
+                                            TargetInstallStage::TargetInputInstall,
+                                            TargetInstallCode::GuardRejected,
+                                        )
+                                    };
+                                media.failure_context.record(diagnostic);
+                                error
+                            })?;
                     }
                     Ok::<(), WanMediaActivationError>(())
                 }
                 .await;
-                if activation.is_err() {
-                    let _ = fail_owned_wan_session(
+                if let Err(error) = activation {
+                    finish_media_activation_failure(
                         &failure_app_state,
                         &task_coordinator,
                         &owned_session_id,
                         &owned_cancellation,
-                        WanSessionFailure::Transport,
+                        error,
+                        media.failure_context.first(),
                     )
                     .await;
                 } else {
@@ -2103,6 +2161,94 @@ async fn fail_owned_wan_session(
         None,
     )
     .await
+}
+
+async fn finish_media_activation_failure(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    owned_cancellation: &tokio::sync::watch::Receiver<bool>,
+    error: WanMediaActivationError,
+    diagnostic: Option<TargetInstallDiagnostic>,
+) {
+    let diagnostic = diagnostic.unwrap_or_else(|| media_activation_diagnostic(&error));
+    let _ = fail_owned_wan_session_with_diagnostic(
+        app_state,
+        coordinator,
+        session_id,
+        owned_cancellation,
+        WanSessionFailure::Transport,
+        Some(diagnostic),
+    )
+    .await;
+}
+
+async fn finish_browser_authority_failure(
+    app_state: &Arc<crate::AppState>,
+    coordinator: &WanSessionCoordinator,
+    session_id: &SessionId,
+    cancellation: &tokio::sync::watch::Receiver<bool>,
+    failure: WanSessionFailure,
+) {
+    let stage = match failure {
+        WanSessionFailure::RouteMismatch => TargetInstallStage::TargetGenerationZeroConnectivity,
+        _ => TargetInstallStage::TargetStateSnapshot,
+    };
+    // The watcher returns only the domain failure, so do not infer a more
+    // specific backend, signature, expiry, or timeout cause here.
+    let diagnostic = TargetInstallDiagnostic::new(stage, TargetInstallCode::GuardRejected);
+    let _ = fail_owned_wan_session_with_diagnostic(
+        app_state,
+        coordinator,
+        session_id,
+        cancellation,
+        failure,
+        Some(diagnostic),
+    )
+    .await;
+}
+
+fn media_activation_diagnostic(error: &WanMediaActivationError) -> TargetInstallDiagnostic {
+    use TargetInstallCode as Code;
+    use TargetInstallStage as Stage;
+    let (stage, code) = match error {
+        WanMediaActivationError::ReadinessTimeout => (Stage::TargetMediaFirstFrame, Code::Timeout),
+        WanMediaActivationError::ReadinessMismatch => {
+            (Stage::TargetMediaReadyEvidence, Code::ReadinessMismatch)
+        }
+        WanMediaActivationError::CoordinatorFailure => (
+            Stage::TargetMediaCoordinatorCommit,
+            Code::CoordinatorUnavailable,
+        ),
+        WanMediaActivationError::ControlEvidenceRequired => {
+            (Stage::TargetInputBarrier, Code::GuardRejected)
+        }
+        WanMediaActivationError::InputScopeRequired => {
+            (Stage::TargetInputInstall, Code::GuardRejected)
+        }
+        WanMediaActivationError::StartupFailed => (Stage::TargetMediaInitMux, Code::GuardRejected),
+        _ => (Stage::TargetMediaAuthority, Code::GuardRejected),
+    };
+    TargetInstallDiagnostic::new(stage, code)
+}
+
+pub(super) async fn fail_owned_media_runtime(
+    app_state: &Arc<crate::AppState>,
+    session_id: &SessionId,
+    cancellation: &tokio::sync::watch::Receiver<bool>,
+    diagnostic: TargetInstallDiagnostic,
+) {
+    if let Some(coordinator) = app_state.wan_session_coordinator() {
+        let _ = fail_owned_wan_session_with_diagnostic(
+            app_state,
+            &coordinator,
+            session_id,
+            cancellation,
+            WanSessionFailure::Transport,
+            Some(diagnostic),
+        )
+        .await;
+    }
 }
 
 async fn fail_owned_wan_session_with_diagnostic(

@@ -29,6 +29,50 @@ use mrd_session_agent::{
 };
 use tokio::sync::watch;
 
+#[test]
+fn post_route_capture_diagnostic_distinguishes_failed_rejected_and_request_timeout() {
+    use crate::wan_diagnostics::{TargetInstallCode as Code, TargetInstallStage as Stage};
+    for (context, source, expected) in [
+        (
+            capture_ack_failure(CommandOutcome::Failed).unwrap(),
+            anyhow!("private capture error"),
+            Code::AckFailed,
+        ),
+        (
+            capture_ack_failure(CommandOutcome::Rejected).unwrap(),
+            anyhow!("private capture error"),
+            Code::AckRejected,
+        ),
+        (
+            CaptureStartFailure::Request,
+            anyhow!(AgentRequestError::Timeout),
+            Code::Timeout,
+        ),
+    ] {
+        let diagnostic = capture_failure_diagnostic(&source.context(context));
+        assert_eq!(diagnostic.stage, Stage::TargetMediaCaptureStart);
+        assert_eq!(diagnostic.code, expected);
+        assert!(!diagnostic
+            .remote_failure()
+            .message
+            .contains("private capture error"));
+    }
+    assert!(capture_ack_failure(CommandOutcome::Completed).is_none());
+    assert_eq!(
+        capture_failure_diagnostic(
+            &anyhow!("private")
+                .context(capture_ack_failure(CommandOutcome::AlreadyStopped).unwrap())
+        )
+        .code,
+        Code::UnexpectedAck
+    );
+    let secret = anyhow!("password=secret token=secret authority=secret");
+    let diagnostic = capture_failure_diagnostic(&secret);
+    assert_eq!(diagnostic.stage, Stage::TargetMediaCaptureStart);
+    assert_eq!(diagnostic.code, Code::GuardRejected);
+    assert!(!diagnostic.remote_failure().message.contains("secret"));
+}
+
 fn paired_cleanup_test_binding() -> AgentBinding {
     use ed25519_dalek::{Signer, SigningKey};
     use mrd_agent_ipc::{
@@ -643,9 +687,24 @@ async fn approved_screen_grant_without_exact_desktop_binding_cannot_start_captur
         .start(&state, &id, &profile())
         .await
         .unwrap_err();
-    assert!(failure
-        .to_string()
-        .contains("did not bind a target desktop"));
+    assert!(matches!(
+        failure.downcast_ref::<CaptureStartFailure>(),
+        Some(CaptureStartFailure::Guard)
+    ));
+    assert!(
+        failure
+            .chain()
+            .any(|cause| cause.to_string().contains("did not bind a target desktop")),
+        "the original exact-desktop rejection must remain in the typed error chain"
+    );
+    assert_eq!(
+        capture_failure_diagnostic(&failure).stage,
+        crate::wan_diagnostics::TargetInstallStage::TargetMediaCaptureStart
+    );
+    assert_eq!(
+        capture_failure_diagnostic(&failure).code,
+        crate::wan_diagnostics::TargetInstallCode::GuardRejected
+    );
     assert!(!state.agent_media_ingress.lock().await.has_session(&id.0));
 }
 

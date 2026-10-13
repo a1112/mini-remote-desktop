@@ -7,6 +7,17 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetInstallStage {
+    TargetMediaAuthority,
+    TargetMediaInitMux,
+    TargetMediaMetadata,
+    TargetMediaCaptureStart,
+    TargetMediaCaptureDrain,
+    TargetMediaVideoTransport,
+    TargetMediaFirstFrame,
+    TargetMediaReadyEvidence,
+    TargetMediaCoordinatorCommit,
+    TargetInputBarrier,
+    TargetInputInstall,
     TargetGenerationZeroBinding,
     TargetGenerationZeroOfferWait,
     TargetGenerationZeroPeerOpen,
@@ -47,6 +58,11 @@ pub(crate) enum TargetInstallStage {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TargetInstallCode {
+    AckFailed,
+    TransportClosed,
+    TransportUnavailable,
+    ReadinessMismatch,
+    CoordinatorUnavailable,
     BindingMismatch,
     CandidateManifestMismatch,
     CandidateRoleMismatch,
@@ -91,6 +107,25 @@ pub(crate) enum TargetInstallCode {
 pub(crate) struct TargetInstallDiagnostic {
     pub(crate) stage: TargetInstallStage,
     pub(crate) code: TargetInstallCode,
+}
+
+/// One owned media attempt's first finite failure. This context never stores
+/// an error string, identity, grant, command, or media payload.
+#[derive(Clone, Default)]
+pub(crate) struct WanMediaFailureContext(
+    std::sync::Arc<std::sync::Mutex<Option<TargetInstallDiagnostic>>>,
+);
+
+impl WanMediaFailureContext {
+    pub(crate) fn record(&self, diagnostic: TargetInstallDiagnostic) {
+        if let Ok(mut first) = self.0.lock() {
+            first.get_or_insert(diagnostic);
+        }
+    }
+
+    pub(crate) fn first(&self) -> Option<TargetInstallDiagnostic> {
+        self.0.lock().ok().and_then(|first| *first)
+    }
 }
 
 impl TargetInstallDiagnostic {
@@ -231,6 +266,54 @@ fn write_windows_event(record: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_route_media_context_retains_only_first_finite_cause_and_public_fields() {
+        let context = WanMediaFailureContext::default();
+        let first = TargetInstallDiagnostic::new(
+            TargetInstallStage::TargetMediaCaptureStart,
+            TargetInstallCode::AckFailed,
+        );
+        context.record(first);
+        context.clone().record(TargetInstallDiagnostic::new(
+            TargetInstallStage::TargetMediaFirstFrame,
+            TargetInstallCode::Timeout,
+        ));
+        assert_eq!(context.first(), Some(first));
+        let session = SessionId("9a7d1313-b0b3-4807-8036-9e68b7ea724e".into());
+        for stage in [
+            TargetInstallStage::TargetMediaAuthority,
+            TargetInstallStage::TargetMediaInitMux,
+            TargetInstallStage::TargetMediaMetadata,
+            TargetInstallStage::TargetMediaCaptureStart,
+            TargetInstallStage::TargetMediaCaptureDrain,
+            TargetInstallStage::TargetMediaVideoTransport,
+            TargetInstallStage::TargetMediaFirstFrame,
+            TargetInstallStage::TargetMediaReadyEvidence,
+            TargetInstallStage::TargetMediaCoordinatorCommit,
+            TargetInstallStage::TargetInputBarrier,
+            TargetInstallStage::TargetInputInstall,
+        ] {
+            for code in [
+                TargetInstallCode::AckFailed,
+                TargetInstallCode::TransportClosed,
+                TargetInstallCode::TransportUnavailable,
+                TargetInstallCode::ReadinessMismatch,
+                TargetInstallCode::CoordinatorUnavailable,
+            ] {
+                let record = TargetInstallDiagnostic::new(stage, code)
+                    .public_record(31415, &session)
+                    .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+                assert_eq!(value.as_object().unwrap().len(), 5);
+                assert!(record.len() <= 512);
+                assert_eq!(value["event"], "wan_target_install_failed");
+                for forbidden in ["password", "credential", "token", "payload", "error"] {
+                    assert!(!record.contains(forbidden));
+                }
+            }
+        }
+    }
 
     #[test]
     fn postapproval_diagnostic_records_keep_only_finite_public_fields() {

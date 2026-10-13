@@ -30,6 +30,77 @@ use windows::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 const MAX_CONSOLE_TARGETS: usize = 64;
 
 #[derive(Debug, Clone, Copy, thiserror::Error)]
+enum CaptureStartFailure {
+    #[error("capture startup guard failed")]
+    Guard,
+    #[error("capture Agent request failed")]
+    Request,
+    #[error("capture Agent rejected resource")]
+    AckRejected,
+    #[error("capture Agent could not start resource")]
+    AckFailed,
+    #[error("capture Agent returned an unexpected outcome")]
+    AckUnexpected,
+    #[error("capture desktop recheck failed")]
+    DesktopRecheck,
+}
+
+pub(crate) fn capture_failure_diagnostic(
+    reason: &anyhow::Error,
+) -> crate::wan_diagnostics::TargetInstallDiagnostic {
+    use crate::wan_diagnostics::{
+        TargetInstallCode as Code, TargetInstallDiagnostic, TargetInstallStage as Stage,
+    };
+    let mut code = match reason.downcast_ref::<CaptureStartFailure>() {
+        Some(CaptureStartFailure::AckRejected) => Code::AckRejected,
+        Some(CaptureStartFailure::AckFailed) => Code::AckFailed,
+        Some(CaptureStartFailure::AckUnexpected) => Code::UnexpectedAck,
+        _ => Code::GuardRejected,
+    };
+    if matches!(
+        reason.downcast_ref::<CaptureStartFailure>(),
+        Some(CaptureStartFailure::Request)
+    ) {
+        if let Some(request) = reason.downcast_ref::<AgentRequestError>() {
+            code = agent_request_diagnostic(request);
+        }
+    } else if let Some(route) = reason.downcast_ref::<AgentRouteError>() {
+        code = paired_route_diagnostic(*route);
+    }
+    TargetInstallDiagnostic::new(Stage::TargetMediaCaptureStart, code)
+}
+
+fn agent_request_diagnostic(
+    request: &AgentRequestError,
+) -> crate::wan_diagnostics::TargetInstallCode {
+    use crate::wan_diagnostics::TargetInstallCode as Code;
+    match request {
+        AgentRequestError::Route(route) => paired_route_diagnostic(*route),
+        AgentRequestError::InvalidPairedAuthority => Code::InvalidPairedAuthority,
+        AgentRequestError::InvalidInput(_) => Code::InvalidInput,
+        AgentRequestError::InvalidConsent(_) => Code::InvalidConsent,
+        AgentRequestError::InvalidRenderAccessUnit => Code::InvalidRenderAccessUnit,
+        AgentRequestError::ConnectionUnavailable => Code::ConnectionUnavailable,
+        AgentRequestError::OutboundUnavailable => Code::OutboundUnavailable,
+        AgentRequestError::DuplicateRequest => Code::DuplicateRequest,
+        AgentRequestError::CapacityExhausted => Code::CapacityExhausted,
+        AgentRequestError::Revoked => Code::Revoked,
+        AgentRequestError::Disconnected => Code::Disconnected,
+        AgentRequestError::Timeout => Code::Timeout,
+        AgentRequestError::StateUnavailable => Code::StateUnavailable,
+    }
+}
+
+fn capture_ack_failure(outcome: CommandOutcome) -> Option<CaptureStartFailure> {
+    match outcome {
+        CommandOutcome::Completed => None,
+        CommandOutcome::Rejected => Some(CaptureStartFailure::AckRejected),
+        CommandOutcome::Failed => Some(CaptureStartFailure::AckFailed),
+        CommandOutcome::AlreadyStopped => Some(CaptureStartFailure::AckUnexpected),
+    }
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 pub(crate) enum PairedDesktopPreparationError {
     #[error("paired policy revalidation failed")]
     PolicyVerification,
@@ -698,6 +769,23 @@ impl ConsoleCaptureState {
         session_id: &SessionId,
         profile: &MediaProfile,
     ) -> Result<()> {
+        self.start_inner(state, session_id, profile)
+            .await
+            .map_err(|reason| {
+                if reason.downcast_ref::<CaptureStartFailure>().is_some() {
+                    reason
+                } else {
+                    reason.context(CaptureStartFailure::Guard)
+                }
+            })
+    }
+
+    async fn start_inner(
+        &self,
+        state: &AppState,
+        session_id: &SessionId,
+        profile: &MediaProfile,
+    ) -> Result<()> {
         let _operation = self.operation.lock().await;
         let snapshot = state
             .session_authorizations
@@ -817,13 +905,19 @@ impl ConsoleCaptureState {
                 Ok(outcome) => Err(anyhow!(
                     "Capture Agent rejected the approved capture resource: {:?}",
                     outcome.outcome
+                )
+                .context(
+                    capture_ack_failure(outcome.outcome)
+                        .unwrap_or(CaptureStartFailure::AckUnexpected),
                 )),
-                Err(reason) => Err(anyhow!(reason).context("Capture Agent request failed")),
+                Err(reason) => Err(anyhow!(reason)
+                    .context("Capture Agent request failed")
+                    .context(CaptureStartFailure::Request)),
             };
         }
         if let Err(error) = self.validate_target(state, &target) {
             self.stop_inner(state, session_id).await;
-            return Err(error);
+            return Err(error.context(CaptureStartFailure::DesktopRecheck));
         }
         Ok(())
     }

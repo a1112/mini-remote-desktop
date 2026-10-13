@@ -88,6 +88,24 @@ async fn fixture_with_authorization(
     WanSessionState,
     Arc<StdMutex<Vec<InputEvent>>>,
 ) {
+    fixture_for_role(
+        media_verified,
+        authorization_installed,
+        WanSessionRole::Target,
+    )
+    .await
+}
+
+async fn fixture_for_role(
+    media_verified: bool,
+    authorization_installed: bool,
+    role: WanSessionRole,
+) -> (
+    Arc<crate::AppState>,
+    Arc<WanSessionCoordinator>,
+    WanSessionState,
+    Arc<StdMutex<Vec<InputEvent>>>,
+) {
     let app = Arc::new(crate::AppState::default());
     let config = WanSessionBackendConfig::new(
         "https://unused.invalid/",
@@ -117,6 +135,8 @@ async fn fixture_with_authorization(
     let now = now_unix_ms();
     let controller_key =
         mrd_identity::DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
+    let target_key =
+        mrd_identity::DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
     let request = WanSessionRequestV3 {
         session_id: {
             static NEXT_SESSION: std::sync::atomic::AtomicU64 =
@@ -143,7 +163,7 @@ async fn fixture_with_authorization(
         request.controller_device_id.clone(),
         request.target_device_id.clone(),
         controller_key.key_id().to_owned(),
-        "2".repeat(64),
+        target_key.key_id().to_owned(),
         now + 60_000,
     )
     .unwrap();
@@ -167,7 +187,7 @@ async fn fixture_with_authorization(
     .unwrap();
     let route_proof =
         RelayRouteProof::from_verified_policy(&access, request.route_policy, false, false).unwrap();
-    let mut state = WanSessionState::new(WanSessionRole::Target, identity);
+    let mut state = WanSessionState::new(role, identity);
     for event in [
         WanSessionEvent::BackendBound {
             request_commitment: commitment,
@@ -192,59 +212,73 @@ async fn fixture_with_authorization(
             RemotePermissionScope::ScreenView,
             RemotePermissionScope::InputKeyboard,
         ];
+        let (peer_device, peer_key) = match role {
+            WanSessionRole::Target => (&request.controller_device_id, &controller_key),
+            WanSessionRole::Controller => (&request.target_device_id, &target_key),
+        };
+        let authorization = crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+            session_id: request.session_id.clone(),
+            peer_device_id: peer_device.clone(),
+            peer_key_id: peer_key.key_id().to_owned(),
+            peer_key_epoch: 1,
+            access_mode: mrd_ipc::RemoteAccessMode::Attended,
+            requested_scopes: scopes.clone(),
+            peer_permission_ceiling: scopes.clone(),
+            machine_permission_ceiling: scopes.clone(),
+            runtime_capabilities: scopes.clone(),
+            transport_kind: "webrtc_relay".into(),
+            request_nonce: request.idempotency_key,
+            created_at_ms: now,
+            expires_at_ms: now + 60_000,
+        };
+        if role == WanSessionRole::Target {
+            app.session_authorizations
+                .begin_verified_incoming(authorization)
+                .await
+                .unwrap();
+            app.session_authorizations
+                .respond_to_consent(
+                    mrd_ipc::ConsentResponse {
+                        session_id: request.session_id.clone(),
+                        decision: mrd_ipc::ConsentDecision::Approve,
+                        approved_scopes: scopes.clone(),
+                        expected_policy_revision: mrd_ipc::DecimalU64::new(1),
+                    },
+                    now,
+                )
+                .await
+                .unwrap();
+        } else {
+            app.session_authorizations
+                .begin_outgoing(authorization)
+                .await
+                .unwrap();
+        }
         app.session_authorizations
-            .begin_verified_incoming(
-                crate::session_authorization::VerifiedIncomingAuthorizationRequest {
-                    session_id: request.session_id.clone(),
-                    peer_device_id: request.controller_device_id.clone(),
-                    peer_key_id: controller_key.key_id().to_owned(),
-                    peer_key_epoch: 1,
-                    access_mode: mrd_ipc::RemoteAccessMode::Attended,
-                    requested_scopes: scopes.clone(),
-                    peer_permission_ceiling: scopes.clone(),
-                    machine_permission_ceiling: scopes.clone(),
-                    runtime_capabilities: scopes.clone(),
-                    transport_kind: "webrtc_relay".into(),
-                    request_nonce: request.idempotency_key,
-                    created_at_ms: now,
-                    expires_at_ms: now + 60_000,
-                },
-            )
+            .bind_authenticated_peer_key(&request.session_id, peer_key.public_key(), now)
             .await
             .unwrap();
-        app.session_authorizations
-            .respond_to_consent(
-                mrd_ipc::ConsentResponse {
-                    session_id: request.session_id.clone(),
-                    decision: mrd_ipc::ConsentDecision::Approve,
-                    approved_scopes: scopes.clone(),
-                    expected_policy_revision: mrd_ipc::DecimalU64::new(1),
-                },
-                now,
-            )
-            .await
-            .unwrap();
-        app.session_authorizations
-            .bind_authenticated_peer_key(&request.session_id, controller_key.public_key(), now)
-            .await
-            .unwrap();
-        app.session_authorizations
-            .install_verified_wan_target_grant(
-                crate::session_authorization::VerifiedSessionGrant {
-                    grant_id: format!("sha256:{}", "3".repeat(64)),
-                    session_id: request.session_id.clone(),
-                    granted_scopes: scopes,
-                    issued_at_ms: now,
-                    expires_at_ms: now + 60_000,
-                    policy_revision: 7,
-                    route_constraint: "webrtc_relay".into(),
-                    transport_fingerprint_sha256: [0x44; 32],
-                },
-                1,
-                now,
-            )
-            .await
-            .unwrap();
+        let verified_grant = crate::session_authorization::VerifiedSessionGrant {
+            grant_id: format!("sha256:{}", "3".repeat(64)),
+            session_id: request.session_id.clone(),
+            granted_scopes: scopes,
+            issued_at_ms: now,
+            expires_at_ms: now + 60_000,
+            policy_revision: 7,
+            route_constraint: "webrtc_relay".into(),
+            transport_fingerprint_sha256: [0x44; 32],
+        };
+        if role == WanSessionRole::Target {
+            app.session_authorizations
+                .install_verified_wan_target_grant(verified_grant, 1, now)
+                .await
+                .unwrap();
+        } else {
+            app.session_authorizations
+                .install_verified_grant(verified_grant, now)
+                .await
+                .unwrap();
+        }
         if media_verified {
             reconcile_wan_session(&app, &request.session_id)
                 .await
@@ -867,4 +901,391 @@ async fn live_registered_media_startup_error_still_terminalizes_and_releases_inp
         "failed",
         "live media error must immediately publish failed IPC state"
     );
+}
+
+#[tokio::test]
+async fn post_route_media_missing_verified_mux_retains_exact_first_failure() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    let (_cancel_tx, cancellation) = watch::channel(false);
+    let media = ServiceWanMediaActivationPort::new(&app);
+    let result = start_verified_media_owned(
+        &coordinator,
+        &state,
+        &media,
+        &cancellation,
+        &app.authorization_security_gate,
+    )
+    .await;
+    assert_eq!(result, Err(WanMediaActivationError::StartupFailed));
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        result.unwrap_err(),
+        media.failure_context.first(),
+    )
+    .await;
+    let failure = app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure
+        .unwrap();
+    assert_eq!(failure.code, RemoteReasonCode::RouteLost);
+    assert!(
+        failure.message.contains("stage=target_media_init_mux"),
+        "{failure:?}"
+    );
+    let records = crate::wan_diagnostics::take_test_records(session);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&records[0]).unwrap()["stage"],
+        "target_media_init_mux"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&records[0]).unwrap()["code"],
+        "transport_unavailable"
+    );
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanMediaActivationError::ReadinessTimeout,
+        None,
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure,
+        Some(failure)
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn post_route_media_pending_first_frame_timeout_retains_first_terminal_diagnostic() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    let (_cancel_tx, cancellation) = watch::channel(false);
+    let media = RegisteredPendingMedia {
+        app: app.clone(),
+        ready_on_abort: false,
+        fail_on_start: false,
+        spawned: StdMutex::new(None),
+        registered: StdMutex::new(None),
+        task: Mutex::new(None),
+    };
+    let result = start_verified_media_owned(
+        &coordinator,
+        &state,
+        &media,
+        &cancellation,
+        &app.authorization_security_gate,
+    )
+    .await;
+    assert_eq!(result, Err(WanMediaActivationError::ReadinessTimeout));
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        result.unwrap_err(),
+        None,
+    )
+    .await;
+    let failure = app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure
+        .unwrap();
+    assert_eq!(failure.code, RemoteReasonCode::RouteLost);
+    assert!(
+        failure
+            .message
+            .contains("stage=target_media_first_frame, code=timeout"),
+        "{failure:?}"
+    );
+    assert_eq!(crate::wan_diagnostics::take_test_records(session).len(), 1);
+    assert_eq!(app.media_tasks.lock().await.active_count(session), 0);
+}
+
+#[tokio::test]
+async fn post_route_watch_backend_failure_retains_first_terminal_owner() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    let (_cancel_tx, cancellation) = watch::channel(false);
+    let failure = super::super::browser_authority::monitor_browser_authority(
+        &RevokedBackend,
+        &state,
+        cancellation.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure, WanSessionFailure::PolicyMismatch);
+    finish_browser_authority_failure(&app, &coordinator, session, &cancellation, failure).await;
+    let remote = app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure
+        .unwrap();
+    assert_eq!(remote.code, RemoteReasonCode::PolicyChanged);
+    assert!(
+        remote
+            .message
+            .contains("stage=target_state_snapshot, code=guard_rejected"),
+        "{remote:?}"
+    );
+    assert_eq!(crate::wan_diagnostics::take_test_records(session).len(), 1);
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanMediaActivationError::StartupFailed,
+        None,
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure,
+        Some(remote)
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+}
+
+#[tokio::test]
+async fn post_route_cancelled_media_and_watch_failures_are_quiet() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    let (_cancel_tx, cancellation) = watch::channel(true);
+    assert!(super::super::browser_authority::monitor_browser_authority(
+        &RevokedBackend,
+        &state,
+        cancellation.clone(),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .is_none());
+    finish_browser_authority_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanSessionFailure::PolicyMismatch,
+    )
+    .await;
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanMediaActivationError::ReadinessTimeout,
+        None,
+    )
+    .await;
+    assert_eq!(
+        coordinator.snapshot(session).await.unwrap().phase(),
+        WanSessionPhase::RelayVerified
+    );
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .authorization_state,
+        RemoteAuthorizationState::Granted
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+    let _guard = app.authorization_security_gate.lock().await;
+    terminalize_wan_session_under_security_gate(&app, session, ServiceWanTerminalRequest::Close)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn post_route_media_failure_waiting_for_gate_is_cancelled_without_emit() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id().clone();
+    let (cancel_tx, cancellation) = watch::channel(false);
+    let gate = app.authorization_security_gate.lock().await;
+    let task_app = app.clone();
+    let task_coordinator = coordinator.clone();
+    let task_session = session.clone();
+    let task = tokio::spawn(async move {
+        finish_media_activation_failure(
+            &task_app,
+            &task_coordinator,
+            &task_session,
+            &cancellation,
+            WanMediaActivationError::ReadinessTimeout,
+            None,
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!task.is_finished());
+    cancel_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        coordinator.snapshot(&session).await.unwrap().phase(),
+        WanSessionPhase::RelayVerified
+    );
+    assert!(crate::wan_diagnostics::take_test_records(&session).is_empty());
+    terminalize_wan_session_under_security_gate(&app, &session, ServiceWanTerminalRequest::Close)
+        .await
+        .unwrap();
+    drop(gate);
+}
+
+#[tokio::test]
+async fn post_route_legal_close_and_controller_failures_do_not_emit_target_diagnostics() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    let (_cancel_tx, cancellation) = watch::channel(false);
+    {
+        let _gate = app.authorization_security_gate.lock().await;
+        terminalize_wan_session_under_security_gate(
+            &app,
+            session,
+            ServiceWanTerminalRequest::Close,
+        )
+        .await
+        .unwrap();
+    }
+    let first = app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure;
+    assert_eq!(first.as_ref().unwrap().code, RemoteReasonCode::GrantRevoked);
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanMediaActivationError::StartupFailed,
+        None,
+    )
+    .await;
+    finish_browser_authority_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanSessionFailure::PolicyMismatch,
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure,
+        first
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+
+    let (app, coordinator, state, _) =
+        fixture_for_role(true, true, WanSessionRole::Controller).await;
+    let session = state.identity().session_id();
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .role,
+        mrd_ipc::RemoteSessionRole::Controller
+    );
+    finish_media_activation_failure(
+        &app,
+        &coordinator,
+        session,
+        &cancellation,
+        WanMediaActivationError::ReadinessTimeout,
+        None,
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure
+            .unwrap()
+            .code,
+        RemoteReasonCode::RouteLost
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
+}
+
+#[tokio::test]
+async fn post_route_owned_background_failure_retains_drain_stage_after_streaming() {
+    let (app, coordinator, state, _) = fixture_with_media(true).await;
+    let session = state.identity().session_id();
+    coordinator.record_streaming(session).await.unwrap();
+    let (_cancel_tx, cancellation) = watch::channel(false);
+    let first = TargetInstallDiagnostic::new(
+        TargetInstallStage::TargetMediaCaptureDrain,
+        TargetInstallCode::DesktopChanged,
+    );
+    fail_owned_media_runtime(&app, session, &cancellation, first).await;
+    let remote = app
+        .session_authorizations
+        .snapshot(session)
+        .await
+        .unwrap()
+        .failure
+        .unwrap();
+    assert_eq!(remote.code, RemoteReasonCode::RouteLost);
+    assert!(remote
+        .message
+        .contains("stage=target_media_capture_drain, code=desktop_changed"));
+    assert_eq!(crate::wan_diagnostics::take_test_records(session).len(), 1);
+    assert_eq!(
+        coordinator.snapshot(session).await.unwrap().failure(),
+        Some(WanSessionFailure::Transport)
+    );
+    assert_eq!(app.media_tasks.lock().await.active_count(session), 0);
+    fail_owned_media_runtime(
+        &app,
+        session,
+        &cancellation,
+        TargetInstallDiagnostic::new(
+            TargetInstallStage::TargetMediaVideoTransport,
+            TargetInstallCode::TransportClosed,
+        ),
+    )
+    .await;
+    assert_eq!(
+        app.session_authorizations
+            .snapshot(session)
+            .await
+            .unwrap()
+            .failure,
+        Some(remote)
+    );
+    assert!(crate::wan_diagnostics::take_test_records(session).is_empty());
 }

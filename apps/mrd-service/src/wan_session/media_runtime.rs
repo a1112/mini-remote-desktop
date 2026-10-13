@@ -7,6 +7,10 @@ use super::{
     },
     model::WanSessionFailure,
 };
+use crate::wan_diagnostics::{
+    TargetInstallCode as DiagnosticCode, TargetInstallDiagnostic,
+    TargetInstallStage as DiagnosticStage, WanMediaFailureContext,
+};
 use crate::{
     app_state::{AppState, WanMediaRuntimeRole},
     lan_discovery::{
@@ -93,6 +97,8 @@ pub(crate) async fn start_target_runtime(
     authority: WanMediaAuthority,
     mux: Arc<dyn TransportMuxPort>,
     test_synthetic_capture: bool,
+    failure_context: WanMediaFailureContext,
+    owned_cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<WanMediaActivationReceipt, WanMediaActivationError> {
     let profile = install_runtime_metadata(
         &app_state,
@@ -100,7 +106,14 @@ pub(crate) async fn start_target_runtime(
         WanMediaRuntimeRole::TargetSender,
         "openh264_software",
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        failure_context.record(TargetInstallDiagnostic::new(
+            DiagnosticStage::TargetMediaMetadata,
+            DiagnosticCode::GuardRejected,
+        ));
+        error
+    })?;
     let session_id = authority.session_id().clone();
     let (receipt, ready) = WanMediaActivationReceipt::pending();
     let task_app_state = Arc::clone(&app_state);
@@ -115,8 +128,12 @@ pub(crate) async fn start_target_runtime(
             mux,
             test_synthetic_capture,
             &mut ready,
+            &failure_context,
         )
         .await;
+        if let Err(error) = result {
+            failure_context.record(runtime_failure_diagnostic(error));
+        }
         #[cfg(windows)]
         task_app_state
             .console_capture
@@ -132,7 +149,14 @@ pub(crate) async fn start_target_runtime(
             .await
             .forget_task(&task_session_id, task_id);
         if result.is_err() && became_ready {
-            terminalize_background_failure(task_app_state, task_session_id);
+            let diagnostic = failure_context
+                .first()
+                .unwrap_or_else(|| runtime_failure_diagnostic(result.unwrap_err()));
+            terminalize_background_failure(
+                task_app_state,
+                task_session_id,
+                owned_cancellation.map(|cancellation| (cancellation, diagnostic)),
+            );
         }
     });
     app_state
@@ -180,7 +204,7 @@ pub(crate) async fn start_controller_runtime(
             .await
             .forget_task(&task_session_id, task_id);
         if result.is_err() && became_ready {
-            terminalize_background_failure(task_app_state, task_session_id);
+            terminalize_background_failure(task_app_state, task_session_id, None);
         }
     });
     app_state
@@ -250,6 +274,7 @@ async fn run_target_runtime(
     mux: Arc<dyn TransportMuxPort>,
     test_synthetic_capture: bool,
     ready: &mut Option<WanMediaReadySender>,
+    failure_context: &WanMediaFailureContext,
 ) -> Result<(), WanMediaRuntimeError> {
     #[cfg(windows)]
     {
@@ -258,7 +283,15 @@ async fn run_target_runtime(
         #[cfg(not(any(test, debug_assertions)))]
         let use_agent = true;
         if use_agent {
-            return run_console_agent_target(&app_state, &authority, &profile, mux, ready).await;
+            return run_console_agent_target(
+                &app_state,
+                &authority,
+                &profile,
+                mux,
+                ready,
+                failure_context,
+            )
+            .await;
         }
     }
     let mut capture = create_target_capture(
@@ -353,13 +386,14 @@ async fn run_console_agent_target(
     profile: &MediaProfile,
     mux: Arc<dyn TransportMuxPort>,
     ready: &mut Option<WanMediaReadySender>,
+    failure_context: &WanMediaFailureContext,
 ) -> Result<(), WanMediaRuntimeError> {
     app_state
         .console_capture
         .start(app_state, authority.session_id(), profile)
         .await
         .map_err(|error| {
-            tracing::warn!("Approved Agent capture could not start: {error:#}");
+            failure_context.record(crate::console_capture::capture_failure_diagnostic(&error));
             WanMediaRuntimeError::Capture
         })?;
     app_state
@@ -375,7 +409,12 @@ async fn run_console_agent_target(
             .console_capture
             .drain(app_state, authority.session_id(), 8)
             .await
-            .map_err(|_| WanMediaRuntimeError::Capture)?;
+            .map_err(|error| {
+                let mut diagnostic = crate::console_capture::capture_failure_diagnostic(&error);
+                diagnostic.stage = DiagnosticStage::TargetMediaCaptureDrain;
+                failure_context.record(diagnostic);
+                WanMediaRuntimeError::Capture
+            })?;
         for unit in units {
             let sequence = unit.sequence;
             let outcome = mux
@@ -393,7 +432,13 @@ async fn run_console_agent_target(
                     }),
                 })
                 .await
-                .map_err(|_| WanMediaRuntimeError::Transport)?;
+                .map_err(|_| {
+                    failure_context.record(TargetInstallDiagnostic::new(
+                        DiagnosticStage::TargetMediaVideoTransport,
+                        DiagnosticCode::TransportUnavailable,
+                    ));
+                    WanMediaRuntimeError::Transport
+                })?;
             match outcome {
                 TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale => {
                     publish_ready(
@@ -403,7 +448,14 @@ async fn run_console_agent_target(
                         sequence,
                         ready,
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        failure_context.record(TargetInstallDiagnostic::new(
+                            DiagnosticStage::TargetMediaReadyEvidence,
+                            DiagnosticCode::ReadinessMismatch,
+                        ));
+                        error
+                    })?;
                 }
                 TransportSendOutcome::Backpressured => {
                     app_state
@@ -412,7 +464,13 @@ async fn run_console_agent_target(
                         .await
                         .increment_dropped_frames(authority.session_id().clone(), 1);
                 }
-                TransportSendOutcome::Closed => return Err(WanMediaRuntimeError::Transport),
+                TransportSendOutcome::Closed => {
+                    failure_context.record(TargetInstallDiagnostic::new(
+                        DiagnosticStage::TargetMediaVideoTransport,
+                        DiagnosticCode::TransportClosed,
+                    ));
+                    return Err(WanMediaRuntimeError::Transport);
+                }
             }
         }
     }
@@ -594,8 +652,40 @@ fn send_startup_failure(ready: &mut Option<WanMediaReadySender>) {
     }
 }
 
-fn terminalize_background_failure(app_state: Arc<AppState>, session_id: SessionId) {
+fn runtime_failure_diagnostic(error: WanMediaRuntimeError) -> TargetInstallDiagnostic {
+    let (stage, code) = match error {
+        WanMediaRuntimeError::Capture | WanMediaRuntimeError::Codec => (
+            DiagnosticStage::TargetMediaCaptureDrain,
+            DiagnosticCode::GuardRejected,
+        ),
+        WanMediaRuntimeError::Transport => (
+            DiagnosticStage::TargetMediaVideoTransport,
+            DiagnosticCode::TransportUnavailable,
+        ),
+        WanMediaRuntimeError::Evidence => (
+            DiagnosticStage::TargetMediaReadyEvidence,
+            DiagnosticCode::ReadinessMismatch,
+        ),
+    };
+    TargetInstallDiagnostic::new(stage, code)
+}
+
+fn terminalize_background_failure(
+    app_state: Arc<AppState>,
+    session_id: SessionId,
+    diagnostic: Option<(tokio::sync::watch::Receiver<bool>, TargetInstallDiagnostic)>,
+) {
     tokio::spawn(async move {
+        if let Some((cancellation, diagnostic)) = diagnostic {
+            super::service::fail_owned_media_runtime(
+                &app_state,
+                &session_id,
+                &cancellation,
+                diagnostic,
+            )
+            .await;
+            return;
+        }
         let _ =
             super::service::fail_wan_session(&app_state, &session_id, WanSessionFailure::Transport)
                 .await;
