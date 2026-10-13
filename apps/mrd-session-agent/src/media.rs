@@ -16,6 +16,10 @@ use mrd_agent_ipc::{
 use mrd_proto::SessionId;
 use std::collections::{HashMap, VecDeque};
 
+#[cfg(any(windows, test))]
+#[path = "capture_queue.rs"]
+pub(crate) mod capture_queue;
+
 /// Desktop-bound media operation represented by a live agent resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaResourceKind {
@@ -188,6 +192,17 @@ pub struct MediaAccessUnitQueue {
     units: VecDeque<EncodedMediaAccessUnit>,
 }
 
+/// Admission result retaining ownership of every unit that was not enqueued.
+#[must_use]
+pub enum MediaAccessUnitPushResult {
+    /// The unit was enqueued and its sequence committed.
+    Accepted,
+    /// A valid unit must wait for the bounded queue to drain.
+    Full(EncodedMediaAccessUnit),
+    /// Identity, payload size, or replay validation failed.
+    Rejected(EncodedMediaAccessUnit),
+}
+
 impl MediaAccessUnitQueue {
     /// Creates a queue with explicit depth and payload bounds.
     pub fn new(
@@ -210,17 +225,25 @@ impl MediaAccessUnitQueue {
     /// oversized payload. A full queue rejects the new unit so backpressure is
     /// explicit and no frame is silently retargeted or reordered.
     pub fn push(&mut self, unit: EncodedMediaAccessUnit) -> bool {
+        matches!(self.try_push(unit), MediaAccessUnitPushResult::Accepted)
+    }
+
+    /// Distinguishes transient capacity pressure from a terminal guard rejection.
+    /// Rejected and full units are returned without cloning their payload.
+    pub fn try_push(&mut self, unit: EncodedMediaAccessUnit) -> MediaAccessUnitPushResult {
         if unit.resource_id != self.resource_id
             || unit.session_id != self.session_id
             || unit.payload.len() > self.max_payload_bytes
             || unit.sequence <= self.last_sequence
-            || self.units.len() >= self.capacity
         {
-            return false;
+            return MediaAccessUnitPushResult::Rejected(unit);
+        }
+        if self.units.len() >= self.capacity {
+            return MediaAccessUnitPushResult::Full(unit);
         }
         self.last_sequence = unit.sequence;
         self.units.push_back(unit);
-        true
+        MediaAccessUnitPushResult::Accepted
     }
 
     /// Removes the oldest queued unit.

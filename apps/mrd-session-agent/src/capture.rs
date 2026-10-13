@@ -381,6 +381,7 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                 let interval =
                     std::time::Duration::from_nanos(1_000_000_000 / u64::from(profile.fps));
                 let mut sequence = 0_u64;
+                let mut profile_frame_preparer = ProfileFramePreparer::default();
                 while !thread_stop.load(Ordering::Acquire) {
                     let next_frame = std::time::Instant::now() + interval;
                     let Ok(frame) = capture.capture_frame() else {
@@ -418,7 +419,7 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                         width,
                         height,
                     };
-                    let Some(frame) = prepare_profile_frame(frame, profile) else {
+                    let Some(frame) = profile_frame_preparer.prepare(&frame, profile) else {
                         report_capture_failure(
                             &worker_session_id,
                             CaptureFailureCause::ProfileFrameInvalid,
@@ -426,7 +427,7 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                         );
                         break;
                     };
-                    let Ok(units) = encoder.encode(&frame) else {
+                    let Ok(units) = encoder.encode(frame) else {
                         // Runtime encoder failure ends the resource rather
                         // than swapping codec state after signed admission.
                         tracing::warn!(
@@ -492,16 +493,22 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                             );
                             return;
                         };
-                        let accepted = queues.lock().ok().and_then(|mut all| {
-                            all.get_mut(&resource_id).map(|queue| queue.push(unit))
-                        });
-                        if accepted != Some(true) {
-                            report_capture_failure(
-                                &worker_session_id,
-                                CaptureFailureCause::EncodedUnitRejected,
-                                &thread_stop,
-                            );
-                            return;
+                        match crate::media::capture_queue::enqueue_capture_access_unit(
+                            &queues,
+                            &resource_id,
+                            unit,
+                            &thread_stop,
+                        ) {
+                            crate::media::capture_queue::CaptureQueueOutcome::Accepted => {}
+                            crate::media::capture_queue::CaptureQueueOutcome::Stopped => return,
+                            crate::media::capture_queue::CaptureQueueOutcome::Rejected => {
+                                report_capture_failure(
+                                    &worker_session_id,
+                                    CaptureFailureCause::EncodedUnitRejected,
+                                    &thread_stop,
+                                );
+                                return;
+                            }
                         }
                     }
                     std::thread::sleep(
@@ -577,6 +584,101 @@ impl Drop for WindowsDxgiOpenH264CaptureAdapter {
 /// maps the whole encoded frame to the whole display, so no invisible crop or
 /// letterbox offset may be introduced here. Pixels stay in this worker.
 #[cfg(windows)]
+#[derive(Default)]
+struct ProfileFramePreparer {
+    shape: Option<(
+        usize,
+        usize,
+        usize,
+        usize,
+        mrd_pipeline_core::FramePixelFormat,
+    )>,
+    x_offsets: Vec<usize>,
+    y_offsets: Vec<usize>,
+    output: Option<mrd_pipeline_core::CapturedFrame>,
+}
+
+#[cfg(windows)]
+impl ProfileFramePreparer {
+    fn prepare<'a>(
+        &'a mut self,
+        frame: &'a mrd_pipeline_core::CapturedFrame,
+        profile: mrd_agent_ipc::AgentCaptureProfile,
+    ) -> Option<&'a mrd_pipeline_core::CapturedFrame> {
+        use mrd_pipeline_core::{CapturedFrame, FramePixelFormat};
+        if !profile.is_valid() || frame.width == 0 || frame.height == 0 {
+            return None;
+        }
+        let pixel_bytes = match frame.pixel_format {
+            FramePixelFormat::Bgra32 | FramePixelFormat::Rgba32 => 4,
+            FramePixelFormat::Rgb24 => 3,
+            FramePixelFormat::Nv12 => return None,
+        };
+        let source_len = frame
+            .width
+            .checked_mul(frame.height)?
+            .checked_mul(pixel_bytes)?;
+        if frame.data.len() != source_len {
+            return None;
+        }
+        let width = profile.width as usize;
+        let height = profile.height as usize;
+        if (frame.width, frame.height) == (width, height) {
+            return Some(frame);
+        }
+        let target_row_bytes = width.checked_mul(pixel_bytes)?;
+        let target_len = target_row_bytes.checked_mul(height)?;
+        let shape = (frame.width, frame.height, width, height, frame.pixel_format);
+        if self.shape != Some(shape) {
+            let x_offsets = (0..width)
+                .map(|x| (x.checked_mul(frame.width)? / width).checked_mul(pixel_bytes))
+                .collect::<Option<Vec<_>>>()?;
+            let y_offsets = (0..height)
+                .map(|y| {
+                    (y.checked_mul(frame.height)? / height)
+                        .checked_mul(frame.width)?
+                        .checked_mul(pixel_bytes)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let output = self.output.get_or_insert_with(|| {
+                CapturedFrame::from_cpu(
+                    width,
+                    height,
+                    frame.pixel_format,
+                    frame.timestamp_us,
+                    vec![],
+                )
+            });
+            output.data.resize(target_len, 0);
+            self.x_offsets = x_offsets;
+            self.y_offsets = y_offsets;
+            self.shape = Some(shape);
+        }
+        let output = self.output.as_mut()?;
+        output.width = width;
+        output.height = height;
+        output.pixel_format = frame.pixel_format;
+        output.timestamp_us = frame.timestamp_us;
+        for (target_row, &source_y) in output
+            .data
+            .chunks_exact_mut(target_row_bytes)
+            .zip(&self.y_offsets)
+        {
+            for (target, &source_x) in target_row
+                .chunks_exact_mut(pixel_bytes)
+                .zip(&self.x_offsets)
+            {
+                let source = source_y + source_x;
+                target.copy_from_slice(&frame.data[source..source + pixel_bytes]);
+            }
+        }
+        Some(output)
+    }
+}
+
+// Keep the original allocation/mapping path as a test oracle and offline
+// benchmark baseline. Production workers use their own reusable preparer.
+#[cfg(all(windows, test))]
 fn prepare_profile_frame(
     frame: mrd_pipeline_core::CapturedFrame,
     profile: mrd_agent_ipc::AgentCaptureProfile,
@@ -621,6 +723,10 @@ fn prepare_profile_frame(
         data,
     ))
 }
+
+#[cfg(all(windows, test))]
+#[path = "capture_profile_frame_tests.rs"]
+mod profile_frame_tests;
 
 #[cfg(all(windows, test))]
 mod tests {
