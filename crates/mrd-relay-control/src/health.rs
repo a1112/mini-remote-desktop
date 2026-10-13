@@ -1,6 +1,6 @@
 use crate::RelayNodeState;
 
-pub const RELAY_LEASE_DURATION_MS: u64 = 15_000;
+pub const RELAY_LEASE_DURATION_MS: u64 = 35_000;
 const HEALTHY_HEARTBEATS_TO_RECOVER: u8 = 3;
 
 pub fn lease_expires_at(heartbeat_at_ms: u64) -> u64 {

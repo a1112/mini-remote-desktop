@@ -373,15 +373,31 @@ fn recovery_requires_three_consecutive_healthy_heartbeats() {
 }
 
 #[test]
-fn lease_expiry_has_an_exact_fifteen_second_boundary() {
+fn lease_covers_thirty_second_setup_after_five_second_heartbeat_age() {
+    let heartbeat_at_ms = NOW_MS - 5_000;
+    let setup_deadline_ms = NOW_MS + 30_000;
+    let mut ready = node("ready-through-setup");
+    ready.lease_expires_at_ms = lease_expires_at(heartbeat_at_ms);
+
+    let decision = select_relays(&policy(), &[ready.clone()], setup_deadline_ms - 1)
+        .expect("the normal heartbeat age must not consume the directory setup window");
+    assert_eq!(decision.primary.node_id.as_str(), "ready-through-setup");
+    for now_ms in [setup_deadline_ms, setup_deadline_ms + 1] {
+        let error = select_relays(&policy(), &[ready.clone()], now_ms)
+            .expect_err("the setup window must not extend the exact lease boundary");
+        assert_eq!(error.rejections.len(), 1);
+        assert_eq!(error.rejections[0].reason, RelayRejectionCode::StaleLease);
+    }
+}
+
+#[test]
+fn lease_expiry_rejects_at_the_exact_encoded_deadline() {
     let heartbeat_at_ms = 42_000;
     let expires_at_ms = lease_expires_at(heartbeat_at_ms);
 
-    assert_eq!(RELAY_LEASE_DURATION_MS, 15_000);
-    assert_eq!(expires_at_ms, 57_000);
-    assert!(lease_is_fresh(expires_at_ms, 56_999));
-    assert!(!lease_is_fresh(expires_at_ms, 57_000));
-    assert!(!lease_is_fresh(expires_at_ms, 57_001));
+    assert!(lease_is_fresh(expires_at_ms, expires_at_ms - 1));
+    assert!(!lease_is_fresh(expires_at_ms, expires_at_ms));
+    assert!(!lease_is_fresh(expires_at_ms, expires_at_ms + 1));
     assert_eq!(lease_expires_at(u64::MAX - 1), u64::MAX);
 }
 

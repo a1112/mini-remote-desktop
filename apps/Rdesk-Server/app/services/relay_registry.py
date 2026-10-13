@@ -33,6 +33,7 @@ from app.services.relay_node_auth import (
     validate_relay_csr,
 )
 from app.services.relay_repository import (
+    RELAY_LEASE_DURATION_SECONDS,
     RelayRepositoryError,
     RelaySecretCipher,
     RelaySecretCipherError,
@@ -884,7 +885,7 @@ class RelayRegistry:
                 and self._as_utc(node.lease_expires_at) > now
             )
             if heartbeat_healthy:
-                lease_expires_at = now + timedelta(seconds=15)
+                lease_expires_at = now + timedelta(seconds=RELAY_LEASE_DURATION_SECONDS)
                 if relay_effective_draining(node) or node.state == "draining":
                     next_streak = node.healthy_heartbeat_streak
                     next_state = "draining"

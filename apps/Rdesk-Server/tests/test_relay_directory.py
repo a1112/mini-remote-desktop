@@ -43,6 +43,7 @@ from app.models.session_request import SessionRequest
 from app.models.user import User
 from app.schemas.relay import RelayEnrollmentRequest
 from app.services.relay_repository import AesGcmRelaySecretCipher, RelayRepository
+from app.services.relay_registry import RelayIdentity, RelayRegistry
 from app.services.relay_signing import Ed25519RelayDirectorySigner
 from app.services.session_grants import (
     SessionGrantPolicy,
@@ -676,6 +677,80 @@ def relay_service_fixture():
         directory_ttl_seconds=30, now=lambda: NOW,
     )
     return engine, session, service
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("heartbeat_source", ["registry", "repository"])
+async def test_healthy_relay_after_one_heartbeat_interval_retains_full_directory_window(
+    heartbeat_source: str,
+):
+    engine, session, service = relay_service_fixture()
+    try:
+        registry = RelayRegistry(
+            AsyncSessionShim(session), enrollment_token_pepper="22" * 32
+        )
+        for relay in session.scalars(select(RelayNode)).all():
+            if heartbeat_source == "registry":
+                registration = session.get(RelayNodeRegistration, relay.node_id)
+                await registry.record_heartbeat(
+                    identity=RelayIdentity(
+                        node_id=relay.node_id,
+                        certificate_fingerprint=relay.certificate_fingerprint,
+                        signing_public_key=registration.signing_public_key,
+                        state=relay.state,
+                    ),
+                    sequence=relay.heartbeat_sequence + 1,
+                    identity_epoch=relay.identity_epoch,
+                    boot_id="A" * 22,
+                    nonce="A" * 22,
+                    process_health="healthy",
+                    listener_health="healthy",
+                    probe_health="healthy",
+                    active_allocations=0,
+                    current_ingress_bps=0,
+                    current_egress_bps=0,
+                    max_allocations=relay.max_allocations,
+                    max_egress_bps=relay.max_egress_bps,
+                    packet_loss_bps=0,
+                    cpu_usage_bps=0,
+                    memory_usage_bps=0,
+                    applied_secret_version=relay.applied_secret_version,
+                    endpoints=relay.endpoints,
+                    now=NOW,
+                )
+            else:
+                await service._repository.record_heartbeat(
+                    node_id=relay.node_id,
+                    certificate_fingerprint=relay.certificate_fingerprint,
+                    sequence=relay.heartbeat_sequence + 1,
+                    active_allocations=0,
+                    current_egress_bps=0,
+                    now=NOW,
+                )
+        session.commit()
+        issued_at = NOW + timedelta(seconds=5)
+        service._now = lambda: issued_at
+        service._credential_issuer._now = lambda: int(issued_at.timestamp())
+        result = await service.issue_access(
+            current_user_id="user-42",
+            session_id="session-7",
+            policy_revision=17,
+            intended_peer_id="device-7",
+        )
+        expected_expiry = issued_at + timedelta(seconds=30)
+        assert result.directory.payload.expires_at_ms == int(
+            expected_expiry.timestamp() * 1000
+        )
+        assert {
+            _aware(reservation.expires_at)
+            for reservation in session.scalars(select(RelayReservation))
+        } == {expected_expiry}
+        assert {
+            credential.expires_at_unix_seconds for credential in result.credentials
+        } == {int(expected_expiry.timestamp())}
+    finally:
+        session.close()
+        engine.dispose()
 
 
 @pytest.mark.anyio

@@ -44,6 +44,8 @@ _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _POSTGRES_INTEGER_MAX = 2**31 - 1
 _POSTGRES_BIGINT_MAX = 2**63 - 1
 _MAX_RESERVATION_TTL_SECONDS = 300
+# Cover a full default 30-second directory after one 5-second heartbeat interval.
+RELAY_LEASE_DURATION_SECONDS = 35
 _SQLITE_UNIQUE_CONSTRAINT_PATTERN = re.compile(
     r"^UNIQUE constraint failed: "
     r"(?P<columns>[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*"
@@ -470,7 +472,7 @@ class RelayRepository:
         node.current_egress_bps = current_egress_bps
         node.lease_expires_at = _checked_add_seconds(
             now,
-            seconds=15,
+            seconds=RELAY_LEASE_DURATION_SECONDS,
             code="INVALID_HEARTBEAT_TIME",
         )
         node.updated_at = now

@@ -420,7 +420,7 @@ async def test_heartbeat_is_monotonic_bound_to_certificate_and_lease_is_exact(
         current_egress_bps=500,
         now=NOW,
     )
-    assert heartbeat.lease_expires_at == NOW + timedelta(seconds=15)
+    assert heartbeat.lease_expires_at == NOW + timedelta(seconds=35)
 
     with pytest.raises(RelayRepositoryError) as replay:
         await repository.record_heartbeat(
@@ -445,10 +445,10 @@ async def test_heartbeat_is_monotonic_bound_to_certificate_and_lease_is_exact(
     assert wrong_certificate.value.code == "CERTIFICATE_MISMATCH"
 
     still_live = await repository.live_nodes(
-        now=NOW + timedelta(seconds=14, milliseconds=999)
+        now=NOW + timedelta(seconds=34, milliseconds=999)
     )
     assert [item.node_id for item in still_live] == [node.node_id]
-    assert await repository.live_nodes(now=NOW + timedelta(seconds=15)) == []
+    assert await repository.live_nodes(now=NOW + timedelta(seconds=35)) == []
 
 
 @pytest.mark.anyio
