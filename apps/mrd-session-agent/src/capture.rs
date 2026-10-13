@@ -116,11 +116,12 @@ fn initialize_capture_encoder(
     mrd_pipeline_core::PipelineError,
 > {
     let software = |approved: mrd_agent_ipc::AgentCaptureProfile| {
-        mrd_encode_openh264::OpenH264Encoder::new_with_bitrate(
+        mrd_encode_openh264::OpenH264Encoder::new_with_bitrate_and_access_unit_limit(
             approved.width as usize,
             approved.height as usize,
             approved.fps,
             approved.bitrate_bps,
+            CAPTURE_MAX_ACCESS_UNIT_BYTES,
         )
         .map(|encoder| Box::new(encoder) as Box<dyn mrd_pipeline_core::VideoEncoder>)
     };
@@ -137,14 +138,16 @@ fn initialize_capture_encoder(
             profile,
             |approved| {
                 // The real Windows constructor configures H.264 Baseline, P1,
-                // UltraLowLatency, no B-frame reordering and the exact profile.
+                // UltraLowLatency, no B-frame reordering and the approved
+                // geometry/timing, with a complete-AU rate-control budget.
                 // CPU BGRA submissions complete synchronously; this adapter
                 // does not opt into the separate queued shared-texture path.
-                mrd_encode_nvenc::NvencH264Encoder::new_max_speed_with_bitrate(
+                mrd_encode_nvenc::NvencH264Encoder::new_max_speed_with_bitrate_and_access_unit_limit(
                     approved.width as usize,
                     approved.height as usize,
                     approved.fps,
                     approved.bitrate_bps,
+                    CAPTURE_MAX_ACCESS_UNIT_BYTES,
                 )
                 .map(|encoder| Box::new(encoder) as Box<dyn mrd_pipeline_core::VideoEncoder>)
             },
@@ -912,5 +915,116 @@ mod tests {
             (decoded.width, decoded.height),
             (profile.width as usize, profile.height as usize)
         );
+    }
+    #[test]
+    #[ignore = "requires an interactive Windows NVIDIA desktop; captures in memory for at most six seconds"]
+    fn native_hd30_capture_access_units_fit_the_authenticated_ipc_limit() {
+        use mrd_pipeline_core::{FrameCapture, VideoDecoder};
+
+        let profile = mrd_agent_ipc::AgentCaptureProfile {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_bps: 10_000_000,
+        };
+        // Reuse the production capture, full-display profile mapping and
+        // encoder factory. Only finite metadata is emitted; desktop pixels and
+        // encoded access-unit bytes never leave this test's memory.
+        let display_index = 0;
+        let mut capture = mrd_capture_dxgi::DxgiDesktopCapture::new_for_index(display_index)
+            .unwrap_or_else(|_| panic!("capture_initialization_failed"));
+        let bounds = capture
+            .source_bounds()
+            .unwrap_or_else(|_| panic!("capture_source_bounds_failed"));
+        let (backend, mut encoder) = super::initialize_capture_encoder(
+            profile,
+            super::CaptureEncoderPreference::PreferNvenc,
+        )
+        .unwrap_or_else(|_| panic!("capture_encoder_initialization_failed"));
+        eprintln!(
+            "native_hd30_metadata backend={} display_index={} source_width={} source_height={} width={} height={} fps={} bitrate_bps={} max_access_unit_bytes={}",
+            backend.as_str(), display_index, bounds.width, bounds.height,
+            profile.width, profile.height, profile.fps, profile.bitrate_bps,
+            super::CAPTURE_MAX_ACCESS_UNIT_BYTES,
+        );
+        assert_eq!(backend, super::CaptureEncoderBackend::Nvenc);
+
+        let started = std::time::Instant::now();
+        let duration = std::time::Duration::from_secs(6);
+        let mut decoder = mrd_decode::H264SoftwareDecoder::new()
+            .unwrap_or_else(|_| panic!("capture_decoder_initialization_failed"));
+        let interval = std::time::Duration::from_nanos(1_000_000_000 / u64::from(profile.fps));
+        let mut frame_count = 0;
+        let mut access_unit_count = 0;
+        let mut max_access_unit_bytes = 0;
+        let mut first_access_unit_bytes = 0;
+        let mut keyframe_count = 0;
+        let mut interframe_count = 0;
+        let mut decoded_frame_count = 0;
+        while started.elapsed() < duration && frame_count < 61 {
+            let next_frame = std::time::Instant::now() + interval;
+            let frame = capture
+                .capture_frame()
+                .unwrap_or_else(|_| panic!("capture_frame_failed"));
+            let frame = super::prepare_profile_frame(frame, profile)
+                .unwrap_or_else(|| panic!("capture_profile_frame_invalid"));
+            let units = encoder
+                .encode(&frame)
+                .unwrap_or_else(|_| panic!("capture_encode_failed"));
+            frame_count += 1;
+            assert_eq!(
+                units.len(),
+                1,
+                "synchronous_capture_must_produce_one_complete_au"
+            );
+            for unit in units {
+                access_unit_count += 1;
+                assert_eq!(unit.codec, mrd_pipeline_core::VideoCodec::H264);
+                assert!(!unit.bytes.is_empty(), "capture_encoded_unit_invalid");
+                let payload_bytes = unit.bytes.len();
+                max_access_unit_bytes = max_access_unit_bytes.max(payload_bytes);
+                if access_unit_count == 1 {
+                    first_access_unit_bytes = payload_bytes;
+                    assert!(unit.is_keyframe, "first_access_unit_must_be_keyframe");
+                }
+                assert!(
+                    payload_bytes <= super::CAPTURE_MAX_ACCESS_UNIT_BYTES,
+                    "capture_encoded_unit_oversized backend={} frame_count={} access_unit_sequence={} is_keyframe={} first_access_unit_bytes={} payload_bytes={} max_access_unit_bytes={}",
+                    backend.as_str(), frame_count, access_unit_count, unit.is_keyframe,
+                    first_access_unit_bytes, payload_bytes, super::CAPTURE_MAX_ACCESS_UNIT_BYTES,
+                );
+                if matches!(access_unit_count, 1 | 31 | 61) {
+                    assert!(unit.is_keyframe, "periodic_access_unit_must_be_keyframe");
+                }
+                if unit.is_keyframe {
+                    keyframe_count += 1;
+                } else {
+                    interframe_count += 1;
+                }
+                decoder
+                    .push_access_unit(&unit.bytes)
+                    .unwrap_or_else(|_| panic!("capture_complete_au_decode_failed"));
+                let decoded = decoder.drain_decoded_frames();
+                assert_eq!(decoded.len(), 1, "complete_au_must_decode_one_frame");
+                assert_eq!(
+                    (decoded[0].width, decoded[0].height),
+                    (profile.width as usize, profile.height as usize)
+                );
+                decoded_frame_count += 1;
+            }
+            std::thread::sleep(next_frame.saturating_duration_since(std::time::Instant::now()));
+        }
+        eprintln!(
+            "native_hd30_summary backend={} frame_count={} access_unit_count={} decoded_frame_count={} keyframe_count={} interframe_count={} first_access_unit_bytes={} max_access_unit_bytes={} elapsed_ms={}",
+            backend.as_str(), frame_count, access_unit_count,
+            decoded_frame_count, keyframe_count, interframe_count, first_access_unit_bytes,
+            max_access_unit_bytes, started.elapsed().as_millis(),
+        );
+        assert_eq!(
+            access_unit_count, 61,
+            "two_periodic_keyframes_must_be_covered"
+        );
+        assert_eq!(decoded_frame_count, access_unit_count);
+        assert!(interframe_count > 0, "interframes_must_be_covered");
     }
 }

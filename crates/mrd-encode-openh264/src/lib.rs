@@ -18,13 +18,54 @@ pub struct OpenH264Encoder {
     frame_index: u64,
     last_forced_intra_timestamp_us: Option<u64>,
     i420: Vec<u8>,
+    max_access_unit_bytes: Option<usize>,
+    rejected_access_unit: bool,
 }
 
 const RECOVERY_KEYFRAME_INTERVAL_US: u64 = 1_000_000;
+const ACCESS_UNIT_PARAMETER_SET_HEADROOM_BYTES: usize = 4 * 1024;
+const OPENH264_MAX_NATIVE_FRAME_RATE: u32 = 60;
+const OPENH264_IDR_BITRATE_RATIO: u64 = 4;
+
+fn bounded_bitrate(bitrate: u32, fps: u32, max_bytes: usize) -> Result<u32, PipelineError> {
+    if bitrate == 0 || fps == 0 {
+        return Err(PipelineError::message(
+            "openh264 budget rate must be non-zero",
+        ));
+    }
+    let payload_bytes = max_bytes
+        .checked_sub(ACCESS_UNIT_PARAMETER_SET_HEADROOM_BYTES)
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| PipelineError::message("openh264 access unit budget too small"))?;
+    let payload_bits = payload_bytes
+        .checked_mul(8)
+        .and_then(|bits| u32::try_from(bits).ok())
+        .ok_or_else(|| PipelineError::message("openh264 access unit bit budget overflow"))?;
+    // Locked OpenH264 allocates four average frames to an IDR, including the
+    // first IDR. Its native frame-rate ceiling is 60 even for higher requests.
+    let budget_bitrate = u64::from(payload_bits)
+        .checked_mul(u64::from(fps.min(OPENH264_MAX_NATIVE_FRAME_RATE)))
+        .ok_or_else(|| PipelineError::message("openh264 budget bitrate overflow"))?
+        / OPENH264_IDR_BITRATE_RATIO;
+    Ok(u64::from(bitrate).min(budget_bitrate) as u32)
+}
+
+fn check_bounded_access_unit_size(
+    byte_len: usize,
+    max_bytes: Option<usize>,
+) -> Result<(), PipelineError> {
+    if max_bytes.is_some_and(|limit| byte_len > limit) {
+        Err(PipelineError::message(
+            "openh264 encoded access unit exceeds budget",
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 impl OpenH264Encoder {
     pub fn new(width: usize, height: usize, fps: u32) -> Result<Self, PipelineError> {
-        Self::new_internal(width, height, fps, None)
+        Self::new_internal(width, height, fps, None, None)
     }
 
     pub fn new_with_bitrate(
@@ -33,7 +74,32 @@ impl OpenH264Encoder {
         fps: u32,
         bitrate: u32,
     ) -> Result<Self, PipelineError> {
-        Self::new_internal(width, height, fps, Some(bitrate.max(1)))
+        Self::new_internal(width, height, fps, Some(bitrate.max(1)), None)
+    }
+
+    /// Applies an IDR-aware bitrate target for a bounded complete access unit.
+    ///
+    /// The requested dimensions and frame rate are retained. The effective
+    /// bitrate cannot exceed `bitrate`; the budget accounts for OpenH264's
+    /// native 60-fps ceiling and four-frame IDR target. This is a rate-control
+    /// target, not a guaranteed encoded-size ceiling for arbitrary pictures.
+    /// A larger normalized AU returns an error and stops further publication
+    /// from this encoder, so dependent P frames cannot reference a withheld AU.
+    pub fn new_with_bitrate_and_access_unit_limit(
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: u32,
+        max_access_unit_bytes: usize,
+    ) -> Result<Self, PipelineError> {
+        let bitrate = bounded_bitrate(bitrate, fps, max_access_unit_bytes)?;
+        Self::new_internal(
+            width,
+            height,
+            fps,
+            Some(bitrate),
+            Some(max_access_unit_bytes),
+        )
     }
 
     fn new_internal(
@@ -41,6 +107,7 @@ impl OpenH264Encoder {
         height: usize,
         fps: u32,
         bitrate: Option<u32>,
+        max_access_unit_bytes: Option<usize>,
     ) -> Result<Self, PipelineError> {
         validate_even_dimensions(width, height)?;
 
@@ -80,6 +147,8 @@ impl OpenH264Encoder {
             frame_index: 0,
             last_forced_intra_timestamp_us: None,
             i420: vec![0; i420_len(width, height)?],
+            max_access_unit_bytes,
+            rejected_access_unit: false,
         })
     }
 
@@ -88,8 +157,67 @@ impl OpenH264Encoder {
     }
 }
 
+#[cfg(test)]
+mod access_unit_budget_tests {
+    use super::*;
+
+    const LIMIT: usize = 128 * 1024;
+
+    #[test]
+    fn hd30_budget_covers_first_and_periodic_idr_targets() {
+        assert_eq!(bounded_bitrate(10_000_000, 30, LIMIT).unwrap(), 7_618_560);
+    }
+
+    #[test]
+    fn software_budget_uses_native_sixty_fps_ceiling() {
+        assert_eq!(bounded_bitrate(20_000_000, 60, LIMIT).unwrap(), 15_237_120);
+        assert_eq!(bounded_bitrate(40_000_000, 120, LIMIT).unwrap(), 15_237_120);
+    }
+
+    #[test]
+    fn budget_does_not_increase_approved_bitrate() {
+        assert_eq!(bounded_bitrate(2_000_000, 30, LIMIT).unwrap(), 2_000_000);
+    }
+
+    #[test]
+    fn budget_rejects_zero_fps() {
+        assert!(bounded_bitrate(10_000_000, 0, LIMIT).is_err());
+    }
+
+    #[test]
+    fn budget_rejects_zero_bitrate() {
+        assert!(bounded_bitrate(0, 30, LIMIT).is_err());
+    }
+
+    #[test]
+    fn budget_rejects_limits_without_parameter_set_headroom() {
+        for limit in [0, 1, 4_095, 4_096] {
+            assert!(bounded_bitrate(10_000_000, 30, limit).is_err());
+        }
+    }
+
+    #[test]
+    fn budget_rejects_bit_count_overflow() {
+        assert!(bounded_bitrate(10_000_000, 30, usize::MAX).is_err());
+        let too_many_bits = (u32::MAX as usize / 8) + 4_097;
+        assert!(bounded_bitrate(10_000_000, 30, too_many_bits).is_err());
+    }
+
+    #[test]
+    fn complete_normalized_access_unit_includes_all_slice_bytes() {
+        assert!(check_bounded_access_unit_size(LIMIT, Some(LIMIT)).is_ok());
+        assert!(check_bounded_access_unit_size(LIMIT + 1, Some(LIMIT)).is_err());
+        assert!(check_bounded_access_unit_size(LIMIT + 1, None).is_ok());
+    }
+}
+
 impl VideoEncoder for OpenH264Encoder {
     fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedAccessUnit>, PipelineError> {
+        if self.rejected_access_unit {
+            return Err(PipelineError::message(
+                "openh264 access unit budget already rejected",
+            ));
+        }
         validate_even_dimensions(frame.width, frame.height)?;
 
         if frame.width != self.width || frame.height != self.height {
@@ -123,6 +251,11 @@ impl VideoEncoder for OpenH264Encoder {
         self.frame_index += 1;
 
         let bytes = normalize_h264_bitstream(bitstream.to_vec());
+        if let Err(error) = check_bounded_access_unit_size(bytes.len(), self.max_access_unit_bytes)
+        {
+            self.rejected_access_unit = true;
+            return Err(error);
+        }
         Ok(encoded_access_units_from_bytes(
             VideoCodec::H264,
             frame.timestamp_us,

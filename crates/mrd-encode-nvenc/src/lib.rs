@@ -11,6 +11,80 @@ use std::sync::{mpsc, Arc, Mutex};
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
+#[cfg(any(windows, test))]
+const H264_ACCESS_UNIT_HEADROOM_BYTES: usize = 4 * 1024;
+
+#[cfg(any(windows, test))]
+fn single_frame_vbv_bits(
+    bitrate: u32,
+    fps: u32,
+    max_access_unit_bytes: usize,
+) -> Result<u32, mrd_pipeline_core::PipelineError> {
+    if bitrate == 0 || fps == 0 {
+        return Err(mrd_pipeline_core::PipelineError::message(
+            "nvenc_access_unit_budget_invalid_rate",
+        ));
+    }
+    let available_bits = max_access_unit_bytes
+        .checked_sub(H264_ACCESS_UNIT_HEADROOM_BYTES)
+        .and_then(|bytes| bytes.checked_mul(8))
+        .and_then(|bits| u32::try_from(bits).ok())
+        .filter(|bits| *bits != 0)
+        .ok_or_else(|| {
+            mrd_pipeline_core::PipelineError::message("nvenc_access_unit_budget_invalid_size")
+        })?;
+    let frame_bits = u64::from(bitrate).div_ceil(u64::from(fps));
+    if frame_bits > u64::from(available_bits) {
+        return Err(mrd_pipeline_core::PipelineError::message(
+            "nvenc_access_unit_budget_cannot_fit_average_frame",
+        ));
+    }
+    u32::try_from(frame_bits)
+        .map_err(|_| mrd_pipeline_core::PipelineError::message("nvenc_access_unit_budget_overflow"))
+}
+
+#[cfg(test)]
+mod access_unit_budget_tests {
+    use super::single_frame_vbv_bits;
+
+    #[test]
+    fn approved_remote_desktop_rates_have_the_same_single_frame_budget() {
+        for (bitrate, fps) in [(10_000_000, 30), (20_000_000, 60), (40_000_000, 120)] {
+            assert_eq!(
+                single_frame_vbv_bits(bitrate, fps, 128 * 1024).unwrap(),
+                333_334
+            );
+        }
+    }
+
+    #[test]
+    fn budget_rounds_up_and_rejects_an_average_frame_that_cannot_fit() {
+        assert_eq!(single_frame_vbv_bits(10, 3, 4097).unwrap(), 4);
+        assert!(single_frame_vbv_bits(25, 3, 4097).is_err());
+    }
+
+    #[test]
+    fn invalid_time_rate_or_access_unit_budget_is_rejected() {
+        for (bitrate, fps, bytes) in [
+            (0, 30, 128 * 1024),
+            (10_000_000, 0, 128 * 1024),
+            (10_000_000, 30, 4096),
+            (10_000_000, 30, 0),
+            (10_000_000, 30, usize::MAX),
+        ] {
+            assert!(single_frame_vbv_bits(bitrate, fps, bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn maximum_rate_and_time_values_do_not_overflow_budget_arithmetic() {
+        assert_eq!(
+            single_frame_vbv_bits(u32::MAX, u32::MAX, 128 * 1024).unwrap(),
+            1
+        );
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use anyhow::{anyhow, Context};
@@ -441,6 +515,39 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             fps: u32,
             bitrate: u32,
         ) -> Result<Self, PipelineError> {
+            Self::new_max_speed_internal(width, height, fps, bitrate, None)
+        }
+
+        /// Uses single-frame CBR/VBV for a bounded full access-unit transport.
+        /// The caller must still check complete output units: rate control is
+        /// not an arbitrary-content hard size guarantee.
+        pub fn new_max_speed_with_bitrate_and_access_unit_limit(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+            max_access_unit_bytes: usize,
+        ) -> Result<Self, PipelineError> {
+            if width < 2
+                || height < 2
+                || u32::try_from(width).is_err()
+                || u32::try_from(height).is_err()
+            {
+                return Err(PipelineError::message(
+                    "nvenc_access_unit_budget_invalid_dimensions",
+                ));
+            }
+            let vbv_bits = super::single_frame_vbv_bits(bitrate, fps, max_access_unit_bytes)?;
+            Self::new_max_speed_internal(width, height, fps, bitrate, Some(vbv_bits))
+        }
+
+        fn new_max_speed_internal(
+            width: usize,
+            height: usize,
+            fps: u32,
+            bitrate: u32,
+            vbv_bits: Option<u32>,
+        ) -> Result<Self, PipelineError> {
             let width = width.max(2);
             let height = height.max(2);
             let fps = fps.max(1);
@@ -468,6 +575,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
             preset.preset_cfg.rc_params.average_bit_rate = bitrate;
             preset.preset_cfg.gop_len = h264_remote_desktop_keyframe_interval(fps) as u32;
             preset.preset_cfg.frame_interval_p = 1;
+            if let Some(vbv_bits) = vbv_bits {
+                preset
+                    .preset_cfg
+                    .rc_params
+                    .set_single_frame_cbr(bitrate, vbv_bits)
+                    .map_err(PipelineError::message)?;
+            }
 
             let init = InitParams {
                 encode_guid: NV_ENC_CODEC_H264_GUID,

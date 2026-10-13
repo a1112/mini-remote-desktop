@@ -222,6 +222,28 @@ pub struct NVencRcParams {
     rsvd1: u32,
 }
 
+impl NVencRcParams {
+    /// Configure a validated single-frame CBR budget; sizes are in bits.
+    pub fn set_single_frame_cbr(
+        &mut self,
+        bitrate: u32,
+        vbv_buffer_bits: u32,
+    ) -> Result<(), &'static str> {
+        if bitrate == 0 || vbv_buffer_bits == 0 {
+            return Err("nvenc_single_frame_cbr_invalid_budget");
+        }
+        self.rate_control_mode = NVencParamsRcMode::CBR;
+        self.average_bit_rate = bitrate;
+        self.vbv_buffer_size = vbv_buffer_bits;
+        self.vbv_initial_delay = vbv_buffer_bits;
+        self.low_delay_key_frame_scale = 1;
+        // SDK 13: temporal AQ is bit 8 and can inflate individual I/P frames.
+        // Preserve spatial AQ and all unrelated preset flags.
+        self.bit_fields.0 &= !(1 << 8);
+        Ok(())
+    }
+}
+
 #[repr(transparent)]
 pub struct NVencRcParamsBitFlags(u32);
 
@@ -618,9 +640,81 @@ mod tests {
 
     use super::{NVencConfig, NVencConfigAV1, NVencConfigHEVC};
     use std::{
-        mem::{ManuallyDrop, MaybeUninit, offset_of, size_of},
+        mem::{offset_of, size_of, ManuallyDrop, MaybeUninit},
         ptr,
     };
+
+    fn rate_control_fixture() -> super::NVencRcParams {
+        use crate::sys::enums::{
+            NVencLookAheadLevel, NVencMultiPass, NVencParamsRcMode, NVencQPMapMode,
+        };
+        let qp = || super::NVencQP {
+            qp_inter_p: 0,
+            qp_inter_b: 0,
+            qp_intra: 0,
+        };
+        super::NVencRcParams {
+            version: super::NV_ENC_RC_PARAMS_VER,
+            rate_control_mode: NVencParamsRcMode::VBR,
+            const_qp: qp(),
+            average_bit_rate: 1_000_000,
+            max_bit_rate: 2_000_000,
+            vbv_buffer_size: 9_000_000,
+            vbv_initial_delay: 8_000_000,
+            bit_fields: super::NVencRcParamsBitFlags((1 << 3) | (1 << 8)),
+            min_qp: qp(),
+            max_qp: qp(),
+            initial_rcqp: qp(),
+            temporal_layer_idx_mask: 0,
+            temporal_layer_qp: [0; 8],
+            target_quality: 0,
+            target_quality_lsb: 0,
+            look_ahead_depth: 0,
+            low_delay_key_frame_scale: 2,
+            y_dc_qp_index_offset: 0,
+            u_dc_qp_index_offset: 0,
+            v_dc_qp_index_offset: 0,
+            qp_map_mode: NVencQPMapMode::Disabled,
+            multi_pass: NVencMultiPass::Disabled,
+            alpha_layer_bitrate_ratio: 0,
+            cb_qp_index_offset: 0,
+            cr_qp_index_offset: 0,
+            rsvd2: 0,
+            lookahead_level: NVencLookAheadLevel::Level0,
+            view_bitrate_ratios: [0; super::MAX_NUM_VIEWS_MINUS_1],
+            rsvd3: 0,
+            rsvd1: 0,
+        }
+    }
+
+    #[test]
+    fn single_frame_cbr_replaces_unbounded_preset_without_reinterpreting_its_layout() {
+        use crate::sys::enums::NVencParamsRcMode;
+        let mut rc = rate_control_fixture();
+        rc.set_single_frame_cbr(10_000_000, 333_334).unwrap();
+        assert!(matches!(rc.rate_control_mode, NVencParamsRcMode::CBR));
+        assert_eq!(rc.average_bit_rate, 10_000_000);
+        assert_eq!(rc.vbv_buffer_size, 333_334);
+        assert_eq!(rc.vbv_initial_delay, 333_334);
+        assert_eq!(rc.low_delay_key_frame_scale, 1);
+        assert_eq!(rc.bit_fields.0 & (1 << 8), 0);
+        assert_ne!(rc.bit_fields.0 & (1 << 3), 0);
+        assert_eq!(rc.version, super::NV_ENC_RC_PARAMS_VER);
+        assert_eq!(rc.max_bit_rate, 2_000_000);
+    }
+
+    #[test]
+    fn single_frame_cbr_rejects_invalid_inputs_before_mutating_preset() {
+        use crate::sys::enums::NVencParamsRcMode;
+        for (bitrate, vbv) in [(0, 333_334), (10_000_000, 0)] {
+            let mut rc = rate_control_fixture();
+            assert!(rc.set_single_frame_cbr(bitrate, vbv).is_err());
+            assert!(matches!(rc.rate_control_mode, NVencParamsRcMode::VBR));
+            assert_eq!(rc.average_bit_rate, 1_000_000);
+            assert_eq!(rc.vbv_buffer_size, 9_000_000);
+            assert_eq!(rc.low_delay_key_frame_scale, 2);
+        }
+    }
 
     #[test]
     fn h264_realtime_config_signals_zero_reordering() {
