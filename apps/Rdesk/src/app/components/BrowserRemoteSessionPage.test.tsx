@@ -369,20 +369,75 @@ describe('independent browser remote desktop', () => {
     expect(await screen.findByText('设备列表')).toBeInTheDocument();
   });
 
-  it('keeps a closed page and visible warning when explicit remote close fails, then allows returning', async () => {
+  it('closeBarrier_pagehide_keeps_return_pending_until_the_owned_close_settles', async () => {
+    show(); await state('streaming'); const video = await videoReady();
+    const closing = deferred(); mocks.close.mockReturnValue(closing.promise);
+    const returnButton = screen.getByRole('button', { name: '断开并返回设备列表' });
+    const surface = inputSurface();
+    await act(async () => { fireEvent(window, new Event('pagehide')); });
+    expect(video.srcObject).toBeNull();
+    expect(surface).toHaveAttribute('aria-disabled', 'true');
+    mocks.sendInput.mockClear(); mocks.sendPointerAction.mockClear();
+    fireEvent.keyDown(surface, { key: 'a', code: 'KeyA' });
+    fireEvent.pointerDown(surface, { button: 0, buttons: 1, clientX: 100, clientY: 100, pointerId: 1 });
+    expect(mocks.sendInput).not.toHaveBeenCalled();
+    expect(mocks.sendPointerAction).not.toHaveBeenCalled();
+    await userEvent.click(returnButton);
+    expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
+    expect(returnButton).toBeDisabled();
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+    await act(async () => closing.resolve());
+    if (!screen.queryByText('设备列表')) {
+      await userEvent.click(screen.getByRole('button', { name: '返回设备列表' }));
+    }
+    expect(await screen.findByText('设备列表')).toBeInTheDocument();
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closeBarrier_failed_close_remains_unconfirmed_when_return_is_clicked_again', async () => {
     show(); await state('streaming'); await videoReady();
     const closing = deferred(); mocks.close.mockReturnValue(closing.promise);
-    await userEvent.click(screen.getByRole('button', { name: '断开并返回设备列表' }));
+    const returnButton = screen.getByRole('button', { name: '断开并返回设备列表' });
+    await userEvent.click(returnButton);
     await act(async () => closing.reject(new Error('HTTP 503 远端撤销不可用')));
     expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
     expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 503 远端撤销不可用');
     expect(screen.getByRole('alert')).toHaveTextContent('无法确认远端已停止');
     expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
     await state('streaming');
-    expect(screen.getByText('会话已结束')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: '返回设备列表' }));
-    expect(await screen.findByText('设备列表')).toBeInTheDocument();
-    expect(mocks.close).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText('画面已连接')).not.toBeInTheDocument();
+    await userEvent.click(returnButton);
+    expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('无法确认远端已停止');
+    expect(screen.queryByText('会话已结束')).not.toBeInTheDocument();
+    expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it.each(['resolve', 'reject'] as const)('closeBarrier_pagehide_late_%s_does_not_change_session_B', async outcome => {
+    show(); await state('streaming'); await videoReady();
+    const oldObserver = mocks.observer!;
+    const oldClose = deferred(); mocks.close.mockReturnValueOnce(oldClose.promise);
+    await act(async () => { fireEvent(window, new Event('pagehide')); });
+    await userEvent.click(screen.getByRole('button', { name: '切换到会话 B' }));
+    await state('streaming'); await videoReady();
+    const video = screen.getByLabelText('远端屏幕') as HTMLVideoElement;
+    const currentStream = video.srcObject;
+    const releases = mocks.releaseInputs.mock.calls.length;
+    const closes = mocks.close.mock.calls.length;
+    await act(async () => {
+      oldObserver.onVideoStream(new MediaStream());
+      oldObserver.onState({ phase: 'failed', grantedScopes: [], error: '旧会话 A 关闭失败' });
+      if (outcome === 'resolve') oldClose.resolve();
+      else oldClose.reject(new Error('旧会话 A close HTTP 503'));
+    });
+    expect(screen.getByText('session-B')).toBeInTheDocument();
+    expect(screen.getByText('画面已连接')).toBeInTheDocument();
+    expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'false');
+    expect(video.srcObject).toBe(currentStream);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
+    expect(mocks.releaseInputs).toHaveBeenCalledTimes(releases);
+    expect(mocks.close).toHaveBeenCalledTimes(closes);
   });
 
   it('does not let a previous session observer or close rejection overwrite or release the next route session', async () => {

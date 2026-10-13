@@ -252,3 +252,125 @@ describe('independent browser remote session bootstrap', () => {
     expect(request.mock.calls.filter(([url]) => url.endsWith('/close'))).toHaveLength(1);
   });
 });
+
+
+describe('close_navigation_keepalive', () => {
+  it.each([true, false])('preserves close-only keepalive and scoped HTTP authentication (guest=%s)', async guest => {
+    if (!guest) localStorage.setItem('rdesk_access_token', 'account-test-only');
+    const request = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/guest-browser-sessions')) return successfulGuestBootstrap(init);
+      if (url.endsWith('/browser-sessions')) return successfulBootstrap(init);
+      return new Response('{}');
+    });
+    vi.stubGlobal('fetch', request);
+    await createBrowserRemoteSession('753662296', guest ? { temporaryPassword: 'ABCD2345' } : undefined);
+    await closeAllBrowserRemoteSessions('leave_page');
+    const creates = request.mock.calls.filter(([url]) => /\/(guest-)?browser-sessions$/.test(url));
+    const closes = request.mock.calls.filter(([url]) => url.endsWith('/close'));
+    expect(creates).toHaveLength(1); expect(closes).toHaveLength(1);
+    expect(creates[0]![1].keepalive).not.toBe(true);
+    expect(closes[0]![1]).toMatchObject({ keepalive: true, method: 'POST', credentials: 'omit', body: '{}' });
+    expect(closes[0]![1].headers).toMatchObject({ Authorization: guest ? 'Bearer guest-http-only' : 'Bearer account-test-only' });
+    expect(closes[0]![1].signal?.aborted).toBe(false);
+    expect(closes[0]![1].body).not.toContain('ABCD2345');
+  });
+
+  it('keeps late-create cancellation cleanup alive without persisting the guest credential', async () => {
+    let entered = false, release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const request = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/guest-browser-sessions')) { entered = true; await gate; return successfulGuestBootstrap(init); }
+      return new Response('{}');
+    });
+    vi.stubGlobal('fetch', request);
+    const creating = createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    const outcome = creating.catch(error => error);
+    await until(() => entered); await closeAllBrowserRemoteSessions(); release();
+    expect((await outcome).message).toContain('取消');
+    const closes = request.mock.calls.filter(([url]) => url.endsWith('/close'));
+    expect(closes).toHaveLength(1);
+    expect(closes[0]![1]).toMatchObject({ keepalive: true, method: 'POST', credentials: 'omit', body: '{}' });
+    expect(localStorage.length).toBe(0); expect(sessionStorage.length).toBe(0);
+  });
+
+  it('retains the independent ten-second HTTP abort bound for an unresponsive close', async () => {
+    const request = vi.fn((url: string, init: RequestInit): Promise<Response> => {
+      if (url.endsWith('/guest-browser-sessions')) return successfulGuestBootstrap(init);
+      if (url.endsWith('/close')) return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new DOMException('aborted test request', 'AbortError')), { once: true });
+      });
+      return Promise.resolve(new Response('{}'));
+    });
+    vi.stubGlobal('fetch', request);
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+    vi.useFakeTimers();
+    try {
+      const closed = closeAllBrowserRemoteSessions('leave_page').then(() => undefined, error => error);
+      const close = request.mock.calls.find(([url]) => url.endsWith('/close'));
+      expect(close).toBeDefined();
+      expect(close![1].keepalive).toBe(true);
+      await vi.advanceTimersByTimeAsync(9999);
+      expect(close![1].signal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect((await closed).message).toContain('超时');
+      expect(close![1].signal?.aborted).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+describe('close_navigation_no_peer_wait', () => {
+  it.each([200, 503])('starts stop POST during peer teardown, joins both and deduplicates even with HTTP %s', async closeStatus => {
+    let context!: { closeBackend: () => Promise<void> };
+    let observer!: { onState: (state: { phase: string; grantedScopes: string[] }) => void };
+    let started = false;
+    let releasePeer!: () => void, releaseBackend!: () => void;
+    const peerGate = new Promise<void>(resolve => { releasePeer = resolve; });
+    const backendGate = new Promise<void>(resolve => { releaseBackend = resolve; });
+    let repeated: Promise<void> | undefined;
+    let handle!: ReturnType<typeof attachBrowserRemoteSession>;
+    const peerClose = vi.fn(async () => {
+      observer.onState({ phase: 'closed', grantedScopes: [] });
+      await peerGate;
+      await context.closeBackend();
+    });
+    vi.doMock('./browserRemotePeer', () => ({ BrowserRemotePeer: class {
+      constructor(value: typeof context, events: typeof observer) { context = value; observer = events; }
+      async start() { started = true; }
+      close = peerClose;
+    } }));
+    const request = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/guest-browser-sessions')) return successfulGuestBootstrap(init);
+      await backendGate;
+      return new Response(closeStatus === 200 ? '{}' : JSON.stringify({ detail: 'stop unavailable' }), { status: closeStatus });
+    });
+    vi.stubGlobal('fetch', request);
+    let pending: Promise<void> | undefined;
+    try {
+      const created = await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345' });
+      handle = attachBrowserRemoteSession(created.sessionId, {
+        onState: state => { if (state.phase === 'closed') repeated = handle.close('reentrant_close'); },
+        onVideoStream: () => undefined,
+      });
+      await until(() => started);
+      pending = handle.close('page_hidden');
+      const outcome = pending.then(() => 'done', () => 'failed');
+      await Promise.resolve();
+      expect(peerClose).toHaveBeenCalledTimes(1);
+      const closes = request.mock.calls.filter(([url]) => url.endsWith('/close'));
+      expect(closes).toHaveLength(1);
+      expect(closes[0]![1].keepalive).toBe(true);
+      expect(repeated).toBe(pending);
+      expect(handle.close('leave_page')).toBe(pending);
+      let done = false; void outcome.then(() => { done = true; });
+      releaseBackend(); await new Promise<void>(resolve => realTimeout(resolve, 5));
+      expect(done).toBe(false);
+      releasePeer(); expect(await outcome).toBe(closeStatus === 200 ? 'done' : 'failed');
+      expect(request.mock.calls.filter(([url]) => url.endsWith('/close'))).toHaveLength(1);
+    } finally {
+      releasePeer(); releaseBackend();
+      await pending?.catch(() => undefined);
+      vi.doUnmock('./browserRemotePeer');
+    }
+  });
+});

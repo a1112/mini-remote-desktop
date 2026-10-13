@@ -111,7 +111,7 @@ const pendingCreates = new Set<string>();
 let creationEpoch = 0;
 const CLOSED_STATES = new Set(['rejected', 'expired', 'closed', 'revoked']);
 
-async function browserApi<T>(accessToken: string | undefined, path: string, body?: unknown): Promise<T> {
+async function browserApi<T>(accessToken: string | undefined, path: string, body?: unknown, keepalive = false): Promise<T> {
   const cancel = new AbortController();
   const timer = setTimeout(() => cancel.abort(), 10_000);
   try {
@@ -120,6 +120,7 @@ async function browserApi<T>(accessToken: string | undefined, path: string, body
       headers: { ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}), 'Content-Type': 'application/json' },
       credentials: 'omit',
       signal: cancel.signal,
+      ...(keepalive ? { keepalive: true } : {}),
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!response.ok) {
@@ -218,16 +219,21 @@ export async function createBrowserRemoteSession(
     if (!stillCurrent()) throw new Error('网页会话创建已取消');
     const bootstrap = await validateBrowserBootstrap(raw, identity, { sessionId, targetDeviceId, requestBody: body });
     if (!stillCurrent()) throw new Error('网页会话创建已取消');
+    let backendClosePromise: Promise<void> | undefined;
+    const closeBackend = () => {
+      backendClosePromise ??= browserApi(accessToken, path + '/close', {}, true).then(() => undefined);
+      return backendClosePromise;
+    };
     const context: BrowserRemoteContext = {
       identity, bootstrap,
       getBootstrap: async () => validateBrowserBootstrap(await browserApi<BrowserSessionBootstrap>(accessToken, path), identity, { sessionId, targetDeviceId, controllerId: bootstrap.controller_device_id }),
       getRelayAccess: () => browserApi(accessToken, `${path}/relay-access`, { generation: 0 }),
-      closeBackend: async () => { await browserApi(accessToken, `${path}/close`, {}); },
+      closeBackend,
     };
     ownedSessions.set(sessionId, { context, closed: false });
     return { sessionId };
   } catch (error) {
-    if (created && accessToken) await browserApi(accessToken, `${path}/close`, {}).catch(() => undefined);
+    if (created && accessToken) await browserApi(accessToken, `${path}/close`, {}, true).catch(() => undefined);
     throw error;
   } finally { password = ''; pendingCreates.delete(sessionId); }
 }
@@ -262,12 +268,27 @@ export function attachBrowserRemoteSession(sessionId: string, observer: BrowserR
     close: reason => {
       if (closePromise) return closePromise;
       closed = true; entry.closed = true; ownedSessions.delete(sessionId);
-      closePromise = Promise.resolve().then(async () => {
-        if (peer) await peer.close(reason);
+      // Install the latch before peer callbacks can reenter close(). Start local
+      // release first, then submit stop immediately without awaiting teardown.
+      let resolveClose!: () => void;
+      let rejectClose!: (error: unknown) => void;
+      closePromise = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+      let localClose: Promise<void>;
+      try {
+        if (peer) localClose = peer.close(reason);
         else {
           observer.onState(startupError ? { phase: 'failed', grantedScopes: [], error: startupError } : { phase: 'closed', grantedScopes: [] });
-          await entry.context.closeBackend();
+          localClose = Promise.resolve();
         }
+      } catch (error) { localClose = Promise.reject(error); }
+      let backendClose: Promise<void>;
+      try { backendClose = entry.context.closeBackend(); }
+      catch (error) { backendClose = Promise.reject(error); }
+      // Both failures are handled immediately; completion waits for both sides.
+      void Promise.allSettled([localClose, backendClose]).then(results => {
+        const failure = results.find(result => result.status === 'rejected');
+        if (failure?.status === 'rejected') rejectClose(failure.reason);
+        else resolveClose();
       });
       return closePromise;
     },

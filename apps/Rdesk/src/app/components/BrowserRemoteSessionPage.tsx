@@ -20,6 +20,7 @@ const inactive = (phase: BrowserRemoteState['phase']) => phase === 'denied' || p
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const pointerButtonMasks = [['left', 1], ['right', 2], ['middle', 4], ['x1', 8], ['x2', 16]] as const;
 type PointerButtons = { buttons: number; coordinates: { x: number; y: number } };
+type CloseOperation = { generation: number; owner: BrowserRemoteHandle; promise: Promise<void>; status: 'pending' | 'complete' | 'unknown' };
 
 export function BrowserRemoteSessionPage() {
   const { id } = useParams();
@@ -39,6 +40,7 @@ export function BrowserRemoteSessionPage() {
   const alive = useRef(false);
   const locallyClosed = useRef(false);
   const closePending = useRef(false);
+  const closeOperation = useRef<CloseOperation | null>(null);
   const sessionGeneration = useRef(0);
   const inputGeneration = useRef(0);
   const ready = !locallyClosed.current && firstFrame && state.phase === 'streaming' && state.grantedScopes.includes('screen.view');
@@ -57,7 +59,10 @@ export function BrowserRemoteSessionPage() {
     pointers.current.clear();
     void handle.current?.releaseInputs(reason).catch(() => undefined);
   }, []);
-  const close = useCallback((reason: string) => {
+  const close = useCallback((reason: string, generation = sessionGeneration.current) => {
+    const existing = closeOperation.current;
+    if (existing?.generation === generation) return existing.promise;
+    if (sessionGeneration.current !== generation) return Promise.resolve();
     inputGeneration.current += 1;
     locallyClosed.current = true;
     const owned = handle.current;
@@ -67,8 +72,31 @@ export function BrowserRemoteSessionPage() {
     if (video.current) video.current.srcObject = null;
     if (alive.current) { setFirstFrame(false); setState(previous => ({ phase: 'closed', grantedScopes: [], setup: previous.setup })); }
     if (!owned) return Promise.resolve();
-    void owned.releaseInputs(reason).catch(() => undefined);
-    return owned.close(reason);
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const promise = new Promise<void>((resolve, reject) => { resolveClose = resolve; rejectClose = reject; });
+    const operation: CloseOperation = { generation, owner: owned, promise, status: 'pending' };
+    closeOperation.current = operation;
+    const current = () => alive.current && sessionGeneration.current === generation && closeOperation.current === operation;
+    if (current()) { setClosing(true); setActionError(null); }
+    const complete = () => {
+      operation.status = 'complete';
+      if (current()) setClosing(false);
+      resolveClose();
+    };
+    const failed = (error: unknown) => {
+      operation.status = 'unknown';
+      if (current()) {
+        setClosing(false);
+        setActionError(`本地控制已停止，远端结束请求失败：${message(error)}。无法确认远端已停止。`);
+      }
+      rejectClose(error);
+    };
+    // Local input stops synchronously. A failed release must not suppress stop.
+    try { void owned.releaseInputs(reason).catch(() => undefined); } catch { /* Best effort; Agent Stop also releases held input. */ }
+    try { void Promise.resolve(owned.close(reason)).then(complete, failed); }
+    catch (error) { failed(error); }
+    return promise;
   }, []);
   useEffect(() => {
     const generation = ++sessionGeneration.current;
@@ -77,6 +105,7 @@ export function BrowserRemoteSessionPage() {
     alive.current = true;
     locallyClosed.current = false;
     closePending.current = false;
+    closeOperation.current = null;
     setState(initialState); setFirstFrame(false); setActionError(null); setClosing(false); hasStream.current = false;
     try {
       if (!id) throw new Error('未找到浏览器会话，请从设备列表重新连接');
@@ -100,20 +129,20 @@ export function BrowserRemoteSessionPage() {
     }
     const onHidden = () => { if (document.visibilityState !== 'visible') release('document_hidden'); };
     const onBlur = () => release('window_blur');
-    const onPageHide = () => { void close('page_hidden').catch(() => undefined); };
+    const onPageHide = () => { void close('page_hidden', generation).catch(() => undefined); };
     const onFullscreen = () => { if (current()) setFullscreen(document.fullscreenElement === surface.current); };
     document.addEventListener('visibilitychange', onHidden);
     document.addEventListener('fullscreenchange', onFullscreen);
     window.addEventListener('blur', onBlur);
     window.addEventListener('pagehide', onPageHide);
     return () => {
-      if (sessionGeneration.current === generation) sessionGeneration.current += 1;
       alive.current = false; hasStream.current = false;
       document.removeEventListener('visibilitychange', onHidden);
       document.removeEventListener('fullscreenchange', onFullscreen);
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('pagehide', onPageHide);
-      void close('leave_page').catch(() => undefined);
+      void close('leave_page', generation).catch(() => undefined);
+      if (sessionGeneration.current === generation) sessionGeneration.current += 1;
       if (ownedVideo) ownedVideo.srcObject = null;
     };
   }, [id, close, release]);
@@ -238,13 +267,13 @@ export function BrowserRemoteSessionPage() {
   };
   const leave = async () => {
     if (closePending.current) return;
-    if (!handle.current) { navigate('/devices'); return; }
+    if (!handle.current && closeOperation.current?.generation !== sessionGeneration.current) { navigate('/devices'); return; }
     closePending.current = true;
     const generation = sessionGeneration.current;
     const current = () => alive.current && sessionGeneration.current === generation;
     setClosing(true); setActionError(null);
     try {
-      await close('leave_page');
+      await close('leave_page', generation);
       if (current()) navigate('/devices');
     } catch (error) {
       if (current()) setActionError(`本地控制已停止，远端结束请求失败：${message(error)}。无法确认远端已停止。`);
@@ -262,9 +291,9 @@ export function BrowserRemoteSessionPage() {
       if (current()) setActionError(null);
     } catch (error) { if (current()) setActionError(message(error)); }
   };
-  const label = ready ? '画面已连接' : phaseLabels[state.phase];
+  const label = closing ? '正在结束远端会话' : closeOperation.current?.status === 'unknown' ? '远端结束未确认' : ready ? '画面已连接' : phaseLabels[state.phase];
 
-  return <main className="flex min-h-dvh flex-col bg-slate-950 text-slate-100">
+  return <main data-browser-close-state={closeOperation.current?.status} className="flex min-h-dvh flex-col bg-slate-950 text-slate-100">
     <header className="flex flex-wrap items-center gap-3 border-b border-white/10 px-4 py-3">
       <button ref={leaveButton} type="button" onClick={() => void leave()} disabled={closing} aria-label={closing ? '正在结束会话' : inactive(state.phase) ? '返回设备列表' : ready ? '断开并返回设备列表' : '取消连接'} className="flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm hover:bg-white/10 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-cyan-400"><ArrowLeft className="h-4 w-4" />{closing ? '正在结束会话' : inactive(state.phase) ? '返回设备列表' : ready ? '断开连接' : '取消连接'}</button>
       <div className="order-first min-w-0 basis-full sm:order-none sm:basis-auto sm:flex-1"><h1 className="flex items-center gap-2 whitespace-nowrap text-base font-semibold"><Monitor className="h-5 w-5 shrink-0 text-cyan-400" />网页远程桌面</h1><p className="mt-1 break-all text-xs text-slate-400">{id}</p></div>
