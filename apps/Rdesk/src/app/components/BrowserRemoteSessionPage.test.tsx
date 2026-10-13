@@ -394,23 +394,48 @@ describe('independent browser remote desktop', () => {
     expect(mocks.close).toHaveBeenCalledTimes(1);
   });
 
-  it('closeBarrier_failed_close_remains_unconfirmed_when_return_is_clicked_again', async () => {
-    show(); await state('streaming'); await videoReady();
+  it.each(['HTTP 401 Temporary access is unavailable', 'HTTP 503 远端撤销不可用'])(
+    'closeRecovery_keeps_%s_unconfirmed_until_an_explicit_return_without_retry', async failure => {
+      show(); await state('streaming'); const video = await videoReady();
+      const closing = deferred(); mocks.close.mockReturnValue(closing.promise);
+      const page = video.closest('main')!;
+      await userEvent.click(screen.getByRole('button', { name: '断开并返回设备列表' }));
+      expect(page).toHaveAttribute('data-browser-close-state', 'pending');
+      expect(screen.queryByRole('button', { name: '返回设备列表（远端结束未确认）' })).not.toBeInTheDocument();
+      await act(async () => closing.reject(new Error(failure)));
+      expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
+      expect(await screen.findByRole('alert')).toHaveTextContent(failure);
+      expect(screen.getByRole('alert')).toHaveTextContent('无法确认远端已停止');
+      expect(screen.getByRole('status')).toHaveTextContent('远端结束未确认');
+      expect(page).toHaveAttribute('data-browser-close-state', 'unknown');
+      expect(video.srcObject).toBeNull();
+      expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
+      await state('streaming');
+      expect(screen.queryByText('画面已连接')).not.toBeInTheDocument();
+      const releases = mocks.releaseInputs.mock.calls.length;
+      const explicitReturn = screen.getByRole('button', { name: '返回设备列表（远端结束未确认）' });
+      expect(explicitReturn).toBeEnabled();
+      await userEvent.click(explicitReturn);
+      expect(await screen.findByText('设备列表')).toBeInTheDocument();
+      expect(mocks.close).toHaveBeenCalledTimes(1);
+      expect(mocks.releaseInputs).toHaveBeenCalledTimes(releases);
+      expect(page).toHaveAttribute('data-browser-close-state', 'unknown');
+    },
+  );
+
+  it('closeRecovery_pagehide_failure_requires_explicit_unconfirmed_return', async () => {
+    show(); await state('streaming'); const video = await videoReady();
     const closing = deferred(); mocks.close.mockReturnValue(closing.promise);
-    const returnButton = screen.getByRole('button', { name: '断开并返回设备列表' });
-    await userEvent.click(returnButton);
-    await act(async () => closing.reject(new Error('HTTP 503 远端撤销不可用')));
-    expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
-    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 503 远端撤销不可用');
-    expect(screen.getByRole('alert')).toHaveTextContent('无法确认远端已停止');
-    expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
-    await state('streaming');
-    expect(screen.queryByText('画面已连接')).not.toBeInTheDocument();
-    await userEvent.click(returnButton);
+    const page = video.closest('main')!;
+    await act(async () => { fireEvent(window, new Event('pagehide')); });
+    await act(async () => closing.reject(new Error('HTTP 401 Temporary access is unavailable')));
     expect(screen.queryByText('设备列表')).not.toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('无法确认远端已停止');
-    expect(screen.queryByText('会话已结束')).not.toBeInTheDocument();
-    expect(screen.getByRole('application')).toHaveAttribute('aria-disabled', 'true');
+    expect(page).toHaveAttribute('data-browser-close-state', 'unknown');
+    await userEvent.click(screen.getByRole('button', { name: '返回设备列表（远端结束未确认）' }));
+    expect(await screen.findByText('设备列表')).toBeInTheDocument();
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+    expect(page).toHaveAttribute('data-browser-close-state', 'unknown');
   });
 
   it.each(['resolve', 'reject'] as const)('closeBarrier_pagehide_late_%s_does_not_change_session_B', async outcome => {

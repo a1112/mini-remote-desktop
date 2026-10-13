@@ -267,6 +267,11 @@ export function BrowserRemoteSessionPage() {
   };
   const leave = async () => {
     if (closePending.current) return;
+    const operation = closeOperation.current;
+    if (operation?.generation === sessionGeneration.current && operation.status === 'unknown') {
+      navigate('/devices');
+      return;
+    }
     if (!handle.current && closeOperation.current?.generation !== sessionGeneration.current) { navigate('/devices'); return; }
     closePending.current = true;
     const generation = sessionGeneration.current;
@@ -291,11 +296,12 @@ export function BrowserRemoteSessionPage() {
       if (current()) setActionError(null);
     } catch (error) { if (current()) setActionError(message(error)); }
   };
+  const closeUnconfirmed = closeOperation.current?.status === 'unknown' && closeOperation.current.generation === sessionGeneration.current;
   const label = closing ? '正在结束远端会话' : closeOperation.current?.status === 'unknown' ? '远端结束未确认' : ready ? '画面已连接' : phaseLabels[state.phase];
 
   return <main data-browser-close-state={closeOperation.current?.status} className="flex min-h-dvh flex-col bg-slate-950 text-slate-100">
     <header className="flex flex-wrap items-center gap-3 border-b border-white/10 px-4 py-3">
-      <button ref={leaveButton} type="button" onClick={() => void leave()} disabled={closing} aria-label={closing ? '正在结束会话' : inactive(state.phase) ? '返回设备列表' : ready ? '断开并返回设备列表' : '取消连接'} className="flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm hover:bg-white/10 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-cyan-400"><ArrowLeft className="h-4 w-4" />{closing ? '正在结束会话' : inactive(state.phase) ? '返回设备列表' : ready ? '断开连接' : '取消连接'}</button>
+      <button ref={leaveButton} type="button" onClick={() => void leave()} disabled={closing} aria-label={closing ? '正在结束会话' : closeUnconfirmed ? '返回设备列表（远端结束未确认）' : inactive(state.phase) ? '返回设备列表' : ready ? '断开并返回设备列表' : '取消连接'} className="flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm hover:bg-white/10 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-cyan-400"><ArrowLeft className="h-4 w-4" />{closing ? '正在结束会话' : closeUnconfirmed ? '返回设备列表（远端结束未确认）' : inactive(state.phase) ? '返回设备列表' : ready ? '断开连接' : '取消连接'}</button>
       <div className="order-first min-w-0 basis-full sm:order-none sm:basis-auto sm:flex-1"><h1 className="flex items-center gap-2 whitespace-nowrap text-base font-semibold"><Monitor className="h-5 w-5 shrink-0 text-cyan-400" />网页远程桌面</h1><p className="mt-1 break-all text-xs text-slate-400">{id}</p></div>
       <span role="status" className={`rounded-full px-3 py-1 text-sm ${ready ? 'bg-emerald-500/15 text-emerald-300' : 'bg-white/10 text-slate-300'}`}>{label}</span>
       <button type="button" onClick={() => void toggleFullscreen()} disabled={!firstFrame} aria-label={fullscreen ? '退出全屏' : '进入全屏'} className="flex min-h-10 items-center gap-2 rounded-lg border border-white/15 px-3 text-sm hover:bg-white/10 disabled:opacity-40 focus-visible:outline-2 focus-visible:outline-cyan-400">{fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}全屏</button>
