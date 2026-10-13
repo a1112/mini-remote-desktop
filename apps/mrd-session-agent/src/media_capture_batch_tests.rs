@@ -68,10 +68,17 @@ fn queue_executor(owner: &SessionId, ids: &[[u8; 16]]) -> MediaExecutor<QueueCap
         })
         .collect();
     let mut executor = MediaExecutor::new(QueueCapture { queues }, NoRender);
-    for id in ids {
-        executor
-            .registry
-            .start(*id, owner.clone(), 0, MediaResourceKind::Capture, None);
+    for (display_id, id) in ids.iter().enumerate() {
+        assert_eq!(
+            executor.registry.start(
+                *id,
+                owner.clone(),
+                u32::try_from(display_id).unwrap(),
+                MediaResourceKind::Capture,
+                None,
+            ),
+            MediaResourceMutation::Started
+        );
     }
     executor
 }

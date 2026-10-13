@@ -3,7 +3,9 @@
 //! This module is deliberately independent of capture/render APIs.  It owns
 //! the process-boundary invariant first: every desktop resource has one exact
 //! resource id, session id, display id, and kind, and cleanup cannot silently
-//! retarget another resource.  Platform adapters are added only behind this
+//! retarget another resource. Capture ownership is exclusive per display in
+//! this registry; render resources do not reserve capture ownership.
+//! Platform adapters are added only behind this
 //! registry in the next Task 25 slice.
 
 use crate::capabilities::AgentCapabilities;
@@ -79,6 +81,8 @@ pub enum MediaResourceMutation {
     Stopped,
     /// The exact resource already exists.
     Duplicate,
+    /// A capture resource already owns this display, regardless of session.
+    DisplayBusy,
     /// No matching resource exists for cleanup.
     Missing,
     /// The requested cleanup belongs to another session or kind.
@@ -551,6 +555,13 @@ impl MediaResourceRegistry {
         if self.resources.contains_key(&resource_id) {
             return MediaResourceMutation::Duplicate;
         }
+        if kind == MediaResourceKind::Capture
+            && self.resources.values().any(|resource| {
+                resource.kind == MediaResourceKind::Capture && resource.display_id == display_id
+            })
+        {
+            return MediaResourceMutation::DisplayBusy;
+        }
         self.resources.insert(
             resource_id,
             MediaResource {
@@ -616,6 +627,10 @@ impl MediaResourceRegistry {
 #[cfg(test)]
 #[path = "media_capture_batch_tests.rs"]
 mod capture_batch_tests;
+
+#[cfg(test)]
+#[path = "media_capture_admission_tests.rs"]
+mod capture_admission_tests;
 
 #[cfg(test)]
 mod tests {
