@@ -40,6 +40,33 @@ async function successfulGuestBootstrap(init: RequestInit) {
 }
 
 describe('temporary password guest browser access', () => {
+  it.each([
+    { routePreference: undefined, policy: 'direct_first' },
+    { routePreference: 'wan_relay' as const, policy: 'relay_only' },
+  ])('preserves the guest route policy $policy and requested input scopes in the create wire request', async ({ routePreference, policy }) => {
+    const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345', accessMode: 'paired', routePreference });
+    const creates = request.mock.calls.filter(([url]) => url.endsWith('/guest-browser-sessions'));
+    expect(creates).toHaveLength(1);
+    expect(JSON.parse(creates[0]![1].body as string)).toMatchObject({
+      route_policy: policy, access_mode: 'paired', temporary_password: 'ABCD2345',
+      requested_scopes: ['input.keyboard', 'input.pointer', 'screen.view'],
+    });
+  });
+
+  it.each([30, 60])('preserves an explicit 4 Mbps H.264 profile at %i fps in the guest create wire request', async (fps) => {
+    const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
+    vi.stubGlobal('fetch', request);
+    const requestedProfile = { width: 1920, height: 1080, fps, bitrate_mbps: 4, codec: 'h264' };
+    await createBrowserRemoteSession('753662296', { temporaryPassword: 'ABCD2345', accessMode: 'paired', requestedProfile });
+    const creates = request.mock.calls.filter(([url]) => url.endsWith('/guest-browser-sessions'));
+    expect(creates).toHaveLength(1);
+    expect(JSON.parse(creates[0]![1].body as string)).toMatchObject({
+      requested_profile: requestedProfile, access_mode: 'paired', temporary_password: 'ABCD2345',
+    });
+  });
+
   it('keeps guest password authentication and reuses the first pairing key for explicit paired reconnect', async () => {
     const request = vi.fn(async (url: string, init: RequestInit) => url.endsWith('/guest-browser-sessions') ? successfulGuestBootstrap(init) : new Response('{}'));
     vi.stubGlobal('fetch', request);

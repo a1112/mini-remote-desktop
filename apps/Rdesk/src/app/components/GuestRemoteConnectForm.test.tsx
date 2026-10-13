@@ -24,6 +24,8 @@ describe('guest remote connection form', () => {
     { preset: null, profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 10, codec: 'h264' } },
     { preset: '1080p60', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: 'h264' } },
     { preset: '1440p120', profile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' } },
+    { preset: '1080p60-low', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 4, codec: 'h264' } },
+    { preset: '1080p30-low', profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 4, codec: 'h264' } },
   ])('requests the selected picture profile before connecting: $preset', async ({ preset, profile }) => {
     const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
     if (preset) await user.selectOptions(screen.getByRole('combobox', { name: '画面档位' }), preset);
@@ -36,23 +38,44 @@ describe('guest remote connection form', () => {
     expect(mocks.navigate).toHaveBeenCalledWith('/browser-session/guest-session');
   });
 
-  it('locks the picture profile while its connection request is pending', async () => {
+  it.each([
+    { selection: null, routePreference: 'auto' },
+    { selection: 'wan_relay', routePreference: 'wan_relay' },
+  ])('requests the selected route before connecting: $routePreference', async ({ selection, routePreference }) => {
+    const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
+    const route = screen.getByRole('combobox', { name: '连接路线' });
+    expect(route).toHaveValue('auto');
+    if (selection) await user.selectOptions(route, selection);
+    await user.type(screen.getByLabelText('远程设备码'), '1501515774');
+    await user.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).toHaveBeenCalledWith('1501515774', expect.objectContaining({
+      routePreference, temporaryPassword: 'ABCD2345', accessMode: 'attended',
+    }));
+  });
+
+  it('locks the picture profile and route while its connection request is pending', async () => {
     let resolve!: (value: unknown) => void;
     mocks.launch.mockImplementation(() => new Promise(done => { resolve = done; }));
     const user = userEvent.setup(); render(<GuestRemoteConnectForm />);
     const preset = screen.getByRole('combobox', { name: '画面档位' });
+    const route = screen.getByRole('combobox', { name: '连接路线' });
     expect(preset).toHaveValue('1080p30');
     await user.selectOptions(preset, '1440p120');
+    await user.selectOptions(route, 'wan_relay');
     await user.type(screen.getByLabelText('远程设备码'), '1501515774');
     await user.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
     await user.click(screen.getByRole('button', { name: '立即连接' }));
     expect(preset).toBeDisabled();
+    expect(route).toBeDisabled();
     expect(mocks.launch).toHaveBeenCalledTimes(1);
     expect(mocks.launch).toHaveBeenCalledWith('1501515774', expect.objectContaining({
       requestedProfile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' },
+      routePreference: 'wan_relay',
     }));
     await act(async () => resolve({ sessionId: 'guest-session', mode: 'route', routePath: '/browser-session/guest-session' }));
     expect(preset).toBeEnabled();
+    expect(route).toBeEnabled();
   });
 
   it.each(['abcd2345', 'ABCD2340', 'ABCD2341', 'ABCD23I5', 'ABCD23O5'])('shows a local format error instead of sending a password outside the issued alphabet: %s', async (password) => {

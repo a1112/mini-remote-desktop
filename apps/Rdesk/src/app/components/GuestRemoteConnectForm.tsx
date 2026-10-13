@@ -12,6 +12,8 @@ const PICTURE_PRESETS = [
   DEFAULT_PICTURE_PRESET,
   { value: '1080p60', label: '流畅（1080p · 60帧）', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 20, codec: 'h264' } },
   { value: '1440p120', label: '高性能（1440p · 120帧）', profile: { width: 2560, height: 1440, fps: 120, bitrate_mbps: 40, codec: 'h264' } },
+  { value: '1080p60-low', label: '省流流畅（1080p · 60帧 · 4Mbps）', profile: { width: 1920, height: 1080, fps: 60, bitrate_mbps: 4, codec: 'h264' } },
+  { value: '1080p30-low', label: '省流（1080p · 30帧 · 4Mbps）', profile: { width: 1920, height: 1080, fps: 30, bitrate_mbps: 4, codec: 'h264' } },
 ] satisfies Array<{ value: string; label: string; profile: MediaProfile }>;
 
 export function GuestRemoteConnectForm() {
@@ -20,6 +22,7 @@ export function GuestRemoteConnectForm() {
   const [deviceCode, setDeviceCode] = useState('');
   const [password, setPassword] = useState('');
   const [picturePreset, setPicturePreset] = useState(DEFAULT_PICTURE_PRESET);
+  const [routePreference, setRoutePreference] = useState<'auto' | 'wan_relay'>('auto');
   const [accessMode, setAccessMode] = useState<'attended' | 'paired'>('attended');
   const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -42,7 +45,7 @@ export function GuestRemoteConnectForm() {
     try {
       const result = await launchRemoteDisplayForDevice(target.deviceId, {
         temporaryPassword: password, signal: cancellation.signal,
-        transportKind: 'webrtc', routePreference: 'auto', targetDeviceName: '远程设备',
+        transportKind: 'webrtc', routePreference, targetDeviceName: '远程设备',
         requestedProfile: { ...picturePreset.profile },
         accessMode,
       });
@@ -79,6 +82,13 @@ export function GuestRemoteConnectForm() {
         onChange={event => { const next = PICTURE_PRESETS.find(preset => preset.value === event.target.value); if (next) setPicturePreset(next); }}
         className="mt-1.5 w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500/30">
         {PICTURE_PRESETS.map(preset => <option key={preset.value} value={preset.value}>{preset.label}</option>)}
+      </select>
+    </label>
+    <label className="block text-sm">连接路线
+      <select aria-label="连接路线" value={routePreference} disabled={busy}
+        onChange={event => { const next = event.target.value; if (next === 'auto' || next === 'wan_relay') setRoutePreference(next); }}
+        className="mt-1.5 w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5">
+        <option value="auto">自动（优先直连）</option><option value="wan_relay">仅中继</option>
       </select>
     </label>
     <label className="block text-sm">连接授权方式
