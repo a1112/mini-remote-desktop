@@ -411,13 +411,17 @@ class DeviceSessionService:
             )
             if row is None or not _is_authorized_participant(row, current_device):
                 _not_found()
+            # Close is cleanup for an exact participant, not a new terminal reason.
+            terminal_close = action == "close" and row.status in {
+                "closed", "rejected", "revoked", "expired"
+            }
             if not await browser_authority_valid(self._session, row, now=self._now(),
-                allow_terminal=current_device.id == row.target_device_id or row.status == "closed"):
+                allow_terminal=current_device.id == row.target_device_id or terminal_close or row.status == "closed"):
                 _not_found()
             if authorization == "target" and row.target_device_id != current_device.id:
                 _deny()
             now = _utc(self._now())
-            if row.status == terminal:
+            if row.status == terminal or terminal_close:
                 await self._session.execute(
                     update(RelayReservation)
                     .where(
