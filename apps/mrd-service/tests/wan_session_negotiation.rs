@@ -229,6 +229,145 @@ fn generation_zero_negotiator_is_present_and_bounded() {
     .is_err());
 }
 
+#[tokio::test]
+async fn native_candidates_sign_with_the_same_generation_zero_manifest_metadata() {
+    let peer = mrd_transport_webrtc::WebRtcPeerConnection::new(PeerConnectionConfig {
+        include_loopback_candidates: true,
+        ice_transport_policy: mrd_transport_webrtc::IceTransportPolicy::All,
+        ..PeerConnectionConfig::default()
+    })
+    .await
+    .expect("native peer without external ICE servers");
+    let native_description = peer.create_offer().await.expect("native local description");
+    let candidates = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut candidates = Vec::new();
+        while let Some(candidate) = peer.next_local_candidate().await {
+            candidates.push(candidate);
+        }
+        candidates
+    })
+    .await;
+    peer.close().await.expect("native fixture cleanup");
+    let candidates = candidates.expect("native ICE stream completes while peer is open");
+    assert!(
+        !candidates.is_empty(),
+        "the fixture must gather native candidates"
+    );
+
+    let session = test_session_id();
+    for role in [
+        WebRtcDescriptionRoleV3::Offer,
+        WebRtcDescriptionRoleV3::Answer,
+    ] {
+        let signer = DeviceIdentity::generate(&ring::rand::SystemRandom::new()).unwrap();
+        let (issuer, intended_peer) = match role {
+            WebRtcDescriptionRoleV3::Offer => ("controller-device", "target-device"),
+            WebRtcDescriptionRoleV3::Answer => ("target-device", "controller-device"),
+        };
+        let mut manifest = std::collections::BTreeMap::new();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let fingerprint = webrtc_candidate_fingerprint_v3(
+                &session,
+                GRANT_COMMITMENT,
+                role,
+                &candidate.candidate,
+                candidate.sdp_mid.as_deref(),
+                candidate.sdp_mline_index,
+                candidate.username_fragment.as_deref(),
+            );
+            let signed = WebRtcCandidateV3::sign(
+                &signer,
+                WebRtcCandidateV3Payload {
+                    claims: AuthClaims {
+                        issuer_device_id: DeviceId(issuer.into()),
+                        issuer_key_id: signer.key_id().into(),
+                        intended_peer_device_id: DeviceId(intended_peer.into()),
+                        issued_at_ms: 1_000,
+                        expires_at_ms: 2_000,
+                        counter: index as u64 + 1,
+                        nonce: [index as u8 + 1; 16],
+                    },
+                    session_id: session.clone(),
+                    controller_device_id: DeviceId("controller-device".into()),
+                    target_device_id: DeviceId("target-device".into()),
+                    grant_commitment: GRANT_COMMITMENT.into(),
+                    description_role: role,
+                    candidate: candidate.candidate.clone(),
+                    sdp_mid: candidate.sdp_mid.clone(),
+                    sdp_mline_index: candidate.sdp_mline_index,
+                    username_fragment: candidate.username_fragment.clone(),
+                    candidate_fingerprint: fingerprint.clone(),
+                },
+            )
+            .expect("each actual adapter candidate must pass the strict V3 signing gate");
+            assert_eq!(signed.payload.sdp_mline_index, Some(0));
+            assert_eq!(signed.payload.sdp_mid, candidate.sdp_mid);
+            assert!(signed.payload.username_fragment == candidate.username_fragment);
+            signed
+                .verify_for_without_replay(&DeviceId(intended_peer.into()), 1_001)
+                .expect("native candidate signature and exact peer binding");
+            assert!(manifest.insert(fingerprint, signed).is_none());
+        }
+        let fingerprints = manifest.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(fingerprints.len(), candidates.len());
+        for fingerprint in &fingerprints {
+            assert!(manifest[fingerprint].payload.candidate_fingerprint == *fingerprint);
+        }
+        let payloads = manifest
+            .values()
+            .map(|message| message.payload.clone())
+            .collect::<Vec<_>>();
+        let mut description_claims = payloads[0].claims.clone();
+        description_claims.counter = payloads.len() as u64 + 1;
+        description_claims.nonce = [240; 16];
+        match role {
+            WebRtcDescriptionRoleV3::Offer => WebRtcOfferV3::sign(
+                &signer,
+                WebRtcOfferV3Payload {
+                    claims: description_claims,
+                    session_id: session.clone(),
+                    controller_device_id: DeviceId("controller-device".into()),
+                    target_device_id: DeviceId("target-device".into()),
+                    grant_commitment: GRANT_COMMITMENT.into(),
+                    sdp: native_description.sdp.clone(),
+                    candidate_fingerprints: fingerprints,
+                },
+            )
+            .expect("native offer manifest signing")
+            .verify_candidate_manifest(&payloads),
+            WebRtcDescriptionRoleV3::Answer => WebRtcAnswerV3::sign(
+                &signer,
+                WebRtcAnswerV3Payload {
+                    claims: description_claims,
+                    session_id: session.clone(),
+                    controller_device_id: DeviceId("controller-device".into()),
+                    target_device_id: DeviceId("target-device".into()),
+                    grant_commitment: GRANT_COMMITMENT.into(),
+                    sdp: native_description.sdp.clone(),
+                    candidate_fingerprints: fingerprints,
+                },
+            )
+            .expect("native answer manifest signing")
+            .verify_candidate_manifest(&payloads),
+        }
+        .expect("the signed description must retain the exact adapter candidate manifest");
+        // Empty wire MIDs stay forbidden. Only the native adapter may express
+        // upstream's missing MID as None, before manifest and payload creation.
+        let mut empty_mid = manifest.values().next().unwrap().payload.clone();
+        empty_mid.sdp_mid = Some("".into());
+        empty_mid.candidate_fingerprint = webrtc_candidate_fingerprint_v3(
+            &empty_mid.session_id,
+            &empty_mid.grant_commitment,
+            empty_mid.description_role,
+            &empty_mid.candidate,
+            empty_mid.sdp_mid.as_deref(),
+            empty_mid.sdp_mline_index,
+            empty_mid.username_fragment.as_deref(),
+        );
+        assert!(WebRtcCandidateV3::sign(&signer, empty_mid).is_err());
+    }
+}
+
 #[test]
 fn generation_zero_context_requires_access_bound_state() {
     let session_id = test_session_id();

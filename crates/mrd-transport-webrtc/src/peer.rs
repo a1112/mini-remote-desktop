@@ -307,7 +307,7 @@ impl From<RTCIceCandidateInit> for IceCandidate {
     fn from(value: RTCIceCandidateInit) -> Self {
         Self {
             candidate: value.candidate,
-            sdp_mid: value.sdp_mid,
+            sdp_mid: value.sdp_mid.filter(|mid| !mid.is_empty()),
             sdp_mline_index: value.sdp_mline_index,
             username_fragment: value.username_fragment,
             generation: 0,
@@ -3525,6 +3525,30 @@ mod tests {
     use super::*;
     use tokio::sync::Semaphore;
     use zeroize::{Zeroize, ZeroizeOnDrop};
+
+    #[test]
+    fn native_candidate_mid_conversion_preserves_nonempty_metadata_and_index() {
+        for (mid, expected_mid) in [
+            (None, None),
+            (Some(""), None),
+            (Some("0"), Some("0")),
+            (Some(" video "), Some(" video ")),
+        ] {
+            let candidate: IceCandidate = RTCIceCandidateInit {
+                candidate: "candidate:adapter-metadata-control".into(),
+                sdp_mid: mid.map(str::to_owned),
+                sdp_mline_index: Some(0),
+                username_fragment: Some("".into()),
+            }
+            .into();
+            assert_eq!(candidate.sdp_mid.as_deref(), expected_mid);
+            assert_eq!(candidate.sdp_mline_index, Some(0));
+            assert_eq!(candidate.username_fragment.as_deref(), Some(""));
+            assert_eq!(candidate.candidate, "candidate:adapter-metadata-control");
+            assert_eq!(candidate.generation(), 0);
+            assert!(candidate.restart_route_token().is_none());
+        }
+    }
 
     async fn native_peer_after_ice_gathering(capacity: usize) -> WebRtcPeerConnection {
         let peer = WebRtcPeerConnection::new(PeerConnectionConfig {
