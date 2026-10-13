@@ -67,6 +67,11 @@ def _guest_invalid_lines():
     return [start + offset for offset, line in enumerate(source) if "invalid()" in line]
 
 
+def _guest_wrong_password_line():
+    source, start = inspect.getsourcelines(GuestBrowserSessionService.create)
+    return next(start + offset + 1 for offset, line in enumerate(source) if "not valid_password" in line)
+
+
 def test_wrong_password_logs_direct_known_caller_without_changing_http(
     device_sessions_api, caplog
 ):
@@ -78,7 +83,7 @@ def test_wrong_password_logs_direct_known_caller_without_changing_http(
     assert response.json() == HTTP_INVALID
     value = _diagnostic(caplog)
     assert value["source"] == "guest_browser_service"
-    assert value["line"] == _guest_invalid_lines()[0]
+    assert value["line"] == _guest_wrong_password_line()
 
 
 def test_changed_publication_logs_later_validation_caller(

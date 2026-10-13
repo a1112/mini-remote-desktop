@@ -60,7 +60,11 @@ class GuestBrowserSessionService:
         valid_password = await self.temporary.verify_password(
             payload.temporary_password.get_secret_value(), access
         )
-        if not valid_password or target is None or access is None:
+        if target is None:
+            invalid()
+        if access is None:
+            invalid()
+        if not valid_password:
             invalid()
         async with principal_key_lock(self.db, key_id), session_grant_identity_lock(
             self.db, "session:" + payload.session_id
