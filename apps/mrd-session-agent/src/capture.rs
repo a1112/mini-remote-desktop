@@ -222,6 +222,26 @@ impl CaptureAdapter for WindowsDxgiCaptureAdapter {
 #[cfg(windows)]
 const CAPTURE_MAX_ACCESS_UNIT_BYTES: usize = 128 * 1024;
 
+// Preserve the approved phase through small wake delays, but never replay
+// missed capture ticks or compress consecutive starts below half a period.
+#[cfg(any(windows, test))]
+fn next_capture_frame_start(
+    scheduled_start: std::time::Duration,
+    actual_start: std::time::Duration,
+    period: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if period < std::time::Duration::from_nanos(2) {
+        return None;
+    }
+    let nominal = scheduled_start.checked_add(period)?;
+    let minimum_next = actual_start.checked_add(period / 2)?;
+    if nominal < minimum_next {
+        actual_start.checked_add(period)
+    } else {
+        Some(nominal)
+    }
+}
+
 #[cfg(windows)]
 fn report_capture_failure(
     session_id: &SessionId,
@@ -382,8 +402,21 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                     std::time::Duration::from_nanos(1_000_000_000 / u64::from(profile.fps));
                 let mut sequence = 0_u64;
                 let mut profile_frame_preparer = ProfileFramePreparer::default();
+                let pacing_epoch = std::time::Instant::now();
+                let mut scheduled_start = std::time::Duration::ZERO;
                 while !thread_stop.load(Ordering::Acquire) {
-                    let next_frame = std::time::Instant::now() + interval;
+                    let Some((next_start, next_frame)) =
+                        next_capture_frame_start(scheduled_start, pacing_epoch.elapsed(), interval)
+                            .and_then(|next| pacing_epoch.checked_add(next).map(|due| (next, due)))
+                    else {
+                        report_capture_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::FrameFailed,
+                            &thread_stop,
+                        );
+                        break;
+                    };
+                    scheduled_start = next_start;
                     let Ok(frame) = capture.capture_frame() else {
                         report_capture_failure(
                             &worker_session_id,
@@ -727,6 +760,10 @@ fn prepare_profile_frame(
 #[cfg(all(windows, test))]
 #[path = "capture_profile_frame_tests.rs"]
 mod profile_frame_tests;
+
+#[cfg(test)]
+#[path = "capture_frame_pacing_tests.rs"]
+mod frame_pacing_tests;
 
 #[cfg(all(windows, test))]
 mod tests {
