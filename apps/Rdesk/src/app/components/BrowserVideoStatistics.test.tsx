@@ -236,3 +236,179 @@ describe('inbound video statistics', () => {
   });
 
 });
+
+
+describe('finite presentation cadence diagnostic', () => {
+  let clock = 1000;
+  let nextId = 1;
+  let videoCallbacks: Map<number, VideoFrameRequestCallback>;
+  let animationCallbacks: Map<number, FrameRequestCallback>;
+  let requestVideo: ReturnType<typeof vi.fn>;
+  let cancelVideo: ReturnType<typeof vi.fn>;
+  function cadenceVideo() {
+    const fixture = videoFixture();
+    requestVideo = vi.fn((callback: VideoFrameRequestCallback) => { const id = nextId++; videoCallbacks.set(id, callback); return id; });
+    cancelVideo = vi.fn((id: number) => { videoCallbacks.delete(id); });
+    Object.defineProperties(fixture.videoRef.current, {
+      requestVideoFrameCallback: { configurable: true, value: requestVideo },
+      cancelVideoFrameCallback: { configurable: true, value: cancelVideo },
+    });
+    return fixture;
+  }
+  function frame(at: number, presentedFrames: number, mediaTime: number, expectedDisplayTime = at + 5, rtpTimestamp = 0) {
+    clock = at;
+    const first = videoCallbacks.entries().next().value as [number, VideoFrameRequestCallback] | undefined;
+    if (!first) throw new Error('expected pending native video callback');
+    videoCallbacks.delete(first[0]);
+    act(() => first[1](at, { presentationTime: at, expectedDisplayTime, width: 1920, height: 1080,
+      presentedFrames, mediaTime, rtpTimestamp }));
+  }
+  function animation(at: number) {
+    clock = at;
+    const first = animationCallbacks.entries().next().value as [number, FrameRequestCallback] | undefined;
+    if (!first) throw new Error('expected pending animation callback');
+    animationCallbacks.delete(first[0]);
+    act(() => first[1](at));
+  }
+  beforeEach(() => {
+    vi.useFakeTimers(); clock = 1000; nextId = 1;
+    videoCallbacks = new Map(); animationCallbacks = new Map();
+    vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      const id = nextId++; animationCallbacks.set(id, callback); return id;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => { animationCallbacks.delete(id); });
+  });
+  afterEach(() => { cleanup(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+  it('requires an explicit ready start and returns bounded numeric aggregates after 30 seconds', () => {
+    const { videoRef } = cadenceVideo();
+    const view = render(<BrowserVideoStatistics videoRef={videoRef} ready={false} />);
+    toggle(true);
+    const start = screen.getByRole('button', { name: '采样呈现节奏（30秒）' });
+    expect(start).toBeDisabled();
+    view.rerender(<BrowserVideoStatistics videoRef={videoRef} ready />);
+    act(() => vi.advanceTimersByTime(1000));
+    expect(requestVideo).not.toHaveBeenCalled();
+    expect(window.requestAnimationFrame).not.toHaveBeenCalled();
+    fireEvent.click(start);
+    expect(start).toBeDisabled();
+    expect(panel()).toHaveAttribute('data-presentation-state', 'running');
+    animation(1010); animation(1026); animation(1066);
+    frame(1020, 100, 2, 1025, 4294967000);
+    frame(1053, 102, 2.033, 1050, 2674); // RTP wraps by 2970 ticks, metadata has two presents.
+    clock = 31000;
+    act(() => vi.advanceTimersByTime(30000));
+    expect(panel()).toHaveAttribute('data-presentation-state', 'complete');
+    expect(panel()).toHaveAttribute('data-presentation-elapsed-ms', '30000');
+    expect(panel()).toHaveAttribute('data-presentation-video-callbacks', '2');
+    expect(panel()).toHaveAttribute('data-presentation-presented-frame-delta', '2');
+    expect(panel().getAttribute('data-presentation-media-time-delta-seconds')).not.toBeNull();
+    expect(Number(panel().getAttribute('data-presentation-media-time-delta-seconds'))).toBeCloseTo(.033, 8);
+    expect(panel()).toHaveAttribute('data-presentation-rtp-time-delta-ms', '33');
+    expect(panel()).toHaveAttribute('data-presentation-raf-interval-p50-ms', '16');
+    expect(panel()).toHaveAttribute('data-presentation-raf-interval-p95-ms', '40');
+    expect(panel()).toHaveAttribute('data-presentation-raf-interval-max-ms', '40');
+    expect(panel()).toHaveAttribute('data-presentation-video-callback-span-ms', '33');
+    expect(panel()).toHaveAttribute('data-presentation-video-gap-p95-ms', '33');
+    expect(panel()).toHaveAttribute('data-presentation-video-late-p95-ms', '3');
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+    expect(screen.getByText(/回调次数可能少于提交呈现的帧数/)).toBeInTheDocument();
+    expect(screen.getByText(/呈现节奏不代表端到端延迟/)).toBeInTheDocument();
+    const requests = requestVideo.mock.calls.length;
+    act(() => vi.advanceTimersByTime(60000));
+    expect(requestVideo).toHaveBeenCalledTimes(requests);
+  });
+  it('cancels on collapse, readiness loss or unmount and never reads late callback metadata', () => {
+    const { videoRef } = cadenceVideo();
+    const view = render(<BrowserVideoStatistics videoRef={videoRef} ready />);
+    toggle(true); fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    const late = videoCallbacks.values().next().value as VideoFrameRequestCallback;
+    toggle(false);
+    expect(cancelVideo).toHaveBeenCalled(); expect(animationCallbacks.size).toBe(0);
+    const read = vi.fn(() => { throw new Error('must not inspect late metadata'); });
+    const metadata = Object.defineProperty({}, 'presentedFrames', { get: read }) as VideoFrameCallbackMetadata;
+    act(() => late(1100, metadata));
+    expect(read).not.toHaveBeenCalled();
+    toggle(true); expect(panel()).not.toHaveAttribute('data-presentation-video-callbacks');
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    view.rerender(<BrowserVideoStatistics videoRef={videoRef} ready={false} />);
+    expect(panel()).toHaveAttribute('data-presentation-state', 'cancelled');
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+    view.rerender(<BrowserVideoStatistics videoRef={videoRef} ready />);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    view.unmount();
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+  });
+  it('marks unsupported native callbacks unavailable and does not create a fallback loop', () => {
+    const { videoRef } = videoFixture();
+    render(<BrowserVideoStatistics videoRef={videoRef} ready />); toggle(true);
+    expect(screen.getByRole('button', { name: '采样呈现节奏（30秒）' })).toBeDisabled();
+    expect(panel()).toHaveAttribute('data-presentation-state', 'unavailable');
+    expect(window.requestAnimationFrame).not.toHaveBeenCalled();
+  });
+  it('keeps invalid or rolled-back numeric metadata unknown without leaking extra fields', () => {
+    const { videoRef } = cadenceVideo();
+    render(<BrowserVideoStatistics videoRef={videoRef} ready />); toggle(true);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    frame(1020, 100, 2, 1010, 20000);
+    frame(1040, 98, 1, Number.NaN, 19000);
+    frame(1060, 110, 3, Number.POSITIVE_INFINITY, 21000);
+    clock = 31000; act(() => vi.advanceTimersByTime(30000));
+    expect(panel()).toHaveAttribute('data-presentation-state', 'complete');
+    expect(panel()).not.toHaveAttribute('data-presentation-presented-frame-delta');
+    expect(panel()).not.toHaveAttribute('data-presentation-media-time-delta-seconds');
+    expect(panel()).not.toHaveAttribute('data-presentation-rtp-time-delta-ms');
+    expect(panel().outerHTML).not.toMatch(/NaN|Infinity|data-[\w-]+="-\d/);
+  });
+  it('cancels when the page becomes hidden and does not retain background callbacks', () => {
+    const { videoRef } = cadenceVideo();
+    render(<BrowserVideoStatistics videoRef={videoRef} ready />); toggle(true);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+    act(() => document.dispatchEvent(new Event('visibilitychange')));
+    expect(panel()).toHaveAttribute('data-presentation-state', 'cancelled');
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+    visibility.mockRestore();
+  });
+  it('bounds each callback category to 8192 and never reads unrelated metadata properties', () => {
+    const { videoRef } = cadenceVideo();
+    render(<BrowserVideoStatistics videoRef={videoRef} ready />); toggle(true);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    const read = vi.fn(() => { throw new Error('unrelated metadata must not be inspected'); });
+    const metadata = Object.defineProperties({ presentedFrames: 1, mediaTime: 1, expectedDisplayTime: 1010, rtpTimestamp: 0 }, {
+      captureTime: { get: read }, processingDuration: { get: read }, width: { get: read }, height: { get: read },
+    }) as VideoFrameCallbackMetadata;
+    clock = 1010;
+    act(() => { const pending = videoCallbacks.entries().next().value as [number, VideoFrameRequestCallback]; videoCallbacks.delete(pending[0]); pending[1](1010, metadata); });
+    expect(read).not.toHaveBeenCalled();
+    act(() => {
+      for (let n = 0; n < 8192; n++) {
+        clock = 1020 + n;
+        const pending = animationCallbacks.entries().next().value as [number, FrameRequestCallback];
+        animationCallbacks.delete(pending[0]); pending[1](clock);
+      }
+    });
+    expect(panel()).toHaveAttribute('data-presentation-state', 'complete');
+    expect(panel()).toHaveAttribute('data-presentation-animation-callbacks', '8192');
+    expect(panel()).toHaveAttribute('data-presentation-sample-limit-reached', '1');
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+  });
+  it('cancels when the video element changes and bounds delayed-timer callbacks at the deadline', () => {
+    const { videoRef } = cadenceVideo();
+    const view = render(<BrowserVideoStatistics videoRef={videoRef} ready />); toggle(true);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    const oldCallbacks = [...videoCallbacks.values()];
+    const replacement = cadenceVideo();
+    view.rerender(<BrowserVideoStatistics videoRef={replacement.videoRef} ready />);
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+    fireEvent.click(screen.getByRole('button', { name: '采样呈现节奏（30秒）' }));
+    clock = 32000;
+    const read = vi.fn(() => { throw new Error('expired sample cannot inspect metadata'); });
+    const expired = Object.defineProperty({}, 'presentedFrames', { get: read }) as VideoFrameCallbackMetadata;
+    act(() => { const pending = videoCallbacks.values().next().value as VideoFrameRequestCallback; pending(32000, expired); oldCallbacks[0]!(32000, expired); });
+    expect(read).not.toHaveBeenCalled();
+    expect(panel()).toHaveAttribute('data-presentation-state', 'complete');
+    expect(panel()).toHaveAttribute('data-presentation-video-callbacks', '0');
+    expect(videoCallbacks.size).toBe(0); expect(animationCallbacks.size).toBe(0);
+  });
+});

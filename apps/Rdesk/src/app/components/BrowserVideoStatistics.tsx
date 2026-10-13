@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
+import { usePresentationCadenceDiagnostics } from '../hooks/usePresentationCadenceDiagnostics';
 import { boundedInboundVideoStatistics, inboundVideoStatisticKeys, type BrowserInboundVideoStatistics } from '../services/browserRemoteSessionService';
 
 type BrowserVideoStatisticsProps = {
@@ -60,6 +61,8 @@ export function BrowserVideoStatistics({ videoRef, ready, sampleInboundVideoStat
   const [sample, setSample] = useState<Sample | null>(null);
   const [inbound, setInbound] = useState<{ sample: InboundSample; rates: InboundRates | null } | null>(null);
   const inboundPending = useRef(false);
+  const cadence = usePresentationCadenceDiagnostics(videoRef, expanded && ready);
+  const cadenceResult = expanded && ready ? cadence.summary : null;
 
   useEffect(() => {
     setSample(null);
@@ -165,6 +168,20 @@ export function BrowserVideoStatistics({ videoRef, ready, sampleInboundVideoStat
 
   return <details open={expanded} onToggle={event => setExpanded(event.currentTarget.open)}
     className="rounded-lg border border-white/10 px-3 py-2 text-xs text-slate-400"
+    data-presentation-state={cadence.state}
+    data-presentation-elapsed-ms={cadenceResult?.elapsedMs ?? undefined}
+    data-presentation-video-callbacks={cadenceResult?.videoCallbacks ?? undefined}
+    data-presentation-animation-callbacks={cadenceResult?.animationCallbacks ?? undefined}
+    data-presentation-presented-frame-delta={cadenceResult?.presentedFrameDelta ?? undefined}
+    data-presentation-media-time-delta-seconds={cadenceResult?.mediaTimeDeltaSeconds ?? undefined}
+    data-presentation-rtp-time-delta-ms={cadenceResult?.rtpTimeDeltaMs ?? undefined}
+    data-presentation-raf-interval-p50-ms={cadenceResult?.rafIntervalP50Ms ?? undefined}
+    data-presentation-raf-interval-p95-ms={cadenceResult?.rafIntervalP95Ms ?? undefined}
+    data-presentation-raf-interval-max-ms={cadenceResult?.rafIntervalMaxMs ?? undefined}
+    data-presentation-video-callback-span-ms={cadenceResult?.videoCallbackSpanMs ?? undefined}
+    data-presentation-video-gap-p95-ms={cadenceResult?.videoGapP95Ms ?? undefined}
+    data-presentation-video-late-p95-ms={cadenceResult?.videoLateP95Ms ?? undefined}
+    data-presentation-sample-limit-reached={cadenceResult?.sampleLimitReached ?? undefined}
     data-browser-video-statistics="true" data-state={expanded ? ready ? 'sampling' : 'waiting' : 'collapsed'}
     data-rtp-sampled-at-ms={visibleInbound?.sample.sampledAtMs ?? undefined}
     data-rtp-frames-received={visibleInbound?.sample.counters.framesReceived ?? undefined}
@@ -191,6 +208,29 @@ export function BrowserVideoStatistics({ videoRef, ready, sampleInboundVideoStat
     data-corrupted-frame-delta={sample?.delta?.corrupted} data-frame-count-per-second={sample?.delta?.perSecond}>
     <summary className="cursor-pointer rounded focus-visible:outline-2 focus-visible:outline-cyan-400">播放统计</summary>
     {expanded && <div className="mt-3 space-y-3">
+      <div className="space-y-2">
+        <button type="button" onClick={cadence.start} disabled={!cadence.canStart}
+          className="rounded border border-white/20 px-3 py-1 text-slate-200 disabled:opacity-50">采样呈现节奏（30秒）</button>
+        <p>{cadence.state === 'running' ? '正在采样；30 秒后自动停止，收起统计或断开连接会取消。' : cadence.state === 'cancelled' ? '采样已取消，可重新开始。' : cadence.state === 'unavailable' ? '当前状态或浏览器不支持呈现节奏采样。' : '点击后进行一次有限采样。'}</p>
+        {cadenceResult && <dl className="grid grid-cols-2 gap-x-5 gap-y-2 sm:grid-cols-3 lg:grid-cols-4">
+          {[
+            ['呈现采样时长（毫秒）', display(cadenceResult.elapsedMs, 2)],
+            ['视频回调次数', display(cadenceResult.videoCallbacks)],
+            ['动画回调次数', display(cadenceResult.animationCallbacks)],
+            ['提交呈现帧数增量', display(cadenceResult.presentedFrameDelta)],
+            ['视频媒体时间跨度（秒）', display(cadenceResult.mediaTimeDeltaSeconds, 6)],
+            ['呈现帧 RTP 时间跨度（毫秒）', display(cadenceResult.rtpTimeDeltaMs, 2)],
+            ['动画回调间隔 p50（毫秒）', display(cadenceResult.rafIntervalP50Ms, 2)],
+            ['动画回调间隔 p95（毫秒）', display(cadenceResult.rafIntervalP95Ms, 2)],
+            ['动画回调最大间隔（毫秒）', display(cadenceResult.rafIntervalMaxMs, 2)],
+            ['首末视频回调跨度（毫秒）', display(cadenceResult.videoCallbackSpanMs, 2)],
+            ['视频回调间隔 p95（毫秒）', display(cadenceResult.videoGapP95Ms, 2)],
+            ['视频回调晚于预期显示 p95（毫秒）', display(cadenceResult.videoLateP95Ms, 2)],
+            ['达到采样数量上限', cadenceResult.sampleLimitReached ? '是' : '否'],
+          ].map(([label, value]) => <div key={label}><dt>{label}</dt><dd className="mt-1 font-mono text-slate-200"><output aria-label={label}>{value}</output></dd></div>)}
+        </dl>}
+        <p>回调次数可能少于提交呈现的帧数；帧数和媒体时间跨度从首末有效回调计算。呈现节奏不代表端到端延迟，也不测量独立源画面数量。浏览器繁忙时停止计时器可能晚于 30 秒；每类至多采集 8192 次回调。</p>
+      </div>
       {!sample && <p>画面就绪后每秒采样。</p>}
       {sample?.qualityStatus === 'unsupported' && <p>当前浏览器不支持播放帧计数，计数和帧率不可用。</p>}
       {(sample?.qualityStatus === 'invalid' || sample?.qualityStatus === 'unavailable') && <p>播放帧计数不可用。</p>}
