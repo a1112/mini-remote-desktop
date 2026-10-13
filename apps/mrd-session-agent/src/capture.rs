@@ -1,5 +1,7 @@
 //! Capture-side adapter boundary for Task 25.
 
+#[cfg(windows)]
+use crate::capture_diagnostics::CaptureFailureCause;
 use crate::media::MediaResource;
 use mrd_proto::SessionId;
 
@@ -218,7 +220,13 @@ impl CaptureAdapter for WindowsDxgiCaptureAdapter {
 const CAPTURE_MAX_ACCESS_UNIT_BYTES: usize = 128 * 1024;
 
 #[cfg(windows)]
-fn report_capture_failure(reason: &'static str) {
+fn report_capture_failure(
+    session_id: &SessionId,
+    cause: CaptureFailureCause,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    crate::capture_diagnostics::report_worker_failure(session_id, cause, stop);
+    let reason = cause.as_str();
     tracing::warn!(reason);
     // The launcher binary has no global tracing subscriber. Keep the same
     // static category observable on its diagnostic stderr without native text.
@@ -338,13 +346,21 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                 use mrd_pipeline_core::FrameCapture;
 
                 let Ok(mut capture) = DxgiDesktopCapture::new_for_index(display_id) else {
-                    report_capture_failure("capture_initialization_failed");
+                    report_capture_failure(
+                        &worker_session_id,
+                        CaptureFailureCause::InitializationFailed,
+                        &thread_stop,
+                    );
                     return;
                 };
                 let Ok((backend, mut encoder)) =
                     initialize_capture_encoder(profile, encoder_preference)
                 else {
-                    report_capture_failure("capture_encoder_initialization_failed");
+                    report_capture_failure(
+                        &worker_session_id,
+                        CaptureFailureCause::EncoderInitializationFailed,
+                        &thread_stop,
+                    );
                     return;
                 };
                 tracing::info!(
@@ -365,19 +381,32 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                 while !thread_stop.load(Ordering::Acquire) {
                     let next_frame = std::time::Instant::now() + interval;
                     let Ok(frame) = capture.capture_frame() else {
-                        report_capture_failure("capture_frame_failed");
+                        report_capture_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::FrameFailed,
+                            &thread_stop,
+                        );
                         break;
                     };
                     if thread_stop.load(Ordering::Acquire) {
                         break;
                     }
                     let Ok(bounds) = capture.source_bounds() else {
-                        report_capture_failure("capture_source_bounds_failed");
+                        report_capture_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::SourceBoundsFailed,
+                            &thread_stop,
+                        );
                         break;
                     };
                     let (Ok(width), Ok(height)) =
                         (u32::try_from(bounds.width), u32::try_from(bounds.height))
                     else {
+                        report_capture_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::SourceDimensionsInvalid,
+                            &thread_stop,
+                        );
                         break;
                     };
                     let bounds = mrd_agent_ipc::CaptureSourceBounds {
@@ -387,7 +416,11 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                         height,
                     };
                     let Some(frame) = prepare_profile_frame(frame, profile) else {
-                        report_capture_failure("capture_profile_frame_invalid");
+                        report_capture_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::ProfileFrameInvalid,
+                            &thread_stop,
+                        );
                         break;
                     };
                     let Ok(units) = encoder.encode(&frame) else {
@@ -398,11 +431,20 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                             encoder_backend = backend.as_str()
                         );
                         eprintln!("mrd-session-agent: capture_encode_failed backend={}", backend.as_str());
+                        crate::capture_diagnostics::report_worker_failure(
+                            &worker_session_id,
+                            CaptureFailureCause::EncodeFailed,
+                            &thread_stop,
+                        );
                         break;
                     };
                     for unit in units {
                         if unit.codec != mrd_pipeline_core::VideoCodec::H264 {
-                            report_capture_failure("capture_encoded_codec_invalid");
+                            report_capture_failure(
+                                &worker_session_id,
+                                CaptureFailureCause::EncodedCodecInvalid,
+                                &thread_stop,
+                            );
                             return;
                         }
                         if unit.bytes.len() > CAPTURE_MAX_ACCESS_UNIT_BYTES {
@@ -415,9 +457,19 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                                 "mrd-session-agent: capture_encoded_unit_oversized payload_bytes={} max_payload_bytes={}",
                                 unit.bytes.len(), CAPTURE_MAX_ACCESS_UNIT_BYTES
                             );
+                            crate::capture_diagnostics::report_worker_failure(
+                                &worker_session_id,
+                                CaptureFailureCause::EncodedUnitOversized,
+                                &thread_stop,
+                            );
                             return;
                         }
                         let Some(next) = sequence.checked_add(1) else {
+                            report_capture_failure(
+                                &worker_session_id,
+                                CaptureFailureCause::SequenceExhausted,
+                                &thread_stop,
+                            );
                             return;
                         };
                         sequence = next;
@@ -430,14 +482,22 @@ impl CaptureAdapter for WindowsDxgiOpenH264CaptureAdapter {
                             unit.bytes,
                         )
                         .and_then(|unit| unit.with_source_bounds(bounds)) else {
-                            report_capture_failure("capture_encoded_unit_invalid");
+                            report_capture_failure(
+                                &worker_session_id,
+                                CaptureFailureCause::EncodedUnitInvalid,
+                                &thread_stop,
+                            );
                             return;
                         };
                         let accepted = queues.lock().ok().and_then(|mut all| {
                             all.get_mut(&resource_id).map(|queue| queue.push(unit))
                         });
                         if accepted != Some(true) {
-                            report_capture_failure("capture_encoded_unit_rejected");
+                            report_capture_failure(
+                                &worker_session_id,
+                                CaptureFailureCause::EncodedUnitRejected,
+                                &thread_stop,
+                            );
                             return;
                         }
                     }

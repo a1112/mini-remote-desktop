@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod capabilities;
 /// Grant-bound desktop capture adapter boundary.
 pub mod capture;
+mod capture_diagnostics;
 /// Agent-local consent authority and trusted session bindings.
 pub mod consent;
 /// Fail-closed cached trusted desktop observations.

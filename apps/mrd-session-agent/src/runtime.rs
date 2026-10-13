@@ -2254,20 +2254,47 @@ impl AgentRuntime {
             None => return Ok(()),
         };
         for unit in units {
-            let binding = self.resolve_session_binding(unit.session_id(), self.clock.now_ms())?;
+            let session_id = unit.session_id().clone();
+            let binding = self
+                .resolve_session_binding(&session_id, self.clock.now_ms())
+                .map_err(|error| {
+                    crate::capture_diagnostics::report_failure(
+                        &session_id,
+                        crate::capture_diagnostics::CaptureFailureCause::BindingRejected,
+                    );
+                    error
+                })?;
             if !binding.as_ref().is_some_and(|binding| {
                 binding_matches_runtime(binding, identity, desktop)
                     && binding
                         .approved_scopes
                         .contains(&mrd_session::PermissionScope::ScreenView)
             }) {
+                crate::capture_diagnostics::report_failure(
+                    &session_id,
+                    crate::capture_diagnostics::CaptureFailureCause::BindingRejected,
+                );
                 return Err(AgentRuntimeError::MediaCaptureFailed);
             }
             let context = self.next_event_context(identity, desktop)?;
             let unit = unit
                 .into_ipc(context, mrd_agent_ipc::MediaCodec::H264)
-                .ok_or(AgentRuntimeError::MediaCaptureFailed)?;
-            writer.enqueue(AgentToService::MediaAccessUnit(unit))?;
+                .ok_or_else(|| {
+                    crate::capture_diagnostics::report_failure(
+                        &session_id,
+                        crate::capture_diagnostics::CaptureFailureCause::IpcUnitInvalid,
+                    );
+                    AgentRuntimeError::MediaCaptureFailed
+                })?;
+            writer
+                .enqueue(AgentToService::MediaAccessUnit(unit))
+                .map_err(|error| {
+                    crate::capture_diagnostics::report_failure(
+                        &session_id,
+                        crate::capture_diagnostics::CaptureFailureCause::OutboundUnavailable,
+                    );
+                    error
+                })?;
         }
         Ok(())
     }

@@ -95,6 +95,52 @@ impl mrd_input::InputInjector for Injector {
         Ok(())
     }
 }
+
+struct DiagnosticCapture {
+    unit: Option<crate::media::EncodedMediaAccessUnit>,
+}
+
+struct NoDiagnosticRender;
+impl crate::render::RenderAdapter for NoDiagnosticRender {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    fn start(&mut self, _: &crate::media::MediaResource, _: &SessionId) -> bool {
+        panic!("capture diagnostic must not start rendering")
+    }
+
+    fn push_access_unit(
+        &mut self,
+        _: &crate::media::MediaResource,
+        _: &mrd_agent_ipc::RenderAccessUnit,
+    ) -> bool {
+        panic!("capture diagnostic must not render media")
+    }
+
+    fn stop(&mut self, _: &[u8; 16], _: &SessionId) -> bool {
+        panic!("capture diagnostic must not stop rendering")
+    }
+}
+
+impl crate::capture::CaptureAdapter for DiagnosticCapture {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn start(&mut self, resource: &crate::media::MediaResource, session: &SessionId) -> bool {
+        resource.session_id() == session
+    }
+
+    fn poll_encoded(&mut self, _: &[u8; 16]) -> Option<crate::media::EncodedMediaAccessUnit> {
+        self.unit.take()
+    }
+
+    fn stop(&mut self, _: &[u8; 16], _: &SessionId) -> bool {
+        self.unit = None;
+        true
+    }
+}
 struct Fixture {
     runtime: AgentRuntime,
     identity: RegisteredAgentIdentity,
@@ -319,6 +365,131 @@ impl Fixture {
         );
         assert_eq!(self.events.lock().unwrap().len(), 1);
     }
+}
+
+async fn capture_diagnostic_fixture(seed: u8, payload: Vec<u8>) -> Fixture {
+    let mut f = Fixture::new();
+    f.authority.claims.session_id =
+        SessionId(format!("c4b10cca-eac1-4bbf-980a-9338bb5784{seed:02x}"));
+    f.authority.signature = f.signing.sign(&f.authority.signing_bytes()).to_bytes();
+    let unit = crate::media::EncodedMediaAccessUnit::new(
+        [11; 16],
+        f.authority.claims.session_id.clone(),
+        1,
+        1,
+        true,
+        payload,
+    )
+    .unwrap()
+    .with_source_bounds(mrd_agent_ipc::CaptureSourceBounds {
+        left: 0,
+        top: 0,
+        width: 1920,
+        height: 1080,
+    })
+    .unwrap();
+    f.runtime.authority.as_mut().unwrap().executor = Box::new(crate::media::MediaExecutor::new(
+        DiagnosticCapture { unit: Some(unit) },
+        NoDiagnosticRender,
+    ));
+    assert_eq!(f.install().await, PairedSessionAuthorityOutcome::Installed);
+    let start = f.execute(
+        11,
+        AgentCommand::StartCapture {
+            resource_id: [11; 16],
+            display_id: 0,
+            profile: None,
+        },
+    );
+    assert_eq!(f.run_execute(start).await, CommandOutcome::Completed);
+    f
+}
+
+fn capture_diagnostic_assert_record(f: &Fixture, cause: &str) {
+    let records = crate::capture_diagnostics::take_test_records(&f.authority.claims.session_id);
+    assert_eq!(
+        records.len(),
+        1,
+        "first fatal pump cause must be observable"
+    );
+    assert_eq!(records[0], format!(
+        "{{\"event\":\"agent_capture_failed\",\"agent_pid\":{},\"session_id\":\"{}\",\"cause\":\"{cause}\"}}",
+        std::process::id(), f.authority.claims.session_id.0
+    ));
+}
+
+#[tokio::test]
+async fn capture_diagnostic_runtime_binding_rejection_keeps_original_media_error() {
+    let mut f = capture_diagnostic_fixture(1, vec![1]).await;
+    f.clock.0.store(2000, Ordering::SeqCst);
+    assert!(matches!(
+        f.runtime.pump_capture_access_units(&f.writer, &f.identity),
+        Err(AgentRuntimeError::MediaCaptureFailed)
+    ));
+    capture_diagnostic_assert_record(&f, "capture_binding_rejected");
+}
+
+#[tokio::test]
+async fn capture_diagnostic_runtime_invalid_ipc_unit_keeps_original_media_error() {
+    let mut f = capture_diagnostic_fixture(2, vec![]).await;
+    assert!(matches!(
+        f.runtime.pump_capture_access_units(&f.writer, &f.identity),
+        Err(AgentRuntimeError::MediaCaptureFailed)
+    ));
+    capture_diagnostic_assert_record(&f, "capture_ipc_unit_invalid");
+}
+
+#[tokio::test]
+async fn capture_diagnostic_runtime_outbound_failure_keeps_original_outbound_error() {
+    let mut f = capture_diagnostic_fixture(3, vec![1]).await;
+    f.writer.abort_and_join().await;
+    assert!(matches!(
+        f.runtime.pump_capture_access_units(&f.writer, &f.identity),
+        Err(AgentRuntimeError::OutboundUnavailable)
+    ));
+    capture_diagnostic_assert_record(&f, "capture_outbound_unavailable");
+}
+
+#[tokio::test]
+async fn capture_diagnostic_runtime_valid_unit_preserves_binding_and_geometry_without_event() {
+    let mut f = capture_diagnostic_fixture(4, vec![1]).await;
+    f.runtime
+        .pump_capture_access_units(&f.writer, &f.identity)
+        .unwrap();
+    let AgentToService::MediaAccessUnit(unit) = f.reply().await else {
+        panic!("valid capture unit must reach the original authenticated writer");
+    };
+    assert_eq!(unit.session_id, f.authority.claims.session_id.0);
+    assert_eq!(unit.resource_id, [11; 16]);
+    assert_eq!(unit.context.registration_id, f.identity.registration_id);
+    assert_eq!(
+        unit.context.registration_epoch,
+        f.identity.registration_epoch
+    );
+    assert_eq!(unit.context.desktop_epoch, 6);
+    assert_eq!(unit.source_bounds.unwrap().width, 1920);
+    assert_eq!(unit.payload, vec![1]);
+    assert!(
+        crate::capture_diagnostics::take_test_records(&f.authority.claims.session_id).is_empty()
+    );
+}
+
+#[tokio::test]
+async fn capture_diagnostic_runtime_stopped_resource_is_not_pumped_or_reported() {
+    let mut f = capture_diagnostic_fixture(5, vec![]).await;
+    let stop = f.execute(
+        12,
+        AgentCommand::StopCapture {
+            resource_id: [11; 16],
+        },
+    );
+    assert_eq!(f.run_execute(stop).await, CommandOutcome::Completed);
+    f.runtime
+        .pump_capture_access_units(&f.writer, &f.identity)
+        .unwrap();
+    assert!(
+        crate::capture_diagnostics::take_test_records(&f.authority.claims.session_id).is_empty()
+    );
 }
 
 #[tokio::test]
