@@ -19,6 +19,7 @@ use webrtc::{
 mod cleanup;
 mod config;
 mod control;
+mod h264_sample_clock;
 mod peer;
 mod probe;
 mod stats;
@@ -48,6 +49,7 @@ pub enum TransportError {
 }
 
 pub struct H264RtpSender {
+    sample_clock: Option<h264_sample_clock::H264SampleClock>,
     track: Arc<TrackLocalStaticRTP>,
     packetizer: Box<dyn Packetizer + Send + Sync>,
     frame_samples: u32,
@@ -995,6 +997,7 @@ impl H264RtpSender {
             90_000,
         ));
         Self {
+            sample_clock: None,
             track: Arc::new(TrackLocalStaticRTP::new(
                 h264_codec_capability_for_profile_level_id(&profile_level_id),
                 track_id.into(),
@@ -1019,12 +1022,27 @@ impl H264RtpSender {
             ));
         }
 
-        self.packetizer
+        let mut packets = self
+            .packetizer
             .packetize(
                 &bytes::Bytes::copy_from_slice(access_unit.bytes.as_slice()),
                 self.frame_samples,
             )
-            .map_err(|error| TransportError::Message(format!("packetize failed: {error}")))
+            .map_err(|error| TransportError::Message(format!("packetize failed: {error}")))?;
+        if let Some(first) = packets.first() {
+            let clock = h264_sample_clock::H264SampleClock::next(
+                self.sample_clock,
+                access_unit.timestamp_us,
+                first.header.timestamp,
+                self.frame_samples,
+            )
+            .ok_or_else(|| TransportError::Message("H264 sampling clock overflow".into()))?;
+            for packet in &mut packets {
+                packet.header.timestamp = clock.timestamp();
+            }
+            self.sample_clock = Some(clock);
+        }
+        Ok(packets)
     }
 
     pub async fn send_access_unit(
@@ -2107,6 +2125,31 @@ mod tests {
     }
 
     #[test]
+    fn h264_sample_clock_preserves_a_100ms_capture_gap() {
+        let mut sender = super::H264RtpSender::new("video", "stream", 30, 1200);
+        let first = mrd_pipeline_core::EncodedAccessUnit {
+            codec: VideoCodec::H264,
+            timestamp_us: 0,
+            is_keyframe: true,
+            bytes: vec![0, 0, 0, 1, 0x65, 1, 2, 3],
+        };
+        let second = mrd_pipeline_core::EncodedAccessUnit {
+            timestamp_us: 100_000,
+            ..first.clone()
+        };
+        let first_packets = sender.packetize_access_unit(&first).expect("first AU");
+        let second_packets = sender.packetize_access_unit(&second).expect("second AU");
+        assert_eq!(
+            second_packets[0]
+                .header
+                .timestamp
+                .wrapping_sub(first_packets[0].header.timestamp),
+            9000,
+            "RTP must retain capture time omitted between emitted access units"
+        );
+    }
+
+    #[test]
     fn h264_packetizer_exposes_stable_rtp_timestamp_per_access_unit() {
         let mut sender = super::H264RtpSender::new("video", "stream", 120, 1200);
         let first = mrd_pipeline_core::EncodedAccessUnit {
@@ -2132,7 +2175,10 @@ mod tests {
         assert!(first_packets
             .iter()
             .all(|packet| packet.header.timestamp == first_timestamp));
-        assert_eq!(second_packets[0].header.timestamp, first_timestamp + 750);
+        assert_eq!(
+            second_packets[0].header.timestamp,
+            first_timestamp.wrapping_add(750)
+        );
     }
 
     #[test]
