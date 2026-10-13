@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 import re
 import base64
 import json
+import logging
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,12 +30,16 @@ from app.schemas.session import (
 )
 from app.services.device_sessions import DeviceSessionError, device_session_out
 from app.services.guest_browser_sessions import GuestBrowserSessionService
-from app.services.temporary_access import TemporaryAccessService
+from app.services.temporary_access import (
+    TemporaryAccessService,
+    invalid as _temporary_invalid,
+)
 from app.services.browser_authority import utc
 from app.services.device_self_enrollment import (
     enrollment_peer_ip,
     _unique_json_object,
     _reject_json_constant,
+    _invalid as _enrollment_invalid,
 )
 from app.services.device_enrollment import DeviceEnrollmentError
 from app.services.relay_directory import RelayAccessService, RelayAccessError
@@ -52,6 +57,73 @@ from app.api.v1.relays import (
 )
 
 HTTP_AUDIENCE = "rdesk-guest-browser-http"
+_GUEST_CREATE_LOGGER = logging.getLogger("rdesk.guest_browser_create")
+_GUEST_INVALID_SOURCE_ALIASES = {
+    GuestBrowserSessionService.create.__code__.co_filename: "guest_browser_service",
+    TemporaryAccessService.publish.__code__.co_filename: "temporary_access_service",
+    enrollment_peer_ip.__code__.co_filename: "device_self_enrollment_service",
+    __file__: "guest_browser_api",
+}
+
+
+def _guest_invalid_source(error):
+    current, previous = error.__traceback__, None
+    for _ in range(32):
+        if current is None:
+            return "unknown", 0
+        if current.tb_next is None:
+            origin = (
+                previous
+                if (
+                    current.tb_frame.f_code is _temporary_invalid.__code__
+                    or current.tb_frame.f_code is _enrollment_invalid.__code__
+                )
+                else current
+            )
+            if origin is None:
+                return "unknown", 0
+            source = _GUEST_INVALID_SOURCE_ALIASES.get(origin.tb_frame.f_code.co_filename)
+            line = origin.tb_lineno
+            if source is not None and type(line) is int and 1 <= line <= 100_000:
+                return source, line
+            return "unknown", 0
+        previous, current = current, current.tb_next
+    return "unknown", 0
+
+
+def _log_guest_create_invalid(payload, error):
+    # Logging must never change admission, rollback, or the masked HTTP denial.
+    try:
+        source, line = _guest_invalid_source(error)
+        session_id = payload.session_id
+        target_device_id = payload.target_device_id
+        if type(session_id) is not str or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,35}", session_id
+        ):
+            session_id = "unknown"
+        if type(target_device_id) is not str or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", target_device_id
+        ):
+            target_device_id = "unknown"
+        _GUEST_CREATE_LOGGER.warning(
+            "%s",
+            json.dumps(
+                {
+                    "event": "guest_browser_create_invalid",
+                    "session_id": session_id,
+                    "target_device_id": target_device_id,
+                    "source": source,
+                    "line": line,
+                },
+                separators=(",", ":"),
+            ),
+            exc_info=False,
+            stack_info=False,
+        )
+    except Exception:
+        pass
+
+
 router = APIRouter(
     prefix="/guest-browser-sessions",
     tags=["guest-browser-sessions"],
@@ -316,9 +388,13 @@ async def create_guest_browser(
         return result
     except DeviceSessionError as error:
         await db.rollback()
+        if error.code == "guest_access_invalid" and error.status_code == 401:
+            _log_guest_create_invalid(payload, error)
         _raise(error)
     except DeviceEnrollmentError as error:
         await db.rollback()
+        if error.status_code == 401:
+            _log_guest_create_invalid(payload, error)
         raise HTTPException(
             error.status_code,
             detail={
