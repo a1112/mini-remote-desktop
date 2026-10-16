@@ -293,4 +293,44 @@ mod tests {
         let (min_width, min_height) = physical_size(min.0, min.1, target.scale);
         assert!(min_width <= width && min_height <= height);
     }
+    #[test]
+    fn air_small_and_large_work_areas_keep_outer_frame_and_minimum_inside() {
+        for (work_w, work_h) in [
+            (1280.0, 720.0),
+            (1470.0, 833.0),
+            (1920.0, 1040.0),
+            (2560.0, 1380.0),
+        ] {
+            for scale in [1.0, 2.0] {
+                let screen = Screen {
+                    area: Bounds {
+                        x: -work_w * scale,
+                        y: 32.0 * scale,
+                        width: work_w * scale,
+                        height: work_h * scale,
+                    },
+                    scale,
+                };
+                let oversized = Geometry {
+                    x: screen.area.x,
+                    y: screen.area.y,
+                    width: 4000.0,
+                    height: 3000.0,
+                };
+                for saved in [None, Some(oversized)] {
+                    let (g, min) =
+                        fit(saved, (1120.0, 740.0), (900.0, 580.0), screen, (16.0, 32.0));
+                    let outer = physical_size(g.width + 16.0, g.height + 32.0, scale);
+                    assert!(g.x >= screen.area.x && g.y >= screen.area.y);
+                    assert!(g.x + outer.0 as f64 <= screen.area.x + screen.area.width + 1.0);
+                    assert!(g.y + outer.1 as f64 <= screen.area.y + screen.area.height + 1.0);
+                    assert!(min.0 <= g.width && min.1 <= g.height);
+                    if saved.is_none() {
+                        assert!(outer.0 as f64 <= screen.area.width * 0.8 + 1.0);
+                        assert!(outer.1 as f64 <= screen.area.height * 0.8 + 1.0);
+                    }
+                }
+            }
+        }
+    }
 }
