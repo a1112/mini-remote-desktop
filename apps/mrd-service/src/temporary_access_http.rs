@@ -90,9 +90,9 @@ pub(crate) async fn publish(
 mod tests {
     use super::*;
     use axum::{
-        Json, Router,
         http::{HeaderMap, StatusCode},
         routing::{get, post},
+        Json, Router,
     };
 
     // Mirrors get_current_device -> _device_from_request: physical credentials
