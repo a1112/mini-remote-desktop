@@ -40,7 +40,16 @@ fn save(window: &WebviewWindow, path: &PathBuf) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(path, format!("{} {} {} {}\n", g.x, g.y, g.width, g.height));
+        // Replace only after a complete write so interruption cannot truncate a preference.
+        let temporary = path.with_extension("tmp");
+        if fs::write(
+            &temporary,
+            format!("{} {} {} {}\n", g.x, g.y, g.width, g.height),
+        )
+        .is_ok()
+        {
+            let _ = fs::rename(&temporary, path);
+        }
     }
 }
 fn apply(
@@ -96,13 +105,17 @@ fn apply(
         _ => (0.0, 32.0),
     };
     let (geometry, min) = window_geometry::fit(saved, default, minimum, screen, frame);
-    // Move to the target monitor first so logical sizes use that monitor's DPI.
+    // Moving is asynchronous on some backends. Explicit physical sizes must use
+    // the selected display's scale rather than the window's previous display DPI.
     let _ = window.set_position(tauri::PhysicalPosition::new(
         geometry.x.round() as i32,
         geometry.y.round() as i32,
     ));
-    let _ = window.set_min_size(Some(tauri::LogicalSize::new(min.0, min.1)));
-    let _ = window.set_size(tauri::LogicalSize::new(geometry.width, geometry.height));
+    let (min_w, min_h) = window_geometry::physical_size(min.0, min.1, screen.scale);
+    let (width, height) =
+        window_geometry::physical_size(geometry.width, geometry.height, screen.scale);
+    let _ = window.set_min_size(Some(tauri::PhysicalSize::new(min_w, min_h)));
+    let _ = window.set_size(tauri::PhysicalSize::new(width, height));
 }
 
 pub fn install(app: &tauri::AppHandle, label: &str, default: (f64, f64), minimum: (f64, f64)) {
@@ -116,7 +129,8 @@ pub fn install(app: &tauri::AppHandle, label: &str, default: (f64, f64), minimum
     };
     let path = base.join(format!("window-geometry-{label}-v1.txt"));
     apply(&window, read(&path), default, minimum);
-    save(&window, &path);
+    // The platform may not have delivered the restored size yet. Save from normal
+    // window events only, so startup cannot overwrite the saved preference.
     let _ = window.show();
     let tracked = window.clone();
     let topology = Mutex::new(monitor_signature(&window));

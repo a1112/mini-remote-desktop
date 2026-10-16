@@ -28,6 +28,14 @@ impl Geometry {
     }
 }
 
+/// Dimensions sent to the backend use the selected monitor, even before a move completes.
+pub fn physical_size(width: f64, height: f64, scale: f64) -> (u32, u32) {
+    (
+        (width * scale).round().max(1.0) as u32,
+        (height * scale).round().max(1.0) as u32,
+    )
+}
+
 pub fn select_screen(saved: Option<Geometry>, screens: &[Screen]) -> usize {
     let Some(g) = saved else { return 0 };
     screens
@@ -259,5 +267,30 @@ mod tests {
                 (0.0, 0.0)
             )
         );
+    }
+    #[test]
+    fn restored_window_uses_target_display_dpi_within_its_work_area() {
+        let monitors = [screen(0.0, 1.0), screen(-2880.0, 2.0)];
+        let saved = Geometry {
+            x: -2800.0,
+            y: 80.0,
+            width: 1000.0,
+            height: 650.0,
+        };
+        let target = monitors[select_screen(Some(saved), &monitors)];
+        let (g, min) = fit(
+            Some(saved),
+            (980.0, 600.0),
+            (720.0, 480.0),
+            target,
+            (0.0, 28.0),
+        );
+        assert_eq!(g, saved);
+        let (width, height) = physical_size(g.width, g.height, target.scale);
+        assert_eq!((width, height), (2000, 1300));
+        assert!(g.x + width as f64 <= target.area.x + target.area.width);
+        assert!(g.y + height as f64 + 28.0 * target.scale <= target.area.y + target.area.height);
+        let (min_width, min_height) = physical_size(min.0, min.1, target.scale);
+        assert!(min_width <= width && min_height <= height);
     }
 }
