@@ -56,6 +56,7 @@ mod tests {
         assert!(!capabilities.supports_command(&AgentCommand::StartCapture {
             resource_id: [1; 16],
             display_id: 0,
+            profile: None,
         }));
         assert!(!capabilities.supports_command(&AgentCommand::StopCapture {
             resource_id: [1; 16],

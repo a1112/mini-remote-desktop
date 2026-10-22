@@ -11,8 +11,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
   SessionAudioSnapshot,
+  TemporaryAccessStatus,
+  TemporaryAccessSecret,
   AdapterResult,
   AutostartStatus,
+  CloseBehavior,
+  UiPreferences,
+  ServiceStatusInfo,
   ClientDiagnostics,
   DeviceInfo,
   DevicePreference,
@@ -35,6 +40,7 @@ import type {
   SessionInfo,
   SessionRuntimeSnapshot,
   RuntimeSnapshot,
+  PublicServerStatus,
   AuditEvent,
   AuditLogQuery,
   AuditEventPageV2,
@@ -49,6 +55,8 @@ import type {
   SessionEventSubscriptionQuery,
   SessionPermissionChange,
   TrustedDeviceApproval,
+  LanPairingApproval,
+  LanPairingCandidate,
   TrustedDeviceRotation,
   TrustedDeviceSnapshot,
   UnattendedAccessPolicy,
@@ -116,10 +124,47 @@ async function invokeAdapter<T>(
     const result = await invoke<T>(command, args);
     return { ok: true, value: result };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: { message } };
+    const nativeError = typeof error === 'object' && error !== null
+      ? error as { message?: unknown; code?: unknown }
+      : null;
+    const message = typeof nativeError?.message === 'string' ? nativeError.message : String(error);
+    // Rust commands may reject with either a structured error or "E_CODE: detail".
+    const code = typeof nativeError?.code === 'string'
+      ? nativeError.code
+      : /^\s*(E_[A-Z0-9_]+):/.exec(message)?.[1];
+    return { ok: false, error: { message, ...(code ? { code } : {}) } };
   }
 }
+
+function validTemporaryAccessStatus(value: unknown): value is TemporaryAccessStatus {
+  if (!value || typeof value !== 'object') return false;
+  const status = value as TemporaryAccessStatus;
+  return typeof status.enabled === 'boolean' && typeof status.ready === 'boolean'
+    && Number.isSafeInteger(status.generation) && status.generation >= 0
+    && (status.expires_at_ms === null || Number.isSafeInteger(status.expires_at_ms) && status.expires_at_ms > 0)
+    && (status.reason === null || typeof status.reason === 'string')
+    && (status.refresh_mode === undefined || status.refresh_mode === 'manual' || status.refresh_mode === 'automatic')
+    && (!status.ready || status.enabled && status.generation > 0 && status.expires_at_ms !== null);
+}
+
+async function invokeLocalTemporaryAccess<T>(command: string, validate: (value: unknown) => value is T): Promise<AdapterResult<T>> {
+  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+    return { ok: false, error: { code: 'E_NATIVE_REQUIRED', message: '本机临时密码仅可在安装的客户端中管理' } };
+  }
+  const result = await invokeAdapter<T>(command);
+  if (!result.ok || validate(result.value)) return result;
+  return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: '本机临时密码状态无效' } };
+}
+
+export const getTemporaryAccessStatus = () => invokeLocalTemporaryAccess('ipc_temporary_access_status', validTemporaryAccessStatus);
+export const rotateTemporaryAccessPassword = () => invokeLocalTemporaryAccess('ipc_temporary_access_rotate', validTemporaryAccessStatus);
+export const disableTemporaryAccess = () => invokeLocalTemporaryAccess('ipc_temporary_access_disable', validTemporaryAccessStatus);
+export const readTemporaryAccessPassword = () => invokeLocalTemporaryAccess('ipc_temporary_access_secret', (value): value is TemporaryAccessSecret => {
+  if (!value || typeof value !== 'object') return false;
+  const secret = value as TemporaryAccessSecret;
+  return validTemporaryAccessStatus(secret.status) && (secret.password === null || typeof secret.password === 'string'
+    && /^[A-Za-z0-9]{8}$/.test(secret.password) && secret.status.ready && secret.status.expires_at_ms! > Date.now());
+});
 
 async function invokeBridgeOrTauri<T>(
   command: string,
@@ -558,6 +603,58 @@ export async function serviceWaitForStopped(timeoutSecs: number): Promise<Adapte
   return invokeAdapter<boolean>('service_wait_for_stopped', { timeoutSecs });
 }
 
+/** Read the service's running state and health together, independently of shell errors. */
+export async function ipcServiceHealth(): Promise<AdapterResult<ServiceStatusInfo>> {
+  const result = await invokeBridgeOrTauri<unknown>(
+    'ipc_service_health',
+    undefined,
+    { type: 'ServiceHealth' },
+    responseField<unknown>('status')
+  );
+  if (!result.ok) return result;
+
+  const status = result.value;
+  if (
+    typeof status !== 'object' || status === null ||
+    !('running' in status) || typeof status.running !== 'boolean' ||
+    !('healthy' in status) || typeof status.healthy !== 'boolean' ||
+    ('pid' in status && status.pid !== null && status.pid !== undefined &&
+      (typeof status.pid !== 'number' || !Number.isInteger(status.pid) || status.pid <= 0))
+  ) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: 'Invalid service health response' } };
+  }
+  return { ok: true, value: status as ServiceStatusInfo };
+}
+
+/** Window close behavior belongs to the native UI shell, not the browser bridge. */
+async function invokeUiPreferences(
+  command: string,
+  args?: Record<string, unknown>
+): Promise<AdapterResult<UiPreferences>> {
+  if (isBrowserContext()) {
+    return { ok: false, error: { code: 'E_UNSUPPORTED', message: 'Window close behavior requires the desktop app' } };
+  }
+  const result = await invokeAdapter<unknown>(command, args);
+  if (!result.ok) return result;
+  const preferences = result.value;
+  if (
+    typeof preferences !== 'object' || preferences === null ||
+    !('close_behavior' in preferences) ||
+    (preferences.close_behavior !== 'hide_to_tray' && preferences.close_behavior !== 'exit_ui')
+  ) {
+    return { ok: false, error: { code: 'E_INVALID_RESPONSE', message: 'Invalid UI preferences response' } };
+  }
+  return { ok: true, value: preferences as UiPreferences };
+}
+
+export async function getUiPreferences(): Promise<AdapterResult<UiPreferences>> {
+  return invokeUiPreferences('get_ui_preferences');
+}
+
+export async function setCloseBehavior(closeBehavior: CloseBehavior): Promise<AdapterResult<UiPreferences>> {
+  return invokeUiPreferences('set_close_behavior', { closeBehavior });
+}
+
 /**
  * Get the shell-owned service/UI status snapshot via IPC.
  */
@@ -568,6 +665,26 @@ export async function shellGetStatus(): Promise<AdapterResult<ShellStatusSnapsho
     { type: 'GetShellStatus' },
     responseField<ShellStatusSnapshot>('status')
   );
+}
+
+/** Read public connectivity through the restricted management IPC endpoint. */
+export async function ipcPublicServerStatus(): Promise<AdapterResult<PublicServerStatus>> {
+  return invokeBridgeOrTauri<PublicServerStatus>(
+    'ipc_public_server_status',
+    undefined,
+    { type: 'GetPublicServerStatus' },
+    responseField<PublicServerStatus>('status')
+  );
+}
+
+/** Bind only the resident's own device. Device credentials never enter the WebView. */
+export async function ipcBindPublicDevice(userToken: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('ipc_bind_public_device', { userToken });
+}
+
+/** Unbind only the resident's own device using an ephemeral user credential. */
+export async function ipcUnbindPublicDevice(userToken: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('ipc_unbind_public_device', { userToken });
 }
 
 /** Read the operating system's actual background service startup configuration. */
@@ -1320,6 +1437,30 @@ export async function ipcListTrustedDevices(
     { type: 'ListTrustedDevices', include_revoked: includeRevoked },
     'TrustedDeviceList',
     'devices'
+  );
+}
+
+export async function ipcListLanPairingCandidates(): Promise<AdapterResult<LanPairingCandidate[]>> {
+  return invokeSecureRemoteContract<LanPairingCandidate[]>(
+    { type: 'ListLanPairingCandidates' },
+    'LanPairingCandidateList',
+    'candidates'
+  );
+}
+
+export async function ipcApproveLanPairing(
+  approval: LanPairingApproval
+): Promise<AdapterResult<TrustedDeviceSnapshot>> {
+  if (shouldUseServiceBridge()) {
+    return {
+      ok: false,
+      error: { code: 'E_INSTALLED_UI_REQUIRED', message: '请在本机已安装的客户端中确认局域网配对' },
+    };
+  }
+  return invokeSecureRemoteContract<TrustedDeviceSnapshot>(
+    { type: 'ApproveLanPairing', approval },
+    'TrustedDeviceUpdated',
+    'device'
   );
 }
 

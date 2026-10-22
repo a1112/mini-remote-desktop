@@ -145,6 +145,7 @@ dependencies = [
  "mrd-ipc",
  "mrd-observability",
  "mrd-pipeline-core",
+ "mrd-process",
  "mrd-proto",
  "mrd-render",
  "mrd-render-d3d11",
@@ -178,7 +179,7 @@ dependencies = [
  "tracing",
  "webrtc",
  "winapi 0.3.9",
- "window-vibrancy 0.7.1",
+ "window-vibrancy",
  "windows 0.52.0",
  "windows-service",
  "winreg 0.52.0",
@@ -432,6 +433,28 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-server"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ab4a3ec9ea8a657c72d99a03a824af695bd0fb5ec639ccbd9cd3543b41a5f9"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "fs-err",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
 ]
 
 [[package]]
@@ -1880,6 +1903,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5c95b673b8f6f7235229ae11c5642d81b04c2e64c1e2fb417bc0cf73ca45f29"
+dependencies = [
+ "autocfg",
+ "tokio",
 ]
 
 [[package]]
@@ -3332,6 +3365,7 @@ dependencies = [
 name = "mrd-capture-macos"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.9.4",
  "core-graphics 0.23.2",
  "mrd-observability",
  "mrd-pipeline-core",
@@ -3396,6 +3430,7 @@ dependencies = [
  "mrd-ffmpeg",
  "mrd-observability",
  "mrd-pipeline-core",
+ "mrd-process",
  "openh264",
  "rust_h265",
  "serde_json",
@@ -3416,9 +3451,18 @@ dependencies = [
 name = "mrd-device-registration"
 version = "0.1.0"
 dependencies = [
+ "mrd-identity",
+ "rcgen 0.13.2",
  "reqwest 0.12.28",
+ "ring",
+ "rustls",
+ "security-framework",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-rustls",
+ "winreg 0.52.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3469,6 +3513,7 @@ dependencies = [
 name = "mrd-ffmpeg"
 version = "0.1.0"
 dependencies = [
+ "mrd-process",
  "reqwest 0.12.28",
  "serde",
  "sha2",
@@ -3517,8 +3562,9 @@ dependencies = [
 name = "mrd-input"
 version = "0.1.0"
 dependencies = [
- "core-foundation 0.9.4",
- "core-graphics 0.23.2",
+ "core-foundation 0.10.1",
+ "core-graphics 0.25.0",
+ "objc2-app-kit",
  "thiserror 1.0.69",
  "windows 0.62.2",
 ]
@@ -3536,6 +3582,7 @@ dependencies = [
  "tokio",
  "tracing",
  "windows 0.62.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -3562,7 +3609,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-server",
  "mrd-mobile-gateway",
+ "rcgen 0.13.2",
+ "rustls-pemfile",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3591,6 +3642,10 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "mrd-process"
+version = "0.1.0"
 
 [[package]]
 name = "mrd-proto"
@@ -3718,6 +3773,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "image",
+ "libc",
  "mrd-agent-ipc",
  "mrd-application",
  "mrd-audio",
@@ -3728,6 +3784,7 @@ dependencies = [
  "mrd-codec-videotoolbox",
  "mrd-decode",
  "mrd-decode-nvdec",
+ "mrd-device-registration",
  "mrd-encode-nvenc",
  "mrd-encode-nvenc-av1",
  "mrd-encode-openh264",
@@ -3738,12 +3795,14 @@ dependencies = [
  "mrd-ipc",
  "mrd-mobile-gateway",
  "mrd-pipeline-core",
+ "mrd-process",
  "mrd-proto",
  "mrd-relay-control",
  "mrd-render",
  "mrd-render-d3d11",
  "mrd-render-macos",
  "mrd-session",
+ "mrd-session-agent",
  "mrd-signal-client",
  "mrd-signal-proto",
  "mrd-store-sqlite",
@@ -3759,6 +3818,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror 1.0.69",
  "time",
  "tokio",
@@ -3803,6 +3863,7 @@ dependencies = [
  "ring",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "windows 0.62.2",
  "zeroize",
 ]
@@ -3811,10 +3872,14 @@ dependencies = [
 name = "mrd-signal-client"
 version = "0.1.0"
 dependencies = [
+ "mrd-identity",
  "mrd-proto",
  "mrd-signal-proto",
+ "ring",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -5152,6 +5217,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures-util",
+ "libc",
  "mrd-identity",
  "mrd-proto",
  "mrd-signal-client",
@@ -5159,8 +5225,10 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -5473,6 +5541,15 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -6460,7 +6537,7 @@ dependencies = [
  "url",
  "webkit2gtk",
  "webview2-com",
- "window-vibrancy 0.6.0",
+ "window-vibrancy",
  "windows 0.61.3",
 ]
 
@@ -7985,21 +8062,6 @@ dependencies = [
  "objc2-foundation",
  "raw-window-handle",
  "windows-sys 0.59.0",
- "windows-version",
-]
-
-[[package]]
-name = "window-vibrancy"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "010797bd7c40396fbc59d3105089fed0885fe267a0ef4a0a4646df54e28647f6"
-dependencies = [
- "objc2",
- "objc2-app-kit",
- "objc2-core-foundation",
- "objc2-foundation",
- "raw-window-handle",
- "windows-sys 0.60.2",
  "windows-version",
 ]
 

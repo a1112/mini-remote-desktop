@@ -1,0 +1,19 @@
+[Unit]
+Description=Renew the MRD public IP TLS certificate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+Environment=RENEWED_LINEAGE=/etc/letsencrypt/live/mrd-public-ip
+StateDirectory=mrd-public-tls
+StateDirectoryMode=0700
+ExecStart=/opt/mrd-certbot/bin/certbot renew --cert-name mrd-public-ip --non-interactive --deploy-hook /usr/local/libexec/mrd-public-tls-deploy
+# Retry an interrupted deployment even when Certbot has already saved the new
+# certificate. The deploy hook records successful rotations by certificate hash.
+ExecStartPost=/usr/local/libexec/mrd-public-tls-deploy
+PrivateTmp=true
+ProtectHome=read-only
+NoNewPrivileges=true

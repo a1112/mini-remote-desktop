@@ -195,6 +195,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_interactive_data_rights_do_not_allow_creating_another_pipe_instance() {
+        let name = format!(
+            r"\\.\pipe\mrd-product-no-create-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let _server = create_pipe(&name, true, &management_sddl("S-1-5-18")).unwrap();
+        let _client = connect_client(&name).unwrap();
+        // A restricted/ordinary token receives IU data rights and no create-instance
+        // right. Elevated administrators legitimately have the separate BA grant.
+        let instance = ServerOptions::new()
+            .first_pipe_instance(false)
+            .create(&name);
+        match instance {
+            Err(error) => assert_eq!(error.raw_os_error(), Some(5)),
+            Ok(_) => {
+                use windows::Win32::Security::{
+                    CheckTokenMembership, CreateWellKnownSid, WinBuiltinAdministratorsSid, PSID,
+                    SECURITY_MAX_SID_SIZE,
+                };
+                let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+                let mut length = sid.len() as u32;
+                let mut administrator = BOOL::default();
+                unsafe {
+                    CreateWellKnownSid(
+                        WinBuiltinAdministratorsSid,
+                        None,
+                        Some(PSID(sid.as_mut_ptr().cast())),
+                        &mut length,
+                    )
+                    .unwrap();
+                    CheckTokenMembership(None, PSID(sid.as_mut_ptr().cast()), &mut administrator)
+                        .unwrap();
+                }
+                assert!(
+                    administrator.as_bool(),
+                    "Ordinary caller received FILE_CREATE_PIPE_INSTANCE"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn management_binding_rejects_an_existing_first_instance() {
         let endpoint = crate::transport::IpcEndpoint::named_pipe(format!(
             r"\\.\pipe\mrd-management-collision-test-{}-{}",

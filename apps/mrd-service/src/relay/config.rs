@@ -13,6 +13,7 @@ const MAX_TRUSTED_KEYS_JSON_BYTES: usize = 8 * 1024;
 pub struct RelayClientConfig {
     endpoint: Url,
     backend_device_token: Zeroizing<String>,
+    shared_credential: Option<std::sync::Arc<crate::public_connection::DeviceCredential>>,
     trusted_keys: BTreeMap<String, Vec<u8>>,
     request_timeout: Duration,
     cache_capacity: usize,
@@ -72,6 +73,7 @@ impl RelayClientConfig {
         Ok(Self {
             endpoint,
             backend_device_token: Zeroizing::new(backend_device_token.to_owned()),
+            shared_credential: None,
             trusted_keys,
             request_timeout,
             cache_capacity,
@@ -139,8 +141,19 @@ impl RelayClientConfig {
         self.cache_capacity
     }
 
-    pub(crate) fn backend_device_token(&self) -> &str {
-        &self.backend_device_token
+    pub(crate) fn backend_device_token(&self) -> Zeroizing<String> {
+        self.shared_credential
+            .as_ref()
+            .map(|credential| credential.snapshot())
+            .unwrap_or_else(|| Zeroizing::new(self.backend_device_token.as_str().to_owned()))
+    }
+
+    pub(crate) fn with_device_credential(
+        mut self,
+        credential: std::sync::Arc<crate::public_connection::DeviceCredential>,
+    ) -> Self {
+        self.shared_credential = Some(credential);
+        self
     }
 }
 

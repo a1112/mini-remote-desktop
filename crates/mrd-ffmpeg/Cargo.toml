@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+mrd-process = { path = "../mrd-process" }
 reqwest.workspace = true
 serde.workspace = true
 sha2 = "0.10"

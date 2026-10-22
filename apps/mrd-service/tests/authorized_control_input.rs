@@ -304,7 +304,18 @@ fn full_input_scopes() -> Vec<RemotePermissionScope> {
 }
 
 fn pointer_event(x: i32) -> ControlEvent {
-    ControlEvent::MouseMove { x, y: 20 }
+    // macOS MouseMove is intentionally guarded by the negotiated capture
+    // source/profile so input cannot target stale display geometry. These
+    // replay-window tests exercise the realtime Pointer lane, so use a wheel
+    // event on macOS to avoid requiring a native display selection fixture.
+    #[cfg(target_os = "macos")]
+    {
+        ControlEvent::MouseWheel { delta: x }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ControlEvent::MouseMove { x, y: 20 }
+    }
 }
 
 #[tokio::test]

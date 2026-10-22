@@ -7,6 +7,7 @@ import {
 } from "../adapters/tauri";
 import { deviceService } from "../services/deviceService";
 import { deviceActionService } from "../services/deviceActionService";
+import { SERVER_API_URL } from "../services/serverConfig";
 import { isTauriRuntime } from "../utils/runtime";
 import { useAuth } from "./AuthContext";
 
@@ -72,8 +73,7 @@ const sourceLabels: Record<DeviceDiscoverySource, string> = {
   server: "服务器",
 };
 
-const API_BASE =
-  (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const API_BASE = SERVER_API_URL;
 const LAN_DEEP_REFRESH_SETTLE_MS = 250;
 
 const uniqueSources = (sources: DeviceDiscoverySource[]) =>
@@ -360,12 +360,16 @@ export function useDevices(options?: UseDevicesOptions) {
     let localDevice: Device | null = null;
 
     try {
-      [lanDevices, localDevice] = await Promise.all([
-        fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
-        fetchLocalDevice(),
-        deviceActionService.refreshDevicePreferences(),
-      ]);
-      setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
+      if (isTauriRuntime()) {
+        [lanDevices, localDevice] = await Promise.all([
+          fetchLanDevices(Boolean(fetchOptions?.deepRefresh)),
+          fetchLocalDevice(),
+          deviceActionService.refreshDevicePreferences(),
+        ]);
+        setCurrentDeviceId(localDevice?.deviceId ?? deviceService.getDeviceId());
+      } else {
+        setCurrentDeviceId(null);
+      }
 
       if (!isLoggedIn || !token) {
         setDevices(mergeDevices([], lanDevices, localDevice));

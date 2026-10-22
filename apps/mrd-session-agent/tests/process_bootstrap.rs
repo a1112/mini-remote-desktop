@@ -157,9 +157,13 @@ mod windows_process_bootstrap {
             .expect("active agent snapshot");
         assert_eq!(
             initial.capabilities.capabilities,
-            [AgentCapability::Consent, AgentCapability::Input]
-                .into_iter()
-                .collect()
+            [
+                AgentCapability::Consent,
+                AgentCapability::Capture,
+                AgentCapability::Input
+            ]
+            .into_iter()
+            .collect()
         );
         assert_ne!(initial.capabilities.desktop_epoch, 0);
 

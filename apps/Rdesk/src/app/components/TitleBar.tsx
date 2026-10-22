@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { SERVER_API_URL } from "../services/serverConfig";
 import {
   Minus,
   Square,
@@ -39,8 +40,9 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
 import { withTauriWindow } from "../utils/tauriWindow";
-import { deviceService } from "../services/deviceService";
+import { useAuth } from './AuthContext';
 import { useFileTransfers, transferName, formatTransferBytes, transferStatusLabel } from "../services/fileTransferListService";
+import { PermissionStatus } from "./PermissionStatus";
 
 interface TitleBarProps {
   onOpenConnections?: () => void;
@@ -67,6 +69,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
   const notifRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
   const { isDark } = useTheme();
+  const { logout: logoutAccount, logoutError } = useAuth();
   const { transfers, loading: transferLoading, error: transferError } = useFileTransfers(transferOpen);
   const detailBar = useDetailBar();
 
@@ -132,25 +135,9 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
     return () => window.removeEventListener("rdesk-auth-changed", loadUser);
   }, []);
 
-  const handleLogout = async () => {
-    // 解绑设备（如果已登录且有设备信息）
-    if (isLoggedIn && userData) {
-      try {
-        await deviceService.unbindDevice(userData.id);
-      } catch (err) {
-        console.warn("[TitleBar] 设备解绑失败，继续登出流程:", err);
-      }
-    }
-
-    localStorage.removeItem("rdesk_access_token");
-    localStorage.removeItem("rdesk_auth_user");
-    setIsLoggedIn(false);
-    setUserInitial("U");
-    setUserLabel("未登录");
-    setUserAvatarUrl(null);
-    setUserData(null);
+  const handleLogout = () => {
+    logoutAccount();
     setUserMenuOpen(false);
-    window.dispatchEvent(new Event("rdesk-auth-changed"));
   };
 
   useEffect(() => {
@@ -207,8 +194,9 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
       onMouseDown={handleTauriDragStart}
       onDoubleClick={handleDragDoubleClick}
     >
+      {logoutError && <p role="alert" className="absolute right-3 top-12 z-50 max-w-sm rounded-lg border border-red-400/30 bg-red-950 px-4 py-3 text-xs leading-relaxed text-red-100 shadow-lg">{logoutError}</p>}
       {/* Left: Sidebar toggle + Quick search */}
-      <div className="flex-1 flex items-center px-2 gap-2">
+      <div className="flex-1 min-w-0 flex items-center px-2 gap-2">
         <button
           onClick={onToggleSidebar}
           className={`flex items-center justify-center w-8 h-8 rounded-md transition-colors shrink-0 ${
@@ -227,7 +215,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
         </button>
 
         <div
-          className={`flex items-center gap-2 px-3 py-1 rounded-md transition-all cursor-text ${
+          className={`flex min-w-0 max-w-full items-center gap-2 px-3 py-1 rounded-md transition-all cursor-text ${
             searchFocused
               ? isDark
                 ? "bg-[#2a2a2a] border border-blue-500 shadow-sm ring-2 ring-blue-500/20 w-80"
@@ -334,6 +322,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
       {/* Right: Status indicators + actions + window controls */}
       <div className="flex items-center h-full shrink-0" style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}>
         {/* Quick action buttons: Connections + Settings */}
+        <PermissionStatus />
         <button
           onClick={onOpenConnections}
           className={iconBtn}
@@ -599,7 +588,7 @@ interface ProfileModalProps {
   isDark: boolean;
 }
 
-const API_BASE = (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const API_BASE = SERVER_API_URL;
 
 function ProfileModal({ isOpen, onClose, userData, isDark }: ProfileModalProps) {
   const [activeTab, setActiveTab] = useState<"profile" | "password">("profile");

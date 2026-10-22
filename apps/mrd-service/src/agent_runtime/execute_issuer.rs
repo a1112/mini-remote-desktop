@@ -193,21 +193,28 @@ impl ExecuteGrantIssuer {
             issued_at_ms: template.issued_at_ms,
             not_before_ms: template.not_before_ms,
             expires_at_ms: template.expires_at_ms,
-            command_digest: command.digest(),
+            command_digest: [0; 32],
             audience: GrantAudience::SessionAgent,
         };
-        let mut grant = ExecuteGrant {
+        let grant = ExecuteGrant {
             claims,
             issuer_key_id: self.key_id,
             signature: [0; 64],
         };
-        grant.signature = self.signing_key.sign(&grant.signing_bytes()).to_bytes();
-        Ok(ExecuteCommand {
+        let mut execute = ExecuteCommand {
             request_token: 1,
             command_id,
             grant,
             command,
-        })
+        };
+        // The command identity is part of the semantic authorization envelope;
+        // transport request tokens are intentionally outside this digest.
+        execute.grant.claims.command_digest = execute.command_digest();
+        execute.grant.signature = self
+            .signing_key
+            .sign(&execute.grant.signing_bytes())
+            .to_bytes();
+        Ok(execute)
     }
 }
 

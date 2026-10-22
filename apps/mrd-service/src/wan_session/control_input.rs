@@ -222,10 +222,20 @@ impl ServiceWanControlInputPort {
             let route = binding.mux.route_snapshot().await;
             if route.session_id == *session_id
                 && !route.closed
-                && (route.kind == TransportRouteKind::WebRtcRelay
+                && (route.kind == binding.authority.expected_route_kind()
                     || cfg!(any(test, debug_assertions))
                         && route.kind == TransportRouteKind::TestMemory)
             {
+                if route.kind == TransportRouteKind::WebRtcDirect {
+                    let verified = app_state
+                        .webrtc_host
+                        .verified_media_mux(session_id, binding.authority.generation())
+                        .await
+                        .map_err(|_| route_lost())?;
+                    if !Arc::ptr_eq(&verified, &binding.mux) {
+                        return Err(route_lost());
+                    }
+                }
                 return Ok((binding.authority, binding.mux));
             }
             return Err(route_lost());
@@ -255,11 +265,7 @@ impl ServiceWanControlInputPort {
                 .lock()
                 .await
                 .clear_session(session_id);
-            let _ = app_state
-                .control_input()
-                .lock()
-                .await
-                .release_session_all(session_id);
+            crate::control_input::release_authenticated_input(&app_state, session_id).await;
         }
     }
 
@@ -298,15 +304,16 @@ impl ServiceWanControlInputPort {
     }
 }
 
-/// Retain the stable mux only after the media adapter verified the exact relay generation.
-/// The mux survives atomic relay replacement, while every use still requires a live relay route.
+/// Retain the mux only after media verified the grant and actual selected route.
+/// Native relay muxes keep their verified atomic replacement semantics. Direct
+/// muxes must remain the exact generation-zero host mux at every input use.
 pub(crate) async fn bind_verified_mux(
     app_state: &Arc<AppState>,
     authority: WanMediaAuthority,
     mux: Arc<dyn TransportMuxPort>,
 ) -> Result<(), WanMediaActivationError> {
     let route = mux.route_snapshot().await;
-    let allowed_route = route.kind == TransportRouteKind::WebRtcRelay
+    let allowed_route = route.kind == authority.expected_route_kind()
         || cfg!(any(test, debug_assertions)) && route.kind == TransportRouteKind::TestMemory;
     if route.session_id != *authority.session_id() || route.closed || !allowed_route {
         return Err(WanMediaActivationError::StartupFailed);
@@ -392,11 +399,8 @@ impl WanInputActivationPort for ServiceWanControlInputPort {
         let task_session_id = session_id.clone();
         let task = tokio::spawn(async move {
             run_target_receiver(Arc::clone(&task_app_state), task_authority, mux).await;
-            let _ = task_app_state
-                .control_input()
-                .lock()
-                .await
-                .release_session_all(&task_session_id);
+            crate::control_input::release_authenticated_input(&task_app_state, &task_session_id)
+                .await;
             task_app_state
                 .wan_control_inputs
                 .lock()
@@ -835,15 +839,18 @@ async fn process_target_envelope(
         authorization_failure = Some(failure.clone());
         Err(failure)
     } else {
-        match app_state
-            .control_input()
-            .lock()
-            .await
-            .handle_authenticated_session_event(
-                authority.session_id(),
-                service_control_scope(envelope.payload.scope),
-                &event,
-            ) {
+        match crate::control_input::apply_authenticated_input(
+            app_state,
+            authority.session_id(),
+            service_control_scope(envelope.payload.scope),
+            envelope.payload.sequence,
+            authorization
+                .expires_at_ms
+                .min(envelope.payload.expires_at_ms),
+            &event,
+        )
+        .await
+        {
             Ok(result) => Ok((input_lane, result.event_count)),
             Err(_) => {
                 let failure = control_failure(
@@ -1319,3 +1326,7 @@ fn route_lost() -> RemoteFailure {
         "verified WAN control route is unavailable",
     )
 }
+
+#[cfg(test)]
+#[path = "browser_direct_tests.rs"]
+mod browser_direct_tests;

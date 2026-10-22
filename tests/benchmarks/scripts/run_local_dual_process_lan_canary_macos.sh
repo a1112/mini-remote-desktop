@@ -218,7 +218,7 @@ fi
 
 if [ "$NO_BUILD" -eq 0 ]; then
   cargo build -p app -p mrd-service
-  cargo build --manifest-path "$REPO/apps/Rdesk/src-tauri/Cargo.toml" --bin macos_metal_present_probe
+  cargo build --manifest-path "$REPO/apps/Rdesk/src-tauri/Cargo.toml" --bin macos_metal_present_probe --features diagnostic-probes
 fi
 
 SERVICE_BIN="$REPO/target/debug/mrd-service"

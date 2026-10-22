@@ -37,18 +37,36 @@ class Settings(BaseSettings):
     jwt_future_iat_skew_seconds: int = 60
     device_jwt_audience: str = ""
     device_jwt_expire_minutes: int = 60
+    device_refresh_jwt_audience: str = "rdesk-device-refresh"
+    device_refresh_jwt_expire_days: int = Field(default=365, ge=1, le=365)
     signaling_jwt_audience: str = "rdesk-signaling"
     signaling_jwt_ttl_seconds: int = 3600
     device_enrollment_token_pepper: SecretStr = SecretStr("")
     device_serial_pepper: SecretStr = SecretStr("")
     device_enrollment_ttl_seconds: int = 300
+    guest_browser_enabled: bool = False
+    guest_browser_global_per_minute: int = Field(default=300, ge=1, le=3000)
+    guest_browser_ip_per_minute: int = Field(default=10, ge=1, le=100)
+    guest_browser_device_per_minute: int = Field(default=5, ge=1, le=50)
+    device_self_enrollment_enabled: bool = False
+    device_self_enrollment_ttl_seconds: int = Field(default=60, ge=10, le=120)
+    device_self_enrollment_global_per_minute: int = Field(default=1000, ge=1, le=5000)
+    device_self_enrollment_ip_per_minute: int = Field(default=30, ge=1, le=500)
+    device_self_enrollment_key_per_minute: int = Field(default=5, ge=1, le=30)
+    # Only these socket peers may supply one validated X-Real-IP value.
+    device_self_enrollment_trusted_proxies: str = ""
     password_pbkdf2_iterations: int = 600_000
     bootstrap_admin_enabled: bool = False
     bootstrap_admin_username: str = ""
     bootstrap_admin_email: str = ""
     bootstrap_admin_password: SecretStr = SecretStr("")
     signaling_ws_url: str = "ws://127.0.0.1:9542/ws"
+    public_api_url: str = "https://175.178.16.90/rdesk/api/v1"
+    public_signal_server_device_id: str = "signal-server"
+    public_signal_server_key_id: str = ""
     realtime_server_health_url: str = "http://127.0.0.1:9542/health"
+    realtime_presence_secret: SecretStr | None = None
+    realtime_presence_url: str = "http://127.0.0.1:9542/internal/presence"
     realtime_server_command: str = "cargo"
     realtime_server_args: str = "run -p realtime-server"
     realtime_server_workdir: str = Field(default_factory=_repository_root)
@@ -72,6 +90,7 @@ class Settings(BaseSettings):
     session_grant_ttl_seconds: int = 600
     relay_policy_ttl_seconds: int = 600
     relay_policy_revision: int = 1
+    relay_max_backups: int = Field(default=1, ge=0, le=7)
     relay_allowed_regions: str = ""
     relay_preferred_regions: str = ""
     relay_accepted_transports: str = "udp,tcp,tls"

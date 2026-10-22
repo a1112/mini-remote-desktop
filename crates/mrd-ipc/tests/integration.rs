@@ -2,10 +2,100 @@
 //!
 //! Tests the full round-trip communication between IpcClient and IpcServer.
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use mrd_ipc::{client::IpcClient, IpcRequest, IpcResponse};
+use mrd_ipc::{
+    client::IpcClient,
+    transport::{IpcEndpoint, IpcServer},
+    IpcRequest, IpcResponse, ServiceStatus,
+};
 use mrd_proto::{DeviceId, SessionId};
+
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+static NEXT_ENDPOINT: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+struct PrivateFixtureDirectory(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for PrivateFixtureDirectory {
+    fn drop(&mut self) {
+        // The transport unlinks only its own socket inode before this directory.
+        // Never recursively remove a directory or replace an existing endpoint.
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+/// Use a real isolated transport server, rather than an ambient installed service.
+/// Production product-client/kernel authentication is covered by its own tests.
+async fn isolated_server(requests: Vec<IpcRequest>) -> (IpcClient, tokio::task::JoinHandle<()>) {
+    let id = format!(
+        "{}-{:x}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        NEXT_ENDPOINT.fetch_add(1, Ordering::Relaxed)
+    );
+    #[cfg(windows)]
+    let endpoint = IpcEndpoint::named_pipe(format!(r"\\.\pipe\mrd-ipc-fixture-{id}"));
+    #[cfg(unix)]
+    let (endpoint, directory) = {
+        use std::os::unix::fs::DirBuilderExt;
+        // Keep the pathname below macOS's Unix-socket length limit.
+        let directory = std::path::PathBuf::from("/tmp").join(format!("mrd-ipc-fixture-{id}"));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        (
+            IpcEndpoint::unix_socket(directory.join("service.sock").to_string_lossy()),
+            PrivateFixtureDirectory(directory),
+        )
+    };
+    let server = IpcServer::bind_with_endpoint(endpoint.clone())
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        #[cfg(unix)]
+        let directory = directory;
+        let mut stream = server.accept().await.unwrap();
+        for expected in requests {
+            let request = stream.recv_request().await.unwrap();
+            assert_eq!(request, expected);
+            let response = match request {
+                IpcRequest::ListDevices => IpcResponse::DeviceList { devices: vec![] },
+                IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
+                    status: ServiceStatus {
+                        running: true,
+                        healthy: true,
+                        pid: Some(std::process::id()),
+                    },
+                },
+                other => panic!("unexpected fixture request: {other:?}"),
+            };
+            stream.send_response(&response).await.unwrap();
+        }
+        drop(stream);
+        drop(server);
+        #[cfg(unix)]
+        drop(directory);
+    });
+    let client = IpcClient::with_config_and_endpoint(
+        mrd_ipc::client::ReconnectConfig {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(100),
+            enabled: true,
+        },
+        endpoint,
+    );
+    (client, task)
+}
 
 /// Helper to create a test session ID
 fn test_session_id() -> SessionId {
@@ -20,37 +110,47 @@ fn test_device_id() -> DeviceId {
 /// Test basic client connection and ListDevices request
 #[tokio::test]
 async fn ipc_client_sends_list_devices_request() {
-    // This test requires the server to be running or creates a mock
-    // For Windows, we need to handle named pipe creation carefully
-
-    let mut client = IpcClient::new();
-
-    // Try to connect - if service is not running, test will fail gracefully
-    let result = client.send_request(IpcRequest::ListDevices).await;
-
-    // We don't assert success here because the service might not be running
-    // In a real integration test environment, we'd spawn the service first
-    if let Ok(response) = result {
-        assert!(matches!(response, IpcResponse::DeviceList { .. }));
-    }
+    let (mut client, server) = isolated_server(vec![IpcRequest::ListDevices]).await;
+    let response = tokio::time::timeout(
+        FIXTURE_TIMEOUT,
+        client.send_request(IpcRequest::ListDevices),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response, IpcResponse::DeviceList { devices: vec![] });
+    assert!(client.is_connected());
+    tokio::time::timeout(FIXTURE_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// Test ServiceHealth request
 #[tokio::test]
 async fn ipc_client_sends_service_health_request() {
-    let mut client = IpcClient::new();
-
-    let result = client.send_request(IpcRequest::ServiceHealth).await;
-
-    if let Ok(response) = result {
-        match response {
-            IpcResponse::ServiceHealth { status } => {
-                assert!(status.running);
-                assert!(status.pid.is_some());
-            }
-            _ => panic!("Expected ServiceHealth response"),
+    let (mut client, server) = isolated_server(vec![IpcRequest::ServiceHealth]).await;
+    let response = tokio::time::timeout(
+        FIXTURE_TIMEOUT,
+        client.send_request(IpcRequest::ServiceHealth),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        response,
+        IpcResponse::ServiceHealth {
+            status: ServiceStatus {
+                running: true,
+                healthy: true,
+                pid: Some(std::process::id()),
+            },
         }
-    }
+    );
+    tokio::time::timeout(FIXTURE_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 /// Test client state transitions
@@ -141,13 +241,34 @@ fn ipc_responses_can_be_deserialized() {
 /// Test multiple sequential requests with client
 #[tokio::test]
 async fn ipc_client_handles_multiple_sequential_requests() {
-    let mut client = IpcClient::new();
-
-    // Try multiple requests
-    let _ = client.send_request(IpcRequest::ServiceHealth).await;
-    let _ = client.send_request(IpcRequest::ListDevices).await;
-    let _ = client.send_request(IpcRequest::ServiceHealth).await;
-
-    // Client should maintain state
-    assert!(!client.is_connected() || client.is_connected());
+    let requests = vec![
+        IpcRequest::ServiceHealth,
+        IpcRequest::ListDevices,
+        IpcRequest::ServiceHealth,
+    ];
+    let (mut client, server) = isolated_server(requests.clone()).await;
+    for request in requests {
+        let response = tokio::time::timeout(FIXTURE_TIMEOUT, client.send_request(request.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        match request {
+            IpcRequest::ListDevices => {
+                assert_eq!(response, IpcResponse::DeviceList { devices: vec![] });
+            }
+            IpcRequest::ServiceHealth => assert!(matches!(
+                response,
+                IpcResponse::ServiceHealth { status }
+                    if status.running && status.healthy && status.pid == Some(std::process::id())
+            )),
+            _ => unreachable!(),
+        }
+        assert!(client.is_connected());
+    }
+    client.disconnect();
+    assert!(!client.is_connected());
+    tokio::time::timeout(FIXTURE_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
 }

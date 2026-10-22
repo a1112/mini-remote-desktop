@@ -873,7 +873,8 @@ async def issue_relay_access(
     service: RelayAccessService = Depends(get_relay_access_service),
 ) -> RelayAccessResponse:
     auth_snapshot = capture_device_auth_snapshot(current_device)
-    if not current_device.is_bound or current_device.bound_user_id is None:
+    if ((not current_device.is_bound or current_device.bound_user_id is None)
+        and not await service.permits_unbound_guest_target(current_device, payload.session_id)):
         raise HTTPException(
             status_code=403,
             detail={

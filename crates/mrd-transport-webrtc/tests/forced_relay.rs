@@ -39,6 +39,20 @@ async fn selected_candidate_pair_is_relay_when_forced() {
     assert!(evidence.has_relay_pair());
     assert!(evidence.control_round_trip());
     assert!(evidence.media_round_trip());
+    let pair = evidence.selected_pair();
+    assert!(
+        pair.packets_sent > 0,
+        "sent packet evidence must be measured"
+    );
+    assert!(
+        pair.packets_received > 0,
+        "received packet evidence must be measured"
+    );
+    assert!(pair.bytes_sent > 0, "sent byte evidence must be measured");
+    assert!(
+        pair.bytes_received > 0,
+        "received byte evidence must be measured"
+    );
 }
 
 fn live_turn_servers() -> Vec<IceServerConfig> {

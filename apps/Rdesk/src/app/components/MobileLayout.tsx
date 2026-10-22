@@ -11,6 +11,11 @@ import { useDevices, type Device } from "./deviceData";
 import { useDeviceRegistration } from "../services/deviceService";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
+import { ServiceStatusPanel } from "./ServiceStatusPanel";
+import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { isTauriRuntime } from '../utils/runtime';
+import { GuestRemoteConnectForm } from './GuestRemoteConnectForm';
+import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
 
 type MobileLayoutProps = { onOpenAuth: () => void };
 
@@ -24,7 +29,7 @@ const tabs = [
 function MobileHomePage() {
   const navigate = useNavigate();
   const { devices } = useDevices();
-  const { deviceId: myDeviceId, deviceName: myDeviceName } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const history = useConnectionHistory();
   const [targetId, setTargetId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -35,8 +40,10 @@ function MobileHomePage() {
   ).slice(0, 3);
 
   const connect = async (rawId: string) => {
-    const deviceId = rawId.replace(/\s/g, "");
-    if (!deviceId || busy) return;
+    if (!rawId.trim() || busy) return;
+    const parsed = parseRemoteDeviceInput(rawId);
+    if (!parsed) { setError(DEVICE_CODE_INPUT_ERROR); return; }
+    const deviceId = parsed.deviceId;
     const device = devices.find((item) => item.deviceId.replace(/\s/g, "") === deviceId);
     setBusy(true);
     setError(null);
@@ -47,7 +54,7 @@ function MobileHomePage() {
         targetOs: device?.os ?? "Unknown",
         routePreference: "auto",
       });
-      navigate(`/session/${result.sessionId}`);
+      navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "连接请求失败");
     } finally {
@@ -58,7 +65,7 @@ function MobileHomePage() {
   const copyMyId = async () => {
     if (!myDeviceId) return;
     try {
-      await navigator.clipboard.writeText(myDeviceId.replace(/\s/g, ""));
+      await navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -70,23 +77,24 @@ function MobileHomePage() {
     <div className="mobile-intro">
       <p className="mobile-eyebrow">安全远程访问</p>
       <h1>连接远程设备</h1>
-      <p>输入远程设备 ID，发起连接请求</p>
+      <p>{isTauriRuntime() ? '输入远程设备码，发起连接请求' : '设备码与临时密码连接，无需登录'}</p>
     </div>
 
     <section className="mobile-card mobile-connect-card" aria-label="连接远程设备">
-      <label htmlFor="mobile-target-id" className="mobile-field-label">远程设备 ID</label>
+      {isTauriRuntime() ? <><label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
       <div className="mobile-input-wrap">
         <Monitor size={20} aria-hidden="true" />
-        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入设备 ID"
+        <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 10 位设备码"
           value={targetId} onChange={(event) => setTargetId(event.target.value)}
           onKeyDown={(event) => { if (event.key === "Enter") void connect(targetId); }} />
       </div>
+      <p className="mobile-state-text">已有的旧设备码和局域网标识仍可使用。</p>
       <button className="mobile-primary-button" disabled={!targetId.trim() || busy} onClick={() => void connect(targetId)}>
         {busy ? <LoaderCircle size={19} className="animate-spin" /> : null}
         {busy ? "连接中…" : "发起连接"}
         {!busy ? <ArrowRight size={20} aria-hidden="true" /> : null}
       </button>
-      {error ? <p className="mobile-error" role="alert">{error}</p> : null}
+      {error ? <p className="mobile-error" role="alert">{error}</p> : null}</> : <GuestRemoteConnectForm />}
     </section>
 
     <section className="mobile-card mobile-recent-card" aria-labelledby="mobile-recent-heading">
@@ -108,12 +116,12 @@ function MobileHomePage() {
       })}</div>}
     </section>
 
-    <section className="mobile-local-device" aria-label="本机设备">
-      <span><small>本机设备</small><strong>{myDeviceName || "设备 ID 未就绪"}</strong><code>{myDeviceId || "等待本机服务"}</code></span>
+    {isTauriRuntime() ? <><section className="mobile-local-device" aria-label="本机设备">
+      <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}
       </button>
-    </section>
+    </section>{registrationError ? <p className="mobile-error" role="alert">{registrationError}</p> : null}{serviceManagedRegistration && !myDeviceId ? <button className="mobile-primary-button" onClick={() => { void reregister(); }}>刷新登记状态</button> : null}<section className="mobile-card"><TemporaryAccessPasswordCard /></section></> : <section className="mobile-card"><h2>网页控制端</h2><p className="mobile-state-text">无需安装客户端或登记本机。设备码和临时密码连接无需登录，由对方确认画面和键鼠权限。</p></section>}
   </div>;
 }
 
@@ -180,7 +188,7 @@ function MobileDeviceDetailPage({ deviceId }: { deviceId: string }) {
         targetIp: target.ip,
         lanP2P: target.p2pAvailable && !target.isLocal,
       });
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "连接请求失败");
     } finally { setBusy(false); }
@@ -224,7 +232,7 @@ function MobileHistoryPage() {
 
 function MobileSettingsPage({ onOpenAuth }: MobileLayoutProps) {
   const { theme, setTheme } = useTheme();
-  const { isLoggedIn, user, logout } = useAuth();
+  const { isLoggedIn, user, logout, logoutError } = useAuth();
   const { deviceId } = useDeviceRegistration();
   return <div className="mobile-page">
     <div className="mobile-intro"><p className="mobile-eyebrow">个人偏好</p><h1>设置</h1><p>管理显示方式与账户</p></div>
@@ -240,10 +248,11 @@ function MobileSettingsPage({ onOpenAuth }: MobileLayoutProps) {
       <h2>账户</h2>
       <div className="mobile-account-row"><UserRound size={22} /><span>{isLoggedIn ? user?.username : "尚未登录"}</span></div>
       <button className="mobile-secondary-button" onClick={isLoggedIn ? logout : onOpenAuth}>{isLoggedIn ? "退出登录" : "登录账户"}</button>
+      {logoutError && <p role="alert" className="mt-3 break-words text-sm text-red-500">{logoutError}</p>}
     </section>
-    <section className="mobile-card mobile-settings-card">
-      <h2>本机设备 ID</h2><code>{deviceId || "等待本机服务"}</code>
-    </section>
+    {isTauriRuntime() && <section className="mobile-card mobile-settings-card">
+      <h2>本机设备码</h2><code>{deviceId ? formatDeviceCode(deviceId) : "等待设备登记"}</code>
+    </section>}
   </div>;
 }
 
@@ -257,6 +266,7 @@ export function MobileLayout({ onOpenAuth }: MobileLayoutProps) {
       <Link to="/" className="mobile-brand" aria-label="R-Desk 首页"><span className="mobile-mark">R</span><span>R-Desk</span></Link>
       <button className="mobile-header-action" aria-label="打开设置" onClick={() => navigate("/settings")}><Settings2 size={23} /></button>
     </header>
+    <ServiceStatusPanel />
     <main className="mobile-main" id="mobile-main">
       {location.pathname === "/" ? <MobileHomePage /> : null}
       {location.pathname === "/devices" ? <MobileDevicesPage onOpenAuth={onOpenAuth} /> : null}

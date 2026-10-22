@@ -18,8 +18,13 @@ import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher"
 import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
+import { DEVICE_CODE_INPUT_ERROR, formatDeviceCode, normalizeDeviceCode, parseRemoteDeviceInput } from "../utils/deviceCode";
+import { isTauriRuntime } from '../utils/runtime';
+import { GuestRemoteConnectForm } from './GuestRemoteConnectForm';
+import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
 
 export function HomePage() {
+  const native = isTauriRuntime();
   const { isDark } = useTheme();
   const navigate = useNavigate();
   const { devices } = useDevices();
@@ -39,7 +44,7 @@ export function HomePage() {
         lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
       };
     });
-  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh } = useDeviceRegistration();
+  const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
   const [copied, setCopied] = useState(false);
@@ -54,7 +59,7 @@ export function HomePage() {
 
   const handleCopy = () => {
     if (!myDeviceId) return;
-    navigator.clipboard.writeText(myDeviceId.replace(/\s/g, ""));
+    navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -95,17 +100,8 @@ export function HomePage() {
     }
   };
 
-  // 格式化设备 ID（每3位一组）
-  const formatDeviceId = (id: string | null) => {
-    if (!id) return "设备 ID 未就绪";
-    const cleaned = id.replace(/\s/g, "");
-    if (cleaned.length === 9) {
-      return `${cleaned.slice(0, 3)} ${cleaned.slice(3, 6)} ${cleaned.slice(6)}`;
-    }
-    return cleaned;
-  };
-
-  const myId = formatDeviceId(myDeviceId);
+  const myId = formatDeviceCode(myDeviceId);
+  const hasTenDigitCode = /^\d{10}$/.test(normalizeDeviceCode(myDeviceId ?? ""));
 
   // 自动聚焦设备名称输入框
   useEffect(() => {
@@ -133,7 +129,7 @@ export function HomePage() {
         targetOs: target.os,
         routePreference: "auto",
       });
-      navigate(`/session/${result.sessionId}`);
+      navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
       setConnectionError(
         error instanceof Error ? error.message : "安全远程会话请求失败",
@@ -146,14 +142,19 @@ export function HomePage() {
 
   const handleConnect = () => {
     if (!connectId.trim()) return;
-    const found = devices.find((device) => device.deviceId.replace(/\s/g, "") === connectId.replace(/\s/g, ""));
+    const parsed = parseRemoteDeviceInput(connectId);
+    if (!parsed) {
+      setConnectionError(DEVICE_CODE_INPUT_ERROR);
+      return;
+    }
+    const found = devices.find((device) => normalizeDeviceCode(device.deviceId) === parsed.deviceId);
     if (found) {
       void launchSecureRemote(found);
     } else {
       void launchSecureRemote({
         id: "custom",
         name: "远程设备",
-        deviceId: connectId,
+        deviceId: parsed.deviceId,
         os: "Unknown",
       });
     }
@@ -174,16 +175,16 @@ export function HomePage() {
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
-      <DeviceRegisterModal
+      {native && <DeviceRegisterModal
         isOpen={registrationOpen}
         onClose={() => setRegistrationOpen(false)}
         onSuccess={() => refresh()}
-      />
-      <div className="grid grid-cols-5 gap-6">
+      />}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
         {/* Left: ID + Connect */}
-        <div className="col-span-2 space-y-5">
+        <div className="space-y-5 lg:col-span-2">
           {/* My Device card */}
-          <div className={`p-5 rounded-xl border ${card}`}>
+          {native ? <div className={`p-5 rounded-xl border ${card}`}>
             {/* 设备名称 + 编辑按钮 */}
             <div className="flex items-center justify-center gap-2 mb-2">
               {editingDeviceName ? (
@@ -239,7 +240,8 @@ export function HomePage() {
               )}
             </div>
 
-            {/* 设备ID + 复制图标 */}
+            <div className={`mb-1 text-center text-xs ${textSecondary}`}>{hasTenDigitCode ? "10 位设备码" : "当前设备标识"}</div>
+            {/* 设备码 + 复制图标 */}
             <div className="flex items-center justify-center gap-1.5 mb-4">
               <div className={`text-2xl font-mono tracking-widest ${textPrimary}`} style={{ fontSize: 18 }}>
                 {myId}
@@ -251,35 +253,43 @@ export function HomePage() {
                     ? "text-green-600"
                     : isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"
                 }`}
-                title={copied ? "已复制" : "复制ID"}
+                title={copied ? "已复制" : "复制设备码"}
               >
                 <Copy className="w-3.5 h-3.5" />
               </button>
             </div>
             {registrationError && <p role="alert" className="mb-3 text-sm text-amber-600">{registrationError}</p>}
+            {serviceManagedRegistration && <button onClick={() => { void reregister(); }} className={`mb-2 w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
+              刷新登记状态
+            </button>}
             <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
-              登记到服务器
+              {serviceManagedRegistration ? "管理员登记或恢复" : "登记到服务器"}
             </button>
-          </div>
+            <TemporaryAccessPasswordCard />
+          </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。使用设备码和临时密码即可发起连接，双方无需登录；对方确认后查看画面并控制已授权的键鼠。</p></section>}
 
           {/* Connect card */}
           <div className={`p-5 rounded-xl border ${card}`}>
             <h3 className={`mb-4 ${textPrimary}`} style={{ fontSize: 15 }}>连接到远程设备</h3>
 
-            <div className="space-y-3">
+            {native ? <div className="space-y-3">
               <div>
                 <label className={`block mb-1.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  远程设备 ID
+                  远程设备码
                 </label>
                 <input
                   type="text"
+                  inputMode="text"
+                  autoComplete="off"
+                  aria-label="远程设备码"
                   value={connectId}
                   onChange={(e) => setConnectId(e.target.value)}
-                  placeholder="输入远程设备 ID"
+                  placeholder="输入 10 位设备码"
                   onKeyDown={(e) => e.key === "Enter" && handleConnect()}
                   className={`w-full px-3 py-2.5 rounded-lg border outline-none transition-all ${inputBg}`}
                   style={{ fontSize: 14 }}
                 />
+                <p className={`mt-1.5 text-xs ${textTertiary}`}>支持带空格的设备码；已有的旧码和局域网标识仍可连接。</p>
               </div>
 
               <div
@@ -319,12 +329,12 @@ export function HomePage() {
                   <span>{connectionError}</span>
                 </div>
               ) : null}
-            </div>
+            </div> : <GuestRemoteConnectForm />}
           </div>
         </div>
 
         {/* Right: Recent connections */}
-        <div className="col-span-3">
+        <div className="lg:col-span-3">
           <div className={`p-5 rounded-xl border h-full ${card}`}>
             <div className="flex items-center justify-between mb-4">
               <h3 className={textPrimary} style={{ fontSize: 15 }}>最近连接</h3>

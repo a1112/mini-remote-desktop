@@ -5,7 +5,26 @@ use crate::{
 use ring::digest;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-const TRUST_COMMITMENT_DOMAIN: &[u8] = b"MRD_TRUST_COMMITMENT_V2";
+const KNOWN_PERMISSION_SCOPES: &[&str] = &[
+    "audio.listen",
+    "audio.talk",
+    "clipboard.read",
+    "clipboard.write",
+    "display.multi_view",
+    "display.switch",
+    "file.read",
+    "file.write",
+    "input.keyboard",
+    "input.pointer",
+    "power.restart",
+    "power.shutdown",
+    "privacy.blank_screen",
+    "privacy.block_local_input",
+    "screen.view",
+    "secure_desktop.control",
+    "secure_desktop.view",
+    "terminal.open",
+];
 
 /// Durable peer trust state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +138,9 @@ struct StoredTrustRecord {
 }
 
 impl PersistentStore {
-    /// Inserts a newly approved pinned peer. Existing key IDs are never overwritten.
+    /// Inserts a newly approved pinned peer with an empty permission ceiling.
+    /// Legacy trust alone never grants a session permission. Existing key IDs
+    /// are never overwritten.
     pub fn insert_trusted_device(
         &self,
         peer_key_id: &str,
@@ -140,7 +161,8 @@ impl PersistentStore {
         Ok(record)
     }
 
-    /// Inserts pinned trust and its approval audit in one sealed transaction.
+    /// Inserts pinned trust with an empty permission ceiling and its approval
+    /// audit in one sealed transaction.
     pub fn insert_trusted_device_with_audit(
         &self,
         peer_key_id: &str,
@@ -170,6 +192,97 @@ impl PersistentStore {
         integrity::write_meta(&transaction, store_key.as_ref(), &mut meta)?;
         transaction.commit()?;
         Ok((record, audit))
+    }
+
+    /// Inserts first-pair trust, its authoritative ceiling and approval audit
+    /// atomically. Existing pinned keys of every state are never overwritten.
+    pub fn insert_trusted_device_with_policy_and_audit(
+        &self,
+        peer_key_id: &str,
+        public_key: &[u8],
+        epoch: u64,
+        permission_ceiling: &[String],
+        audit: AuditDraft,
+    ) -> Result<(TrustRecord, AuditRecord), StoreError> {
+        self.insert_trusted_device_with_policy_and_audit_guarded(
+            peer_key_id,
+            public_key,
+            epoch,
+            permission_ceiling,
+            audit,
+            || Ok(()),
+        )
+    }
+
+    /// Rechecks the verified pairing actor and candidate after waiting for the
+    /// SQLite write lock, before performing any durable trust mutation. The
+    /// callback runs while the store lock is held and must not reenter it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_trusted_device_with_policy_and_audit_guarded(
+        &self,
+        peer_key_id: &str,
+        public_key: &[u8],
+        epoch: u64,
+        permission_ceiling: &[String],
+        mut audit: AuditDraft,
+        before_insert: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(TrustRecord, AuditRecord), StoreError> {
+        validate_pinned_identity(peer_key_id, public_key, epoch, 1)?;
+        let scopes = canonical_permission_ceiling(permission_ceiling)?;
+        audit_store::validate_draft(&audit)?;
+        let mut connection = self.connection();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (mut meta, store_key) = self.verify_store_snapshot_connection(&transaction)?;
+        before_insert()?;
+        let record = insert_record(
+            &transaction,
+            peer_key_id,
+            public_key,
+            epoch,
+            TrustState::Trusted,
+        )?;
+        for scope in &scopes {
+            transaction.execute(
+                "INSERT INTO trust_permissions(peer_key_id, permission_scope) VALUES (?1, ?2)",
+                params![peer_key_id, scope],
+            )?;
+        }
+        audit.outcome = "allowed".to_owned();
+        audit.reason_code = None;
+        let audit = audit_store::append_audit_in_transaction(
+            &transaction,
+            self.protector.as_ref(),
+            &meta.store_id,
+            audit,
+        )?;
+        let (trust_count, trust_commitment) = trust_commitment(&transaction)?;
+        meta.trust_count = trust_count;
+        meta.trust_commitment = trust_commitment;
+        meta.audit_commitment = audit_store::audit_commitment(&transaction)?;
+        integrity::write_meta(&transaction, store_key.as_ref(), &mut meta)?;
+        transaction.commit()?;
+        Ok((record, audit))
+    }
+
+    /// Returns the sealed effective ceiling; absent and inactive peers have
+    /// no permission. Does not derive permission from audit or UI projection.
+    pub fn trust_permission_ceiling(&self, peer_key_id: &str) -> Result<Vec<String>, StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        self.verify_store_snapshot_connection(&transaction)?;
+        let scopes = if query_record(&transaction, peer_key_id)?
+            .is_some_and(|record| record.state == TrustState::Trusted)
+        {
+            let scopes: Vec<String> = transaction
+                .prepare("SELECT permission_scope FROM trust_permissions WHERE peer_key_id = ?1 ORDER BY permission_scope")?
+                .query_map([peer_key_id], |row| row.get(0))?
+                .collect::<Result<_, _>>()?;
+            canonical_permission_ceiling(&scopes)?
+        } else {
+            Vec::new()
+        };
+        transaction.commit()?;
+        Ok(scopes)
     }
 
     /// Applies a revision-checked transition. Revocation is terminal for a key ID.
@@ -279,7 +392,7 @@ pub(crate) fn verify_trust_snapshot(
     connection: &Connection,
     meta: &integrity::StoreMeta,
 ) -> Result<(), StoreError> {
-    let (count, commitment) = trust_commitment(connection)?;
+    let (count, commitment) = trust_commitment_for_version(connection, meta.format_version)?;
     if count != meta.trust_count || commitment != meta.trust_commitment {
         return Err(StoreError::StoreIntegrity);
     }
@@ -287,18 +400,53 @@ pub(crate) fn verify_trust_snapshot(
 }
 
 pub(crate) fn trust_commitment(connection: &Connection) -> Result<(u64, Vec<u8>), StoreError> {
+    trust_commitment_for_version(connection, integrity::STORE_FORMAT_VERSION)
+}
+
+fn trust_commitment_for_version(
+    connection: &Connection,
+    version: u32,
+) -> Result<(u64, Vec<u8>), StoreError> {
     let records = query_all_records(connection)?;
     let count = records.len() as u64;
-    let mut bytes = TRUST_COMMITMENT_DOMAIN.to_vec();
+    let mut bytes = match version {
+        integrity::LEGACY_STORE_FORMAT_VERSION => b"MRD_TRUST_COMMITMENT_V2".to_vec(),
+        integrity::STORE_FORMAT_VERSION => b"MRD_TRUST_COMMITMENT_V3".to_vec(),
+        _ => return Err(StoreError::StoreIntegrity),
+    };
     bytes.extend_from_slice(&count.to_be_bytes());
-    for stored in records {
-        let record = stored.record;
+    for stored in &records {
+        let record = &stored.record;
         integrity::append_field(&mut bytes, record.peer_key_id.as_bytes());
         integrity::append_field(&mut bytes, &record.public_key);
         bytes.extend_from_slice(&record.epoch.to_be_bytes());
         integrity::append_field(&mut bytes, record.state.as_str().as_bytes());
         bytes.extend_from_slice(&record.revision.to_be_bytes());
         bytes.extend_from_slice(&stored.updated_at.to_be_bytes());
+    }
+    if version == integrity::STORE_FORMAT_VERSION {
+        let mut statement = connection.prepare(
+            "SELECT peer_key_id, permission_scope FROM trust_permissions ORDER BY peer_key_id, permission_scope"
+        )?;
+        let mut rows = statement.query([])?;
+        let mut policy_count = 0_u64;
+        while let Some(row) = rows.next()? {
+            let peer_key_id: String = row.get(0)?;
+            let scope: String = row.get(1)?;
+            if !KNOWN_PERMISSION_SCOPES.contains(&scope.as_str())
+                || !records
+                    .iter()
+                    .any(|stored| stored.record.peer_key_id == peer_key_id)
+            {
+                return Err(StoreError::StoreIntegrity);
+            }
+            integrity::append_field(&mut bytes, peer_key_id.as_bytes());
+            integrity::append_field(&mut bytes, scope.as_bytes());
+            policy_count = policy_count
+                .checked_add(1)
+                .ok_or(StoreError::StoreIntegrity)?;
+        }
+        bytes.extend_from_slice(&policy_count.to_be_bytes());
     }
     Ok((
         count,
@@ -463,6 +611,26 @@ fn validate_pinned_identity(
         ));
     }
     Ok(())
+}
+
+fn canonical_permission_ceiling(scopes: &[String]) -> Result<Vec<String>, StoreError> {
+    if scopes.len() > KNOWN_PERMISSION_SCOPES.len()
+        || scopes
+            .iter()
+            .any(|scope| !KNOWN_PERMISSION_SCOPES.contains(&scope.as_str()))
+    {
+        return Err(StoreError::TrustTransition(
+            "invalid trust permission ceiling".to_owned(),
+        ));
+    }
+    let mut canonical = scopes.to_vec();
+    canonical.sort_unstable();
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(StoreError::TrustTransition(
+            "duplicate trust permission scope".to_owned(),
+        ));
+    }
+    Ok(canonical)
 }
 
 fn key_id(public_key: &[u8]) -> String {

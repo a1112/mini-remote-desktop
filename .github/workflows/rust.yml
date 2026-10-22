@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  CARGO_BUILD_JOBS: "2"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
 
@@ -76,6 +77,7 @@ jobs:
           -p mrd-session
           -p mrd-application
           -p mrd-signal-proto
+          -p mrd-signal-client
           -p mrd-signal-server
           -p realtime-server
           -p mrd-service

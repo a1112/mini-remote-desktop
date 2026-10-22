@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from uuid import uuid4
 
@@ -20,6 +21,10 @@ from app.db.session import Base
 class Device(Base):
     __tablename__ = "devices"
     __table_args__ = (
+        CheckConstraint(
+            "principal_kind IN ('physical', 'browser_controller')",
+            name="ck_devices_principal_kind",
+        ),
         CheckConstraint(
             "length(tenant_id) BETWEEN 1 AND 64",
             name="ck_devices_tenant_id",
@@ -51,6 +56,9 @@ class Device(Base):
     )
     name: Mapped[str] = mapped_column(String(128), index=True)
     device_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    principal_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="physical", server_default=text("'physical'")
+    )
     os: Mapped[str] = mapped_column(String(64))
     icon: Mapped[str] = mapped_column(String(32), default="Monitor")
     location: Mapped[str] = mapped_column(String(64), default="")
@@ -86,6 +94,11 @@ class Device(Base):
     auth_revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # SHA-256 of the one active refresh-token JTI. Refresh replaces this value
+    # while holding the device row lock, making credentials single-use.
+    active_refresh_jti_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
 
     status: Mapped["DeviceStatus"] = relationship(
         "DeviceStatus",
@@ -103,11 +116,18 @@ class Device(Base):
 
 
 def generate_device_id_from_digest(serial_digest: str) -> str:
-    """Derive the stable public numeric ID from the non-reversible HMAC digest."""
+    """Derive the first ten-digit candidate from the non-reversible HMAC digest.
 
-    if len(serial_digest) != 64:
+    Persisted assignments are authoritative: registration resolves collisions
+    against the database and retries always return the stored device ID.
+    """
+
+    if (
+        not isinstance(serial_digest, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", serial_digest, flags=re.ASCII) is None
+    ):
         raise ValueError("device serial digest is invalid")
-    return str(int(serial_digest, 16) % 10**12).zfill(12)
+    return str(int(serial_digest, 16) % 10**10).zfill(10)
 
 
 class DeviceStatus(Base):

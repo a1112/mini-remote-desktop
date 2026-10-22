@@ -14,6 +14,7 @@ import {
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
 import { deviceService } from "../services/deviceService";
+import { SERVER_API_URL } from "../services/serverConfig";
 
 interface AuthModalProps {
   open: boolean;
@@ -35,8 +36,7 @@ type RegisterPayload = {
   password: string;
 };
 
-const API_BASE =
-  (import.meta as any).env?.VITE_RDESK_SERVER_URL ?? "http://127.0.0.1:9530/api/v1";
+const API_BASE = SERVER_API_URL;
 
 export function AuthModal({ open, onClose }: AuthModalProps) {
   const { isDark } = useTheme();
@@ -133,15 +133,9 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
         role: data.role,
       });
 
-      // 绑定设备（如果设备已注册）
-      try {
-        const bindResult = await deviceService.bindDevice(data.user_id);
-        if (bindResult.success && bindResult.kickedUser) {
-          console.log("[Auth] 设备从其他用户迁移:", bindResult.kickedUser);
-        }
-      } catch (err) {
-        console.warn("[Auth] 设备绑定失败，但不影响登录:", err);
-      }
+      // Binding errors are published by the device service to the home screen.
+      // An account may log in before enrollment; enrollment completes binding.
+      await deviceService.bindDevice(data.user_id);
 
       onClose();
     } catch (e) {

@@ -38,6 +38,22 @@ SERIAL_PEPPER = bytes.fromhex("67" * 32)
 DATABASE_URL = os.getenv("MRD_TEST_DATABASE_URL")
 
 
+class AsyncSavepoint:
+    def __init__(self, transaction: object) -> None:
+        self.transaction = transaction
+
+    async def commit(self) -> None:
+        self.transaction.commit()
+
+    async def rollback(self) -> None:
+        self.transaction.rollback()
+
+
+class EnrollmentSessionShim(AsyncSessionShim):
+    async def begin_nested(self) -> AsyncSavepoint:
+        return AsyncSavepoint(self.session.begin_nested())
+
+
 def _configure_jwt(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(settings.__dict__, "jwt_secret", SecretStr(JWT_SECRET))
     monkeypatch.setitem(settings.__dict__, "jwt_issuer", "https://auth.rdesk.test")
@@ -110,7 +126,7 @@ def device_api(monkeypatch: pytest.MonkeyPatch):
     session.commit()
 
     async def override_db():
-        yield AsyncSessionShim(session)
+        yield EnrollmentSessionShim(session)
 
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")

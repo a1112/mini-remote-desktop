@@ -7,4 +7,5 @@ pydantic-settings==2.14.2
 PyJWT==2.13.0
 email-validator==2.2.0
 python-multipart==0.0.32
+httpx==0.28.1
 cryptography==50.0.1

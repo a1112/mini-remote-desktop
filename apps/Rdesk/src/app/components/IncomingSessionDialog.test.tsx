@@ -86,7 +86,7 @@ describe("IncomingSessionDialog", () => {
       screen.getByRole("checkbox", { name: "input.pointer" }),
     );
     await user.click(
-      screen.getByRole("button", { name: "Allow selected permissions" }),
+      screen.getByRole("button", { name: "在本机确认" }),
     );
 
     expect(onRespond).toHaveBeenCalledWith({
@@ -129,7 +129,7 @@ describe("IncomingSessionDialog", () => {
     );
 
     const approve = screen.getByRole("button", {
-      name: "Allow selected permissions",
+      name: "在本机确认",
     });
     expect(approve).toBeDisabled();
 
@@ -154,7 +154,7 @@ describe("IncomingSessionDialog", () => {
     );
 
     const approve = screen.getByRole("button", {
-      name: "Allow selected permissions",
+      name: "在本机确认",
     });
     const deny = screen.getByRole("button", { name: "Deny" });
     act(() => {
@@ -185,7 +185,7 @@ describe("IncomingSessionDialog", () => {
     );
 
     expect(
-      screen.getByRole("button", { name: "Allow selected permissions" }),
+      screen.getByRole("button", { name: "在本机确认" }),
     ).toBeDisabled();
     expect(screen.getByRole("button", { name: "Deny" })).toBeEnabled();
     expect(screen.getByText("This request has expired.")).toBeInTheDocument();
@@ -205,7 +205,7 @@ describe("IncomingSessionDialog", () => {
       );
 
       const approve = screen.getByRole("button", {
-        name: "Allow selected permissions",
+        name: "在本机确认",
       });
       expect(approve).toBeEnabled();
 

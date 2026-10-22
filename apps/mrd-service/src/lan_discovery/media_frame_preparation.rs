@@ -26,6 +26,31 @@ pub(crate) fn prepare_frame_for_h264(
     frame: CapturedFrame,
     profile: &MediaProfile,
 ) -> Result<CapturedFrame> {
+    let (target_width, target_height) = h264_target_dimensions(frame.width, frame.height, profile);
+    prepare_frame_at_dimensions(frame, target_width, target_height)
+}
+
+/// WAN transport metadata and input coordinates use the entire approved frame.
+/// Scale the full source extent, including when its aspect ratio differs.
+pub(crate) fn prepare_exact_frame_for_h264(
+    frame: CapturedFrame,
+    profile: &MediaProfile,
+) -> Result<CapturedFrame> {
+    if !(2..=7680).contains(&profile.width)
+        || !(2..=4320).contains(&profile.height)
+        || !profile.width.is_multiple_of(2)
+        || !profile.height.is_multiple_of(2)
+    {
+        anyhow::bail!("invalid exact H264 capture dimensions");
+    }
+    prepare_frame_at_dimensions(frame, profile.width as usize, profile.height as usize)
+}
+
+fn prepare_frame_at_dimensions(
+    frame: CapturedFrame,
+    target_width: usize,
+    target_height: usize,
+) -> Result<CapturedFrame> {
     if frame.width < 2 || frame.height < 2 {
         anyhow::bail!(
             "captured frame is too small: {}x{}",
@@ -33,8 +58,6 @@ pub(crate) fn prepare_frame_for_h264(
             frame.height
         );
     }
-
-    let (target_width, target_height) = h264_target_dimensions(frame.width, frame.height, profile);
 
     #[cfg(target_os = "macos")]
     if frame.macos_cv_pixel_buffer().is_some() {
@@ -506,6 +529,36 @@ fn read_captured_rgb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_wan_frame_scaling_preserves_full_display_coordinates_and_lan_aspect_policy() {
+        let profile = MediaProfile {
+            width: 4,
+            height: 2,
+            ..MediaProfile::default()
+        };
+        let source = || {
+            let data = (0..4)
+                .flat_map(|y| (0..2).flat_map(move |x| [x, y, 77, 255]))
+                .collect();
+            CapturedFrame::from_cpu(2, 4, FramePixelFormat::Bgra32, 42, data)
+        };
+        let exact = prepare_exact_frame_for_h264(source(), &profile).unwrap();
+        assert_eq!((exact.width, exact.height, exact.timestamp_us), (4, 2, 42));
+        assert_eq!(&exact.data[..3], &[77, 0, 0]);
+        assert_eq!(&exact.data[9..12], &[77, 0, 1]);
+        assert_eq!(&exact.data[21..24], &[77, 2, 1]);
+        let lan = prepare_frame_for_h264(source(), &profile).unwrap();
+        assert_eq!((lan.width, lan.height), (2, 2));
+        assert!(prepare_exact_frame_for_h264(
+            source(),
+            &MediaProfile {
+                width: 3,
+                ..profile
+            }
+        )
+        .is_err());
+    }
 
     #[test]
     fn i420_to_rgb24_converts_decoder_planes_to_rgb_pixels() {

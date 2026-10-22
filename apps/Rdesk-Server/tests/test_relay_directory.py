@@ -596,6 +596,22 @@ def relay_service_fixture():
         id="device-7", name="target", device_id="device-public-7", os="linux",
         is_bound=True, bound_user_id=owner.id, tenant_id="tenant-a",
     )
+    requester_device = Device(
+        id="requester-device", name="requester", device_id="requester-device-public",
+        os="linux", is_bound=True, bound_user_id=requester.id, tenant_id="tenant-a",
+    )
+    user_device = Device(
+        id="device-for-user-42", name="requester-test", device_id="device-for-user-42-public",
+        os="linux", is_bound=True, bound_user_id=requester.id, tenant_id="tenant-a",
+    )
+    owner_device = Device(
+        id="device-for-owner-9", name="owner-test", device_id="device-for-owner-9-public",
+        os="linux", is_bound=True, bound_user_id=owner.id, tenant_id="tenant-a",
+    )
+    legacy_device = Device(
+        id="legacy-caller-device", name="legacy-caller", device_id="legacy-caller-public",
+        os="linux", is_bound=True, bound_user_id=requester.id, tenant_id="tenant-a",
+    )
     grant = SessionRequest(
         id="session-7", requester_user_id=requester.id, target_device_id=device.id,
         signaling_room="room-7", tenant_id="tenant-a", status="approved",
@@ -605,7 +621,10 @@ def relay_service_fixture():
         relay_preferred_regions=["ap-east", "eu-west"],
         relay_accepted_transports=["udp", "tcp", "tls"],
     )
-    session.add_all([requester, owner, device, grant])
+    session.add_all([
+        requester, owner, device, requester_device, user_device, owner_device,
+        legacy_device, grant,
+    ])
     for index, (node_id, region, domain) in enumerate(
         (("relay-a", "ap-east", "rack-a"), ("relay-b", "eu-west", "rack-b"))
     ):

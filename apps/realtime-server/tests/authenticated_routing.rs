@@ -87,6 +87,7 @@ fn token(device: &TestDevice, role: BackendRole, expires_at_ms: u64) -> Verified
         device_key_id: device.identity.key_id().into(),
         role,
         expires_at_ms,
+        browser: None,
     }
 }
 
@@ -333,6 +334,7 @@ fn register_requires_challenge_key_proof_and_unexpired_backend_token() {
             device_key_id: "victim-key-id".into(),
             role: BackendRole::Controller,
             expires_at_ms: NOW + 10_000,
+            browser: None,
         },
     );
     let mut guarded = RealtimeCore::new(config(), Arc::new(tokens)).unwrap();
@@ -493,6 +495,82 @@ fn v3_initial_all_five_messages_route_unchanged_only_to_the_signed_peer() {
         NOW + 6,
     );
     assert_eq!(core.route_count(), 1);
+}
+
+#[test]
+fn authenticated_peers_control_each_other_only_after_separate_target_grants() {
+    let peer: BackendRole = serde_json::from_str("\"Peer\"").unwrap();
+    let mut first = TestDevice::new("peer-first", 61);
+    let mut second = TestDevice::new("peer-second", 62);
+    let mut core = core_with(&[(&first, peer.clone()), (&second, peer.clone())]);
+    register(&mut core, &mut first, peer.clone());
+    register(&mut core, &mut second, peer);
+    for reverse in [false, true] {
+        let (controller, target, id) = if reverse {
+            (&mut second, &mut first, "peer-reverse")
+        } else {
+            (&mut first, &mut second, "peer-forward")
+        };
+        let intent = signed_intent_v3(controller, target, id, [44; 16]);
+        assert_routes_to(
+            &mut core,
+            controller.connection_id,
+            target.connection_id,
+            AuthenticatedSignalMessage::SessionIntentV3(intent.clone()),
+            NOW + 2,
+        );
+        let early_offer = signed_offer_v3(
+            controller,
+            target.device_id.clone(),
+            id,
+            "a".repeat(64),
+            vec!["b".repeat(64)],
+        );
+        assert!(core
+            .handle(
+                controller.connection_id,
+                SignalEnvelope::new(AuthenticatedSignalMessage::WebrtcOfferV3(early_offer)),
+                NOW + 3
+            )
+            .is_err());
+        let grant = signed_grant_v3(target, controller, &intent);
+        assert_routes_to(
+            &mut core,
+            target.connection_id,
+            controller.connection_id,
+            AuthenticatedSignalMessage::SessionGrantV3(grant.clone()),
+            NOW + 4,
+        );
+        let offer = signed_offer_v3(
+            controller,
+            target.device_id.clone(),
+            id,
+            grant.commitment().unwrap(),
+            vec!["b".repeat(64)],
+        );
+        assert_routes_to(
+            &mut core,
+            controller.connection_id,
+            target.connection_id,
+            AuthenticatedSignalMessage::WebrtcOfferV3(offer),
+            NOW + 5,
+        );
+        let answer = signed_answer_v3(
+            target,
+            controller,
+            id,
+            grant.commitment().unwrap(),
+            vec!["c".repeat(64)],
+        );
+        assert_routes_to(
+            &mut core,
+            target.connection_id,
+            controller.connection_id,
+            AuthenticatedSignalMessage::WebrtcAnswerV3(answer),
+            NOW + 6,
+        );
+    }
+    assert_eq!(core.route_count(), 2);
 }
 
 #[test]

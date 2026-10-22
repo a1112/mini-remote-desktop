@@ -1339,6 +1339,19 @@ fn parse_probe_evidence(
 }
 
 fn valid_candidate_id(value: &str) -> bool {
+    // webrtc-ice emits RFC 5245 candidate:<foundation> identifiers. The
+    // foundation's exact ICE alphabet includes '+' and '/'; these identifiers
+    // are opaque proof fields and are never filesystem paths or commands.
+    if let Some(foundation) = value.strip_prefix("candidate:") {
+        if !foundation.is_empty()
+            && foundation.len() <= 32
+            && foundation
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+        {
+            return true;
+        }
+    }
     !value.is_empty()
         && value.len() <= 128
         && value.is_ascii()

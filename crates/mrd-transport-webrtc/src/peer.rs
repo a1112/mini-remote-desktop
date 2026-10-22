@@ -51,7 +51,7 @@ use crate::{
         ControlChannels, ControlLane, ControlState, QueuedBytes, BULK_LABEL, CTRL_REL_LABEL,
         CTRL_RT_LABEL,
     },
-    stats::selected_candidate_pair,
+    stats::{probe_traffic_observation, selected_candidate_pair, ProbeTrafficObservation},
     turn_stream::TurnStreamBridgeOwner,
     H264RtpIngress, H264RtpSender, SelectedCandidatePairStats, TransportError,
 };
@@ -797,6 +797,11 @@ struct PhysicalSnapshot {
     control: Arc<ControlState>,
     active_tasks: Arc<AtomicUsize>,
     h264_sender: Arc<Mutex<H264RtpSender>>,
+}
+
+pub(crate) struct ProbeTrafficCheckpoint {
+    pc: Arc<RTCPeerConnection>,
+    observation: ProbeTrafficObservation,
 }
 
 struct PartialPhysicalPeer {
@@ -1830,6 +1835,46 @@ impl WebRtcPeerConnection {
     async fn selected_candidate_pair_stats_physical(&self) -> Option<SelectedCandidatePairStats> {
         let pc = self.physical_snapshot().ok()?.pc;
         selected_candidate_pair(pc.get_stats().await)
+    }
+
+    pub(crate) async fn probe_traffic_checkpoint(
+        &self,
+    ) -> Result<ProbeTrafficCheckpoint, TransportError> {
+        self.wait_for_channel(ControlLane::Reliable).await?;
+        if self.active_route().is_some() {
+            return Err(TransportError::Message(
+                "probe physical route changed".into(),
+            ));
+        }
+        let pc = self.physical_snapshot()?.pc;
+        let observation = probe_traffic_observation(pc.get_stats().await).ok_or_else(|| {
+            TransportError::Message("probe traffic checkpoint is incomplete".into())
+        })?;
+        if self.active_route().is_some() || !Arc::ptr_eq(&pc, &self.physical_snapshot()?.pc) {
+            return Err(TransportError::Message(
+                "probe physical route changed".into(),
+            ));
+        }
+        Ok(ProbeTrafficCheckpoint { pc, observation })
+    }
+
+    pub(crate) async fn measured_probe_pair_since(
+        &self,
+        before: &ProbeTrafficCheckpoint,
+        payload_bytes: usize,
+    ) -> Result<SelectedCandidatePairStats, TransportError> {
+        let after = self.probe_traffic_checkpoint().await?;
+        if !Arc::ptr_eq(&before.pc, &after.pc) {
+            return Err(TransportError::Message(
+                "probe physical peer changed".into(),
+            ));
+        }
+        after
+            .observation
+            .measured_since(&before.observation, payload_bytes)
+            .ok_or_else(|| {
+                TransportError::Message("probe traffic counters or selected pair changed".into())
+            })
     }
 
     pub fn active_task_count(&self) -> usize {

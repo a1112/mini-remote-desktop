@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from app.api.v1.turn import (
 )
 from app.core.security import get_current_user
 from app.core.response_security import SensitiveResponseCacheMiddleware
+from app.db.session import get_db
 from app.services.turn_credentials import (
     NodeTurnCredentialService,
     TurnCredentialExpired,
@@ -47,9 +49,21 @@ def app(*, authenticated: bool, legacy_enabled: bool = False) -> FastAPI:
         test_app.dependency_overrides[require_legacy_turn_credentials_enabled] = lambda: None
     if authenticated:
         test_app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(
-            id="user-42"
+            id="user-42", tenant_id="tenant-a"
         )
+        test_app.dependency_overrides[get_db] = lambda: _GrantDb()
     return test_app
+
+
+class _GrantDb:
+    async def scalar(self, _query: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            status="approved",
+            requester_user_id="user-42",
+            tenant_id="tenant-a",
+            grant_expires_at=datetime.fromtimestamp(NOW + 600, UTC),
+            policy_expires_at=datetime.fromtimestamp(NOW + 600, UTC),
+        )
 
 
 def test_sensitive_cache_middleware_does_not_disable_ordinary_api_caching():

@@ -12,14 +12,22 @@ pub struct ControlInputResult {
     pub event_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg(any(target_os = "macos", test))]
 pub struct ControlInputTargetGeometry {
     pub frame_width: u32,
     pub frame_height: u32,
-    pub source_width: u32,
-    pub source_height: u32,
-    pub origin_x: i32,
-    pub origin_y: i32,
+    pub source_width: f64,
+    pub source_height: f64,
+    pub origin_x: f64,
+    pub origin_y: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg(any(target_os = "macos", test))]
+struct MacosInputTargetBinding {
+    source: mrd_ipc::CaptureSource,
+    profile: mrd_ipc::MediaProfileNegotiation,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -116,6 +124,57 @@ impl ControlInputRegistry {
         event: &ControlInputEvent,
     ) -> Result<ControlInputResult, InputError> {
         self.handle_event_inner(Some(session_id), event, Some(scope))
+    }
+
+    #[cfg(any(windows, test))]
+    fn begin_agent_event(
+        &mut self,
+        session_id: &SessionId,
+        event: &ControlInputEvent,
+    ) -> Result<bool, InputError> {
+        let lane = input_lane(event);
+        counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).accepted_messages += 1;
+        if self.migration_frozen_sessions.contains(session_id)
+            && !matches!(event, ControlInputEvent::ReleaseAll)
+        {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane).dropped_messages +=
+                1;
+            return Err(InputError::InvalidEvent(
+                "control input is frozen during relay migration".into(),
+            ));
+        }
+        if self.should_coalesce_realtime_event(Some(session_id), event) {
+            counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane)
+                .coalesced_messages += 1;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(windows, test))]
+    fn finish_agent_event(
+        &mut self,
+        session_id: &SessionId,
+        scope: ControlInputScope,
+        event: &ControlInputEvent,
+        result: Result<u32, InputError>,
+    ) -> Result<ControlInputResult, InputError> {
+        let lane = input_lane(event);
+        match result {
+            Ok(event_count) => {
+                self.record_successful_realtime_event(Some(session_id), event, Some(scope));
+                let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
+                counter.injected_messages += u64::from(event_count);
+                counter.last_error = None;
+                Ok(ControlInputResult { lane, event_count })
+            }
+            Err(error) => {
+                let counter = counter_for_lane_mut(&mut self.reliable, &mut self.realtime, lane);
+                counter.failed_messages += 1;
+                counter.last_error = Some(error.to_string());
+                Err(error)
+            }
+        }
     }
 
     fn handle_event_inner(
@@ -321,6 +380,7 @@ impl ControlInputRegistry {
             self.last_realtime_mouse_move_by_session.remove(session_id);
         }
         let Some(state) = self.pressed_by_session.get(session_id) else {
+            self.reset_input_if_idle();
             return Ok(0);
         };
         let buttons = if scope == ControlInputScope::Pointer {
@@ -342,7 +402,16 @@ impl ControlInputRegistry {
             released =
                 released.saturating_add(self.transition_session_key(session_id, key, false)?);
         }
+        self.reset_input_if_idle();
         Ok(released)
+    }
+
+    fn reset_input_if_idle(&mut self) {
+        // Native cursor/click/lock state must not leak into the next session.
+        // Keep it intact while any other session still owns a pressed input.
+        if self.button_holder_counts.is_empty() && self.key_holder_counts.is_empty() {
+            self.injector.reset_idle_state();
+        }
     }
 
     pub(crate) fn release_session_all(
@@ -451,6 +520,233 @@ impl Default for ControlInputRegistry {
     }
 }
 
+/// Network receivers call this only while their authorization gate is held and
+/// after validating the signed envelope, lane, scope, replay counter and expiry.
+pub(crate) async fn apply_authenticated_input(
+    state: &crate::AppState,
+    session_id: &SessionId,
+    scope: ControlInputScope,
+    _remote_sequence: u64,
+    remote_expires_at_ms: u64,
+    event: &ControlInputEvent,
+) -> Result<ControlInputResult, InputError> {
+    ensure_input_not_expired(remote_expires_at_ms)?;
+    #[cfg(target_os = "macos")]
+    let (mapped_event, target_binding) =
+        map_authenticated_macos_input(state, session_id, remote_expires_at_ms, event).await?;
+    #[cfg(target_os = "macos")]
+    let event = &mapped_event;
+    #[cfg(target_os = "macos")]
+    let _target_guards = if let Some(binding) = target_binding.as_ref() {
+        // Keep the existing profiles -> sources lock order. Retain both
+        // guards while waiting for input and through synchronous injection.
+        let profiles = state.media_profiles.lock().await;
+        ensure_input_not_expired(remote_expires_at_ms)?;
+        let sources = state.capture_sources.lock().await;
+        ensure_input_not_expired(remote_expires_at_ms)?;
+        if sources
+            .get(session_id)
+            .as_ref()
+            .map(|selection| &selection.source)
+            != Some(&binding.source)
+            || profiles.get(session_id).as_ref() != Some(&binding.profile)
+        {
+            return Err(InputError::InvalidEvent(
+                "pointer input target changed before application".into(),
+            ));
+        }
+        Some((profiles, sources))
+    } else {
+        None
+    };
+    let registry = state.control_input();
+    let mut registry = registry.lock().await;
+    // Native geometry queries and registry contention can take longer than the
+    // signed event's remaining lifetime. Recheck after every asynchronous wait.
+    ensure_input_not_expired(remote_expires_at_ms)?;
+    #[cfg(windows)]
+    if state.console_capture.is_enabled() {
+        // Keep this lock until the Agent acknowledges application. A migration
+        // freeze must wait for in-flight input before releasing its resources.
+        if !registry.begin_agent_event(session_id, event)? {
+            return Ok(ControlInputResult {
+                lane: input_lane(event),
+                event_count: 0,
+            });
+        }
+        let remote_scope = match scope {
+            ControlInputScope::Pointer => mrd_ipc::RemotePermissionScope::InputPointer,
+            ControlInputScope::Keyboard => mrd_ipc::RemotePermissionScope::InputKeyboard,
+        };
+        let result = state
+            .console_capture
+            .apply_input(
+                state,
+                session_id,
+                remote_scope,
+                _remote_sequence,
+                remote_expires_at_ms,
+                agent_event(event),
+            )
+            .await
+            .map(|ack| u32::from(ack.is_some()))
+            .map_err(|_| {
+                InputError::Unavailable("approved desktop Agent did not apply input".into())
+            });
+        return registry.finish_agent_event(session_id, scope, event, result);
+    }
+    registry.handle_authenticated_session_event(session_id, scope, event)
+}
+
+fn ensure_input_not_expired(remote_expires_at_ms: u64) -> Result<(), InputError> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| InputError::Unavailable("input clock unavailable".into()))?
+        .as_millis();
+    if now_ms >= u128::from(remote_expires_at_ms) {
+        return Err(InputError::InvalidEvent(
+            "signed input event expired before application".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+async fn map_authenticated_macos_input(
+    state: &crate::AppState,
+    session_id: &SessionId,
+    remote_expires_at_ms: u64,
+    event: &ControlInputEvent,
+) -> Result<(ControlInputEvent, Option<MacosInputTargetBinding>), InputError> {
+    if !matches!(event, ControlInputEvent::MouseMove { .. }) {
+        return Ok((event.clone(), None));
+    }
+    // Use the same registry lock order as LAN session commits. The negotiated
+    // profile describes decoded video pixels, not capture backing pixels.
+    let (source, profile) = {
+        let profiles = state.media_profiles.lock().await;
+        let sources = state.capture_sources.lock().await;
+        let source = sources
+            .get(session_id)
+            .ok_or_else(|| {
+                InputError::InvalidEvent("pointer input has no selected capture source".into())
+            })?
+            .source;
+        let profile = profiles.get(session_id).ok_or_else(|| {
+            InputError::InvalidEvent("pointer input has no negotiated media profile".into())
+        })?;
+        validate_macos_pointer_profile(&source.id, &profile)?;
+        (source, profile)
+    };
+    let query_source = source.clone();
+    let bounds = tokio::task::spawn_blocking(move || {
+        crate::capture_source::macos_input_bounds(&query_source)
+    })
+    .await
+    .map_err(|_| InputError::Unavailable("macOS capture bounds query failed".into()))?
+    .map_err(|error| InputError::InvalidEvent(error.to_string()))?;
+    ensure_input_not_expired(remote_expires_at_ms)?;
+    // A target switch while Quartz was queried invalidates this event. Never
+    // apply geometry from one selected source to another source's video frame.
+    {
+        let profiles = state.media_profiles.lock().await;
+        let sources = state.capture_sources.lock().await;
+        if sources
+            .get(session_id)
+            .as_ref()
+            .map(|selection| &selection.source)
+            != Some(&source)
+            || profiles.get(session_id).as_ref() != Some(&profile)
+        {
+            return Err(InputError::InvalidEvent(
+                "pointer input target changed before application".into(),
+            ));
+        }
+    }
+    let mapped_event = map_control_input_event_for_target_geometry(
+        event,
+        Some(ControlInputTargetGeometry {
+            frame_width: profile.selected.width,
+            frame_height: profile.selected.height,
+            source_width: bounds.width,
+            source_height: bounds.height,
+            origin_x: bounds.origin_x,
+            origin_y: bounds.origin_y,
+        }),
+    )?;
+    Ok((
+        mapped_event,
+        Some(MacosInputTargetBinding { source, profile }),
+    ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_pointer_profile(
+    source_id: &str,
+    profile: &mrd_ipc::MediaProfileNegotiation,
+) -> Result<(), InputError> {
+    if profile.selected_source_id.as_deref() != Some(source_id)
+        || profile.selected.width == 0
+        || profile.selected.height == 0
+        || profile
+            .selected_width
+            .is_some_and(|width| width != profile.selected.width)
+        || profile
+            .selected_height
+            .is_some_and(|height| height != profile.selected.height)
+    {
+        return Err(InputError::InvalidEvent(
+            "pointer input media profile does not match the selected capture source".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn release_authenticated_input(state: &crate::AppState, session_id: &SessionId) {
+    let registry = state.control_input();
+    let mut registry = registry.lock().await;
+    #[cfg(windows)]
+    if state.console_capture.is_enabled() {
+        if state
+            .console_capture
+            .stop_input(state, session_id)
+            .await
+            .is_err()
+        {
+            tracing::warn!(session_id = %session_id.0, "desktop Agent input cleanup failed");
+        }
+    }
+    let _ = registry.release_session_all(session_id);
+}
+
+#[cfg(windows)]
+fn agent_event(event: &ControlInputEvent) -> mrd_agent_ipc::InputEventPayload {
+    use mrd_agent_ipc::{InputButton as Button, InputEventPayload as Event, InputKey as Key};
+    match *event {
+        ControlInputEvent::MouseMove { x, y } => Event::MouseMove { x, y },
+        ControlInputEvent::MouseWheel { delta } => Event::MouseWheel { delta },
+        ControlInputEvent::MouseHorizontalWheel { delta } => Event::MouseHorizontalWheel { delta },
+        ControlInputEvent::MouseButton { button, pressed } => Event::MouseButton {
+            button: match button {
+                ControlInputButton::Left => Button::Left,
+                ControlInputButton::Right => Button::Right,
+                ControlInputButton::Middle => Button::Middle,
+                ControlInputButton::X1 => Button::X1,
+                ControlInputButton::X2 => Button::X2,
+            },
+            pressed,
+        },
+        ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code },
+            pressed,
+        } => Event::Key {
+            key: Key::VirtualKey { code },
+            pressed,
+        },
+        ControlInputEvent::ReleaseAll => Event::ReleaseAll,
+    }
+}
+
 fn input_lane(event: &ControlInputEvent) -> ControlInputLane {
     match event {
         ControlInputEvent::MouseMove { .. }
@@ -496,77 +792,60 @@ fn lane_snapshot(
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub fn map_control_input_event_for_target_geometry(
     event: &ControlInputEvent,
     geometry: Option<ControlInputTargetGeometry>,
-) -> ControlInputEvent {
-    let Some(geometry) = geometry else {
-        return event.clone();
-    };
+) -> Result<ControlInputEvent, InputError> {
     match *event {
         ControlInputEvent::MouseMove { x, y } => {
+            let geometry = geometry.ok_or_else(|| {
+                InputError::InvalidEvent("pointer input has no target geometry".into())
+            })?;
             let x = scale_target_coordinate(
                 x,
                 geometry.frame_width,
                 geometry.source_width,
                 geometry.origin_x,
-            );
+            )?;
             let y = scale_target_coordinate(
                 y,
                 geometry.frame_height,
                 geometry.source_height,
                 geometry.origin_y,
-            );
-            ControlInputEvent::MouseMove { x, y }
+            )?;
+            Ok(ControlInputEvent::MouseMove { x, y })
         }
-        _ => event.clone(),
+        _ => Ok(event.clone()),
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn scale_target_coordinate(
     coordinate: i32,
     frame_extent: u32,
-    source_extent: u32,
-    origin: i32,
-) -> i32 {
-    if frame_extent == 0 || source_extent == 0 {
-        return coordinate;
+    source_extent: f64,
+    origin: f64,
+) -> Result<i32, InputError> {
+    let end = origin + source_extent;
+    let first = origin.ceil();
+    let last = end.ceil() - 1.0;
+    if frame_extent == 0
+        || !origin.is_finite()
+        || !source_extent.is_finite()
+        || source_extent <= 0.0
+        || !end.is_finite()
+        || first > last
+        || first < f64::from(i32::MIN)
+        || last > f64::from(i32::MAX)
+    {
+        return Err(InputError::InvalidEvent(
+            "pointer input target geometry is invalid".into(),
+        ));
     }
-    let scaled = i64::from(coordinate) * i64::from(source_extent) / i64::from(frame_extent);
-    let max_source = i64::from(source_extent.saturating_sub(1));
-    let bounded = scaled.clamp(0, max_source) + i64::from(origin);
-    bounded.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
-pub(crate) async fn map_session_pointer(
-    state: &crate::AppState,
-    session: &SessionId,
-    event: &ControlInputEvent,
-) -> Result<ControlInputEvent, InputError> {
-    #[cfg(target_os = "macos")]
-    if matches!(event, ControlInputEvent::MouseMove { .. }) {
-        let profile = state.media_profiles.lock().await.get(session);
-        if let Some(profile) = profile {
-            let source = state.capture_sources.lock().await.get(session);
-            let bounds = mrd_input::macos::capture_bounds(
-                source.as_ref().map(|source| source.source.id.as_str()),
-            )?;
-            return Ok(map_control_input_event_for_target_geometry(
-                event,
-                Some(ControlInputTargetGeometry {
-                    frame_width: profile.selected.width,
-                    frame_height: profile.selected.height,
-                    source_width: bounds.size.width.round() as u32,
-                    source_height: bounds.size.height.round() as u32,
-                    origin_x: bounds.origin.x.round() as i32,
-                    origin_y: bounds.origin.y.round() as i32,
-                }),
-            ));
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = (state, session);
-    Ok(event.clone())
+    let coordinate = f64::from(coordinate).clamp(0.0, f64::from(frame_extent));
+    let mapped = origin + coordinate * source_extent / f64::from(frame_extent);
+    Ok(mapped.round().clamp(first, last) as i32)
 }
 
 fn input_event_from_ipc(event: &ControlInputEvent) -> Result<InputEvent, InputError> {
@@ -610,6 +889,153 @@ fn input_key_from_ipc(key: ControlInputKey) -> InputKey {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[test]
+    fn native_idle_reset_preserves_other_sessions_pressed_input() {
+        struct IdleResetRecorder(Arc<std::sync::atomic::AtomicUsize>);
+        impl InputInjector for IdleResetRecorder {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn inject(&mut self, _: &InputEvent) -> Result<(), InputError> {
+                Ok(())
+            }
+            fn reset_idle_state(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = ControlInputRegistry::with_injector(IdleResetRecorder(resets.clone()));
+        let first = SessionId("first".into());
+        let second = SessionId("second".into());
+        let down = ControlInputEvent::Key {
+            key: ControlInputKey::VirtualKey { code: 0x41 },
+            pressed: true,
+        };
+        registry.handle_session_event(&first, &down).unwrap();
+        registry.handle_session_event(&second, &down).unwrap();
+        registry.release_session_all(&first).unwrap();
+        assert_eq!(resets.load(std::sync::atomic::Ordering::SeqCst), 0);
+        registry.release_session_all(&second).unwrap();
+        let idle_resets = resets.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(idle_resets > 0);
+        // A session with only pointer motion has no pressed-state entry, but
+        // still leaves native cursor/click state that cleanup must discard.
+        registry
+            .handle_session_event(&first, &ControlInputEvent::MouseMove { x: 10, y: 20 })
+            .unwrap();
+        registry.release_session_all(&first).unwrap();
+        assert!(resets.load(std::sync::atomic::Ordering::SeqCst) > idle_resets);
+    }
+
+    #[tokio::test]
+    async fn input_expiring_while_waiting_for_registry_never_reaches_injector() {
+        let state = Arc::new(crate::AppState::new());
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        state
+            .replace_control_input_for_test(SharedRecordingInputInjector {
+                events: recorded.clone(),
+            })
+            .await;
+        let registry = state.control_input();
+        let held = registry.lock().await;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 30;
+        let pending_state = state.clone();
+        let pending = tokio::spawn(async move {
+            apply_authenticated_input(
+                &pending_state,
+                &SessionId("queued-expired".into()),
+                ControlInputScope::Pointer,
+                1,
+                deadline,
+                &ControlInputEvent::MouseWheel { delta: 120 },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        assert!(pending.await.unwrap().is_err());
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn resident_input_without_approved_agent_never_falls_back_to_session_zero() {
+        let state = crate::AppState::new();
+        state.bind_console_capture_issuer(Arc::new(
+            crate::agent_runtime::ExecuteGrantIssuer::from_seed([53; 32]).unwrap(),
+        ));
+        let recorded = Arc::new(StdMutex::new(Vec::new()));
+        state
+            .replace_control_input_for_test(SharedRecordingInputInjector {
+                events: recorded.clone(),
+            })
+            .await;
+        let result = apply_authenticated_input(
+            &state,
+            &SessionId("unapproved-agent".into()),
+            ControlInputScope::Pointer,
+            1,
+            u64::MAX,
+            &ControlInputEvent::MouseMove { x: 25, y: 50 },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(recorded.lock().unwrap().is_empty());
+        assert_eq!(
+            state.control_input().lock().await.injected_message_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_input_counts_only_applied_ack_and_never_calls_local_injector() {
+        let mut registry = ControlInputRegistry::with_injector(
+            mrd_input::UnsupportedInputInjector::new("Session 0 must not inject"),
+        );
+        let session_id = SessionId("agent-applied".into());
+        let event = ControlInputEvent::MouseMove { x: 123, y: 456 };
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        assert_eq!(registry.injected_message_count(), 0);
+        registry
+            .finish_agent_event(&session_id, ControlInputScope::Pointer, &event, Ok(1))
+            .unwrap();
+        assert_eq!(registry.injected_message_count(), 1);
+        assert!(!registry.begin_agent_event(&session_id, &event).unwrap());
+        assert_eq!(registry.snapshot(session_id).realtime.coalesced_messages, 1);
+    }
+
+    #[test]
+    fn failed_agent_ack_does_not_coalesce_retry_and_migration_stays_frozen() {
+        let mut registry = ControlInputRegistry::with_injector(
+            mrd_input::UnsupportedInputInjector::new("Session 0 must not inject"),
+        );
+        let session_id = SessionId("agent-failed".into());
+        let event = ControlInputEvent::MouseMove { x: 12, y: 34 };
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        assert!(registry
+            .finish_agent_event(
+                &session_id,
+                ControlInputScope::Pointer,
+                &event,
+                Err(InputError::Unavailable(
+                    "Agent acknowledgement missing".into()
+                ))
+            )
+            .is_err());
+        assert!(registry.begin_agent_event(&session_id, &event).unwrap());
+        registry.freeze_session_for_migration(&session_id).unwrap();
+        assert!(registry.begin_agent_event(&session_id, &event).is_err());
+        assert!(registry
+            .begin_agent_event(&session_id, &ControlInputEvent::ReleaseAll)
+            .unwrap());
+        assert_eq!(registry.injected_message_count(), 0);
+        assert_eq!(registry.snapshot(session_id).realtime.failed_messages, 1);
+    }
 
     #[derive(Clone)]
     struct SharedRecordingInputInjector {
@@ -868,12 +1294,13 @@ mod tests {
             Some(ControlInputTargetGeometry {
                 frame_width: 1280,
                 frame_height: 720,
-                source_width: 2560,
-                source_height: 1440,
-                origin_x: 0,
-                origin_y: 0,
+                source_width: 2560.0,
+                source_height: 1440.0,
+                origin_x: 0.0,
+                origin_y: 0.0,
             }),
-        );
+        )
+        .unwrap();
 
         assert_eq!(event, ControlInputEvent::MouseMove { x: 1280, y: 720 });
     }
@@ -885,12 +1312,13 @@ mod tests {
             Some(ControlInputTargetGeometry {
                 frame_width: 1280,
                 frame_height: 720,
-                source_width: 2560,
-                source_height: 1440,
-                origin_x: 1920,
-                origin_y: -120,
+                source_width: 2560.0,
+                source_height: 1440.0,
+                origin_x: 1920.0,
+                origin_y: -120.0,
             }),
-        );
+        )
+        .unwrap();
 
         assert_eq!(event, ControlInputEvent::MouseMove { x: 4479, y: 1319 });
     }
@@ -908,14 +1336,201 @@ mod tests {
                 Some(ControlInputTargetGeometry {
                     frame_width: 1280,
                     frame_height: 720,
-                    source_width: 2560,
-                    source_height: 1440,
-                    origin_x: 1920,
-                    origin_y: 0,
+                    source_width: 2560.0,
+                    source_height: 1440.0,
+                    origin_x: 1920.0,
+                    origin_y: 0.0,
                 }),
-            ),
+            )
+            .unwrap(),
             event
         );
+    }
+
+    #[test]
+    fn macos_retina_frame_pixels_map_to_logical_points_with_negative_origin() {
+        let geometry = Some(ControlInputTargetGeometry {
+            frame_width: 3840,
+            frame_height: 2160,
+            source_width: 1920.0,
+            source_height: 1080.0,
+            origin_x: -1920.0,
+            origin_y: -120.0,
+        });
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &ControlInputEvent::MouseMove { x: 1920, y: 1080 },
+                geometry,
+            )
+            .unwrap(),
+            ControlInputEvent::MouseMove { x: -960, y: 420 },
+        );
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &ControlInputEvent::MouseMove { x: 3839, y: 2159 },
+                geometry,
+            )
+            .unwrap(),
+            ControlInputEvent::MouseMove { x: -1, y: 959 },
+        );
+    }
+
+    #[test]
+    fn macos_scaled_window_frame_maps_to_global_bounds_without_y_flip() {
+        let geometry = Some(ControlInputTargetGeometry {
+            frame_width: 640,
+            frame_height: 360,
+            source_width: 1280.0,
+            source_height: 720.0,
+            origin_x: -100.5,
+            origin_y: 200.25,
+        });
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &ControlInputEvent::MouseMove { x: 320, y: 90 },
+                geometry,
+            )
+            .unwrap(),
+            ControlInputEvent::MouseMove { x: 540, y: 380 },
+        );
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &ControlInputEvent::MouseMove {
+                    x: i32::MIN,
+                    y: i32::MAX
+                },
+                geometry,
+            )
+            .unwrap(),
+            ControlInputEvent::MouseMove { x: -100, y: 920 },
+        );
+    }
+
+    #[test]
+    fn pointer_geometry_rejects_missing_degenerate_and_nonfinite_bounds() {
+        let event = ControlInputEvent::MouseMove { x: 1, y: 2 };
+        assert!(map_control_input_event_for_target_geometry(&event, None).is_err());
+        let valid = ControlInputTargetGeometry {
+            frame_width: 1920,
+            frame_height: 1080,
+            source_width: 1920.0,
+            source_height: 1080.0,
+            origin_x: 0.0,
+            origin_y: 0.0,
+        };
+        for geometry in [
+            ControlInputTargetGeometry {
+                frame_width: 0,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                frame_height: 0,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                source_width: 0.0,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                source_height: -1.0,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                source_width: f64::NAN,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                origin_y: f64::INFINITY,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                source_width: f64::MAX,
+                origin_x: f64::MAX,
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                origin_x: f64::from(i32::MAX),
+                ..valid
+            },
+            ControlInputTargetGeometry {
+                origin_x: 0.1,
+                source_width: 0.1,
+                ..valid
+            },
+        ] {
+            assert!(
+                map_control_input_event_for_target_geometry(&event, Some(geometry)).is_err(),
+                "{geometry:?}"
+            );
+        }
+        // Single-pixel video and single-point geometry are valid endpoints.
+        assert_eq!(
+            map_control_input_event_for_target_geometry(
+                &event,
+                Some(ControlInputTargetGeometry {
+                    frame_width: 1,
+                    frame_height: 1,
+                    source_width: 1.0,
+                    source_height: 1.0,
+                    origin_x: -30.0,
+                    origin_y: 40.0,
+                })
+            )
+            .unwrap(),
+            ControlInputEvent::MouseMove { x: -30, y: 40 }
+        );
+    }
+
+    #[test]
+    fn target_geometry_leaves_all_non_mouse_move_events_unchanged_without_geometry() {
+        for event in [
+            ControlInputEvent::MouseButton {
+                button: ControlInputButton::Left,
+                pressed: true,
+            },
+            ControlInputEvent::MouseWheel { delta: 120 },
+            ControlInputEvent::MouseHorizontalWheel { delta: -120 },
+            ControlInputEvent::Key {
+                key: ControlInputKey::VirtualKey { code: 0x41 },
+                pressed: true,
+            },
+            ControlInputEvent::ReleaseAll,
+        ] {
+            assert_eq!(
+                map_control_input_event_for_target_geometry(&event, None).unwrap(),
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn macos_pointer_requires_negotiated_profile_for_the_selected_source() {
+        let selected = mrd_ipc::MediaProfile {
+            width: 3840,
+            height: 2160,
+            ..Default::default()
+        };
+        let valid = mrd_ipc::MediaProfileNegotiation {
+            requested: selected.clone(),
+            selected,
+            status: "selected".into(),
+            reason: None,
+            selected_source_id: Some("macos:display:1".into()),
+            selected_width: Some(3840),
+            selected_height: Some(2160),
+            downgrade_reason: None,
+        };
+        assert!(validate_macos_pointer_profile("macos:display:1", &valid).is_ok());
+        assert!(validate_macos_pointer_profile("macos:display:2", &valid).is_err());
+        let mut invalid = valid.clone();
+        invalid.selected_source_id = None;
+        assert!(validate_macos_pointer_profile("macos:display:1", &invalid).is_err());
+        invalid = valid.clone();
+        invalid.selected.width = 0;
+        assert!(validate_macos_pointer_profile("macos:display:1", &invalid).is_err());
+        invalid = valid;
+        invalid.selected_height = Some(1080);
+        assert!(validate_macos_pointer_profile("macos:display:1", &invalid).is_err());
     }
 
     #[test]

@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod backend_token;
+pub mod persistent_identity;
 pub mod presence;
+pub mod presence_query;
 pub mod routes;
 pub mod ws;
 
@@ -12,10 +14,14 @@ use mrd_signal_proto::{
     SignalEnvelope, SignalProtocolError, SignalReplayGuard, VerifiedSignalMetadata,
     WebRtcDescriptionRoleV3,
 };
+use persistent_identity::{PersistentIdentityError, PersistentServerState, ServerSigningCounter};
 use presence::{PresenceEntry, PresenceError, PresenceRegistry};
 use ring::rand::{SecureRandom, SystemRandom};
 use routes::{AuthorizedRoutes, IntentDisposition, RouteError};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use thiserror::Error;
 
 pub use auth::{
@@ -87,11 +93,14 @@ pub struct RealtimeCore {
     config: CoreConfig,
     authenticator: Authenticator,
     server_identity: DeviceIdentity,
-    server_counter: u64,
+    server_counter: ServerSigningCounter,
     replay: SignalReplayGuard,
     presence: PresenceRegistry,
     routes: AuthorizedRoutes,
     rates: HashMap<ConnectionId, RateState>,
+    browser_revocations: HashMap<DeviceId, u64>,
+    terminating: HashSet<ConnectionId>,
+    pending_transport_closures: Vec<ConnectionId>,
 }
 
 impl std::fmt::Debug for RealtimeCore {
@@ -113,6 +122,29 @@ impl RealtimeCore {
         config.validate()?;
         let server_identity = DeviceIdentity::generate(&SystemRandom::new())
             .map_err(|_| RealtimeError::EntropyUnavailable)?;
+        Self::with_signing_state(
+            config,
+            token_verifier,
+            server_identity,
+            ServerSigningCounter::Ephemeral(1),
+        )
+    }
+
+    pub fn with_persistent_state(
+        config: CoreConfig,
+        token_verifier: Arc<dyn BackendTokenVerifier>,
+        state: PersistentServerState,
+    ) -> Result<Self, RealtimeError> {
+        Self::with_signing_state(config, token_verifier, state.identity, state.counter)
+    }
+
+    fn with_signing_state(
+        config: CoreConfig,
+        token_verifier: Arc<dyn BackendTokenVerifier>,
+        server_identity: DeviceIdentity,
+        server_counter: ServerSigningCounter,
+    ) -> Result<Self, RealtimeError> {
+        config.validate()?;
         Ok(Self {
             authenticator: Authenticator::new(
                 config.server_device_id.clone(),
@@ -122,11 +154,14 @@ impl RealtimeCore {
             ),
             config,
             server_identity,
-            server_counter: 1,
+            server_counter,
             replay: SignalReplayGuard::new(4_096, 2_048),
             presence: PresenceRegistry::default(),
             routes: AuthorizedRoutes::default(),
             rates: HashMap::new(),
+            browser_revocations: HashMap::new(),
+            terminating: HashSet::new(),
+            pending_transport_closures: Vec::new(),
         })
     }
 
@@ -167,6 +202,9 @@ impl RealtimeCore {
         now_ms: u64,
     ) -> Result<Vec<Delivery>, RealtimeError> {
         self.check_rate(connection_id, now_ms)?;
+        if self.terminating.contains(&connection_id) {
+            return Err(RealtimeError::InvalidConnection);
+        }
         envelope.validate_version()?;
         match &envelope.message {
             AuthenticatedSignalMessage::Register(register) => {
@@ -183,6 +221,7 @@ impl RealtimeCore {
         }
 
         let presence = self.registered_presence(connection_id, now_ms)?.clone();
+        self.authorize_browser_signal(&presence, &envelope.message)?;
         match &envelope.message {
             AuthenticatedSignalMessage::PresenceHeartbeat(heartbeat) => {
                 let metadata = heartbeat.verify_for(
@@ -209,7 +248,7 @@ impl RealtimeCore {
                 let metadata =
                     intent.verify_for(&request.target_device_id, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Controller {
+                if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let target = self
@@ -217,7 +256,7 @@ impl RealtimeCore {
                     .by_device(&request.target_device_id)
                     .ok_or(RealtimeError::TargetUnavailable)?
                     .clone();
-                if target.role != BackendRole::Agent {
+                if !target.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let disposition =
@@ -239,7 +278,7 @@ impl RealtimeCore {
                     &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Agent {
+                if !presence.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self
@@ -257,7 +296,7 @@ impl RealtimeCore {
                 let metadata =
                     offer.verify_for(&offer.payload.target_device_id, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Controller {
+                if !presence.role.has_capability(BackendRole::Controller) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -275,7 +314,7 @@ impl RealtimeCore {
                     &mut self.replay,
                 )?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != BackendRole::Agent {
+                if !presence.role.has_capability(BackendRole::Agent) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -297,7 +336,7 @@ impl RealtimeCore {
                 };
                 let metadata = candidate.verify_for(expected_peer, now_ms, &mut self.replay)?;
                 self.bind_sender(&presence, &metadata)?;
-                if presence.role != required_role {
+                if !presence.role.has_capability(required_role) {
                     return Err(RealtimeError::UnauthorizedRoute);
                 }
                 let peer = self.routes.resolve_granted(
@@ -380,13 +419,16 @@ impl RealtimeCore {
                     .routes
                     .close(&close.payload.session_id, &presence.device_id)?;
                 self.require_intended_peer(&metadata, &peer)?;
+                let peer_connection = self.connection_for(&peer)?;
+                self.revoke_closed_browser(&presence.device_id, now_ms);
+                self.revoke_closed_browser(&peer, now_ms);
                 tracing::info!(
                     session_id = %close.payload.session_id.0,
                     closing_device_id = %presence.device_id.0,
                     peer_device_id = %peer.0,
                     "authenticated session route closed"
                 );
-                Ok(vec![delivery(self.connection_for(&peer)?, envelope)])
+                Ok(vec![delivery(peer_connection, envelope)])
             }
             _ => Err(RealtimeError::UnsupportedMessage),
         }
@@ -404,6 +446,24 @@ impl RealtimeCore {
         let registration =
             self.authenticator
                 .authenticate(connection_id, register, now_ms, &mut self.replay)?;
+        self.browser_revocations
+            .retain(|_, expires| now_ms < *expires);
+        if registration.token.browser.is_some() {
+            if self
+                .browser_revocations
+                .contains_key(&registration.token.device_id)
+            {
+                return Err(RealtimeError::UnauthorizedRoute);
+            }
+            if self
+                .browser_revocations
+                .len()
+                .saturating_add(self.presence.browser_count())
+                >= self.config.max_connections
+            {
+                return Err(RealtimeError::ConnectionCapacity);
+            }
+        }
         self.presence.register(PresenceEntry {
             connection_id,
             device_id: registration.token.device_id.clone(),
@@ -411,6 +471,7 @@ impl RealtimeCore {
             role: registration.token.role,
             last_seen_ms: now_ms,
             token_expires_at_ms: registration.token.expires_at_ms,
+            browser: registration.token.browser,
         })?;
         let registered =
             self.sign_registered(registration.token.device_id, connection_id, now_ms)?;
@@ -431,11 +492,7 @@ impl RealtimeCore {
         connection_id: ConnectionId,
         now_ms: u64,
     ) -> Result<Registered, RealtimeError> {
-        let counter = self.server_counter;
-        self.server_counter = self
-            .server_counter
-            .checked_add(1)
-            .ok_or(RealtimeError::CounterExhausted)?;
+        let counter = self.server_counter.next()?;
         let mut nonce = [0_u8; 16];
         SystemRandom::new()
             .fill(&mut nonce)
@@ -472,7 +529,7 @@ impl RealtimeCore {
             .by_connection(connection_id)
             .ok_or(RealtimeError::NotRegistered)?;
         if now_ms >= entry.token_expires_at_ms {
-            self.disconnect(connection_id);
+            self.terminate_connection(connection_id);
             return Err(RealtimeError::TokenExpired);
         }
         self.presence
@@ -502,6 +559,75 @@ impl RealtimeCore {
             return Err(RealtimeError::UnauthorizedRoute);
         }
         Ok(())
+    }
+
+    fn authorize_browser_signal(
+        &self,
+        presence: &PresenceEntry,
+        message: &AuthenticatedSignalMessage,
+    ) -> Result<(), RealtimeError> {
+        let Some(browser) = &presence.browser else {
+            return Ok(());
+        };
+        let bound = |session: &mrd_proto::SessionId, controller: &DeviceId, target: &DeviceId| {
+            session == &browser.session_id
+                && controller == &presence.device_id
+                && target == &browser.target_device_id
+        };
+        let allowed = match message {
+            AuthenticatedSignalMessage::PresenceHeartbeat(_) => true,
+            AuthenticatedSignalMessage::SessionIntentV3(intent) => {
+                let request = &intent.payload.request;
+                bound(
+                    &request.session_id,
+                    &request.controller_device_id,
+                    &request.target_device_id,
+                ) && request
+                    .requested_scopes
+                    .iter()
+                    .all(|scope| browser.allowed_scopes.contains(scope))
+            }
+            AuthenticatedSignalMessage::WebrtcOfferV3(offer) => bound(
+                &offer.payload.session_id,
+                &offer.payload.controller_device_id,
+                &offer.payload.target_device_id,
+            ),
+            AuthenticatedSignalMessage::WebrtcCandidateV3(candidate) => {
+                candidate.payload.description_role == WebRtcDescriptionRoleV3::Offer
+                    && bound(
+                        &candidate.payload.session_id,
+                        &candidate.payload.controller_device_id,
+                        &candidate.payload.target_device_id,
+                    )
+            }
+            AuthenticatedSignalMessage::SessionClose(close) => {
+                close.payload.session_id == browser.session_id
+                    && close.payload.claims.intended_peer_device_id == browser.target_device_id
+            }
+            _ => false,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(RealtimeError::UnauthorizedRoute)
+        }
+    }
+
+    fn revoke_closed_browser(&mut self, device: &DeviceId, now_ms: u64) {
+        let Some(presence) = self.presence.by_device(device).cloned() else {
+            return;
+        };
+        if presence.browser.is_none() {
+            return;
+        }
+        // Covers every credential minted before this close, including a later
+        // refresh, under the verifier's ten-minute lifetime and clock-skew bound.
+        let deadline = presence
+            .token_expires_at_ms
+            .max(now_ms.saturating_add(660_000));
+        self.browser_revocations
+            .insert(presence.device_id.clone(), deadline);
+        self.terminate_connection(presence.connection_id);
     }
 
     fn connection_for(&self, device: &DeviceId) -> Result<ConnectionId, RealtimeError> {
@@ -535,9 +661,29 @@ impl RealtimeCore {
         Ok(())
     }
 
+    // Revocation removes authority immediately, but the connection continues to
+    // count against capacity until the WebSocket actor has joined its writer.
+    fn terminate_connection(&mut self, connection_id: ConnectionId) {
+        if self.terminating.insert(connection_id) {
+            self.pending_transport_closures.push(connection_id);
+        }
+        self.remove_authenticated_presence(connection_id);
+    }
+
+    pub(crate) fn take_transport_closures(&mut self) -> Vec<ConnectionId> {
+        std::mem::take(&mut self.pending_transport_closures)
+    }
+
     pub fn disconnect(&mut self, connection_id: ConnectionId) {
-        self.authenticator.remove_connection(connection_id);
         self.rates.remove(&connection_id);
+        self.terminating.remove(&connection_id);
+        self.pending_transport_closures
+            .retain(|id| *id != connection_id);
+        self.remove_authenticated_presence(connection_id);
+    }
+
+    fn remove_authenticated_presence(&mut self, connection_id: ConnectionId) {
+        self.authenticator.remove_connection(connection_id);
         if let Some(presence) = self.presence.remove_connection(connection_id) {
             self.routes.remove_device(&presence.device_id);
             tracing::info!(
@@ -549,17 +695,15 @@ impl RealtimeCore {
     }
 
     pub fn prune(&mut self, now_ms: u64) -> Vec<ConnectionId> {
+        self.browser_revocations
+            .retain(|_, expires| now_ms < *expires);
         let expired = self.presence.prune(now_ms, self.config.presence_ttl_ms);
-        let expired_connections = expired
-            .iter()
-            .map(|presence| presence.connection_id)
-            .collect();
         for presence in expired {
-            self.rates.remove(&presence.connection_id);
+            self.terminate_connection(presence.connection_id);
             self.routes.remove_device(&presence.device_id);
         }
         self.routes.prune(now_ms, self.config.route_ttl_ms);
-        expired_connections
+        self.take_transport_closures()
     }
 
     pub fn is_present(&self, device: &DeviceId) -> bool {
@@ -572,6 +716,65 @@ impl RealtimeCore {
 
     pub fn presence_count(&self) -> usize {
         self.presence.len()
+    }
+
+    pub(crate) fn presence_snapshot(
+        &self,
+        requested: &[String],
+        sampled_at_ms: u64,
+    ) -> presence_query::PresenceSnapshot {
+        presence_query::PresenceSnapshot {
+            version: 1,
+            sampled_at_ms,
+            devices: requested
+                .iter()
+                .map(|device_id| {
+                    let entry = self.presence.by_device(&DeviceId(device_id.clone()));
+                    presence_query::DevicePresenceSnapshot {
+                        device_id: device_id.clone(),
+                        online: entry.is_some_and(|entry| {
+                            sampled_at_ms >= entry.last_seen_ms
+                                && sampled_at_ms < entry.token_expires_at_ms
+                                && sampled_at_ms
+                                    < entry
+                                        .last_seen_ms
+                                        .saturating_add(self.config.presence_ttl_ms)
+                        }),
+                        last_seen_ms: entry.map(|entry| entry.last_seen_ms),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn identity_snapshot(
+        &self,
+        requested: &[String],
+        sampled_at_ms: u64,
+    ) -> presence_query::IdentitySnapshot {
+        presence_query::IdentitySnapshot {
+            version: 1,
+            sampled_at_ms,
+            identities: requested
+                .iter()
+                .filter_map(|id| {
+                    let entry = self.presence.by_device(&DeviceId(id.clone()))?;
+                    (entry.browser.is_none()
+                        && !entry.device_id.0.starts_with("browser_")
+                        && sampled_at_ms >= entry.last_seen_ms
+                        && sampled_at_ms < entry.token_expires_at_ms
+                        && sampled_at_ms
+                            < entry
+                                .last_seen_ms
+                                .saturating_add(self.config.presence_ttl_ms))
+                    .then(|| presence_query::RegisteredIdentitySnapshot {
+                        device_id: entry.device_id.0.clone(),
+                        device_key_id: entry.device_key_id.clone(),
+                        role: entry.role.clone(),
+                    })
+                })
+                .collect(),
+        }
     }
 }
 
@@ -608,6 +811,8 @@ pub enum RealtimeError {
     UnsupportedMessage,
     #[error("server counter is exhausted")]
     CounterExhausted,
+    #[error(transparent)]
+    PersistentIdentity(#[from] PersistentIdentityError),
     #[error("server entropy is unavailable")]
     EntropyUnavailable,
     #[error(transparent)]
@@ -623,9 +828,10 @@ pub enum RealtimeError {
 impl RealtimeError {
     pub fn reason_code(&self) -> ProtocolReasonCode {
         match self {
-            Self::InvalidConfig | Self::CounterExhausted | Self::EntropyUnavailable => {
-                ProtocolReasonCode::Internal
-            }
+            Self::InvalidConfig
+            | Self::CounterExhausted
+            | Self::EntropyUnavailable
+            | Self::PersistentIdentity(_) => ProtocolReasonCode::Internal,
             Self::InvalidConnection | Self::UnsupportedMessage => ProtocolReasonCode::Malformed,
             Self::ConnectionCapacity | Self::RateLimited => ProtocolReasonCode::RateLimited,
             Self::NotRegistered
@@ -648,6 +854,7 @@ impl RealtimeError {
                 RouteError::Conflict | RouteError::MigrationConflict => {
                     ProtocolReasonCode::Conflict
                 }
+                RouteError::Capacity => ProtocolReasonCode::RateLimited,
                 _ => ProtocolReasonCode::UnauthorizedRoute,
             },
         }

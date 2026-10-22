@@ -63,6 +63,20 @@ pub trait UiLauncherPort: Send + Sync {
 
     /// Get the UI executable path
     fn get_ui_path(&self) -> anyhow::Result<Option<PathBuf>>;
+
+    /// Verify a peer process using the platform's authenticated UI identity.
+    ///
+    /// Unix UID checks and request-declared PIDs/paths are insufficient for
+    /// consent. Platforms with a stronger identity primitive override this
+    /// method; the default is fail-closed.
+    #[cfg(target_os = "macos")]
+    fn is_trusted_ui_peer(
+        &self,
+        _peer_pid: u32,
+        _peer_executable_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// In-memory UI launcher (for development/testing)

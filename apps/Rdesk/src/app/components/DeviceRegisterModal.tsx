@@ -91,12 +91,13 @@ export function DeviceRegisterModal({
 
     setRegistering(true);
     setError(null);
+    const credential = enrollmentToken.trim();
+    setEnrollmentToken("");
 
     try {
       const response = credentialMode === "enroll"
-        ? await deviceService.enroll(enrollmentToken.trim(), deviceName || hardwareInfo.hostname)
-        : await deviceService.recoverDeviceCredential(enrollmentToken.trim());
-      setEnrollmentToken("");
+        ? await deviceService.enroll(credential, deviceName || hardwareInfo.hostname)
+        : await deviceService.recoverDeviceCredential(credential);
       setResult(response);
       setStep("success");
 

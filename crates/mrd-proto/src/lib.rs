@@ -11,6 +11,16 @@ pub struct SessionId(pub String);
 pub enum BackendRole {
     Controller,
     Agent,
+    Peer,
+}
+
+impl BackendRole {
+    /// Authenticated full clients can act as either endpoint. Registration
+    /// must still bind the exact declared role to its backend credential.
+    pub fn has_capability(&self, required: BackendRole) -> bool {
+        self == &required
+            || (matches!(self, Self::Peer) && matches!(required, Self::Controller | Self::Agent))
+    }
 }
 
 #[derive(Debug, Error)]

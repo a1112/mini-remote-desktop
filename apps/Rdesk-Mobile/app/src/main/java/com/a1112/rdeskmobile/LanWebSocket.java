@@ -9,8 +9,14 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Base64;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 final class LanWebSocket {
     interface Listener {
@@ -20,14 +26,15 @@ final class LanWebSocket {
     }
 
     private final String url;
+    private final String certificateFingerprint;
     private final Listener listener;
     private final SecureRandom random = new SecureRandom();
     private volatile Socket socket;
     private volatile OutputStream output;
     private volatile boolean closed;
 
-    LanWebSocket(String url, Listener listener) {
-        this.url = url; this.listener = listener;
+    LanWebSocket(String url, String certificateFingerprint, Listener listener) {
+        this.url = url; this.certificateFingerprint = certificateFingerprint; this.listener = listener;
     }
 
     void connect() {
@@ -38,14 +45,18 @@ final class LanWebSocket {
         String reason = "连接已断开";
         try {
             URI uri = URI.create(url);
-            if (!"ws".equals(uri.getScheme())) throw new IllegalArgumentException("仅支持局域网 WebSocket");
-            Socket connection = new Socket(); socket = connection;
+            if (!"wss".equals(uri.getScheme())) throw new IllegalArgumentException("仅支持加密 WebSocket");
+            if (!Protocol.isCertificateFingerprintValid(certificateFingerprint)) throw new IllegalArgumentException("缺少网关证书指纹");
+            SSLSocket connection = openPinnedTlsSocket(uri); socket = connection;
             connection.connect(new InetSocketAddress(uri.getHost(), uri.getPort()), 5000);
+            connection.startHandshake();
             connection.setTcpNoDelay(true);
             InputStream input = connection.getInputStream(); output = connection.getOutputStream();
             byte[] nonce = new byte[16]; random.nextBytes(nonce);
             String key = Base64.getEncoder().encodeToString(nonce);
-            String request = "GET " + uri.getRawPath() + " HTTP/1.1\r\nHost: " + uri.getHost() + ":" + uri.getPort() +
+            String target = uri.getRawPath();
+            if (uri.getRawQuery() != null && !uri.getRawQuery().isEmpty()) target += "?" + uri.getRawQuery();
+            String request = "GET " + target + " HTTP/1.1\r\nHost: " + uri.getHost() + ":" + uri.getPort() +
                     "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + key +
                     "\r\nSec-WebSocket-Version: 13\r\n\r\n";
             output.write(request.getBytes(StandardCharsets.US_ASCII)); output.flush();
@@ -108,6 +119,30 @@ final class LanWebSocket {
 
     private static int readByte(InputStream input) throws Exception {
         int value = input.read(); if (value < 0) throw new IllegalStateException("连接已关闭"); return value;
+    }
+
+    private SSLSocket openPinnedTlsSocket(URI uri) throws Exception {
+        TrustManager[] trustManagers = new TrustManager[] { new X509TrustManager() {
+            @Override public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {}
+            @Override public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                if (chain == null || chain.length == 0) throw new CertificateException("网关未提供证书");
+                try {
+                    String actual = hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
+                    if (!actual.equalsIgnoreCase(certificateFingerprint)) throw new CertificateException("网关证书指纹不匹配");
+                } catch (CertificateException error) { throw error; }
+                catch (Exception error) { throw new CertificateException("无法验证网关证书", error); }
+            }
+            @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        }};
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(null, trustManagers, random);
+        return (SSLSocket) context.getSocketFactory().createSocket();
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder value = new StringBuilder(bytes.length * 2);
+        for (byte item : bytes) value.append(String.format("%02x", item & 0xff));
+        return value.toString();
     }
 
     private static void readFully(InputStream input, byte[] data) throws Exception {

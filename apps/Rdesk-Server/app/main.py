@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
 import shlex
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from app.api.v1.router import api_router
@@ -12,6 +13,12 @@ from app.core.response_security import SensitiveResponseCacheMiddleware
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
+from app.db.migrate_add_relay_redundancy import migrate as migrate_relay_redundancy
+from app.db.migrate_add_browser_controllers import migrate as migrate_browser_controllers
+from app.db.migrate_add_device_self_enrollment import (
+    SELF_ENROLLMENT_TABLES, migrate as migrate_device_self_enrollment,
+)
+from app.db.migrate_add_guest_temporary_access import GUEST_TABLES, migrate as migrate_guest_temporary_access
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
@@ -24,8 +31,17 @@ async def lifespan(_: FastAPI):
         await migrate_relay_control(conn)
         # legacy/dev bootstrap only. Relay tables are created and verified by the
         # explicit versioned migration above, never by metadata.create_all.
-        await conn.run_sync(Base.metadata.create_all)
+        # Public identity tables are versioned and verified by their explicit
+        # migration, including on the first fresh database startup.
+        await conn.run_sync(lambda sync: Base.metadata.create_all(
+            sync, tables=[table for table in Base.metadata.sorted_tables
+                          if table.name not in SELF_ENROLLMENT_TABLES | GUEST_TABLES],
+        ))
         await migrate_relay_access(conn, serial_pepper=settings.device_serial_pepper)
+        await migrate_relay_redundancy(conn)
+        await migrate_browser_controllers(conn)
+        await migrate_device_self_enrollment(conn)
+        await migrate_guest_temporary_access(conn)
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.
@@ -42,6 +58,52 @@ app.state.realtime_manager = RealtimeSidecarManager(
     ],
     workdir=settings.realtime_server_workdir,
 )
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+@app.middleware("http")
+async def reject_oversized_requests(request: Request, call_next):
+    """Reject oversized bodies before FastAPI parses or stores them."""
+
+    limit = 8 * 1024 * 1024
+    if request.url.path.startswith("/api/v1/auth/"):
+        limit = 64 * 1024
+    elif request.url.path.endswith("/avatar"):
+        limit = 6 * 1024 * 1024
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            length = limit + 1
+        if length < 0 or length > limit:
+            return JSONResponse(
+                {"detail": "request body is too large"}, status_code=413
+            )
+
+    # Content-Length is optional for chunked requests. Wrap the ASGI receive
+    # callable as well so a client cannot bypass the limit by streaming an
+    # unbounded body.
+    received = 0
+    receive = request._receive
+
+    async def limited_receive():
+        nonlocal received
+        message = await receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _RequestBodyTooLarge
+        return message
+
+    request._receive = limited_receive
+    try:
+        return await call_next(request)
+    except _RequestBodyTooLarge:
+        return JSONResponse({"detail": "request body is too large"}, status_code=413)
 
 app.add_middleware(
     CORSMiddleware,

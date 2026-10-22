@@ -8,7 +8,9 @@ const mocks = vi.hoisted(() => ({
   launch: vi.fn(),
   history: [] as Array<{ sessionId: string; peerDeviceId: string; role: "controller"; startedAt: number; endedAt: number | null }>,
   devices: [] as Array<Record<string, unknown>>,
+  native: true,
 }));
+vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => mocks.native }));
 
 vi.mock("./ThemeContext", () => ({ useTheme: () => ({ isDark: true, theme: "dark", setTheme: vi.fn() }) }));
 vi.mock("./AuthContext", () => ({ useAuth: () => ({ isLoggedIn: false, user: null, logout: vi.fn() }) }));
@@ -16,6 +18,7 @@ vi.mock("./deviceData", () => ({ useDevices: () => ({ devices: mocks.devices, lo
 vi.mock("../services/deviceService", () => ({ useDeviceRegistration: () => ({ deviceId: "123456789", deviceName: "本机" }) }));
 vi.mock("../services/connectionHistoryService", () => ({ useConnectionHistory: () => mocks.history }));
 vi.mock("../services/remoteDisplayLauncher", () => ({ launchRemoteDisplayForDevice: mocks.launch }));
+vi.mock("./ServiceStatusPanel", () => ({ ServiceStatusPanel: () => <div>公网连接状态</div> }));
 
 function renderMobile(path = "/") {
   return render(<MemoryRouter initialEntries={[path]}><Routes>
@@ -27,6 +30,7 @@ function renderMobile(path = "/") {
 describe("mobile pages", () => {
   beforeEach(() => {
     mocks.history = [];
+    mocks.native = true;
     mocks.devices = [];
     mocks.launch.mockReset().mockResolvedValue({ sessionId: "real-session", mode: "route" });
   });
@@ -35,20 +39,57 @@ describe("mobile pages", () => {
     const user = userEvent.setup();
     renderMobile();
     expect(screen.getByText("暂无连接记录")).toBeInTheDocument();
-    expect(screen.getByText("123456789")).toBeInTheDocument();
+    expect(screen.getByText("123 456 789")).toBeInTheDocument();
+    expect(screen.getByText("公网连接状态")).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "设备" }));
     expect(screen.getByText("暂无已发现设备")).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "记录" }));
     expect(screen.getByText("暂无连接记录")).toBeInTheDocument();
   });
 
+  it('shows zero-install browser controller mode and navigates to its dedicated session page', async () => {
+    mocks.native = false;
+    mocks.launch.mockResolvedValue({ sessionId: 'browser-session', mode: 'route', routePath: '/browser-session/browser-session' });
+    render(<MemoryRouter><Routes><Route path="/browser-session/:id" element={<div>网页会话已打开</div>} /><Route path="*" element={<MobileLayout onOpenAuth={vi.fn()} />} /></Routes></MemoryRouter>);
+    expect(screen.getByText('网页控制端')).toBeInTheDocument();
+    expect(screen.queryByText('123 456 789')).not.toBeInTheDocument();
+    await userEvent.type(screen.getByPlaceholderText('输入 10 位设备码'), '0123456789');
+    await userEvent.type(screen.getByLabelText('远端临时密码'), 'ABCD2345');
+    await userEvent.click(screen.getByRole('button', { name: '立即连接' }));
+    expect(mocks.launch).toHaveBeenCalledWith('0123456789', expect.objectContaining({ temporaryPassword: 'ABCD2345' }));
+    expect(await screen.findByText('网页会话已打开')).toBeInTheDocument();
+  });
+
   it("starts an authenticated session for the entered device ID", async () => {
     const user = userEvent.setup();
     renderMobile();
-    await user.type(screen.getByPlaceholderText("输入设备 ID"), "900 123 456");
+    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "900 123 456");
     await user.click(screen.getByRole("button", { name: "发起连接" }));
     expect(mocks.launch).toHaveBeenCalledWith("900123456", expect.objectContaining({ routePreference: "auto" }));
     expect(await screen.findByText("会话路由已打开")).toBeInTheDocument();
+  });
+
+  it("preserves leading zeroes in a ten digit remote device code", async () => {
+    const user = userEvent.setup();
+    renderMobile();
+    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "012 345 6789");
+    await user.click(screen.getByRole("button", { name: "发起连接" }));
+    expect(mocks.launch).toHaveBeenCalledWith("0123456789", expect.objectContaining({ routePreference: "auto" }));
+    expect(await screen.findByText("会话路由已打开")).toBeInTheDocument();
+  });
+
+  it("rejects malformed input while preserving legacy LAN identifiers", async () => {
+    const user = userEvent.setup();
+    renderMobile();
+    const input = screen.getByPlaceholderText("输入 10 位设备码");
+    await user.type(input, "0123456789/private");
+    await user.click(screen.getByRole("button", { name: "发起连接" }));
+    expect(mocks.launch).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("请输入 10 位数字设备码");
+    await user.clear(input);
+    await user.type(input, "lan-LCXACE");
+    await user.click(screen.getByRole("button", { name: "发起连接" }));
+    expect(mocks.launch).toHaveBeenCalledWith("lan-LCXACE", expect.anything());
   });
 
   it("lists real history and devices without fabricating entries", async () => {

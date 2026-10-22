@@ -1,0 +1,111 @@
+--- a/src/apps/relay/mainrelay.c
++++ b/src/apps/relay/mainrelay.c
+@@ -57,6 +57,10 @@
+     size_t global_allocation_count = 0; // used for drain mode, to know when all allocations have gone away
+ 
+ ////// TEMPORARY data //////////
++
++// Legacy negative TLS options are local state; preserve turn_params_t ABI.
++static bool no_tlsv1 = false;
++static bool no_tlsv1_1 = false;
+ 
+ static int use_lt_credentials = 0;
+ static int anon_credentials = 0;
+@@ -1245,6 +1249,8 @@
+     "file.\n"
+     " --tlsv1					Set TLSv1 as a minimum supported protocol version.\n"
+     " --tlsv1_1					Set TLSv1.1 as a minimum supported protocol version.\n"
++    " --no-tlsv1\t\t\t\t\tSet TLSv1.1/DTLSv1.2 as a minimum supported protocol version.\n"
++    " --no-tlsv1_1\t\t\t\t\tSet TLSv1.2/DTLSv1.2 as a minimum supported protocol version.\n"
+     " --no-tlsv1_2					Set TLSv1.3/DTLSv1.2 as a minimum supported protocol version.\n"
+     "						With openssl-1.0.2 and below, do not allow "
+     "TLSv1.2/DTLSv1.2 protocols.\n"
+@@ -1636,6 +1642,8 @@
+   DH1066_OPT,
+   ENABLE_TLSV1_OPT,
+   ENABLE_TLSV1_1_OPT,
++  NO_TLSV1_OPT,
++  NO_TLSV1_1_OPT,
+   NO_TLSV1_2_OPT,
+   CHECK_ORIGIN_CONSISTENCY_OPT,
+   ADMIN_MAX_BPS_OPT,
+@@ -1816,6 +1824,8 @@
+     {"dh1066", optional_argument, NULL, DH1066_OPT},
+     {"tlsv1", optional_argument, NULL, ENABLE_TLSV1_OPT},
+     {"tlsv1_1", optional_argument, NULL, ENABLE_TLSV1_1_OPT},
++    {"no-tlsv1", optional_argument, NULL, NO_TLSV1_OPT},
++    {"no-tlsv1_1", optional_argument, NULL, NO_TLSV1_1_OPT},
+     {"no-tlsv1_2", optional_argument, NULL, NO_TLSV1_2_OPT},
+     {"secret-key-file", required_argument, NULL, SECRET_KEY_OPT},
+     {"keep-address-family", optional_argument, NULL, 'K'},
+@@ -2183,6 +2193,12 @@
+     break;
+   case ENABLE_TLSV1_1_OPT:
+     turn_params.enable_tlsv1_1 = get_bool_value(value);
++    break;
++  case NO_TLSV1_OPT:
++    no_tlsv1 = get_bool_value(value);
++    break;
++  case NO_TLSV1_1_OPT:
++    no_tlsv1_1 = get_bool_value(value);
+     break;
+   case NO_TLSV1_2_OPT:
+     turn_params.no_tlsv1_2 = get_bool_value(value);
+@@ -4206,6 +4222,10 @@
+ 
+ static void set_ctx(SSL_CTX **out, const char *protocol, const SSL_METHOD *method) {
+   SSL_CTX *ctx = SSL_CTX_new(method);
++  if (ctx == NULL) {
++    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "%s: ERROR: cannot create TLS/DTLS context\n", protocol);
++    exit(EXIT_FAILURE);
++  }
+   int err = 0;
+   int rc = 0;
+   SSL_CTX_set_alpn_select_cb(ctx, ServerALPNCallback, NULL);
+@@ -4463,14 +4483,24 @@
+     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "ERROR: TLS is not supported.\n");
+ #else
+     set_ctx(&turn_params.tls_ctx, "TLS", TLS_server_method());
++    // TLS version constants ascend; choose the strongest explicit floor once.
++    // Zero preserves the OpenSSL default when all options are absent or false.
++    int tls_min_version = 0;
+     if (turn_params.enable_tlsv1) {
+-      SSL_CTX_set_min_proto_version(turn_params.tls_ctx, TLS1_VERSION);
+-    }
+-    if (turn_params.enable_tlsv1_1) {
+-      SSL_CTX_set_min_proto_version(turn_params.tls_ctx, TLS1_1_VERSION);
++      tls_min_version = TLS1_VERSION;
++    }
++    if (turn_params.enable_tlsv1_1 || no_tlsv1) {
++      tls_min_version = TLS1_1_VERSION;
++    }
++    if (no_tlsv1_1) {
++      tls_min_version = TLS1_2_VERSION;
+     }
+     if (turn_params.no_tlsv1_2) {
+-      SSL_CTX_set_min_proto_version(turn_params.tls_ctx, TLS1_3_VERSION);
++      tls_min_version = TLS1_3_VERSION;
++    }
++    if (tls_min_version != 0 && SSL_CTX_set_min_proto_version(turn_params.tls_ctx, tls_min_version) != 1) {
++      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "TLS: ERROR: cannot apply requested minimum protocol version\n");
++      exit(EXIT_FAILURE);
+     }
+     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "TLS cipher suite: %s\n", turn_params.cipher_list);
+ #endif
+@@ -4481,8 +4511,14 @@
+     TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "ERROR: DTLS is not supported.\n");
+ #else
+     set_ctx(&turn_params.dtls_ctx, "DTLS", DTLS_server_method());
+-    if (turn_params.no_tlsv1_2) {
+-      SSL_CTX_set_max_proto_version(turn_params.dtls_ctx, DTLS1_VERSION);
++    // DTLS constants are reverse ordered; apply its independent bounds directly.
++    if ((no_tlsv1 || no_tlsv1_1) && SSL_CTX_set_min_proto_version(turn_params.dtls_ctx, DTLS1_2_VERSION) != 1) {
++      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "DTLS: ERROR: cannot apply requested minimum protocol version\n");
++      exit(EXIT_FAILURE);
++    }
++    if (turn_params.no_tlsv1_2 && SSL_CTX_set_max_proto_version(turn_params.dtls_ctx, DTLS1_VERSION) != 1) {
++      TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "DTLS: ERROR: cannot apply requested maximum protocol version\n");
++      exit(EXIT_FAILURE);
+     }
+     setup_dtls_callbacks(turn_params.dtls_ctx);
+     TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "DTLS cipher suite: %s\n", turn_params.cipher_list);

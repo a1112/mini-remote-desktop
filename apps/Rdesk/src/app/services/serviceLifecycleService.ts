@@ -6,7 +6,7 @@
  * All actual lifecycle operations go through mrd-service IPC commands.
  *
  * For service lifecycle operations (start, stop, restart), use the shell commands:
- * - shell_get_status: check service status
+ * - ipc_service_health: check service status and health
  * - shell_shutdown_service: request service shutdown
  */
 
@@ -14,16 +14,21 @@ import * as tauriAdapter from '../adapters/tauri';
 import type {
   AdapterResult,
   AutostartStatus,
+  CloseBehavior,
+  UiPreferences,
+  ServiceStatusInfo,
   AppSettings,
   DecodePolicy,
   DecodePolicyResponse,
   FfmpegInstallResult,
   FfmpegProbeResult,
-  ShellStatusSnapshot,
 } from '../adapters/tauri';
 
 // Re-export types from adapter
 export type {
+  CloseBehavior,
+  UiPreferences,
+  ServiceStatusInfo,
   AppSettings,
   DecodePolicy,
   DecodePolicyResponse,
@@ -54,28 +59,40 @@ function unwrapAdapterResult<T>(result: AdapterResult<T>): T {
   throw new ServiceError(result.error.message, result.error.code);
 }
 
-function isServiceUnavailable(message: string): boolean {
+function isServiceUnavailable(message: string, code?: string): boolean {
   const normalized = message.toLowerCase();
+  if (/denied|busy|invalid_response/i.test(code ?? '') || /access denied|permission denied|pipe instances are busy/.test(normalized)) {
+    return false;
+  }
   return (
     normalized.includes('connection refused') ||
+    normalized.includes('endpoint not found') ||
     normalized.includes('cannot find the file') ||
     normalized.includes('no such file') ||
     /\bos error 2\b/.test(normalized)
   );
 }
 
-async function getShellStatusSnapshot(): Promise<ShellStatusSnapshot | null> {
-  const result = await tauriAdapter.shellGetStatus();
+export const getServiceHealth = async (): Promise<ServiceStatusInfo> => {
+  const result = await tauriAdapter.ipcServiceHealth();
   if (result.ok) {
     return result.value;
   }
 
-  if (isServiceUnavailable(result.error.message)) {
-    return null;
+  if (isServiceUnavailable(result.error.message, result.error.code)) {
+    return { running: false, healthy: false, pid: null };
   }
 
   throw new ServiceError(result.error.message, result.error.code);
-}
+};
+
+export const getUiPreferences = async (): Promise<UiPreferences> => {
+  return unwrapAdapterResult(await tauriAdapter.getUiPreferences());
+};
+
+export const setCloseBehavior = async (closeBehavior: CloseBehavior): Promise<UiPreferences> => {
+  return unwrapAdapterResult(await tauriAdapter.setCloseBehavior(closeBehavior));
+};
 
 // ============================================================================
 // Bootstrap Commands (Phase 6: bootstrap-only behavior)
@@ -151,16 +168,14 @@ export const stopService = async (): Promise<boolean> => {
   return true;
 };
 
-/** @deprecated Use shell_get_status IPC command instead */
+/** @deprecated Use getServiceHealth for a complete snapshot. */
 export const getServiceStatus = async (): Promise<boolean> => {
-  const snapshot = await getShellStatusSnapshot();
-  return snapshot !== null;
+  return (await getServiceHealth()).running;
 };
 
-/** @deprecated Use shell_get_status IPC command instead */
+/** @deprecated Use getServiceHealth for a complete snapshot. */
 export const serviceHealthCheck = async (): Promise<boolean> => {
-  const snapshot = await getShellStatusSnapshot();
-  return snapshot !== null && snapshot.last_error === null;
+  return (await getServiceHealth()).healthy;
 };
 
 /** @deprecated Service restart is no longer owned by Rdesk */
@@ -190,8 +205,7 @@ export const restartServiceWithBackoff = async (
 
 /** @deprecated Service lifecycle is no longer owned by Rdesk */
 export const getServicePid = async (): Promise<number | null> => {
-  const snapshot = await getShellStatusSnapshot();
-  return snapshot?.service_pid ?? null;
+  return (await getServiceHealth()).pid ?? null;
 };
 
 /** @deprecated Service restart is no longer owned by Rdesk */
@@ -239,17 +253,24 @@ export const setDecodePolicy = async (
   return unwrapAdapterResult(result);
 };
 
-export const ffmpegProbe = async (): Promise<FfmpegProbeResult> => {
-  const result = await tauriAdapter.ffmpegProbe();
-  return unwrapAdapterResult(result);
+// Keep native FFmpeg operations serialized even when their settings view unmounts.
+let ffmpegOperationQueue: Promise<void> = Promise.resolve();
+
+function queueFfmpegOperation<T>(operation: () => Promise<AdapterResult<T>>): Promise<T> {
+  const result = ffmpegOperationQueue.then(async () => unwrapAdapterResult(await operation()));
+  // A failure belongs to its caller; it must not block later queued operations.
+  ffmpegOperationQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+export const ffmpegProbe = (): Promise<FfmpegProbeResult> => {
+  return queueFfmpegOperation(() => tauriAdapter.ffmpegProbe());
 };
 
-export const ffmpegDownload = async (): Promise<FfmpegInstallResult> => {
-  const result = await tauriAdapter.ffmpegDownload();
-  return unwrapAdapterResult(result);
+export const ffmpegDownload = (): Promise<FfmpegInstallResult> => {
+  return queueFfmpegOperation(() => tauriAdapter.ffmpegDownload());
 };
 
-export const ffmpegResetGoldenSettings = async (): Promise<AppSettings> => {
-  const result = await tauriAdapter.ffmpegResetGoldenSettings();
-  return unwrapAdapterResult(result);
+export const ffmpegResetGoldenSettings = (): Promise<AppSettings> => {
+  return queueFfmpegOperation(() => tauriAdapter.ffmpegResetGoldenSettings());
 };

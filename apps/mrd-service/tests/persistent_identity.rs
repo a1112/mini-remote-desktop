@@ -28,7 +28,10 @@ use ring::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroize;
@@ -96,12 +99,14 @@ impl SecretProtector for TestSecretProtector {
 }
 
 fn temp_db() -> PathBuf {
+    static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let serial = TEMP_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "mrd-service-persistent-identity-{}-{unique}.sqlite",
+        "mrd-service-persistent-identity-{}-{unique}-{serial}.sqlite",
         std::process::id()
     ))
 }

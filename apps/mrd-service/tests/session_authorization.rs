@@ -15,6 +15,13 @@ use std::sync::Arc;
 
 use ring::rand::SystemRandom;
 
+async fn respond_to_consent(state: &Arc<AppState>, response: ConsentResponse) -> IpcResponse {
+    // The IPC dispatcher also authenticates the signed macOS UI caller. These
+    // authorization tests exercise the handler's state and audit semantics;
+    // the caller gate has dedicated coverage in ipc_server::dispatch tests.
+    mrd_service::handlers::session::respond_to_consent(state, response).await
+}
+
 fn attended_request(session_id: &str) -> VerifiedIncomingAuthorizationRequest {
     let created_at_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -131,18 +138,16 @@ async fn deny_returns_stable_reason_and_starts_no_media() {
         .begin_verified_incoming(attended_request("consent-denied"))
         .await
         .expect("pending consent");
-    let server = mrd_service::ipc_server::IpcServer::new(state.clone());
-
-    let response = server
-        .handle_request(IpcRequest::RespondToConsent {
-            response: ConsentResponse {
-                session_id: pending.session_id.clone(),
-                decision: ConsentDecision::Deny,
-                approved_scopes: Vec::new(),
-                expected_policy_revision: DecimalU64::new(1),
-            },
-        })
-        .await;
+    let response = respond_to_consent(
+        &state,
+        ConsentResponse {
+            session_id: pending.session_id.clone(),
+            decision: ConsentDecision::Deny,
+            approved_scopes: Vec::new(),
+            expected_policy_revision: DecimalU64::new(1),
+        },
+    )
+    .await;
 
     let IpcResponse::ConsentRecorded { session } = response else {
         panic!("expected authoritative denied snapshot, got {response:?}");
@@ -202,16 +207,16 @@ async fn timeout_expires_request_and_late_consent_cannot_revive_it() {
         Some(RemoteReasonCode::AuthorizationTimeout)
     );
 
-    let response = mrd_service::ipc_server::IpcServer::new(state.clone())
-        .handle_request(IpcRequest::RespondToConsent {
-            response: ConsentResponse {
-                session_id: pending.session_id.clone(),
-                decision: ConsentDecision::Approve,
-                approved_scopes: vec![RemotePermissionScope::ScreenView],
-                expected_policy_revision: DecimalU64::new(1),
-            },
-        })
-        .await;
+    let response = respond_to_consent(
+        &state,
+        ConsentResponse {
+            session_id: pending.session_id.clone(),
+            decision: ConsentDecision::Approve,
+            approved_scopes: vec![RemotePermissionScope::ScreenView],
+            expected_policy_revision: DecimalU64::new(1),
+        },
+    )
+    .await;
     let IpcResponse::RemoteAccessError { failure, .. } = response else {
         panic!("late consent must fail closed, got {response:?}");
     };
@@ -261,19 +266,19 @@ async fn attended_approval_grants_only_the_five_way_scope_intersection() {
                 && matches!(event.event, RemoteSessionEvent::ConsentRequested { .. })
     ));
 
-    let response = server
-        .handle_request(IpcRequest::RespondToConsent {
-            response: ConsentResponse {
-                session_id: pending.session_id.clone(),
-                decision: ConsentDecision::Approve,
-                approved_scopes: vec![
-                    RemotePermissionScope::ScreenView,
-                    RemotePermissionScope::InputKeyboard,
-                ],
-                expected_policy_revision: DecimalU64::new(1),
-            },
-        })
-        .await;
+    let response = respond_to_consent(
+        &state,
+        ConsentResponse {
+            session_id: pending.session_id.clone(),
+            decision: ConsentDecision::Approve,
+            approved_scopes: vec![
+                RemotePermissionScope::ScreenView,
+                RemotePermissionScope::InputKeyboard,
+            ],
+            expected_policy_revision: DecimalU64::new(1),
+        },
+    )
+    .await;
     let IpcResponse::ConsentRecorded { session } = response else {
         panic!("expected approved authorization snapshot, got {response:?}");
     };
@@ -760,18 +765,16 @@ async fn rejected_consent_attempt_is_not_audited_as_an_applied_decision() {
         .begin_verified_incoming(request)
         .await
         .expect("pending consent");
-    let server = mrd_service::ipc_server::IpcServer::new(state.clone());
-
-    let rejected = server
-        .handle_request(IpcRequest::RespondToConsent {
-            response: ConsentResponse {
-                session_id: session_id.clone(),
-                decision: ConsentDecision::Approve,
-                approved_scopes: vec![RemotePermissionScope::ScreenView],
-                expected_policy_revision: DecimalU64::new(99),
-            },
-        })
-        .await;
+    let rejected = respond_to_consent(
+        &state,
+        ConsentResponse {
+            session_id: session_id.clone(),
+            decision: ConsentDecision::Approve,
+            approved_scopes: vec![RemotePermissionScope::ScreenView],
+            expected_policy_revision: DecimalU64::new(99),
+        },
+    )
+    .await;
     assert!(matches!(rejected, IpcResponse::RemoteAccessError { .. }));
     let before = state
         .audit_log
@@ -794,16 +797,16 @@ async fn rejected_consent_attempt_is_not_audited_as_an_applied_decision() {
         RemoteAuthorizationState::AwaitingLocalConsent
     );
 
-    let applied = server
-        .handle_request(IpcRequest::RespondToConsent {
-            response: ConsentResponse {
-                session_id: session_id.clone(),
-                decision: ConsentDecision::Approve,
-                approved_scopes: vec![RemotePermissionScope::ScreenView],
-                expected_policy_revision: DecimalU64::new(1),
-            },
-        })
-        .await;
+    let applied = respond_to_consent(
+        &state,
+        ConsentResponse {
+            session_id: session_id.clone(),
+            decision: ConsentDecision::Approve,
+            approved_scopes: vec![RemotePermissionScope::ScreenView],
+            expected_policy_revision: DecimalU64::new(1),
+        },
+    )
+    .await;
     assert!(matches!(applied, IpcResponse::ConsentRecorded { .. }));
     let after = state
         .audit_log

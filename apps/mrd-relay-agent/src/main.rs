@@ -79,6 +79,13 @@ impl CliFailure {
         }
     }
 
+    const fn runtime_stage(reason: &'static str) -> Self {
+        Self {
+            exit_code: 70,
+            reason,
+        }
+    }
+
     #[cfg(windows)]
     const fn service() -> Self {
         Self {
@@ -502,7 +509,7 @@ async fn run_linux(
     }
     let protector = Arc::new(LinuxPlaintextProtector::new());
     let trusted_ca = read_linux_integrity_file(&config.agent().trusted_ca_path, 64 * 1024)
-        .map_err(|_| CliFailure::runtime())?;
+        .map_err(|_| CliFailure::runtime_stage("relay_trusted_ca_read_failed"))?;
     let identity_file = Arc::new(linux_hardened_file(&config.agent().identity_path)?);
     let runtime_file = Arc::new(linux_hardened_file(&config.agent().runtime_state_path)?);
     let identity = Arc::new(
@@ -515,10 +522,12 @@ async fn run_linux(
     );
     let enrollment =
         StrictCredentialFile::new_linux(config.enrollment_token_path().to_path_buf(), 512)
-            .map_err(|_| CliFailure::runtime())?;
+            .map_err(|_| {
+                CliFailure::runtime_stage("relay_enrollment_credential_boundary_failed")
+            })?;
     let turn_secret =
         StrictCredentialFile::new_linux(config.turn_rest_secret_path().to_path_buf(), 43)
-            .map_err(|_| CliFailure::runtime())?;
+            .map_err(|_| CliFailure::runtime_stage("relay_turn_credential_boundary_failed"))?;
     run_with_stores(
         config,
         runtime,
@@ -551,7 +560,7 @@ async fn run_linux(
 fn linux_hardened_file(path: &Path) -> Result<HardenedAtomicFile, CliFailure> {
     let parent = path.parent().ok_or_else(CliFailure::config)?;
     HardenedAtomicFile::new_linux(parent.to_path_buf(), path.to_path_buf())
-        .map_err(|_| CliFailure::runtime())
+        .map_err(|_| CliFailure::runtime_stage("relay_state_file_boundary_failed"))
 }
 
 #[cfg(windows)]
@@ -757,7 +766,7 @@ where
         trusted_ca_text,
         clock.clone(),
     )
-    .map_err(|_| CliFailure::runtime())?;
+    .map_err(map_runtime_error)?;
     let enrollment = if identity.active_certificate().is_none() {
         let (token, turn_rest_secret) = load_bootstrap()?;
         Some(EnrollmentRequest {
@@ -776,11 +785,11 @@ where
     };
     let enrollment_backend: Arc<dyn RelayBackendPort> = Arc::new(
         ReqwestRelayBackend::new(config.agent().backend_url.clone(), &trusted_ca)
-            .map_err(|_| CliFailure::runtime())?,
+            .map_err(|_| CliFailure::runtime_stage("relay_bootstrap_tls_client_failed"))?,
     );
     let factory: Arc<dyn RelayBackendClientFactoryPort> = Arc::new(
         ReqwestRelayBackendFactory::new(config.agent().backend_url.clone(), &trusted_ca)
-            .map_err(|_| CliFailure::runtime())?,
+            .map_err(|_| CliFailure::runtime_stage("relay_mtls_client_factory_failed"))?,
     );
     let native_scrape = ReqwestNativeCoturnScrape::new(
         config.agent().metrics_url.clone(),
@@ -815,8 +824,26 @@ where
         .map_err(map_runtime_error)
 }
 
-fn map_runtime_error(_error: RuntimeError) -> CliFailure {
-    CliFailure::runtime()
+fn map_runtime_error(error: RuntimeError) -> CliFailure {
+    // Use only static categories. HTTP response bodies and credential-bearing
+    // error objects must never be formatted into service logs.
+    let reason = match error {
+        RuntimeError::IdentityIo => "relay_identity_io",
+        RuntimeError::IdentityInvalid => "relay_identity_invalid",
+        RuntimeError::IdentityPermissions => "relay_identity_permissions_invalid",
+        RuntimeError::EnrollmentMissing => "relay_enrollment_missing",
+        RuntimeError::RenewalConflict => "relay_renewal_conflict",
+        RuntimeError::CertificateInvalid => "relay_certificate_invalid",
+        RuntimeError::Backend(_) => "relay_backend_request_failed",
+        RuntimeError::Process(error) => error.reason_code(),
+        RuntimeError::DirectiveReplay => "relay_directive_replayed",
+        RuntimeError::SecretVersionReplay => "relay_secret_version_replayed",
+        RuntimeError::SecretUpdateUnsafe => "relay_secret_update_requires_drain",
+        RuntimeError::StateIo => "relay_runtime_state_io",
+        RuntimeError::StateInvalid => "relay_runtime_state_invalid",
+        RuntimeError::MetricsUnavailable => "relay_metrics_unavailable",
+    };
+    CliFailure::runtime_stage(reason)
 }
 
 fn validate_loaded_secret(
@@ -846,4 +873,26 @@ fn canonical_turn_secret(value: &str) -> bool {
         Err(_) => return false,
     };
     decoded.len() == 32 && URL_SAFE_NO_PAD.encode(decoded.as_slice()) == value
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use mrd_relay_agent::process::ProcessError;
+
+    #[test]
+    fn startup_diagnostics_identify_static_failure_categories() {
+        assert_eq!(
+            map_runtime_error(RuntimeError::StateInvalid).reason,
+            "relay_runtime_state_invalid"
+        );
+        assert_eq!(
+            map_runtime_error(RuntimeError::CertificateInvalid).reason,
+            "relay_certificate_invalid"
+        );
+        assert_eq!(
+            map_runtime_error(RuntimeError::Process(ProcessError::ProbeInvalid)).reason,
+            "relay_probe_invalid"
+        );
+    }
 }

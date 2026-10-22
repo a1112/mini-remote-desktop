@@ -29,6 +29,8 @@ public final class ProjectionService extends Service {
     static final String EXTRA_DATA = "data";
     static final String EXTRA_HOST = "host";
     static final String EXTRA_PORT = "port";
+    static final String EXTRA_TOKEN = "token";
+    static final String EXTRA_FINGERPRINT = "fingerprint";
     private static final String CHANNEL = "rdesk_projection";
     private static volatile boolean active;
 
@@ -76,7 +78,9 @@ public final class ProjectionService extends Service {
                     reader.getSurface(), null, null);
             String host = intent.getStringExtra(EXTRA_HOST);
             int port = intent.getIntExtra(EXTRA_PORT, 9534);
-            socket = new LanWebSocket(Protocol.phonePublishUrl(host, port), new LanWebSocket.Listener() {
+            String token = intent.getStringExtra(EXTRA_TOKEN);
+            String fingerprint = intent.getStringExtra(EXTRA_FINGERPRINT);
+            socket = new LanWebSocket(Protocol.phonePublishUrl(host, port, token), fingerprint, new LanWebSocket.Listener() {
                 @Override public void onText(String text) {
                     if (text.contains("\"type\":\"error\"")) { stopSelf(); return; }
                     if (text.contains("\"type\":\"ready\"")) { remoteReady = true; return; }

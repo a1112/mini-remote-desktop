@@ -24,6 +24,136 @@ use serde::{Deserialize, Serialize};
 mod wire {
     use super::*;
 
+    /// Sensitive management credentials serialize as strings and never appear in Debug.
+    #[derive(
+        Clone, Serialize, Deserialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+    )]
+    #[serde(transparent)]
+    pub struct PublicDeviceCredential(String);
+    impl From<String> for PublicDeviceCredential {
+        fn from(value: String) -> Self {
+            Self(value)
+        }
+    }
+    impl From<&str> for PublicDeviceCredential {
+        fn from(value: &str) -> Self {
+            Self(value.to_owned())
+        }
+    }
+    impl PublicDeviceCredential {
+        pub fn into_secret(mut self) -> String {
+            std::mem::take(&mut self.0)
+        }
+    }
+    impl std::fmt::Debug for PublicDeviceCredential {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PublicDeviceCredential(REDACTED)")
+        }
+    }
+
+    /// Negotiated minor for the own-device, dual-credential binding operations.
+    pub const PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR: u16 = 1;
+
+    /// Ephemeral user JWT: bounded on construction/deserialization, erased on drop.
+    #[derive(Clone, Serialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+    #[serde(transparent)]
+    pub struct PublicUserCredential(String);
+
+    impl TryFrom<String> for PublicUserCredential {
+        type Error = &'static str;
+        fn try_from(value: String) -> Result<Self, Self::Error> {
+            let value = zeroize::Zeroizing::new(value);
+            let mut parts = value.split('.');
+            if value.is_empty()
+                || value.len() > 4096
+                || !(0..3).all(|_| {
+                    parts.next().is_some_and(|part| {
+                        !part.is_empty()
+                            && part.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+                            })
+                    })
+                })
+                || parts.next().is_some()
+            {
+                return Err("用户登录凭据无效，请重新登录");
+            }
+            Ok(Self(value.as_str().to_owned()))
+        }
+    }
+    impl<'de> Deserialize<'de> for PublicUserCredential {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            Self::try_from(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        }
+    }
+    impl PublicUserCredential {
+        pub fn secret(&self) -> &str {
+            &self.0
+        }
+    }
+    impl std::fmt::Debug for PublicUserCredential {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("PublicUserCredential(REDACTED)")
+        }
+    }
+
+    /// How the resident service refreshes its temporary password.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum TemporaryAccessRefreshMode {
+        /// Password material changes only after explicit local refresh.
+        Manual,
+        /// Legacy services rotate password material on a timer.
+        Automatic,
+    }
+
+    /// Temporary access state without its locally held password.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TemporaryAccessStatus {
+        pub enabled: bool,
+        pub ready: bool,
+        pub generation: u64,
+        pub expires_at_ms: Option<u64>,
+        pub reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_mode: Option<TemporaryAccessRefreshMode>,
+    }
+
+    /// Memory-only local password; formatting always redacts its contents.
+    #[derive(
+        Clone, Serialize, Deserialize, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+    )]
+    #[serde(transparent)]
+    pub struct TemporaryAccessPassword(String);
+
+    impl TemporaryAccessPassword {
+        pub fn secret(&self) -> &str {
+            &self.0
+        }
+        pub fn into_secret(mut self) -> String {
+            std::mem::take(&mut self.0)
+        }
+    }
+    impl From<String> for TemporaryAccessPassword {
+        fn from(value: String) -> Self {
+            Self(value)
+        }
+    }
+    impl std::fmt::Debug for TemporaryAccessPassword {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("TemporaryAccessPassword(REDACTED)")
+        }
+    }
+
+    /// Password reads are available only to the authenticated local product UI.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct TemporaryAccessSecret {
+        pub status: TemporaryAccessStatus,
+        pub password: Option<TemporaryAccessPassword>,
+    }
+
     // === Shell / Lifecycle DTOs (Phase 2) ===
     // Defined first to avoid forward references
 
@@ -1778,6 +1908,33 @@ mod wire {
         pub permission_ceiling: Vec<RemotePermissionScope>,
     }
 
+    /// Public binding of one current, server-verified first-pairing candidate.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct LanPairingCandidate {
+        pub candidate_id: String,
+        pub device_id: DeviceId,
+        pub device_name: String,
+        pub peer_key_id: String,
+        pub key_epoch: DecimalU64,
+        pub discovery_endpoint: String,
+        pub expires_at_ms: u64,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+    }
+
+    /// Exact displayed peer binding confirmed by the verified installed UI.
+    /// Public keys are resolved from signed discovery, never supplied by a client.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct LanPairingApproval {
+        pub candidate_id: String,
+        pub device_id: DeviceId,
+        pub peer_key_id: String,
+        pub key_epoch: DecimalU64,
+        pub discovery_endpoint: String,
+        pub permission_ceiling: Vec<RemotePermissionScope>,
+    }
+
     /// Approval metadata for an already verified key-rotation transition.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct TrustedDeviceRotation {
@@ -1980,6 +2137,38 @@ mod wire {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(tag = "type")]
     pub enum IpcRequest {
+        /// Secret-free public registration and authenticated signaling health.
+        GetPublicServerStatus,
+        /// Secret-free temporary-password availability for this machine.
+        GetTemporaryAccessStatus,
+        /// Cleartext read restricted to the authenticated local product UI.
+        ReadTemporaryAccessPassword,
+        /// Replace the password and invalidate pending requests from its old generation.
+        RotateTemporaryAccessPassword,
+        /// Freeze temporary access and revoke its active guest sessions.
+        DisableTemporaryAccess,
+        /// Negotiate before transmitting an ephemeral user credential.
+        GetPublicDeviceBindingProtocol,
+        /// Bind the resident's current registered device; no caller-selected target.
+        BindPublicDevice {
+            protocol_minor: u16,
+            user_token: PublicUserCredential,
+        },
+        /// Unbind the resident's current registered device; no caller-selected target.
+        UnbindPublicDevice {
+            protocol_minor: u16,
+            user_token: PublicUserCredential,
+        },
+        /// Enroll this service-owned machine at its configured trusted server.
+        /// Device credentials are never returned over this endpoint.
+        EnrollPublicDevice {
+            enrollment_token: PublicDeviceCredential,
+            device_name: String,
+        },
+        /// Refresh the existing identity using an administrator-issued credential.
+        RecoverPublicDevice {
+            device_token: PublicDeviceCredential,
+        },
         /// Register local device with the service
         RegisterDevice {
             device_id: DeviceId,
@@ -2053,6 +2242,10 @@ mod wire {
         },
         /// List public-key-pinned trusted device projections.
         ListTrustedDevices { include_revoked: bool },
+        /// Inspect current signed LAN candidates without granting any authority.
+        ListLanPairingCandidates,
+        /// Explicit first pairing; requires the verified installed product caller.
+        ApproveLanPairing { approval: LanPairingApproval },
         /// Approve an already authenticated pending peer key.
         ApproveTrustedDevice { approval: TrustedDeviceApproval },
         /// Suspend a trusted peer key.
@@ -2297,6 +2490,8 @@ mod wire {
                     | Self::RotateUnattendedAccess { .. }
                     | Self::ListTrustedDevices { .. }
                     | Self::ApproveTrustedDevice { .. }
+                    | Self::ListLanPairingCandidates
+                    | Self::ApproveLanPairing { .. }
                     | Self::SuspendTrustedDevice { .. }
                     | Self::RevokeTrustedDevice { .. }
                     | Self::RotateTrustedDevice { .. }
@@ -2313,6 +2508,14 @@ mod wire {
     #[allow(clippy::large_enum_variant)]
     #[serde(tag = "type")]
     pub enum IpcResponse {
+        /// Public server state without device credentials or privileged session data.
+        PublicServerStatus { status: PublicServerStatus },
+        /// Temporary password state without any cleartext credential.
+        TemporaryAccessStatus { status: TemporaryAccessStatus },
+        /// A memory-only response exclusively for the verified local UI.
+        TemporaryAccessSecret { secret: TemporaryAccessSecret },
+        /// Explicit support for the narrow own-device binding protocol.
+        PublicDeviceBindingProtocol { protocol_minor: u16 },
         /// Device registration successful
         DeviceRegistered { device_id: DeviceId },
         /// List of available devices
@@ -2359,6 +2562,10 @@ mod wire {
         UnattendedAccessUpdated { access: UnattendedAccessSnapshot },
         /// Trusted device projections.
         TrustedDeviceList { devices: Vec<TrustedDeviceSnapshot> },
+        /// Current signed first-pairing candidates, with public metadata only.
+        LanPairingCandidateList {
+            candidates: Vec<LanPairingCandidate>,
+        },
         /// Trusted device projection after a state transition.
         TrustedDeviceUpdated { device: TrustedDeviceSnapshot },
         /// Session snapshot after a permission transition.
@@ -2691,6 +2898,21 @@ mod wire {
         pub signaling: SignalingRuntimeSnapshot,
     }
 
+    /// A narrow product health projection readable by a normal desktop client.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PublicServerStatus {
+        pub service_running: bool,
+        pub api_url: Option<String>,
+        pub api_reachable: Option<bool>,
+        pub device_registered: bool,
+        pub device_id: Option<String>,
+        pub device_name: Option<String>,
+        pub signaling_state: String,
+        pub reconnect_attempt: u32,
+        pub last_connected_at_ms: Option<u64>,
+        pub last_error: Option<String>,
+    }
+
     /// Secret-free authenticated signaling health projection.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct SignalingRuntimeSnapshot {
@@ -2771,6 +2993,60 @@ pub use wire::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn temporary_access_refresh_mode_preserves_legacy_wire_and_accepts_known_modes() {
+        let legacy = serde_json::json!({
+            "enabled": true, "ready": true, "generation": 1,
+            "expires_at_ms": 600000, "reason": null,
+        });
+        let status: TemporaryAccessStatus = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(status).unwrap(), legacy);
+        for mode in ["manual", "automatic"] {
+            let mut current = legacy.clone();
+            current["refresh_mode"] = serde_json::json!(mode);
+            let decoded = serde_json::from_value::<TemporaryAccessStatus>(current.clone());
+            assert!(decoded.is_ok(), "known refresh modes must decode");
+            assert_eq!(serde_json::to_value(decoded.unwrap()).unwrap(), current);
+        }
+        let mut invalid = legacy;
+        invalid["refresh_mode"] = serde_json::json!("unbounded");
+        assert!(serde_json::from_value::<TemporaryAccessStatus>(invalid).is_err());
+    }
+
+    #[test]
+    fn public_binding_credentials_are_bounded_redacted_and_require_minor() {
+        let request = IpcRequest::BindPublicDevice {
+            protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+            user_token: PublicUserCredential::try_from("user.access.secret".to_owned()).unwrap(),
+        };
+        assert!(!format!("{request:?}").contains("user.access.secret"));
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["user_token"], "user.access.secret");
+        assert_eq!(
+            serde_json::from_value::<IpcRequest>(json.clone()).unwrap(),
+            request
+        );
+        let mut missing_minor = json;
+        missing_minor
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_minor");
+        assert!(serde_json::from_value::<IpcRequest>(missing_minor).is_err());
+        for secret in [
+            String::new(),
+            "one.part".into(),
+            "a.b.c.d".into(),
+            "a..c".into(),
+            "a.b.c\r\nInjected".into(),
+            format!("{}.b.c", "a".repeat(4096)),
+        ] {
+            let error = serde_json::from_value::<PublicUserCredential>(serde_json::json!(secret))
+                .unwrap_err();
+            assert!(!error.to_string().contains(&secret) || secret.is_empty());
+        }
+        assert!(PublicUserCredential::try_from(format!("{}.b.c", "a".repeat(4092))).is_ok());
+    }
 
     #[test]
     fn display_mode_ipc_round_trips_with_restore_metadata() {

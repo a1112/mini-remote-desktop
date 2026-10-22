@@ -67,3 +67,8 @@ client-qt/venv
 
 # Local iOS / service bridge credentials and device identifiers.
 apps/Rdesk/.env.ios.local
+
+# Track native Rdesk Mobile launcher source and generated density resources
+!apps/Rdesk-Mobile/branding/launcher-source.png
+!apps/Rdesk-Mobile/app/src/main/res/mipmap-*/*.png
+!apps/Rdesk-Mobile/app/src/main/res/drawable-*/*.png

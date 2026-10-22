@@ -492,7 +492,11 @@ async fn request_wan_remote_session(
         access_mode: WanAccessModeV3::Attended,
         requested_scopes,
         requested_profile,
-        route_policy: WanRoutePolicyV3::RelayOnly,
+        route_policy: if request.route_preference == RemoteRoutePreference::WanRelay {
+            WanRoutePolicyV3::RelayOnly
+        } else {
+            WanRoutePolicyV3::DirectFirst
+        },
     };
     let identity =
         match crate::wan_session::model::WanSessionIdentity::new_controller_pending_target(
@@ -1894,6 +1898,8 @@ fn wan_terminal_error_response(
 }
 
 async fn clear_session_media_state(app_state: &Arc<AppState>, session_id: &SessionId) {
+    #[cfg(windows)]
+    app_state.console_capture.stop(app_state, session_id).await;
     app_state.media_profiles.lock().await.remove(session_id);
     app_state.capture_sources.lock().await.remove(session_id);
     app_state

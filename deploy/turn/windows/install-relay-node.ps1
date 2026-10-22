@@ -2840,7 +2840,8 @@ $transportCapabilities = @("turn_udp", "turn_tcp", "turns_tcp" | Where-Object { 
 if (($transportCapabilities -join ",") -cne "turn_udp,turn_tcp,turns_tcp") {
   Fail "relay_install_transport_capabilities_incomplete"
 }
-if ($coturnCapacityBytesPerSecond -lt 25000000) {
+$coturnPerAllocationBytesPerSecond = [int64][decimal]::Floor([decimal]$coturnCapacityBytesPerSecond / [decimal]$maxAllocations)
+if ($coturnPerAllocationBytesPerSecond -lt 1) {
   Fail "relay_install_per_allocation_bandwidth_invalid"
 }
 
@@ -2916,6 +2917,7 @@ foreach ($rawLine in $sourceBaselineLines) {
     }
     { $_ -like "total-quota=*" } { [void]$renderedBaselineLines.Add("total-quota=$maxAllocations"); continue }
     { $_ -like "bps-capacity=*" } { [void]$renderedBaselineLines.Add("bps-capacity=$coturnCapacityBytesPerSecond"); continue }
+    { $_ -like "max-bps=*" } { [void]$renderedBaselineLines.Add("max-bps=$coturnPerAllocationBytesPerSecond"); continue }
     default { [void]$renderedBaselineLines.Add($rawLine) }
   }
 }

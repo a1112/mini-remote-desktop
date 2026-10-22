@@ -2,18 +2,43 @@ package com.a1112.rdeskmobile;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 
 final class Protocol {
     static final int MAX_JPEG_BYTES = 2 * 1024 * 1024;
 
     private Protocol() {}
 
-    static String desktopUrl(String host, int port) {
-        return base(host, port) + "/mobile/desktop/ws";
+    static String desktopUrl(String host, int port, String pairingToken) {
+        return base(host, port) + "/mobile/desktop/ws?token=" + encodeToken(pairingToken);
     }
 
-    static String phonePublishUrl(String host, int port) {
-        return base(host, port) + "/mobile/phone/publish/ws";
+    static String phonePublishUrl(String host, int port, String pairingToken) {
+        return base(host, port) + "/mobile/phone/publish/ws?token=" + encodeToken(pairingToken);
+    }
+
+    static boolean isPairingTokenValid(String token) {
+        return token != null && token.getBytes(StandardCharsets.UTF_8).length >= 32;
+    }
+
+    static boolean isCertificateFingerprintValid(String fingerprint) {
+        return fingerprint != null && fingerprint.matches("[0-9a-fA-F]{64}");
+    }
+
+    static boolean isGatewayHostValid(String host, int port) {
+        try { base(host, port); return true; }
+        catch (Exception ignored) { return false; }
+    }
+
+    private static String encodeToken(String pairingToken) {
+        if (!isPairingTokenValid(pairingToken)) throw new IllegalArgumentException("请输入至少 32 字节的配对令牌");
+        try {
+            // The String/Charset overload is only available on newer Android APIs.
+            return URLEncoder.encode(pairingToken, "UTF-8");
+        } catch (java.io.UnsupportedEncodingException error) {
+            throw new IllegalStateException("UTF-8 is unavailable", error);
+        }
     }
 
     private static String base(String host, int port) {
@@ -30,7 +55,7 @@ final class Protocol {
                 (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31) ||
                 (octets[0] == 192 && octets[1] == 168);
         if (!local) throw new IllegalArgumentException("仅允许受信局域网地址");
-        return "ws://" + host.trim() + ":" + port;
+        return "wss://" + host.trim() + ":" + port;
     }
 
     static float normalized(float position, float extent) {
@@ -46,7 +71,7 @@ final class Protocol {
 
     static List<String> discoveryPrefixes(String host) {
         try {
-            desktopUrl(host, 9534);
+            if (!isGatewayHostValid(host, 9534)) return List.of();
             String[] octets = host.split("\\.");
             int first = Integer.parseInt(octets[0]);
             int second = Integer.parseInt(octets[1]);

@@ -5,10 +5,12 @@ import org.junit.Test;
 
 public class ProtocolTest {
     @Test public void acceptsOnlyPrivateOrLoopbackGateways() {
-        assertEquals("ws://192.168.1.5:9533/mobile/desktop/ws", Protocol.desktopUrl("192.168.1.5", 9533));
-        assertEquals("ws://127.0.0.1:9533/mobile/phone/publish/ws", Protocol.phonePublishUrl("127.0.0.1", 9533));
-        assertThrows(IllegalArgumentException.class, () -> Protocol.desktopUrl("example.com", 9533));
-        assertThrows(IllegalArgumentException.class, () -> Protocol.desktopUrl("192.168.1.5/x", 9533));
+        String token = "01234567890123456789012345678901";
+        assertEquals("wss://192.168.1.5:9533/mobile/desktop/ws?token=" + token, Protocol.desktopUrl("192.168.1.5", 9533, token));
+        assertEquals("wss://127.0.0.1:9533/mobile/phone/publish/ws?token=" + token, Protocol.phonePublishUrl("127.0.0.1", 9533, token));
+        assertThrows(IllegalArgumentException.class, () -> Protocol.desktopUrl("example.com", 9533, token));
+        assertThrows(IllegalArgumentException.class, () -> Protocol.desktopUrl("192.168.1.5/x", 9533, token));
+        assertThrows(IllegalArgumentException.class, () -> Protocol.desktopUrl("192.168.1.5", 9533, "short"));
     }
 
     @Test public void normalizesTouchesAndClampsEdges() {

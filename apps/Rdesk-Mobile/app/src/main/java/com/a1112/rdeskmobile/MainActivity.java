@@ -26,7 +26,7 @@ import org.json.JSONObject;
 
 public final class MainActivity extends Activity {
     private static final int PROJECTION_REQUEST = 31;
-    private EditText hostInput, portInput, keyboardInput;
+    private EditText hostInput, portInput, pairingTokenInput, fingerprintInput, keyboardInput;
     private TextView status, targetStatus;
     private ImageView desktopImage;
     private LanWebSocket desktopSocket;
@@ -43,6 +43,8 @@ public final class MainActivity extends Activity {
         buildUi();
         hostInput.setText(getPreferences(0).getString("host", ""));
         portInput.setText(getPreferences(0).getString("port", "9534"));
+        pairingTokenInput.setText(getPreferences(0).getString("pairing_token", ""));
+        fingerprintInput.setText(getPreferences(0).getString("tls_sha256", ""));
         refreshTargetStatus();
         scanLan(true);
     }
@@ -68,12 +70,14 @@ public final class MainActivity extends Activity {
 
         LinearLayout connection = card(card); root.addView(connection, spaced());
         connection.addView(label("电脑网关", 20, text));
-        connection.addView(label("电脑与手机连接同一受信局域网。", 13, Color.rgb(159, 178, 209)));
+        connection.addView(label("电脑与手机连接同一局域网，并使用配对令牌和证书指纹建立加密连接。", 13, Color.rgb(159, 178, 209)));
         Button scan = button("扫描局域网电脑", false); connection.addView(scan, spaced()); scan.setOnClickListener(v -> scanLan(true));
         discoveryStatus = label("正在搜索同一局域网的电脑…", 13, Color.rgb(159, 178, 209)); connection.addView(discoveryStatus, spaced());
         discoveredList = new LinearLayout(this); discoveredList.setOrientation(LinearLayout.VERTICAL); connection.addView(discoveredList);
         hostInput = field("电脑 IPv4 地址，例如 192.168.1.10", false); connection.addView(hostInput, spaced());
         portInput = field("端口", false); portInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER); connection.addView(portInput, spaced());
+        pairingTokenInput = field("网关配对令牌（至少 32 字节）", true); connection.addView(pairingTokenInput, spaced());
+        fingerprintInput = field("TLS 证书 SHA-256 指纹（扫描发现时自动填充）", false); connection.addView(fingerprintInput, spaced());
         status = label("未连接", 14, Color.rgb(159, 178, 209)); connection.addView(status, spaced());
         Button connect = button("连接电脑屏幕", true); connection.addView(connect, spaced()); connect.setOnClickListener(v -> connectDesktop());
 
@@ -105,17 +109,19 @@ public final class MainActivity extends Activity {
         share.setOnClickListener(v -> requestProjection());
         Button stop = button("停止共享与电脑控制", false); target.addView(stop, spaced());
         stop.setOnClickListener(v -> { stopService(new Intent(this, ProjectionService.class)); refreshTargetStatus(); });
-        root.addView(label("局域网连接当前使用明文传输，请只在受信网络使用。共享时可从通知栏随时停止。", 12, Color.rgb(145, 162, 190)), spaced());
+        root.addView(label("连接需要配对令牌和网关证书指纹；屏幕共享仍需每次由您批准，并可从通知栏停止。", 12, Color.rgb(145, 162, 190)), spaced());
     }
 
     private void connectDesktop() {
         try {
             String host = hostInput.getText().toString().trim();
             int port = Integer.parseInt(portInput.getText().toString().trim());
-            String url = Protocol.desktopUrl(host, port);
-            rememberGateway(host, port);
+            String token = pairingTokenInput.getText().toString();
+            String fingerprint = fingerprintInput.getText().toString().trim();
+            String url = Protocol.desktopUrl(host, port, token);
+            rememberGateway(host, port, token, fingerprint);
             disconnectDesktop(); status.setText("正在连接电脑…");
-            desktopSocket = new LanWebSocket(url, new LanWebSocket.Listener() {
+            desktopSocket = new LanWebSocket(url, fingerprint, new LanWebSocket.Listener() {
                 @Override public void onText(String text) {
                     runOnUiThread(() -> {
                         if (text.contains("\"type\":\"ready\"")) { status.setText("已连接，正在等待电脑画面"); sessionPanel.setVisibility(View.VISIBLE); }
@@ -142,7 +148,7 @@ public final class MainActivity extends Activity {
         discoveredList.removeAllViews();
         LanDiscovery.scan(hostInput.getText().toString().trim(), extended, new LanDiscovery.Listener() {
             private int found;
-            @Override public void onGateway(String address, int port, String name) {
+            @Override public void onGateway(String address, int port, String name, String fingerprint) {
                 runOnUiThread(() -> {
                     if (isDestroyed() || generation != discoveryGeneration) return;
                     found++;
@@ -152,6 +158,7 @@ public final class MainActivity extends Activity {
                     device.setOnClickListener(v -> {
                         hostInput.setText(address);
                         portInput.setText(String.valueOf(port));
+                        fingerprintInput.setText(fingerprint);
                         connectDesktop();
                     });
                 });
@@ -214,8 +221,11 @@ public final class MainActivity extends Activity {
         try {
             String host = hostInput.getText().toString().trim();
             int port = Integer.parseInt(portInput.getText().toString().trim());
-            Protocol.phonePublishUrl(host, port);
-            rememberGateway(host, port);
+            String token = pairingTokenInput.getText().toString();
+            String fingerprint = fingerprintInput.getText().toString().trim();
+            Protocol.phonePublishUrl(host, port, token);
+            if (!Protocol.isCertificateFingerprintValid(fingerprint)) throw new IllegalArgumentException("请输入网关证书指纹");
+            rememberGateway(host, port, token, fingerprint);
             MediaProjectionManager manager = getSystemService(MediaProjectionManager.class);
             startActivityForResult(manager.createScreenCaptureIntent(), PROJECTION_REQUEST);
         } catch (Exception error) { Toast.makeText(this, error.getMessage(), Toast.LENGTH_LONG).show(); }
@@ -228,13 +238,16 @@ public final class MainActivity extends Activity {
         Intent service = new Intent(this, ProjectionService.class)
                 .putExtra(ProjectionService.EXTRA_RESULT, result).putExtra(ProjectionService.EXTRA_DATA, data)
                 .putExtra(ProjectionService.EXTRA_HOST, hostInput.getText().toString().trim())
-                .putExtra(ProjectionService.EXTRA_PORT, Integer.parseInt(portInput.getText().toString().trim()));
+                .putExtra(ProjectionService.EXTRA_PORT, Integer.parseInt(portInput.getText().toString().trim()))
+                .putExtra(ProjectionService.EXTRA_TOKEN, pairingTokenInput.getText().toString())
+                .putExtra(ProjectionService.EXTRA_FINGERPRINT, fingerprintInput.getText().toString().trim());
         startForegroundService(service);
         targetStatus.setText("正在共享手机屏幕");
     }
 
-    private void rememberGateway(String host, int port) {
-        getPreferences(0).edit().putString("host", host).putString("port", String.valueOf(port)).apply();
+    private void rememberGateway(String host, int port, String token, String fingerprint) {
+        getPreferences(0).edit().putString("host", host).putString("port", String.valueOf(port))
+                .putString("pairing_token", token).putString("tls_sha256", fingerprint).apply();
     }
 
     private void refreshTargetStatus() {

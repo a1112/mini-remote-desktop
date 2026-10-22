@@ -38,6 +38,7 @@ const MAX_RESTART_ATTEMPTS: u8 = 3;
 const MAX_BACKEND_BACKOFF_MS: u64 = 30_000;
 const BACKEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const LOCAL_SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
+const ALLOCATION_PROOF_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -355,6 +356,7 @@ pub struct IdentityLifecycle {
 #[derive(Clone)]
 pub struct SharedRelayHealth {
     state: Arc<Mutex<SharedRelayHealthState>>,
+    sample_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,6 +377,7 @@ struct SharedRelayHealthState {
 impl Default for SharedRelayHealth {
     fn default() -> Self {
         Self {
+            sample_gate: Arc::new(tokio::sync::Mutex::new(())),
             state: Arc::new(Mutex::new(SharedRelayHealthState {
                 snapshot: RelayHealthSnapshot {
                     process: ProcessHealth::Failed,
@@ -390,6 +393,14 @@ impl Default for SharedRelayHealth {
 }
 
 impl SharedRelayHealth {
+    async fn acquire_sample(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, RuntimeError> {
+        tokio::time::timeout(
+            ALLOCATION_PROOF_WAIT_TIMEOUT,
+            self.sample_gate.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| RuntimeError::MetricsUnavailable)
+    }
     pub fn snapshot(&self) -> RelayHealthSnapshot {
         self.state
             .lock()
@@ -460,6 +471,22 @@ impl SharedRelayHealth {
             state.snapshot
         }
     }
+}
+
+fn sample_matches_proof(
+    generation: u64,
+    secret_version: u64,
+    before: &crate::process::CoturnSnapshot,
+    after: &crate::process::CoturnSnapshot,
+) -> bool {
+    generation != 0
+        && secret_version != 0
+        && before.generation == generation
+        && after.generation == generation
+        && before.applied_secret_version == secret_version
+        && after.applied_secret_version == secret_version
+        && before.health == ProcessHealth::Healthy
+        && after.health == ProcessHealth::Healthy
 }
 
 impl IdentityLifecycle {
@@ -994,7 +1021,6 @@ where
             }
         }
 
-        let health = supervisor_health.snapshot_for_heartbeat(runtime.clock.monotonic_ms());
         let heartbeat_epoch = identity.identity_epoch();
         let renewal_recovery_pending = renewal_in_flight_for_epoch(
             in_flight.as_ref().map(|operation| &operation.operation),
@@ -1005,12 +1031,10 @@ where
                 if *identity_epoch == heartbeat_epoch
         );
         let (heartbeat_result, completion_during_heartbeat) = {
-            let heartbeat = runtime.heartbeat_cycle_at_deadline(
+            let heartbeat = runtime.heartbeat_cycle_with_shared_health(
                 identity,
                 sampler,
-                health.process,
-                health.listener,
-                health.probe,
+                supervisor_health,
                 pressure,
             );
             tokio::pin!(heartbeat);
@@ -1337,6 +1361,8 @@ where
     }
 
     pub async fn supervise_once(&mut self) -> Result<(), RuntimeError> {
+        let sample_gate = self.shared_health.sample_gate.clone();
+        let sample_guard = sample_gate.lock().await;
         if !self.local_ready.load(Ordering::Acquire) {
             self.shared_health.finish_probe(
                 RelayHealthSnapshot {
@@ -1415,6 +1441,7 @@ where
             generation,
             self.clock.monotonic_ms(),
         );
+        drop(sample_guard);
         let mut persisted = self.state_store.load()?.coturn_restart_budget;
         let validated_wall_unix_seconds = self.clock.unix_seconds();
         validate_coturn_restart_budget(persisted.as_ref(), validated_wall_unix_seconds)?;
@@ -2572,6 +2599,69 @@ where
         .await
     }
 
+    async fn heartbeat_cycle_with_shared_health<F, M>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+        sampler: &HeartbeatSampler<M>,
+        shared_health: &SharedRelayHealth,
+        pressure: HostPressureSnapshot,
+    ) -> Result<(), RuntimeError>
+    where
+        F: IdentityFsPort,
+        M: MetricsPort,
+    {
+        let sample_guard = shared_health.acquire_sample().await?;
+        let health = shared_health.snapshot_for_heartbeat(self.clock.monotonic_ms());
+        let generation = shared_health
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        let before = if health.probe == RelayHealth::Healthy {
+            Some(
+                tokio::time::timeout(LOCAL_SAMPLE_TIMEOUT, self.coturn.snapshot())
+                    .await
+                    .map_err(|_| RuntimeError::MetricsUnavailable)?
+                    .map_err(RuntimeError::Process)?,
+            )
+        } else {
+            None
+        };
+        let mut payload = tokio::time::timeout(
+            LOCAL_SAMPLE_TIMEOUT,
+            sampler.sample(
+                identity.identity_epoch(),
+                health.process,
+                health.listener,
+                health.probe,
+                pressure,
+                self.secret_version,
+            ),
+        )
+        .await
+        .map_err(|_| RuntimeError::MetricsUnavailable)??;
+        if let Some(before) = before {
+            let after = tokio::time::timeout(LOCAL_SAMPLE_TIMEOUT, self.coturn.snapshot())
+                .await
+                .map_err(|_| RuntimeError::MetricsUnavailable)?
+                .map_err(RuntimeError::Process)?;
+            if !sample_matches_proof(generation, self.secret_version, &before, &after)
+                || shared_health
+                    .snapshot_for_heartbeat(self.clock.monotonic_ms())
+                    .probe
+                    != RelayHealth::Healthy
+            {
+                payload.process_health = after.health.into();
+                payload.listener_health = after.health.into();
+                payload.probe_health = RelayHealth::NonEvidence;
+            }
+        }
+        let heartbeat = identity.sign_heartbeat(self.clock.unix_seconds(), payload)?;
+        // Network latency cannot hold the local supervisor or its safety probe.
+        drop(sample_guard);
+        self.heartbeat_once(heartbeat).await
+    }
+
     async fn heartbeat_cycle_at_deadline<F, M>(
         &mut self,
         identity: &mut CertificateState<F>,
@@ -3180,6 +3270,49 @@ mod identifier_tests {
             LocalAllocationProbePort, ProcessError, SecretBytes,
         },
     };
+
+    #[tokio::test]
+    async fn heartbeat_sampling_waits_for_in_progress_allocation_proof() {
+        let health = SharedRelayHealth::default();
+        let probe = health.sample_gate.lock().await;
+        health.begin_probe(ProcessHealth::Healthy, 17, 100);
+        let waiting_health = health.clone();
+        let pending = tokio::spawn(async move {
+            let _sample = waiting_health.acquire_sample().await.unwrap();
+            waiting_health.snapshot_for_heartbeat(200)
+        });
+        tokio::task::yield_now().await;
+        assert!(!pending.is_finished());
+        health.finish_probe(
+            super::RelayHealthSnapshot {
+                process: ProcessHealth::Healthy,
+                listener: ProcessHealth::Healthy,
+                probe: crate::backend::RelayHealth::Healthy,
+            },
+            17,
+            200,
+        );
+        drop(probe);
+        assert_eq!(
+            pending.await.unwrap().probe,
+            crate::backend::RelayHealth::Healthy
+        );
+    }
+
+    #[test]
+    fn heartbeat_requires_same_proved_generation_and_secret_through_metrics_sampling() {
+        let proved = CoturnSnapshot::healthy(0, 0).with_generation(17, 3);
+        let mut after = proved.clone();
+        assert!(super::sample_matches_proof(17, 3, &proved, &after));
+        after.generation = 18;
+        assert!(!super::sample_matches_proof(17, 3, &proved, &after));
+        after = proved.clone();
+        after.applied_secret_version = 4;
+        assert!(!super::sample_matches_proof(17, 3, &proved, &after));
+        after = proved.clone();
+        after.health = ProcessHealth::Failed;
+        assert!(!super::sample_matches_proof(17, 3, &proved, &after));
+    }
 
     #[test]
     fn generated_operation_ids_reject_non_alphanumeric_first_char_without_losing_length() {

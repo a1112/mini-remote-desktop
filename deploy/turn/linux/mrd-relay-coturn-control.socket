@@ -13,7 +13,10 @@ RemoveOnStop=yes
 MaxConnections=16
 MaxConnectionsPerSource=4
 TriggerLimitIntervalSec=30s
-TriggerLimitBurst=30
+# Each bounded snapshot/probe is a separate authenticated socket activation.
+# Allow the supervisor, five-second heartbeat, and verifier to coexist while
+# retaining per-source concurrency and a finite total activation budget.
+TriggerLimitBurst=256
 
 [Install]
 WantedBy=sockets.target

@@ -16,6 +16,8 @@ pub struct SignalingConfig {
     device_name: String,
     role: BackendRole,
     backend_device_token: Zeroizing<String>,
+    shared_credential: Option<std::sync::Arc<crate::public_connection::DeviceCredential>>,
+    counter_allocator: Option<std::sync::Arc<super::PersistentSignalingCounter>>,
     credential_endpoint: Option<Url>,
     server_device_id: DeviceId,
     trusted_server_key_id: Option<String>,
@@ -34,6 +36,7 @@ impl fmt::Debug for SignalingConfig {
             .field("role", &self.role)
             .field("backend_device_token", &"REDACTED")
             .field("credential_exchange", &self.credential_endpoint.is_some())
+            .field("persistent_counter", &self.counter_allocator.is_some())
             .field("server_device_id", &self.server_device_id)
             .field("trusted_server_key_id", &self.trusted_server_key_id)
             .field("connect_timeout", &self.connect_timeout)
@@ -95,6 +98,8 @@ impl SignalingConfig {
             device_name: device_name.to_owned(),
             role,
             backend_device_token: Zeroizing::new(backend_device_token.to_owned()),
+            shared_credential: None,
+            counter_allocator: None,
             credential_endpoint: None,
             server_device_id,
             trusted_server_key_id: trusted_server_key_id.map(|key| key.to_ascii_lowercase()),
@@ -124,6 +129,7 @@ impl SignalingConfig {
         {
             "agent" => BackendRole::Agent,
             "controller" => BackendRole::Controller,
+            "peer" => BackendRole::Peer,
             _ => return Err(SignalingConfigError::InvalidRole),
         };
         let connect_timeout = env_duration_ms(
@@ -195,6 +201,21 @@ impl SignalingConfig {
         self.credential_endpoint.as_ref()
     }
 
+    /// Share one durable sequence across reconnects and service-owned connections.
+    pub fn with_counter_allocator(
+        mut self,
+        allocator: std::sync::Arc<super::PersistentSignalingCounter>,
+    ) -> Self {
+        self.counter_allocator = Some(allocator);
+        self
+    }
+
+    pub(crate) fn counter_allocator(
+        &self,
+    ) -> Option<&std::sync::Arc<super::PersistentSignalingCounter>> {
+        self.counter_allocator.as_ref()
+    }
+
     pub(crate) fn endpoint(&self) -> &Url {
         &self.endpoint
     }
@@ -211,8 +232,19 @@ impl SignalingConfig {
         self.role.clone()
     }
 
-    pub(crate) fn backend_device_token(&self) -> &str {
-        &self.backend_device_token
+    pub(crate) fn backend_device_token(&self) -> Zeroizing<String> {
+        self.shared_credential
+            .as_ref()
+            .map(|credential| credential.snapshot())
+            .unwrap_or_else(|| Zeroizing::new(self.backend_device_token.as_str().to_owned()))
+    }
+
+    pub(crate) fn with_device_credential(
+        mut self,
+        credential: std::sync::Arc<crate::public_connection::DeviceCredential>,
+    ) -> Self {
+        self.shared_credential = Some(credential);
+        self
     }
 
     pub(crate) fn server_device_id(&self) -> &DeviceId {
@@ -329,6 +361,23 @@ mod tests {
     use std::sync::Mutex;
 
     static ENVIRONMENT: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn environment_accepts_one_peer_connection_for_both_device_capabilities() {
+        let _guard = ENVIRONMENT.lock().unwrap();
+        let _restore = RestoreEnvironment::save(&[
+            "MRD_SIGNAL_URL",
+            "MRD_SIGNAL_DEVICE_TOKEN",
+            "MRD_SIGNAL_ROLE",
+        ]);
+        std::env::set_var("MRD_SIGNAL_URL", "wss://signal.example/ws");
+        std::env::set_var("MRD_SIGNAL_DEVICE_TOKEN", "device-token");
+        std::env::set_var("MRD_SIGNAL_ROLE", "peer");
+        let config = SignalingConfig::from_env(DeviceId("device-1".into()), "Workstation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.role(), BackendRole::Peer);
+    }
 
     struct RestoreEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
 

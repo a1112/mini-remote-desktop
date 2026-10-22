@@ -27,8 +27,11 @@ mod test_orchestrator;
 mod webrtc_host;
 mod webrtc_media;
 
+#[cfg(test)]
+use app_settings::save_settings;
 use app_settings::{
-    default_settings_path, load_settings, save_settings, AppSettings, DecodePolicy,
+    default_settings_path, load_settings, update_settings, AppSettings, CloseBehavior,
+    DecodePolicy, UiPreferences, UiPreferencesCache,
 };
 use device_info::HardwareInfo;
 use mrd_device_registration::{DeviceRegistrationRequest, DeviceRegistrationResponse};
@@ -107,6 +110,7 @@ enum TrayAction {
 #[derive(Clone)]
 struct AppState {
     settings_path: std::path::PathBuf,
+    ui_preferences: std::sync::Arc<UiPreferencesCache>,
     // Service lifecycle manager - controls mrd-service
     service_manager: std::sync::Arc<service_manager::ServiceManager>,
     // Test harness for end-to-end pipeline visualization
@@ -176,7 +180,11 @@ fn ensure_rustls_crypto_provider() {
 /// Tauri 命令：获取硬件信息
 #[tauri::command]
 fn get_hardware_info() -> Result<HardwareInfo, String> {
-    Ok(device_info::get_hardware_info())
+    let hardware = device_info::get_hardware_info();
+    if hardware.motherboard_serial.trim().is_empty() {
+        return Err("无法读取受保护设备身份，请解锁本机钥匙串或重启后台服务后重试".into());
+    }
+    Ok(hardware)
 }
 
 #[tauri::command]
@@ -250,7 +258,26 @@ fn center_window(window: WebviewWindow) -> Result<(), String> {
 
 #[tauri::command]
 fn close_window(window: WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|err| err.to_string())
+    if window.label() == "main" {
+        handle_main_window_close(window.app_handle())
+    } else {
+        window.hide().map_err(|error| error.to_string())
+    }
+}
+
+fn tray_action_for_close_behavior(close_behavior: CloseBehavior) -> TrayAction {
+    match close_behavior {
+        CloseBehavior::HideToTray => TrayAction::HideWindow,
+        CloseBehavior::ExitUi => TrayAction::QuitUi,
+    }
+}
+
+fn handle_main_window_close(app: &AppHandle) -> Result<(), String> {
+    let preferences = app.state::<AppState>().ui_preferences.snapshot()?;
+    apply_tray_action(
+        app,
+        tray_action_for_close_behavior(preferences.close_behavior),
+    )
 }
 
 #[tauri::command]
@@ -2066,6 +2093,21 @@ async fn set_decode_policy(
 }
 
 #[tauri::command]
+fn get_ui_preferences(state: tauri::State<'_, AppState>) -> Result<UiPreferences, String> {
+    state.ui_preferences.snapshot()
+}
+
+#[tauri::command]
+fn set_close_behavior(
+    state: tauri::State<'_, AppState>,
+    close_behavior: CloseBehavior,
+) -> Result<UiPreferences, String> {
+    state
+        .ui_preferences
+        .set_close_behavior(&state.settings_path, close_behavior)
+}
+
+#[tauri::command]
 fn ffmpeg_probe(
     state: tauri::State<'_, AppState>,
 ) -> Result<mrd_ffmpeg::FfmpegProbeResult, String> {
@@ -2134,7 +2176,11 @@ async fn service_wait_for_stopped(
     state: tauri::State<'_, AppState>,
     timeout_secs: u64,
 ) -> Result<bool, String> {
-    state.service_manager.wait_for_stopped(timeout_secs).await.map_err(|error| format!("{error:#}"))
+    state
+        .service_manager
+        .wait_for_stopped(timeout_secs)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Check if this instance bootstrapped the service
@@ -2233,8 +2279,14 @@ struct AutostartStatus {
 #[tauri::command]
 async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
     let mut client = mrd_ipc::client::IpcClient::management();
-    match client.send_request(mrd_ipc::IpcRequest::GetAutostartStatus).await.map_err(|error| error.to_string())? {
-        mrd_ipc::IpcResponse::AutostartStatus { enabled, supported } => Ok(AutostartStatus { enabled, supported }),
+    match client
+        .send_request(mrd_ipc::IpcRequest::GetAutostartStatus)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        mrd_ipc::IpcResponse::AutostartStatus { enabled, supported } => {
+            Ok(AutostartStatus { enabled, supported })
+        }
         mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("Unexpected autostart status response".to_string()),
     }
@@ -2243,7 +2295,11 @@ async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
 #[tauri::command]
 async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
     let mut client = mrd_ipc::client::IpcClient::management();
-    match client.send_request(mrd_ipc::IpcRequest::SetAutostart { enabled }).await.map_err(|error| error.to_string())? {
+    match client
+        .send_request(mrd_ipc::IpcRequest::SetAutostart { enabled })
+        .await
+        .map_err(|error| error.to_string())?
+    {
         mrd_ipc::IpcResponse::Ack => Ok(()),
         mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("Unexpected autostart configuration response".to_string()),
@@ -2252,7 +2308,10 @@ async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
 
 /// Request service-owned shutdown and report rejection to the caller.
 #[tauri::command]
-async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn shell_shutdown_service(
+    mode: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     let shutdown_mode = match mode.as_str() {
         "graceful" => mrd_ipc::ShutdownMode::Graceful,
         "force" => mrd_ipc::ShutdownMode::Force,
@@ -2260,7 +2319,11 @@ async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>)
         _ => return Err(format!("Unknown shutdown mode: {}", mode)),
     };
 
-    state.service_manager.request_shutdown(shutdown_mode).await.map_err(|error| format!("{error:#}"))
+    state
+        .service_manager
+        .request_shutdown(shutdown_mode)
+        .await
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// Quit UI and stop service (explicit user action)
@@ -2268,8 +2331,14 @@ async fn shell_shutdown_service(mode: String, state: tauri::State<'_, AppState>)
 /// Phase 6: This now uses IPC ShutdownService instead of directly stopping
 /// the service process. Rdesk no longer owns service lifecycle.
 #[tauri::command]
-async fn shell_quit_ui_and_stop_service(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    state.service_manager.shutdown_and_wait(mrd_ipc::ShutdownMode::Graceful, 30).await
+async fn shell_quit_ui_and_stop_service(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .service_manager
+        .shutdown_and_wait(mrd_ipc::ShutdownMode::Graceful, 30)
+        .await
         .map_err(|error| format!("{error:#}"))?;
     request_app_exit(&app_handle, "user_quit");
     Ok(())
@@ -3072,6 +3141,135 @@ async fn ipc_secure_remote(request: mrd_ipc::IpcRequest) -> Result<mrd_ipc::IpcR
 
 /// Get runtime snapshot via IPC (migrated version)
 #[tauri::command]
+async fn ipc_public_server_status() -> Result<mrd_ipc::PublicServerStatus, String> {
+    use mrd_ipc::{IpcRequest, IpcResponse};
+    let mut client = mrd_ipc::client::IpcClient::trusted_management();
+    match client
+        .send_request(IpcRequest::GetPublicServerStatus)
+        .await
+        .map_err(|_| "无法读取后台公网连接状态".to_owned())?
+    {
+        IpcResponse::PublicServerStatus { status } => Ok(status),
+        IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("后台返回的公网连接状态无效".into()),
+    }
+}
+
+/// This command reads a secret-free status over the protected local IPC channel.
+#[tauri::command]
+async fn ipc_temporary_access_status() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    match client
+        .send_request_no_reconnect(mrd_ipc::IpcRequest::GetTemporaryAccessStatus)
+        .await
+        .map_err(|_| "无法读取临时密码状态".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessStatus { status } => Ok(status),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+/// Cleartext exists only in the resident and this verified native UI's memory.
+#[tauri::command]
+async fn ipc_temporary_access_secret() -> Result<mrd_ipc::TemporaryAccessSecret, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    match client
+        .send_request_no_reconnect(mrd_ipc::IpcRequest::ReadTemporaryAccessPassword)
+        .await
+        .map_err(|_| "无法读取本机临时密码".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessSecret { secret } => Ok(secret),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+async fn temporary_access_change(disable: bool) -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    let mut client = mrd_ipc::client::IpcClient::new();
+    let request = if disable {
+        mrd_ipc::IpcRequest::DisableTemporaryAccess
+    } else {
+        mrd_ipc::IpcRequest::RotateTemporaryAccessPassword
+    };
+    match client
+        .send_request_no_reconnect(request)
+        .await
+        .map_err(|_| "无法更新临时密码，请检查后台服务".to_owned())?
+    {
+        mrd_ipc::IpcResponse::TemporaryAccessStatus { status } => Ok(status),
+        mrd_ipc::IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+        _ => Err("临时密码协议不兼容，请更新客户端和服务".into()),
+    }
+}
+#[tauri::command]
+async fn ipc_temporary_access_rotate() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    temporary_access_change(false).await
+}
+#[tauri::command]
+async fn ipc_temporary_access_disable() -> Result<mrd_ipc::TemporaryAccessStatus, String> {
+    temporary_access_change(true).await
+}
+
+async fn change_public_device_binding(user_token: String, bind: bool) -> Result<(), String> {
+    use mrd_ipc::{
+        IpcRequest, IpcResponse, PublicUserCredential, PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+    };
+    let user_token = PublicUserCredential::try_from(user_token).map_err(str::to_owned)?;
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        #[cfg(windows)]
+        let mut client = mrd_ipc::client::IpcClient::product();
+        #[cfg(not(windows))]
+        let mut client = mrd_ipc::client::IpcClient::trusted_management();
+        // Never send a user credential to a service that has not advertised this
+        // exact narrow protocol, or to an unverified pipe server.
+        match client
+            .send_request_no_reconnect(IpcRequest::GetPublicDeviceBindingProtocol)
+            .await
+        {
+            Ok(IpcResponse::PublicDeviceBindingProtocol { protocol_minor })
+                if protocol_minor == PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR => {}
+            Ok(IpcResponse::Error { code, .. }) if code == "E_PRODUCT_CALLER_DENIED" => {
+                return Err("请使用已安装的桌面客户端绑定本机设备".to_owned());
+            }
+            _ => return Err("后台服务不支持安全设备绑定，请更新或重新启动后台服务".to_owned()),
+        }
+        let request = if bind {
+            IpcRequest::BindPublicDevice {
+                protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token,
+            }
+        } else {
+            IpcRequest::UnbindPublicDevice {
+                protocol_minor: PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                user_token,
+            }
+        };
+        match client.send_request_no_reconnect(request).await {
+            Ok(IpcResponse::Ack) => Ok(()),
+            Ok(IpcResponse::Error { code, message }) if code == "E_PUBLIC_DEVICE_BINDING" => {
+                Err(message)
+            }
+            Ok(IpcResponse::Error { code, .. }) if code == "E_PRODUCT_DESKTOP_DENIED" => {
+                Err("请在设备当前本机桌面登录后绑定或解绑设备".to_owned())
+            }
+            _ => Err("本机设备绑定失败，请确认后台服务已启动后重试".to_owned()),
+        }
+    })
+    .await
+    .map_err(|_| "本机设备绑定操作超时，请稍后重试".to_owned())?
+}
+
+#[tauri::command]
+async fn ipc_bind_public_device(user_token: String) -> Result<(), String> {
+    change_public_device_binding(user_token, true).await
+}
+
+#[tauri::command]
+async fn ipc_unbind_public_device(user_token: String) -> Result<(), String> {
+    change_public_device_binding(user_token, false).await
+}
+
+/// Get runtime snapshot via IPC (migrated version)
+#[tauri::command]
 async fn ipc_runtime_snapshot() -> Result<mrd_ipc::RuntimeSnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
@@ -3235,7 +3433,10 @@ async fn webrtc_session_list_via_ipc() -> Result<Vec<String>, String> {
 
 /// Tauri 命令：设备注册
 ///
-/// 调用后端 API 进行设备注册，后端根据主板序列号生成设备ID
+/// 通过后台服务登记或恢复设备，公网设备码由服务器分配（10 位）。
+// Preserve the existing ten named Tauri arguments used by the UI contract.
+// The public endpoint immediately maps enrollment/recovery to typed IPC requests.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn register_device(
     motherboard_serial: String,
@@ -3252,7 +3453,45 @@ async fn register_device(
     let api_base = std::env::var("RDESK_SERVER_URL")
         .ok()
         .or(api_base)
-        .unwrap_or_else(|| "http://127.0.0.1:9530/api/v1".to_owned());
+        .unwrap_or_else(|| "https://175.178.16.90/rdesk/api/v1".to_owned());
+    if api_base.trim_end_matches('/') == "https://175.178.16.90/rdesk/api/v1" {
+        use mrd_ipc::{IpcRequest, IpcResponse};
+        let request = match (enrollment_token, device_token) {
+            (Some(enrollment_token), None) => IpcRequest::EnrollPublicDevice {
+                enrollment_token: enrollment_token.into(),
+                device_name: device_name.unwrap_or(hostname),
+            },
+            (None, Some(device_token)) => IpcRequest::RecoverPublicDevice {
+                device_token: device_token.into(),
+            },
+            _ => return Err("请提供一次性设备登记码或管理员恢复凭据".into()),
+        };
+        // Enrollment belongs to the core endpoint on macOS. The management
+        // endpoint rejects it before the signed UI caller can be checked.
+        #[cfg(target_os = "macos")]
+        let mut client = mrd_ipc::client::IpcClient::new();
+        #[cfg(not(target_os = "macos"))]
+        let mut client = mrd_ipc::client::IpcClient::trusted_management();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            client.send_request(request),
+        )
+        .await
+        .map_err(|_| "后台设备登记超时，请重试同一登记码".to_owned())?
+        .map_err(|_| "无法连接设备后台服务".to_owned())?;
+        return match response {
+            IpcResponse::PublicServerStatus { status } if status.device_registered => {
+                Ok(DeviceRegistrationResponse {
+                    device_id: status.device_id.ok_or("后台设备码缺失")?,
+                    device_name: status.device_name.ok_or("后台设备名称缺失")?,
+                    access_token: "service-managed".into(),
+                    refresh_token: None,
+                })
+            }
+            IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
+            _ => Err("后台设备登记响应无效".into()),
+        };
+    }
     mrd_device_registration::register_device(
         &api_base,
         &DeviceRegistrationRequest {
@@ -3286,9 +3525,9 @@ async fn set_decode_policy_with(
     decode_policy: DecodePolicy,
 ) -> Result<DecodePolicyResponse, String> {
     // Save policy to settings - actual decode policy application now happens in mrd-service
-    let mut settings = load_settings(settings_path)?;
-    settings.decode_policy = decode_policy;
-    save_settings(settings_path, &settings)?;
+    update_settings(settings_path, |settings| {
+        settings.decode_policy = decode_policy
+    })?;
     Ok(DecodePolicyResponse {
         decode_policy: decode_policy.as_str().to_string(),
     })
@@ -3311,10 +3550,9 @@ async fn ffmpeg_download_at_path(
 }
 
 fn reset_ffmpeg_settings_at_path(settings_path: &std::path::Path) -> Result<AppSettings, String> {
-    let mut settings = load_settings(settings_path)?;
-    settings.ffmpeg = mrd_ffmpeg::golden_settings();
-    save_settings(settings_path, &settings)?;
-    Ok(settings)
+    update_settings(settings_path, |settings| {
+        settings.ffmpeg = mrd_ffmpeg::golden_settings();
+    })
 }
 
 // ============================================================================
@@ -4096,6 +4334,55 @@ mod tray_tests {
         std::fs::remove_file(&path).expect("cleanup temp settings");
     }
 
+    #[tokio::test]
+    async fn app_settings_decode_update_preserves_saved_close_behavior() {
+        let path = unique_settings_path("decode-preserves-close");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        std::fs::write(&path, r#"{"close_behavior":"exit_ui"}"#).expect("save preferences");
+
+        set_decode_policy_with(&path, DecodePolicy::Nvdec)
+            .await
+            .expect("update decode policy");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings"))
+                .expect("parse settings");
+
+        assert_eq!(saved["close_behavior"], "exit_ui");
+        std::fs::remove_file(&path).expect("cleanup settings");
+    }
+
+    #[test]
+    fn app_settings_ffmpeg_reset_preserves_saved_close_behavior() {
+        let path = unique_settings_path("ffmpeg-reset-preserves-close");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create test directory");
+        std::fs::write(
+            &path,
+            r#"{"close_behavior":"exit_ui","decode_policy":"software"}"#,
+        )
+        .expect("save preferences");
+
+        reset_ffmpeg_settings_at_path(&path).expect("reset ffmpeg");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read settings"))
+                .expect("parse settings");
+
+        assert_eq!(saved["close_behavior"], "exit_ui");
+        assert_eq!(saved["decode_policy"], "software");
+        std::fs::remove_file(&path).expect("cleanup settings");
+    }
+
+    #[test]
+    fn app_settings_close_behavior_uses_only_ui_actions() {
+        assert_eq!(
+            tray_action_for_close_behavior(CloseBehavior::HideToTray),
+            TrayAction::HideWindow
+        );
+        assert_eq!(
+            tray_action_for_close_behavior(CloseBehavior::ExitUi),
+            TrayAction::QuitUi
+        );
+    }
+
     #[test]
     fn reset_ffmpeg_settings_uses_golden_defaults() {
         let path = unique_settings_path("ffmpeg-reset");
@@ -4501,7 +4788,7 @@ fn main() {
     spawn_native_surface_control_input_forwarder();
 
     let settings_path = default_settings_path();
-    let _settings = load_settings(&settings_path).unwrap_or_else(|error| {
+    let settings = load_settings(&settings_path).unwrap_or_else(|error| {
         eprintln!("failed to load app settings: {error}");
         AppSettings::default()
     });
@@ -4554,6 +4841,7 @@ fn main() {
     tauri::Builder::default()
         .manage(AppState {
             settings_path,
+            ui_preferences: std::sync::Arc::new(UiPreferencesCache::from_settings(&settings)),
             service_manager,
             test_harness,
             test_orchestrator,
@@ -4615,8 +4903,8 @@ fn main() {
                             return;
                         }
                         api.prevent_close();
-                        if let Err(error) = hide_main_window(&app_handle_for_close) {
-                            eprintln!("failed to hide Rdesk window: {error}");
+                        if let Err(error) = handle_main_window_close(&app_handle_for_close) {
+                            eprintln!("failed to close Rdesk window: {error}");
                         }
                     }
                 });
@@ -4652,7 +4940,9 @@ fn main() {
                                 eprintln!("Failed to register UI presence: {}", e);
                             }
                         }
-                        Ok(false) => eprintln!("mrd-service did not become ready within 30 seconds"),
+                        Ok(false) => {
+                            eprintln!("mrd-service did not become ready within 30 seconds")
+                        }
                         Err(e) => eprintln!("mrd-service health check failed: {e:#}"),
                     }
                 });
@@ -4690,6 +4980,8 @@ fn main() {
             nvdec_runtime_probe,
             decode_policy,
             set_decode_policy,
+            get_ui_preferences,
+            set_close_behavior,
             ffmpeg_probe,
             ffmpeg_download,
             ffmpeg_reset_golden_settings,
@@ -4732,6 +5024,13 @@ fn main() {
             ipc_recover_session,
             ipc_session_snapshot,
             ipc_runtime_snapshot,
+            ipc_public_server_status,
+            ipc_temporary_access_status,
+            ipc_temporary_access_secret,
+            ipc_temporary_access_rotate,
+            ipc_temporary_access_disable,
+            ipc_bind_public_device,
+            ipc_unbind_public_device,
             ipc_audit_log,
             ipc_capability_snapshot,
             ipc_peer_capability_snapshot,

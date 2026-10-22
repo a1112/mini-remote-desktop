@@ -1,8 +1,8 @@
 use crate::ConnectionId;
-use mrd_proto::{BackendRole, DeviceId};
+use mrd_proto::{BackendRole, DeviceId, SessionId};
 use mrd_signal_proto::{
     AuthenticatedRegister, ServerChallenge, SignalProtocolError, SignalReplayGuard,
-    VerifiedSignalMetadata,
+    VerifiedSignalMetadata, WanPermissionScopeV3,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use std::{collections::HashMap, sync::Arc};
@@ -14,6 +14,27 @@ pub struct VerifiedBackendToken {
     pub device_key_id: String,
     pub role: BackendRole,
     pub expires_at_ms: u64,
+    pub browser: Option<BrowserSignalingRestriction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserSignalingAuthority {
+    Account {
+        user_id: String,
+    },
+    TemporaryPassword {
+        temporary_access_generation: u64,
+        target_auth_version: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserSignalingRestriction {
+    pub authority: BrowserSignalingAuthority,
+    pub tenant_id: String,
+    pub session_id: SessionId,
+    pub target_device_id: DeviceId,
+    pub allowed_scopes: Vec<WanPermissionScopeV3>,
 }
 
 pub trait BackendTokenVerifier: Send + Sync {
@@ -148,7 +169,7 @@ impl Authenticator {
         {
             return Err(AuthError::ChallengeMismatch);
         }
-        register.verify_for(&self.server_device_id, now_ms, replay)?;
+        let metadata = register.verify_for_without_replay(&self.server_device_id, now_ms)?;
         let token = self
             .token_verifier
             .verify(&register.payload.backend_device_token, now_ms)
@@ -163,16 +184,10 @@ impl Authenticator {
         {
             return Err(AuthError::TokenBindingMismatch);
         }
-        Ok(AuthenticatedRegistration {
-            token,
-            metadata: VerifiedSignalMetadata {
-                issuer_device_id: claims.issuer_device_id.clone(),
-                issuer_key_id: claims.issuer_key_id.clone(),
-                intended_peer_device_id: claims.intended_peer_device_id.clone(),
-                counter: claims.counter,
-                nonce: claims.nonce,
-            },
-        })
+        // Replay state is committed only after the backend token and all
+        // signed identity bindings have been accepted.
+        replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        Ok(AuthenticatedRegistration { token, metadata })
     }
 
     pub fn remove_connection(&mut self, connection_id: ConnectionId) {

@@ -27,7 +27,7 @@ use mrd_application::{
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{
     webrtc_candidate_fingerprint_v3, AuthenticatedPayload, SignalReplayGuard, SignedSignal,
-    WebRtcCandidateV3, WebRtcDescriptionRoleV3,
+    WanRoutePolicyV3, WebRtcCandidateV3, WebRtcDescriptionRoleV3,
 };
 use mrd_transport_webrtc::{
     IceCandidate, IceTransportPolicy, PeerConnectionConfig, PeerConnectionRole, SessionDescription,
@@ -134,6 +134,7 @@ pub struct GenerationZeroRouteProof {
     directory_id: String,
     primary_node_id: String,
     relay_url_digest: String,
+    route_policy: WanRoutePolicyV3,
     local_relay: bool,
     remote_relay: bool,
 }
@@ -164,11 +165,30 @@ impl GenerationZeroRouteProof {
         local_relay: bool,
         remote_relay: bool,
     ) -> Result<Self, GenerationZeroNegotiationError> {
+        Self::new_with_policy(
+            session_id,
+            directory_id,
+            primary_node_id,
+            relay_url_digest,
+            WanRoutePolicyV3::RelayOnly,
+            local_relay,
+            remote_relay,
+        )
+    }
+
+    fn new_with_policy(
+        session_id: SessionId,
+        directory_id: String,
+        primary_node_id: String,
+        relay_url_digest: String,
+        route_policy: WanRoutePolicyV3,
+        local_relay: bool,
+        remote_relay: bool,
+    ) -> Result<Self, GenerationZeroNegotiationError> {
         if !is_sha256_hex(&relay_url_digest)
             || directory_id.is_empty()
             || primary_node_id.is_empty()
-            || !local_relay
-            || !remote_relay
+            || (route_policy == WanRoutePolicyV3::RelayOnly && (!local_relay || !remote_relay))
         {
             return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
         }
@@ -178,6 +198,7 @@ impl GenerationZeroRouteProof {
             directory_id,
             primary_node_id,
             relay_url_digest,
+            route_policy,
             local_relay,
             remote_relay,
         })
@@ -223,27 +244,33 @@ impl GenerationZeroRouteProof {
         &self.relay_url_digest
     }
 
+    pub fn route_policy(&self) -> WanRoutePolicyV3 {
+        self.route_policy
+    }
+
     pub fn is_relay_to_relay(&self) -> bool {
         self.local_relay && self.remote_relay
     }
 
     fn from_verified_route(
         session_id: &SessionId,
-        route: &RelayRouteEvidence,
+        evidence: &crate::transports::webrtc::VerifiedActiveRelayEvidence,
     ) -> Result<Self, GenerationZeroNegotiationError> {
+        let route = evidence.route();
         if route.session_id() != session_id.0
             || route.generation() != 0
             || !is_sha256_hex(&hex_digest(route.urls_digest()))
         {
             return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
         }
-        Self::new(
+        Self::new_with_policy(
             session_id.clone(),
             route.directory_id().to_owned(),
             route.node_id().to_owned(),
             hex_digest(route.urls_digest()),
-            true,
-            true,
+            evidence.policy(),
+            evidence.local_relay(),
+            evidence.remote_relay(),
         )
     }
 }
@@ -298,6 +325,18 @@ pub trait GenerationZeroWebRtcHost: Send + Sync {
         expected: &RelayRouteEvidence,
         session_id: &SessionId,
     ) -> Result<GenerationZeroRouteProof, GenerationZeroWebRtcHostError>;
+
+    async fn prove_generation_zero_route_with_policy(
+        &self,
+        expected: &RelayRouteEvidence,
+        session_id: &SessionId,
+        policy: WanRoutePolicyV3,
+    ) -> Result<GenerationZeroRouteProof, GenerationZeroWebRtcHostError> {
+        if policy != WanRoutePolicyV3::RelayOnly {
+            return Err(GenerationZeroWebRtcHostError::Rejected);
+        }
+        self.prove_generation_zero_route(expected, session_id).await
+    }
 
     async fn close_session(
         &self,
@@ -408,7 +447,15 @@ impl GenerationZeroWebRtcHost for ServiceWebRtcTransportHost {
         session_id: &SessionId,
         config: PeerConnectionConfig,
     ) -> Result<(), GenerationZeroWebRtcHostError> {
-        if config.ice_transport_policy != IceTransportPolicy::Relay || config.ice_servers.len() != 1
+        if config.ice_servers.is_empty()
+            || config.ice_servers.len() > 2
+            || config.ice_servers[0].urls.is_empty()
+            || config.ice_servers[0]
+                .urls
+                .iter()
+                .any(|url| !(url.starts_with("turn:") || url.starts_with("turns:")))
+            || (config.ice_transport_policy == IceTransportPolicy::Relay
+                && config.ice_servers.len() != 1)
         {
             return Err(GenerationZeroWebRtcHostError::Rejected);
         }
@@ -483,7 +530,21 @@ impl GenerationZeroWebRtcHost for ServiceWebRtcTransportHost {
             .verify_active_relay(session_id, expected.clone())
             .await
             .map_err(map_host_error)?;
-        GenerationZeroRouteProof::from_verified_route(session_id, evidence.route())
+        GenerationZeroRouteProof::from_verified_route(session_id, &evidence)
+            .map_err(|_| GenerationZeroWebRtcHostError::RouteEvidenceMismatch)
+    }
+
+    async fn prove_generation_zero_route_with_policy(
+        &self,
+        expected: &RelayRouteEvidence,
+        session_id: &SessionId,
+        policy: WanRoutePolicyV3,
+    ) -> Result<GenerationZeroRouteProof, GenerationZeroWebRtcHostError> {
+        let evidence = self
+            .verify_active_wan_route(session_id, expected.clone(), policy)
+            .await
+            .map_err(map_host_error)?;
+        GenerationZeroRouteProof::from_verified_route(session_id, &evidence)
             .map_err(|_| GenerationZeroWebRtcHostError::RouteEvidenceMismatch)
     }
 
@@ -615,7 +676,17 @@ impl GenerationZeroSessionInstaller for ServiceGenerationZeroSessionInstaller {
             || proof.directory_id() != route.directory_id()
             || proof.primary_node_id() != route.node_id()
             || proof.relay_url_digest() != hex_digest(route.urls_digest())
-            || !proof.is_relay_to_relay()
+            || (proof.route_policy() == WanRoutePolicyV3::RelayOnly && !proof.is_relay_to_relay())
+            || self
+                .app_state
+                .wan_session_coordinator()
+                .ok_or(GenerationZeroNegotiationError::NotReady)?
+                .snapshot(&expected_session)
+                .await
+                .map_err(|_| GenerationZeroNegotiationError::NotReady)?
+                .grant()
+                .map(GrantBinding::route_policy)
+                != Some(proof.route_policy())
         {
             return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
         }
@@ -863,10 +934,14 @@ impl GenerationZeroNegotiationContext {
             WanSessionRole::Controller => PeerConnectionRole::Offerer,
             WanSessionRole::Target => PeerConnectionRole::Answerer,
         };
-        Ok(credential.apply_relay_only(PeerConnectionConfig {
+        let config = PeerConnectionConfig {
             role,
             ..PeerConnectionConfig::default()
-        }))
+        };
+        Ok(match self.grant.route_policy() {
+            WanRoutePolicyV3::RelayOnly => credential.apply_relay_only(config),
+            WanRoutePolicyV3::DirectFirst => credential.apply_direct_first(config),
+        })
     }
 }
 
@@ -1171,7 +1246,8 @@ impl GenerationZeroNegotiator {
                     || proof.directory_id() != context.access.directory_id()
                     || proof.primary_node_id() != context.access.primary_node_id()
                     || proof.relay_url_digest() != context.access.relay_url_digest()
-                    || !proof.is_relay_to_relay()
+                    || proof.route_policy() != context.grant.route_policy()
+                    || (context.grant.route_policy() == WanRoutePolicyV3::RelayOnly && !proof.is_relay_to_relay())
                 {
                     return Err(GenerationZeroNegotiationError::RouteEvidenceMismatch);
                 }
@@ -1184,7 +1260,7 @@ impl GenerationZeroNegotiator {
                     .await?;
                 if let Some(coordinator) = &self.coordinator {
                     let model_proof =
-                        RelayRouteProof::from_verified_access(context.access(), true, true)
+                        RelayRouteProof::from_verified_policy(context.access(), proof.route_policy(), proof.local_relay, proof.remote_relay)
                             .map_err(|_| GenerationZeroNegotiationError::RouteEvidenceMismatch)?;
                     let installer = Arc::clone(&self.installer);
                     let proof_for_install = proof.clone();
@@ -1859,7 +1935,11 @@ impl GenerationZeroNegotiator {
             .route_evidence(context.access().primary_node_id(), 0)
             .map_err(|_| GenerationZeroNegotiationError::RouteEvidenceMismatch)?;
         self.host
-            .prove_generation_zero_route(&route, context.identity().session_id())
+            .prove_generation_zero_route_with_policy(
+                &route,
+                context.identity().session_id(),
+                context.grant.route_policy(),
+            )
             .await
             .map_err(|_| GenerationZeroNegotiationError::RouteEvidenceMismatch)
     }

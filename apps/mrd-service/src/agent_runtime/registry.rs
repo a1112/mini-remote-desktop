@@ -1002,6 +1002,42 @@ impl AgentRegistry {
         minimum_protocol_minor: u16,
         now_ms: u64,
     ) -> Result<ExactAgentRoute, AgentRouteError> {
+        self.resolve_bound_generation(
+            binding,
+            required_capability,
+            minimum_protocol_minor,
+            now_ms,
+            false,
+        )
+    }
+
+    /// Deliver only a cleanup command to its original live registration. The
+    /// Agent separately verifies its signed receipt before confirming retirement;
+    /// this route never enables a start or input on a changed desktop.
+    pub(super) fn resolve_cleanup_with_minimum_minor(
+        &self,
+        binding: &AgentBinding,
+        required_capability: AgentCapability,
+        minimum_protocol_minor: u16,
+        now_ms: u64,
+    ) -> Result<ExactAgentRoute, AgentRouteError> {
+        self.resolve_bound_generation(
+            binding,
+            required_capability,
+            minimum_protocol_minor,
+            now_ms,
+            true,
+        )
+    }
+
+    fn resolve_bound_generation(
+        &self,
+        binding: &AgentBinding,
+        required_capability: AgentCapability,
+        minimum_protocol_minor: u16,
+        now_ms: u64,
+        cleanup: bool,
+    ) -> Result<ExactAgentRoute, AgentRouteError> {
         if binding.required_capability != required_capability {
             return Err(AgentRouteError::CapabilityBindingMismatch);
         }
@@ -1020,13 +1056,19 @@ impl AgentRegistry {
         {
             return Err(AgentRouteError::BindingRevoked);
         }
-        if active.capabilities.desktop_epoch != binding.desktop_epoch {
+        if !cleanup && active.capabilities.desktop_epoch != binding.desktop_epoch {
             return Err(AgentRouteError::DesktopChanged);
         }
         if active.identity.protocol_minor < minimum_protocol_minor {
             return Err(AgentRouteError::ProtocolVersionUnavailable);
         }
-        validate_route_readiness(active, required_capability, now_ms)?;
+        if cleanup {
+            if agent_health(active, now_ms) != AgentHealth::Healthy {
+                return Err(AgentRouteError::Unhealthy);
+            }
+        } else {
+            validate_route_readiness(active, required_capability, now_ms)?;
+        }
         Ok(ExactAgentRoute {
             binding: binding.clone(),
             lease: registration_lease(active),

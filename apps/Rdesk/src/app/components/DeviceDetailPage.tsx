@@ -396,7 +396,7 @@ function RemoteTab({ device }: { device: Device }) {
         lanP2P: isLanP2PRemote,
       });
       if (result.mode === "route") {
-        navigate(`/session/${result.sessionId}`);
+        navigate(result.routePath ?? `/session/${result.sessionId}`);
         return;
       }
       activeSessionIdRef.current = result.sessionId;
@@ -1595,7 +1595,7 @@ function AppsTab({
         targetIp: device.ip,
         lanP2P: isLanP2PRemote,
       });
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
       setAppsError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -1637,7 +1637,7 @@ function AppsTab({
       });
       sessionHandedOffRef.current = true;
       setActiveSelection(result.captureSourceSelection ?? null);
-      if (result.mode === "route") navigate(`/session/${result.sessionId}`);
+      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
       setAppsError(error instanceof Error ? error.message : String(error));
     } finally {

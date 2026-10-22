@@ -10,6 +10,25 @@ pub(super) struct LanPeerRegistry {
 }
 
 impl LanPeerRegistry {
+    pub(super) fn mark_paired_binding(
+        &mut self,
+        paired: &super::first_pairing::VerifiedLanPairingPeer,
+    ) {
+        let Some(peer) = self
+            .peers
+            .get_mut(&format!("signed:{}", paired.peer_key_id))
+        else {
+            return;
+        };
+        if peer.device_id == paired.device_id.0
+            && peer.public_key.as_deref() == Some(paired.public_key.as_slice())
+            && peer.key_epoch == Some(paired.key_epoch)
+            && peer.control_addr() == paired.discovery_endpoint
+        {
+            peer.authentication = LanPeerAuthentication::Signed(AuthenticatedPeerTrust::Trusted);
+        }
+    }
+
     pub(super) fn upsert(&mut self, peer: LanPeerRecord) {
         self.peers.insert(peer.registry_key(), peer);
     }

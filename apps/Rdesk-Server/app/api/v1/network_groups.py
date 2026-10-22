@@ -32,8 +32,9 @@ router = APIRouter(prefix="/network-groups", tags=["network-groups"])
 
 def _owned_bound_device_filters(
     user: User,
-) -> tuple[ColumnElement[bool], ColumnElement[bool], ColumnElement[bool]]:
+) -> tuple[ColumnElement[bool], ...]:
     return (
+        Device.principal_kind == "physical",
         Device.tenant_id == user.tenant_id,
         Device.is_bound.is_(True),
         Device.bound_user_id == user.id,

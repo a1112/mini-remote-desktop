@@ -616,16 +616,19 @@ async fn security_negative_wrong_scope_emits_authoritative_evidence() {
         .expect("incoming peer key binding");
     let audit_baseline = audit_sequence_baseline(&app_state);
     let side_effect_baseline = capture_side_effect_totals(&app_state).await;
-    let response = IpcServer::new(app_state.clone())
-        .handle_request(IpcRequest::RespondToConsent {
-            response: mrd_ipc::ConsentResponse {
-                session_id: session_id.clone(),
-                decision: mrd_ipc::ConsentDecision::Approve,
-                approved_scopes: vec![RemotePermissionScope::InputKeyboard],
-                expected_policy_revision: pending.policy_revision,
-            },
-        })
-        .await;
+    // Exercise the authorization handler directly: the IPC dispatcher adds a
+    // macOS kernel-bound signed-UI caller gate before reaching this scope
+    // decision, while this negative case targets the authorization semantics.
+    let response = session::respond_to_consent(
+        &app_state,
+        mrd_ipc::ConsentResponse {
+            session_id: session_id.clone(),
+            decision: mrd_ipc::ConsentDecision::Approve,
+            approved_scopes: vec![RemotePermissionScope::InputKeyboard],
+            expected_policy_revision: pending.policy_revision,
+        },
+    )
+    .await;
     assert!(matches!(
         response,
         IpcResponse::RemoteAccessError { ref failure, .. }

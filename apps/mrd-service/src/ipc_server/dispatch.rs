@@ -15,24 +15,47 @@ pub(super) async fn dispatch_request(server: &IpcServer, request: IpcRequest) ->
 
 impl IpcServer {
     async fn dispatch_request_inner(&self, request: IpcRequest) -> IpcResponse {
+        #[cfg(target_os = "macos")]
+        if let Some(response) = self.macos_sensitive_request_denial(&request) {
+            return response;
+        }
+        #[cfg(windows)]
+        if self.product_only {
+            if let Some(denial) = self.product_request_denial(&request).await {
+                return denial;
+            }
+        }
         if self.management_only && !management_request_is_allowed(&request) {
             return IpcResponse::Error {
                 code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
                 message: "This endpoint accepts only service health, shell status, autostart and shutdown commands".to_owned(),
             };
         }
-        let _admission = if matches!(&request,
-            IpcRequest::StartSession { .. } | IpcRequest::StartLanRemoteSession { .. }
-            | IpcRequest::AcceptSession { .. } | IpcRequest::RequestRemoteSession { .. }
-            | IpcRequest::RecoverSession { .. }
+        let _admission = if matches!(
+            &request,
+            IpcRequest::EnrollPublicDevice { .. }
+                | IpcRequest::RecoverPublicDevice { .. }
+                | IpcRequest::BindPublicDevice { .. }
+                | IpcRequest::UnbindPublicDevice { .. }
+                | IpcRequest::RotateTemporaryAccessPassword
+                | IpcRequest::StartSession { .. }
+                | IpcRequest::StartLanRemoteSession { .. }
+                | IpcRequest::AcceptSession { .. }
+                | IpcRequest::RequestRemoteSession { .. }
+                | IpcRequest::RecoverSession { .. }
         ) {
             match self.app_state.shutdown.admit() {
                 Ok(permit) => Some(permit),
-                Err(error) => return IpcResponse::Error {
-                    code: "E_SERVICE_SHUTTING_DOWN".to_owned(), message: error.to_string(),
-                },
+                Err(error) => {
+                    return IpcResponse::Error {
+                        code: "E_SERVICE_SHUTTING_DOWN".to_owned(),
+                        message: error.to_string(),
+                    }
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
         let mut security_unhealthy = !self.app_state.security_is_healthy();
         if security_unhealthy && !allowed_when_security_unhealthy(&request) {
             return security_store_unavailable_response();
@@ -47,6 +70,82 @@ impl IpcServer {
             }
         }
         match request {
+            IpcRequest::GetTemporaryAccessStatus => IpcResponse::TemporaryAccessStatus {
+                status: crate::public_connection::temporary::status(&self.app_state).await,
+            },
+            IpcRequest::ReadTemporaryAccessPassword => IpcResponse::TemporaryAccessSecret {
+                secret: crate::public_connection::temporary::secret(&self.app_state).await,
+            },
+            IpcRequest::RotateTemporaryAccessPassword => temporary_response(
+                crate::public_connection::temporary::rotate(&self.app_state).await,
+            ),
+            IpcRequest::DisableTemporaryAccess => temporary_response(
+                crate::public_connection::temporary::disable(&self.app_state).await,
+            ),
+            IpcRequest::GetPublicDeviceBindingProtocol => {
+                IpcResponse::PublicDeviceBindingProtocol {
+                    protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR,
+                }
+            }
+            IpcRequest::BindPublicDevice {
+                protocol_minor,
+                user_token,
+            } => binding_response(
+                crate::public_connection::change_device_binding(
+                    &self.app_state.public_connection,
+                    protocol_minor,
+                    user_token,
+                    true,
+                )
+                .await,
+            ),
+            IpcRequest::UnbindPublicDevice {
+                protocol_minor,
+                user_token,
+            } => binding_response(
+                crate::public_connection::change_device_binding(
+                    &self.app_state.public_connection,
+                    protocol_minor,
+                    user_token,
+                    false,
+                )
+                .await,
+            ),
+            IpcRequest::GetPublicServerStatus => IpcResponse::PublicServerStatus {
+                status: self
+                    .app_state
+                    .public_connection
+                    .snapshot(&self.app_state.signaling_status.snapshot()),
+            },
+            IpcRequest::EnrollPublicDevice {
+                enrollment_token,
+                device_name,
+            } => {
+                match crate::public_connection::enroll(
+                    &self.app_state,
+                    enrollment_token.into_secret(),
+                    device_name,
+                )
+                .await
+                {
+                    Ok(status) => IpcResponse::PublicServerStatus { status },
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PUBLIC_ENROLLMENT".into(),
+                        message: message.into(),
+                    },
+                }
+            }
+            IpcRequest::RecoverPublicDevice { device_token } => {
+                match crate::public_connection::recover(&self.app_state, device_token.into_secret())
+                    .await
+                {
+                    Ok(status) => IpcResponse::PublicServerStatus { status },
+                    Err(message) => IpcResponse::Error {
+                        code: "E_PUBLIC_RECOVERY".into(),
+                        message: message.into(),
+                    },
+                }
+            }
             IpcRequest::RegisterDevice {
                 device_id,
                 device_name,
@@ -117,6 +216,39 @@ impl IpcServer {
                 identity::list_trusted_devices(&self.app_state, include_revoked).await
             }
 
+            IpcRequest::ListLanPairingCandidates => {
+                crate::lan_discovery::pairing_approval::list_candidates(&self.app_state).await
+            }
+
+            IpcRequest::ApproveLanPairing { approval } => {
+                #[cfg(windows)]
+                {
+                    if self.validate_first_pairing_caller().is_err() {
+                        IpcResponse::Error {
+                            code: "E_PRODUCT_CALLER_DENIED".to_owned(),
+                            message: "请在当前桌面的正式客户端中确认配对".to_owned(),
+                        }
+                    } else {
+                        let server = self.clone();
+                        crate::lan_discovery::pairing_approval::approve_candidate(
+                            &self.app_state,
+                            approval,
+                            move || server.validate_first_pairing_caller(),
+                        )
+                        .await
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = approval;
+                    IpcResponse::Error {
+                        code: "E_PRODUCT_CALLER_DENIED".to_owned(),
+                        message: "First pairing requires a supported verified installed desktop UI"
+                            .to_owned(),
+                    }
+                }
+            }
+
             IpcRequest::ApproveTrustedDevice { .. } => IpcResponse::Error {
                 code: "E_AUTHENTICATED_PEER_REQUIRED".to_string(),
                 message: "trusted-device approval requires an authenticated pending peer key"
@@ -148,7 +280,12 @@ impl IpcServer {
             }
 
             IpcRequest::GetRemoteSession { session_id } => {
-                session::get_remote_session(&self.app_state, session_id).await
+                let result = session::get_remote_session(&self.app_state, session_id).await;
+                #[cfg(windows)]
+                if let IpcResponse::RemoteSession { session } = &result {
+                    self.observe_owned_product_session(session).await;
+                }
+                result
             }
 
             IpcRequest::GetRouteEvidence { session_id } => {
@@ -156,11 +293,52 @@ impl IpcServer {
             }
 
             IpcRequest::GetAuditEventsV2 { query } => {
+                #[cfg(windows)]
+                if self.product_only {
+                    return self.read_product_audit(query).await;
+                }
                 telemetry::audit_events_v2(&self.app_state, query).await
             }
 
             IpcRequest::RespondToConsent { response } => {
-                session::respond_to_consent(&self.app_state, response).await
+                #[cfg(windows)]
+                let session_id = response.session_id.clone();
+                #[cfg(windows)]
+                let audit_cursor = match self.product_audit_cursor().await {
+                    Ok(cursor) => cursor,
+                    Err(denial) => {
+                        self.app_state
+                            .console_capture
+                            .stop(&self.app_state, &session_id)
+                            .await;
+                        return denial;
+                    }
+                };
+                #[cfg(windows)]
+                let previous_instance = self
+                    .app_state
+                    .session_authorizations
+                    .product_audit_binding(&session_id)
+                    .await
+                    .map(|(instance, _)| instance);
+                let result = session::respond_to_consent(&self.app_state, response).await;
+                #[cfg(windows)]
+                self.remember_product_response(
+                    &session_id,
+                    &result,
+                    mrd_ipc::RemoteSessionRole::Agent,
+                    audit_cursor,
+                    previous_instance.map(super::product::ProductAuditOwnerProof::Consent),
+                )
+                .await;
+                #[cfg(windows)]
+                if !matches!(result, IpcResponse::ConsentRecorded { .. }) {
+                    self.app_state
+                        .console_capture
+                        .stop(&self.app_state, &session_id)
+                        .await;
+                }
+                result
             }
 
             IpcRequest::SubscribeSessionEvents { query } => {
@@ -169,6 +347,20 @@ impl IpcServer {
 
             IpcRequest::RequestRemoteSession { request } => {
                 let session_id = request.session_id.clone();
+                #[cfg(windows)]
+                let outgoing_birth = if self.product_only {
+                    self.app_state
+                        .session_authorizations
+                        .observe_outgoing_birth(&session_id)
+                        .await
+                } else {
+                    None
+                };
+                #[cfg(windows)]
+                let audit_cursor = match self.product_audit_cursor().await {
+                    Ok(cursor) => cursor,
+                    Err(denial) => return denial,
+                };
                 let target_device_id = request.target_device_id.clone();
                 let mut details = vec![(
                     "requested_scopes".to_string(),
@@ -229,14 +421,25 @@ impl IpcServer {
                     crate::wan_session::media::WanRouteSelection::Lan => SessionStartKind::Lan,
                     crate::wan_session::media::WanRouteSelection::WanRelay => SessionStartKind::Wan,
                 };
-                self.finish_session_start_audit(
-                    response,
-                    session_id,
-                    target_device_id,
-                    session_kind,
-                    details,
+                let result = self
+                    .finish_session_start_audit(
+                        response,
+                        session_id.clone(),
+                        target_device_id,
+                        session_kind,
+                        details,
+                    )
+                    .await;
+                #[cfg(windows)]
+                self.remember_product_response(
+                    &session_id,
+                    &result,
+                    mrd_ipc::RemoteSessionRole::Controller,
+                    audit_cursor,
+                    outgoing_birth.map(super::product::ProductAuditOwnerProof::Outgoing),
                 )
-                .await
+                .await;
+                result
             }
 
             IpcRequest::EnableUnattendedAccess { policy } => {
@@ -766,6 +969,12 @@ impl IpcServer {
                 pid,
                 executable_path,
             } => {
+                #[cfg(target_os = "macos")]
+                let executable_path = self
+                    .peer_executable_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .or(executable_path);
                 shell_handlers::ui_attached(
                     &self.app_state,
                     &self.ui_launcher,
@@ -780,9 +989,10 @@ impl IpcServer {
             }
 
             IpcRequest::GetShellStatus => {
-                let _ = shell_handlers::refresh_autostart_state(&self.app_state, &self.autostart).await;
+                let _ =
+                    shell_handlers::refresh_autostart_state(&self.app_state, &self.autostart).await;
                 shell_handlers::shell_status(&self.app_state).await
-            },
+            }
 
             IpcRequest::SetAutostart { enabled } => {
                 shell_handlers::set_autostart(&self.app_state, &self.autostart, enabled).await
@@ -790,16 +1000,185 @@ impl IpcServer {
 
             IpcRequest::GetAutostartStatus => shell_handlers::autostart_status(&self.autostart),
 
-            IpcRequest::ShutdownService { mode } => shell_handlers::shutdown_service(&self.app_state, mode),
+            IpcRequest::ShutdownService { mode } => {
+                shell_handlers::shutdown_service(&self.app_state, mode)
+            }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_sensitive_request_denial(&self, request: &IpcRequest) -> Option<IpcResponse> {
+        // Classify first: missing kernel peer metadata is a denial for a sensitive request.
+        if !macos_request_is_sensitive(request) {
+            return None;
+        }
+        let peer_executable_path = self.peer_executable_path.as_deref();
+        let trusted_peer = match (self.peer_pid, peer_executable_path) {
+            (Some(pid), Some(path)) if pid != 0 && !path.as_os_str().is_empty() => self
+                .ui_launcher
+                .lock()
+                .inspect_err(|_| {
+                    tracing::warn!(stage = "ui_peer_verifier_lock_failed");
+                })
+                .ok()
+                .and_then(|launcher| {
+                    launcher
+                        .is_trusted_ui_peer(pid, Some(path))
+                        .inspect_err(|_| {
+                            tracing::warn!(stage = "ui_peer_verifier_failed", peer_pid = pid);
+                        })
+                        .ok()
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        let trusted_pid = self
+            .ui_launcher
+            .lock()
+            .inspect_err(|_| {
+                tracing::warn!(stage = "ui_pid_verifier_lock_failed");
+            })
+            .ok()
+            .and_then(|launcher| {
+                launcher
+                    .get_ui_pid()
+                    .inspect_err(|_| {
+                        tracing::warn!(stage = "ui_pid_verifier_failed");
+                    })
+                    .ok()
+                    .flatten()
+            });
+        let denial = macos_sensitive_request_policy_denial(
+            request,
+            self.peer_pid,
+            peer_executable_path,
+            trusted_peer,
+            trusted_pid,
+        );
+        if denial.is_some() {
+            let request_kind = match request {
+                IpcRequest::UiAttached { .. } => "ui_attached",
+                IpcRequest::UiDetached { .. } => "ui_detached",
+                IpcRequest::RespondToConsent { .. } => "respond_to_consent",
+                IpcRequest::ReadTemporaryAccessPassword => "read_temporary_access_password",
+                IpcRequest::RotateTemporaryAccessPassword => "rotate_temporary_access_password",
+                IpcRequest::DisableTemporaryAccess => "disable_temporary_access",
+                _ => "other_sensitive_request",
+            };
+            tracing::warn!(
+                stage = "ui_sensitive_request_denied",
+                request_kind,
+                peer_pid = self.peer_pid.unwrap_or(0),
+                peer_path_present =
+                    peer_executable_path.is_some_and(|path| !path.as_os_str().is_empty()),
+                trusted_peer,
+                trusted_pid = trusted_pid.unwrap_or(0),
+                peer_equals_trusted_pid = trusted_pid == self.peer_pid,
+            );
+        }
+        denial
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_request_is_sensitive(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::UiAttached { .. }
+            | IpcRequest::UiDetached { .. }
+            | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::ReadTemporaryAccessPassword
+            | IpcRequest::RotateTemporaryAccessPassword
+            | IpcRequest::DisableTemporaryAccess
+    )
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_sensitive_request_policy_denial(
+    request: &IpcRequest,
+    peer_pid: Option<u32>,
+    peer_executable_path: Option<&std::path::Path>,
+    trusted_peer: bool,
+    trusted_pid: Option<u32>,
+) -> Option<IpcResponse> {
+    if !macos_request_is_sensitive(request) {
+        return None;
+    }
+    let verified = trusted_peer
+        && peer_pid.is_some_and(|pid| pid != 0)
+        && peer_executable_path.is_some_and(|path| !path.as_os_str().is_empty());
+    let (allowed, code, message) = match request {
+        IpcRequest::UiAttached { pid, .. } | IpcRequest::UiDetached { pid, .. } => (
+            verified && peer_pid == Some(*pid),
+            "E_UI_CALLER_DENIED",
+            "UI lifecycle updates require the signed macOS Rdesk process",
+        ),
+        IpcRequest::RespondToConsent { .. } => (
+            verified && trusted_pid == peer_pid,
+            "E_CONSENT_CALLER_DENIED",
+            "Consent must be answered by the signed macOS Rdesk process",
+        ),
+        IpcRequest::ReadTemporaryAccessPassword
+        | IpcRequest::RotateTemporaryAccessPassword
+        | IpcRequest::DisableTemporaryAccess => (
+            verified && trusted_pid == peer_pid,
+            "E_TEMPORARY_ACCESS_CALLER_DENIED",
+            "Temporary access requires the active signed macOS Rdesk process",
+        ),
+        _ => return None,
+    };
+    if allowed {
+        None
+    } else {
+        Some(IpcResponse::Error {
+            code: code.to_owned(),
+            message: message.to_owned(),
+        })
     }
 }
 
 fn management_request_is_allowed(request: &IpcRequest) -> bool {
-    matches!(request,
-        IpcRequest::ServiceHealth | IpcRequest::GetShellStatus | IpcRequest::SetAutostart { .. }
-        | IpcRequest::GetAutostartStatus | IpcRequest::ShutdownService { .. }
+    // Unix management shares the same owner-only private socket boundary as
+    // core IPC. The Windows management pipe is intentionally read-only: its
+    // ACL grants interactive users data rights, so enrollment/recovery,
+    // autostart, and shutdown mutations must go through the verified product
+    // pipe or an explicitly elevated service administrator endpoint.
+    #[cfg(unix)]
+    if matches!(
+        request,
+        IpcRequest::BindPublicDevice { .. } | IpcRequest::UnbindPublicDevice { .. }
+    ) {
+        return true;
+    }
+    matches!(
+        request,
+        IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetTemporaryAccessStatus
+            | IpcRequest::GetPublicDeviceBindingProtocol
+            | IpcRequest::ServiceHealth
+            | IpcRequest::GetShellStatus
+            | IpcRequest::GetAutostartStatus
     )
+}
+
+fn temporary_response(result: Result<mrd_ipc::TemporaryAccessStatus, &'static str>) -> IpcResponse {
+    match result {
+        Ok(status) => IpcResponse::TemporaryAccessStatus { status },
+        Err(reason) => IpcResponse::Error {
+            code: "E_TEMPORARY_ACCESS".into(),
+            message: reason.into(),
+        },
+    }
+}
+
+fn binding_response(result: Result<(), &'static str>) -> IpcResponse {
+    match result {
+        Ok(()) => IpcResponse::Ack,
+        Err(message) => IpcResponse::Error {
+            code: "E_PUBLIC_DEVICE_BINDING".into(),
+            message: message.into(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -923,6 +1302,9 @@ fn allowed_when_security_unhealthy(request: &IpcRequest) -> bool {
     matches!(
         request,
         IpcRequest::ServiceHealth
+            | IpcRequest::GetPublicServerStatus
+            | IpcRequest::GetTemporaryAccessStatus
+            | IpcRequest::DisableTemporaryAccess
             | IpcRequest::ListSessions
             | IpcRequest::SessionRuntimeSnapshot { .. }
             | IpcRequest::RuntimeSnapshot
@@ -941,6 +1323,7 @@ fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
         IpcRequest::RegisterDevice { .. }
             | IpcRequest::RequestRemoteSession { .. }
             | IpcRequest::RespondToConsent { .. }
+            | IpcRequest::ApproveLanPairing { .. }
             | IpcRequest::EnableUnattendedAccess { .. }
             | IpcRequest::DisableUnattendedAccess { .. }
             | IpcRequest::RotateUnattendedAccess { .. }
@@ -959,7 +1342,9 @@ fn requires_durable_audit_preflight(request: &IpcRequest) -> bool {
 fn is_emergency_safety_command(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::StopSession { .. } | IpcRequest::FailSession { .. }
+        IpcRequest::StopSession { .. }
+            | IpcRequest::FailSession { .. }
+            | IpcRequest::DisableTemporaryAccess
     )
 }
 
@@ -976,6 +1361,123 @@ mod tests {
     };
     use mrd_proto::{DeviceId, SessionId};
     use std::sync::Arc;
+
+    #[test]
+    fn macos_temporary_access_requires_complete_active_signed_ui_identity() {
+        let executable = std::path::Path::new("/Applications/Rdesk.app/Contents/MacOS/Rdesk");
+        for request in [
+            IpcRequest::ReadTemporaryAccessPassword,
+            IpcRequest::RotateTemporaryAccessPassword,
+            IpcRequest::DisableTemporaryAccess,
+        ] {
+            for (pid, path, trusted, active) in [
+                (None, Some(executable), true, Some(7)),
+                (Some(7), None, true, Some(7)),
+                (Some(0), Some(executable), true, Some(0)),
+                (Some(7), Some(std::path::Path::new("")), true, Some(7)),
+                (Some(7), Some(executable), false, Some(7)),
+                (Some(7), Some(executable), true, None),
+                (Some(7), Some(executable), true, Some(8)),
+            ] {
+                assert!(
+                    matches!(super::macos_sensitive_request_policy_denial(&request, pid, path, trusted, active),
+                    Some(IpcResponse::Error { ref code, .. }) if code == "E_TEMPORARY_ACCESS_CALLER_DENIED")
+                );
+            }
+            assert!(super::macos_sensitive_request_policy_denial(
+                &request,
+                Some(7),
+                Some(executable),
+                true,
+                Some(7)
+            )
+            .is_none());
+            assert!(!super::management_request_is_allowed(&request));
+        }
+        assert!(super::macos_sensitive_request_policy_denial(
+            &IpcRequest::GetTemporaryAccessStatus,
+            None,
+            None,
+            false,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn macos_lifecycle_and_consent_missing_kernel_metadata_fail_closed() {
+        let attached = IpcRequest::UiAttached {
+            pid: 7,
+            executable_path: None,
+        };
+        assert!(
+            matches!(super::macos_sensitive_request_policy_denial(&attached, None, None, true, None),
+            Some(IpcResponse::Error { ref code, .. }) if code == "E_UI_CALLER_DENIED")
+        );
+        let consent = IpcRequest::RespondToConsent {
+            response: mrd_ipc::ConsentResponse {
+                session_id: SessionId("missing-kernel-identity".into()),
+                decision: mrd_ipc::ConsentDecision::Deny,
+                approved_scopes: vec![],
+                expected_policy_revision: DecimalU64::from(1),
+            },
+        };
+        assert!(
+            matches!(super::macos_sensitive_request_policy_denial(&consent, None, None, true, None),
+            Some(IpcResponse::Error { ref code, .. }) if code == "E_CONSENT_CALLER_DENIED")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_binding_management_negotiates_and_fails_closed_without_registration() {
+        let state = Arc::new(AppState::new());
+        let server = IpcServer::new_management(state.clone());
+        let core = IpcServer::new(state);
+        let response = dispatch_request(&server, IpcRequest::GetPublicDeviceBindingProtocol).await;
+        assert!(matches!(
+            response,
+            IpcResponse::PublicDeviceBindingProtocol {
+                protocol_minor: mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR
+            }
+        ));
+        for minor in [0, mrd_ipc::PUBLIC_DEVICE_BINDING_PROTOCOL_MINOR] {
+            for bind in [true, false] {
+                let user_token =
+                    mrd_ipc::PublicUserCredential::try_from("user.access.secret".to_owned())
+                        .unwrap();
+                let request = if bind {
+                    IpcRequest::BindPublicDevice {
+                        protocol_minor: minor,
+                        user_token,
+                    }
+                } else {
+                    IpcRequest::UnbindPublicDevice {
+                        protocol_minor: minor,
+                        user_token,
+                    }
+                };
+                #[cfg(windows)]
+                assert!(
+                    !super::management_request_is_allowed(&request),
+                    "any interactive process must not borrow the resident device credential"
+                );
+                let response = dispatch_request(&server, request.clone()).await;
+                #[cfg(windows)]
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED")
+                );
+                #[cfg(unix)]
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_PUBLIC_DEVICE_BINDING")
+                );
+                assert!(!format!("{response:?}").contains("user.access.secret"));
+                let response = dispatch_request(&core, request).await;
+                assert!(
+                    matches!(response, IpcResponse::Error { ref code, .. } if code == "E_PUBLIC_DEVICE_BINDING")
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn dispatch_request_routes_capability_snapshot_without_accept_loop() {
@@ -1360,5 +1862,54 @@ mod tests {
         assert_eq!(peer_key_id.as_deref(), Some("sha256:controller-key"));
         assert_eq!(failure.code, RemoteReasonCode::PolicyChanged);
         assert!(failure.message.contains("not granted"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_same_uid_ui_claim_fails_closed_without_os_identity() {
+        use crate::shell::{InMemoryUiLauncher, UiLauncherPortRef};
+        use mrd_ipc::{ConsentDecision, ConsentResponse};
+        use std::path::PathBuf;
+        use std::sync::Mutex;
+
+        let app_state = Arc::new(AppState::new());
+        let launcher_impl = InMemoryUiLauncher::new();
+        let peer_pid = std::process::id();
+        // Model a malicious same-UID client first claiming the active PID, as
+        // the old self-declared lifecycle path allowed.
+        launcher_impl.simulate_attach(peer_pid);
+        let launcher: UiLauncherPortRef = Arc::new(Mutex::new(launcher_impl));
+        let server = IpcServer::new_with_launcher(
+            app_state,
+            mrd_ipc::transport::IpcEndpoint::service_from_env_or_default(),
+            launcher,
+        )
+        .with_peer_identity(peer_pid, PathBuf::from("/tmp/Rdesk"));
+
+        let attached = server
+            .handle_request(IpcRequest::UiAttached {
+                pid: peer_pid,
+                executable_path: Some("/tmp/Rdesk".to_owned()),
+            })
+            .await;
+        assert!(matches!(
+            attached,
+            IpcResponse::Error { ref code, .. } if code == "E_UI_CALLER_DENIED"
+        ));
+
+        let consent = server
+            .handle_request(IpcRequest::RespondToConsent {
+                response: ConsentResponse {
+                    session_id: SessionId("same-uid-spoof".to_owned()),
+                    decision: ConsentDecision::Deny,
+                    approved_scopes: Vec::new(),
+                    expected_policy_revision: DecimalU64::from(1),
+                },
+            })
+            .await;
+        assert!(matches!(
+            consent,
+            IpcResponse::Error { ref code, .. } if code == "E_CONSENT_CALLER_DENIED"
+        ));
     }
 }

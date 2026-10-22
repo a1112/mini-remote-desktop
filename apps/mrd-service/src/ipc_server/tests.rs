@@ -312,20 +312,21 @@ async fn capability_snapshot_marks_keyboard_mouse_unavailable_when_injector_is_u
         .iter()
         .find(|item| item.id == "control.keyboard_mouse")
         .expect("keyboard/mouse control capability");
-    let (status, reason) = if cfg!(target_os = "macos") {
-        (CapabilityStatus::PermissionMissing, "Enable Accessibility")
+    let expected = if cfg!(target_os = "macos") {
+        CapabilityStatus::PermissionMissing
     } else {
-        (
-            CapabilityStatus::Unsupported,
-            "Input injector is unavailable",
-        )
+        CapabilityStatus::Unsupported
     };
-    assert_eq!(control.status, status);
+    assert_eq!(control.status, expected);
     assert!(control
         .reason
         .as_deref()
         .unwrap_or_default()
-        .contains(reason));
+        .contains(if cfg!(target_os = "macos") {
+            "Accessibility"
+        } else {
+            "Input injector is unavailable"
+        }));
 }
 
 #[tokio::test]

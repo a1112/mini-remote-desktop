@@ -5,6 +5,16 @@
  * This is the single source of truth for IPC command shapes.
  */
 
+export type TemporaryAccessStatus = {
+  enabled: boolean;
+  ready: boolean;
+  generation: number;
+  expires_at_ms: number | null;
+  reason: string | null;
+  refresh_mode?: 'manual' | 'automatic';
+};
+export type TemporaryAccessSecret = { status: TemporaryAccessStatus; password: string | null };
+
 // ============================================================================
 // Test Workbench Unified Domain Model
 // ============================================================================
@@ -610,6 +620,19 @@ export interface AutostartStatus {
   supported: boolean;
 }
 
+/** The authoritative local service health snapshot returned by ServiceHealth. */
+export interface ServiceStatusInfo {
+  running: boolean;
+  healthy: boolean;
+  pid?: number | null;
+}
+
+export type CloseBehavior = 'hide_to_tray' | 'exit_ui';
+
+export interface UiPreferences {
+  close_behavior: CloseBehavior;
+}
+
 export interface ShellStatusSnapshot {
   service_pid: number;
   ui_pid: number | null;
@@ -863,6 +886,20 @@ export interface SignalingRuntimeSnapshot {
   last_error: string | null;
 }
 
+/** Secret-free public connectivity, reported by the background service. */
+export interface PublicServerStatus {
+  service_running: boolean;
+  api_url: string | null;
+  api_reachable: boolean | null;
+  device_registered: boolean;
+  device_id: string | null;
+  device_name: string | null;
+  signaling_state: SignalingRuntimeSnapshot['state'];
+  reconnect_attempt: number;
+  last_connected_at_ms: number | null;
+  last_error: string | null;
+}
+
 export interface AuditLogQuery {
   session_id?: string | null;
   action?: string | null;
@@ -1051,6 +1088,27 @@ export interface TrustedDeviceSnapshot {
   trust_revision: DecimalU64;
   approved_at_ms?: number | null;
   updated_at_ms: number;
+}
+
+/** Signed discovery candidate issued by the service. Its ID is a public selector. */
+export interface LanPairingCandidate {
+  candidate_id: string;
+  device_id: string;
+  device_name: string;
+  peer_key_id: string;
+  key_epoch: DecimalU64;
+  discovery_endpoint: string;
+  expires_at_ms: number;
+  permission_ceiling: RemotePermissionScope[];
+}
+
+export interface LanPairingApproval {
+  candidate_id: string;
+  device_id: string;
+  peer_key_id: string;
+  key_epoch: DecimalU64;
+  discovery_endpoint: string;
+  permission_ceiling: RemotePermissionScope[];
 }
 
 export interface TrustedDeviceApproval {

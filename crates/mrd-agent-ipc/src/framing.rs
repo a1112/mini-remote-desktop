@@ -13,8 +13,17 @@ pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 /// exact-request consent cancellation cleanup. Minor version 3 adds bounded
 /// service-to-agent render access units. Minor version 4 binds StartRender to
 /// an immutable product surface id and native presentation handle. Minor 5
-/// adds authenticated render-boundary counters from the session agent.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 5;
+/// adds authenticated render-boundary counters from the session agent. Minor 6
+/// binds StartCapture to exact approved encoder settings. Minor 7 authenticates
+/// the actual physical capture rectangle for product input-coordinate mapping.
+/// Minor 8 binds every input event to an exclusive injection deadline.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 8;
+/// Minimum negotiated minor version that enforces input event deadlines.
+pub const AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR: u16 = 8;
+/// Minimum negotiated minor version that carries real capture-source bounds.
+pub const AGENT_IPC_CAPTURE_SOURCE_BOUNDS_PROTOCOL_MINOR: u16 = 7;
+/// Minimum negotiated minor version that supports profile-bound StartCapture.
+pub const AGENT_IPC_CAPTURE_PROFILE_PROTOCOL_MINOR: u16 = 6;
 /// Minimum negotiated minor version that supports correlated request tokens.
 pub const AGENT_IPC_CORRELATED_REQUESTS_PROTOCOL_MINOR: u16 = 1;
 /// Minimum negotiated minor version that supports consent cancellation cleanup.

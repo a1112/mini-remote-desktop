@@ -302,6 +302,7 @@ fn input_event(sequence: u64) -> InputEventEnvelope {
         resource_id: [4; 16],
         start_grant_id: [5; 32],
         sequence,
+        expires_at_ms: NOW_MS + 5_000,
         event: InputEventPayload::MouseMove { x: 10, y: 20 },
     }
 }
@@ -714,6 +715,30 @@ async fn consent_cancel_contract_rejects_an_agent_negotiated_at_minor_one() {
             .await,
         Err(AgentRequestError::Route(
             mrd_service::agent_runtime::AgentRouteError::ProtocolVersionUnavailable,
+        ))
+    );
+    assert_eq!(legacy.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn input_deadline_contract_rejects_an_agent_negotiated_before_minor_eight() {
+    let (registry, server) = ConnectedAgent::shared_server(Duration::from_millis(100));
+    let legacy = ConnectedAgent::connect_to_with_minor(
+        registry,
+        server.clone(),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID,
+        1,
+        32 * 1024,
+        [AgentCapability::Input].into_iter().collect(),
+        ReplacementPolicy::RejectExisting,
+        mrd_agent_ipc::AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR - 1,
+    )
+    .await;
+    assert_eq!(
+        server.request_input(&legacy.binding, input_event(1)).await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::ProtocolVersionUnavailable
         ))
     );
     assert_eq!(legacy.finish().await, AgentConnectionExit::Disconnected);
@@ -1197,8 +1222,16 @@ async fn queued_execute_revalidates_the_bound_capability_before_write() {
             async move { server.request_input(&binding, input_event(sequence)).await }
         }));
     }
-    let target_execute = execute_command([113; 16]);
-    let target = tokio::spawn({
+    // Cleanup must remain routable after capability loss. Exercise a new input
+    // resource here so this assertion checks admission of new work, not Stop.
+    let target_execute = execute_command_for(
+        [113; 16],
+        AgentCommand::StartInput {
+            resource_id: [13; 16],
+            input_scopes: permission_scopes([PermissionScope::InputPointer]),
+        },
+    );
+    let mut target = tokio::spawn({
         let server = Arc::clone(&agent.server);
         let binding = agent.binding.clone();
         let execute = target_execute.clone();
@@ -1224,18 +1257,23 @@ async fn queued_execute_revalidates_the_bound_capability_before_write() {
         .expect("remove bound input capability");
 
     let mut execute_was_delivered = false;
-    while !target.is_finished() {
-        let frame = tokio::time::timeout(
-            Duration::from_millis(200),
-            read_frame::<_, ServiceToAgent>(&mut agent.stream),
-        )
-        .await
-        .expect("queued writes must make progress")
-        .expect("read queued request");
-        execute_was_delivered |= matches!(frame.message, ServiceToAgent::Execute(_));
-    }
+    let target_result = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            tokio::select! {
+                result = &mut target => break result.expect("target request"),
+                frame = read_frame::<_, ServiceToAgent>(&mut agent.stream) => {
+                    execute_was_delivered |= matches!(
+                        frame.expect("read queued request").message,
+                        ServiceToAgent::Execute(_),
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .expect("queued admission must resolve when its capability is removed");
     assert_eq!(
-        target.await.expect("target request"),
+        target_result,
         Err(AgentRequestError::Route(
             mrd_service::agent_runtime::AgentRouteError::CapabilityUnavailable,
         ))
@@ -1592,6 +1630,7 @@ async fn execute_command_capability_must_match_the_persisted_binding() {
         AgentCommand::StartCapture {
             resource_id: [21; 16],
             display_id: 1,
+            profile: None,
         },
     );
     assert_eq!(
@@ -1651,6 +1690,16 @@ async fn execute_issuer_binds_render_command_to_exact_agent_and_authority() {
     .expect("template from exact binding");
 
     let missing_scope = template.clone().with_scopes(PermissionScopes::new());
+    let cleanup = issuer
+        .issue(
+            [84; 16],
+            [85; 32],
+            AgentCommand::StopRender {
+                resource_id: [78; 16],
+            },
+            template.clone().with_scopes(PermissionScopes::new()),
+        )
+        .expect("pre-sign exact cleanup while authority is valid");
     let execute = issuer
         .issue([80; 16], [81; 32], command.clone(), template)
         .expect("issue exact render grant");
@@ -1661,7 +1710,39 @@ async fn execute_issuer_binds_render_command_to_exact_agent_and_authority() {
         &execute.grant.signing_bytes(),
         &execute.grant.signature,
     ));
-    assert_eq!(execute.grant.claims.command_digest, command.digest());
+    assert_eq!(
+        execute.grant.claims.command_digest,
+        execute.command_digest()
+    );
+    let claims = &execute.grant.claims;
+    let context = mrd_agent_ipc::ExecutionContext {
+        registration_id: claims.registration_id,
+        registration_epoch: claims.registration_epoch,
+        session_id: claims.session_id.clone(),
+        peer: claims.peer.clone(),
+        authorization_scopes: claims.scopes.clone(),
+        authorization_expires_at_ms: claims.expires_at_ms,
+        policy_revision: claims.policy_revision,
+        windows_session_id: claims.windows_session_id,
+        desktop_epoch: claims.desktop_epoch,
+        desktop_kind: claims.desktop_kind,
+        now_ms: NOW_MS,
+        expected_issuer_key_id: issuer.key_id(),
+    };
+    assert!(mrd_agent_ipc::validate_execute_command(&execute, &context, &verifier).is_ok());
+    let mut after_expiry = context.clone();
+    after_expiry.now_ms = context.authorization_expires_at_ms + 1;
+    assert!(mrd_agent_ipc::validate_execute_command(&cleanup, &after_expiry, &verifier).is_ok());
+    assert_eq!(
+        mrd_agent_ipc::validate_execute_command(&execute, &after_expiry, &verifier),
+        Err(mrd_agent_ipc::GrantValidationError::AuthorizationExpired)
+    );
+    let mut substituted = execute.clone();
+    substituted.command_id = [82; 16];
+    assert_eq!(
+        mrd_agent_ipc::validate_execute_command(&substituted, &context, &verifier),
+        Err(mrd_agent_ipc::GrantValidationError::CommandMismatch)
+    );
     assert_eq!(
         execute.grant.claims.registration_id,
         *render_binding.registration_id()
@@ -1680,6 +1761,113 @@ async fn execute_issuer_binds_render_command_to_exact_agent_and_authority() {
         Err(ExecuteGrantIssueError::MissingScope)
     );
     assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+}
+
+#[tokio::test]
+async fn cleanup_can_confirm_an_old_desktop_only_on_the_original_registration() {
+    let mut agent = ConnectedAgent::start(Duration::from_secs(1)).await;
+    let old_binding = agent.binding.clone();
+    let mut snapshot = agent
+        .registry
+        .active_for_session_at(WINDOWS_SESSION_ID, NOW_MS)
+        .unwrap()
+        .capabilities;
+    snapshot.revision += 1;
+    snapshot.desktop_epoch = 2;
+    snapshot.capabilities.clear();
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::AgentCapabilitySnapshot(snapshot),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while agent
+            .registry
+            .active_for_session_at(WINDOWS_SESSION_ID, NOW_MS)
+            .unwrap()
+            .capabilities
+            .desktop_epoch
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let start = execute_command_for(
+        [90; 16],
+        AgentCommand::StartInput {
+            resource_id: [13; 16],
+            input_scopes: permission_scopes([PermissionScope::InputPointer]),
+        },
+    );
+    assert_eq!(
+        agent.server.request_execute(&old_binding, start).await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::DesktopChanged
+        ))
+    );
+    let cleanup = execute_command([91; 16]);
+    let requesting = tokio::spawn({
+        let server = agent.server.clone();
+        let binding = old_binding.clone();
+        let cleanup = cleanup.clone();
+        async move { server.request_execute(&binding, cleanup).await }
+    });
+    let delivered = tokio::time::timeout(
+        Duration::from_millis(300),
+        read_frame::<_, ServiceToAgent>(&mut agent.stream),
+    )
+    .await
+    .expect("only cleanup should reach the original Agent after desktop retirement")
+    .unwrap()
+    .message;
+    let ServiceToAgent::Execute(execute) = delivered else {
+        panic!("expected exact cleanup");
+    };
+    assert_eq!(execute.command_id, cleanup.command_id);
+    assert_eq!(execute.grant.claims.desktop_epoch, 1);
+    write_frame(
+        &mut agent.stream,
+        &AgentToService::CommandResult(CommandResult {
+            request_token: execute.request_token,
+            registration_id: agent.identity.registration_id,
+            command_id: execute.command_id,
+            outcome: CommandOutcome::AlreadyStopped,
+            completed_at_ms: NOW_MS,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        requesting.await.unwrap().unwrap().outcome,
+        CommandOutcome::AlreadyStopped
+    );
+    let registry = agent.registry.clone();
+    let server = agent.server.clone();
+    assert_eq!(agent.finish().await, AgentConnectionExit::Disconnected);
+    let replacement = ConnectedAgent::connect_to(
+        registry,
+        server.clone(),
+        WINDOWS_SESSION_ID,
+        PROCESS_ID + 1,
+        2,
+        32 * 1024,
+        [AgentCapability::Input].into_iter().collect(),
+        ReplacementPolicy::RejectExisting,
+    )
+    .await;
+    assert_eq!(
+        server.request_execute(&old_binding, cleanup).await,
+        Err(AgentRequestError::Route(
+            mrd_service::agent_runtime::AgentRouteError::BindingRevoked
+        ))
+    );
+    assert_eq!(
+        replacement.finish().await,
+        AgentConnectionExit::Disconnected
+    );
 }
 
 #[tokio::test]

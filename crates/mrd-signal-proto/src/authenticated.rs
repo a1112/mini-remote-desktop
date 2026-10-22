@@ -37,6 +37,41 @@ impl SignalEnvelope {
         Ok(())
     }
 
+    /// Scheduling metadata only: this does not verify a signature, identity,
+    /// validity interval or replay state. Authentication must still follow.
+    pub fn unverified_claims(&self) -> Option<&AuthClaims> {
+        match &self.message {
+            AuthenticatedSignalMessage::Register(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::Registered(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::PresenceHeartbeat(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionIntent(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionGrant(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionDeny(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcOffer(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcAnswer(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcCandidate(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionIntentV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::SessionGrantV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcOfferV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcAnswerV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::WebrtcCandidateV3(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::RelayMigrationOffer(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::RelayMigrationAnswer(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::RelayMigrationCandidate(message) => {
+                Some(&message.payload.claims)
+            }
+            AuthenticatedSignalMessage::SessionClose(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ReconnectRequest(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ReconnectGrant(message) => Some(&message.payload.claims),
+            AuthenticatedSignalMessage::ServerChallenge(_)
+            | AuthenticatedSignalMessage::ProtocolError(_) => None,
+        }
+    }
+
     /// Validate the mandatory envelope/message pairing before decoding a
     /// potentially sensitive authenticated payload.
     pub fn validate_wire_version(
@@ -97,7 +132,12 @@ impl<'de> Deserialize<'de> for SignalEnvelope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum AuthenticatedSignalMessage {
     ServerChallenge(ServerChallenge),
     Register(AuthenticatedRegister),
@@ -285,6 +325,22 @@ where
         now_ms: u64,
         replay: &mut SignalReplayGuard,
     ) -> Result<VerifiedSignalMetadata, SignalProtocolError> {
+        let metadata = self.verify_for_without_replay(expected_peer, now_ms)?;
+        replay.accept(&metadata.issuer_key_id, metadata.counter, metadata.nonce)?;
+        Ok(metadata)
+    }
+
+    /// Verify signature, claims, and payload without mutating replay state.
+    ///
+    /// Registration performs backend-token and identity binding checks after
+    /// cryptographic verification. Keeping replay commit separate prevents an
+    /// unauthenticated caller from consuming a global signer slot with a
+    /// syntactically valid but backend-invalid registration.
+    pub fn verify_for_without_replay(
+        &self,
+        expected_peer: &DeviceId,
+        now_ms: u64,
+    ) -> Result<VerifiedSignalMetadata, SignalProtocolError> {
         if self.signer_public_key.len() != 32 || self.signature.len() != 64 {
             return Err(SignalProtocolError::InvalidSignature);
         }
@@ -301,11 +357,6 @@ where
             &self.signature,
         )
         .map_err(|_| SignalProtocolError::InvalidSignature)?;
-        replay.accept(
-            &self.payload.claims().issuer_key_id,
-            self.payload.claims().counter,
-            self.payload.claims().nonce,
-        )?;
         Ok(VerifiedSignalMetadata::from_claims(self.payload.claims()))
     }
 }

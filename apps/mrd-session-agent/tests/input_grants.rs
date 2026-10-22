@@ -916,6 +916,7 @@ fn event(
         resource_id,
         start_grant_id,
         sequence,
+        expires_at_ms: 2_000,
         event: payload,
     }
 }
@@ -1303,7 +1304,7 @@ async fn establish_pressed_input_for<S>(
         other => panic!("expected StartInput result, got {other:?}"),
     }
 
-    let key_down = event_for_session(
+    let mut key_down = event_for_session(
         execution.session_id,
         resource_id,
         start_grant_id,
@@ -1313,6 +1314,7 @@ async fn establish_pressed_input_for<S>(
             pressed: true,
         },
     );
+    key_down.expires_at_ms = grant_expires_at_ms.unwrap_or(2_000);
     write_frame(&mut *service, &ServiceToAgent::InputEvent(key_down.clone()))
         .await
         .unwrap();
@@ -1449,6 +1451,85 @@ fn events_require_the_exact_start_resource_scope_and_live_context() {
     assert_eq!(events.lock().expect("events").len(), 1);
 }
 
+#[tokio::test]
+async fn queued_input_expiring_before_agent_dispatch_never_reaches_the_injector() {
+    struct AdjustableClock(std::sync::atomic::AtomicU64);
+    impl AgentClock for AdjustableClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let clock = Arc::new(AdjustableClock(std::sync::atomic::AtomicU64::new(1_500)));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _) = start_gated_attended_input_runtime_with_environment(
+        SharedInjector::available(Arc::clone(&events)),
+        desktop,
+        clock.clone(),
+    )
+    .await;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::ConsentRequest(consent_request(20, [12; 16])),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(read_frame::<_, AgentToService>(&mut service).await.unwrap().message,
+        AgentToService::ConsentResult(result) if result.decision == ConsentDecision::Approved)
+    );
+    let start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputPointer]),
+        },
+        START_GRANT_ID,
+        &context(),
+    );
+    write_frame(&mut service, &ServiceToAgent::Execute(Box::new(start)))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read_frame::<_, AgentToService>(&mut service).await.unwrap().message,
+        AgentToService::CommandResult(result) if result.outcome == CommandOutcome::Completed)
+    );
+
+    let mut queued = event(
+        RESOURCE_ID,
+        START_GRANT_ID,
+        1,
+        InputEventPayload::MouseMove { x: 40, y: 50 },
+    );
+    queued.expires_at_ms = 1_600;
+    // This current-thread test fits the entire IPC frame in the duplex buffer.
+    // Advancing time before yielding makes expiration after enqueue deterministic.
+    write_frame(&mut service, &ServiceToAgent::InputEvent(queued))
+        .await
+        .unwrap();
+    clock.0.store(1_600, Ordering::SeqCst);
+    let ack = tokio::time::timeout(
+        Duration::from_secs(1),
+        read_frame::<_, AgentToService>(&mut service),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(ack.message, AgentToService::InputAck(ack)
+        if ack.outcome == InputAckOutcome::Rejected { reason: InputRejection::Grant }));
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "expired queued input must perform zero injection"
+    );
+    drop(service);
+    assert_eq!(
+        agent.await.unwrap().unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
 #[test]
 fn resource_sequence_is_exactly_once_and_conflicts_are_rejected() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -1468,6 +1549,16 @@ fn resource_sequence_is_exactly_once_and_conflicts_are_rejected() {
     );
     assert_eq!(manager.handle(&first, &context()), InputAckOutcome::Applied);
     assert_eq!(manager.handle(&first, &context()), InputAckOutcome::Applied);
+    assert_eq!(events.lock().expect("events").len(), 1);
+
+    let mut deadline_conflict = first.clone();
+    deadline_conflict.expires_at_ms -= 1;
+    assert_eq!(
+        manager.handle(&deadline_conflict, &context()),
+        InputAckOutcome::Rejected {
+            reason: InputRejection::Replay,
+        }
+    );
     assert_eq!(events.lock().expect("events").len(), 1);
 
     let conflict = event(
@@ -1502,6 +1593,254 @@ fn resource_sequence_is_exactly_once_and_conflicts_are_rejected() {
         }
     );
     assert_eq!(events.lock().expect("events").len(), 2);
+}
+
+#[tokio::test]
+async fn late_expiry_cleanup_acknowledges_only_the_original_retired_resource() {
+    struct AdjustableClock(std::sync::atomic::AtomicU64);
+    impl AgentClock for AdjustableClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    async fn assert_outcome(
+        service: &mut tokio::io::DuplexStream,
+        command: &ExecuteCommand,
+        expected: CommandOutcome,
+    ) {
+        write_frame(service, &ServiceToAgent::Execute(Box::new(command.clone())))
+            .await
+            .unwrap();
+        let message = loop {
+            let message = read_frame::<_, AgentToService>(service)
+                .await
+                .unwrap()
+                .message;
+            if matches!(
+                message,
+                AgentToService::AgentCapabilitySnapshot(_) | AgentToService::AgentHeartbeat(_)
+            ) {
+                continue;
+            }
+            break message;
+        };
+        assert!(
+            matches!(&message, AgentToService::CommandResult(result) if result.outcome == expected),
+            "unexpected cleanup outcome: {message:?}"
+        );
+    }
+    let clock = Arc::new(AdjustableClock(std::sync::atomic::AtomicU64::new(1_500)));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let desktop = MutableDesktop::new(TrustedDesktopState {
+        desktop_epoch: 11,
+        desktop_kind: DesktopKind::Default,
+    });
+    let (agent, mut service, _) = start_gated_attended_input_runtime_with_environment(
+        SharedInjector::available(Arc::clone(&events)),
+        desktop.clone(),
+        clock.clone(),
+    )
+    .await;
+    establish_pressed_input(&mut service).await;
+    let original_stop = execute_command(
+        AgentCommand::StopInput {
+            resource_id: RESOURCE_ID,
+        },
+        [60; 32],
+        &context(),
+    );
+    clock.0.store(2_500, Ordering::SeqCst);
+
+    // Each mutation is submitted over the authenticated Agent IPC, but cannot retarget
+    // the original cleanup receipt after native expiration has removed it.
+    let mut invalid = Vec::new();
+    let mut command = original_stop.clone();
+    command.grant.claims.peer.device_id = DeviceId("different-peer".into());
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.peer.key_id[0] ^= 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.policy_revision += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.registration_epoch += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.registration_id[0] ^= 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.windows_session_id += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.desktop_epoch += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.session_id = other_session_id();
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.command = AgentCommand::StopInput {
+        resource_id: OTHER_RESOURCE_ID,
+    };
+    command.grant.claims.command_digest = command.command_digest();
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.command = AgentCommand::StopCapture {
+        resource_id: RESOURCE_ID,
+    };
+    command.grant.claims.command_digest = command.command_digest();
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.expires_at_ms += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.expires_at_ms -= 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.issued_at_ms += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.claims.not_before_ms += 1;
+    invalid.push(command);
+    let mut command = original_stop.clone();
+    command.grant.signature = [0; 64];
+    invalid.push(command);
+    for command in invalid {
+        assert_outcome(&mut service, &command, CommandOutcome::Rejected).await;
+    }
+    assert_eq!(
+        events.lock().unwrap().len(),
+        2,
+        "native expiration must release the held key once"
+    );
+    assert_outcome(&mut service, &original_stop, CommandOutcome::AlreadyStopped).await;
+    assert_outcome(&mut service, &original_stop, CommandOutcome::AlreadyStopped).await;
+
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 12,
+        desktop_kind: DesktopKind::Secure,
+    });
+    let after_lock_stop = execute_command(
+        AgentCommand::StopInput {
+            resource_id: RESOURCE_ID,
+        },
+        [63; 32],
+        &context(),
+    );
+    assert_outcome(
+        &mut service,
+        &after_lock_stop,
+        CommandOutcome::AlreadyStopped,
+    )
+    .await;
+    desktop.set(TrustedDesktopState {
+        desktop_epoch: 13,
+        desktop_kind: DesktopKind::Default,
+    });
+    assert_outcome(
+        &mut service,
+        &after_lock_stop,
+        CommandOutcome::AlreadyStopped,
+    )
+    .await;
+
+    let new_start = execute_command(
+        AgentCommand::StartInput {
+            resource_id: OTHER_RESOURCE_ID,
+            input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+        },
+        [61; 32],
+        &context(),
+    );
+    assert_outcome(&mut service, &new_start, CommandOutcome::Rejected).await;
+    write_frame(
+        &mut service,
+        &ServiceToAgent::InputEvent(event(
+            RESOURCE_ID,
+            START_GRANT_ID,
+            2,
+            InputEventPayload::Key {
+                key: InputKey::VirtualKey { code: 0x42 },
+                pressed: true,
+            },
+        )),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(read_frame::<_, AgentToService>(&mut service).await.unwrap().message,
+        AgentToService::InputAck(ack) if ack.outcome == InputAckOutcome::Rejected {reason:InputRejection::Grant})
+    );
+    assert_eq!(
+        events.lock().unwrap().len(),
+        2,
+        "cleanup receipts must not revive Start or Input"
+    );
+    drop(service);
+    assert_eq!(
+        agent.await.unwrap().unwrap(),
+        AgentExit::ServiceDisconnected
+    );
+}
+
+#[tokio::test]
+async fn stopped_resource_identity_cannot_be_reused_by_a_new_start() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let (agent, mut service, _) =
+        start_gated_attended_input_runtime(SharedInjector::available(events.clone())).await;
+    establish_pressed_input(&mut service).await;
+    let commands = [
+        (
+            AgentCommand::StopInput {
+                resource_id: RESOURCE_ID,
+            },
+            [60; 32],
+            CommandOutcome::Completed,
+        ),
+        (
+            AgentCommand::StopInput {
+                resource_id: RESOURCE_ID,
+            },
+            [61; 32],
+            CommandOutcome::AlreadyStopped,
+        ),
+        (
+            AgentCommand::StartInput {
+                resource_id: RESOURCE_ID,
+                input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+            },
+            [62; 32],
+            CommandOutcome::Rejected,
+        ),
+        (
+            AgentCommand::StartInput {
+                resource_id: OTHER_RESOURCE_ID,
+                input_scopes: scopes(&[PermissionScope::InputKeyboard]),
+            },
+            [63; 32],
+            CommandOutcome::Completed,
+        ),
+    ];
+    for (command, grant_id, expected) in commands {
+        let execute = execute_command(command, grant_id, &context());
+        write_frame(&mut service, &ServiceToAgent::Execute(Box::new(execute)))
+            .await
+            .unwrap();
+        let message = read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message;
+        assert!(
+            matches!(&message, AgentToService::CommandResult(result) if result.outcome == expected),
+            "unexpected resource lifecycle outcome: {message:?}"
+        );
+    }
+    assert_eq!(events.lock().unwrap().len(), 2);
+    drop(service);
+    assert_eq!(
+        agent.await.unwrap().unwrap(),
+        AgentExit::ServiceDisconnected
+    );
 }
 
 #[test]
@@ -2510,7 +2849,7 @@ async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
         }
         other => panic!("expected StartInput result, got {other:?}"),
     }
-    let down = event(
+    let mut down = event(
         RESOURCE_ID,
         START_GRANT_ID,
         1,
@@ -2519,6 +2858,7 @@ async fn runtime_expires_idle_binding_before_thirty_second_heartbeat() {
             pressed: true,
         },
     );
+    down.expires_at_ms = 1_900;
     write_frame(&mut service, &ServiceToAgent::InputEvent(down))
         .await
         .unwrap();
@@ -3633,8 +3973,33 @@ async fn active_and_closing_prompt_reject_input_without_injection() {
     ));
     assert_eq!(
         stop_calls.load(Ordering::SeqCst),
-        1,
-        "StopInput cleanup must still reach the input backend while consent is active",
+        0,
+        "a resource with no successful Start must never reach native cleanup",
+    );
+    let retired_stop = execute_command(
+        AgentCommand::StopInput {
+            resource_id: RESOURCE_ID,
+        },
+        [70; 32],
+        &context(),
+    );
+    write_frame(
+        &mut service,
+        &ServiceToAgent::Execute(Box::new(retired_stop)),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        read_frame::<_, AgentToService>(&mut service)
+            .await
+            .unwrap()
+            .message,
+        AgentToService::CommandResult(result) if result.outcome == CommandOutcome::AlreadyStopped
+    ));
+    assert_eq!(
+        stop_calls.load(Ordering::SeqCst),
+        0,
+        "prompt activation already retired the old resource; acknowledgement must not inject",
     );
 
     let active_event = event(

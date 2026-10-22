@@ -44,12 +44,16 @@ pub trait RelayInputBarrier: Send + Sync {
 
 pub struct ServiceRelayInputBarrier {
     registry: Arc<Mutex<ControlInputRegistry>>,
+    #[cfg(windows)]
+    state: std::sync::Weak<AppState>,
 }
 
 impl ServiceRelayInputBarrier {
-    pub fn new(app_state: &AppState) -> Self {
+    pub fn new(app_state: &Arc<AppState>) -> Self {
         Self {
             registry: app_state.control_input(),
+            #[cfg(windows)]
+            state: Arc::downgrade(app_state),
         }
     }
 }
@@ -57,12 +61,22 @@ impl ServiceRelayInputBarrier {
 #[async_trait]
 impl RelayInputBarrier for ServiceRelayInputBarrier {
     async fn freeze_after_release(&self, session_id: &SessionId) -> Result<(), ()> {
-        self.registry
-            .lock()
-            .await
+        let mut registry = self.registry.lock().await;
+        registry
             .freeze_session_for_migration(session_id)
-            .map(|_| ())
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        #[cfg(windows)]
+        {
+            let state = self.state.upgrade().ok_or(())?;
+            if state.console_capture.is_enabled() {
+                state
+                    .console_capture
+                    .stop_input(&state, session_id)
+                    .await
+                    .map_err(|_| ())?;
+            }
+        }
+        Ok(())
     }
 
     async fn thaw(&self, session_id: &SessionId) {
@@ -488,7 +502,22 @@ impl RelayFailoverCoordinator {
         active_node_id: &str,
         active_mux: Arc<dyn TransportMuxPort>,
     ) -> Result<(), RelayFailoverConfigError> {
-        self.install_session_inner(context, access, active_node_id, active_mux)
+        self.install_session_inner(context, access, active_node_id, active_mux, false)
+            .await
+    }
+
+    /// Test seam for direct generation zero. Release builds require private
+    /// selected-pair evidence through install_verified_session instead.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub async fn install_direct_session_for_test(
+        &self,
+        context: RelayAccessContext,
+        access: Arc<VerifiedRelayAccess>,
+        backup_node_id: &str,
+        active_mux: Arc<dyn TransportMuxPort>,
+    ) -> Result<(), RelayFailoverConfigError> {
+        self.install_session_inner(context, access, backup_node_id, active_mux, true)
             .await
     }
 
@@ -506,8 +535,14 @@ impl RelayFailoverCoordinator {
         if evidence.route() != &expected {
             return Err(RelayFailoverConfigError::ActiveRelayEvidenceMismatch);
         }
-        self.install_session_inner(context, access, active_node_id, active_mux)
-            .await
+        self.install_session_inner(
+            context,
+            access,
+            active_node_id,
+            active_mux,
+            !evidence.uses_relay(),
+        )
+        .await
     }
 
     async fn install_session_inner(
@@ -516,6 +551,7 @@ impl RelayFailoverCoordinator {
         access: Arc<VerifiedRelayAccess>,
         active_node_id: &str,
         active_mux: Arc<dyn TransportMuxPort>,
+        initial_direct: bool,
     ) -> Result<(), RelayFailoverConfigError> {
         let (active_directory_id, active_node_id, active_failure_domain) = {
             let payload = access.directory().payload();
@@ -535,8 +571,16 @@ impl RelayFailoverCoordinator {
             }
             (
                 payload.directory_id.clone(),
-                active.node_id.clone(),
-                active.failure_domain.clone(),
+                if initial_direct {
+                    String::new()
+                } else {
+                    active.node_id.clone()
+                },
+                if initial_direct {
+                    String::new()
+                } else {
+                    active.failure_domain.clone()
+                },
             )
         };
         let route = active_mux.route_snapshot().await;

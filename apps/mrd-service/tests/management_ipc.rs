@@ -32,17 +32,29 @@ async fn management_pipe_denies_files_session_remote_power_and_ui_process_contro
         },
     ];
     for request in denied {
+        // macOS rejects sensitive UI lifecycle requests at the kernel-bound
+        // caller gate before the management allowlist is evaluated. Both
+        // responses are intentional denials; all other requests must carry
+        // the management endpoint's exact allowlist error.
+        let macos_sensitive_ui_request = cfg!(target_os = "macos")
+            && matches!(
+                &request,
+                IpcRequest::UiAttached { .. } | IpcRequest::UiDetached { .. }
+            );
         let response = server.handle_request(request).await;
-        assert!(
-            matches!(response, IpcResponse::Error { code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED")
-        );
+        assert!(matches!(
+            response,
+            IpcResponse::Error { ref code, .. }
+                if code == "E_MANAGEMENT_COMMAND_DENIED"
+                    || (macos_sensitive_ui_request && code == "E_UI_CALLER_DENIED")
+        ));
     }
     assert!(state.sessions.lock().await.list_all().is_empty());
     assert_eq!(state.shell.lock().await.ui_pid, None);
 }
 
 #[tokio::test]
-async fn management_pipe_allows_health_shell_autostart_and_shutdown() {
+async fn management_pipe_allows_read_only_health_shell_and_autostart_status() {
     let state = Arc::new(AppState::new());
     let _runtime = state.shutdown.bind_runtime().unwrap();
     let server = IpcServer::new_management(state).with_autostart(Arc::new(Mutex::new(
@@ -56,27 +68,25 @@ async fn management_pipe_allows_health_shell_autostart_and_shutdown() {
         server.handle_request(IpcRequest::GetShellStatus).await,
         IpcResponse::ShellStatus { .. }
     ));
-    for request in [
-        IpcRequest::GetAutostartStatus,
-        IpcRequest::SetAutostart { enabled: false },
-    ] {
-        let response = server.handle_request(request).await;
-        assert!(
-            !matches!(response, IpcResponse::Error { code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED")
-        );
-    }
     assert!(matches!(
-        server
-            .handle_request(IpcRequest::ShutdownService {
-                mode: ShutdownMode::Graceful
-            })
-            .await,
-        IpcResponse::Ack
+        server.handle_request(IpcRequest::GetAutostartStatus).await,
+        IpcResponse::AutostartStatus { .. }
     ));
+    for request in [
+        IpcRequest::SetAutostart { enabled: false },
+        IpcRequest::ShutdownService {
+            mode: ShutdownMode::Graceful,
+        },
+    ] {
+        assert!(matches!(
+            server.handle_request(request).await,
+            IpcResponse::Error { code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED"
+        ));
+    }
 }
 
 #[tokio::test]
-async fn real_management_pipe_enforces_the_allowlist_and_delivers_shutdown_ack() {
+async fn real_management_pipe_enforces_the_read_only_allowlist() {
     let state = Arc::new(AppState::new());
     let _runtime = state.shutdown.bind_runtime().unwrap();
     let unique = format!(
@@ -92,9 +102,15 @@ async fn real_management_pipe_enforces_the_allowlist_and_delivers_shutdown_ack()
         r"\\.\pipe\mrd-management-smoke-{unique}"
     ));
     #[cfg(unix)]
-    let endpoint = mrd_ipc::transport::IpcEndpoint::unix_socket(format!(
-        "/tmp/mrd-management-smoke-{unique}.sock"
-    ));
+    let endpoint = {
+        let mrd_ipc::transport::IpcEndpoint::UnixSocket(default) =
+            mrd_ipc::transport::IpcEndpoint::default_service();
+        mrd_ipc::transport::IpcEndpoint::unix_socket(
+            std::path::Path::new(&default)
+                .with_file_name(format!("mrd-management-smoke-{unique}.sock"))
+                .to_string_lossy(),
+        )
+    };
     let server = IpcServer::new_management_with_endpoint(state.clone(), endpoint.clone())
         .with_autostart(Arc::new(Mutex::new(mrd_service::NoOpAutostart::new(
             "test",
@@ -132,13 +148,13 @@ async fn real_management_pipe_enforces_the_allowlist_and_delivers_shutdown_ack()
             })
             .await
             .unwrap(),
-        IpcResponse::Ack
+        IpcResponse::Error { code, .. } if code == "E_MANAGEMENT_COMMAND_DENIED"
     ));
     assert_eq!(
         state
             .shutdown
             .ready_mode_at_epoch(0, state.shutdown.admission_epoch()),
-        Some(ShutdownMode::Graceful)
+        None
     );
     client.disconnect();
     task.abort();

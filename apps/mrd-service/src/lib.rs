@@ -10,14 +10,15 @@ pub mod browser_webcodecs_preview;
 pub mod browser_webrtc_preview;
 pub mod capabilities;
 pub mod capture_source;
+#[cfg(windows)]
+pub mod console_capture;
 pub mod control_input;
 pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
-#[cfg(target_os = "macos")]
-pub mod macos_runtime;
 pub mod media_adaptation;
+pub mod public_connection;
 pub use mrd_mobile_gateway as mobile_gateway;
 pub mod relay;
 pub mod resource_monitor;
@@ -27,6 +28,8 @@ pub mod session_authorization;
 pub mod shell;
 pub mod shutdown;
 pub mod signaling;
+pub mod temporary_access;
+mod temporary_access_http;
 pub mod transports;
 pub mod wake_on_lan;
 pub mod wan_session;

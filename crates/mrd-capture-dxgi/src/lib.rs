@@ -60,6 +60,8 @@ pub struct DxgiDesktopCapture {
     source_left: i32,
     #[cfg(windows)]
     source_top: i32,
+    #[cfg(windows)]
+    source_device_name: String,
 }
 
 impl DxgiDesktopCapture {
@@ -103,18 +105,29 @@ impl DxgiDesktopCapture {
         #[cfg(not(windows))]
         let _ = display_index;
         #[cfg(windows)]
-        let (source_left, source_top) = {
-            let targets = enumerate_dxgi_output_targets().unwrap_or_default();
-            targets
-                .get(display_index.unwrap_or(usize::MAX))
-                .or_else(|| {
-                    targets
-                        .iter()
-                        .find(|target| target.width == width && target.height == height)
-                })
-                .map(|target| (target.left, target.top))
-                .unwrap_or((0, 0))
+        let source_target = match display_index {
+            Some(index) => dxgi_cpu_target_for_scrap_index(index)?,
+            None => {
+                let mut matches = enumerate_dxgi_output_targets()?
+                    .into_iter()
+                    .filter(|target| target.width == width && target.height == height);
+                let target = matches.next().ok_or_else(|| {
+                    PipelineError::message("cannot identify CPU capture display geometry")
+                })?;
+                if matches.next().is_some() {
+                    return Err(PipelineError::message(
+                        "CPU capture display geometry is ambiguous",
+                    ));
+                }
+                target
+            }
         };
+        #[cfg(windows)]
+        if source_target.width != width || source_target.height != height {
+            return Err(PipelineError::message(
+                "CPU capture display geometry changed during startup",
+            ));
+        }
         let capturer = Capturer::new(display).map_err(|error| {
             PipelineError::message(format!("create dxgi capturer failed: {error}"))
         })?;
@@ -125,9 +138,11 @@ impl DxgiDesktopCapture {
             height,
             last_frame: None,
             #[cfg(windows)]
-            source_left,
+            source_left: source_target.left,
             #[cfg(windows)]
-            source_top,
+            source_top: source_target.top,
+            #[cfg(windows)]
+            source_device_name: source_target.device_name,
         })
     }
 
@@ -138,6 +153,82 @@ impl DxgiDesktopCapture {
     pub fn height(&self) -> usize {
         self.height
     }
+
+    /// Current physical rectangle of this exact CPU capture output.
+    /// Never substitute another same-sized display when its source disappears.
+    #[cfg(windows)]
+    pub fn source_bounds(&self) -> Result<DxgiOutputTarget, PipelineError> {
+        let target = enumerate_dxgi_output_targets()?
+            .into_iter()
+            .find(|target| target.device_name == self.source_device_name)
+            .ok_or_else(|| PipelineError::message("CPU capture source display is unavailable"))?;
+        if target.width != self.width || target.height != self.height {
+            return Err(PipelineError::message(
+                "CPU capture source dimensions changed",
+            ));
+        }
+        Ok(target)
+    }
+}
+
+// scrap enumerates every DXGI output in adapter/output order, including outputs
+// that our general product display list filters out. Preserve that exact index
+// before validating the selected output instead of indexing the filtered list.
+#[cfg(windows)]
+fn dxgi_cpu_target_for_scrap_index(index: usize) -> Result<DxgiOutputTarget, PipelineError> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }
+        .map_err(|_| PipelineError::message("cannot enumerate CPU capture output"))?;
+    let mut ordinal = 0;
+    for adapter_index in 0..16 {
+        let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        for output_index in 0..16 {
+            let output = match unsafe { adapter.EnumOutputs(output_index) } {
+                Ok(output) => output,
+                Err(_) => break,
+            };
+            if output.cast::<IDXGIOutput1>().is_err() {
+                // scrap also abandons this adapter when this output cannot
+                // supply its desktop-duplication interface.
+                break;
+            }
+            if ordinal != index {
+                ordinal += 1;
+                continue;
+            }
+            let desc = unsafe { output.GetDesc() }
+                .map_err(|_| PipelineError::message("cannot query CPU capture output geometry"))?;
+            let rect = desc.DesktopCoordinates;
+            let width = rect.right.checked_sub(rect.left).filter(|width| *width > 0);
+            let height = rect
+                .bottom
+                .checked_sub(rect.top)
+                .filter(|height| *height > 0);
+            let name = dxgi_device_name_from_raw(&desc.DeviceName);
+            let (Some(width), Some(height), Some(device_name)) = (width, height, name) else {
+                return Err(PipelineError::message(
+                    "CPU capture output geometry is invalid",
+                ));
+            };
+            if !desc.AttachedToDesktop.as_bool() {
+                return Err(PipelineError::message("CPU capture output is detached"));
+            }
+            return Ok(DxgiOutputTarget {
+                adapter_index,
+                output_index,
+                device_name,
+                left: rect.left,
+                top: rect.top,
+                width: width as usize,
+                height: height as usize,
+            });
+        }
+    }
+    Err(PipelineError::message(
+        "CPU capture output index is unavailable",
+    ))
 }
 
 impl FrameCapture for DxgiDesktopCapture {

@@ -287,6 +287,7 @@ impl WanSessionCoordinator {
             request,
             request_commitment,
             intent_commitment,
+            controller_public_key: _,
         } = verified;
         validate_request_identity(&identity, &request)?;
         let calculated = request
@@ -675,7 +676,9 @@ impl WanSessionCoordinator {
                 || state.identity() != identity
                 || state.grant() != Some(grant)
                 || state.access() != Some(access)
-                || !proof.is_relay_to_relay()
+                || proof.route_policy() != grant.route_policy()
+                || (grant.route_policy() == WanRoutePolicyV3::RelayOnly
+                    && !proof.is_relay_to_relay())
                 || proof.access() != access
             {
                 return Err(WanSessionCoordinatorError::BackendBindingMismatch);
@@ -1197,6 +1200,7 @@ pub struct VerifiedWanSessionIntent {
     request: WanSessionRequestV3,
     request_commitment: String,
     intent_commitment: String,
+    controller_public_key: [u8; 32],
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1372,6 +1376,12 @@ impl VerifiedWanSessionIntent {
         {
             return Err(WanSessionCoordinatorError::VerifiedIntentRequired);
         }
+        let controller_public_key = event
+            .sender
+            .public_key
+            .as_slice()
+            .try_into()
+            .map_err(|_| WanSessionCoordinatorError::VerifiedIntentRequired)?;
         let identity = WanSessionIdentity::new(
             request.session_id.clone(),
             request.controller_device_id.clone(),
@@ -1398,6 +1408,7 @@ impl VerifiedWanSessionIntent {
             request,
             request_commitment,
             intent_commitment,
+            controller_public_key,
         })
     }
 
@@ -1415,6 +1426,10 @@ impl VerifiedWanSessionIntent {
 
     pub fn intent_commitment(&self) -> &str {
         &self.intent_commitment
+    }
+
+    pub(crate) fn controller_public_key(&self) -> &[u8; 32] {
+        &self.controller_public_key
     }
 }
 
@@ -1677,7 +1692,6 @@ fn validate_request_identity(
         .validate()
         .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
     if request.access_mode != WanAccessModeV3::Attended
-        || request.route_policy != WanRoutePolicyV3::RelayOnly
         || !request_matches_identity(identity, request)
     {
         return Err(WanSessionCoordinatorError::BackendBindingMismatch);

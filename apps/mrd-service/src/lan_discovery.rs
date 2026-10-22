@@ -59,6 +59,7 @@ mod capture_sources;
 mod discovery_config;
 mod discovery_identity;
 mod dynamic_window_fps;
+mod first_pairing;
 pub(crate) mod lan_control_input;
 mod local_network_identity;
 mod media_access_unit;
@@ -82,6 +83,7 @@ pub(crate) mod media_sender;
 mod media_sender_telemetry;
 mod media_timing;
 mod media_transport;
+pub(crate) mod pairing_approval;
 mod peer_format;
 mod peer_lookup;
 mod peer_registry;
@@ -172,7 +174,8 @@ use media_frame_preparation::decoded_frame_to_rgb24;
 use media_frame_preparation::window_h264_capture_dimensions;
 use media_frame_preparation::{captured_frame_memory_path, h264_target_dimensions};
 pub(crate) use media_frame_preparation::{
-    decoded_frame_format_stage, decoded_frame_pixel_format, prepare_frame_for_h264,
+    decoded_frame_format_stage, decoded_frame_pixel_format, prepare_exact_frame_for_h264,
+    prepare_frame_for_h264,
 };
 use media_keyframe_request::{
     decode_lan_keyframe_request_datagram, encode_lan_keyframe_request_datagram,
@@ -437,6 +440,7 @@ pub struct LanDiscoveryState {
     running: AtomicBool,
     last_probe_ms: AtomicU64,
     peers: Mutex<LanPeerRegistry>,
+    first_pairing: Mutex<first_pairing::LanPairingCandidates>,
     signed_replays: Mutex<LanSignedReplayCache>,
     pending_sessions: Arc<StdMutex<HashSet<SessionId>>>,
     recent_control_inputs: Mutex<HashMap<LanControlInputDedupeKey, LanControlInputAckState>>,
@@ -500,6 +504,7 @@ impl LanDiscoveryState {
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
             peers: Mutex::new(LanPeerRegistry::default()),
+            first_pairing: Mutex::new(first_pairing::LanPairingCandidates::default()),
             signed_replays: Mutex::new(LanSignedReplayCache::default()),
             pending_sessions: Arc::new(StdMutex::new(HashSet::new())),
             recent_control_inputs: Mutex::new(HashMap::new()),
@@ -996,6 +1001,7 @@ pub async fn ingest_signed_lan_announcement(
     addr: SocketAddr,
     observed_at_ms: u64,
 ) -> Result<()> {
+    let received_at = std::time::Instant::now();
     signed.verify(observed_at_ms)?;
     if signed.payload.discovery_endpoint != addr {
         anyhow::bail!(
@@ -1009,6 +1015,9 @@ pub async fn ingest_signed_lan_announcement(
     {
         return Ok(());
     }
+    // Pairing/revocation and ingestion must not publish a cached pre-transition
+    // trust classification after another operation commits its durable state.
+    let _security_guard = app_state.authorization_security_gate.lock().await;
     let trust = resolve_authenticated_peer_trust(
         app_state,
         &signed.payload.signer_key_id,
@@ -1028,6 +1037,27 @@ pub async fn ingest_signed_lan_announcement(
         signed.payload.expires_at_ms,
         observed_at_ms,
     )?;
+    if trust == AuthenticatedPeerTrust::Untrusted {
+        app_state
+            .lan_discovery
+            .first_pairing
+            .lock()
+            .await
+            .observe_verified(
+                &signed,
+                trust,
+                observed_at_ms,
+                received_at,
+                app_state.lan_discovery.config.peer_ttl,
+            )?;
+    } else {
+        app_state
+            .lan_discovery
+            .first_pairing
+            .lock()
+            .await
+            .remove_peer(&signed.payload.signer_key_id);
+    }
     app_state
         .lan_discovery
         .upsert_signed_peer(&signed, trust)
@@ -1090,6 +1120,21 @@ async fn resolve_authenticated_peer_trust(
         Err(error) => {
             app_state.mark_security_unhealthy();
             Err(anyhow::Error::new(error).context("LAN trust lookup task failed"))
+        }
+    }
+}
+
+async fn resolve_authenticated_peer_permission_ceiling(
+    app_state: &Arc<AppState>,
+    peer_key_id: &str,
+) -> Result<Vec<RemotePermissionScope>> {
+    let registry = app_state.device_identities();
+    let key = peer_key_id.to_owned();
+    match tokio::task::spawn_blocking(move || registry.permission_ceiling(&key)).await {
+        Ok(Ok(scopes)) => Ok(scopes),
+        _ => {
+            app_state.mark_security_unhealthy();
+            anyhow::bail!("authoritative peer permission policy is unavailable")
         }
     }
 }
@@ -1288,7 +1333,7 @@ async fn begin_outgoing_authorization_under_security_gate(
     peer_key_id: &str,
     peer_public_key: &[u8],
     peer_key_epoch: u64,
-    request: crate::session_authorization::VerifiedIncomingAuthorizationRequest,
+    mut request: crate::session_authorization::VerifiedIncomingAuthorizationRequest,
 ) -> Result<()> {
     let _admission_guard = app_state.authorization_security_gate.lock().await;
     let admission_trust =
@@ -1297,6 +1342,11 @@ async fn begin_outgoing_authorization_under_security_gate(
     if !admission_trust.is_controllable() {
         anyhow::bail!("LAN peer trust changed before session admission");
     }
+    let peer_ceiling =
+        resolve_authenticated_peer_permission_ceiling(app_state, peer_key_id).await?;
+    request
+        .peer_permission_ceiling
+        .retain(|scope| peer_ceiling.contains(scope));
     if app_state.sessions.lock().await.get(session_id).is_some() {
         anyhow::bail!(
             "session id became occupied before secure LAN admission: {}",
@@ -2707,6 +2757,9 @@ async fn handle_signed_remote_session_request(
         app_state.security_is_healthy() && app_state.control_input().lock().await.is_available();
     let authorization_capabilities =
         lan_authorization_capabilities_with_input_control(input_control_available);
+    let durable_peer_ceiling =
+        resolve_authenticated_peer_permission_ceiling(app_state, &request.payload.source_key_id)
+            .await?;
     let _pending_authorization = match app_state
         .session_authorizations
         .begin_verified_incoming(
@@ -2717,7 +2770,7 @@ async fn handle_signed_remote_session_request(
                 peer_key_epoch: request.payload.source_key_epoch,
                 access_mode: request.payload.access_mode,
                 requested_scopes: request.payload.requested_scopes.clone(),
-                peer_permission_ceiling: authorization_capabilities.clone(),
+                peer_permission_ceiling: durable_peer_ceiling,
                 machine_permission_ceiling: authorization_capabilities.clone(),
                 runtime_capabilities: authorization_capabilities,
                 transport_kind: request.payload.transport_kind.clone(),
@@ -4726,6 +4779,8 @@ async fn release_control_state_for_session(app_state: &Arc<AppState>, session_id
 
 async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &SessionId) {
     app_state.session_audio.lock().await.remove(session_id);
+    #[cfg(windows)]
+    app_state.console_capture.stop(app_state, session_id).await;
     app_state.remove_agent_render_route(session_id).await;
     app_state.media_profiles.lock().await.remove(session_id);
     app_state.capture_sources.lock().await.remove(session_id);
@@ -4900,6 +4955,7 @@ fn spawn_quic_media_sender(
             if !session_allows_media(&task_app_state, &task_session_id).await {
                 return Ok(());
             }
+            #[cfg(not(windows))]
             let _ = task_app_state
                 .session_authorizations
                 .mark_streaming(&task_session_id, now_ms())
@@ -4949,6 +5005,20 @@ async fn send_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
+    // Lifecycle fixtures use the existing synthetic source without a native
+    // authority. Every production Windows sender still requires its exact Agent.
+    #[cfg(all(windows, not(test)))]
+    let use_console_agent = true;
+    #[cfg(all(windows, test))]
+    let use_console_agent = app_state.console_capture.is_enabled();
+    #[cfg(windows)]
+    if use_console_agent {
+        let profile = selected_media_profile(&app_state, &session_id).await;
+        app_state
+            .console_capture
+            .start(&app_state, &session_id, &profile)
+            .await?;
+    }
     #[cfg(target_os = "macos")]
     let _audio_sender =
         crate::session_audio::spawn_sender(app_state.clone(), session_id.clone(), endpoint.clone())
@@ -5031,6 +5101,10 @@ async fn send_quic_media_loop(
         .lock()
         .await
         .supports(&session_id, LAN_QUIC_MEDIA_PROFILE_TRANSPORT);
+    #[cfg(windows)]
+    let first_agent_frame_deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(windows)]
+    let mut first_agent_frame_sent = false;
     loop {
         while delayed_media_children.try_join_next().is_some() {}
         while reliable_keyframe_children.try_join_next().is_some() {}
@@ -5057,6 +5131,7 @@ async fn send_quic_media_loop(
         );
         let requested_codec = LanAccessUnitCodec::from_profile(&profile);
         let loop_started = Instant::now();
+        #[cfg(not(windows))]
         let sender_turn = match app_state
             .take_agent_media_turn(&session_id.0, 8, requested_codec)
             .await
@@ -5074,6 +5149,41 @@ async fn send_quic_media_loop(
                 .await?;
                 continue;
             }
+        };
+        #[cfg(windows)]
+        let sender_turn = {
+            let agent_turn = async {
+                let units = app_state
+                    .console_capture
+                    .drain(&app_state, &session_id, 8)
+                    .await?;
+                let units = units
+                    .into_iter()
+                    .map(|unit| {
+                        let validated = media_sender::validate_agent_access_unit(unit)
+                            .context("Agent encoded frame invalid")?;
+                        media_sender::prepare_agent_transport_unit(validated, requested_codec)
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "Agent codec does not match negotiated media: {error:?}"
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok::<_, anyhow::Error>(SenderMediaTurn::Agent(units))
+            };
+            #[cfg(not(test))]
+            let turn = agent_turn.await?;
+            #[cfg(test)]
+            let turn = if use_console_agent {
+                agent_turn.await?
+            } else {
+                app_state
+                    .take_agent_media_turn(&session_id.0, 8, requested_codec)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("test media source rejected: {error:?}"))?
+            };
+            turn
         };
         let (access_units, capture_memory_path) =
             if !media_sender::sender_turn_requires_local_capture(&sender_turn) {
@@ -5098,6 +5208,10 @@ async fn send_quic_media_loop(
                     pipelines.set_codec_fallback_reason(session_id.clone(), None);
                 }
                 if access_units.is_empty() {
+                    #[cfg(windows)]
+                    if !first_agent_frame_sent && Instant::now() >= first_agent_frame_deadline {
+                        anyhow::bail!("The approved capture Agent did not produce its first frame");
+                    }
                     tokio::time::sleep(Duration::from_millis(1)).await;
                     sender_stats.record_elapsed("sender.agent_wait", loop_started);
                     continue;
@@ -5554,7 +5668,18 @@ async fn send_quic_media_loop(
                     // Enqueue acceptance is not wire-send evidence. The mux owns packetization
                     // and asynchronous endpoint I/O, so legacy fragment counters intentionally
                     // remain unchanged on this route.
-                    TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale => {}
+                    TransportSendOutcome::Enqueued | TransportSendOutcome::ReplacedStale =>
+                    {
+                        #[cfg(windows)]
+                        if !first_agent_frame_sent {
+                            app_state
+                                .session_authorizations
+                                .mark_streaming(&session_id, now_ms())
+                                .await
+                                .context("Capture authorization changed before first frame")?;
+                            first_agent_frame_sent = true;
+                        }
+                    }
                     TransportSendOutcome::Backpressured => {
                         frame_id = frame_id.wrapping_add(1).max(1);
                         continue;
@@ -6032,6 +6157,15 @@ async fn send_quic_media_loop(
                 .await?;
                 frame_id = frame_id.wrapping_add(1).max(1);
                 continue;
+            }
+            #[cfg(windows)]
+            if !first_agent_frame_sent {
+                app_state
+                    .session_authorizations
+                    .mark_streaming(&session_id, now_ms())
+                    .await
+                    .context("Capture authorization changed before first frame")?;
+                first_agent_frame_sent = true;
             }
             sender_stats.frame_completed();
             if !session_allows_media(&app_state, &session_id).await {
@@ -7627,6 +7761,8 @@ async fn render_lan_quic_media_v3_compressed_access_unit_frame(
     true
 }
 
+#[cfg(test)]
+mod first_pairing_integration_tests;
 #[cfg(test)]
 mod security_negative_evidence_tests;
 #[cfg(test)]

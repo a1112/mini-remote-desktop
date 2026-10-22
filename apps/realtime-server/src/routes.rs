@@ -6,6 +6,10 @@ use mrd_signal_proto::{
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
+const MAX_AUTHORIZED_ROUTES: usize = 4_096;
+const MAX_ROUTES_PER_CONTROLLER: usize = 64;
+const MAX_ROUTES_PER_TARGET: usize = 64;
+
 #[derive(Debug, Clone)]
 struct SessionRoute {
     controller: DeviceId,
@@ -64,6 +68,25 @@ impl AuthorizedRoutes {
         }
         if self.routes.contains_key(&request.session_id) {
             return Err(RouteError::Conflict);
+        }
+        if self.routes.len() >= MAX_AUTHORIZED_ROUTES {
+            return Err(RouteError::Capacity);
+        }
+        let controller_routes = self
+            .routes
+            .values()
+            .filter(|route| route.controller == *controller)
+            .count();
+        if controller_routes >= MAX_ROUTES_PER_CONTROLLER {
+            return Err(RouteError::Capacity);
+        }
+        let target_routes = self
+            .routes
+            .values()
+            .filter(|route| route.target == request.target_device_id)
+            .count();
+        if target_routes >= MAX_ROUTES_PER_TARGET {
+            return Err(RouteError::Capacity);
         }
         self.routes.insert(
             request.session_id.clone(),
@@ -319,6 +342,8 @@ pub enum RouteError {
     Unauthorized,
     #[error("session route conflicts with an existing route")]
     Conflict,
+    #[error("authorized session route capacity is exhausted")]
+    Capacity,
     #[error("session route has not been granted")]
     NotGranted,
     #[error("candidate fingerprint was not granted")]

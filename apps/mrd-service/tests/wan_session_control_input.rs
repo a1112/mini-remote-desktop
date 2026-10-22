@@ -32,6 +32,33 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
+fn pointer_ipc_event(x: i32, y: i32) -> ControlInputEvent {
+    // macOS MouseMove is guarded by the negotiated capture geometry. These
+    // WAN lane tests do not need a native display selection, so keep the
+    // Pointer scope while using a wheel event on macOS.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = y;
+        ControlInputEvent::MouseWheel { delta: x }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ControlInputEvent::MouseMove { x, y }
+    }
+}
+
+fn pointer_wire_event(x: i32, y: i32) -> ControlEvent {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = y;
+        ControlEvent::MouseWheel { delta: x }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ControlEvent::MouseMove { x, y }
+    }
+}
+
 #[derive(Clone)]
 struct RecordingInputInjector {
     events: Arc<StdMutex<Vec<InputEvent>>>,
@@ -355,7 +382,7 @@ async fn controller_pointer_and_keyboard_use_the_wan_mux_and_inject_once() {
     let pointer = send_control_input(
         &fixture.controller_state,
         fixture.session_id.clone(),
-        ControlInputEvent::MouseMove { x: 320, y: 240 },
+        pointer_ipc_event(320, 240),
     )
     .await;
     assert!(matches!(pointer, IpcResponse::ControlInputAccepted { .. }));
@@ -417,7 +444,7 @@ async fn stale_realtime_wan_sequence_is_rejected_without_reinjection() {
             PermissionScope::InputPointer,
             2,
             75,
-            ControlEvent::MouseMove { x: 200, y: 210 },
+            pointer_wire_event(200, 210),
         )
         .await;
     fixture
@@ -429,7 +456,7 @@ async fn stale_realtime_wan_sequence_is_rejected_without_reinjection() {
             PermissionScope::InputPointer,
             1,
             76,
-            ControlEvent::MouseMove { x: 100, y: 110 },
+            pointer_wire_event(100, 110),
         )
         .await;
     fixture
@@ -492,7 +519,7 @@ async fn wrong_peer_and_missing_scope_never_reach_the_target_injector() {
             PermissionScope::InputPointer,
             1,
             81,
-            ControlEvent::MouseMove { x: 10, y: 20 },
+            pointer_wire_event(10, 20),
         )
         .await;
     wrong_peer

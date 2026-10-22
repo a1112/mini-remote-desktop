@@ -1,3 +1,5 @@
+import hmac
+import hashlib
 import re
 from datetime import UTC, datetime
 
@@ -10,7 +12,13 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.response_security import no_store_sensitive_response
 from app.core.security import (
+    DeviceRefreshIdentity,
+    DeviceAuthSnapshot,
+    capture_device_auth_snapshot,
+    device_auth_snapshot_matches,
     create_device_access_token,
+    create_device_refresh_token,
+    get_device_refresh_identity,
     get_device_enrollment_token_optional,
     get_current_device,
     get_current_device_optional,
@@ -43,6 +51,7 @@ from app.services.device_enrollment import (
     DeviceEnrollmentService,
     device_serial_digest,
 )
+from app.services.realtime_presence import DevicePresence, query_realtime_presence
 
 router = APIRouter(
     prefix="/devices",
@@ -73,6 +82,14 @@ def _to_out(device: Device) -> DeviceOut:
         favorite=device.favorite,
         is_bound=device.is_bound,
     )
+
+
+def _with_presence(device: DeviceOut, presence: DevicePresence) -> DeviceOut:
+    seen = presence.last_seen_ms
+    last_seen = "离线" if seen is None else datetime.fromtimestamp(
+        seen // 1000, UTC
+    ).replace(microsecond=(seen % 1000) * 1000).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return device.model_copy(update={"status": "online" if presence.online else "offline", "last_seen": last_seen})
 
 
 @router.post(
@@ -124,16 +141,21 @@ async def register_device(
                 token=enrollment_token,
                 registration=payload.model_dump(mode="json"),
             )
+            access_token = create_device_access_token(registered.device)
+            # create_device_refresh_token rotates the active JTI on the model.
+            # Generate it before the enrollment commit so the token returned to
+            # a newly enrolled device is backed by durable server state.
+            refresh_token = create_device_refresh_token(registered.device)
             await _commit(db)
             await db.refresh(registered.device)
         except DeviceEnrollmentError as error:
             await db.rollback()
             _raise_device_enrollment(error)
-        access_token = create_device_access_token(registered.device)
         return DeviceRegisterResponse(
             device_id=registered.device.device_id,
             device_name=registered.device.name,
             access_token=access_token,
+            refresh_token=refresh_token,
         )
 
     # Without a one-time enrollment, this route is refresh-only. Authenticate
@@ -152,6 +174,7 @@ async def register_device(
         )
     else:
         assert current_device is not None
+        authenticated = capture_device_auth_snapshot(current_device)
         existing = await db.scalar(
             select(Device)
             .where(Device.id == current_device.id)
@@ -160,7 +183,15 @@ async def register_device(
         )
         if (
             existing is None
-            or existing.motherboard_serial_digest
+            or existing.id != authenticated.row_id
+            or existing.device_id != authenticated.device_id
+            or existing.auth_version != authenticated.auth_version
+            or existing.auth_revoked_at is not None
+            or authenticated.auth_revoked_at is not None
+        ):
+            _deny_device_registration(401)
+        if (
+            existing.motherboard_serial_digest
             != _device_serial_digest(payload.motherboard_serial)
         ):
             _deny_device_registration(403)
@@ -169,6 +200,8 @@ async def register_device(
     os_type = payload.os_version.split()[0] if payload.os_version else "Unknown"
 
     if existing:
+        if existing.principal_kind != "physical" or existing.device_id.startswith("browser_"):
+            _deny_device_registration(401)
         # 设备已存在，更新信息
         if payload.hostname:
             existing.hostname = payload.hostname
@@ -184,16 +217,19 @@ async def register_device(
         if payload.device_name:
             existing.name = payload.device_name
 
-        await db.commit()
-        await db.refresh(existing)
-
-        # 生成访问令牌
+        # Generate the rotating JTI before committing; otherwise a freshly
+        # returned enrollment/refresh credential can be absent after a new
+        # session reads the device row.
         access_token = create_device_access_token(existing)
+        refresh_token = create_device_refresh_token(existing)
+        await _commit(db)
+        await db.refresh(existing)
 
         return DeviceRegisterResponse(
             device_id=existing.device_id,
             device_name=existing.name,
             access_token=access_token,
+            refresh_token=refresh_token,
         )
     else:
         raise HTTPException(
@@ -203,6 +239,54 @@ async def register_device(
                 "message": "device enrollment required",
             },
         )
+
+
+@router.post("/refresh", response_model=DeviceRegisterResponse)
+async def refresh_device_credentials(
+    payload: DeviceRegisterRequest,
+    identity: DeviceRefreshIdentity = Depends(get_device_refresh_identity),
+    db: AsyncSession = Depends(get_db),
+) -> DeviceRegisterResponse:
+    # Refresh credentials are deliberately absent from all ordinary API auth
+    # dependencies. Lock and re-read the row so revocation cannot be bypassed by
+    # a stale identity-map object or a concurrent ownership/version change.
+    device = await db.scalar(
+        select(Device).where(Device.id == identity.row_id, Device.principal_kind == "physical").with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if (
+        device is None
+        or device.device_id != identity.device_id
+        or device.tenant_id != identity.tenant_id
+        or device.auth_version != identity.auth_version
+        or device.auth_revoked_at is not None
+        or identity.expires_at <= int(datetime.now(UTC).timestamp())
+        or not isinstance(device.motherboard_serial_digest, str)
+        or not hmac.compare_digest(device.motherboard_serial_digest, identity.serial_digest)
+        or not hmac.compare_digest(_device_serial_digest(payload.motherboard_serial), identity.serial_digest)
+        or device.active_refresh_jti_hash is None
+        or not hmac.compare_digest(
+            device.active_refresh_jti_hash,
+            hashlib.sha256(identity.jti.encode("ascii")).hexdigest(),
+        )
+    ):
+        raise HTTPException(status_code=401, detail="Invalid device authentication credentials")
+    device.hostname = payload.hostname
+    device.os_version = payload.os_version
+    device.os = payload.os_version.split()[0] if payload.os_version else "Unknown"
+    for field in ("cpu_info", "total_memory_mb", "gpu_info"):
+        value = getattr(payload, field)
+        if value is not None:
+            setattr(device, field, value)
+    if payload.device_name:
+        device.name = payload.device_name
+    access_token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
+    await _commit(db)
+    return DeviceRegisterResponse(
+        device_id=device.device_id, device_name=device.name,
+        access_token=access_token, refresh_token=refresh_token,
+    )
 
 
 @router.post(
@@ -250,12 +334,14 @@ async def bind_device(
 
     将设备与用户账户绑定，绑定后只有该用户可以访问此设备。
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     device, _ = await bind_device_owner(
         db,
         device_id=payload.device_id,
         current_user=current_user,
         now=datetime.now(UTC),
+        authenticated=authenticated,
     )
     await _commit(db)
 
@@ -273,7 +359,7 @@ async def list_devices(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[DeviceOut]:
-    stmt: Select[tuple[Device]] = select(Device).options(selectinload(Device.status))
+    stmt: Select[tuple[Device]] = select(Device).where(Device.principal_kind == "physical").options(selectinload(Device.status))
     if current_user.role != "admin":
         stmt = stmt.where(
             Device.tenant_id == current_user.tenant_id,
@@ -292,6 +378,9 @@ async def list_devices(
             and item.tenant_id == current_user.tenant_id
         ]
     result = [_to_out(item) for item in rows]
+    presence = await query_realtime_presence([item.device_id for item in rows])
+    if presence is not None:
+        result = [_with_presence(item, presence.get(item.device_id, DevicePresence())) for item in result]
     if status:
         result = [item for item in result if item.status == status]
     return result
@@ -305,7 +394,7 @@ async def get_device(
 ) -> DeviceOut:
     stmt = (
         select(Device)
-        .where(Device.id == device_id)
+        .where(Device.id == device_id, Device.principal_kind == "physical")
         .options(selectinload(Device.status))
     )
     if current_user.role != "admin":
@@ -324,7 +413,9 @@ async def get_device(
         )
     ):
         raise HTTPException(status_code=404, detail="Device not found")
-    return _to_out(device)
+    result = _to_out(device)
+    presence = await query_realtime_presence([device.device_id])
+    return result if presence is None else _with_presence(result, presence.get(device.device_id, DevicePresence()))
 
 
 @router.post(
@@ -343,17 +434,19 @@ async def auto_bind_device(
 
     逻辑：
     1. 如果设备未绑定(is_bound=False)：直接绑定当前用户
-    2. 如果设备已被其他用户绑定：强制迁移到当前用户
+    2. 如果设备已被其他用户绑定：拒绝迁移
     3. 如果设备已被当前用户绑定：更新绑定时间（续期）
 
     返回：绑定状态、被踢出的用户信息（如有）
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     _, is_new_binding = await bind_device_owner(
         db,
         device_id=payload.device_id,
         current_user=current_user,
         now=datetime.now(UTC),
+        authenticated=authenticated,
     )
     await _commit(db)
 
@@ -379,16 +472,16 @@ async def unbind_device(
     1. 验证设备确实绑定到该用户
     2. 解除绑定（is_bound=False, bound_user_id=None, bound_at=None）
     """
+    authenticated = capture_device_auth_snapshot(current_device)
     _require_matching_device(current_device, payload.device_id)
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == payload.device_id)
+        .where(Device.device_id == payload.device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
 
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+    _require_fresh_device_auth(device, authenticated)
 
     if not device.is_bound and device.bound_user_id is None:
         # 设备未绑定，直接返回成功（幂等）
@@ -422,6 +515,7 @@ async def bind_device_owner(
     device_id: str,
     current_user: object,
     now: datetime,
+    authenticated: DeviceAuthSnapshot | None = None,
 ) -> tuple[Device, bool]:
     user_id = getattr(current_user, "id", None)
     tenant_id = getattr(current_user, "tenant_id", None)
@@ -437,10 +531,12 @@ async def bind_device_owner(
         )
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
+    if authenticated is not None:
+        _require_fresh_device_auth(device, authenticated)
     if device is None:
         raise HTTPException(status_code=404, detail="Device not found")
     if device.is_bound or device.bound_user_id is not None:
@@ -470,6 +566,16 @@ def _require_matching_device(device: Device, requested_device_id: str) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid device authentication credentials",
         )
+
+
+def _require_fresh_device_auth(device: Device | None, authenticated: DeviceAuthSnapshot) -> None:
+    if (device is None or device.id != authenticated.row_id
+        or device.device_id != authenticated.device_id
+        or device.tenant_id != authenticated.tenant_id
+        or type(device.auth_version) is not int or device.auth_version < 1
+        or device.auth_version != authenticated.auth_version
+        or device.auth_revoked_at is not None or authenticated.auth_revoked_at is not None):
+        raise HTTPException(status_code=401, detail="Invalid device authentication credentials")
 
 
 async def _commit(db: AsyncSession) -> None:
@@ -557,23 +663,25 @@ async def rotate_device_credentials(
     current_device: Device = Depends(get_current_device),
     db: AsyncSession = Depends(get_db),
 ) -> DeviceCredentialResponse:
+    authenticated = capture_device_auth_snapshot(current_device)
     device = await _locked_device(db, device_id)
     if (
-        current_device.id != device.id
-        or not device.is_bound
-        or device.bound_user_id != current_user.id
-        or device.tenant_id != current_user.tenant_id
+        not device_auth_snapshot_matches(device, authenticated)
+        or authenticated.bound_user_id != current_user.id
+        or authenticated.tenant_id != current_user.tenant_id
     ):
         raise HTTPException(status_code=403, detail="Device credential rotation denied")
     device.auth_version += 1
     device.auth_revoked_at = None
     await db.flush()
     token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
     await _commit(db)
     return DeviceCredentialResponse(
         device_id=device.device_id,
         auth_version=device.auth_version,
         access_token=token,
+        refresh_token=refresh_token,
     )
 
 
@@ -591,11 +699,13 @@ async def admin_rotate_device_credentials(
     device.auth_revoked_at = None
     await db.flush()
     token = create_device_access_token(device)
+    refresh_token = create_device_refresh_token(device)
     await _commit(db)
     return DeviceCredentialResponse(
         device_id=device.device_id,
         auth_version=device.auth_version,
         access_token=token,
+        refresh_token=refresh_token,
     )
 
 
@@ -622,7 +732,7 @@ async def revoke_device_credentials(
 async def _locked_device(db: AsyncSession, device_id: str) -> Device:
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -642,7 +752,7 @@ async def get_binding_status(
 
     返回：是否已绑定、绑定的用户信息、绑定时间
     """
-    statement = select(Device).where(Device.device_id == device_id)
+    statement = select(Device).where(Device.device_id == device_id, Device.principal_kind == "physical")
     if current_user.role != "admin":
         statement = statement.where(
             Device.tenant_id == current_user.tenant_id,
@@ -695,7 +805,7 @@ async def rename_device(
     """
     device = await db.scalar(
         select(Device)
-        .where(Device.device_id == device_id)
+        .where(Device.device_id == device_id, Device.principal_kind == "physical")
         .with_for_update()
         .execution_options(populate_existing=True)
     )

@@ -1,0 +1,91 @@
+--- a/src/apps/relay/prom_server.c
++++ b/src/apps/relay/prom_server.c
+@@ -183,12 +183,14 @@
+   return buf;
+ }
+ 
+-void start_prometheus_server(void) {
++void initialize_prometheus_metrics(void) {
+   if (!turn_params.prometheus) {
+-    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "prometheus collector disabled, not started\n");
+     return;
+   }
+-  prom_collector_registry_default_init();
++  if (prom_collector_registry_default_init() != 0) {
++    TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "could not initialize prometheus registry\n");
++    exit(EXIT_FAILURE);
++  }
+ 
+   const char *label[] = {"realm", NULL};
+   size_t nlabels = 1;
+@@ -270,6 +272,25 @@
+   const char *typeLabel[] = {"type"};
+   turn_total_allocations = prom_collector_registry_must_register_metric(
+       prom_gauge_new("turn_total_allocations", "Represents current allocations number", 1, typeLabel));
++  // Materialize only enabled client transports before allocation workers start.
++  // Adding zero creates a missing series without resetting an existing count.
++  const SOCKET_TYPE types[] = {UDP_SOCKET, TCP_SOCKET, TLS_SOCKET, DTLS_SOCKET};
++  const bool enabled[] = {!turn_params.no_udp, !turn_params.no_tcp, !turn_params.no_tls,
++#if DTLS_SUPPORTED
++                          turn_params.dtls
++#else
++                          false
++#endif
++  };
++  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
++    if (enabled[i]) {
++      const char *values[] = {socket_type_name(types[i])};
++      if (prom_gauge_add(turn_total_allocations, 0, values) != 0) {
++        TURN_LOG_FUNC(TURN_LOG_LEVEL_ERROR, "could not initialize allocation metric for %s\n", values[0]);
++        exit(EXIT_FAILURE);
++      }
++    }
++  }
+   // Packet counters
+   packet_processed = prom_collector_registry_must_register_metric(
+       prom_counter_new("turn_packet_processed", "Incoming packet processed", 0, NULL));
+@@ -288,6 +309,14 @@
+       prom_counter_new("turn_udp_sendmmsg_datagrams", "Datagrams sent via egress batches", 0, NULL));
+   turn_udp_sendmmsg_gso_datagrams = prom_collector_registry_must_register_metric(
+       prom_counter_new("turn_udp_sendmmsg_gso_datagrams", "Datagrams coalesced via a single UDP-GSO sendmsg", 0, NULL));
++
++}
++
++void start_prometheus_server(void) {
++  if (!turn_params.prometheus) {
++    TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "prometheus collector disabled, not started\n");
++    return;
++  }
+ 
+   // some flags appeared first in microhttpd v0.9.53
+   unsigned int flags = 0;
+@@ -549,6 +578,8 @@
+ 
+ #else
+ 
++void initialize_prometheus_metrics(void) {}
++
+ void start_prometheus_server(void) {
+   TURN_LOG_FUNC(TURN_LOG_LEVEL_INFO, "turnserver compiled without prometheus support\n");
+   return;
+--- a/src/apps/relay/prom_server.h
++++ b/src/apps/relay/prom_server.h
+@@ -119,6 +119,8 @@
+ 
+ #endif /* !defined(TURN_NO_PROMETHEUS) */
+ 
++/* Initialize descriptors and enabled allocation series before setup_server(). */
++void initialize_prometheus_metrics(void);
+ void start_prometheus_server(void);
+ 
+ void prom_set_finished_traffic(const char *realm, const char *user, unsigned long rsvp, unsigned long rsvb,
+--- a/src/apps/relay/mainrelay.c
++++ b/src/apps/relay/mainrelay.c
+@@ -3919,6 +3919,7 @@
+     }
+   }
+ 
++  initialize_prometheus_metrics();
+   setup_server();
+ 
+ #if defined(WINDOWS)

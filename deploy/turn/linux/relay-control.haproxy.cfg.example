@@ -1,0 +1,36 @@
+# Dedicated relay-node control ingress. Keep shared NGINX on 80/443.
+# Server identity and the node CA are protected, independently provisioned files.
+global
+    user haproxy
+    group haproxy
+    ssl-default-bind-options ssl-min-ver TLSv1.2
+    maxconn 256
+
+defaults
+    mode http
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    option http-server-close
+
+frontend relay_control
+    bind 0.0.0.0:9443 ssl crt /etc/mrd-relay-control/server.pem ca-file /etc/mrd-relay-control/node-ca.pem verify optional
+    acl bootstrap path_reg ^/api/v1/relays/enroll$ ^/api/v1/relays/enrollments/[A-Za-z0-9._-]+/pickup$
+    acl authenticated_node path_reg ^/api/v1/relays/[A-Za-z0-9._-]+/(heartbeat|renew|secret-rotation/(upload|commit|status))$
+    acl has_certificate ssl_c_used
+    acl certificate_valid ssl_c_verify 0
+    http-request deny deny_status 404 if !bootstrap !authenticated_node
+    http-request deny deny_status 403 if authenticated_node !has_certificate
+    http-request deny deny_status 403 if authenticated_node !certificate_valid
+    http-request del-header Forwarded
+    http-request del-header X-Forwarded- -m beg
+    http-request del-header X-Real-IP
+    http-request del-header X-Client-IP
+    http-request del-header X-Rdesk-Client-TLS
+    http-request del-header X-Rdesk-Client-Cert-Sha256
+    http-request set-header X-Rdesk-Client-TLS verified
+    http-request set-header X-Rdesk-Client-Cert-Sha256 sha256:%[ssl_c_der,sha2(256),hex,lower] if has_certificate certificate_valid
+    default_backend relay_api
+
+backend relay_api
+    server rdesk 127.0.0.1:9530

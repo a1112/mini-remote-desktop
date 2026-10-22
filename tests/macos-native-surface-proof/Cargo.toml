@@ -1,0 +1,12 @@
+[package]
+name = "mrd-macos-native-surface-proof"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep the AppKit proof independent of the large Tauri application build.
+[workspace]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "=0.26.1"
+objc = "=0.2.7"

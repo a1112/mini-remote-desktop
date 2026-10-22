@@ -65,6 +65,18 @@ fn authenticated_envelope_requires_explicit_supported_version() {
 }
 
 #[test]
+fn authenticated_message_enum_rejects_unknown_outer_fields() {
+    let identity = identity();
+    let message = AuthenticatedSignalMessage::Register(signed_register(&identity, [1; 16], 1));
+    let mut value = serde_json::to_value(message).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown".into(), serde_json::json!(true));
+    assert!(serde_json::from_value::<AuthenticatedSignalMessage>(value).is_err());
+}
+
+#[test]
 fn protocol_error_debug_never_exposes_server_detail() {
     let sentinel = "TEST_ONLY_PROTOCOL_DETAIL_SDP_AND_TURN_SECRET";
     let message = SignalErrorMessage {

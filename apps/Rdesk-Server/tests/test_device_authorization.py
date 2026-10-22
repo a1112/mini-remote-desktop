@@ -91,6 +91,7 @@ class Device:
     status = Column()
     tenant_id = Column()
     is_bound = Column()
+    principal_kind = Column()
 
     def __init__(
         self,
@@ -102,6 +103,7 @@ class Device:
         self.id = database_id or f"db-{device_id}"
         self.name = f"device-{device_id}"
         self.device_id = device_id
+        self.principal_kind = "physical"
         self.os = "Linux"
         self.icon = "Monitor"
         self.status = None
@@ -115,6 +117,8 @@ class Device:
             f"tenant-{bound_user_id}" if bound_user_id is not None else "tenant-unbound"
         )
         self.bound_at = None
+        self.auth_version = 1
+        self.auth_revoked_at = None
 
 
 STUBBED_MODULE_NAMES = (
@@ -158,6 +162,29 @@ def _install_dependency_stubs() -> None:
     security = types.ModuleType("app.core.security")
     security.create_access_token = lambda *_args: "token"
     security.create_device_access_token = lambda *_args: "device-token"
+    security.create_device_refresh_token = lambda *_args: None
+    security.get_device_refresh_identity = object()
+    security.DeviceRefreshIdentity = object
+    security.DeviceAuthSnapshot = object
+    security.capture_device_auth_snapshot = lambda device: types.SimpleNamespace(
+        row_id=device.id, device_id=device.device_id,
+        auth_version=getattr(device, "auth_version", 1),
+        auth_revoked_at=getattr(device, "auth_revoked_at", None),
+        bound_user_id=device.bound_user_id,
+        is_bound=device.is_bound,
+        tenant_id=device.tenant_id,
+    )
+    security.device_auth_snapshot_matches = lambda device, snapshot: (
+        device.id == snapshot.row_id
+        and device.device_id == snapshot.device_id
+        and device.auth_version == snapshot.auth_version
+        and device.bound_user_id == snapshot.bound_user_id
+        and device.is_bound == snapshot.is_bound
+        and device.tenant_id == snapshot.tenant_id
+        and device.auth_revoked_at == snapshot.auth_revoked_at
+        and snapshot.auth_revoked_at is None
+        and snapshot.is_bound
+    )
     security.get_device_enrollment_token_optional = object()
     security.get_current_device = object()
     security.get_current_device_optional = object()

@@ -23,6 +23,7 @@ pub enum WanAccessModeV3 {
 #[serde(rename_all = "snake_case")]
 pub enum WanRoutePolicyV3 {
     RelayOnly,
+    DirectFirst,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

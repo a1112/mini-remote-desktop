@@ -122,11 +122,11 @@ impl RegistrationSigner for OneShotEd25519Signer {
 
 #[cfg(windows)]
 fn build_windows_media_executor() -> crate::media::MediaExecutor<
-    crate::capture::UnavailableCaptureAdapter,
+    crate::capture::WindowsDxgiOpenH264CaptureAdapter,
     crate::windows_render::WindowsRenderAdapter,
 > {
     crate::media::MediaExecutor::new(
-        crate::capture::UnavailableCaptureAdapter,
+        crate::capture::WindowsDxgiOpenH264CaptureAdapter::new(),
         crate::windows_render::WindowsRenderAdapter::new(),
     )
 }
@@ -603,12 +603,12 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn production_media_executor_never_claims_unassembled_capture() {
+    fn production_media_executor_advertises_the_assembled_capture_adapter() {
         use crate::runtime::AuthorizedCommandExecutor;
         use mrd_agent_ipc::AgentCapability;
 
         let executor = build_windows_media_executor();
-        assert!(!executor
+        assert!(executor
             .capabilities()
             .as_set()
             .contains(&AgentCapability::Capture));

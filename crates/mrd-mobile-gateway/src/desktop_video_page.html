@@ -70,7 +70,7 @@ section{padding:14px;background:#15213a;border-radius:10px;margin:12px 0}
     const own=++generation;
     if(!('VideoDecoder' in window)) {$('status').textContent='此浏览器不支持 WebCodecs，请使用本机 Chrome/Edge';return;}
     $('status').textContent='正在连接';
-    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/mobile/desktop/video/ws');ws.binaryType='arraybuffer';
+    ws=new WebSocket('wss://'+location.host+'/mobile/desktop/video/ws'+location.search);ws.binaryType='arraybuffer';
     ws.onmessage=event=>{
       if(own!==generation)return;
       if(typeof event.data==='string'){

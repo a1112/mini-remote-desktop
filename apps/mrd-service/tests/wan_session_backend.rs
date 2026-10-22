@@ -107,6 +107,7 @@ enum FakeMode {
     AlwaysStatus(StatusCode, String),
     Oversized(usize),
     MismatchedSession,
+    TemporaryAuthority(Value),
 }
 
 #[derive(Clone)]
@@ -234,7 +235,10 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
                 .body(Body::from(vec![b'x'; *size]))
                 .expect("oversized fake response");
         }
-        FakeMode::Normal | FakeMode::FailFirst(_) | FakeMode::MismatchedSession => {}
+        FakeMode::Normal
+        | FakeMode::FailFirst(_)
+        | FakeMode::MismatchedSession
+        | FakeMode::TemporaryAuthority(_) => {}
     }
 
     let status = if parts.uri.path().ends_with("/approve") {
@@ -267,6 +271,11 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
     } else {
         session_response(&state, status)
     };
+    if let FakeMode::TemporaryAuthority(extra) = &state.mode {
+        for (key, value) in extra.as_object().unwrap() {
+            response[key] = value.clone();
+        }
+    }
     if matches!(state.mode, FakeMode::MismatchedSession) {
         response["session_id"] = json!("another-session");
     }
@@ -875,4 +884,73 @@ fn configuration_rejects_remote_cleartext_and_endpoint_userinfo() {
         DeviceId("target-1".into()),
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn device_inspection_accepts_only_complete_typed_temporary_authority() {
+    let mut request = request();
+    request.controller_device_id = DeviceId("browser_0123456789abcdef0123456789abcdef".into());
+    let fake=FakeBackend::spawn_with_mode(request.clone(),FakeMode::TemporaryAuthority(json!({"authority_kind":"temporary_password","temporary_access_generation":3,"target_auth_version":2}))).await;
+    let backend = HttpWanSessionBackend::new(client_config(
+        &fake.base_url,
+        &private_material("temporary-device-auth"),
+    ))
+    .unwrap();
+    assert!(
+        backend.inspect(&binding(&request)).await.is_ok(),
+        "valid device-authenticated temporary authority must parse"
+    );
+}
+
+#[tokio::test]
+async fn temporary_authority_rejects_partial_versions_unattended_and_extra_scopes() {
+    let mut request = request();
+    request.controller_device_id = DeviceId("browser_0123456789abcdef0123456789abcdef".into());
+    let mut unattended_body = serde_json::to_value(&request).unwrap();
+    unattended_body["access_mode"] = json!("unattended");
+    for fields in [
+        json!({"authority_kind":"temporary_password","temporary_access_generation":3,"target_auth_version":2,"request":unattended_body}),
+        json!({"authority_kind":"temporary_password","temporary_access_generation":3}),
+        json!({"authority_kind":"temporary_password","temporary_access_generation":0,"target_auth_version":2}),
+        json!({"authority_kind":"account","temporary_access_generation":3,"target_auth_version":2}),
+    ] {
+        let fake =
+            FakeBackend::spawn_with_mode(request.clone(), FakeMode::TemporaryAuthority(fields))
+                .await;
+        let backend = HttpWanSessionBackend::new(client_config(
+            &fake.base_url,
+            &private_material("temporary-device-auth"),
+        ))
+        .unwrap();
+        assert!(matches!(
+            backend.inspect(&binding(&request)).await,
+            Err(WanSessionBackendError::InvalidResponse)
+        ));
+    }
+    let fields = json!({"authority_kind":"temporary_password","temporary_access_generation":3,"target_auth_version":2});
+    let mut input_only = request.clone();
+    input_only.requested_scopes = vec![WanPermissionScopeV3::InputKeyboard];
+    let mut files = request.clone();
+    files.requested_scopes = vec![
+        WanPermissionScopeV3::FileRead,
+        WanPermissionScopeV3::ScreenView,
+    ];
+    let mut physical = request.clone();
+    physical.controller_device_id = DeviceId("physical-controller".into());
+    for forbidden in [input_only, files, physical] {
+        let fake = FakeBackend::spawn_with_mode(
+            forbidden.clone(),
+            FakeMode::TemporaryAuthority(fields.clone()),
+        )
+        .await;
+        let backend = HttpWanSessionBackend::new(client_config(
+            &fake.base_url,
+            &private_material("temporary-device-auth"),
+        ))
+        .unwrap();
+        assert!(matches!(
+            backend.inspect(&binding(&forbidden)).await,
+            Err(WanSessionBackendError::InvalidResponse)
+        ));
+    }
 }

@@ -13,7 +13,8 @@ from typing import Callable, Iterable, NoReturn, Protocol
 from pydantic import ValidationError
 from sqlalchemy import func, select
 
-from app.core.security import DeviceAuthSnapshot
+from app.core.security import DeviceAuthSnapshot, device_auth_snapshot_matches
+from app.services.browser_authority import browser_authority_valid
 from app.models.device import Device
 from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.relay_audit_event import RelayAuditEvent
@@ -176,6 +177,8 @@ class RelayAccessService:
         session_id: str,
         policy_revision: int,
         intended_peer_id: str,
+        auth_snapshot: DeviceAuthSnapshot | None = None,
+        current_device_id: str | None = None,
     ) -> RelayAccessResult:
         async with session_grant_identity_lock(self._session, "session:" + session_id):
             return await self._issue_access_locked(
@@ -183,6 +186,8 @@ class RelayAccessService:
                 session_id=session_id,
                 policy_revision=policy_revision,
                 intended_peer_id=intended_peer_id,
+                auth_snapshot=auth_snapshot,
+                current_device_id=current_device_id,
             )
 
     async def create_wan_generation_locked(
@@ -330,6 +335,13 @@ class RelayAccessService:
             generation=generation,
         )
 
+    async def permits_unbound_guest_target(self, device, session_id):
+        grant = await self._session.scalar(select(SessionRequest).where(
+            SessionRequest.id == session_id, SessionRequest.authority_kind == "temporary_password",
+            SessionRequest.target_device_id == device.id, SessionRequest.status == "approved"))
+        return bool(device.principal_kind == "physical" and device.auth_revoked_at is None
+            and grant is not None and await browser_authority_valid(self._session, grant, now=self._now()))
+
     async def issue_authenticated_access(
         self,
         *,
@@ -356,6 +368,8 @@ class RelayAccessService:
                 session_id=session_id,
                 policy_revision=policy_revision,
                 intended_peer_id=intended_peer_id,
+                auth_snapshot=auth_snapshot,
+                current_device_id=current_device.id,
             )
         if generation is None:
             _deny_access()
@@ -512,11 +526,14 @@ class RelayAccessService:
             grant is None
             or grant.requester_device_id != controller.id
             or grant.target_device_id != target.id
-            or users_by_id.get(controller.bound_user_id) is None
-            or users_by_id.get(target.bound_user_id) is None
-            or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
-            or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id
+            or (grant.authority_kind != "temporary_password" and (
+                users_by_id.get(controller.bound_user_id) is None
+                or users_by_id.get(target.bound_user_id) is None
+                or users_by_id[controller.bound_user_id].tenant_id != grant.tenant_id
+                or users_by_id[target.bound_user_id].tenant_id != grant.tenant_id))
         ):
+            _deny_access()
+        if not await browser_authority_valid(self._session, grant, now=self._now()):
             _deny_access()
         return grant, controller, target, caller
 
@@ -533,17 +550,16 @@ class RelayAccessService:
         requested_generation: int,
         now: datetime,
     ) -> None:
+        guest = getattr(grant, "authority_kind", "account") == "temporary_password"
         participant_ids = {grant.requester_device_id, grant.target_device_id}
         valid = (
             controller is not None
             and target is not None
             and caller is not None
-            and _matches_auth_snapshot(caller, auth_snapshot)
+            and _matches_auth_snapshot(caller, auth_snapshot, allow_unbound=guest)
             and caller.id in participant_ids
             and controller.id != target.id
-            and controller.is_bound
-            and target.is_bound
-            and caller.is_bound
+            and ((controller.is_bound and target.is_bound and caller.is_bound) or guest)
             and controller.auth_revoked_at is None
             and target.auth_revoked_at is None
             and caller.auth_revoked_at is None
@@ -674,7 +690,7 @@ class RelayAccessService:
         try:
             reservations = await self._repository.reserve_capacity(
                 session_id=grant.id,
-                user_id=grant.requester_user_id,
+                user_id=_wan_reservation_subject(grant),
                 ordered_node_ids=[item.node_id for item in ordered_candidates],
                 now=now,
                 ttl_seconds=reservation_ttl,
@@ -946,7 +962,7 @@ class RelayAccessService:
             if (
                 reservation is None
                 or reservation.session_id != grant.id
-                or reservation.user_id != grant.requester_user_id
+                or reservation.user_id != _wan_reservation_subject(grant)
                 or reservation.node_id != candidate.node_id
                 or reservation.directory_generation != persisted.directory_id
                 or reservation.reserved_egress_bps != required_egress_bps
@@ -1072,6 +1088,8 @@ class RelayAccessService:
         session_id: str,
         policy_revision: int,
         intended_peer_id: str,
+        auth_snapshot: DeviceAuthSnapshot | None = None,
+        current_device_id: str | None = None,
     ) -> RelayAccessResult:
         now = _utc(self._now())
         try:
@@ -1081,16 +1099,33 @@ class RelayAccessService:
                 )
                 if grant_preview is None:
                     _deny_access()
-                target_device = await self._session.scalar(
+                device_ids = {grant_preview.target_device_id}
+                if auth_snapshot is not None:
+                    if current_device_id != auth_snapshot.row_id:
+                        _deny_access()
+                    device_ids.add(auth_snapshot.row_id)
+                device_rows = await self._session.scalars(
                     select(Device)
-                    .where(Device.id == grant_preview.target_device_id)
+                    .where(Device.id.in_(device_ids))
+                    .order_by(Device.id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
+                devices = {device.id: device for device in device_rows}
+                target_device = devices.get(grant_preview.target_device_id)
                 if target_device is None:
                     _deny_access()
                 if not target_device.is_bound or target_device.bound_user_id is None:
                     _deny_access()
+                if auth_snapshot is not None:
+                    caller_device = devices.get(auth_snapshot.row_id)
+                    if (
+                        caller_device is None
+                        or not device_auth_snapshot_matches(caller_device, auth_snapshot)
+                        or caller_device.bound_user_id != current_user_id
+                        or caller_device.tenant_id != grant_preview.tenant_id
+                    ):
+                        _deny_access()
                 participant_rows = await self._session.scalars(
                     select(User)
                     .where(
@@ -1645,6 +1680,7 @@ def _grant_conforms_to_current_policy(
         == list(current_policy.preferred_regions)
         and getattr(grant, "relay_accepted_transports", None)
         == list(current_policy.accepted_transports)
+        and _grant_max_backups(grant) == current_policy.max_backups
         and policy_deadline <= grant_deadline
         and grant_deadline <= now + timedelta(seconds=current_policy.grant_ttl_seconds)
         and policy_deadline
@@ -1684,11 +1720,11 @@ def _signed_endpoint_host(host: str) -> str:
 
 
 def _matches_auth_snapshot(
-    device: Device, snapshot: DeviceAuthSnapshot
+    device: Device, snapshot: DeviceAuthSnapshot, *, allow_unbound: bool = False
 ) -> bool:
     return (
         snapshot.auth_revoked_at is None
-        and snapshot.is_bound
+        and (snapshot.is_bound or allow_unbound)
         and device.id == snapshot.row_id
         and device.device_id == snapshot.device_id
         and device.auth_version == snapshot.auth_version
@@ -1724,7 +1760,7 @@ def _wan_request_binding_valid(
         and request.controller_device_id == controller.device_id
         and request.target_device_id == target.device_id
         and request.access_mode == "attended"
-        and request.route_policy == "relay_only"
+        and request.route_policy in {"relay_only", "direct_first"}
         and normalized["requested_scopes"] == grant.requested_scopes
         and normalized["requested_profile"] == grant.requested_profile
         and grant.request_commitment == commitment
@@ -1755,6 +1791,13 @@ def endpoint_parts(endpoint: str) -> tuple[str, str, int]:
     return transport, host, int(matched.group("port"))
 
 
+def _grant_max_backups(grant: object) -> int:
+    # Existing, unmapped test snapshots predate this field. Persisted grants
+    # have a non-null strict default installed by the redundancy migration.
+    value = getattr(grant, "relay_max_backups", 1)
+    return 1 if value is None else value
+
+
 def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
     allowed = _bounded_string_tuple(grant.relay_allowed_regions, {"region"})
     preferred = _bounded_string_tuple(grant.relay_preferred_regions, {"region"})
@@ -1768,6 +1811,9 @@ def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
         or any(region not in allowed for region in preferred)
         or grant.policy_revision is None
         or grant.policy_revision <= 0
+        or not isinstance(_grant_max_backups(grant), int)
+        or isinstance(_grant_max_backups(grant), bool)
+        or not 0 <= _grant_max_backups(grant) <= 7
     ):
         _deny_access()
     return RelaySelectionPolicy(
@@ -1775,7 +1821,7 @@ def _policy_from_grant(grant: SessionRequest) -> RelaySelectionPolicy:
         allowed_regions=allowed,
         preferred_regions=preferred,
         accepted_transports=accepted,
-        max_backups=1,
+        max_backups=_grant_max_backups(grant),
     )
 
 
@@ -2032,3 +2078,9 @@ def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _wan_reservation_subject(grant):
+    if getattr(grant, "authority_kind", "account") == "temporary_password":
+        return "guest-session-" + grant.id
+    return grant.requester_user_id

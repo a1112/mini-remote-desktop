@@ -2,7 +2,8 @@
 
 use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop};
 use core_graphics::event::{
-    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType, EventField,
+    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CallbackResult, EventField,
 };
 use mrd_input::{macos::MacosInputInjector, InputButton, InputEvent, InputInjector, InputKey};
 use std::{
@@ -38,13 +39,13 @@ fn native_keyboard_pointer_drag_and_wheels_reach_the_macos_event_stream() {
                     event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1),
                     event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2),
                 ));
-                event.set_type(CGEventType::Null);
+                return CallbackResult::Drop;
             }
-            None
+            CallbackResult::Keep
         },
     )
     .expect("create isolated MRD input event observer");
-    let source = tap.mach_port.create_runloop_source(0).unwrap();
+    let source = tap.mach_port().create_runloop_source(0).unwrap();
     let run_loop = CFRunLoop::get_current();
     unsafe {
         run_loop.add_source(&source, kCFRunLoopDefaultMode);
