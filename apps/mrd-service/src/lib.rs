@@ -15,11 +15,14 @@ pub mod display_mode;
 pub mod handlers;
 pub mod ipc_server;
 pub mod lan_discovery;
+#[cfg(target_os = "macos")]
+pub mod macos_runtime;
 pub mod media_adaptation;
 pub use mrd_mobile_gateway as mobile_gateway;
 pub mod relay;
 pub mod resource_monitor;
 pub mod security;
+pub mod session_audio;
 pub mod session_authorization;
 pub mod shell;
 pub mod shutdown;

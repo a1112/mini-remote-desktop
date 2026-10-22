@@ -21,6 +21,7 @@ members = [
   "crates/mrd-encode-vvenc",
   "crates/mrd-ffmpeg",
   "crates/mrd-input",
+  "crates/mrd-audio",
   "crates/mrd-mobile-gateway",
   "crates/mrd-agent-ipc",
   "crates/mrd-ipc",

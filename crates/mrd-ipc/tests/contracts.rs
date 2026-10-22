@@ -1683,6 +1683,26 @@ fn secure_remote_requests_have_stable_tags_and_required_fields() {
         .iter()
         .all(|(request, _)| request.is_secure_remote()));
     assert!(!IpcRequest::ListSessions.is_secure_remote());
+    for request in [
+        IpcRequest::SendControlInput {
+            session_id: SessionId("authorized-input".into()),
+            event: ControlInputEvent::ReleaseAll,
+        },
+        IpcRequest::GetSessionAudio {
+            session_id: SessionId("authorized-audio".into()),
+        },
+        IpcRequest::SetSessionAudioMuted {
+            session_id: SessionId("authorized-audio".into()),
+            muted: true,
+        },
+    ] {
+        assert!(request.is_secure_remote());
+        let wire = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IpcRequest>(&wire).unwrap(),
+            request
+        );
+    }
 
     for (request, expected_type) in requests {
         let value = serde_json::to_value(&request).unwrap();

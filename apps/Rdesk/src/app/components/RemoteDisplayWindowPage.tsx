@@ -85,6 +85,7 @@ import {
 } from "../services/ipcSessionService";
 import { decoderCapabilityAvailableForConfig } from "./TestWorkbench/capabilityMeta";
 import { isTauriRuntime } from "../utils/runtime";
+import { SessionAudioControl } from "./SessionAudioControl";
 import { withTauriWindow } from "../utils/tauriWindow";
 
 type RenderMode = "web" | "d3d11_native" | "d3d12_native" | "metal_native" | "linux_native";
@@ -6389,6 +6390,9 @@ export function RemoteDisplayWindowPage() {
           className="flex shrink-0 items-center gap-2 px-3"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
+          {!isLocalPipelinePreview && <SessionAudioControl sessionId={sessionId}
+            authorized={remoteAuthorizationSnapshot?.authorization_state === "granted" &&
+              remoteAuthorizationSnapshot.granted_scopes.includes("audio.listen")} />}
           <div
             ref={diagnosticsPopoverRef}
             className="relative hidden md:block"

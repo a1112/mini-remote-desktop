@@ -167,7 +167,7 @@ export function IncomingSessionDialog({
                 onChange={() => toggleScope(scope)}
                 type="checkbox"
               />
-              <span className="font-mono text-sm">{scope}</span>
+              <span className="text-sm">{scope === "audio.listen" ? "系统声音 (audio.listen)" : scope}</span>
             </label>
           ))}
         </div>

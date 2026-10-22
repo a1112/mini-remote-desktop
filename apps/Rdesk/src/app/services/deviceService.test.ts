@@ -2,10 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockIpcRegisterDevice = vi.hoisted(() => vi.fn());
 const mockRegisterDevice = vi.hoisted(() => vi.fn());
+const mockHardware = vi.hoisted(() => vi.fn());
+const mockRuntime = vi.hoisted(() => vi.fn());
 
 vi.mock("../adapters/tauri", () => ({
   ipcRegisterDevice: mockIpcRegisterDevice,
   registerDevice: mockRegisterDevice,
+  getHardwareInfo: mockHardware,
+  ipcRuntimeSnapshot: mockRuntime,
 }));
 
 vi.mock("../utils/runtime", () => ({
@@ -34,6 +38,10 @@ describe("deviceService", () => {
     mockIpcRegisterDevice.mockReset();
     mockIpcRegisterDevice.mockResolvedValue({ ok: true, value: "registered" });
     mockRegisterDevice.mockReset();
+    mockHardware.mockReset();
+    mockRuntime.mockReset();
+    mockHardware.mockResolvedValue({ ok: true, value: hardwareInfo });
+    mockRuntime.mockResolvedValue({ ok: true, value: { device_id: "lan-persistent-key", is_registered: true, sessions: [] } });
     (deviceService as any).deviceInfo = null;
     (deviceService as any).initPromise = null;
     (window as any).__TAURI__ = {
@@ -116,14 +124,14 @@ describe("deviceService", () => {
   });
 
   it("waits for pending LAN initialization before persisting a server enrollment", async () => {
-    let resolveHardware!: (value: typeof hardwareInfo) => void;
-    (window.__TAURI__!.invoke as any).mockImplementationOnce(() => new Promise((resolve) => { resolveHardware = resolve; }));
+    let resolveHardware!: (value: { ok: true; value: typeof hardwareInfo }) => void;
+    mockHardware.mockImplementationOnce(() => new Promise((resolve) => { resolveHardware = resolve; }));
     mockRegisterDevice.mockResolvedValue({ ok: true, value: serverInfo });
     const initializing = deviceService.initialize();
     const enrolling = deviceService.enroll("a".repeat(43));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mockRegisterDevice).not.toHaveBeenCalled();
-    resolveHardware(hardwareInfo);
+    resolveHardware({ ok: true, value: hardwareInfo });
     await Promise.all([initializing, enrolling]);
     expect(deviceService.getDeviceId()).toBe(serverInfo.device_id);
     expect(JSON.parse(localStorage.getItem("rdesk_device_info")!).access_token).toBe(serverInfo.access_token);
@@ -184,9 +192,39 @@ describe("deviceService", () => {
   });
 
   it("does not create a device identity when hardware information is unavailable", async () => {
-    delete (window as any).__TAURI__;
+    mockHardware.mockResolvedValue({ ok: false, error: { message: "hardware unavailable" } });
     const info = await deviceService.initialize();
     expect(info).toBeNull();
+    expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
+  it("uses the Mac service identity without Tauri v1 globals or a hostname-derived duplicate ID", async () => {
+    delete (window as any).__TAURI__;
+    mockHardware.mockResolvedValue({ ok: true, value: { ...hardwareInfo, os_type: "macos", hostname: "Same Mac Name" } });
+    expect((await deviceService.initialize())?.device_id).toBe("lan-persistent-key");
+    expect(mockIpcRegisterDevice).toHaveBeenCalledWith("lan-persistent-key", "Same Mac Name");
+  });
+  it("waits for the Mac service instead of persisting a fabricated fallback identity", async () => {
+    mockHardware.mockResolvedValue({ ok: true, value: { ...hardwareInfo, os_type: "macos" } });
+    mockRuntime.mockResolvedValue({ ok: false, error: { message: "service starting" } });
+    expect(await deviceService.initialize()).toBeNull();
+    expect(localStorage.getItem("rdesk_device_info")).toBeNull();
+  });
+  it("preserves a server-assigned Mac identity instead of replacing it with the LAN service identity", async () => {
+    mockHardware.mockResolvedValue({ ok: true, value: { ...hardwareInfo, os_type: "macos" } });
+    localStorage.setItem("rdesk_device_info", JSON.stringify(serverInfo));
+    mockRegisterDevice.mockResolvedValue({ ok: false, error: { message: "server offline" } });
+
+    expect(await deviceService.initialize()).toEqual(serverInfo);
+    expect(mockRuntime).not.toHaveBeenCalled();
+    expect(JSON.parse(localStorage.getItem("rdesk_device_info")!)).toEqual(serverInfo);
+  });
+  it("requires server enrollment on Mac before using its LAN identity", async () => {
+    mockHardware.mockResolvedValue({ ok: true, value: { ...hardwareInfo, os_type: "macos" } });
+    vi.spyOn(deviceService as any, "shouldUseServerRegistration").mockReturnValue(true);
+
+    expect(await deviceService.initialize()).toBeNull();
+    expect(mockRuntime).not.toHaveBeenCalled();
+    expect(mockIpcRegisterDevice).not.toHaveBeenCalled();
     expect(localStorage.getItem("rdesk_device_info")).toBeNull();
   });
 });

@@ -467,6 +467,9 @@ pub(super) async fn process_authenticated_control_input_datagram(
 
     // Keep the authorization gate held through the final injection call. Trust,
     // policy, revocation, and terminal-route transitions use the same gate.
+    let mapped =
+        crate::control_input::map_session_pointer(app_state, &authorization.session_id, &event)
+            .await;
     let control_input_registry = app_state.control_input();
     let mut control_input = control_input_registry.lock().await;
     let injection_at_ms = super::now_ms();
@@ -529,11 +532,13 @@ pub(super) async fn process_authenticated_control_input_datagram(
         socket.send_to(&ack, addr).await?;
         return Ok(());
     }
-    let injection = control_input.handle_authenticated_session_event(
-        &authorization.session_id,
-        service_control_scope(envelope.payload.scope),
-        &event,
-    );
+    let injection = mapped.and_then(|event| {
+        control_input.handle_authenticated_session_event(
+            &authorization.session_id,
+            service_control_scope(envelope.payload.scope),
+            &event,
+        )
+    });
     drop(control_input);
     let (ack_result, failure) = match injection {
         Ok(result) => (Ok((lane, result.event_count)), None),

@@ -11,6 +11,8 @@ This repository now uses a product-oriented mainline layout.
 Current mainline roots:
 
 - `apps/Rdesk`
+- `apps/Rdesk-iOS` — [iPhone / iPad 原生运行版](apps/Rdesk-iOS/README.md)
+- `apps/Rdesk-Mobile` — [Android 移动版](apps/Rdesk-Mobile/README.md)
 - `apps/Rdesk-Server`
 - `apps/realtime-server`
 - `crates/*`

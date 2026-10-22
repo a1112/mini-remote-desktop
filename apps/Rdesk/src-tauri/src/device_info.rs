@@ -116,7 +116,7 @@ fn rand_seed() -> u32 {
 fn get_hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "Unknown".to_string())
+        .unwrap_or_else(|_| sysinfo::System::host_name().unwrap_or_else(|| "Unknown".to_string()))
 }
 
 /// 获取操作系统版本

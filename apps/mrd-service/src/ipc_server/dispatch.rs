@@ -606,6 +606,12 @@ impl IpcServer {
                 control::set_transport_policy(session_id, policy)
             }
 
+            IpcRequest::GetSessionAudio { session_id } => {
+                crate::session_audio::snapshot(&self.app_state, session_id, None).await
+            }
+            IpcRequest::SetSessionAudioMuted { session_id, muted } => {
+                crate::session_audio::snapshot(&self.app_state, session_id, Some(muted)).await
+            }
             IpcRequest::GetControlChannelSnapshot { session_id } => {
                 control::control_channel_snapshot(&self.app_state, session_id).await
             }

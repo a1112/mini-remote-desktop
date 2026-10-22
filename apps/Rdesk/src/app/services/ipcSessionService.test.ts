@@ -3,11 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const adapter = vi.hoisted(() => ({
   requestRemoteSession: vi.fn(),
   startSession: vi.fn(),
+  lanDiscovery: vi.fn(),
 }));
 
 vi.mock("../adapters/tauri", () => ({
   ipcRequestRemoteSession: adapter.requestRemoteSession,
   ipcStartSession: adapter.startSession,
+  ipcLanDiscoverySnapshot: adapter.lanDiscovery,
 }));
 
 import {
@@ -40,6 +42,7 @@ describe("startLocalTestSession", () => {
 describe("requestRemoteSession", () => {
   beforeEach(() => {
     adapter.requestRemoteSession.mockReset();
+    adapter.lanDiscovery.mockResolvedValue({ ok: true, value: { peers: [] } });
     adapter.requestRemoteSession.mockResolvedValue({
       ok: true,
       value: {
@@ -105,6 +108,14 @@ describe("requestRemoteSession", () => {
       requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
       requested_profile: null,
     });
+  });
+
+  it("requests separately consented audio only from a LAN peer advertising system audio", async () => {
+    adapter.lanDiscovery.mockResolvedValue({ ok: true, value: { peers: [{ device_id: "target-1", media_capabilities: ["audio.system.pcm16.v1"] }] } });
+    await requestRemoteSession("session-1", "target-1", "quic");
+    expect(adapter.requestRemoteSession).toHaveBeenCalledWith(expect.objectContaining({
+      requested_scopes: ["screen.view", "input.pointer", "input.keyboard", "audio.listen"],
+    }));
   });
 
   it("allows an explicitly selected WAN relay route without LAN QUIC", async () => {

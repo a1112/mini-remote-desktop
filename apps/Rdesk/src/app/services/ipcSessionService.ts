@@ -203,12 +203,23 @@ export const requestRemoteSession = async (
       "E_SECURE_LAN_TRANSPORT"
     );
   }
+  let requestAudio = false;
+  if (transportKind === "quic" && routePreference !== "wan_relay") {
+    try {
+      const discovery = await tauriAdapter.ipcLanDiscoverySnapshot();
+      requestAudio = discovery.ok && discovery.value.peers.some((peer) =>
+        peer.device_id === targetDeviceId && (peer.media_capabilities?.includes("audio.system.pcm16.v1") ?? false)
+      );
+    } catch {
+      // Optional audio discovery cannot prevent an otherwise valid session.
+    }
+  }
   const result = await tauriAdapter.ipcRequestRemoteSession({
     session_id: sessionId,
     target_device_id: targetDeviceId,
     access_mode: "attended",
     route_preference: routePreference,
-    requested_scopes: ["screen.view", "input.pointer", "input.keyboard"],
+    requested_scopes: ["screen.view", "input.pointer", "input.keyboard", ...(requestAudio ? ["audio.listen" as const] : [])],
     requested_profile: requestedProfile ?? null,
   });
   const snapshot = unwrapAdapterResult(result);

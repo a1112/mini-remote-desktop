@@ -1017,6 +1017,21 @@ mod wire {
         pub realtime: ControlChannelLaneSnapshot,
     }
 
+    /// System-audio state owned by the local service, not inferred by the UI.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct SessionAudioSnapshot {
+        pub session_id: SessionId,
+        pub status: String,
+        pub muted: bool,
+        pub packets: u64,
+        pub dropped_packets: u64,
+        pub buffered_frames: usize,
+        pub underrun_packets: u64,
+        pub sample_rate: u32,
+        pub channels: u16,
+        pub last_error: Option<String>,
+    }
+
     /// Mouse button carried by a service-owned control input request.
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
@@ -2178,6 +2193,10 @@ mod wire {
             policy: TransportPolicyConfig,
         },
         /// Get control channel lane state for a session.
+        /// Query service-owned system audio state.
+        GetSessionAudio { session_id: SessionId },
+        /// Mute receiver playback without changing the remote authorization grant.
+        SetSessionAudioMuted { session_id: SessionId, muted: bool },
         GetControlChannelSnapshot {
             /// Target session id.
             session_id: SessionId,
@@ -2262,11 +2281,15 @@ mod wire {
         /// Return whether this request belongs to the secure remote-session contract.
         ///
         /// Shell passthroughs use this exact allowlist to avoid exposing unrelated
-        /// filesystem, lifecycle, control, or test-only service operations.
+        /// filesystem, lifecycle, or test-only service operations. Input and audio
+        /// remain subject to the service's active session grants.
         pub fn is_secure_remote(&self) -> bool {
             matches!(
                 self,
                 Self::GetRemoteSession { .. }
+                    | Self::SendControlInput { .. }
+                    | Self::GetSessionAudio { .. }
+                    | Self::SetSessionAudioMuted { .. }
                     | Self::RequestRemoteSession { .. }
                     | Self::RespondToConsent { .. }
                     | Self::EnableUnattendedAccess { .. }
@@ -2463,7 +2486,8 @@ mod wire {
             /// Service-owned policy decision snapshot.
             snapshot: TransportPolicySnapshot,
         },
-        /// Control channel lane snapshot.
+        /// Authorization-bound system audio status.
+        SessionAudioSnapshot { snapshot: SessionAudioSnapshot },
         ControlChannelSnapshot {
             /// Reliable/realtime lane snapshot.
             snapshot: ControlChannelSnapshot,

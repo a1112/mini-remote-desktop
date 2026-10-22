@@ -2,6 +2,28 @@ use super::*;
 #[cfg(target_os = "macos")]
 use std::thread;
 
+#[tokio::test]
+async fn discovery_keeps_service_available_when_initial_probe_is_denied() {
+    let config = LanDiscoveryConfig {
+        discovery_port: 0,
+        broadcast_enabled: false,
+        probe_endpoints: vec!["255.255.255.255:21116".parse().unwrap()],
+        ..LanDiscoveryConfig::default()
+    };
+    let state = Arc::new(AppState::with_tray_and_lan_discovery_config(
+        crate::shell::default_tray(),
+        config,
+    ));
+    let denied_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert!(send_probe(&denied_socket, 0, &state.lan_discovery)
+        .await
+        .is_err());
+    start_lan_discovery(state.clone()).await.unwrap();
+    let snapshot = state.lan_discovery.snapshot().await;
+    assert!(snapshot.running);
+    assert!(snapshot.last_probe_ms.is_none());
+}
+
 async fn install_test_screen_view_grant(
     app_state: &Arc<AppState>,
     session_id: &SessionId,

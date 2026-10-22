@@ -1254,7 +1254,11 @@ pub async fn start_lan_discovery(app_state: Arc<AppState>) -> Result<()> {
         announce_loop(announce_socket, announce_state).await;
     });
 
-    send_probe(&socket, port, &app_state.lan_discovery).await?;
+    // A first-launch macOS local-network prompt or an offline interface must not
+    // take down IPC and the whole service. The announce loop already retries.
+    if let Err(error) = send_probe(&socket, port, &app_state.lan_discovery).await {
+        tracing::warn!(%error, "initial LAN probe failed; discovery will retry, check local network permission and connectivity");
+    }
     Ok(())
 }
 
@@ -3399,6 +3403,8 @@ fn lan_authorization_capabilities_with_input_control(
     input_control_available: bool,
 ) -> Vec<RemotePermissionScope> {
     let mut capabilities = vec![RemotePermissionScope::ScreenView];
+    #[cfg(target_os = "macos")]
+    capabilities.push(RemotePermissionScope::AudioListen);
     if input_control_available {
         capabilities.extend([
             RemotePermissionScope::InputPointer,
@@ -4719,6 +4725,7 @@ async fn release_control_state_for_session(app_state: &Arc<AppState>, session_id
 }
 
 async fn cleanup_lan_media_resources(app_state: &Arc<AppState>, session_id: &SessionId) {
+    app_state.session_audio.lock().await.remove(session_id);
     app_state.remove_agent_render_route(session_id).await;
     app_state.media_profiles.lock().await.remove(session_id);
     app_state.capture_sources.lock().await.remove(session_id);
@@ -4942,6 +4949,11 @@ async fn send_quic_media_loop(
     endpoint: QuinnDatagramEndpoint,
     session_id: SessionId,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let _audio_sender =
+        crate::session_audio::spawn_sender(app_state.clone(), session_id.clone(), endpoint.clone())
+            .await
+            .map(AbortOnDrop);
     let negotiated_max_datagram_size = endpoint
         .max_datagram_size()
         .unwrap_or(LAN_QUIC_FALLBACK_DATAGRAM_BYTES)
@@ -6468,6 +6480,14 @@ async fn receive_quic_media_loop(
     session_id: SessionId,
     endpoint: QuinnDatagramEndpoint,
 ) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let audio_receiver =
+        crate::session_audio::spawn_receiver(app_state.clone(), session_id.clone()).await;
+    #[cfg(target_os = "macos")]
+    let (audio_tx, _audio_receiver) = match audio_receiver {
+        Some((tx, task)) => (Some(tx), Some(AbortOnDrop(task))),
+        None => (None, None),
+    };
     let mut reassembler = QuicAuReassembler::new(lan_media_reassembler_config())
         .with_max_frame_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES)
         .with_max_total_bytes(LAN_QUIC_RELIABLE_MEDIA_MAX_BYTES * 4);
@@ -6802,6 +6822,13 @@ async fn receive_quic_media_loop(
         let reassembled_frame = match receiver_input {
             LanReceiverInput::Frame(frame) => Some(frame),
             LanReceiverInput::Datagram(media_message) => {
+                if mrd_audio::AudioPacket::is_audio(&media_message) {
+                    #[cfg(target_os = "macos")]
+                    if let Some(tx) = &audio_tx {
+                        let _ = tx.try_send(media_message);
+                    }
+                    continue;
+                }
                 match decode_lan_sender_stats_datagram(&media_message) {
                     Ok(Some(stats)) => {
                         let mut pipelines = app_state.media_pipelines.lock().await;

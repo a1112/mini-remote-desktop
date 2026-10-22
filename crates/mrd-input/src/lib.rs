@@ -3,6 +3,9 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windows;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputButton {
     Left,

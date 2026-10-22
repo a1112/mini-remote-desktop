@@ -683,6 +683,31 @@ impl SessionAuthorizationRegistry {
         allowed
     }
 
+    pub(crate) async fn audio_binding(&self, session_id: &SessionId) -> Option<([u8; 16], u64)> {
+        let mut inner = self.inner.lock().await;
+        let now = unix_time_ms();
+        expire_grant_locked(&mut inner, session_id, now);
+        let record = inner.records.get(session_id)?;
+        let grant = record.grant.as_ref()?;
+        if record.snapshot.authorization_state != RemoteAuthorizationState::Granted
+            || now < grant.issued_at_ms
+            || now > grant.expires_at_ms
+            || !grant
+                .granted_scopes
+                .contains(&RemotePermissionScope::AudioListen)
+        {
+            return None;
+        }
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"MRD_SYSTEM_AUDIO_V1\0");
+        hash.update(&parse_sha256_identifier(&grant.grant_id)?);
+        hash.update(session_id.0.as_bytes());
+        Some((
+            hash.finish().as_ref()[..16].try_into().ok()?,
+            grant.expires_at_ms,
+        ))
+    }
+
     pub(crate) async fn acquire_scope_lease(
         &self,
         session_id: &SessionId,

@@ -97,8 +97,13 @@ pub fn apply_control_input_capability_status(
         .iter_mut()
         .find(|item| item.id == "control.keyboard_mouse")
     {
-        item.status = CapabilityStatus::Unsupported;
-        item.reason = Some("Input injector is unavailable on this host.".to_string());
+        if cfg!(target_os = "macos") && item.platform == CapabilityPlatform::Macos {
+            item.status = CapabilityStatus::PermissionMissing;
+            item.reason = Some("Enable Accessibility for Rdesk Service in System Settings, then restart the service.".to_string());
+        } else {
+            item.status = CapabilityStatus::Unsupported;
+            item.reason = Some("Input injector is unavailable on this host.".to_string());
+        }
     }
 }
 
@@ -358,7 +363,7 @@ fn local_capabilities(
     add_render_capabilities(&mut items, &platform, probe_mode);
     add_memory_capabilities(&mut items, &platform, probe_mode);
     add_transport_capabilities(&mut items, &platform);
-    add_control_capabilities(&mut items, &platform);
+    add_control_capabilities(&mut items, &platform, probe_mode);
     add_audio_capabilities(&mut items, &platform);
     add_service_capabilities(&mut items, &platform, probe_mode);
     add_security_capabilities(&mut items, &platform);
@@ -1743,7 +1748,39 @@ fn add_transport_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabi
     }
 }
 
-fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+fn add_control_capabilities(
+    items: &mut Vec<CapabilityItem>,
+    platform: &CapabilityPlatform,
+    probe_mode: CapabilityProbeMode,
+) {
+    #[cfg(target_os = "macos")]
+    if matches!(platform, CapabilityPlatform::Macos) {
+        let (status, reason) = match probe_mode {
+            CapabilityProbeMode::Static => (
+                CapabilityStatus::Supported,
+                "CoreGraphics input requires Accessibility permission for Rdesk Service.",
+            ),
+            CapabilityProbeMode::Runtime if mrd_input::macos::can_post_events() => (
+                CapabilityStatus::Available,
+                "CoreGraphics input posting permission is granted.",
+            ),
+            CapabilityProbeMode::Runtime => (
+                CapabilityStatus::PermissionMissing,
+                "Enable Accessibility for Rdesk Service in System Settings.",
+            ),
+        };
+        push_item(
+            items,
+            platform,
+            CapabilityDomain::Control,
+            "control.keyboard_mouse",
+            "Keyboard and mouse control",
+            status,
+            Some(reason),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = probe_mode;
     if matches!(platform, CapabilityPlatform::Windows) {
         push_available(
             items,
@@ -1752,7 +1789,7 @@ fn add_control_capabilities(items: &mut Vec<CapabilityItem>, platform: &Capabili
             "control.keyboard_mouse",
             "Keyboard and mouse control",
         );
-    } else {
+    } else if !matches!(platform, CapabilityPlatform::Macos) || !cfg!(target_os = "macos") {
         push_item(
             items,
             platform,
@@ -1789,6 +1826,11 @@ where
 }
 
 fn add_audio_capabilities(items: &mut Vec<CapabilityItem>, platform: &CapabilityPlatform) {
+    if matches!(platform, CapabilityPlatform::Macos) {
+        push_supported(items, platform, CapabilityDomain::Audio, "audio.system", "System audio",
+            "ScreenCaptureKit system capture and 48 kHz stereo playback over authorized LAN QUIC; runtime state and permission failures are reported per session.");
+        return;
+    }
     push_item(
         items,
         platform,
@@ -2829,6 +2871,20 @@ mod tests {
 
         assert_eq!(encode.status, CapabilityStatus::Unimplemented);
         assert_eq!(decode.status, CapabilityStatus::Unimplemented);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_runtime_input_denial_reports_permission_instead_of_unsupported() {
+        let mut snapshot = local_capability_snapshot_static();
+        apply_control_input_capability_status(&mut snapshot, false);
+        let control = snapshot
+            .capabilities
+            .iter()
+            .find(|item| item.id == "control.keyboard_mouse")
+            .unwrap();
+        assert_eq!(control.status, CapabilityStatus::PermissionMissing);
+        assert!(control.reason.as_deref().unwrap().contains("Accessibility"));
     }
 
     #[test]

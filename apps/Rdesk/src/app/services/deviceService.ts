@@ -8,27 +8,8 @@
  */
 
 import { useEffect, useState } from "react";
-import { ipcRegisterDevice, registerDevice as registerDeviceCommand } from "../adapters/tauri";
+import { getHardwareInfo, ipcRegisterDevice, ipcRuntimeSnapshot, registerDevice as registerDeviceCommand, type HardwareInfo } from "../adapters/tauri";
 import { isTauriRuntime } from "../utils/runtime";
-
-interface HardwareInfo {
-  motherboard_serial: string;
-  hostname: string;
-  os_type: string;
-  os_version: string;
-  cpu_info: {
-    name: string;
-    vendor_id: string;
-    cores: number;
-    max_frequency_mhz?: number;
-  };
-  total_memory_mb: number;
-  gpu_info: Array<{
-    name: string;
-    vendor: string;
-    memory_mb?: number;
-  }>;
-}
 
 interface DeviceRegistrationResponse {
   device_id: string;
@@ -107,13 +88,30 @@ class DeviceRegistrationService {
       return null;
     }
     try {
+      const hardwareInfo = await this.getHardwareInfo();
+      if (hardwareInfo.os_type === "macos") {
+        const runtime = await ipcRuntimeSnapshot();
+        if (!runtime.ok || !runtime.value.device_id) return null;
+        const id = runtime.value.device_id;
+        const info: StoredDeviceInfo = {
+          device_id: id,
+          device_name: stored?.device_id === id && !this.shouldReplaceStoredLocalDeviceName(stored.device_name)
+            ? stored.device_name : hardwareInfo.hostname,
+          access_token: LOCAL_ACCESS_TOKEN,
+          motherboard_serial: id,
+          registered_at: stored?.device_id === id ? stored.registered_at : new Date().toISOString(),
+        };
+        this.saveDeviceInfo(info);
+        this.deviceInfo = info;
+        void this.syncWithLocalService(info);
+        return info;
+      }
       if (stored) {
         const refreshed = await this.refreshStoredLocalDeviceInfo(stored);
         this.deviceInfo = refreshed;
         void this.syncWithLocalService(refreshed);
         return refreshed;
       }
-      const hardwareInfo = await this.getHardwareInfo();
       return this.saveLocalDeviceInfo(hardwareInfo);
     } catch {
       this.registrationError = "无法读取设备硬件信息，请在桌面客户端重试";
@@ -220,12 +218,9 @@ class DeviceRegistrationService {
    * 获取硬件信息（通过 Tauri）
    */
   private async getHardwareInfo(): Promise<HardwareInfo> {
-    // 检查 Tauri 环境是否可用
-    const tauri = typeof window !== "undefined" ? window.__TAURI__ : undefined;
-    const isTauriAvailable = typeof tauri?.invoke === "function";
-
-    if (!isTauriAvailable) throw new Error("仅桌面客户端可以读取设备硬件信息");
-    return tauri.invoke<HardwareInfo>("get_hardware_info");
+    const result = await getHardwareInfo();
+    if (!result.ok) throw new Error(result.error.message);
+    return result.value;
   }
 
   /**
@@ -512,10 +507,19 @@ export function useDeviceRegistration() {
   };
 
   useEffect(() => {
-    deviceService.initialize().then((info) => {
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    async function initialize() {
+      const info = await deviceService.initialize().catch(() => null);
+      if (cancelled) return;
       updateInfo(info);
       setIsLoading(false);
-    });
+      if (!info && isTauriRuntime() && !deviceService.getRegistrationError()) {
+        retry = setTimeout(() => void initialize(), 1500);
+      }
+    }
+    void initialize();
+    return () => { cancelled = true; if (retry !== undefined) clearTimeout(retry); };
   }, []);
 
   return {

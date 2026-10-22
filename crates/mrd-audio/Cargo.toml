@@ -1,0 +1,13 @@
+[package]
+name = "mrd-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = "1.5.4"
+cpal = "0.15.3"
+

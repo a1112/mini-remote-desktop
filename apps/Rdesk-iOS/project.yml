@@ -1,0 +1,49 @@
+name: RdeskMobile
+options:
+  bundleIdPrefix: com.a1112
+  deploymentTarget:
+    iOS: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.1"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    TARGETED_DEVICE_FAMILY: "1,2"
+targets:
+  RdeskMobile:
+    type: application
+    platform: iOS
+    sources: [Sources, Resources]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.a1112.rdeskmobile
+        INFOPLIST_FILE: Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: true
+  RdeskMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: RdeskMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+  RdeskMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: RdeskMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+schemes:
+  RdeskMobile:
+    build:
+      targets:
+        RdeskMobile: all
+    test:
+      targets: [RdeskMobileTests, RdeskMobileUITests]
+      gatherCoverageData: true

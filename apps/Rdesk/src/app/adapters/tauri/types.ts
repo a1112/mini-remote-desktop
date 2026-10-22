@@ -1714,3 +1714,15 @@ export interface TauriError {
 export type AdapterResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: TauriError };
+export interface SessionAudioSnapshot {
+  session_id: string;
+  status: string;
+  muted: boolean;
+  packets: number;
+  dropped_packets: number;
+  buffered_frames: number;
+  underrun_packets: number;
+  sample_rate: number;
+  channels: number;
+  last_error: string | null;
+}

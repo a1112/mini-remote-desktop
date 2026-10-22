@@ -179,9 +179,27 @@ impl IpcServer {
 
     /// Bind a custom Unix domain socket endpoint.
     pub async fn bind_with_endpoint(endpoint: IpcEndpoint) -> Result<Self> {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
         let socket_path = endpoint.socket_path();
-        let _ = std::fs::remove_file(socket_path);
+        match std::fs::symlink_metadata(socket_path) {
+            Ok(metadata) => {
+                anyhow::ensure!(
+                    metadata.file_type().is_socket(),
+                    "IPC path is not a socket: {socket_path}"
+                );
+                match UnixStream::connect(socket_path).await {
+                    Ok(_) => anyhow::bail!("IPC endpoint is already in use: {socket_path}"),
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(socket_path)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let listener = UnixListener::bind(socket_path)?;
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
         Ok(Self {
             listener,
             management_socket: None,
@@ -504,10 +522,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn unix_socket_ipc_roundtrip() -> Result<()> {
-        use tokio::time::{sleep, Duration};
-
-        let server_handle = tokio::spawn(async {
-            let server = IpcServer::bind().await?;
+        let path = test_socket_path("roundtrip");
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        let server = IpcServer::bind_with_endpoint(endpoint.clone()).await?;
+        let server_handle = tokio::spawn(async move {
             let mut stream = server.accept().await?;
 
             let request = stream.recv_request().await?;
@@ -518,14 +536,53 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         });
 
-        sleep(Duration::from_millis(100)).await;
-
-        let mut stream = IpcClient::connect().await?;
+        let mut stream = IpcClient::connect_with_endpoint(&endpoint).await?;
         stream.send_request(&IpcRequest::ListDevices).await?;
         let response = stream.recv_response().await?;
         assert!(matches!(response, IpcResponse::DeviceList { .. }));
 
         server_handle.await??;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn test_socket_path(name: &str) -> String {
+        format!(
+            "/tmp/mrd-ipc-{name}-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unix_endpoint_preserves_active_listeners_and_non_socket_files() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = test_socket_path("ownership");
+        let endpoint = IpcEndpoint::unix_socket(&path);
+        std::fs::write(&path, b"keep")?;
+        assert!(IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path)?, b"keep");
+        std::fs::remove_file(&path)?;
+        let server = IpcServer::bind_with_endpoint(endpoint.clone()).await?;
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(IpcServer::bind_with_endpoint(endpoint.clone())
+            .await
+            .is_err());
+        assert!(IpcClient::connect_with_endpoint(&endpoint).await.is_ok());
+        drop(server);
+        let recovered = IpcServer::bind_with_endpoint(endpoint).await?;
+        drop(recovered);
+        std::fs::remove_file(path)?;
         Ok(())
     }
 

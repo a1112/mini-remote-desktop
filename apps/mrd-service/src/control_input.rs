@@ -13,7 +13,6 @@ pub struct ControlInputResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub struct ControlInputTargetGeometry {
     pub frame_width: u32,
     pub frame_height: u32,
@@ -62,7 +61,11 @@ impl ControlInputRegistry {
         let injector: Box<dyn InputInjector> =
             Box::new(mrd_input::windows::WindowsSendInputInjector::new());
 
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        let injector: Box<dyn InputInjector> =
+            Box::new(mrd_input::macos::MacosInputInjector::new());
+
+        #[cfg(not(any(windows, target_os = "macos")))]
         let injector: Box<dyn InputInjector> = Box::new(mrd_input::UnsupportedInputInjector::new(
             "input injection is not implemented for this platform",
         ));
@@ -493,7 +496,6 @@ fn lane_snapshot(
     }
 }
 
-#[cfg(test)]
 pub fn map_control_input_event_for_target_geometry(
     event: &ControlInputEvent,
     geometry: Option<ControlInputTargetGeometry>,
@@ -521,7 +523,6 @@ pub fn map_control_input_event_for_target_geometry(
     }
 }
 
-#[cfg(test)]
 fn scale_target_coordinate(
     coordinate: i32,
     frame_extent: u32,
@@ -535,6 +536,37 @@ fn scale_target_coordinate(
     let max_source = i64::from(source_extent.saturating_sub(1));
     let bounded = scaled.clamp(0, max_source) + i64::from(origin);
     bounded.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+pub(crate) async fn map_session_pointer(
+    state: &crate::AppState,
+    session: &SessionId,
+    event: &ControlInputEvent,
+) -> Result<ControlInputEvent, InputError> {
+    #[cfg(target_os = "macos")]
+    if matches!(event, ControlInputEvent::MouseMove { .. }) {
+        let profile = state.media_profiles.lock().await.get(session);
+        if let Some(profile) = profile {
+            let source = state.capture_sources.lock().await.get(session);
+            let bounds = mrd_input::macos::capture_bounds(
+                source.as_ref().map(|source| source.source.id.as_str()),
+            )?;
+            return Ok(map_control_input_event_for_target_geometry(
+                event,
+                Some(ControlInputTargetGeometry {
+                    frame_width: profile.selected.width,
+                    frame_height: profile.selected.height,
+                    source_width: bounds.size.width.round() as u32,
+                    source_height: bounds.size.height.round() as u32,
+                    origin_x: bounds.origin.x.round() as i32,
+                    origin_y: bounds.origin.y.round() as i32,
+                }),
+            ));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (state, session);
+    Ok(event.clone())
 }
 
 fn input_event_from_ipc(event: &ControlInputEvent) -> Result<InputEvent, InputError> {

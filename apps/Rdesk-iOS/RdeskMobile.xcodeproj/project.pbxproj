@@ -1,0 +1,537 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		09CCCD114F96CBAFDC7090D9 /* GatewayProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 338D40451525E562C3F3C7DB /* GatewayProtocol.swift */; };
+		0D596AA9828DF25D710C1642 /* RemoteSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEBE8218765F23BD1470AE32 /* RemoteSession.swift */; };
+		24F9D7E4E43E8E384A73E007 /* RemoteCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = 707AFEADE083B62D6A5F2D67 /* RemoteCanvas.swift */; };
+		37A8DD9A8A076D06FEC4E4FD /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 3C55C044076F58A34D29264B /* Assets.xcassets */; };
+		4C868B602879918BDB680B8B /* RdeskMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 701C153F716C0B0181610094 /* RdeskMobileApp.swift */; };
+		6F567B6BF350EAFEBCEDBD88 /* GatewayProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 55C4925BDF5211C490F1DF63 /* GatewayProtocolTests.swift */; };
+		7D9A7ECAF401F0B9BE55C4F2 /* RemoteFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4633BAA4B1F102E4A8C5D8A9 /* RemoteFlowTests.swift */; };
+		E96FB8428B6798AD6F09A561 /* LANDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = D559283B08890921F044D7B5 /* LANDiscovery.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		5973D9B32AED8DEDC0DCE735 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = DDED8165A31BAB73FA10C5D9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7032C83584BA0483AED0A8C5;
+			remoteInfo = RdeskMobile;
+		};
+		9AFB2DA8EED3218F7F0A5239 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = DDED8165A31BAB73FA10C5D9 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 7032C83584BA0483AED0A8C5;
+			remoteInfo = RdeskMobile;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		19153DEFECBC99471A1DC3CB /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		338D40451525E562C3F3C7DB /* GatewayProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayProtocol.swift; sourceTree = "<group>"; };
+		3C55C044076F58A34D29264B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		4633BAA4B1F102E4A8C5D8A9 /* RemoteFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteFlowTests.swift; sourceTree = "<group>"; };
+		55C4925BDF5211C490F1DF63 /* GatewayProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GatewayProtocolTests.swift; sourceTree = "<group>"; };
+		701C153F716C0B0181610094 /* RdeskMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RdeskMobileApp.swift; sourceTree = "<group>"; };
+		707AFEADE083B62D6A5F2D67 /* RemoteCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteCanvas.swift; sourceTree = "<group>"; };
+		85FC098A2903AF0FA5A984E6 /* RdeskMobileUITests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = RdeskMobileUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D559283B08890921F044D7B5 /* LANDiscovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANDiscovery.swift; sourceTree = "<group>"; };
+		E9917440BC90356F90FFD82B /* RdeskMobileTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = RdeskMobileTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		EEBE8218765F23BD1470AE32 /* RemoteSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSession.swift; sourceTree = "<group>"; };
+		F7AE2AA01FC399F9C31596CD /* RdeskMobile.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = RdeskMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		32C16EF158908A3F3D882612 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				3C55C044076F58A34D29264B /* Assets.xcassets */,
+				19153DEFECBC99471A1DC3CB /* Info.plist */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		4841C3147A75EC7E9AB338CF /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				55C4925BDF5211C490F1DF63 /* GatewayProtocolTests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		93CD0E2DE291A309AC6F6064 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				338D40451525E562C3F3C7DB /* GatewayProtocol.swift */,
+				D559283B08890921F044D7B5 /* LANDiscovery.swift */,
+				701C153F716C0B0181610094 /* RdeskMobileApp.swift */,
+				707AFEADE083B62D6A5F2D67 /* RemoteCanvas.swift */,
+				EEBE8218765F23BD1470AE32 /* RemoteSession.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		C6CEC2A58AF0ABA511B3B72D /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F7AE2AA01FC399F9C31596CD /* RdeskMobile.app */,
+				E9917440BC90356F90FFD82B /* RdeskMobileTests.xctest */,
+				85FC098A2903AF0FA5A984E6 /* RdeskMobileUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D6082490238A3627FBD2B4BE /* UITests */ = {
+			isa = PBXGroup;
+			children = (
+				4633BAA4B1F102E4A8C5D8A9 /* RemoteFlowTests.swift */,
+			);
+			path = UITests;
+			sourceTree = "<group>";
+		};
+		EAC6EC8F14928538CB5DC36D = {
+			isa = PBXGroup;
+			children = (
+				32C16EF158908A3F3D882612 /* Resources */,
+				93CD0E2DE291A309AC6F6064 /* Sources */,
+				4841C3147A75EC7E9AB338CF /* Tests */,
+				D6082490238A3627FBD2B4BE /* UITests */,
+				C6CEC2A58AF0ABA511B3B72D /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		7032C83584BA0483AED0A8C5 /* RdeskMobile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 84581C38EA0506937FCA8927 /* Build configuration list for PBXNativeTarget "RdeskMobile" */;
+			buildPhases = (
+				129A946AAE0D78156835ABCF /* Sources */,
+				D543C6E8A55F07DB83BCE947 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RdeskMobile;
+			packageProductDependencies = (
+			);
+			productName = RdeskMobile;
+			productReference = F7AE2AA01FC399F9C31596CD /* RdeskMobile.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AD3DC2F9E5AAD54DE608E551 /* RdeskMobileUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 2E355F973D291DC160FFC2BA /* Build configuration list for PBXNativeTarget "RdeskMobileUITests" */;
+			buildPhases = (
+				DE57448FD9A688333F2AC4EE /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				8EFAD4197DA9829B16F2D9A2 /* PBXTargetDependency */,
+			);
+			name = RdeskMobileUITests;
+			packageProductDependencies = (
+			);
+			productName = RdeskMobileUITests;
+			productReference = 85FC098A2903AF0FA5A984E6 /* RdeskMobileUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		C6848921F6D9927FD19697BB /* RdeskMobileTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C45AEA9E72D713F47213226F /* Build configuration list for PBXNativeTarget "RdeskMobileTests" */;
+			buildPhases = (
+				179B3DCD974171D02E5CC11C /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0CDEFBFAB7591326441E9834 /* PBXTargetDependency */,
+			);
+			name = RdeskMobileTests;
+			packageProductDependencies = (
+			);
+			productName = RdeskMobileTests;
+			productReference = E9917440BC90356F90FFD82B /* RdeskMobileTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		DDED8165A31BAB73FA10C5D9 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					7032C83584BA0483AED0A8C5 = {
+						ProvisioningStyle = Automatic;
+					};
+					AD3DC2F9E5AAD54DE608E551 = {
+						ProvisioningStyle = Automatic;
+						TestTargetID = 7032C83584BA0483AED0A8C5;
+					};
+					C6848921F6D9927FD19697BB = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 22E0F1DFBAA5069BD66E1658 /* Build configuration list for PBXProject "RdeskMobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = EAC6EC8F14928538CB5DC36D;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = C6CEC2A58AF0ABA511B3B72D /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				7032C83584BA0483AED0A8C5 /* RdeskMobile */,
+				C6848921F6D9927FD19697BB /* RdeskMobileTests */,
+				AD3DC2F9E5AAD54DE608E551 /* RdeskMobileUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		D543C6E8A55F07DB83BCE947 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				37A8DD9A8A076D06FEC4E4FD /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		129A946AAE0D78156835ABCF /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				09CCCD114F96CBAFDC7090D9 /* GatewayProtocol.swift in Sources */,
+				E96FB8428B6798AD6F09A561 /* LANDiscovery.swift in Sources */,
+				4C868B602879918BDB680B8B /* RdeskMobileApp.swift in Sources */,
+				24F9D7E4E43E8E384A73E007 /* RemoteCanvas.swift in Sources */,
+				0D596AA9828DF25D710C1642 /* RemoteSession.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		179B3DCD974171D02E5CC11C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6F567B6BF350EAFEBCEDBD88 /* GatewayProtocolTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		DE57448FD9A688333F2AC4EE /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7D9A7ECAF401F0B9BE55C4F2 /* RemoteFlowTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0CDEFBFAB7591326441E9834 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7032C83584BA0483AED0A8C5 /* RdeskMobile */;
+			targetProxy = 5973D9B32AED8DEDC0DCE735 /* PBXContainerItemProxy */;
+		};
+		8EFAD4197DA9829B16F2D9A2 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 7032C83584BA0483AED0A8C5 /* RdeskMobile */;
+			targetProxy = 9AFB2DA8EED3218F7F0A5239 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		55279868807E82A8A5697E77 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.RdeskMobileTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RdeskMobile.app/RdeskMobile";
+			};
+			name = Release;
+		};
+		5C33238F7F0FFC1AEE1E63F7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.RdeskMobileUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = RdeskMobile;
+			};
+			name = Debug;
+		};
+		62595A67D9B488DDE0A1F069 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 0.1.1;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		6563ED4995D35A5B8D5DD376 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.RdeskMobileUITests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = RdeskMobile;
+			};
+			name = Release;
+		};
+		945F2453E4F3335E8C2D6EF5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.RdeskMobileTests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RdeskMobile.app/RdeskMobile";
+			};
+			name = Debug;
+		};
+		96A2ACCCDAEAFF850EB5E181 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				INFOPLIST_FILE = Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.rdeskmobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		9767C3582AADB98059E9F7C2 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				INFOPLIST_FILE = Resources/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.a1112.rdeskmobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		E1F1457257895BAC2D77D383 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_STYLE = Automatic;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 0.1.1;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		22E0F1DFBAA5069BD66E1658 /* Build configuration list for PBXProject "RdeskMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				E1F1457257895BAC2D77D383 /* Debug */,
+				62595A67D9B488DDE0A1F069 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		2E355F973D291DC160FFC2BA /* Build configuration list for PBXNativeTarget "RdeskMobileUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				5C33238F7F0FFC1AEE1E63F7 /* Debug */,
+				6563ED4995D35A5B8D5DD376 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		84581C38EA0506937FCA8927 /* Build configuration list for PBXNativeTarget "RdeskMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				96A2ACCCDAEAFF850EB5E181 /* Debug */,
+				9767C3582AADB98059E9F7C2 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C45AEA9E72D713F47213226F /* Build configuration list for PBXNativeTarget "RdeskMobileTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				945F2453E4F3335E8C2D6EF5 /* Debug */,
+				55279868807E82A8A5697E77 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = DDED8165A31BAB73FA10C5D9 /* Project object */;
+}

@@ -89,6 +89,8 @@ pub struct AppState {
     pub capability_snapshot: Arc<Mutex<CapabilitySnapshotRegistry>>,
     /// Service-owned keyboard and mouse injection state.
     pub control_input: Arc<Mutex<ControlInputRegistry>>,
+    /// Authorized system-audio runtime and playback controls, scoped by session.
+    pub session_audio: Arc<Mutex<crate::session_audio::AudioRegistry>>,
     /// Bounded authenticated WAN control sender, replay, and receiver ownership.
     pub(crate) wan_control_inputs:
         Arc<Mutex<crate::wan_session::control_input::WanControlInputRegistry>>,
@@ -510,6 +512,7 @@ impl AppState {
             )),
             capability_snapshot: Arc::new(Mutex::new(CapabilitySnapshotRegistry::default())),
             control_input: Arc::new(Mutex::new(ControlInputRegistry::default())),
+            session_audio: Arc::new(Mutex::new(crate::session_audio::AudioRegistry::default())),
             wan_control_inputs: Arc::new(Mutex::new(
                 crate::wan_session::control_input::WanControlInputRegistry::default(),
             )),

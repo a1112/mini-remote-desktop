@@ -63,3 +63,7 @@ client-qt/venv
 # Track committed Tauri app icons
 !apps/Rdesk/src-tauri/icons/
 !apps/Rdesk/src-tauri/icons/**/*.png
+!apps/Rdesk-iOS/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+
+# Local iOS / service bridge credentials and device identifiers.
+apps/Rdesk/.env.ios.local

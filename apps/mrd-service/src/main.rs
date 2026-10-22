@@ -407,7 +407,16 @@ async fn run_service(
     runtime_error.map_or(Ok(()), Err)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn run_service(
+    _mode: RunMode,
+    _controls: Option<()>,
+    _reporter: StatusReporter,
+) -> Result<()> {
+    mrd_service::macos_runtime::run().await
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn run_service(
     _mode: RunMode,
     _controls: Option<()>,

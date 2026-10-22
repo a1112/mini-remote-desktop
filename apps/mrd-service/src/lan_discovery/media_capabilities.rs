@@ -71,6 +71,7 @@ pub(super) fn lan_media_capabilities_with_input_control(
     #[cfg(target_os = "macos")]
     {
         capabilities.extend(macos_lan_media_capabilities());
+        capabilities.push(crate::session_audio::CAPABILITY.to_string());
     }
     #[cfg(target_os = "linux")]
     {

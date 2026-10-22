@@ -10,6 +10,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import type {
+  SessionAudioSnapshot,
   AdapterResult,
   AutostartStatus,
   ClientDiagnostics,
@@ -950,6 +951,14 @@ export async function ipcSendControlInput(
     }
   });
   return operation;
+}
+
+export async function ipcGetSessionAudio(sessionId: string): Promise<AdapterResult<SessionAudioSnapshot>> {
+  return invokeSecureRemoteContract({ type: 'GetSessionAudio', session_id: sessionId }, 'SessionAudioSnapshot', 'snapshot');
+}
+
+export async function ipcSetSessionAudioMuted(sessionId: string, muted: boolean): Promise<AdapterResult<SessionAudioSnapshot>> {
+  return invokeSecureRemoteContract({ type: 'SetSessionAudioMuted', session_id: sessionId, muted }, 'SessionAudioSnapshot', 'snapshot');
 }
 
 const reliableControlInputTails = new Map<string, Promise<void>>();
