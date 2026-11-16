@@ -5634,12 +5634,31 @@ async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_ch
         pending.probe_evidence_sha256 = Some([0xab; 32]);
         pending.probe_generation = Some(7);
     }
+    // Recover the pending status before and after the accepted metrics heartbeat.
+    backend.status_results.lock().unwrap().extend([
+        Ok(SecretRotationStatus::Pending {
+            active_secret_version: 1,
+        }),
+        Ok(SecretRotationStatus::Pending {
+            active_secret_version: 1,
+        }),
+    ]);
     backend
-        .status_results
+        .heartbeat_results
         .lock()
         .unwrap()
-        .push_back(Ok(SecretRotationStatus::Pending {
-            active_secret_version: 1,
+        .push_back(Ok(NodeDirective {
+            identity_epoch: 1,
+            sequence: 2,
+            state: RelayNodeState::Draining,
+            desired: DesiredNodeState {
+                draining: true,
+                secret_version: 2,
+                not_before_unix_seconds: Some(renewal_due_now),
+                old_credential_deadline_unix_seconds: Some(renewal_due_now),
+                rotation_challenge: Some(ROTATION_CHALLENGE.into()),
+            },
+            secret_update: None,
         }));
     let mut runtime = AgentRuntime::new_with_state_store(
         slot.clone(),
@@ -5683,7 +5702,16 @@ async fn pending_rotation_blocks_identity_renewal_and_reconciles_before_epoch_ch
         Err(RuntimeError::Process(ProcessError::ProbeUnavailable))
     );
     assert!(backend.renewals.lock().unwrap().is_empty());
-    assert_eq!(backend.statuses.lock().unwrap().len(), 1);
+    assert!(backend.commits.lock().unwrap().is_empty());
+    let statuses = backend.statuses.lock().unwrap();
+    assert_eq!(statuses.len(), 2);
+    let heartbeats = backend.heartbeats.lock().unwrap();
+    assert_eq!(heartbeats.len(), 1);
+    assert!(statuses[0].authentication.sequence < heartbeats[0].sequence);
+    assert!(heartbeats[0].sequence < statuses[1].authentication.sequence);
+    let payload = serde_json::from_slice::<HeartbeatPayload>(&heartbeats[0].body).unwrap();
+    assert_eq!(payload.applied_secret_version, 1);
+    assert_eq!(payload.probe_health, RelayHealth::NonEvidence);
     assert_eq!(*coturn.secret_versions.lock().unwrap(), vec![2]);
     assert_eq!(identity.identity_epoch(), 1);
     let state = store.state.lock().unwrap();

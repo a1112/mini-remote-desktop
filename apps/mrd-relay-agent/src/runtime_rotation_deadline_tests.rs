@@ -97,7 +97,15 @@ impl MetricsPort for Metrics {
         if self.0.stopped.load(Ordering::SeqCst) || !self.0.warmed.load(Ordering::SeqCst) {
             return Err(MetricsError::Unavailable);
         }
-        Ok(CoturnMetrics::default())
+        Ok(CoturnMetrics {
+            active_allocations: self
+                .0
+                .active_allocations
+                .load(Ordering::SeqCst)
+                .try_into()
+                .unwrap(),
+            ..CoturnMetrics::default()
+        })
     }
 }
 
@@ -193,6 +201,8 @@ struct Backend {
     uploads: Mutex<Vec<SecretUploadRequest>>,
     upload_error: Mutex<Option<BackendError>>,
     hang_commit: bool,
+    rotation_status: Mutex<SecretRotationStatus>,
+    last_reported_allocations: Mutex<Option<u32>>,
 }
 
 #[async_trait]
@@ -213,6 +223,8 @@ impl RelayBackendPort for Backend {
     }
 
     async fn heartbeat(&self, heartbeat: SignedHeartbeat) -> Result<NodeDirective, BackendError> {
+        let payload = serde_json::from_slice::<HeartbeatPayload>(&heartbeat.body).unwrap();
+        assert!(!heartbeat.signature_b64.is_empty());
         self.heartbeats.lock().unwrap().push(heartbeat);
         if self
             .heartbeat_successes
@@ -224,6 +236,9 @@ impl RelayBackendPort for Backend {
             // Stop the otherwise infinite production loop after observing the
             // next advertised version; this is independent of rotation success.
             return Err(BackendError::ProtocolInvalid);
+        }
+        if let Some(count) = self.last_reported_allocations.lock().unwrap().as_mut() {
+            *count = payload.active_allocations;
         }
         Ok(NodeDirective {
             identity_epoch: 1,
@@ -250,6 +265,14 @@ impl RelayBackendPort for Backend {
 
     async fn commit_secret(&self, request: SecretCommitRequest) -> Result<(), BackendError> {
         self.commits.lock().unwrap().push(request);
+        if self
+            .last_reported_allocations
+            .lock()
+            .unwrap()
+            .is_some_and(|count| count != 0)
+        {
+            return Err(BackendError::Conflict);
+        }
         if self.hang_commit {
             return std::future::pending().await;
         }
@@ -261,9 +284,7 @@ impl RelayBackendPort for Backend {
         request: SecretRotationStatusRequest,
     ) -> Result<SecretRotationStatus, BackendError> {
         self.statuses.lock().unwrap().push(request);
-        Ok(SecretRotationStatus::CommittedExact {
-            active_secret_version: 2,
-        })
+        Ok(*self.rotation_status.lock().unwrap())
     }
 }
 
@@ -357,6 +378,10 @@ impl Fixture {
             uploads: Mutex::default(),
             upload_error: Mutex::default(),
             hang_commit,
+            rotation_status: Mutex::new(SecretRotationStatus::CommittedExact {
+                active_secret_version: 2,
+            }),
+            last_reported_allocations: Mutex::new(None),
         });
         let slot = Arc::new(SwappableRelayBackend::new(backend.clone()));
         let runtime = AgentRuntime::new_with_state_store(
@@ -395,6 +420,15 @@ impl Fixture {
     }
 
     async fn run(&mut self, once: bool) -> Result<(), RuntimeError> {
+        self.run_with_probe_health(once, RelayHealth::NonEvidence)
+            .await
+    }
+
+    async fn run_with_probe_health(
+        &mut self,
+        once: bool,
+        probe_health: RelayHealth,
+    ) -> Result<(), RuntimeError> {
         let mut lifecycle = IdentityLifecycle::new(Duration::from_secs(86_400)).unwrap();
         let factory = Factory(self.backend.clone());
         if once {
@@ -409,7 +443,7 @@ impl Fixture {
                 &self.sampler,
                 ProcessHealth::Healthy,
                 ProcessHealth::Healthy,
-                RelayHealth::NonEvidence,
+                probe_health,
                 HostPressureSnapshot::default(),
                 false,
             )
@@ -822,4 +856,87 @@ async fn pending_rotation_wrong_identity_epoch_is_rejected_before_upload() {
     assert!(fixture.backend.uploads.lock().unwrap().is_empty());
     assert!(fixture.runtime.coturn.applied.lock().unwrap().is_empty());
     assert!(fixture.backend.commits.lock().unwrap().is_empty());
+}
+
+fn pending_rotation_with_stale_server_metrics(heartbeat_successes: usize) -> Fixture {
+    let fixture = Fixture::new(
+        SecretRotationPhase::CommitUnknown,
+        Some(Duration::ZERO),
+        false,
+    );
+    *fixture.backend.rotation_status.lock().unwrap() = SecretRotationStatus::Pending {
+        active_secret_version: 1,
+    };
+    *fixture.backend.last_reported_allocations.lock().unwrap() = Some(2);
+    fixture
+        .backend
+        .heartbeat_successes
+        .store(heartbeat_successes, Ordering::SeqCst);
+    fixture
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_status_refreshes_native_heartbeat_before_retrying_commit() {
+    for once in [false, true] {
+        let mut fixture = pending_rotation_with_stale_server_metrics(1);
+        let original = fixture.store.load().unwrap().pending_rotation.unwrap();
+        let result = fixture
+            .run_with_probe_health(once, RelayHealth::Healthy)
+            .await;
+        assert_eq!(
+            result,
+            if once { Ok(()) } else { Err(RuntimeError::Backend(BackendError::ProtocolInvalid)) },
+            "an accepted native heartbeat must clear the stale server allocation count before commit"
+        );
+        fixture.assert_committed();
+        assert_eq!(
+            fixture.heartbeat_versions(),
+            if once { vec![1] } else { vec![1, 2] }
+        );
+        assert_eq!(
+            *fixture.backend.last_reported_allocations.lock().unwrap(),
+            Some(0)
+        );
+        let hb = &fixture.backend.heartbeats.lock().unwrap()[0];
+        let payload = serde_json::from_slice::<HeartbeatPayload>(&hb.body).unwrap();
+        assert_eq!(payload.active_allocations, 0);
+        assert_eq!(payload.probe_health, RelayHealth::NonEvidence);
+        let statuses = fixture.backend.statuses.lock().unwrap();
+        assert!(!statuses.is_empty());
+        for status in statuses.iter() {
+            assert_eq!(status.identity_epoch, original.identity_epoch);
+            assert_eq!(status.rotation_id, original.rotation_id);
+            assert_eq!(status.secret_version, original.secret_version);
+            assert_eq!(status.rotation_challenge, original.rotation_challenge);
+        }
+        assert!(statuses[0].authentication.sequence < hb.sequence);
+        let commits = fixture.backend.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].rotation_id, original.rotation_id);
+        assert!(commits[0].authentication.sequence > hb.sequence);
+        assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_status_keeps_exact_commit_unknown_when_heartbeat_is_rejected() {
+    for once in [false, true] {
+        let mut fixture = pending_rotation_with_stale_server_metrics(0);
+        let original = fixture.store.load().unwrap().pending_rotation.unwrap();
+        assert_eq!(
+            fixture.run(once).await,
+            Err(RuntimeError::Backend(BackendError::ProtocolInvalid))
+        );
+        assert_eq!(fixture.heartbeat_versions(), vec![1]);
+        assert_eq!(
+            *fixture.backend.last_reported_allocations.lock().unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            fixture.store.load().unwrap().pending_rotation.unwrap(),
+            original
+        );
+        assert_eq!(fixture.runtime.coturn.probes.load(Ordering::SeqCst), 0);
+        assert!(fixture.backend.commits.lock().unwrap().is_empty());
+    }
 }

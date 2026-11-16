@@ -46,6 +46,13 @@ const ALLOCATION_PROOF_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const IDENTITY_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const CERTIFICATE_LIFETIME_RENEWAL_WINDOW_CAP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+#[derive(PartialEq, Eq)]
+enum RotationAdvance {
+    Waiting,
+    Complete,
+    AwaitingHeartbeat,
+}
+
 fn rotation_resume_timeout(reconciliation_required: bool) -> RuntimeError {
     if reconciliation_required {
         RuntimeError::Backend(BackendError::Unavailable)
@@ -718,8 +725,9 @@ where
         runtime.activate_identity_epoch(identity_epoch)?;
     }
     let reconciliation_required = runtime.rotation_requires_reconcile_before_heartbeat();
+    let mut probe_health = probe_health;
     if runtime.has_pending_rotation() {
-        let reconciled = if wait_for_deadline {
+        let advance = if wait_for_deadline {
             runtime
                 .resume_secret_rotation_before_heartbeat(identity)
                 .await?
@@ -731,8 +739,11 @@ where
             .await
             .map_err(|_| rotation_resume_timeout(reconciliation_required))??
         };
-        if reconciliation_required && !reconciled {
+        if reconciliation_required && advance == RotationAdvance::Waiting {
             return Err(RuntimeError::Backend(BackendError::Unavailable));
+        }
+        if advance == RotationAdvance::AwaitingHeartbeat {
+            probe_health = RelayHealth::NonEvidence;
         }
     }
     if wait_for_deadline {
@@ -1026,13 +1037,13 @@ where
 
         let reconciliation_required = runtime.rotation_requires_reconcile_before_heartbeat();
         if runtime.has_pending_rotation() {
-            let reconciled = tokio::time::timeout(
+            let advance = tokio::time::timeout(
                 SECRET_ROTATION_TIMEOUT,
                 runtime.resume_secret_rotation_before_heartbeat(identity),
             )
             .await
             .map_err(|_| rotation_resume_timeout(reconciliation_required))??;
-            if reconciliation_required && !reconciled {
+            if reconciliation_required && advance == RotationAdvance::Waiting {
                 return Err(RuntimeError::Backend(BackendError::Unavailable));
             }
         }
@@ -2672,6 +2683,11 @@ where
                 payload.probe_health = RelayHealth::NonEvidence;
             }
         }
+        if self.rotation_requires_reconcile_before_heartbeat() {
+            // An authenticated Pending status permits a metrics refresh, not
+            // health evidence for a version the control plane has not committed.
+            payload.probe_health = RelayHealth::NonEvidence;
+        }
         let heartbeat = identity.sign_heartbeat(self.clock.unix_seconds(), payload)?;
         // Network latency cannot hold the local supervisor or its safety probe.
         drop(sample_guard);
@@ -2839,7 +2855,7 @@ where
     async fn resume_secret_rotation_before_heartbeat<F: IdentityFsPort>(
         &mut self,
         identity: &mut CertificateState<F>,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<RotationAdvance, RuntimeError> {
         if let Some(pending) = self.pending_rotation.as_ref() {
             if pending.identity_epoch != self.identity_epoch
                 || identity.identity_epoch() != self.identity_epoch
@@ -2871,15 +2887,25 @@ where
                     .map_err(RuntimeError::Backend)?;
             }
         }
-        self.advance_secret_rotation(identity).await
+        self.advance_secret_rotation_inner(identity, true).await
     }
 
     pub async fn advance_secret_rotation<F: IdentityFsPort>(
         &mut self,
         identity: &mut CertificateState<F>,
     ) -> Result<bool, RuntimeError> {
+        self.advance_secret_rotation_inner(identity, false)
+            .await
+            .map(|advance| advance == RotationAdvance::Complete)
+    }
+
+    async fn advance_secret_rotation_inner<F: IdentityFsPort>(
+        &mut self,
+        identity: &mut CertificateState<F>,
+        before_heartbeat: bool,
+    ) -> Result<RotationAdvance, RuntimeError> {
         let Some(mut pending) = self.pending_rotation.clone() else {
-            return Ok(false);
+            return Ok(RotationAdvance::Waiting);
         };
         if pending.identity_epoch != self.identity_epoch
             || identity.identity_epoch() != self.identity_epoch
@@ -2956,6 +2982,12 @@ where
                 SecretRotationStatus::Pending {
                     active_secret_version,
                 } if active_secret_version == self.secret_version => {
+                    if before_heartbeat {
+                        // Keep the exact durable proof until normal signed
+                        // metrics are accepted. A failed/cancelled heartbeat
+                        // must leave the next restart on this same status path.
+                        return Ok(RotationAdvance::AwaitingHeartbeat);
+                    }
                     pending.phase = SecretRotationPhase::Applied;
                     pending.applied_generation = None;
                     pending.probe_evidence_sha256 = None;
@@ -2985,7 +3017,7 @@ where
             self.persist_pending_rotation(pending.clone())?;
         }
         if !safe_window_elapsed(&pending, self.clock.as_ref()) {
-            return Ok(false);
+            return Ok(RotationAdvance::Waiting);
         }
         let mut snapshot = self
             .coturn
@@ -2993,7 +3025,7 @@ where
             .await
             .map_err(RuntimeError::Process)?;
         if snapshot.active_allocations != 0 {
-            return Ok(false);
+            return Ok(RotationAdvance::Waiting);
         }
         if pending.phase == SecretRotationPhase::Probed
             && (pending.applied_generation != Some(snapshot.generation)
@@ -3108,7 +3140,7 @@ where
             pending.probe_evidence_sha256 = None;
             pending.probe_generation = None;
             self.persist_pending_rotation(pending)?;
-            return Ok(false);
+            return Ok(RotationAdvance::Waiting);
         }
         let proof = pending
             .probe_evidence_sha256
@@ -3197,7 +3229,7 @@ where
         &mut self,
         pending: &PendingSecretRotation,
         digest: [u8; 32],
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<RotationAdvance, RuntimeError> {
         let committed = RuntimeStateSnapshot {
             identity_epoch: self.identity_epoch,
             last_directive_sequence: self.last_directive_sequence,
@@ -3216,7 +3248,7 @@ where
         self.secret_digest = committed.secret_digest;
         self.pending_rotation = None;
         self.commit_unknown_loaded_from_store = false;
-        Ok(true)
+        Ok(RotationAdvance::Complete)
     }
 
     fn persist_pending_rotation(
