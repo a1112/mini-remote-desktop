@@ -12,6 +12,7 @@ from app.models.relay_reservation import RelayReservation
 from app.models.relay_access_generation import RelayAccessGeneration
 from app.models.session_request import SessionRequest
 from app.models.user import User
+from app.models.oidc import OidcIdentity, OidcLoginTransaction
 
 __all__ = [
     "User",

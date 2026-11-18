@@ -882,6 +882,7 @@ $secureQualityReport = [pscustomobject]@{
   auditEventIds = @("secure-audit-1")
   controlInputAck = [pscustomobject]@{ session_id = "secure-quality-session"; lane = "reliable"; event_count = 1 }
   firstFrameTimeMs = 100.0
+  firstPresentedFrameTimeMs = 150.0
   maxZeroFrameWindowAfterFirstFrameMs = 0.0
   sampleFramesDecoded = 60
   sampleObservedFps = 60.0
@@ -916,6 +917,11 @@ foreach ($invalidRoute in @("not-quic", "quic_quinn", "proxy/quic")) {
 }
 
 $secureQualityArtifact = Convert-SecureLanReportToQualityArtifact -Report $secureQualityReport -RunId "secure-quality-test"
+Assert-Equal $secureQualityArtifact.present.visible_first_frame_ms 150.0 "Quality artifact uses native presentation time"
+$decodeOnlyReport = $secureQualityReport | ConvertTo-Json -Depth 16 | ConvertFrom-Json
+$decodeOnlyReport.PSObject.Properties.Remove("firstPresentedFrameTimeMs")
+$decodeOnlyArtifact = Convert-SecureLanReportToQualityArtifact -Report $decodeOnlyReport -RunId "secure-decode-only-test"
+Assert-Equal $decodeOnlyArtifact.present.visible_first_frame_ms $null "Decode time cannot substitute for missing presentation evidence"
 Assert-Equal $secureQualityArtifact.side_effects.sender_tasks_started 1 "Positive artifact uses authoritative sender_active"
 Assert-Equal $secureQualityArtifact.side_effects.receiver_tasks_started 1 "Positive artifact uses authoritative receiver_active"
 Assert-Equal $secureQualityArtifact.side_effects.media_packets_sent 10 "Positive artifact uses sender transport packet counters"

@@ -279,6 +279,17 @@ impl IpcClient {
         }
     }
 
+    /// Send a one-shot request with a deadline covering connection, write, and reply.
+    /// Consumes the client so a cancelled exchange cannot leave a partial frame
+    /// or an unread response on a reused connection.
+    pub async fn send_request_with_timeout(
+        mut self,
+        request: IpcRequest,
+        timeout: Duration,
+    ) -> Result<IpcResponse> {
+        tokio::time::timeout(timeout, self.send_request(request)).await?
+    }
+
     /// Send a request with a single attempt (no auto-reconnect on failure)
     pub async fn send_request_no_reconnect(&mut self, request: IpcRequest) -> Result<IpcResponse> {
         if self.stream.is_none() {

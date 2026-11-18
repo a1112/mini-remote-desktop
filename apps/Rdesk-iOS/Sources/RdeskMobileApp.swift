@@ -13,6 +13,9 @@ struct HomeView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var showRemote = false
     @State private var error: String?
+    @State private var certificateFingerprint = ""
+    @State private var pairingToken = ""
+    @State private var gatewayToConfirm: DiscoveredGateway?
     private let accent = Color(red: 0.25, green: 0.42, blue: 0.95)
 
     var body: some View {
@@ -47,6 +50,14 @@ struct HomeView: View {
                                 .textFieldStyle(.roundedBorder).frame(width: 100)
                                 .accessibilityIdentifier("portField")
                         }
+                        TextField("SHA-256 证书指纹", text: $certificateFingerprint)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("fingerprintField")
+                        SecureField("网关配对令牌", text: $pairingToken)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityIdentifier("pairingTokenField")
                         Button { connect() } label: {
                             Label("连接电脑屏幕", systemImage: "arrow.up.right")
                                 .font(.headline).frame(maxWidth: .infinity).padding(.vertical, 7)
@@ -64,11 +75,7 @@ struct HomeView: View {
                             }.accessibilityIdentifier("scanButton")
                         }
                         ForEach(discovery.gateways) { gateway in
-                            Button {
-                                host = gateway.endpoint.host
-                                port = String(gateway.endpoint.port)
-                                connect()
-                            } label: {
+                            Button { gatewayToConfirm = gateway } label: {
                                 HStack {
                                     Image(systemName: "desktopcomputer").font(.title2)
                                     VStack(alignment: .leading, spacing: 4) {
@@ -85,10 +92,8 @@ struct HomeView: View {
 
                     VStack(alignment: .leading, spacing: 12) {
                         Label("开始之前", systemImage: "info.circle").font(.headline)
-                        Text("1. 在 Windows 电脑上启动 Rdesk 移动网关。\n2. 手机和电脑连接同一局域网。\n3. 允许 Rdesk 访问本地网络，然后搜索或输入地址。")
+                        Text("在同一受信局域网中启动 Windows 移动网关。允许本地网络访问，然后搜索电脑或填写地址。核对网关窗口显示的证书指纹，并输入启动网关时设置的配对令牌。")
                             .font(.subheadline).foregroundStyle(.secondary).lineSpacing(6)
-                        Text("当前版本使用 JPEG 画面，支持点击、拖动、滚轮和文字输入。仅在受信局域网使用：网关采用明文连接，无配对密码。")
-                            .font(.footnote).foregroundStyle(.secondary)
                     }.card()
                     Text("Rdesk for iOS · 0.1.1").font(.caption).foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity)
@@ -97,6 +102,14 @@ struct HomeView: View {
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("Rdesk")
             .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("完成") { hideKeyboard() } } }
+            .alert(item: $gatewayToConfirm) { gateway in
+                Alert(
+                    title: Text("核对 Windows 网关证书"),
+                    message: Text("请与电脑网关窗口显示的 SHA-256 指纹核对。\n\n\(gateway.fingerprint.hex)"),
+                    primaryButton: .default(Text("指纹一致")) { select(gateway) },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            }
             .fullScreenCover(isPresented: $showRemote) { RemoteView(session: session) { connect() } }
             .onChange(of: showRemote) { shown in if !shown { session.disconnect() } }
             .onChange(of: scenePhase) { phase in
@@ -111,22 +124,32 @@ struct HomeView: View {
                 if ProcessInfo.processInfo.arguments.contains("--gateway-fixture") {
                     host = "127.0.0.1"
                     port = "19534"
-                    connect()
+                    certificateFingerprint = ProcessInfo.processInfo.environment["MRD_IOS_FIXTURE_FINGERPRINT"] ?? ""
+                    pairingToken = ProcessInfo.processInfo.environment["MRD_IOS_FIXTURE_TOKEN"] ?? ""
                 }
                 #endif
             }
         }.tint(accent)
     }
 
+    private func select(_ gateway: DiscoveredGateway) {
+        if (try? GatewayEndpoint(host: host, port: port)) != gateway.endpoint { pairingToken = "" }
+        host = gateway.endpoint.host
+        port = String(gateway.endpoint.port)
+        certificateFingerprint = gateway.fingerprint.hex
+        error = nil
+    }
+
     private func connect() {
         do {
             let endpoint = try GatewayEndpoint(host: host, port: port)
+            let fingerprint = try GatewayFingerprint(certificateFingerprint)
+            try session.connect(endpoint, fingerprint: fingerprint, pairingToken: pairingToken)
             host = endpoint.host
             port = String(endpoint.port)
             error = nil
             discovery.stop()
             hideKeyboard()
-            session.connect(endpoint)
             showRemote = true
         } catch { self.error = error.localizedDescription }
     }

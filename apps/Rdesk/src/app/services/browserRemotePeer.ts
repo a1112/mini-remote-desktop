@@ -62,6 +62,26 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     this.timers.add(timer);
     return timer;
   }
+  /**
+   * Signed message claims are deliberately short lived and authenticate only
+   * delivery of that message. A backend policy lease may outlive those claims
+   * and the JWT's second-rounded expiry; the bootstrap principal authority is
+   * the upper bound for the signed policy itself.
+   */
+  private principalAuthorityExpiresAtMs(bootstrap: BrowserRemoteContext['bootstrap'] = this.context.bootstrap): number {
+    return Number.isSafeInteger(bootstrap.expires_at_ms) ? bootstrap.expires_at_ms : 0;
+  }
+  /**
+   * Local control/session work must still stop at the shortest currently held
+   * credential. This is intentionally separate from policy verification: a
+   * refreshed token may have a new expiry, but an already accepted grant must
+   * never extend the current local authority on its own.
+   */
+  private localAuthorizationExpiresAtMs(bootstrap: BrowserRemoteContext['bootstrap'] = this.context.bootstrap): number {
+    const expiries = [bootstrap.expires_at_ms, bootstrap.credential.expires_at_ms];
+    if (bootstrap.http_credential) expiries.push(bootstrap.http_credential.expires_at_ms);
+    return expiries.every(expiry => Number.isSafeInteger(expiry)) ? Math.min(...expiries) : 0;
+  }
   private assertConsentDeadline(): void {
     if (!this.intent || this.intent.payload.claims.expires_at_ms <= Date.now()) throw new Error(CONSENT_TIMEOUT_ERROR);
   }
@@ -189,23 +209,24 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
         || grant.relay_generation !== 0 || !grant.approved_scopes.includes('screen.view')
         || grant.approved_scopes.some((scope: string) => !this.context.bootstrap.session.request.requested_scopes.includes(scope))
         || grant.approved_profile?.codec !== 'h264' || grant.policy_expires_at_ms <= Date.now()
-        || grant.policy_expires_at_ms > this.context.bootstrap.expires_at_ms) throw new Error('远端会话授权与本次请求不匹配');
+        || grant.policy_expires_at_ms > this.principalAuthorityExpiresAtMs()) throw new Error('远端会话授权与本次请求不匹配');
       const fresh = await this.context.getBootstrap();
       if (this.closing) return;
       this.assertConsentDeadline();
-      this.assertApprovedPolicy(grant, fresh.session);
+      this.assertApprovedPolicy(grant, fresh.session, fresh);
       const commitment = await signedSignalCommitment('grant', message.payload);
       if (this.closing) return;
       this.assertConsentDeadline();
-      this.assertApprovedPolicy(grant, fresh.session);
+      this.assertApprovedPolicy(grant, fresh.session, fresh);
       this.grant = message.payload;
       this.grantCommitment = commitment;
       if (this.consentDeadline) {
         clearTimeout(this.consentDeadline); this.timers.delete(this.consentDeadline); this.consentDeadline = undefined;
       }
       this.publish({ phase: 'negotiating', grantedScopes: [...grant.approved_scopes] });
-      this.deadline(() => this.fail(new Error('远端会话授权已到期')), grant.policy_expires_at_ms - Date.now());
-      await this.negotiate(grant);
+      const localExpiresAtMs = Math.min(grant.policy_expires_at_ms, this.localAuthorizationExpiresAtMs(fresh));
+      this.deadline(() => this.fail(new Error('远端会话授权已到期')), localExpiresAtMs - Date.now());
+      await this.negotiate(grant, fresh);
       return;
     }
     if (type === 'webrtc_answer_v3' || type === 'webrtc_candidate_v3') {
@@ -246,12 +267,14 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     if (this.seenMessages.size > 512) this.seenMessages.delete(this.seenMessages.values().next().value!);
     return payload;
   }
-  private assertApprovedPolicy(grant: WireObject, snapshot: WireObject): void {
+  private assertApprovedPolicy(grant: WireObject, snapshot: WireObject, bootstrap = this.context.bootstrap): void {
     if (snapshot.status !== 'approved' || canonicalWanRequest(snapshot.request) !== canonicalWanRequest(this.context.bootstrap.session.request)
       || snapshot.request_commitment !== this.context.bootstrap.session.request_commitment
       || snapshot.policy_revision !== grant.backend_policy_revision || snapshot.active_relay_generation !== 0
       || JSON.stringify(snapshot.approved_scopes) !== JSON.stringify(grant.approved_scopes)
       || JSON.stringify(canonicalProfile(snapshot.approved_profile)) !== JSON.stringify(canonicalProfile(grant.approved_profile))
+      || grant.policy_expires_at_ms <= Date.now()
+      || grant.policy_expires_at_ms > this.principalAuthorityExpiresAtMs(bootstrap)
       || Date.parse(snapshot.policy_expires_at) !== grant.policy_expires_at_ms || Date.parse(snapshot.grant_expires_at) <= Date.now()) throw new Error('远端授权不符合服务器当前会话策略');
   }
   private async refreshAuthorization(): Promise<void> {
@@ -260,12 +283,12 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
     try {
       const fresh = await this.context.getBootstrap();
       if (this.closing) return;
-      if (this.grant) this.assertApprovedPolicy(this.grant.payload, fresh.session);
+      if (this.grant) this.assertApprovedPolicy(this.grant.payload, fresh.session, fresh);
       else if (fresh.session.status === 'rejected') this.fail(new Error('远端拒绝了连接'), 'denied');
     } catch (error) { this.fail(error); }
     finally { this.polling = false; }
   }
-  private async negotiate(grant: WireObject): Promise<void> {
+  private async negotiate(grant: WireObject, bootstrap: BrowserRemoteContext['bootstrap'] = this.context.bootstrap): Promise<void> {
     const access = await this.context.getRelayAccess();
     if (this.closing) return;
     await waitUntilRelayDirectoryIssued(access, this.signalWaitAbort.signal);
@@ -292,7 +315,7 @@ export class BrowserRemotePeer implements BrowserRemoteHandle {
       identity: this.context.identity, sourceDeviceId: this.controllerId, sessionId: this.sessionId,
       grantCommitment: this.grantCommitment!, targetDeviceId: this.targetId, targetKeyId: this.context.bootstrap.target_key_id,
       scopes: [...grant.approved_scopes], policyRevision: grant.backend_policy_revision,
-      expiresAtMs: Math.min(grant.policy_expires_at_ms, this.context.bootstrap.expires_at_ms),
+      expiresAtMs: Math.min(grant.policy_expires_at_ms, this.localAuthorizationExpiresAtMs(bootstrap)),
       isActive: () => !this.closing && this.routeVerified && this.controlReady() && this.state.phase === 'streaming' && this.pc?.connectionState === 'connected',
     }, { reliable, realtime }, error => this.fail(error));
     pc.addEventListener('track', event => {

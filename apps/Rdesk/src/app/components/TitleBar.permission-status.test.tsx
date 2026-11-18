@@ -43,3 +43,15 @@ describe('permission control placement', () => {
     expect(mocks.window).not.toHaveBeenCalled();
   });
 });
+
+it("focuses device search with the keyboard shortcut and submits the entered query", async () => {
+  const onSearch = vi.fn();
+  render(<TitleBar onSearchDevices={onSearch} />);
+  await act(async () => {});
+  fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+  const input = screen.getByRole("searchbox", { name: "搜索设备" });
+  expect(input).toHaveFocus();
+  fireEvent.change(input, { target: { value: "  工作电脑  " } });
+  fireEvent.submit(screen.getByRole("search", { name: "查找设备" }));
+  expect(onSearch).toHaveBeenCalledWith("工作电脑");
+});

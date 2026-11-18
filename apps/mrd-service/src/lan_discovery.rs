@@ -9,9 +9,9 @@ use mrd_application::ports::{
 };
 use mrd_identity::UnattendedCredential;
 use mrd_ipc::{
-    CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoverySnapshot,
-    MediaProfile, MediaProfileNegotiation, RemoteAccessMode, RemoteAuthorizationState,
-    RemoteFailure, RemotePermissionScope, RemoteReasonCode,
+    CaptureSource, CaptureSourceSelection, DisplayMode, DisplayModeChange, LanDiscoveryErrorCode,
+    LanDiscoverySnapshot, MediaProfile, MediaProfileNegotiation, RemoteAccessMode,
+    RemoteAuthorizationState, RemoteFailure, RemotePermissionScope, RemoteReasonCode,
 };
 #[cfg(test)]
 use mrd_ipc::{MediaSenderTransportSnapshot, MediaStageMetrics};
@@ -439,6 +439,7 @@ pub struct LanDiscoveryState {
     instance_id: String,
     running: AtomicBool,
     last_probe_ms: AtomicU64,
+    error_code: StdMutex<Option<LanDiscoveryErrorCode>>,
     peers: Mutex<LanPeerRegistry>,
     first_pairing: Mutex<first_pairing::LanPairingCandidates>,
     signed_replays: Mutex<LanSignedReplayCache>,
@@ -503,6 +504,7 @@ impl LanDiscoveryState {
             instance_id: new_instance_id(),
             running: AtomicBool::new(false),
             last_probe_ms: AtomicU64::new(0),
+            error_code: StdMutex::new(None),
             peers: Mutex::new(LanPeerRegistry::default()),
             first_pairing: Mutex::new(first_pairing::LanPairingCandidates::default()),
             signed_replays: Mutex::new(LanSignedReplayCache::default()),
@@ -770,6 +772,10 @@ impl LanDiscoveryState {
         self.probe_requested.notify_one();
     }
 
+    fn set_error(&self, code: Option<LanDiscoveryErrorCode>) {
+        *self.error_code.lock().unwrap() = code;
+    }
+
     pub async fn request_probe_and_wait(&self, wait: Duration) -> LanDiscoverySnapshot {
         let notified = self.peer_changed.notified();
         self.request_probe();
@@ -882,6 +888,7 @@ impl LanDiscoveryState {
             } else {
                 Some(last_probe)
             },
+            error_code: *self.error_code.lock().unwrap(),
             peers,
         }
     }
@@ -1248,10 +1255,17 @@ pub async fn send_probe(
     state: &LanDiscoveryState,
 ) -> Result<()> {
     let packet = periodic_discovery_packet(state);
-    for target in state.probe_targets(discovery_port) {
-        send_packet(socket, &packet, target).await?;
+    let targets = state.probe_targets(discovery_port);
+    if targets.is_empty() {
+        return Ok(());
+    }
+    for target in targets {
+        send_packet(socket, &packet, target)
+            .await
+            .inspect_err(|_| state.set_error(Some(LanDiscoveryErrorCode::ProbeSendFailed)))?;
     }
     state.last_probe_ms.store(now_ms(), Ordering::Relaxed);
+    state.set_error(None);
     Ok(())
 }
 
@@ -1274,14 +1288,25 @@ pub async fn start_lan_discovery(app_state: Arc<AppState>) -> Result<()> {
     let socket = Arc::new(
         UdpSocket::bind(("0.0.0.0", port))
             .await
-            .with_context(|| format!("failed to bind LAN discovery UDP port {port}"))?,
+            .with_context(|| format!("failed to bind LAN discovery UDP port {port}"))
+            .inspect_err(|_| {
+                app_state
+                    .lan_discovery
+                    .set_error(Some(LanDiscoveryErrorCode::SocketBindFailed));
+            })?,
     );
     if app_state.lan_discovery.config.broadcast_enabled {
         socket
             .set_broadcast(true)
-            .context("failed to enable LAN discovery UDP broadcast")?;
+            .context("failed to enable LAN discovery UDP broadcast")
+            .inspect_err(|_| {
+                app_state
+                    .lan_discovery
+                    .set_error(Some(LanDiscoveryErrorCode::BroadcastSetupFailed));
+            })?;
     }
 
+    app_state.lan_discovery.set_error(None);
     app_state
         .lan_discovery
         .running

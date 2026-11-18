@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path
 from typing import Callable, Protocol
-from urllib.error import URLError
 from urllib.request import urlopen
 import json
 import subprocess
@@ -72,38 +72,30 @@ class RealtimeSidecarManager:
         with self._lifecycle_lock:
             process = self._process
             running = bool(process and process.poll() is None)
-            reachable = False
-            health_status = "unreachable"
-
-            try:
-                with urlopen(self.health_url, timeout=1.5) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                    if (
-                        isinstance(payload, dict)
-                        and payload.get("status") == "ok"
-                        and payload.get("service") == EXPECTED_SERVICE
-                        and _supports_required_protocols(payload)
-                    ):
-                        reachable = True
-                        health_status = "ok"
-                    else:
-                        health_status = "unexpected-service"
-            except (
-                URLError,
-                OSError,
-                TimeoutError,
-                json.JSONDecodeError,
-                UnicodeDecodeError,
-            ):
-                reachable = False
-
             pid = getattr(process, "pid", None) if running else None
-            return RealtimeStatus(
-                running=running,
-                reachable=reachable,
-                status=health_status,
-                pid=pid,
-            )
+        health_status = self.probe_health()
+        return RealtimeStatus(running, health_status == "ok", health_status, pid)
+
+    def probe_health(self) -> str:
+        # Readiness also calls this without holding the lifecycle lock; a slow
+        # stop/restart must not prevent an independent health probe.
+        try:
+            with urlopen(self.health_url, timeout=1.5) as response:
+                limit = 16 * 1024
+                body = response.read(limit + 1)
+                if len(body) > limit:
+                    return "unexpected-service"
+                payload = json.loads(body)
+        except (OSError, HTTPException, ValueError):
+            return "unreachable"
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and payload.get("service") == EXPECTED_SERVICE
+            and _supports_required_protocols(payload)
+        ):
+            return "ok"
+        return "unexpected-service"
 
     def start(self) -> RealtimeStatus:
         with self._lifecycle_lock:

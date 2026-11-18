@@ -739,8 +739,7 @@ impl GenerationZeroNegotiationAuthority for ImmutableGenerationZeroAuthority {
         context: &GenerationZeroNegotiationContext,
         now_unix_ms: u64,
     ) -> Result<(), GenerationZeroNegotiationError> {
-        if now_unix_ms >= context.identity().deadline_unix_ms()
-            || context.grant().grant_expires_at_ms() <= now_unix_ms
+        if context.grant().grant_expires_at_ms() <= now_unix_ms
             || context.grant().policy_expires_at_ms() <= now_unix_ms
             || context.access().generation() != 0
         {
@@ -834,9 +833,6 @@ impl GenerationZeroNegotiationContext {
         if state.phase() != WanSessionPhase::AccessBound {
             return Err(GenerationZeroNegotiationError::NotReady);
         }
-        if now_unix_ms >= state.identity().deadline_unix_ms() {
-            return Err(GenerationZeroNegotiationError::DeadlineExceeded);
-        }
         if !is_sha256_hex(&grant_commitment) {
             return Err(GenerationZeroNegotiationError::InvalidBinding);
         }
@@ -848,6 +844,10 @@ impl GenerationZeroNegotiationContext {
             .access()
             .cloned()
             .ok_or(GenerationZeroNegotiationError::NotReady)?;
+        if now_unix_ms >= grant.grant_expires_at_ms() || now_unix_ms >= grant.policy_expires_at_ms()
+        {
+            return Err(GenerationZeroNegotiationError::DeadlineExceeded);
+        }
         if grant.grant_commitment() != Some(grant_commitment.as_str())
             || grant.policy_revision() != access.policy_revision()
             || access.generation() != 0
@@ -1365,7 +1365,6 @@ impl GenerationZeroNegotiator {
     ) -> Result<Duration, GenerationZeroNegotiationError> {
         let now = self.clock.now_unix_ms();
         let deadlines = [
-            context.identity().deadline_unix_ms(),
             context.grant().grant_expires_at_ms(),
             context.grant().policy_expires_at_ms(),
             relay_access.directory().payload().expires_at_ms,

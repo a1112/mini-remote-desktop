@@ -580,6 +580,7 @@ fn public_discovery_snapshot_cannot_mint_authenticated_route_evidence() {
         discovery_port: 21_116,
         instance_id: "dispatch-instance".to_string(),
         last_probe_ms: None,
+        error_code: None,
         peers: vec![LanPeerInfo {
             device_id: DeviceId("target".to_string()),
             device_name: "Target".to_string(),

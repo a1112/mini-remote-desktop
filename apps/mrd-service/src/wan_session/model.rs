@@ -489,6 +489,10 @@ pub struct WanSessionState {
     role: WanSessionRole,
     identity: WanSessionIdentity,
     phase: WanSessionPhase,
+    /// The signed intent deadline gates only the consent/handshake window.
+    /// Once a backend grant is accepted, the grant and policy expiries become
+    /// the session lease and may outlive the short-lived intent claims.
+    lease_deadline_unix_ms: Option<u64>,
     accepted_events: Vec<WanSessionEvent>,
     request_commitment: Option<String>,
     intent_commitment: Option<String>,
@@ -505,6 +509,7 @@ impl fmt::Debug for WanSessionState {
             .field("role", &self.role)
             .field("identity", &self.identity)
             .field("phase", &self.phase)
+            .field("lease_deadline_unix_ms", &self.lease_deadline_unix_ms)
             .field("request_commitment", &self.request_commitment)
             .field("grant", &self.grant)
             .field("access", &self.access)
@@ -520,6 +525,7 @@ impl WanSessionState {
             role,
             identity,
             phase: WanSessionPhase::Created,
+            lease_deadline_unix_ms: None,
             accepted_events: Vec::with_capacity(8),
             request_commitment: None,
             intent_commitment: None,
@@ -536,6 +542,18 @@ impl WanSessionState {
 
     pub fn identity(&self) -> &WanSessionIdentity {
         &self.identity
+    }
+
+    /// The effective authorization deadline for state transitions and owned
+    /// runtime work. Before a grant this is the signed intent/consent
+    /// deadline; after a grant it is the backend lease's earliest expiry.
+    pub fn effective_deadline_unix_ms(&self) -> u64 {
+        self.lease_deadline_unix_ms
+            .unwrap_or_else(|| self.identity.deadline_unix_ms())
+    }
+
+    pub fn lease_deadline_unix_ms(&self) -> Option<u64> {
+        self.lease_deadline_unix_ms
     }
 
     pub(crate) fn bind_controller_target_key(
@@ -595,7 +613,7 @@ impl WanSessionState {
         if self.phase.is_terminal() {
             return Err(WanSessionTransitionError::Terminal);
         }
-        if now_unix_ms >= self.identity.deadline_unix_ms {
+        if now_unix_ms >= self.effective_deadline_unix_ms() {
             return self.fail(WanSessionFailure::DeadlineExceeded);
         }
         if target <= self.phase {
@@ -635,8 +653,12 @@ impl WanSessionState {
                 if self.request_commitment.as_deref() == Some(grant.request_commitment())
                     && now_unix_ms < grant.grant_expires_at_ms()
                     && now_unix_ms < grant.policy_expires_at_ms()
-                    && grant.grant_expires_at_ms() <= self.identity.deadline_unix_ms
                 {
+                    self.lease_deadline_unix_ms = Some(
+                        grant
+                            .grant_expires_at_ms()
+                            .min(grant.policy_expires_at_ms()),
+                    );
                     self.grant = Some(grant.clone());
                     Ok(())
                 } else {

@@ -144,6 +144,12 @@ class SessionRequest(Base):
     approved_profile: Mapped[dict[str, object] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"), nullable=True
     )
+    # Present only for sessions approved without target interaction. This is
+    # durable authorization state, never a caller-provided session parameter.
+    same_account_authority: Mapped[dict[str, object] | None] = mapped_column(
+        JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql"),
+        nullable=True,
+    )
     active_relay_generation: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True
     )

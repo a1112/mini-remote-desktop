@@ -266,6 +266,68 @@ def test_browser_attended_approval_downscopes_credential_and_issues_real_relay_a
                                     public_key=bytes(inspect_response.json()["relay_directory_public_key"]))
 
 
+def test_verified_same_account_browser_uses_its_session_key_and_real_relay(wan_relay_api, monkeypatch):
+    from app.api.v1 import browser_sessions
+    from app.models.device_machine_identity import DeviceMachineIdentity
+    from app.models.oidc import OidcIdentity
+    from app.services.relay_signing import Ed25519RelayDirectorySigner
+
+    api = wan_relay_api
+    issuer = "https://r-auth.example.test/realms/rdesk"
+    monkeypatch.setitem(settings.__dict__, "oidc_enabled", True)
+    monkeypatch.setitem(settings.__dict__, "oidc_issuer", issuer)
+    public_key = bytes(range(32, 64))
+    target_key = hashlib.sha256(public_key).hexdigest()
+    owner = api.session.get(User, "controller-user")
+    target = api.devices["controller-1"]
+    api.session.add(OidcIdentity(issuer=issuer, subject="browser-owner", user_id=owner.id,
+                                 created_at=datetime.now(UTC)))
+    api.session.add(DeviceMachineIdentity(key_id=target_key, public_key=public_key.hex(),
+                                          device_row_id=target.id, created_at=datetime.now(UTC)))
+    api.session.commit()
+
+    async def target_identity(_):
+        return target_key
+
+    monkeypatch.setattr(browser_sessions, "query_realtime_target_key", target_identity)
+    api.service._signer = Ed25519RelayDirectorySigner(key_id=DIRECTORY_KEY_ID,
+                                                      private_key_seed=DIRECTORY_SEED)
+    browser = SimpleNamespace(client=api.client, session=api.session,
+        user_token=create_access_token(owner.id, owner.username, owner.role, owner.session_version))
+    created = _create_browser(browser, target_device_id="controller-1")
+    assert created.status_code == 200, created.text
+    body = created.json()
+    params = {"controller_key_id": body["controller_key_id"], "target_key_id": target_key}
+    headers = _headers(api, "controller-1")
+    path = "/api/v1/device-sessions/browser-session-1"
+    trusted = api.client.get(path + "/same-account", headers=headers, params=params)
+    assert trusted.status_code == 200 and trusted.json() == {"trusted": True}
+    assert api.client.get(path + "/same-account", headers=headers,
+                          params={**params, "controller_key_id": "a" * 64}).json() == {"trusted": False}
+    approval = api.client.post(path + "/approve-same-account", headers=headers, params=params,
+        json={"approved_scopes": ["input.keyboard", "input.pointer", "screen.view"],
+              "approved_profile": None})
+    assert approval.status_code == 200, approval.text
+    inspected = api.client.get("/api/v1/browser-sessions/browser-session-1", headers=_browser_headers(browser))
+    assert inspected.status_code == 200, inspected.text
+    assert inspected.json()["session"]["status"] == "approved"
+    relay = api.client.post("/api/v1/browser-sessions/browser-session-1/relay-access",
+                            headers=_browser_headers(browser), json={})
+    assert relay.status_code == 200, relay.text
+    async def replaced_target_identity(_):
+        return "a" * 64
+    monkeypatch.setattr(browser_sessions, "query_realtime_target_key", replaced_target_identity)
+    assert api.client.get("/api/v1/browser-sessions/browser-session-1",
+                          headers=_browser_headers(browser)).status_code == 404
+    monkeypatch.setattr(browser_sessions, "query_realtime_target_key", target_identity)
+    owner.session_version += 1
+    api.session.commit()
+    assert api.client.get(path + "/same-account", headers=headers, params=params).status_code == 404
+    assert api.client.post(path + "/approve-same-account", headers=headers, params=params,
+        json={"approved_scopes": ["input.keyboard", "input.pointer", "screen.view"],
+              "approved_profile": None}).status_code == 404
+
+
 def test_expired_browser_cannot_use_real_relay_or_native_approval(wan_relay_api):
     from app.models.browser_controller import BrowserController
     api = wan_relay_api

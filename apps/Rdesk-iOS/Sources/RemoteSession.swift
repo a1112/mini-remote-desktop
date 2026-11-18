@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import ImageIO
+import Security
 
 private actor FrameDecoder {
     func decode(_ data: Data) throws -> UIImage {
@@ -19,8 +20,38 @@ private actor FrameDecoder {
     }
 }
 
-// Reject redirects so a LAN endpoint cannot send this cleartext client to a public host.
-private final class LANSessionDelegate: NSObject, URLSessionTaskDelegate {
+private final class LANSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let endpoint: GatewayEndpoint
+    private let fingerprint: GatewayFingerprint
+    private let lock = NSLock()
+    private var rejected = false
+
+    init(endpoint: GatewayEndpoint, fingerprint: GatewayFingerprint) {
+        self.endpoint = endpoint
+        self.fingerprint = fingerprint
+    }
+
+    var rejectedCertificate: Bool { lock.withLock { rejected } }
+
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let protection = challenge.protectionSpace
+        guard protection.authenticationMethod == NSURLAuthenticationMethodServerTrust else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        guard protection.host == endpoint.host, protection.port == Int(endpoint.port),
+              let trust = protection.serverTrust,
+              let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first,
+              fingerprint.matches(certificate: SecCertificateCopyData(leaf) as Data) else {
+            lock.withLock { rejected = true }
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        // The verified leaf identifies a gateway even when it uses a self-signed certificate for localhost.
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
@@ -54,7 +85,8 @@ final class RemoteSession: ObservableObject {
     private var fpsFrames = 0
     private let decoder = FrameDecoder()
 
-    func connect(_ endpoint: GatewayEndpoint) {
+    func connect(_ endpoint: GatewayEndpoint, fingerprint: GatewayFingerprint, pairingToken: String) throws {
+        let request = try endpoint.request(pairingToken: pairingToken)
         close()
         phase = .connecting
         message = "正在连接电脑…"
@@ -65,9 +97,13 @@ final class RemoteSession: ObservableObject {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 12
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        let session = URLSession(configuration: config, delegate: LANSessionDelegate(), delegateQueue: nil)
+        config.tlsMinimumSupportedProtocolVersion = .TLSv12
+        config.urlCredentialStorage = nil
+        config.httpShouldSetCookies = false
+        let delegate = LANSessionDelegate(endpoint: endpoint, fingerprint: fingerprint)
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         transport = session
-        let task = session.webSocketTask(with: endpoint.url)
+        let task = session.webSocketTask(with: request)
         task.maximumMessageSize = GatewayProtocol.maxJPEGBytes
         socket = task
         let id = generation
@@ -112,7 +148,15 @@ final class RemoteSession: ObservableObject {
                 }
             } catch {
                 guard let self, self.generation == id, !Task.isCancelled else { return }
-                self.fail(error.localizedDescription)
+                if delegate.rejectedCertificate {
+                    self.fail(GatewayError.certificateMismatch.localizedDescription)
+                } else if let gatewayError = error as? GatewayError {
+                    self.fail(gatewayError.localizedDescription)
+                } else if self.phase == .connecting {
+                    self.fail("连接未建立，请核对网关地址、证书指纹和配对令牌。")
+                } else {
+                    self.fail("与电脑的连接已中断，请重新连接。")
+                }
             }
         }
         watchdog = Task { [weak self] in
@@ -207,7 +251,7 @@ final class RemoteSession: ObservableObject {
                     if let self, self.generation == id { self.writer = nil }
                 } catch {
                     guard let self, self.generation == id, !Task.isCancelled else { return }
-                    self.fail("发送操作失败：\(error.localizedDescription)")
+                    self.fail("发送操作失败，连接已断开。")
                 }
             }
         } catch { inputError = error.localizedDescription }

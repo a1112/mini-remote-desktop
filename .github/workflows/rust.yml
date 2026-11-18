@@ -186,6 +186,55 @@ jobs:
       - run: python -m compileall -q app
       - run: python -m pytest -q
 
+  backend-integration:
+    name: Backend integration (PostgreSQL and realtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: apps/Rdesk-Server/requirements-dev.txt
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-integration
+      - run: python -m pip install -r apps/Rdesk-Server/requirements-dev.txt
+      - run: cargo build --locked -p realtime-server
+      - name: Run backend tests with local PostgreSQL and WebSocket fixtures
+        working-directory: apps/Rdesk-Server
+        shell: bash
+        run: |
+          if ! command -v pg_config >/dev/null || [[ ! -x "$(pg_config --bindir)/initdb" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends postgresql libpq-dev
+          fi
+          pg_bin="$(pg_config --bindir)"
+          fixture_dir="$(mktemp -d "$RUNNER_TEMP/mrd-pg.XXXXXX")"
+          socket_dir="$fixture_dir/socket"
+          pg_port=59441
+          mkdir -m 700 "$socket_dir"
+          stop_postgres() {
+            if [[ -f "$fixture_dir/data/postmaster.pid" ]]; then
+              "$pg_bin/pg_ctl" -D "$fixture_dir/data" -m fast -w stop
+            fi
+          }
+          trap stop_postgres EXIT
+          "$pg_bin/initdb" -D "$fixture_dir/data" -U oidc_fixture --auth=trust --no-locale --encoding=UTF8
+          "$pg_bin/pg_ctl" -D "$fixture_dir/data" -l "$fixture_dir/postgres.log" \
+            -o "-h '' -p $pg_port -k '$socket_dir' -c unix_socket_permissions=0700" -w start
+
+          test_db="postgresql+asyncpg://oidc_fixture@/postgres?host=$socket_dir&port=$pg_port"
+          RDESK_ENVIRONMENT=test \
+            RDESK_DB_URL="$test_db" \
+            MRD_TEST_DATABASE_URL="$test_db" \
+            MRD_OIDC_TEST_SOCKET="$socket_dir" \
+            MRD_OIDC_TEST_PORT="$pg_port" \
+            MRD_REALTIME_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/realtime-server" \
+            python -m pytest -q
+
   full-workspace-linux:
     name: Full Rust workspace (Linux)
     runs-on: ubuntu-latest

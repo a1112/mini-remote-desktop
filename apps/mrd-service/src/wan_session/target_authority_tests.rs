@@ -19,6 +19,8 @@ use ring::rand::SystemRandom;
 struct Backend {
     request: WanSessionRequestV3,
     now: u64,
+    case: String,
+    calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 #[async_trait]
 impl WanSessionWorkflowBackend for Backend {
@@ -38,7 +40,8 @@ impl WanSessionWorkflowBackend for Backend {
             self.request.clone(),
             self.request.commitment().unwrap(),
         )
-        .unwrap())
+        .unwrap()
+        .with_temporary_guest(self.case == "guest"))
     }
     async fn approve(
         &self,
@@ -46,20 +49,38 @@ impl WanSessionWorkflowBackend for Backend {
         approval: &WanSessionApproval,
         _: u64,
     ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
-        Ok(WanBackendSessionSnapshot::approved(
-            self.request.clone(),
-            self.request.commitment().unwrap(),
-            GrantBinding::new(
-                self.request.commitment().unwrap(),
-                approval.approved_scopes().to_vec(),
-                7,
-                self.now + 50_000,
-                self.now + 50_000,
-                self.request.route_policy,
-            )
-            .unwrap(),
-        )
-        .unwrap())
+        self.calls.lock().unwrap().push("approve");
+        self.approved(approval)
+    }
+    async fn same_account(
+        &self,
+        _: &WanSessionIdentity,
+        _: u64,
+    ) -> Result<bool, WanSessionPortError> {
+        self.calls.lock().unwrap().push("same-account");
+        if self.case == "trust_unavailable" {
+            return Err(WanSessionPortError::Unavailable);
+        }
+        Ok(matches!(
+            self.case.as_str(),
+            "same_account"
+                | "same_account_changed"
+                | "same_account_extra_scope"
+                | "same_account_revoked"
+                | "guest"
+        ))
+    }
+    async fn approve_same_account(
+        &self,
+        _: &WanSessionIdentity,
+        approval: &WanSessionApproval,
+        _: u64,
+    ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
+        self.calls.lock().unwrap().push("approve-same-account");
+        if self.case == "same_account_changed" {
+            return Err(WanSessionPortError::Rejected);
+        }
+        self.approved(approval)
     }
     async fn access_generation_zero(
         &self,
@@ -76,10 +97,34 @@ impl WanSessionWorkflowBackend for Backend {
         .unwrap())
     }
 }
+impl Backend {
+    fn approved(
+        &self,
+        approval: &WanSessionApproval,
+    ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
+        Ok(WanBackendSessionSnapshot::approved(
+            self.request.clone(),
+            self.request.commitment().unwrap(),
+            GrantBinding::new(
+                self.request.commitment().unwrap(),
+                approval.approved_scopes().to_vec(),
+                7,
+                // Backend authorization is a session lease, intentionally
+                // longer than the signed intent's 60-second consent window.
+                self.now + 600_000,
+                self.now + 600_000,
+                self.request.route_policy,
+            )
+            .unwrap(),
+        )
+        .unwrap())
+    }
+}
 struct Signaling {
     identity: Arc<DeviceIdentity>,
     commitment: std::sync::Mutex<Option<String>>,
     revoke: Option<Arc<crate::session_authorization::SessionAuthorizationRegistry>>,
+    calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
 }
 #[async_trait]
 impl WanSessionWorkflowSignaling for Signaling {
@@ -151,6 +196,7 @@ async fn run_flow(
     DeviceIdentity,
     Arc<Signaling>,
     Result<(), ()>,
+    VerifiedSignalingEvent,
 ) {
     let app = Arc::new(crate::AppState::default());
     let target = DeviceId("physical-target-authority".into());
@@ -160,18 +206,41 @@ async fn run_flow(
         .register(target.clone(), "Target".into());
     let target_key = app.device_identities.machine_identity();
     let controller_key = DeviceIdentity::generate(&SystemRandom::new()).unwrap();
+    if case == "same_account_revoked" {
+        app.device_identities.trust_authenticated_peer_for_test(
+            &controller_key,
+            1,
+            mrd_store_sqlite::TrustState::Revoked,
+        );
+    }
     let now = now_unix_ms();
     let request = WanSessionRequestV3 {
         session_id: SessionId("target-intent-authority".into()),
         idempotency_key: [7; 16],
-        controller_device_id: DeviceId("browser_0123456789abcdef".into()),
+        controller_device_id: DeviceId(
+            if case.starts_with("same_account") {
+                "physical-controller"
+            } else {
+                "browser_0123456789abcdef"
+            }
+            .into(),
+        ),
         target_device_id: target.clone(),
         access_mode: WanAccessModeV3::Attended,
-        requested_scopes: vec![
-            WanPermissionScopeV3::InputKeyboard,
-            WanPermissionScopeV3::InputPointer,
-            WanPermissionScopeV3::ScreenView,
-        ],
+        requested_scopes: if case == "same_account_extra_scope" {
+            vec![
+                WanPermissionScopeV3::FileRead,
+                WanPermissionScopeV3::InputKeyboard,
+                WanPermissionScopeV3::InputPointer,
+                WanPermissionScopeV3::ScreenView,
+            ]
+        } else {
+            vec![
+                WanPermissionScopeV3::InputKeyboard,
+                WanPermissionScopeV3::InputPointer,
+                WanPermissionScopeV3::ScreenView,
+            ]
+        },
         requested_profile: None,
         route_policy: WanRoutePolicyV3::DirectFirst,
     };
@@ -219,6 +288,7 @@ async fn run_flow(
         identity: target_key.clone(),
         commitment: Default::default(),
         revoke: (case == "revoked_during_grant").then(|| app.session_authorizations.clone()),
+        calls: Default::default(),
     });
     let coordinator = Arc::new(
         WanSessionCoordinator::with_workflow_ports(
@@ -228,11 +298,14 @@ async fn run_flow(
                 Arc::new(Backend {
                     request: request.clone(),
                     now,
+                    case: case.to_owned(),
+                    calls: signaling.calls.clone(),
                 }),
                 signaling.clone(),
-                Arc::new(ServiceWanSessionConsentPublisher::new(
-                    app.session_authorizations.clone(),
-                )),
+                Arc::new(
+                    ServiceWanSessionConsentPublisher::new(app.session_authorizations.clone())
+                        .with_app_state(&app),
+                ),
                 Arc::new(SystemWanSessionClock),
             ),
         )
@@ -243,7 +316,18 @@ async fn run_flow(
     let denied = case == "denied";
     let approve_app = app.clone();
     let approve_session = request.session_id.clone();
-    let approval = if case == "expired" || case == "metadata_key" || case == "wrong_target" {
+    let approval = if matches!(
+            case,
+            "same_account"
+                | "same_account_changed"
+                | "same_account_extra_scope"
+                | "same_account_revoked"
+                | "trust_unavailable"
+        )
+        || case == "expired"
+        || case == "metadata_key"
+        || case == "wrong_target"
+    {
         None
     } else {
         Some(tokio::spawn(async move {
@@ -285,17 +369,33 @@ async fn run_flow(
                 .unwrap();
         }))
     };
-    let result =
-        handle_target_intent(&app, &coordinator, event, &target, target_key.as_ref()).await;
+    let replay_event = event.clone();
+    let result = handle_target_intent(
+        &app,
+        &coordinator,
+        event,
+        &target,
+        target_key.as_ref(),
+    )
+    .await;
     if let Some(approval) = approval {
         approval.await.unwrap();
     }
-    (app, coordinator, request, controller_key, signaling, result)
+    (
+        app,
+        coordinator,
+        request,
+        controller_key,
+        signaling,
+        result,
+        replay_event,
+    )
 }
 
 #[tokio::test]
 async fn approved_target_intent_installs_the_exact_signed_grant_and_peer_key() {
-    let (app, coordinator, request, controller_key, signaling, result) = run_flow("approved").await;
+    let (app, coordinator, request, controller_key, signaling, result, _) =
+        run_flow("approved").await;
     assert!(result.is_ok(), "target workflow must reach AccessBound before usable authorization: state={:?}, authorization={:?}",coordinator.snapshot(&request.session_id).await,app.session_authorizations.snapshot(&request.session_id).await);
     let snapshot = app
         .session_authorizations
@@ -341,9 +441,152 @@ async fn approved_target_intent_installs_the_exact_signed_grant_and_peer_key() {
 }
 
 #[tokio::test]
+async fn same_account_uses_guarded_backend_approval_without_consent_prompt() {
+    let (app, coordinator, request, _, signaling, result, _) = run_flow("same_account").await;
+    assert!(result.is_ok());
+    assert_eq!(
+        *signaling.calls.lock().unwrap(),
+        ["same-account", "approve-same-account"]
+    );
+    assert!(signaling.commitment.lock().unwrap().is_some());
+    let snapshot = app
+        .session_authorizations
+        .snapshot(&request.session_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.authorization_state,
+        RemoteAuthorizationState::Granted
+    );
+    let events = app
+        .session_authorizations
+        .subscribe(mrd_ipc::SessionEventSubscriptionQuery {
+            session_id: Some(request.session_id.clone()),
+            after_sequence: None,
+            limit: 32,
+            wait_timeout_ms: 0,
+        })
+        .await
+        .unwrap();
+    assert!(!events.events.iter().any(|event| matches!(
+        event.event,
+        mrd_ipc::RemoteSessionEvent::ConsentRequested { .. }
+    )));
+    assert!(!events
+        .pending_sessions
+        .iter()
+        .any(|pending| pending.session_id == request.session_id));
+    coordinator.close(&request.session_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_account_cannot_fall_back_to_ordinary_approval() {
+    let (app, coordinator, request, _, signaling, result, _) =
+        run_flow("same_account_changed").await;
+    assert!(result.is_err());
+    assert_eq!(
+        *signaling.calls.lock().unwrap(),
+        ["same-account", "approve-same-account"]
+    );
+    assert!(signaling.commitment.lock().unwrap().is_none());
+    assert!(app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .is_none());
+    assert!(coordinator
+        .snapshot(&request.session_id)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
+}
+
+#[tokio::test]
+async fn same_account_respects_current_capabilities_and_existing_revocation() {
+    let (app, coordinator, request, _, _, result, _) = run_flow("same_account_extra_scope").await;
+    assert!(result.is_ok());
+    let authorization = app
+        .session_authorizations
+        .snapshot(&request.session_id)
+        .await
+        .unwrap();
+    assert!(!authorization
+        .granted_scopes
+        .contains(&RemotePermissionScope::FileRead));
+    assert!(authorization
+        .granted_scopes
+        .contains(&RemotePermissionScope::ScreenView));
+    coordinator.close(&request.session_id).await.unwrap();
+
+    let (app, coordinator, request, _, signaling, result, _) =
+        run_flow("same_account_revoked").await;
+    assert!(result.is_err());
+    assert_eq!(*signaling.calls.lock().unwrap(), ["same-account"]);
+    assert!(app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .is_none());
+    assert!(coordinator
+        .snapshot(&request.session_id)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
+}
+
+#[tokio::test]
+async fn guest_and_other_accounts_use_normal_consent() {
+    for case in ["guest", "other_account"] {
+        let (app, coordinator, request, _, signaling, result, _) = run_flow(case).await;
+        assert!(result.is_ok(), "{case}");
+        let calls = signaling.calls.lock().unwrap().clone();
+        assert!(calls.contains(&"approve"));
+        assert!(!calls.contains(&"approve-same-account"));
+        if case == "guest" {
+            assert!(!calls.contains(&"same-account"));
+        }
+        let events = app
+            .session_authorizations
+            .subscribe(mrd_ipc::SessionEventSubscriptionQuery {
+                session_id: Some(request.session_id.clone()),
+                after_sequence: None,
+                limit: 32,
+                wait_timeout_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(events.events.iter().any(|event| matches!(
+            event.event,
+            mrd_ipc::RemoteSessionEvent::ConsentRequested { .. }
+        )));
+        coordinator.close(&request.session_id).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn unverifiable_account_fails_without_prompt_or_approval() {
+    let (app, coordinator, request, _, signaling, result, _) = run_flow("trust_unavailable").await;
+    assert!(result.is_err());
+    assert_eq!(*signaling.calls.lock().unwrap(), ["same-account"]);
+    assert!(app
+        .session_authorizations
+        .active_grant(&request.session_id)
+        .await
+        .is_none());
+    assert!(coordinator
+        .snapshot(&request.session_id)
+        .await
+        .unwrap()
+        .phase()
+        .is_terminal());
+}
+
+#[tokio::test]
 async fn rejected_expired_and_mismatched_intents_never_install_authority() {
     for case in ["denied", "expired", "metadata_key", "wrong_target"] {
-        let (app, coordinator, request, _, _, result) = run_flow(case).await;
+        let (app, coordinator, request, _, _, result, _) = run_flow(case).await;
         assert!(result.is_err(), "{case} must fail");
         assert!(
             app.session_authorizations
@@ -360,7 +603,8 @@ async fn rejected_expired_and_mismatched_intents_never_install_authority() {
 
 #[tokio::test]
 async fn authorization_install_failure_terminalizes_an_approved_coordinator() {
-    let (app, coordinator, request, _, signaling, result) = run_flow("revoked_during_grant").await;
+    let (app, coordinator, request, _, signaling, result, _) =
+        run_flow("revoked_during_grant").await;
     assert!(
         signaling.commitment.lock().unwrap().is_some(),
         "the signed grant was produced before local revocation"

@@ -8,6 +8,7 @@ from typing import Callable
 from pydantic import ValidationError
 from sqlalchemy import func, select, update
 
+from app.core.config import settings
 from app.core.security import DeviceAuthSnapshot
 from app.models.device import Device
 from app.models.relay_audit_event import RelayAuditEvent
@@ -22,6 +23,10 @@ from app.schemas.session import (
 )
 from app.services.relay_directory import RelayAccessService
 from app.services.browser_authority import browser_authority_valid
+from app.services.same_account_authority import (
+    same_account_authority_valid,
+    same_account_binding_valid,
+)
 from app.services.session_grants import (
     SessionGrantError,
     bind_session_grant_policy,
@@ -176,7 +181,142 @@ class DeviceSessionService:
         if not await browser_authority_valid(self._session, row, now=self._now(),
                                              allow_terminal=current_device.id == row.target_device_id):
             _not_found()
+        if not await same_account_authority_valid(self._session, row):
+            _not_found()
         return row
+
+    async def same_account(
+        self,
+        *,
+        session_id: str,
+        current_device: Device,
+        auth_snapshot: DeviceAuthSnapshot,
+        controller_key_id: str,
+        target_key_id: str,
+    ) -> bool:
+        # This result is advisory. Approval checks the same facts again in the
+        # transaction which creates the relay grant.
+        async with session_grant_identity_lock(self._session, "session:" + session_id):
+            row, controller, target, caller, users_by_id = await self._locked_context(
+                session_id=session_id,
+                current_device=current_device,
+                auth_snapshot=auth_snapshot,
+            )
+            if row.target_device_id != caller.id:
+                _deny()
+            return await self._same_account_valid(
+                row, controller, target, users_by_id, controller_key_id, target_key_id
+            )
+
+    async def _same_account_valid(
+        self,
+        row: SessionRequest,
+        controller: Device,
+        target: Device,
+        users_by_id: dict[str, User],
+        controller_key_id: str | None,
+        target_key_id: str | None,
+    ) -> bool:
+        return await same_account_binding_valid(
+            self._session, row, controller, target,
+            users_by_id.get(row.requester_user_id),
+            controller_key_id=controller_key_id, target_key_id=target_key_id,
+            lock_identity=True,
+        )
+
+    async def _locked_context(
+        self,
+        *,
+        session_id: str,
+        current_device: Device,
+        auth_snapshot: DeviceAuthSnapshot,
+    ) -> tuple[SessionRequest, Device, Device, Device, dict[str, User]]:
+        """Load a session's current authorization under the existing lock order."""
+        preview = await self._session.scalar(
+            select(SessionRequest).where(SessionRequest.id == session_id)
+        )
+        if preview is None or preview.requester_device_id is None:
+            _not_found()
+        devices = list(
+            await self._session.scalars(
+                select(Device)
+                .where(
+                    Device.id.in_(
+                        {
+                            preview.requester_device_id,
+                            preview.target_device_id,
+                            auth_snapshot.row_id,
+                        }
+                    )
+                )
+                .order_by(Device.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        by_device_id = {device.id: device for device in devices}
+        controller = by_device_id.get(preview.requester_device_id)
+        target = by_device_id.get(preview.target_device_id)
+        caller = by_device_id.get(auth_snapshot.row_id)
+        user_ids = sorted(
+            {
+                user_id
+                for user_id in (
+                    preview.requester_user_id,
+                    getattr(controller, "bound_user_id", None),
+                    getattr(target, "bound_user_id", None),
+                    getattr(caller, "bound_user_id", None),
+                )
+                if isinstance(user_id, str)
+            }
+        )
+        users = list(
+            await self._session.scalars(
+                select(User)
+                .where(User.id.in_(user_ids))
+                .order_by(User.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        users_by_id = {user.id: user for user in users}
+        row = await self._session.scalar(
+            select(SessionRequest)
+            .where(SessionRequest.id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        guest = row is not None and row.authority_kind == "temporary_password"
+        if (
+            row is None
+            or row.requester_device_id != getattr(controller, "id", None)
+            or row.target_device_id != getattr(target, "id", None)
+            or caller is None
+            or current_device.id != auth_snapshot.row_id
+            or not _matches_auth_snapshot(caller, auth_snapshot, allow_unbound=guest)
+            or not _is_authorized_participant(row, caller)
+            or controller is None
+            or target is None
+            or (not guest and (not _is_active_device(controller)
+                or not _is_active_device(target)
+                or controller.bound_user_id != row.requester_user_id
+                or users_by_id.get(controller.bound_user_id) is None
+                or users_by_id.get(target.bound_user_id) is None
+                or users_by_id[controller.bound_user_id].tenant_id != row.tenant_id
+                or users_by_id[target.bound_user_id].tenant_id != row.tenant_id))
+        ):
+            _not_found()
+        request = device_session_out(row).request
+        if not await browser_authority_valid(self._session, row, now=self._now()):
+            _not_found()
+        if not await same_account_authority_valid(self._session, row, lock_identity=True):
+            _not_found()
+        if (
+            request.controller_device_id != controller.device_id
+            or request.target_device_id != target.device_id
+        ):
+            _not_found()
+        return row, controller, target, caller, users_by_id
 
     async def approve(
         self,
@@ -186,6 +326,9 @@ class DeviceSessionService:
         auth_snapshot: DeviceAuthSnapshot,
         payload: DeviceSessionApprovalIn,
         relay_access: RelayAccessService,
+        same_account_only: bool = False,
+        controller_key_id: str | None = None,
+        target_key_id: str | None = None,
     ) -> SessionRequest:
         try:
             validate_session_grant_policy(relay_access.current_policy)
@@ -194,90 +337,27 @@ class DeviceSessionService:
                 error.code, error.status_code, str(error)
             ) from None
         async with session_grant_identity_lock(self._session, "session:" + session_id):
-            preview = await self._session.scalar(
-                select(SessionRequest).where(SessionRequest.id == session_id)
+            row, controller, target, caller, users_by_id = await self._locked_context(
+                session_id=session_id,
+                current_device=current_device,
+                auth_snapshot=auth_snapshot,
             )
-            if preview is None or preview.requester_device_id is None:
-                _not_found()
-            devices = list(
-                await self._session.scalars(
-                    select(Device)
-                    .where(
-                        Device.id.in_(
-                            {
-                                preview.requester_device_id,
-                                preview.target_device_id,
-                                auth_snapshot.row_id,
-                            }
-                        )
-                    )
-                    .order_by(Device.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            by_device_id = {device.id: device for device in devices}
-            controller = by_device_id.get(preview.requester_device_id)
-            target = by_device_id.get(preview.target_device_id)
-            caller = by_device_id.get(auth_snapshot.row_id)
-            user_ids = sorted(
-                {
-                    user_id
-                    for user_id in (
-                        preview.requester_user_id,
-                        getattr(controller, "bound_user_id", None),
-                        getattr(target, "bound_user_id", None),
-                        getattr(caller, "bound_user_id", None),
-                    )
-                    if isinstance(user_id, str)
-                }
-            )
-            users = list(
-                await self._session.scalars(
-                    select(User)
-                    .where(User.id.in_(user_ids))
-                    .order_by(User.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            )
-            users_by_id = {user.id: user for user in users}
-            row = await self._session.scalar(
-                select(SessionRequest)
-                .where(SessionRequest.id == session_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-            guest = row is not None and row.authority_kind == "temporary_password"
-            if (
-                row is None
-                or row.requester_device_id != getattr(controller, "id", None)
-                or row.target_device_id != getattr(target, "id", None)
-                or caller is None
-                or current_device.id != auth_snapshot.row_id
-                or not _matches_auth_snapshot(caller, auth_snapshot, allow_unbound=guest)
-                or not _is_authorized_participant(row, caller)
-                or controller is None
-                or target is None
-                or (not guest and (not _is_active_device(controller)
-                    or not _is_active_device(target)
-                    or controller.bound_user_id != row.requester_user_id
-                    or users_by_id.get(controller.bound_user_id) is None
-                    or users_by_id.get(target.bound_user_id) is None
-                    or users_by_id[controller.bound_user_id].tenant_id != row.tenant_id
-                    or users_by_id[target.bound_user_id].tenant_id != row.tenant_id))
-            ):
-                _not_found()
-            request = device_session_out(row).request
-            if not await browser_authority_valid(self._session, row, now=self._now()):
-                _not_found()
-            if (
-                request.controller_device_id != controller.device_id
-                or request.target_device_id != target.device_id
-            ):
-                _not_found()
+            guest = row.authority_kind == "temporary_password"
             if row.target_device_id != caller.id:
                 _deny()
+            if same_account_only and not await self._same_account_valid(
+                row, controller, target, users_by_id, controller_key_id, target_key_id
+            ):
+                _deny()
+            if same_account_only:
+                row.same_account_authority = {
+                    "owner_user_id": row.requester_user_id,
+                    "issuer": settings.oidc_issuer,
+                    "controller_key_id": controller_key_id,
+                    "target_key_id": target_key_id,
+                    "controller_auth_version": controller.auth_version,
+                    "target_auth_version": target.auth_version,
+                }
             approved_scopes = list(payload.approved_scopes)
             approved_profile = (
                 payload.approved_profile.model_dump(mode="json")
@@ -322,6 +402,8 @@ class DeviceSessionService:
                 )
                 if guest:
                     await self._require_guest_approval_authority(row)
+                elif same_account_only:
+                    await self._require_same_account_approval_authority(row)
                 return row
             if row.status != "requested":
                 _conflict()
@@ -346,6 +428,8 @@ class DeviceSessionService:
             )
             if guest:
                 await self._require_guest_approval_authority(row)
+            elif same_account_only:
+                await self._require_same_account_approval_authority(row)
             self._audit(
                 action="wan_session_approved",
                 row=row,
@@ -360,6 +444,7 @@ class DeviceSessionService:
         # rolls back the newly created generation and reservations atomically.
         if not await browser_authority_valid(self._session, row, now=self._now()):
             _not_found()
+
         at = _utc(self._now())
         if any(
             not isinstance(deadline, datetime) or _utc(deadline) <= at
@@ -369,6 +454,12 @@ class DeviceSessionService:
                 row.policy_expires_at,
             )
         ):
+            _not_found()
+
+    async def _require_same_account_approval_authority(self, row: SessionRequest) -> None:
+        # Browser authority can expire while relay capacity is being reserved.
+        if (not await browser_authority_valid(self._session, row, now=self._now())
+            or not await same_account_authority_valid(self._session, row, lock_identity=True)):
             _not_found()
 
     async def transition(

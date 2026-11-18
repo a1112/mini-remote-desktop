@@ -21,12 +21,13 @@ pub(crate) fn requires_browser_authority_watch(state: &WanSessionState) -> bool 
 pub(crate) async fn monitor_browser_authority(
     backend: &dyn WanSessionWorkflowBackend,
     state: &WanSessionState,
+    same_account_target: bool,
     mut cancellation: watch::Receiver<bool>,
     poll_interval: Duration,
     inspect_timeout: Duration,
     runtime: Option<&crate::transports::webrtc::ServiceWebRtcTransportHost>,
 ) -> Option<WanSessionFailure> {
-    if !requires_browser_authority_watch(state) {
+    if !requires_browser_authority_watch(state) && !same_account_target {
         return None;
     }
     loop {
@@ -52,11 +53,10 @@ pub(crate) async fn monitor_browser_authority(
             Some(grant) => grant,
             None => return Some(WanSessionFailure::PolicyMismatch),
         };
-        let deadline = state
-            .identity()
-            .deadline_unix_ms()
-            .min(grant.grant_expires_at_ms())
-            .min(grant.policy_expires_at_ms());
+        // The signed intent deadline gates consent only. Once the target has
+        // installed the backend grant, authority is retained until the
+        // backend lease (grant/policy) expires.
+        let deadline = state.effective_deadline_unix_ms();
         if state.phase().is_terminal() || now >= deadline {
             return Some(WanSessionFailure::PolicyMismatch);
         }
@@ -250,6 +250,7 @@ mod tests {
             monitor_browser_authority(
                 backend,
                 state,
+                false,
                 cancel,
                 Duration::from_millis(1),
                 Duration::from_millis(5),
@@ -373,6 +374,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_account_physical_target_is_revoked_when_backend_authority_changes() {
+        let (state, request, grant) = fixture("physical-controller");
+        let snapshot = WanBackendSessionSnapshot::approved(
+            request.clone(),
+            request.commitment().unwrap(),
+            grant,
+        )
+        .unwrap();
+        let backend = backend(vec![Ok(snapshot), Err(WanSessionPortError::Rejected)]);
+        let (_sender, cancellation) = watch::channel(false);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            monitor_browser_authority(
+                &backend,
+                &state,
+                true,
+                cancellation,
+                Duration::from_millis(1),
+                Duration::from_millis(5),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Some(WanSessionFailure::PolicyMismatch));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn cancelled_browser_watch_does_not_inspect_or_fail() {
         let (state, _, _) = fixture("browser_0123456789abcdef");
         let backend = backend(vec![]);
@@ -381,6 +411,7 @@ mod tests {
             monitor_browser_authority(
                 &backend,
                 &state,
+                false,
                 cancel,
                 Duration::from_millis(1),
                 Duration::from_millis(5),

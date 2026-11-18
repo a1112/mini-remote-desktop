@@ -46,6 +46,8 @@ const capabilityMock = vi.hoisted(() => ({
   ipcPeerCapabilitySnapshot: vi.fn(),
 }));
 
+vi.mock("../utils/runtime", () => ({ isTauriRuntime: () => true }));
+
 vi.mock("./ThemeContext", () => ({
   useTheme: () => ({
     isDark: false,
@@ -125,18 +127,12 @@ function LocationProbe() {
 
 function renderSidebar({
   collapsed = false,
-  onOpenConnections = vi.fn(),
 }: {
   collapsed?: boolean;
-  onOpenConnections?: () => void;
 } = {}) {
   render(
     <MemoryRouter>
-      <Sidebar
-        collapsed={collapsed}
-        onOpenConnections={onOpenConnections}
-        onOpenSettings={vi.fn()}
-      />
+      <Sidebar collapsed={collapsed} />
       <LocationProbe />
     </MemoryRouter>
   );
@@ -207,15 +203,11 @@ describe("Sidebar device actions", () => {
     expect(screen.getByRole("button", { name: "设备信息" })).not.toBeDisabled();
   });
 
-  it("opens the connection dialog from the add device toolbar button", async () => {
-    const onOpenConnections = vi.fn();
+  it("opens connection history from the main navigation", async () => {
     const user = userEvent.setup();
-
-    renderSidebar({ onOpenConnections });
-
-    await user.click(screen.getByTitle("添加设备"));
-
-    expect(onOpenConnections).toHaveBeenCalledTimes(1);
+    renderSidebar();
+    await user.click(screen.getByRole("link", { name: "连接记录" }));
+    expect(screen.getByTestId("location")).toHaveTextContent("/connections");
   });
 
   it("sends Wake-on-LAN for an offline device with a known MAC address", async () => {

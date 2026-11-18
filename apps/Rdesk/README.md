@@ -8,4 +8,5 @@
   Run `npm i` to install the dependencies.
 
   Run `npm run dev` to start the development server.
-  
+
+  macOS 客户端与内嵌服务的固定签名及构建方式见 [macOS 开发签名](../../docs/macos-signing.md)。

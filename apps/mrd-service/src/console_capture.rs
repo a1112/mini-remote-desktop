@@ -269,6 +269,176 @@ impl ConsoleCaptureState {
         Ok(())
     }
 
+    /// Bind the active console only after the coordinator has obtained the
+    /// backend's atomically revalidated same-account grant. Subsequent capture
+    /// and input continue to resolve this exact Agent generation and logon.
+    pub(crate) async fn bind_verified_same_account_target(
+        &self,
+        state: &AppState,
+        session_id: &SessionId,
+    ) -> Result<()> {
+        let _operation = self.operation.lock().await;
+        let coordinator = state
+            .wan_session_coordinator()
+            .context("WAN coordinator unavailable")?;
+        ensure!(
+            coordinator.is_same_account_target(session_id).await,
+            "Same-account authority missing"
+        );
+        let workflow = coordinator.snapshot(session_id).await?;
+        ensure!(
+            workflow.role() == crate::wan_session::model::WanSessionRole::Target
+                && workflow.phase() == crate::wan_session::model::WanSessionPhase::AccessBound,
+            "Same-account grant is not active"
+        );
+        let grant = workflow.grant().context("Same-account grant missing")?;
+        let snapshot = state
+            .session_authorizations
+            .snapshot(session_id)
+            .await
+            .context("Authorization missing")?;
+        ensure!(
+            snapshot.role == RemoteSessionRole::Agent
+                && snapshot.authorization_state == RemoteAuthorizationState::Granted,
+            "Local authorization is not granted"
+        );
+        if !snapshot.granted_scopes.iter().any(|scope| {
+            matches!(
+                scope,
+                RemotePermissionScope::ScreenView
+                    | RemotePermissionScope::InputPointer
+                    | RemotePermissionScope::InputKeyboard
+            )
+        }) {
+            return Ok(());
+        }
+        let local_grant = state
+            .session_authorizations
+            .active_grant(session_id)
+            .await
+            .context("Local grant missing")?;
+        let now = now_ms();
+        let expires_at = grant
+            .grant_expires_at_ms()
+            .min(grant.policy_expires_at_ms())
+            .min(now.saturating_add(mrd_agent_ipc::AGENT_CONSENT_MAX_LIFETIME_MS));
+        ensure!(now < expires_at, "Same-account grant expired");
+        let active = active_console()?;
+        let observed = state
+            .agent_registry
+            .active_for_session_at(active, now_ms())
+            .context("No capture Agent owns this console")?;
+        ensure!(
+            observed.identity.protocol_minor
+                >= mrd_agent_ipc::AGENT_IPC_SAME_ACCOUNT_PROTOCOL_MINOR,
+            "Capture Agent must be updated"
+        );
+        let binding =
+            state
+                .agent_registry
+                .bind_active_session(active, AgentCapability::Capture, now_ms())?;
+        let consent_binding =
+            state
+                .agent_registry
+                .bind_active_session(active, AgentCapability::Consent, now_ms())?;
+        ensure!(
+            same_registration(&binding, &consent_binding),
+            "Desktop Agent changed during authorization"
+        );
+        let target = Target {
+            binding,
+            logon_hash: observed.identity.logon_sid_hash,
+            authorization_expires_at_ms: expires_at,
+            resource: None,
+            input: HashMap::new(),
+            closing: false,
+        };
+        self.validate_target(state, &target)?;
+        {
+            let mut targets = self.targets.lock().await;
+            targets.retain(|_, target| {
+                target.resource.is_some()
+                    || !target.input.is_empty()
+                    || target.authorization_expires_at_ms > now_ms()
+            });
+            ensure!(
+                targets.len() < MAX_CONSOLE_TARGETS || targets.contains_key(session_id),
+                "Capture session limit reached"
+            );
+            if let Some(existing) = targets.get(session_id) {
+                self.validate_target(state, existing)?;
+                ensure!(
+                    !existing.closing
+                        && !existing.input.values().any(|input| input.cleanup_pending)
+                        && same_target(existing, &target),
+                    "Same-account authorization cannot retarget an existing desktop"
+                );
+                return Ok(());
+            }
+        }
+        let scopes: PermissionScopes = snapshot
+            .granted_scopes
+            .iter()
+            .copied()
+            .map(PermissionScope::from)
+            .collect();
+        let peer = PeerBinding {
+            device_id: snapshot.peer_device_id.clone(),
+            key_id: decode_peer_key(&snapshot.peer_key_id)?,
+        };
+        let template = ExecuteGrantTemplate::for_binding(
+            &consent_binding,
+            session_id.clone(),
+            peer,
+            scopes.clone(),
+            local_grant.policy_revision,
+            DesktopKind::Default,
+            now,
+            now,
+            expires_at,
+        )?;
+        let execute = self.issuer()?.issue(
+            random_id()?,
+            random_id()?,
+            AgentCommand::AuthorizeSameAccount {
+                resource_id: random_id()?,
+                scopes,
+            },
+            template,
+        )?;
+        let result = state
+            .console_agent_server()
+            .context("Capture Agent server unavailable")?
+            .request_execute(&consent_binding, execute)
+            .await?;
+        ensure!(
+            result.outcome == CommandOutcome::Completed,
+            "Capture Agent rejected same-account authorization"
+        );
+        self.validate_target(state, &target)?;
+        let mut targets = self.targets.lock().await;
+        targets.retain(|_, target| {
+            target.resource.is_some()
+                || !target.input.is_empty()
+                || target.authorization_expires_at_ms > now_ms()
+        });
+        ensure!(
+            targets.len() < MAX_CONSOLE_TARGETS || targets.contains_key(session_id),
+            "Capture session limit reached"
+        );
+        if let Some(existing) = targets.get(session_id) {
+            ensure!(
+                !existing.closing
+                    && !existing.input.values().any(|input| input.cleanup_pending)
+                    && same_target(existing, &target),
+                "Same-account authorization cannot retarget an existing desktop"
+            );
+        } else {
+            targets.insert(session_id.clone(), target);
+        }
+        Ok(())
+    }
+
     /// Resolve the approved exact target, start its capture resource, and keep
     /// the grant metadata for a bounded, command-specific stop at cleanup.
     pub(crate) async fn start(

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ChevronDown, Loader2, RefreshCw, Wifi, WifiOff } from "lucide-react";
 import { useTheme } from "./ThemeContext";
-import { ipcPublicServerStatus } from "../adapters/tauri/commands";
-import type { PublicServerStatus } from "../adapters/tauri/types";
+import { ipcLanDiscoverySnapshot, ipcPublicServerStatus } from "../adapters/tauri/commands";
+import type { LanDiscoverySnapshot, PublicServerStatus } from "../adapters/tauri/types";
 import { formatDeviceCode } from "../utils/deviceCode";
 import { isTauriRuntime } from '../utils/runtime';
 
@@ -27,6 +27,18 @@ function signalingLabel(state: PublicServerStatus["signaling_state"]): string {
     case "stopped": return "信令连接已停止";
     default: return "信令连接未启用";
   }
+}
+
+function lanDiscoveryLabel(snapshot: LanDiscoverySnapshot | null): string {
+  if (!snapshot) return "状态未知";
+  if (!snapshot.enabled) return "局域网发现未启用";
+  switch (snapshot.error_code) {
+    case "socket_bind_failed": return "无法绑定局域网发现端口";
+    case "broadcast_setup_failed": return "无法启用局域网广播";
+    case "probe_send_failed": return "局域网探测发送失败";
+  }
+  if (!snapshot.running) return "局域网发现未运行";
+  return snapshot.last_probe_ms == null ? "发现正在运行，等待探测" : "发现正在运行，已发送探测";
 }
 
 /** Display only the server host. Paths, query strings and URL credentials are private. */
@@ -65,14 +77,30 @@ function connectionError(code: string | null): string | null {
 export function ServiceStatusPanel() {
   const { isDark } = useTheme();
   const [status, setStatus] = useState<PublicServerStatus | null>(null);
+  const [lanDiscovery, setLanDiscovery] = useState<LanDiscoverySnapshot | null>(null);
   const [checking, setChecking] = useState(true);
   const [failed, setFailed] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const inFlight = useRef(false);
+  const lanInFlight = useRef(false);
   const mounted = useRef(false);
+
+  const refreshLanDiscovery = useCallback(async () => {
+    if (lanInFlight.current) return;
+    lanInFlight.current = true;
+    try {
+      const result = await ipcLanDiscoverySnapshot();
+      if (mounted.current) setLanDiscovery(result.ok ? result.value : null);
+    } catch {
+      if (mounted.current) setLanDiscovery(null);
+    } finally {
+      lanInFlight.current = false;
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     if (!isTauriRuntime()) return;
+    void refreshLanDiscovery();
     if (inFlight.current) return;
     inFlight.current = true;
     if (mounted.current) setChecking(true);
@@ -87,7 +115,7 @@ export function ServiceStatusPanel() {
       inFlight.current = false;
       if (mounted.current) setChecking(false);
     }
-  }, []);
+  }, [refreshLanDiscovery]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -110,12 +138,13 @@ export function ServiceStatusPanel() {
   const muted = isDark ? "text-gray-400" : "text-gray-500";
   const tone = online ? "text-emerald-600" : status?.signaling_state === "connecting" ? "text-blue-500" : "text-amber-600";
 
-  return <section aria-label="服务器连接状态" className={`shrink-0 border-b px-3 py-2 ${isDark ? "bg-[#1f1f1f] border-gray-700 text-gray-200" : "bg-white border-gray-200 text-gray-800"}`}>
+  return <section aria-label="服务器连接状态" className={`remote-service-status shrink-0 border-b px-3 py-1 ${isDark ? "bg-[#1f1f1f] border-gray-700 text-gray-200" : "bg-white border-gray-200 text-gray-800"}`}>
     <div className="flex flex-wrap items-center gap-2">
-      <div className={`flex min-w-0 flex-1 items-center gap-2 text-sm ${tone}`} role="status" aria-live="polite">
+      <div className={`flex min-w-0 flex-1 items-center gap-2 text-sm ${tone}`} role="status" aria-live="polite" data-online={online}>
         {checking && !status ? <Loader2 className="h-4 w-4 shrink-0 animate-spin" /> : online ? <Wifi className="h-4 w-4 shrink-0" /> : <WifiOff className="h-4 w-4 shrink-0" />}
         <span>{label}</span>
       </div>
+      {lanDiscovery?.enabled && lanDiscovery.error_code && <span role="status" className="text-xs text-amber-600">局域网发现异常</span>}
       <button type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${muted}`}>
         连接详情 <ChevronDown className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`} />
       </button>
@@ -130,6 +159,7 @@ export function ServiceStatusPanel() {
         <dt className={muted}>服务器接口</dt><dd>{status?.api_reachable === true ? "服务器接口可达" : status?.api_reachable === false ? "服务器接口暂时不可达" : "尚未检测"}</dd>
         <dt className={muted}>设备登记</dt><dd>{status?.device_registered ? `已登记 · ${formatDeviceCode(status.device_id)}` : "设备尚未登记到服务器"}</dd>
         <dt className={muted}>信令连接</dt><dd>{status ? signalingLabel(status.signaling_state) : "状态未知"}{status && status.reconnect_attempt > 0 ? `（重试 ${status.reconnect_attempt} 次）` : ""}</dd>
+        <dt className={muted}>局域网发现</dt><dd>{lanDiscoveryLabel(lanDiscovery)}</dd>
         {status?.last_connected_at_ms && <><dt className={muted}>最近连接</dt><dd>{new Date(status.last_connected_at_ms).toLocaleString("zh-CN")}</dd></>}
       </dl>
       {error && <p className="text-amber-600">{error}</p>}

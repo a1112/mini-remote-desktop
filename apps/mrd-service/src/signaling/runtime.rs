@@ -1,4 +1,6 @@
-use super::{ServiceSignalingMapper, SignalingConfig, SignalingConfigError};
+use super::{
+    event_mapper::StaleWanGrant, ServiceSignalingMapper, SignalingConfig, SignalingConfigError,
+};
 use crate::AppState;
 use mrd_application::{
     apply_authenticated_realtime_events, AuthenticatedSessionSignal, AuthenticatedSignalingPort,
@@ -2233,7 +2235,10 @@ async fn run_connection(
                     Ok(InboundDisposition::Applied(event)) => {
                         inbox.push(*event);
                         if let Err(error) = apply_authenticated_realtime_events(&inbox, mapper.as_ref()).await {
-                            let _ = error;
+                            if error.is::<StaleWanGrant>() {
+                                tracing::debug!("discarded verified WAN grant without pending authorization");
+                                continue;
+                            }
                             return ConnectionExit::Failed(SignalingRuntimeError::Apply);
                         }
                     }

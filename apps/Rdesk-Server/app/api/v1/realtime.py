@@ -55,7 +55,7 @@ async def _require_realtime_admin(
 
 
 @router.get("/status")
-async def realtime_status(
+def realtime_status(
     request: Request,
     _current_user: User = Depends(_require_authenticated_user),
 ) -> dict:
@@ -69,7 +69,7 @@ async def realtime_status(
 
 
 @router.post("/start")
-async def realtime_start(
+def realtime_start(
     request: Request,
     _administrator: User = Depends(_require_realtime_admin),
 ) -> dict:
@@ -83,7 +83,7 @@ async def realtime_start(
 
 
 @router.post("/stop")
-async def realtime_stop(
+def realtime_stop(
     request: Request,
     _administrator: User = Depends(_require_realtime_admin),
 ) -> dict:
@@ -97,7 +97,7 @@ async def realtime_stop(
 
 
 @router.post("/restart")
-async def realtime_restart(
+def realtime_restart(
     request: Request,
     _administrator: User = Depends(_require_realtime_admin),
 ) -> dict:

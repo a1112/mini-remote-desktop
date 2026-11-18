@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { useAuth } from "./AuthContext";
+import { RAuthButton } from "./RAuthButton";
 import { deviceService } from "../services/deviceService";
 import { SERVER_API_URL } from "../services/serverConfig";
 
@@ -50,6 +51,7 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
   const [qrTimer, setQrTimer] = useState(120);
   const [rememberMe, setRememberMe] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [rAuthPending, setRAuthPending] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
   const [contentKey, setContentKey] = useState("login-account"); // For animation
@@ -135,7 +137,7 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
 
       // Binding errors are published by the device service to the home screen.
       // An account may log in before enrollment; enrollment completes binding.
-      await deviceService.bindDevice(data.user_id);
+      await deviceService.bindDevice();
 
       onClose();
     } catch (e) {
@@ -379,12 +381,13 @@ export function AuthModal({ open, onClose }: AuthModalProps) {
               {/* Submit */}
               <button
                 onClick={() => void handleLogin()}
-                disabled={submitting}
+                disabled={submitting || rAuthPending}
                 className="w-full py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm font-medium disabled:opacity-60"
                 style={{ fontSize: 14 }}
               >
                 {submitting ? "登录中..." : "登 录"}
               </button>
+              {open && <RAuthButton disabled={submitting} onBusyChange={setRAuthPending} onAuthenticated={onClose} />}
 
               {authError && (
                 <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/20 text-red-500 text-center" style={{ fontSize: 12 }}>

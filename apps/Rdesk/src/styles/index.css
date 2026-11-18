@@ -2,6 +2,7 @@
 @import './tailwind.css';
 @import './theme.css';
 @import './mobile.css';
+@import './remote-desktop.css';
 
 /* Global Animations */
 @keyframes fadeInSlideUp {

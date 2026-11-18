@@ -21,11 +21,9 @@ import {
   ipcListDirectory,
   ipcListFileTransferProviders,
   ipcListFileTransfers,
-  ipcStartFileTransfer,
+  type DirectoryList,
   type FileEntry,
-  type FileEntryKind,
   type FileTransferProviderDescriptor,
-  type FileTransferEntry,
   type FileTransferStatus,
   type FileTransferTaskSnapshot,
 } from "../adapters/tauri";
@@ -55,14 +53,10 @@ import {
   Clipboard,
   Maximize2,
   Minimize2,
-  Send,
   Pause,
   Play,
-  Upload,
-  Download,
   File,
   Folder,
-  ChevronRight,
   Globe,
   FileText,
   Image,
@@ -79,14 +73,9 @@ import {
   Search,
   LayoutGrid,
   List,
-  Plus,
   Laptop,
   Server,
   Smartphone,
-  Trash2,
-  Scissors,
-  ClipboardPaste,
-  Edit3,
   Info,
   ArrowRightLeft,
   ChevronUp,
@@ -95,6 +84,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { useDetailBar } from "./DetailBarContext";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./ui/context-menu";
 
 type TabType = "remote" | "files" | "apps" | "terminal" | "info";
 
@@ -295,7 +285,7 @@ export function DeviceDetailPage() {
       {/* Tab content */}
       <div className="flex-1 overflow-hidden">
         {activeTab === "remote" && <RemoteTab device={device} />}
-        {activeTab === "files" && <FilesTab device={device} devices={devices} />}
+        {activeTab === "files" && <FilesTab device={device} />}
         {activeTab === "apps" && <AppsTab device={device} />}
         {activeTab === "terminal" && <AppsTab device={device} terminalFocus />}
         {activeTab === "info" && <InfoTab device={device} />}
@@ -602,16 +592,6 @@ function RemoteTab({ device }: { device: Device }) {
 }
 
 /* ======================== File Transfer Tab ======================== */
-export type FileItem = {
-  name: string;
-  path?: string;
-  kind?: FileEntryKind;
-  type: "folder" | "file";
-  size: string;
-  modified: string;
-  fileKind: string;
-};
-
 function formatFileSize(sizeBytes: number | null | undefined): string {
   if (sizeBytes === null || sizeBytes === undefined) return "--";
   if (sizeBytes < 1024) return `${sizeBytes} B`;
@@ -637,82 +617,6 @@ function fileKindLabel(entry: FileEntry): string {
   if (ext === "png" || ext === "jpg" || ext === "jpeg") return "图片";
   if (ext === "txt" || ext === "md") return "文本文件";
   return "文件";
-}
-
-function fileEntryToItem(entry: FileEntry): FileItem {
-  return {
-    name: entry.name,
-    path: entry.path,
-    kind: entry.kind,
-    type: entry.kind === "directory" ? "folder" : "file",
-    size: entry.kind === "directory" ? "--" : formatFileSize(entry.size_bytes),
-    modified: formatModifiedTime(entry.modified_ms),
-    fileKind: fileKindLabel(entry),
-  };
-}
-
-function pathSegmentsFromDirectory(path: string | null, fallback: string[]): string[] {
-  if (!path) return fallback;
-  const segments = path.split(/[\\/]+/).filter(Boolean);
-  return segments.length > 0 ? segments : [path];
-}
-
-type FileTransferDragPayload = {
-  files: string[];
-  entries: FileTransferEntry[];
-  fromSide: "left" | "right";
-  fromDeviceId: string;
-};
-
-export type FileTransferDropRequest = {
-  sourceDeviceId: string;
-  targetDeviceId: string;
-  entries: FileTransferEntry[];
-  targetPath: string;
-};
-
-export function fileTransferEntriesFromSelection(
-  files: FileItem[],
-  selectedNames: string[],
-  contextFileName: string
-): FileTransferEntry[] {
-  const transferNames = selectedNames.includes(contextFileName)
-    ? selectedNames
-    : [contextFileName];
-  return transferNames
-    .map((name) => files.find((candidate) => candidate.name === name))
-    .filter((file): file is FileItem => Boolean(file?.path))
-    .map((file) => ({
-      source_path: file.path ?? "",
-      file_name: file.name,
-      kind: file.kind ?? (file.type === "folder" ? "directory" : "file"),
-    }));
-}
-
-export function fileTransferDropRequestForSendToOther({
-  sourceDeviceId,
-  targetDeviceId,
-  targetPath,
-  files,
-  selectedNames,
-  contextFileName,
-}: {
-  sourceDeviceId: string;
-  targetDeviceId: string | null | undefined;
-  targetPath: string | null | undefined;
-  files: FileItem[];
-  selectedNames: string[];
-  contextFileName: string;
-}): FileTransferDropRequest | null {
-  if (!targetDeviceId || !targetPath) return null;
-  const entries = fileTransferEntriesFromSelection(files, selectedNames, contextFileName);
-  if (entries.length === 0) return null;
-  return {
-    sourceDeviceId,
-    targetDeviceId,
-    targetPath,
-    entries,
-  };
 }
 
 function fileTransferStatusLabel(status: FileTransferStatus): string {
@@ -774,339 +678,174 @@ function upsertFileTransferTask(
   return nextTransfers;
 }
 
-function FilePane({
-  deviceId,
-  side,
-  otherDeviceName,
-  targetDeviceId,
-  targetPath,
-  isDark,
-  onPathChange,
-  onFileTransferDrop,
-  dragOver,
-  devices,
-}: {
-  deviceId: string; side: "left" | "right"; otherDeviceName: string | null; isDark: boolean;
-  targetDeviceId: string | null;
-  targetPath: string | null;
-  onPathChange: (path: string | null) => void;
-  onFileTransferDrop: (request: FileTransferDropRequest) => void;
-  dragOver: boolean;
-  devices: Device[];
-}) {
-  const dev = devices.find(d => d.id === deviceId);
-  const devName = dev?.name ?? "未知设备";
-  const contextMenuRef = useRef<HTMLDivElement>(null);
-  const [currentPath, setCurrentPath] = useState<string[]>([devName]);
-  const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-  const [viewMode, setViewMode] = useState<"list" | "grid">("list");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number; fileName: string; fileType: string } | null>(null);
-  const [serviceFiles, setServiceFiles] = useState<FileItem[] | null>(null);
-  const [servicePath, setServicePath] = useState<string | null>(null);
-  const [serviceParentPath, setServiceParentPath] = useState<string | null>(null);
-  const [serviceLoading, setServiceLoading] = useState(false);
-  const [serviceError, setServiceError] = useState<string | null>(null);
+function localEntryIcon(entry: FileEntry) {
+  if (entry.kind === "directory") return <Folder aria-hidden="true" className="size-4 shrink-0 text-yellow-600" />;
+  if (entry.name.endsWith(".png") || entry.name.endsWith(".jpg")) return <Image aria-hidden="true" className="size-4 shrink-0 text-green-600" />;
+  if (entry.name.endsWith(".pdf")) return <FileText aria-hidden="true" className="size-4 shrink-0 text-red-600" />;
+  if (entry.name.endsWith(".mp3") || entry.name.endsWith(".wav")) return <Music aria-hidden="true" className="size-4 shrink-0 text-purple-600" />;
+  return <File aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />;
+}
+
+function LocalDirectoryPane() {
+  const [directory, setDirectory] = useState<DirectoryList | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [asTiles, setAsTiles] = useState(false);
+  const [details, setDetails] = useState<FileEntry | null>(null);
+  const [copyStatus, setCopyStatus] = useState<"copied" | "failed" | null>(null);
+  const latestDirectoryRequest = useRef(0);
 
   const loadDirectory = useCallback(async (path: string | null) => {
-    setServiceLoading(true);
-    setServiceError(null);
-    if (!dev?.isLocal) {
-      setServiceFiles([]);
-      setServiceError("远程目录浏览尚未接入服务");
-      setServiceLoading(false);
-      return;
+    const request = ++latestDirectoryRequest.current;
+    setLoading(true);
+    setError(null);
+    setDetails(null);
+    setCopyStatus(null);
+    try {
+      const result = await ipcListDirectory(path);
+      if (request !== latestDirectoryRequest.current) return;
+      if (result.ok) setDirectory(result.value);
+      else setError(result.error.message);
+    } catch (cause) {
+      if (request === latestDirectoryRequest.current) {
+        setError(cause instanceof Error ? cause.message : "暂时无法读取目录");
+      }
+    } finally {
+      if (request === latestDirectoryRequest.current) setLoading(false);
     }
-    const result = await ipcListDirectory(path);
-    if (!result.ok) {
-      setServiceError(result.error.message);
-      setServiceLoading(false);
-      return;
-    }
-    setServicePath(result.value.path);
-    onPathChange(result.value.path);
-    setServiceParentPath(result.value.parent_path ?? null);
-    setServiceFiles(result.value.entries.map(fileEntryToItem));
-    setCurrentPath(pathSegmentsFromDirectory(result.value.path, [devName]));
-    setSelectedFiles(new Set());
-    setServiceLoading(false);
-  }, [devName, dev?.isLocal, onPathChange]);
-
-  useEffect(() => {
-    setServiceFiles(null);
-    setServicePath(null);
-    onPathChange(null);
-    setServiceParentPath(null);
-    setCurrentPath([devName]);
-    setSelectedFiles(new Set());
-    void loadDirectory(null);
-  }, [devName, deviceId, loadDirectory, onPathChange]);
-
-  const files: FileItem[] = (serviceFiles ?? []).filter(f =>
-    searchQuery ? f.name.toLowerCase().includes(searchQuery.toLowerCase()) : true
-  );
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) setContextMenuState(null);
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
   }, []);
 
-  const handleContextMenu = (e: React.MouseEvent, fileName: string, fileType: string) => { e.preventDefault(); setContextMenuState({ x: e.clientX, y: e.clientY, fileName, fileType }); };
-  const handleFileClick = (e: React.MouseEvent, fileName: string) => {
-    if (e.ctrlKey || e.metaKey) {
-      setSelectedFiles(prev => { const n = new Set(prev); if (n.has(fileName)) n.delete(fileName); else n.add(fileName); return n; });
-    } else setSelectedFiles(new Set([fileName]));
-  };
-  const handleDoubleClick = (f: FileItem) => {
-    if (f.type === "folder") {
-      if (f.path) void loadDirectory(f.path);
-      else {
-        setCurrentPath(p => [...p, f.name]);
-        setSelectedFiles(new Set());
-      }
-    }
-  };
-  const navigateUp = () => {
-    if (serviceParentPath) {
-      void loadDirectory(serviceParentPath);
-      return;
-    }
-    if (currentPath.length > 1) { setCurrentPath(p => p.slice(0, -1)); setSelectedFiles(new Set()); }
-  };
-  const navigateHome = () => {
+  useEffect(() => {
     void loadDirectory(null);
-  };
-  const navigateTo = (i: number) => { setCurrentPath(p => p.slice(0, i + 1)); setSelectedFiles(new Set()); };
+    return () => { latestDirectoryRequest.current += 1; };
+  }, [loadDirectory]);
 
-  const handleDragStart = (e: React.DragEvent, fileName: string) => {
-    const dragFiles = selectedFiles.has(fileName) ? Array.from(selectedFiles) : [fileName];
-    const entries = fileTransferEntriesFromSelection(files, dragFiles, fileName);
-    e.dataTransfer.setData(
-      "fileTransfer",
-      JSON.stringify({ files: dragFiles, entries, fromSide: side, fromDeviceId: deviceId })
-    );
-    e.dataTransfer.effectAllowed = "copy";
-  };
-
-  const handlePaneDrop = (e: React.DragEvent) => {
-    e.preventDefault();
+  const copyPath = async (path: string) => {
     try {
-      const parsed = JSON.parse(e.dataTransfer.getData("fileTransfer")) as FileTransferDragPayload;
-      if (parsed.fromSide !== side && servicePath && parsed.entries.length > 0) {
-        onFileTransferDrop({
-          sourceDeviceId: parsed.fromDeviceId,
-          targetDeviceId: deviceId,
-          entries: parsed.entries,
-          targetPath: servicePath,
-        });
-      }
-    } catch {}
+      await navigator.clipboard.writeText(path);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
+    }
   };
 
-  const handleSendContextFileToOther = () => {
-    if (!contextMenuState) return;
-    const request = fileTransferDropRequestForSendToOther({
-      sourceDeviceId: deviceId,
-      targetDeviceId,
-      targetPath,
-      files,
-      selectedNames: Array.from(selectedFiles),
-      contextFileName: contextMenuState.fileName,
-    });
-    if (request) onFileTransferDrop(request);
-    setContextMenuState(null);
-  };
-
-  const DevIcon = dev?.icon ?? Monitor;
-  const getFileIcon = (f: FileItem) => {
-    if (f.type === "folder") return <Folder className="w-4 h-4 text-yellow-500 shrink-0" />;
-    if (f.name.endsWith(".png") || f.name.endsWith(".jpg")) return <Image className="w-4 h-4 text-green-500 shrink-0" />;
-    if (f.name.endsWith(".pdf")) return <FileText className="w-4 h-4 text-red-500 shrink-0" />;
-    if (f.name.endsWith(".mp3") || f.name.endsWith(".wav")) return <Music className="w-4 h-4 text-purple-500 shrink-0" />;
-    return <File className={`w-4 h-4 shrink-0 ${isDark ? "text-gray-500" : "text-gray-400"}`} />;
-  };
+  const query = search.trim().toLowerCase();
+  const entries = (directory?.entries ?? []).filter((entry) => entry.name.toLowerCase().includes(query));
+  const parentPath = directory?.parent_path;
+  const iconButton = "rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-blue-500 disabled:opacity-40";
 
   return (
-    <div className={`flex-1 flex flex-col min-w-0 relative ${dragOver ? (isDark ? "ring-2 ring-inset ring-blue-500/50" : "ring-2 ring-inset ring-blue-400/50") : ""}`}
-      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; }} onDrop={handlePaneDrop}>
-      {dragOver && servicePath && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none bg-blue-500/5">
-          <div className={`px-4 py-2 rounded-lg border-2 border-dashed ${isDark ? "border-blue-500/40 bg-[#1e1e1e]/90 text-blue-400" : "border-blue-400/40 bg-white/90 text-blue-600"}`} style={{ fontSize: 13 }}>
-            <Download style={{ width: 16, height: 16, display: "inline", marginRight: 6, verticalAlign: -3 }} />拖放到此处传输
-          </div>
-        </div>
-      )}
-      {/* Toolbar */}
-      <div className={`flex items-center gap-1.5 px-2 py-1 border-b shrink-0 ${isDark ? "bg-[#232323] border-gray-700" : "bg-white border-gray-200"}`}>
-        <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-md mr-1 ${isDark ? "bg-[#2a2a2a]" : "bg-gray-50"}`}>
-          <DevIcon style={{ width: 12, height: 12 }} className={isDark ? "text-gray-400" : "text-gray-500"} />
-          <span className={isDark ? "text-gray-300" : "text-gray-600"} style={{ fontSize: 11 }}>{devName}</span>
-          <div className={`w-1.5 h-1.5 rounded-full ${dev?.status === "online" ? "bg-green-500" : "bg-gray-400"}`} />
-        </div>
-        <div className={`w-px h-4 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
-        <button onClick={navigateUp} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"} ${currentPath.length <= 1 ? "opacity-40 pointer-events-none" : ""}`} title="上级目录">
-          <ArrowUp style={{ width: 13, height: 13 }} />
+    <section aria-label="本机目录" className="flex min-h-0 flex-1 flex-col overflow-hidden bg-card text-card-foreground">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-border px-3 py-2">
+        <button type="button" aria-label="上级目录" className={iconButton} disabled={!parentPath || loading} onClick={() => void loadDirectory(parentPath ?? null)}>
+          <ArrowUp aria-hidden="true" className="size-4" />
         </button>
-        <button onClick={navigateHome} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="主目录">
-          <Home style={{ width: 13, height: 13 }} />
+        <button type="button" aria-label="主目录" className={iconButton} disabled={loading} onClick={() => void loadDirectory(null)}>
+          <Home aria-hidden="true" className="size-4" />
         </button>
-        <button onClick={() => void loadDirectory(servicePath)} className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-500 hover:bg-gray-100 hover:text-gray-700"}`} title="刷新">
-          <RefreshCw style={{ width: 12, height: 12 }} />
+        <button type="button" aria-label="刷新目录" className={iconButton} disabled={loading} onClick={() => void loadDirectory(directory?.path ?? null)}>
+          <RefreshCw aria-hidden="true" className="size-4" />
         </button>
-        <div className={`flex-1 flex items-center gap-0.5 px-2 py-0.5 rounded-md min-w-0 ${isDark ? "bg-[#2a2a2a] border border-gray-700" : "bg-gray-50 border border-gray-200"}`}>
-          {currentPath.map((seg, i) => (
-            <span key={i} className="flex items-center gap-0.5 shrink-0">
-              {i > 0 && <ChevronRight style={{ width: 9, height: 9 }} className={isDark ? "text-gray-600" : "text-gray-300"} />}
-              <button onClick={() => navigateTo(i)} className={`px-0.5 rounded transition-colors truncate ${isDark ? "text-gray-300 hover:text-blue-400 hover:bg-gray-700" : "text-gray-600 hover:text-blue-600 hover:bg-gray-100"}`} style={{ fontSize: 10, maxWidth: 90 }}>{seg}</button>
-            </span>
+        <span className="min-w-24 flex-1 truncate rounded bg-muted px-2 py-1.5 font-mono text-xs" title={directory?.path}>
+          {directory?.path ?? "本机目录"}
+        </span>
+        <label className="flex items-center gap-1.5 rounded border border-border px-2">
+          <Search aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          <input
+            type="search"
+            aria-label="搜索当前目录"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="搜索当前目录"
+            className="w-28 bg-transparent py-1.5 text-xs"
+          />
+        </label>
+        <button type="button" aria-label="列表视图" aria-pressed={!asTiles} className={iconButton} onClick={() => setAsTiles(false)}>
+          <List aria-hidden="true" className="size-4" />
+        </button>
+        <button type="button" aria-label="网格视图" aria-pressed={asTiles} className={iconButton} onClick={() => setAsTiles(true)}>
+          <LayoutGrid aria-hidden="true" className="size-4" />
+        </button>
+      </div>
+
+      {loading && <p role="status" className="px-3 py-2 text-xs text-muted-foreground">正在读取目录…</p>}
+      {error && <p role="alert" className="break-words px-3 py-2 text-xs text-destructive">目录读取失败。{error}</p>}
+      {copyStatus === "copied" && <p role="status" className="px-3 py-2 text-xs text-muted-foreground">已复制文件路径</p>}
+      {copyStatus === "failed" && <p role="alert" className="px-3 py-2 text-xs text-destructive">无法复制文件路径</p>}
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {!loading && !error && entries.length === 0 && (
+          <p role="status" className="px-3 py-4 text-sm text-muted-foreground">
+            {query ? "没有符合条件的项目" : "此目录为空"}
+          </p>
+        )}
+        <ul className={asTiles ? "grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-2 p-3" : "divide-y divide-border"}>
+          {entries.map((entry) => (
+            <li key={entry.path} className="min-w-0">
+              <ContextMenu>
+                <ContextMenuTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => entry.kind === "directory" ? void loadDirectory(entry.path) : setDetails(entry)}
+                    className={asTiles
+                      ? "flex w-full flex-col items-center gap-2 rounded border border-border p-3 text-xs hover:bg-muted focus-visible:ring-2 focus-visible:ring-blue-500"
+                      : "flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs hover:bg-muted focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500"}
+                  >
+                    {localEntryIcon(entry)}
+                    <span className="max-w-full min-w-0 flex-1 truncate">{entry.name}</span>
+                    {!asTiles && <>
+                      <span className="w-24 shrink-0 text-right text-muted-foreground">{formatModifiedTime(entry.modified_ms)}</span>
+                      <span className="w-20 shrink-0 text-right text-muted-foreground">{fileKindLabel(entry)}</span>
+                      <span className="w-16 shrink-0 text-right text-muted-foreground">{formatFileSize(entry.size_bytes)}</span>
+                    </>}
+                  </button>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  {entry.kind === "directory" && <ContextMenuItem onSelect={() => void loadDirectory(entry.path)}>
+                    <FolderOpen aria-hidden="true" />打开
+                  </ContextMenuItem>}
+                  <ContextMenuItem onSelect={() => void copyPath(entry.path)}>
+                    <Copy aria-hidden="true" />复制路径
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={() => setDetails(entry)}>
+                    <Info aria-hidden="true" />属性
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
+            </li>
           ))}
-        </div>
-        <div className={`flex items-center gap-1 px-2 py-0.5 rounded-md w-32 ${isDark ? "bg-[#2a2a2a] border border-gray-700" : "bg-gray-50 border border-gray-200"}`}>
-          <Search style={{ width: 11, height: 11 }} className={isDark ? "text-gray-500" : "text-gray-400"} />
-          <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="搜索..." className={`bg-transparent outline-none flex-1 min-w-0 placeholder-gray-500 ${isDark ? "text-gray-200" : "text-gray-700"}`} style={{ fontSize: 10 }} />
-        </div>
-        <div className={`flex items-center rounded-md overflow-hidden border ${isDark ? "border-gray-700" : "border-gray-200"}`}>
-          <button onClick={() => setViewMode("list")} className={`p-1 transition-colors ${viewMode === "list" ? (isDark ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700") : (isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600")}`}>
-            <List style={{ width: 12, height: 12 }} />
-          </button>
-          <button onClick={() => setViewMode("grid")} className={`p-1 transition-colors ${viewMode === "grid" ? (isDark ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700") : (isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600")}`}>
-            <LayoutGrid style={{ width: 12, height: 12 }} />
-          </button>
-        </div>
+        </ul>
       </div>
-      {viewMode === "list" && (
-        <div className={`flex items-center px-3 py-0.5 border-b shrink-0 ${isDark ? "border-gray-700/60 bg-[#232323]" : "border-gray-100 bg-white"}`}>
-          <span className={`flex-1 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>名称</span>
-          <span className={`w-24 text-right ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>修改日期</span>
-          <span className={`w-20 text-right ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>类型</span>
-          <span className={`w-16 text-right ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>大小</span>
+
+      {details && <section className="shrink-0 border-t border-border bg-muted/50 px-3 py-2" aria-label="文件属性">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <h3 className="min-w-0 truncate text-sm font-medium">{details.name}</h3>
+          <button type="button" className={iconButton} onClick={() => setDetails(null)}>关闭属性</button>
         </div>
-      )}
-      <div
-        className={`flex-1 overflow-y-auto ${viewMode === "grid" ? "p-2" : ""} ${isDark ? "bg-[#1e1e1e]" : "bg-white"}`}
-        onClick={(e) => { if (e.target === e.currentTarget) setSelectedFiles(new Set()); }}
-        onContextMenu={(e) => { if (e.target === e.currentTarget) { e.preventDefault(); setContextMenuState({ x: e.clientX, y: e.clientY, fileName: "", fileType: "background" }); } }}
-      >
-        {serviceError && (
-          <div role="alert" className={`px-3 py-2 border-b ${isDark ? "border-red-900/40 bg-red-950/20 text-red-300" : "border-red-100 bg-red-50 text-red-700"}`} style={{ fontSize: 11 }}>
-            目录读取失败：{serviceError}
-          </div>
-        )}
-        {serviceLoading && (
-          <div className={`flex items-center gap-2 px-3 py-2 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 11 }}>
-            <Loader2 className="w-3 h-3 animate-spin" />
-            正在读取目录...
-          </div>
-        )}
-        {viewMode === "list" ? (
-          <div>
-            {files.map((f) => {
-              const isSel = selectedFiles.has(f.name);
-              return (
-                <div key={f.name} draggable onDragStart={(e) => handleDragStart(e, f.name)}
-                  onClick={(e) => handleFileClick(e, f.name)} onDoubleClick={() => handleDoubleClick(f)}
-                  onContextMenu={(e) => handleContextMenu(e, f.name, f.type)}
-                  className={`flex items-center px-3 py-1 cursor-default transition-colors ${isSel ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "hover:bg-[#252525]" : "hover:bg-gray-50/80")}`}>
-                  <div className="flex items-center gap-2 flex-1 min-w-0">
-                    {getFileIcon(f)}
-                    <span className={`truncate ${isSel ? (isDark ? "text-blue-300" : "text-blue-700") : (isDark ? "text-gray-300" : "text-gray-700")}`} style={{ fontSize: 11 }}>{f.name}</span>
-                  </div>
-                  <span className={`w-24 text-right shrink-0 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>{f.modified}</span>
-                  <span className={`w-20 text-right shrink-0 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>{f.fileKind}</span>
-                  <span className={`w-16 text-right shrink-0 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>{f.size}</span>
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="grid grid-cols-4 gap-1.5">
-            {files.map((f) => {
-              const isSel = selectedFiles.has(f.name);
-              return (
-                <div key={f.name} draggable onDragStart={(e) => handleDragStart(e, f.name)}
-                  onClick={(e) => handleFileClick(e, f.name)} onDoubleClick={() => handleDoubleClick(f)}
-                  onContextMenu={(e) => handleContextMenu(e, f.name, f.type)}
-                  className={`flex flex-col items-center gap-1 p-2.5 rounded-lg cursor-default transition-colors ${isSel ? (isDark ? "bg-blue-900/30" : "bg-blue-50") : (isDark ? "hover:bg-[#252525]" : "hover:bg-gray-50")}`}>
-                  {f.type === "folder" ? <Folder className="w-7 h-7 text-yellow-500" />
-                    : f.name.endsWith(".png") || f.name.endsWith(".jpg") ? <Image className="w-7 h-7 text-green-500" />
-                    : f.name.endsWith(".pdf") ? <FileText className="w-7 h-7 text-red-500" />
-                    : <File className={`w-7 h-7 ${isDark ? "text-gray-500" : "text-gray-400"}`} />}
-                  <span className={`text-center truncate w-full ${isSel ? (isDark ? "text-blue-300" : "text-blue-700") : (isDark ? "text-gray-300" : "text-gray-700")}`} style={{ fontSize: 10 }}>{f.name}</span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </div>
-      <div className={`flex items-center justify-between px-3 py-0.5 border-t shrink-0 ${isDark ? "bg-[#232323] border-gray-700" : "bg-white border-gray-200"}`}>
-        <div className="flex items-center gap-2">
-          <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 9 }}>{files.length} 个项目</span>
-          {selectedFiles.size > 0 && <span className={isDark ? "text-gray-400" : "text-gray-500"} style={{ fontSize: 9 }}>已选择 {selectedFiles.size} 项</span>}
-        </div>
-        <span className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 9 }}>本机目录</span>
-      </div>
-      {contextMenuState && (
-        <div ref={contextMenuRef} className={`fixed z-50 rounded-lg border shadow-lg py-1 min-w-[180px] ${isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"}`} style={{ left: contextMenuState.x, top: contextMenuState.y }}>
-          {contextMenuState.fileType !== "background" ? (
-            <>
-              {contextMenuState.fileType === "folder" && (
-                <CtxItem icon={<FolderOpen style={{ width: 13, height: 13 }} />} label="打开" onClick={() => { handleDoubleClick({ name: contextMenuState.fileName, type: "folder", size: "", modified: "", fileKind: "" }); setContextMenuState(null); }} isDark={isDark} />
-              )}
-              <CtxItem icon={<Download style={{ width: 13, height: 13 }} />} label="下载到本地" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              {otherDeviceName && targetPath && (
-                <CtxItem icon={<Send style={{ width: 13, height: 13 }} />} label={`发送到 ${otherDeviceName}`}
-                  onClick={handleSendContextFileToOther} isDark={isDark} />
-              )}
-              <div className={`h-px mx-2 my-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
-              <CtxItem icon={<Scissors style={{ width: 13, height: 13 }} />} label="剪切" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <CtxItem icon={<Copy style={{ width: 13, height: 13 }} />} label="复制" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <CtxItem icon={<Edit3 style={{ width: 13, height: 13 }} />} label="重命名" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <CtxItem icon={<Trash2 style={{ width: 13, height: 13 }} />} label="删除" onClick={() => setContextMenuState(null)} isDark={isDark} danger />
-              <div className={`h-px mx-2 my-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
-              <CtxItem icon={<Info style={{ width: 13, height: 13 }} />} label="属性" onClick={() => setContextMenuState(null)} isDark={isDark} />
-            </>
-          ) : (
-            <>
-              <CtxItem icon={<Upload style={{ width: 13, height: 13 }} />} label="上传文件到此处" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <CtxItem icon={<Folder style={{ width: 13, height: 13 }} />} label="新建文件夹" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <div className={`h-px mx-2 my-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
-              <CtxItem icon={<ClipboardPaste style={{ width: 13, height: 13 }} />} label="粘贴" onClick={() => setContextMenuState(null)} isDark={isDark} />
-              <CtxItem icon={<RefreshCw style={{ width: 13, height: 13 }} />} label="刷新" onClick={() => setContextMenuState(null)} isDark={isDark} />
-            </>
-          )}
-        </div>
-      )}
-    </div>
+        <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+          <dt>路径</dt><dd className="break-all font-mono">{details.path}</dd>
+          <dt>类型</dt><dd>{fileKindLabel(details)}</dd>
+          <dt>修改日期</dt><dd>{formatModifiedTime(details.modified_ms)}</dd>
+          <dt>大小</dt><dd>{formatFileSize(details.size_bytes)}</dd>
+          <dt>只读</dt><dd>{details.readonly ? "是" : "否"}</dd>
+        </dl>
+      </section>}
+    </section>
   );
 }
 
-function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
+function FilesTab({ device }: { device: Device }) {
   const { isDark } = useTheme();
+  const native = isTauriRuntime();
   const unavailableReason = remoteStartUnavailableReason(device);
 
-  const [leftDeviceId, setLeftDeviceId] = useState(device.id);
-  const [rightDeviceId, setRightDeviceId] = useState<string | null>(null);
-  const [leftPanePath, setLeftPanePath] = useState<string | null>(null);
-  const [rightPanePath, setRightPanePath] = useState<string | null>(null);
-  const [showAddMenu, setShowAddMenu] = useState(false);
-  const [addMenuSide, setAddMenuSide] = useState<"left" | "right">("right");
-  const addMenuRef = useRef<HTMLDivElement>(null);
-  const addBtnRef = useRef<HTMLButtonElement>(null);
-  const [dragOverSide, setDragOverSide] = useState<"left" | "right" | null>(null);
-  const [transferMessage, setTransferMessage] = useState<string | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
   const [fileTransfers, setFileTransfers] = useState<FileTransferTaskSnapshot[]>([]);
   const [transferListError, setTransferListError] = useState<string | null>(null);
   const [fileTransferProviders, setFileTransferProviders] = useState<FileTransferProviderDescriptor[]>([]);
   const [providerListError, setProviderListError] = useState<string | null>(null);
   const [cancellingTransferId, setCancellingTransferId] = useState<string | null>(null);
-
-  const onlineDevices = devices.filter(d => d.status === "online");
-  const leftDevice = devices.find(d => d.id === leftDeviceId);
-  const rightDevice = rightDeviceId ? devices.find(d => d.id === rightDeviceId) : null;
 
   const refreshFileTransfers = useCallback(async () => {
     const result = await ipcListFileTransfers();
@@ -1129,49 +868,10 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
   }, []);
 
   useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node) && addBtnRef.current && !addBtnRef.current.contains(e.target as Node)) setShowAddMenu(false);
-    };
-    document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
-  }, []);
-
-  useEffect(() => {
+    if (!native || unavailableReason) return;
     void refreshFileTransfers();
     void refreshFileTransferProviders();
-  }, [refreshFileTransferProviders, refreshFileTransfers]);
-
-  const handleAddDevice = (dId: string) => {
-    if (addMenuSide === "right") setRightDeviceId(dId);
-    else setLeftDeviceId(dId);
-    setShowAddMenu(false);
-  };
-
-  const handleFileTransferDrop = useCallback(async (request: FileTransferDropRequest) => {
-    setTransferMessage(null);
-    setTransferError(null);
-    const result = await ipcStartFileTransfer({
-      source_device_id: request.sourceDeviceId,
-      target_device_id: request.targetDeviceId,
-      entries: request.entries,
-      target_path: request.targetPath,
-      conflict_policy: "rename",
-      transport_hint: "local",
-      provider_hint: "mrd-local",
-    });
-    if (!result.ok) {
-      setTransferError(result.error.message);
-      return;
-    }
-    if (result.value.status === "failed") {
-      setTransferError(result.value.error ?? "文件传输失败");
-      return;
-    }
-    setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
-    setTransferMessage(
-      `已传输 ${result.value.copied_entries}/${result.value.total_entries} 个文件`
-    );
-  }, []);
+  }, [native, refreshFileTransferProviders, refreshFileTransfers, unavailableReason]);
 
   const handleCancelFileTransfer = useCallback(async (transferId: string) => {
     setCancellingTransferId(transferId);
@@ -1184,6 +884,10 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
     }
     setFileTransfers((transfers) => upsertFileTransferTask(transfers, result.value));
   }, []);
+
+  if (!native) {
+    return <p className="p-6 text-sm text-muted-foreground">网页端暂不支持文件操作。可在桌面客户端浏览本机目录。</p>;
+  }
 
   if (unavailableReason) {
     return (
@@ -1198,23 +902,7 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
 
   return (
     <div className={`relative flex h-full flex-col overflow-hidden ${isDark ? "bg-[#1a1a1a]" : "bg-[#f0f2f5]"}`}>
-      {(transferMessage || transferError) && (
-        <div
-          role="status"
-          className={`absolute right-4 top-20 z-30 rounded-md border px-3 py-2 shadow-sm ${
-            transferError
-              ? isDark
-                ? "border-red-900/50 bg-red-950 text-red-200"
-                : "border-red-100 bg-red-50 text-red-700"
-              : isDark
-                ? "border-emerald-900/50 bg-emerald-950 text-emerald-200"
-                : "border-emerald-100 bg-emerald-50 text-emerald-700"
-          }`}
-          style={{ fontSize: 12 }}
-        >
-          {transferError ?? transferMessage}
-        </div>
-      )}
+      {transferError && <p role="alert" className="px-4 py-2 text-xs text-destructive">{transferError}</p>}
       {(fileTransfers.length > 0 || transferListError) && (
         <div
           role="region"
@@ -1368,132 +1056,14 @@ function FilesTab({ device, devices }: { device: Device; devices: Device[] }) {
           </div>
         </div>
       )}
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-      {/* Left pane */}
-      <div
-        className="flex-1 flex flex-col min-w-0"
-        onDragOver={(e) => { e.preventDefault(); setDragOverSide("left"); }}
-        onDragLeave={() => setDragOverSide(null)}
-        onDrop={() => setDragOverSide(null)}
-      >
-        <FilePane
-          deviceId={leftDeviceId}
-          side="left"
-          otherDeviceName={rightDevice?.name ?? null}
-          targetDeviceId={rightDeviceId}
-          targetPath={rightPanePath}
-          isDark={isDark}
-          onPathChange={setLeftPanePath}
-          onFileTransferDrop={handleFileTransferDrop}
-          dragOver={dragOverSide === "left"}
-          devices={devices}
-        />
-      </div>
-
-      {/* Center divider with + button */}
-      <div className={`relative w-8 shrink-0 flex flex-col items-center justify-center border-x ${isDark ? "bg-[#1a1a1a] border-gray-700/60" : "bg-[#f0f2f5] border-gray-200"}`}>
-        <div className={`flex flex-col items-center gap-1 mb-2 ${isDark ? "text-gray-600" : "text-gray-300"}`}>
-          <ChevronRight style={{ width: 12, height: 12 }} />
-          <ChevronRight style={{ width: 12, height: 12, transform: "rotate(180deg)" }} />
-        </div>
-
-        <button
-          ref={addBtnRef}
-          onClick={() => { setAddMenuSide("right"); setShowAddMenu(!showAddMenu); }}
-          className={`w-7 h-7 rounded-full flex items-center justify-center border transition-all ${isDark ? "bg-[#232323] border-gray-600 text-gray-400 hover:border-blue-500 hover:text-blue-400 hover:bg-blue-900/20" : "bg-white border-gray-300 text-gray-400 hover:border-blue-400 hover:text-blue-500 hover:bg-blue-50"} shadow-sm`}
-          title="添加设备"
-        >
-          <Plus style={{ width: 13, height: 13 }} />
-        </button>
-
-        <div className={`flex flex-col items-center gap-1 mt-2 ${isDark ? "text-gray-600" : "text-gray-300"}`}>
-          <ArrowRightLeft style={{ width: 12, height: 12 }} />
-        </div>
-
-        {/* Add device menu */}
-        {showAddMenu && (
-          <div ref={addMenuRef} className={`absolute z-50 top-1/2 left-full ml-2 -translate-y-1/2 rounded-xl border shadow-xl py-2 min-w-[220px] ${isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"}`}>
-            <div className={`px-3 py-1.5 ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 10 }}>选择设备</div>
-            {onlineDevices.map((d) => {
-              const DIcon = d.icon;
-              const isActive = d.id === leftDeviceId || d.id === rightDeviceId;
-              return (
-                <button
-                  key={d.id}
-                  onClick={() => handleAddDevice(d.id)}
-                  disabled={isActive}
-                  className={`w-full flex items-center gap-2.5 px-3 py-2 transition-colors ${isActive ? (isDark ? "text-gray-600 cursor-not-allowed" : "text-gray-300 cursor-not-allowed") : (isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-700 hover:bg-gray-50")}`}
-                  style={{ fontSize: 12 }}
-                >
-                  <div className={`w-6 h-6 rounded-md flex items-center justify-center ${isDark ? "bg-gray-700" : "bg-gray-100"}`}>
-                    <DIcon style={{ width: 13, height: 13 }} />
-                  </div>
-                  <div className="flex-1 text-left min-w-0">
-                    <div className="truncate">{d.name}</div>
-                    <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 10 }}>{d.os} · {d.ip}</div>
-                  </div>
-                  {isActive && (
-                    <span className={`px-1.5 py-0.5 rounded ${isDark ? "bg-gray-700 text-gray-500" : "bg-gray-100 text-gray-400"}`} style={{ fontSize: 9 }}>已添加</span>
-                  )}
-                  <div className="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0" />
-                </button>
-              );
-            })}
-            {onlineDevices.length === 0 && (
-              <div className={`px-3 py-4 text-center ${isDark ? "text-gray-500" : "text-gray-400"}`} style={{ fontSize: 12 }}>没有在线设备</div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Right pane */}
-      <div
-        className="flex-1 flex flex-col min-w-0"
-        onDragOver={(e) => { e.preventDefault(); setDragOverSide("right"); }}
-        onDragLeave={() => setDragOverSide(null)}
-        onDrop={() => setDragOverSide(null)}
-      >
-        {rightDeviceId ? (
-          <FilePane
-            deviceId={rightDeviceId}
-            side="right"
-            otherDeviceName={leftDevice?.name ?? null}
-            targetDeviceId={leftDeviceId}
-            targetPath={leftPanePath}
-            isDark={isDark}
-            onPathChange={setRightPanePath}
-            onFileTransferDrop={handleFileTransferDrop}
-            dragOver={dragOverSide === "right"}
-            devices={devices}
-          />
-        ) : (
-          <div className={`flex-1 flex flex-col items-center justify-center ${isDark ? "bg-[#1e1e1e]" : "bg-white"}`}>
-            <div className={`w-14 h-14 rounded-2xl flex items-center justify-center mb-4 ${isDark ? "bg-gray-800" : "bg-gray-50"}`}>
-              <Monitor className={`w-7 h-7 ${isDark ? "text-gray-600" : "text-gray-300"}`} />
-            </div>
-            <div className={isDark ? "text-gray-500" : "text-gray-400"} style={{ fontSize: 14 }}>选择设备以开始传输</div>
-            <div className={`mt-1 ${isDark ? "text-gray-600" : "text-gray-300"}`} style={{ fontSize: 12 }}>点击中间的 + 号添加设备，或从侧边栏拖入</div>
-            <button
-              onClick={() => { setAddMenuSide("right"); setShowAddMenu(true); }}
-              className={`mt-5 flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors ${isDark ? "bg-[#232323] border-gray-600 text-gray-300 hover:border-blue-500 hover:text-blue-400" : "bg-gray-50 border-gray-200 text-gray-600 hover:border-blue-400 hover:text-blue-500"}`}
-              style={{ fontSize: 12 }}
-            >
-              <Plus style={{ width: 14, height: 14 }} />
-              添加设备
-            </button>
-          </div>
-        )}
-      </div>
-      </div>
+      {device.isLocal ? <LocalDirectoryPane key={device.id} /> : (
+        <section aria-label="远程文件" className="flex flex-1 flex-col items-center justify-center gap-2 px-6 py-8 text-center">
+          <FolderOpen aria-hidden="true" className="size-9 text-muted-foreground" />
+          <h3 className="font-medium">远程文件不可用</h3>
+          <p className="max-w-sm text-sm text-muted-foreground">远程目录浏览尚未接入服务，当前无法浏览或传输此设备的文件。</p>
+        </section>
+      )}
     </div>
-  );
-}
-
-function CtxItem({ icon, label, onClick, isDark, danger }: { icon: React.ReactNode; label: string; onClick: () => void; isDark: boolean; danger?: boolean }) {
-  return (
-    <button onClick={onClick} className={`w-full flex items-center gap-2.5 px-3 py-1.5 transition-colors ${danger ? (isDark ? "text-red-400 hover:bg-red-900/30" : "text-red-600 hover:bg-red-50") : (isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-700 hover:bg-gray-50")}`} style={{ fontSize: 12 }}>
-      <span className={danger ? "" : isDark ? "text-gray-500" : "text-gray-400"}>{icon}</span>{label}
-    </button>
   );
 }
 

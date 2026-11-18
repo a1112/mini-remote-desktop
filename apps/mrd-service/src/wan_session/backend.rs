@@ -365,6 +365,24 @@ pub trait WanSessionBackend: Send + Sync {
         binding: &WanSessionBinding,
         approval: &WanSessionApproval,
     ) -> Result<WanSessionRecord, WanSessionBackendError>;
+    /// Only a target-authenticated backend response can establish this fact.
+    async fn same_account(
+        &self,
+        _binding: &WanSessionBinding,
+        _controller_key_id: &str,
+        _target_key_id: &str,
+    ) -> Result<bool, WanSessionBackendError> {
+        Ok(false)
+    }
+    async fn approve_same_account(
+        &self,
+        _binding: &WanSessionBinding,
+        _approval: &WanSessionApproval,
+        _controller_key_id: &str,
+        _target_key_id: &str,
+    ) -> Result<WanSessionRecord, WanSessionBackendError> {
+        Err(WanSessionBackendError::Unauthorized)
+    }
     async fn reject(
         &self,
         binding: &WanSessionBinding,
@@ -422,16 +440,33 @@ impl ServiceWanSessionWorkflowBackend {
         super::coordinator::WanBackendSessionSnapshot,
         super::coordinator::WanSessionPortError,
     > {
+        let temporary_guest = record.temporary_authority().is_some();
         if let Some(authority) = record.temporary_authority() {
             let owner = self
                 .temporary_owner
                 .as_ref()
                 .and_then(Weak::upgrade)
-                .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        target: "mrd-service",
+                        stage = "temporary_guest_authorization",
+                        validation = "owner_unavailable",
+                        "WAN temporary guest authorization owner is unavailable"
+                    );
+                    super::coordinator::WanSessionPortError::Rejected
+                })?;
             let auth = owner
                 .public_connection
                 .device_auth_version()
-                .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        target: "mrd-service",
+                        stage = "temporary_guest_authorization",
+                        validation = "device_auth_version_missing",
+                        "WAN temporary guest authorization has no device auth version"
+                    );
+                    super::coordinator::WanSessionPortError::Rejected
+                })?;
             let online = owner.signaling_status.snapshot().state
                 == crate::signaling::SignalingConnectionState::Authenticated;
             let now = std::time::SystemTime::now()
@@ -453,6 +488,17 @@ impl ServiceWanSessionWorkflowBackend {
                     auth,
                 )
             {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "temporary_guest_authorization",
+                    validation = if record.status() == WanSessionStatus::Approved {
+                        "approved_guest_not_authorized"
+                    } else {
+                        "guest_not_admitted"
+                    },
+                    signaling_online = online,
+                    "WAN temporary guest authorization was rejected"
+                );
                 return Err(super::coordinator::WanSessionPortError::Rejected);
             }
         } else if let Some(owner) = self.temporary_owner.as_ref().and_then(Weak::upgrade) {
@@ -513,6 +559,7 @@ impl ServiceWanSessionWorkflowBackend {
                 return Err(super::coordinator::WanSessionPortError::Rejected);
             }
         }
+        .map(|snapshot| snapshot.with_temporary_guest(temporary_guest))
         .map_err(|_| super::coordinator::WanSessionPortError::Rejected)
     }
 
@@ -626,13 +673,74 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
         super::coordinator::WanBackendSessionSnapshot,
         super::coordinator::WanSessionPortError,
     > {
-        self.snapshot(
-            self.backend
-                .approve(binding, approval)
-                .await
-                .map_err(map_workflow_error)?,
-        )
-        .await
+        let record = match self.backend.approve(binding, approval).await {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_approve_http",
+                    backend_error = safe_backend_error_category(error),
+                    "WAN backend approval request failed"
+                );
+                return Err(map_workflow_error(error));
+            }
+        };
+        match self.snapshot(record).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_approve_snapshot",
+                    port_error = safe_port_error_category(error),
+                    "WAN backend approval response failed local binding checks"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn same_account(
+        &self,
+        identity: &super::model::WanSessionIdentity,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<bool, super::coordinator::WanSessionPortError> {
+        self.backend
+            .same_account(
+                identity.binding(),
+                identity.controller_key_fingerprint(),
+                identity
+                    .target_key_fingerprint()
+                    .ok_or(super::coordinator::WanSessionPortError::Rejected)?,
+            )
+            .await
+            .map_err(map_workflow_error)
+    }
+
+    async fn approve_same_account(
+        &self,
+        identity: &super::model::WanSessionIdentity,
+        approval: &WanSessionApproval,
+        _absolute_deadline_unix_ms: u64,
+    ) -> Result<
+        super::coordinator::WanBackendSessionSnapshot,
+        super::coordinator::WanSessionPortError,
+    > {
+        let record = self
+            .backend
+            .approve_same_account(
+                identity.binding(),
+                approval,
+                identity.controller_key_fingerprint(),
+                identity
+                    .target_key_fingerprint()
+                    .ok_or(super::coordinator::WanSessionPortError::Rejected)?,
+            )
+            .await
+            .map_err(map_workflow_error)?;
+        if record.temporary_authority().is_some() {
+            return Err(super::coordinator::WanSessionPortError::Rejected);
+        }
+        self.snapshot(record).await
     }
 
     async fn access_generation_zero(
@@ -641,14 +749,38 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
         policy_revision: u64,
         _absolute_deadline_unix_ms: u64,
     ) -> Result<super::model::RelayAccessBinding, super::coordinator::WanSessionPortError> {
-        let request = WanRelayAccessRequest::generation_zero(binding.clone(), policy_revision)
-            .map_err(map_workflow_error)?;
-        let access = self
-            .backend
-            .access(&request)
-            .await
-            .map_err(map_workflow_error)?;
+        let request = match WanRelayAccessRequest::generation_zero(binding.clone(), policy_revision)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_access_request",
+                    backend_error = safe_backend_error_category(error),
+                    "WAN generation-zero access request could not be constructed"
+                );
+                return Err(map_workflow_error(error));
+            }
+        };
+        let access = match self.backend.access(&request).await {
+            Ok(access) => access,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_access_http",
+                    backend_error = safe_backend_error_category(error),
+                    "WAN generation-zero access request failed"
+                );
+                return Err(map_workflow_error(error));
+            }
+        };
         if access.generation() != 0 {
+            tracing::warn!(
+                target: "mrd-service",
+                stage = "backend_access_generation",
+                validation = "generation_not_zero",
+                "WAN generation-zero access response was rejected"
+            );
             return Err(super::coordinator::WanSessionPortError::Rejected);
         }
         let primary = access
@@ -658,11 +790,27 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
             .candidates
             .iter()
             .find(|candidate| candidate.selection_reason == "preferred-region")
-            .ok_or(super::coordinator::WanSessionPortError::Rejected)?;
+            .ok_or_else(|| {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_access_directory",
+                    validation = "preferred_region_missing",
+                    "WAN generation-zero access response has no preferred relay"
+                );
+                super::coordinator::WanSessionPortError::Rejected
+            })?;
         let evidence = access
             .verified()
             .route_evidence(&primary.node_id, 0)
-            .map_err(|_| super::coordinator::WanSessionPortError::Rejected)?;
+            .map_err(|_| {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_access_directory",
+                    validation = "route_evidence_missing",
+                    "WAN generation-zero access response has no valid route evidence"
+                );
+                super::coordinator::WanSessionPortError::Rejected
+            })?;
         let session_id = binding.session_id().clone();
         let route_binding = super::model::RelayAccessBinding::generation_zero(
             policy_revision,
@@ -670,10 +818,26 @@ impl super::coordinator::WanSessionWorkflowBackend for ServiceWanSessionWorkflow
             evidence.node_id().to_owned(),
             hex_digest(evidence.urls_digest()),
         )
-        .map_err(|_| super::coordinator::WanSessionPortError::Rejected)?;
+        .map_err(|_| {
+            tracing::warn!(
+                target: "mrd-service",
+                stage = "backend_access_binding",
+                validation = "route_binding_invalid",
+                "WAN generation-zero route binding was rejected"
+            );
+            super::coordinator::WanSessionPortError::Rejected
+        })?;
         self.relay_access
             .write()
-            .map_err(|_| super::coordinator::WanSessionPortError::Unavailable)?
+            .map_err(|_| {
+                tracing::warn!(
+                    target: "mrd-service",
+                    stage = "backend_access_binding",
+                    port_error = "unavailable",
+                    "WAN relay access cache is unavailable"
+                );
+                super::coordinator::WanSessionPortError::Unavailable
+            })?
             .insert(session_id, access);
         Ok(route_binding)
     }
@@ -709,6 +873,26 @@ impl HttpWanSessionBackend {
             .base_url()
             .join(relative)
             .map_err(|_| WanSessionBackendError::InvalidConfiguration)
+    }
+
+    fn same_account_endpoint(
+        &self,
+        binding: &WanSessionBinding,
+        action: &str,
+        controller_key_id: &str,
+        target_key_id: &str,
+    ) -> Result<Url, WanSessionBackendError> {
+        if !is_sha256_hex(controller_key_id) || !is_sha256_hex(target_key_id) {
+            return Err(WanSessionBackendError::InvalidRequest);
+        }
+        let mut url = self.endpoint(&format!(
+            "device-sessions/{}/{action}",
+            binding.session_id.0
+        ))?;
+        url.query_pairs_mut()
+            .append_pair("controller_key_id", controller_key_id)
+            .append_pair("target_key_id", target_key_id);
+        Ok(url)
     }
 
     async fn execute_json<B: Serialize + ?Sized>(
@@ -877,6 +1061,49 @@ impl WanSessionBackend for HttpWanSessionBackend {
         .await
     }
 
+    async fn same_account(
+        &self,
+        binding: &WanSessionBinding,
+        controller_key_id: &str,
+        target_key_id: &str,
+    ) -> Result<bool, WanSessionBackendError> {
+        let endpoint =
+            self.same_account_endpoint(binding, "same-account", controller_key_id, target_key_id)?;
+        let bytes = self
+            .execute_json::<()>(Method::GET, endpoint, None, true)
+            .await?;
+        let response: SameAccountResponse =
+            serde_json::from_slice(&bytes).map_err(|_| WanSessionBackendError::InvalidResponse)?;
+        Ok(response.trusted)
+    }
+
+    async fn approve_same_account(
+        &self,
+        binding: &WanSessionBinding,
+        approval: &WanSessionApproval,
+        controller_key_id: &str,
+        target_key_id: &str,
+    ) -> Result<WanSessionRecord, WanSessionBackendError> {
+        let body = DeviceSessionApprovalBody {
+            approved_scopes: approval.approved_scopes.clone(),
+            approved_profile: approval.approved_profile.clone(),
+        };
+        let endpoint = self.same_account_endpoint(
+            binding,
+            "approve-same-account",
+            controller_key_id,
+            target_key_id,
+        )?;
+        let bytes = self
+            .execute_json(Method::POST, endpoint, Some(&body), false)
+            .await?;
+        let record = parse_record(&bytes, binding)?;
+        if record.status != WanSessionStatus::Approved {
+            return Err(WanSessionBackendError::BindingMismatch);
+        }
+        Ok(record)
+    }
+
     async fn reject(
         &self,
         binding: &WanSessionBinding,
@@ -994,6 +1221,12 @@ impl From<&WanSessionRequestV3> for DeviceSessionCreateBody {
 struct DeviceSessionApprovalBody {
     approved_scopes: Vec<WanPermissionScopeV3>,
     approved_profile: Option<WanMediaProfileV3>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SameAccountResponse {
+    trusted: bool,
 }
 
 #[derive(Serialize)]
@@ -1272,6 +1505,29 @@ fn map_workflow_error(error: WanSessionBackendError) -> super::coordinator::WanS
         | WanSessionBackendError::BindingMismatch => {
             super::coordinator::WanSessionPortError::Rejected
         }
+    }
+}
+
+fn safe_backend_error_category(error: WanSessionBackendError) -> &'static str {
+    match error {
+        WanSessionBackendError::InvalidConfiguration => "invalid_configuration",
+        WanSessionBackendError::InvalidRequest => "invalid_request",
+        WanSessionBackendError::Unavailable => "unavailable",
+        WanSessionBackendError::DeadlineExceeded => "deadline_exceeded",
+        WanSessionBackendError::Unauthorized => "unauthorized",
+        WanSessionBackendError::NotFound => "not_found",
+        WanSessionBackendError::Conflict => "conflict",
+        WanSessionBackendError::ResponseTooLarge => "response_too_large",
+        WanSessionBackendError::InvalidResponse => "invalid_response",
+        WanSessionBackendError::BindingMismatch => "binding_mismatch",
+    }
+}
+
+fn safe_port_error_category(error: super::coordinator::WanSessionPortError) -> &'static str {
+    match error {
+        super::coordinator::WanSessionPortError::Unavailable => "unavailable",
+        super::coordinator::WanSessionPortError::Rejected => "rejected",
+        super::coordinator::WanSessionPortError::DeadlineExceeded => "deadline_exceeded",
     }
 }
 

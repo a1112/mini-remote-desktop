@@ -351,6 +351,54 @@ describe('independent browser peer lifecycle', () => {
     } finally { release(); await peer.close('test_cleanup'); }
   });
 
+  it('rejects a policy lease beyond the bootstrap principal authority even when signed claims are shorter', async () => {
+    const clock = controlledClock();
+    context.bootstrap.expires_at_ms = Date.now() + 20_000;
+    const { peer, socket, intent } = await pendingPeer();
+    const target = await fixtureIdentity(fixture.target);
+    const grantPayload = {
+      ...fixture.grant.payload,
+      policy_expires_at_ms: Date.now() + 30_000,
+      intent_commitment: await protocol.signedSignalCommitment('intent', intent),
+    };
+    const grant = await protocol.signSignal(target, 'session_grant_v3', grantPayload);
+    expect(grantPayload.policy_expires_at_ms).toBeGreaterThan(grantPayload.claims.expires_at_ms);
+    try {
+      socket.receive({ version: 3, message: { type: 'session_grant_v3', payload: grant } });
+      await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+      expect(onState.mock.calls.some(([state]) => state.phase === 'negotiating' || state.grantedScopes.length > 0)).toBe(false);
+      expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [], error: '远端会话授权与本次请求不匹配' }));
+      expect(context.getRelayAccess).not.toHaveBeenCalled();
+      expect(Socket.sockets[0]?.readyState).toBe(3);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { await peer.close('test_cleanup'); }
+  });
+
+  it('accepts policy at principal expiry after JWT rounding while local control/session expiry stays shortest', async () => {
+    const clock = controlledClock();
+    const principalExpiresAtMs = fixture.grant.payload.policy_expires_at_ms;
+    const credentialExpiresAtMs = principalExpiresAtMs - 999;
+    context.bootstrap.expires_at_ms = principalExpiresAtMs;
+    context.bootstrap.credential.expires_at_ms = credentialExpiresAtMs;
+    const { peer, pc } = await approvedPeer();
+    const track = Object.assign(new EventTarget(), { kind: 'video', stop: vi.fn() });
+    pc.dispatchEvent(Object.assign(new Event('track'), { track, streams: [{ getTracks: () => [track] }] }));
+    pc.connectionState = 'connected'; pc.dispatchEvent(new Event('connectionstatechange'));
+    await until(() => onState.mock.calls.some(([state]) => state.route === 'direct'));
+    peer.markVideoReady(1280, 720);
+    pc.channels.forEach(channel => channel.open());
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'streaming' }));
+    expect((peer as unknown as { control?: { binding?: { expiresAtMs: number } } }).control?.binding?.expiresAtMs)
+      .toBe(credentialExpiresAtMs);
+    expect(credentialExpiresAtMs).toBeLessThan(principalExpiresAtMs);
+    pc.channels.forEach(channel => { channel.readyState = 'closed'; });
+    await clock.advance(credentialExpiresAtMs - Date.now());
+    await until(() => vi.mocked(context.closeBackend).mock.calls.length === 1);
+    expect(onState).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'failed', grantedScopes: [] }));
+    expect(PeerConnection.peers).toHaveLength(1);
+    await peer.close('test_cleanup');
+  });
+
   it('clears the pending consent deadline on explicit close without a later timeout', async () => {
     const clock = controlledClock();
     const { peer, socket, intent } = await pendingPeer();
@@ -368,6 +416,9 @@ describe('independent browser peer lifecycle', () => {
     const clock = controlledClock();
     context.bootstrap.credential.expires_at_ms = Date.now() + 30000;
     const { peer, pc } = await approvedPeer();
+    // The target's signed grant claims are short-lived delivery credentials;
+    // the approved backend policy lease is intentionally longer.
+    expect(fixture.grant.payload.policy_expires_at_ms).toBeGreaterThan(fixture.grant.payload.claims.expires_at_ms);
     const track = Object.assign(new EventTarget(), { kind: 'video', stop: vi.fn() });
     pc.dispatchEvent(Object.assign(new Event('track'), { track, streams: [{ getTracks: () => [track] }] }));
     pc.connectionState = 'connected'; pc.dispatchEvent(new Event('connectionstatechange'));

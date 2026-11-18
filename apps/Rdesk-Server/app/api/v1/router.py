@@ -8,6 +8,7 @@ from app.api.v1 import (
     device_self_enrollment,
     devices,
     network_groups,
+    oidc,
     public,
     realtime,
     relays,
@@ -18,6 +19,7 @@ from app.api.v1 import (
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
+api_router.include_router(oidc.router)
 api_router.include_router(browser_sessions.router)
 api_router.include_router(guest_browser_sessions.router)
 api_router.include_router(device_sessions.router)

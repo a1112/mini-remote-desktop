@@ -52,6 +52,7 @@ from app.services.device_enrollment import (
     device_serial_digest,
 )
 from app.services.realtime_presence import DevicePresence, query_realtime_presence
+from app.services.same_account_authority import revoke_same_account_on_unbind
 
 router = APIRouter(
     prefix="/devices",
@@ -497,6 +498,7 @@ async def unbind_device(
         )
 
     # 解除绑定
+    await revoke_same_account_on_unbind(db, device, now=datetime.now(UTC))
     device.is_bound = False
     device.bound_user_id = None
     device.bound_at = None

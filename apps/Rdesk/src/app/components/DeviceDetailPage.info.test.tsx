@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Monitor } from "lucide-react";
 import { MemoryRouter, Route, Routes } from "react-router";
@@ -34,6 +34,7 @@ const device = (overrides: Partial<Device> = {}): Device => ({
 
 const deviceDataMock = vi.hoisted(() => ({
   devices: [] as Device[],
+  native: true,
 }));
 
 const remoteDisplayLauncherMock = vi.hoisted(() => ({
@@ -47,7 +48,6 @@ const tauriAdapterMock = vi.hoisted(() => ({
   ipcListDirectory: vi.fn(),
   ipcListFileTransferProviders: vi.fn(),
   ipcListFileTransfers: vi.fn(),
-  ipcStartFileTransfer: vi.fn(),
 }));
 
 vi.mock("./deviceData", () => ({
@@ -90,15 +90,15 @@ vi.mock("../adapters/tauri", () => ({
   ipcListDirectory: tauriAdapterMock.ipcListDirectory,
   ipcListFileTransferProviders: tauriAdapterMock.ipcListFileTransferProviders,
   ipcListFileTransfers: tauriAdapterMock.ipcListFileTransfers,
-  ipcStartFileTransfer: tauriAdapterMock.ipcStartFileTransfer,
 }));
 
 vi.mock("../utils/runtime", () => ({
-  isTauriRuntime: () => true,
+  isTauriRuntime: () => deviceDataMock.native,
 }));
 
 beforeEach(() => {
   deviceDataMock.devices = [device()];
+  deviceDataMock.native = true;
   remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockReset();
   remoteDisplayLauncherMock.launchRemoteDisplayForDevice.mockResolvedValue({
     sessionId: "secure-session",
@@ -111,7 +111,6 @@ beforeEach(() => {
   tauriAdapterMock.ipcListDirectory.mockReset();
   tauriAdapterMock.ipcListFileTransferProviders.mockReset();
   tauriAdapterMock.ipcListFileTransfers.mockReset();
-  tauriAdapterMock.ipcStartFileTransfer.mockReset();
   tauriAdapterMock.ipcListDirectory.mockResolvedValue({
     ok: true,
     value: {
@@ -135,22 +134,6 @@ beforeEach(() => {
           readonly: false,
         },
       ],
-    },
-  });
-  tauriAdapterMock.ipcStartFileTransfer.mockResolvedValue({
-    ok: true,
-    value: {
-      transfer_id: "file-transfer-1",
-      status: "completed",
-      source_device_id: "agent-device",
-      target_device_id: "peer-device",
-      transport_kind: "local",
-      total_entries: 1,
-      copied_entries: 1,
-      total_bytes: 2048,
-      copied_bytes: 2048,
-      error: null,
-      entries: [],
     },
   });
   tauriAdapterMock.ipcListFileTransfers.mockResolvedValue({
@@ -256,17 +239,8 @@ describe("DeviceDetailPage info tab", () => {
     expect(tauriAdapterMock.ipcListDirectory).toHaveBeenCalledWith(null);
   });
 
-  it("does not invent a destination path when dropping a file onto a remote pane", async () => {
-    deviceDataMock.devices = [
-      device({ isLocal: true }),
-      device({
-        id: "peer-device",
-        deviceId: "peer-device",
-        name: "Peer PC",
-        ip: "192.168.1.3",
-        favorite: false,
-      }),
-    ];
+  it("opens the folder selected from the menu and refreshes the actual service path", async () => {
+    deviceDataMock.devices = [device({ isLocal: true })];
     const user = userEvent.setup();
 
     render(
@@ -277,30 +251,46 @@ describe("DeviceDetailPage info tab", () => {
       </MemoryRouter>
     );
 
-    await waitFor(() => {
-      expect(screen.getByText("service-report.txt")).toBeInTheDocument();
-    });
+    const folder = await screen.findByRole("button", { name: /ServiceDownloads/ });
+    const folderPath = "C:\\Users\\tester\\Downloads";
+    const parentPath = "C:\\Users\\tester";
+    const listing = { ok: true, value: { path: folderPath, parent_path: parentPath, entries: [] } };
+    tauriAdapterMock.ipcListDirectory.mockResolvedValueOnce(listing);
+    fireEvent.contextMenu(folder);
+    await user.click(await screen.findByRole("menuitem", { name: "打开" }));
+    expect(tauriAdapterMock.ipcListDirectory).toHaveBeenLastCalledWith(folderPath);
+    expect(await screen.findByText(folderPath)).toBeInTheDocument();
 
-    await user.click(screen.getAllByRole("button", { name: "添加设备" })[0]!);
-    await user.click(screen.getByRole("button", { name: /Peer PC/ }));
+    tauriAdapterMock.ipcListDirectory.mockResolvedValueOnce(listing);
+    await user.click(screen.getByRole("button", { name: "刷新目录" }));
+    expect(tauriAdapterMock.ipcListDirectory).toHaveBeenLastCalledWith(folderPath);
+    await user.click(screen.getByRole("button", { name: "上级目录" }));
+    expect(tauriAdapterMock.ipcListDirectory).toHaveBeenLastCalledWith(parentPath);
+  });
 
-    expect(screen.getAllByText("service-report.txt")).toHaveLength(1);
-    expect(screen.getByText(/远程目录浏览尚未接入服务/)).toBeInTheDocument();
+  it("shows only real file actions and uses the service metadata for properties and copy path", async () => {
+    deviceDataMock.devices = [device({ isLocal: true })];
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes><Route path="/devices/:id" element={<DeviceDetailPage />} /></Routes>
+      </MemoryRouter>
+    );
 
-    const dragStore: Record<string, string> = {};
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      setData: vi.fn((key: string, value: string) => {
-        dragStore[key] = value;
-      }),
-      getData: vi.fn((key: string) => dragStore[key] ?? ""),
-    };
+    const path = "C:\\Users\\tester\\service-report.txt";
+    const file = await screen.findByRole("button", { name: /service-report.txt/ });
+    fireEvent.contextMenu(file);
+    const menu = within(await screen.findByRole("menu"));
+    expect(menu.getAllByRole("menuitem")).toHaveLength(2);
+    await user.click(menu.getByRole("menuitem", { name: "复制路径" }));
+    expect(await navigator.clipboard.readText()).toBe(path);
+    expect(await screen.findByText("已复制文件路径")).toBeInTheDocument();
 
-    fireEvent.dragStart(screen.getAllByText("service-report.txt")[0]!, { dataTransfer });
-    fireEvent.drop(screen.getAllByText("Peer PC")[0]!, { dataTransfer });
-
-    expect(tauriAdapterMock.ipcStartFileTransfer).not.toHaveBeenCalled();
+    await user.click(file);
+    const properties = within(screen.getByRole("region", { name: "文件属性" }));
+    expect(properties.getByText(path)).toBeInTheDocument();
+    expect(properties.getByText("2 KB")).toBeInTheDocument();
+    expect(properties.getByText("否")).toBeInTheDocument();
   });
 
   it("does not display local service files as a remote directory", async () => {
@@ -311,7 +301,22 @@ describe("DeviceDetailPage info tab", () => {
     );
     await waitFor(() => expect(screen.getByText(/远程目录浏览尚未接入服务/)).toBeInTheDocument());
     expect(screen.queryByText("service-report.txt")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "添加设备" })).not.toBeInTheDocument();
     expect(tauriAdapterMock.ipcListDirectory).not.toHaveBeenCalled();
+  });
+
+  it("does not request local file capabilities from the browser", () => {
+    deviceDataMock.native = false;
+    deviceDataMock.devices = [device({ isLocal: true })];
+    render(
+      <MemoryRouter initialEntries={["/devices/agent-device?tab=files"]}>
+        <Routes><Route path="/devices/:id" element={<DeviceDetailPage />} /></Routes>
+      </MemoryRouter>
+    );
+    expect(screen.getByText(/网页端暂不支持文件操作/)).toBeInTheDocument();
+    expect(tauriAdapterMock.ipcListDirectory).not.toHaveBeenCalled();
+    expect(tauriAdapterMock.ipcListFileTransfers).not.toHaveBeenCalled();
+    expect(tauriAdapterMock.ipcListFileTransferProviders).not.toHaveBeenCalled();
   });
 
   it("shows local and reserved file transfer providers in the file transfer tab", async () => {

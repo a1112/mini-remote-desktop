@@ -12,6 +12,7 @@ from app.models.user import User
 from app.schemas.browser_session import BrowserSessionCreateIn
 from app.schemas.session import DeviceSessionCreateIn
 from app.services.browser_authority import browser_authority_valid
+from app.services.same_account_authority import same_account_authority_valid
 from app.services.device_sessions import DeviceSessionError, DeviceSessionService
 from app.services.session_grants import session_grant_identity_lock
 from app.services.device_principal_keys import key_is_physical_machine, principal_key_lock
@@ -108,7 +109,8 @@ class BrowserSessionService:
             or row.tenant_id != user.tenant_id or principal.user_id != user.id
             or principal.user_session_version != user.session_version
             or (not allow_terminal and row.status not in {"requested", "approved"})
-            or not await browser_authority_valid(self.db, row, allow_terminal=allow_terminal)):
+            or not await browser_authority_valid(self.db, row, allow_terminal=allow_terminal)
+            or (not allow_terminal and not await same_account_authority_valid(self.db, row))):
             self.unavailable()
         shadow = await self.db.scalar(select(Device).where(Device.id == principal.device_row_id))
         return row, principal, shadow
@@ -155,7 +157,10 @@ class BrowserSessionService:
                 or principal.user_session_version != binding.user_session_version
                 or principal.device_row_id != binding.controller_row_id
                 or principal.key_id != binding.controller_key_id
-                or not await browser_authority_valid(self.db, row)):
+                or (isinstance(row.same_account_authority, dict)
+                    and row.same_account_authority.get("target_key_id") != binding.target_key_id)
+                or not await browser_authority_valid(self.db, row)
+                or not await same_account_authority_valid(self.db, row, lock_identity=True)):
                 self.unavailable()
             return row, principal, shadow
 

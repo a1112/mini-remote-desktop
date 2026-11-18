@@ -47,6 +47,8 @@ client-qt/venv
 /artifacts/benchmark-scenario-run-summary.json
 /artifacts/benchmarks/
 /artifacts/component-matrix/
+/artifacts/e2e/browser-control-macos/
+/.rdesk-macos-signing-identity
 /artifacts/ffmpeg-perf/
 /artifacts/local-performance/
 /artifacts/local-zero-copy/
@@ -72,3 +74,4 @@ apps/Rdesk/.env.ios.local
 !apps/Rdesk-Mobile/branding/launcher-source.png
 !apps/Rdesk-Mobile/app/src/main/res/mipmap-*/*.png
 !apps/Rdesk-Mobile/app/src/main/res/drawable-*/*.png
+/.pnpm-store/

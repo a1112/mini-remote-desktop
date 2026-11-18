@@ -210,7 +210,13 @@ pub async fn respond_to_consent(
                                 .map(|_| ())
                         }
                     };
-                    if coordinator_result.is_err() {
+                    if let Err(error) = &coordinator_result {
+                        tracing::warn!(
+                            target: "mrd-service",
+                            stage = "consent_apply",
+                            error_category = crate::wan_session::coordinator::safe_error_category(error),
+                            "WAN consent decision could not be applied by the coordinator"
+                        );
                         let _ =
                             crate::wan_session::service::reconcile_wan_session_under_security_gate(
                                 app_state,

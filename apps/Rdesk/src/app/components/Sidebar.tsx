@@ -10,21 +10,18 @@ import {
 } from "../services/ipcSessionService";
 import { ipcCapabilitySnapshot, ipcPeerCapabilitySnapshot } from "../adapters/tauri";
 import { useTheme } from "./ThemeContext";
+import { isTauriRuntime } from "../utils/runtime";
 import { useAuth } from "./AuthContext";
 import { NavLink, useLocation, useNavigate } from "react-router";
 import {
   Monitor,
+  MonitorUp,
   Laptop,
   History,
-  FolderOpen,
   Settings,
-  Shield,
-  LayoutDashboard,
   Server,
   Smartphone,
   ChevronDown,
-  Plus,
-  Wifi,
   MoreHorizontal,
   Play,
   FolderOpen as FolderIcon,
@@ -46,14 +43,12 @@ import {
 
 interface SidebarProps {
   collapsed: boolean;
-  onOpenConnections: () => void;
-  onOpenSettings: () => void;
 }
 
 const navItems = [
-  { to: "/", label: "控制中心", icon: LayoutDashboard, end: true },
+  { to: "/", label: "远程控制", icon: MonitorUp, end: true },
   { to: "/devices", label: "我的设备", icon: Monitor },
-  { to: "/test", label: "测试工作台", icon: Terminal },
+  { to: "/connections", label: "连接记录", icon: History },
 ];
 
 const iconMap: Record<string, typeof Monitor> = {
@@ -120,7 +115,8 @@ function remotePowerUnavailableReasonFromSnapshot(
   );
 }
 
-export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: SidebarProps) {
+export function Sidebar({ collapsed }: SidebarProps) {
+  const native = isTauriRuntime();
   const { devices, refresh, currentDeviceId } = useDevices({ pollInterval: 30000, enabled: true });
   const [devicesExpanded, setDevicesExpanded] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -133,12 +129,13 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   const { isLoggedIn, user } = useAuth();
 
   const refreshSessionSummaries = useCallback(async () => {
+    if (!native) return;
     try {
       setSessionSummaries(await listSessions());
     } catch {
       setSessionSummaries([]);
     }
-  }, []);
+  }, [native]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -180,6 +177,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   }, [refreshSessionSummaries]);
 
   useEffect(() => {
+    if (!native) return;
     let cancelled = false;
     void ipcCapabilitySnapshot()
       .then((result) => {
@@ -198,7 +196,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [native]);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -252,7 +250,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
   useEffect(() => {
     let cancelled = false;
     setPeerRemotePowerUnavailableReason(null);
-    if (!contextMenuDevice || contextMenuDevice.isLocal) {
+    if (!native || !contextMenuDevice || contextMenuDevice.isLocal) {
       return () => {
         cancelled = true;
       };
@@ -276,7 +274,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
     return () => {
       cancelled = true;
     };
-  }, [contextMenuDevice?.deviceId, contextMenuDevice?.isLocal]);
+  }, [native, contextMenuDevice?.deviceId, contextMenuDevice?.isLocal]);
 
   // 重命名设备
   const handleStartRename = (deviceId: string, currentName: string) => {
@@ -686,58 +684,19 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
 
   return (
     <aside
-      className={`relative flex flex-col transition-all duration-300 shrink-0 border-r rounded-l-lg ${ 
-        isDark ? "bg-[#1e1e1e] border-gray-700" : "bg-[#e9ecf2] border-gray-300/50"
-      }`}
-      style={{ width: collapsed ? 56 : 220 }}
+      className={`remote-sidebar relative flex shrink-0 flex-col border-r transition-[width] duration-200 ${collapsed ? "remote-sidebar-collapsed" : ""}`}
+      style={{ width: collapsed ? 54 : 196 }}
     >
-      {/* App branding */}
-      <div className={`flex items-center justify-center gap-2.5 px-4 py-4 shrink-0 border-b ${isDark ? "border-gray-700" : "border-gray-300/30"}`}>
-        <div
-          className="rounded bg-gradient-to-br from-yellow-400 to-yellow-600 flex items-center justify-center shadow-sm shrink-0 transition-all duration-300"
-          style={{ width: collapsed ? 28 : 34, height: collapsed ? 28 : 34 }}
-        >
-          <Wifi
-            className="text-white transition-all duration-300"
-            style={{ width: collapsed ? 14 : 18, height: collapsed ? 14 : 18 }}
-          />
-        </div>
-        {!collapsed && (
-          <span
-            className={`font-semibold tracking-tight ${isDark ? "text-gray-200" : "text-gray-800"}`}
-            style={{ fontSize: 15 }}
-          >
-            R-Desk
-          </span>
-        )}
+      <div className="remote-brand" aria-label="Rdesk">
+        <span className="remote-brand-mark"><MonitorUp size={18} aria-hidden="true" /></span>
+        {!collapsed && <span>Rdesk</span>}
       </div>
 
-      {/* Nav */}
-      <nav className="py-3 px-2 space-y-0.5 shrink-0">
+      <nav aria-label="主导航" className="shrink-0 space-y-1 px-2 pb-3">
         {navItems.map(({ to, label, icon: Icon, end }) => (
-          <NavLink
-            key={to}
-            to={to}
-            end={end}
-            className={({ isActive }) =>
-              `flex items-center gap-2.5 px-2.5 py-2 rounded-md transition-all duration-150 group relative ${
-                isActive
-                  ? isDark ? "bg-blue-900/30 text-blue-400" : "bg-white/80 text-blue-600 shadow-sm"
-                  : isDark ? "text-gray-400 hover:bg-gray-800 hover:text-gray-200" : "text-gray-600 hover:bg-white/50 hover:text-gray-900"
-              }`
-            }
-          >
-            {({ isActive }) => (
-              <>
-                {isActive && (
-                  <div className={`absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-4 rounded-r-full ${isDark ? "bg-blue-400" : "bg-blue-600"}`} />
-                )}
-                <Icon className="shrink-0" style={{ width: 16, height: 16 }} />
-                {!collapsed && (
-                  <span style={{ fontSize: 13 }} className="font-medium">{label}</span>
-                )}
-              </>
-            )}
+          <NavLink key={to} to={to} end={end} className="remote-nav-link" aria-label={label} title={collapsed ? label : undefined}>
+            <Icon size={17} className="shrink-0" aria-hidden="true" />
+            {!collapsed && <span>{label}</span>}
           </NavLink>
         ))}
       </nav>
@@ -749,6 +708,7 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
           <div className="flex items-center justify-between px-3 py-2">
             <button
               onClick={() => setDevicesExpanded(!devicesExpanded)}
+              aria-expanded={devicesExpanded}
               className={`flex items-center gap-1.5 transition-colors ${isDark ? "text-gray-400 hover:text-gray-200" : "text-gray-500 hover:text-gray-700"}`}
             >
               <ChevronDown
@@ -769,18 +729,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
               >
                 <RefreshCw style={{ width: 14, height: 14 }} />
               </button>
-              <button
-                onClick={onOpenConnections}
-                className={`p-0.5 rounded transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700 hover:text-gray-200" : "text-gray-400 hover:bg-gray-100 hover:text-gray-600"}`}
-                title="添加设备"
-              >
-                <Plus style={{ width: 14, height: 14 }} />
-              </button>
             </div>
           </div>
 
           {devicesExpanded && (
             <div className="px-1.5 pb-2" onContextMenu={handleListContextMenu}>
+              {devices.length === 0 && <p className="px-2 py-1 text-xs text-[color:var(--desk-muted)]">暂无设备</p>}
               {/* Online devices */}
               {onlineDevices.map((device) => {
                 const isActive = location.pathname === `/devices/${device.id}`;
@@ -847,12 +801,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                             {device.ping}ms
                           </span>
                         )}
-                        <div
-                          className={`shrink-0 p-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity ${isDark ? "hover:bg-gray-700" : "hover:bg-gray-200"}`}
+                        <button type="button" aria-label={`${device.name}的更多操作`}
+                          className={`shrink-0 p-0.5 rounded opacity-60 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity ${isDark ? "hover:bg-gray-700" : "hover:bg-gray-200"}`}
                           onClick={(e) => handleMoreClick(e, device.id)}
                         >
-                          <MoreHorizontal style={{ width: 13, height: 13 }} />
-                        </div>
+                          <MoreHorizontal size={14} aria-hidden="true" />
+                        </button>
                       </>
                     )}
                     {renameSaved && !isEditing && (
@@ -933,12 +887,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
                           </span>
                         )}
                         <span className="shrink-0 text-gray-400" style={{ fontSize: 10 }}>{device.lastSeen}</span>
-                        <div
-                          className={`shrink-0 p-0.5 rounded opacity-0 group-hover:opacity-100 transition-opacity ${isDark ? "hover:bg-gray-700" : "hover:bg-gray-200"}`}
+                        <button type="button" aria-label={`${device.name}的更多操作`}
+                          className={`shrink-0 p-0.5 rounded opacity-60 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity ${isDark ? "hover:bg-gray-700" : "hover:bg-gray-200"}`}
                           onClick={(e) => handleMoreClick(e, device.id)}
                         >
-                          <MoreHorizontal style={{ width: 13, height: 13 }} />
-                        </div>
+                          <MoreHorizontal size={14} aria-hidden="true" />
+                        </button>
                       </>
                     )}
                     {renameSaved && !isEditing && (
@@ -1002,6 +956,12 @@ export function Sidebar({ collapsed, onOpenConnections, onOpenSettings }: Sideba
         </div>
       )}
 
+      {native && <div className="px-2 py-1">
+        <NavLink to="/test" className="remote-nav-link" aria-label="测试工作台" title="测试工作台">
+          <Terminal size={16} aria-hidden="true" />
+          {!collapsed && <span>测试工作台</span>}
+        </NavLink>
+      </div>}
       <AppVersionBadge collapsed={collapsed} isDark={isDark} />
 
       {/* Context menu */}

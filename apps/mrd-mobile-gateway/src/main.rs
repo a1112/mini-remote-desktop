@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     let tls = RustlsConfig::from_der(cert_chain, key_der)
         .await
         .context("build mobile gateway TLS configuration")?;
-    tracing::info!("mobile gateway listening with TLS on {}", bind);
+    tracing::info!(%bind, certificate_sha256 = %fingerprint, "mobile gateway listening with TLS");
     if !bind.ip().is_loopback() {
         let port = bind.port();
         let fingerprint = fingerprint.clone();

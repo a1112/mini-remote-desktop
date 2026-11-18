@@ -122,6 +122,21 @@ impl AuthorizedCommandExecutor for CountingCaptureExecutor {
 
 struct ApproveScreenView;
 
+struct CountUnexpectedPrompt(Arc<AtomicUsize>);
+impl ConsentBackend for CountUnexpectedPrompt {
+    fn is_available(&self) -> bool {
+        true
+    }
+    fn prompt(
+        &self,
+        _: ConsentPrompt,
+        _: watch::Receiver<Option<mrd_session_agent::consent::ConsentAbortReason>>,
+    ) -> ConsentBackendFuture {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { ConsentBackendDecision::Denied })
+    }
+}
+
 impl ConsentBackend for ApproveScreenView {
     fn is_available(&self) -> bool {
         true
@@ -197,6 +212,132 @@ fn signed_start_capture(
 
 fn resign(execute: &mut ExecuteCommand) {
     execute.grant.signature = test_signature(&execute.grant.signing_bytes());
+}
+
+fn signed_same_account(command_id: [u8; 16], desktop_epoch: u64) -> ExecuteCommand {
+    let mut command = signed_start_capture([command_id[0]; 32], command_id, desktop_epoch);
+    command.command = AgentCommand::AuthorizeSameAccount {
+        resource_id: [command_id[0]; 16],
+        scopes: [PermissionScope::ScreenView].into_iter().collect(),
+    };
+    command.grant.claims.command_digest = command.command_digest();
+    resign(&mut command);
+    command
+}
+
+#[tokio::test]
+async fn signed_same_account_authority_enables_capture_without_prompt_and_rejects_forgery() {
+    let (agent_stream, mut service) = tokio::io::duplex(32 * 1024);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let desktop = Arc::new(RwLock::new(Some(TrustedDesktopState {
+        desktop_epoch: 3,
+        desktop_kind: DesktopKind::Default,
+    })));
+    let (changes, _) = watch::channel(());
+    let runtime = AgentRuntime::new(
+        AgentRuntimeConfig {
+            session: descriptor(),
+            heartbeat_interval: Duration::from_secs(30),
+            handshake_timeout: Duration::from_secs(1),
+        },
+        Arc::new(FixedClock),
+        Arc::new(FixedSigner),
+    )
+    .unwrap()
+    .with_attended_authority(
+        Arc::new(CountUnexpectedPrompt(prompts.clone())),
+        Arc::new(FixedExecuteGrantVerifier),
+        Arc::new(MutableDesktopSource {
+            state: desktop,
+            changes,
+        }),
+        GRANT_ISSUER_KEY_ID,
+        Box::new(CountingCaptureExecutor {
+            executions: executions.clone(),
+        }),
+    )
+    .unwrap();
+    let agent = tokio::spawn(runtime.run(agent_stream));
+    let register = match read_agent_message(&mut service).await {
+        AgentToService::AgentRegister(value) => value,
+        other => panic!("unexpected {other:?}"),
+    };
+    send_service_message(
+        &mut service,
+        &ServiceToAgent::AgentChallenge(AgentChallenge {
+            registration_id: REGISTRATION_ID,
+            registration_epoch: 1,
+            challenge_id: CHALLENGE_ID,
+            challenge_nonce: [10; 32],
+            expected_agent_instance_id: register.agent_instance_id,
+            expected_process_id: register.process_id,
+            expected_process_creation_time: register.process_creation_time,
+            expected_logon_sid_hash: register.logon_sid_hash,
+            expected_windows_session_id: register.windows_session_id,
+            issued_at_ms: 1_000,
+            expires_at_ms: 2_000,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentRegistered(_)
+    ));
+    assert!(matches!(
+        read_agent_message(&mut service).await,
+        AgentToService::AgentCapabilitySnapshot(_)
+    ));
+
+    let mut forged = signed_same_account([60; 16], 3);
+    forged.grant.signature[0] ^= 1;
+    assert_eq!(
+        send_execute_and_read_result(&mut service, forged)
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_same_account([61; 16], 4))
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_start_capture([62; 32], [62; 16], 3))
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    let authorization = signed_same_account([63; 16], 3);
+    assert_eq!(
+        send_execute_and_read_result(&mut service, authorization.clone())
+            .await
+            .outcome,
+        CommandOutcome::Completed
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, authorization)
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_same_account([64; 16], 3))
+            .await
+            .outcome,
+        CommandOutcome::Rejected
+    );
+    assert_eq!(
+        send_execute_and_read_result(&mut service, signed_start_capture([65; 32], [65; 16], 3))
+            .await
+            .outcome,
+        CommandOutcome::Completed
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(prompts.load(Ordering::SeqCst), 0);
+    drop(service);
+    let _ = agent.await;
 }
 
 async fn read_agent_message<R>(reader: &mut R) -> AgentToService

@@ -343,6 +343,10 @@ async function browserDevTestRuns(params?: {
 // Window / Tray Commands
 // ============================================================================
 
+export async function openRAuthLogin(url: string): Promise<AdapterResult<void>> {
+  return invokeAdapter<void>('open_r_auth_login', { url });
+}
+
 export async function startDragWindow(): Promise<AdapterResult<void>> {
   return invokeAdapter<void>('start_drag_window');
 }

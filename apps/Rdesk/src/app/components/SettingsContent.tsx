@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Bell, LogOut, Monitor, Palette, Shield, User, Volume2, Wifi } from 'lucide-react';
 import { useAuth } from './AuthContext';
+import { RAuthButton } from './RAuthButton';
 import { useTheme } from './ThemeContext';
 import { listSessions } from '../services/ipcSessionService';
 import { isTauriRuntime } from '../utils/runtime';
@@ -201,6 +202,7 @@ export function SettingsContent() {
       {active === 'notifications' && <><Unsupported label="连接通知" toggle /><Unsupported label="断开通知" toggle /><Unsupported label="连接请求通知" toggle /><Unsupported label="提示音" toggle /></>}
       {active === 'account' && <>
         <div className="my-4 flex items-center gap-3"><div className="flex h-10 w-10 items-center justify-center rounded-full bg-blue-500/10 text-blue-500"><User className="h-5 w-5" /></div><div><p className="text-sm font-medium">{isLoggedIn ? user?.username : '未登录'}</p><p className="mt-1 text-xs text-gray-500">{isLoggedIn ? user?.role : '登录后可使用账户服务'}</p></div></div>
+        {isLoggedIn && <RAuthButton linkExisting />}
         <Unsupported label="升级账户" /><Unsupported label="修改密码" /><Unsupported label="注销账户" />
         {isLoggedIn && <div className="mt-5"><Action onClick={logout}><span className="flex items-center gap-2"><LogOut className="h-3.5 w-3.5" />退出登录</span></Action><p className="mt-2 text-xs text-gray-500">退出此设备的账户登录，保留本地偏好。</p></div>}
         {logoutError && <p role="alert" className="mt-3 break-words text-sm text-red-500">{logoutError}</p>}

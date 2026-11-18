@@ -22,7 +22,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
+from starlette.requests import Request
 
+from app.core.client_ip import InvalidForwardedAddress, trusted_client_ip
 from app.models.device import Device, generate_device_id_from_digest
 from app.models.device_machine_identity import DeviceMachineIdentity, DeviceSelfEnrollmentChallenge
 from app.models.relay_audit_event import RelayAuditEvent
@@ -62,24 +64,14 @@ def contextual_self_registration(canonical: bytes) -> bytes:
             + struct.pack(">Q", len(canonical)) + canonical)
 
 
-def enrollment_peer_ip(request: object, trusted_proxies: str) -> str:
+def enrollment_peer_ip(request: Request, trusted_proxies: str) -> str:
     """Ignore forwarded headers unless the actual socket peer is configured."""
-    client = getattr(request, "client", None)
     try:
-        peer = ipaddress.ip_address(client.host)
-        trusted = [ipaddress.ip_network(value.strip()) for value in trusted_proxies.split(",") if value.strip()]
-    except (AttributeError, ValueError):
+        return trusted_client_ip(request, trusted_proxies)
+    except InvalidForwardedAddress:
+        _invalid()
+    except ValueError:
         raise DeviceEnrollmentError("device_self_enrollment_unavailable", 503, "self enrollment unavailable") from None
-    if any(peer in network for network in trusted):
-        values = request.headers.getlist("x-real-ip")
-        if len(values) == 1:
-            try:
-                return str(ipaddress.ip_address(values[0]))
-            except ValueError:
-                _invalid()
-        elif values:
-            _invalid()
-    return str(peer)
 
 
 class DeviceSelfEnrollmentService:

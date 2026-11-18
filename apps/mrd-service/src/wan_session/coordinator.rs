@@ -14,7 +14,10 @@ use mrd_signal_proto::{SignalReplayGuard, WanAccessModeV3, WanRoutePolicyV3, Wan
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use thiserror::Error;
@@ -147,6 +150,7 @@ struct SessionEntry {
     task_group: Mutex<SessionTaskGroup>,
     budgets: Mutex<SessionBudgets>,
     cleanup_receipt: OnceCell<CleanupReceipt>,
+    same_account_auto_approval: AtomicBool,
 }
 
 struct CleanupReceipt {
@@ -287,7 +291,7 @@ impl WanSessionCoordinator {
             request,
             request_commitment,
             intent_commitment,
-            controller_public_key: _,
+            controller_public_key,
         } = verified;
         validate_request_identity(&identity, &request)?;
         let calculated = request
@@ -337,6 +341,19 @@ impl WanSessionCoordinator {
             if snapshot.request_commitment() != request_commitment {
                 return Err(WanSessionCoordinatorError::BackendBindingMismatch);
             }
+            // Guests never enter the automatic path, even if a backend response
+            // or a test adapter incorrectly claims an account match.
+            let same_account = if snapshot.is_temporary_guest() {
+                false
+            } else {
+                run_port_before_deadline(
+                    workflow.clock.as_ref(),
+                    deadline,
+                    workflow.backend.same_account(&identity, deadline),
+                )
+                .await
+                .map_err(WanSessionCoordinatorError::Backend)?
+            };
             self.apply(
                 &session_id,
                 WanSessionEvent::BackendBound {
@@ -345,15 +362,33 @@ impl WanSessionCoordinator {
                 workflow.clock.now_unix_ms(),
             )
             .await?;
-            run_port_before_deadline(
-                workflow.clock.as_ref(),
-                deadline,
-                workflow
-                    .consent
-                    .publish_attended_request(&identity, &request, deadline),
-            )
-            .await
-            .map_err(WanSessionCoordinatorError::Consent)?;
+            if same_account {
+                run_port_before_deadline(
+                    workflow.clock.as_ref(),
+                    deadline,
+                    workflow.consent.publish_same_account_request(
+                        &identity,
+                        &request,
+                        &controller_public_key,
+                        deadline,
+                    ),
+                )
+                .await
+                .map_err(WanSessionCoordinatorError::Consent)?;
+                entry
+                    .same_account_auto_approval
+                    .store(true, Ordering::Release);
+            } else {
+                run_port_before_deadline(
+                    workflow.clock.as_ref(),
+                    deadline,
+                    workflow
+                        .consent
+                        .publish_attended_request(&identity, &request, deadline),
+                )
+                .await
+                .map_err(WanSessionCoordinatorError::Consent)?;
+            }
             self.apply(
                 &session_id,
                 WanSessionEvent::AwaitingConsent { intent_commitment },
@@ -390,7 +425,11 @@ impl WanSessionCoordinator {
             .ok_or(WanSessionCoordinatorError::BackendBindingMismatch)?
             .to_owned();
         let deadline = identity.deadline_unix_ms();
+        // Keep the stage separate from the coarse error category. Both are
+        // deliberately secret-free operational diagnostics.
+        let mut failure_stage = "load_attended_approval";
         let result = async {
+            failure_stage = "load_attended_approval";
             let approval = run_port_before_deadline(
                 workflow.clock.as_ref(),
                 deadline,
@@ -398,21 +437,44 @@ impl WanSessionCoordinator {
             )
             .await
             .map_err(WanSessionCoordinatorError::Consent)?;
-            let snapshot = run_port_before_deadline(
-                workflow.clock.as_ref(),
-                deadline,
-                workflow
-                    .backend
-                    .approve(identity.binding(), &approval, deadline),
-            )
-            .await
+            failure_stage = "backend_approve";
+            let snapshot = if entry.same_account_auto_approval.load(Ordering::Acquire) {
+                // No fallback to ordinary approval: the backend rechecks owner
+                // equality atomically with this authorization transition.
+                run_port_before_deadline(
+                    workflow.clock.as_ref(),
+                    deadline,
+                    workflow
+                        .backend
+                        .approve_same_account(&identity, &approval, deadline),
+                )
+                .await
+            } else {
+                run_port_before_deadline(
+                    workflow.clock.as_ref(),
+                    deadline,
+                    workflow
+                        .backend
+                        .approve(identity.binding(), &approval, deadline),
+                )
+                .await
+            }
             .map_err(WanSessionCoordinatorError::Backend)?;
+            if snapshot.is_temporary_guest()
+                && entry.same_account_auto_approval.load(Ordering::Acquire)
+                || state.request_commitment() != Some(snapshot.request_commitment())
+            {
+                failure_stage = "backend_grant_binding";
+                return Err(WanSessionCoordinatorError::BackendBindingMismatch);
+            }
             let grant = snapshot.verify_approved(&identity)?.clone();
             if grant.approved_scopes() != approval.approved_scopes()
                 || grant.approved_profile() != approval.approved_profile()
             {
+                failure_stage = "backend_grant_binding";
                 return Err(WanSessionCoordinatorError::BackendBindingMismatch);
             }
+            failure_stage = "backend_access_generation_zero";
             let access = run_port_before_deadline(
                 workflow.clock.as_ref(),
                 deadline,
@@ -428,6 +490,7 @@ impl WanSessionCoordinator {
             // this state becomes authoritative.  The returned commitment is
             // the exact bytes that peers will bind their WebRTC messages to;
             // a backend-only grant remains deliberately unbound.
+            failure_stage = "signaling_grant";
             let signed_grant_commitment = run_port_before_deadline(
                 workflow.clock.as_ref(),
                 deadline,
@@ -444,6 +507,7 @@ impl WanSessionCoordinator {
             let grant = grant
                 .with_grant_commitment(signed_grant_commitment)
                 .map_err(|_| WanSessionCoordinatorError::BackendBindingMismatch)?;
+            failure_stage = "state_granted";
             self.apply(
                 session_id,
                 WanSessionEvent::Granted(grant.clone()),
@@ -459,6 +523,15 @@ impl WanSessionCoordinator {
             Ok(TransitionResult::Applied)
         }
         .await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "mrd-service",
+                operation = "approve_target",
+                stage = failure_stage,
+                error_category = safe_error_category(error),
+                "WAN target approval failed"
+            );
+        }
         self.fail_workflow_if_needed(session_id, result, workflow.clock.now_unix_ms())
             .await
     }
@@ -474,12 +547,22 @@ impl WanSessionCoordinator {
         let entry = self.entry(session_id).await?;
         let _operation = entry.operation.lock().await;
         let initial_state = self.snapshot(session_id).await?;
+        let consent_deadline = initial_state.identity().deadline_unix_ms();
+        // A grant may carry a longer backend lease than the short-lived
+        // signaling claims, but it must have been issued while this intent's
+        // consent window was still open.  Duplicate delivery after grant
+        // installation is handled below and remains idempotent.
+        if initial_state.phase() == WanSessionPhase::AwaitingConsent
+            && workflow.clock.now_unix_ms() >= consent_deadline
+        {
+            return Err(WanSessionCoordinatorError::DeadlineExceeded);
+        }
         let base_identity_matches = verified.session_id == *initial_state.identity().session_id()
             && verified.controller_device_id == *initial_state.identity().controller_device_id()
             && verified.target_device_id == *initial_state.identity().target_device_id()
             && verified.controller_key_fingerprint
                 == initial_state.identity().controller_key_fingerprint()
-            && verified.expires_at_ms <= initial_state.identity().deadline_unix_ms()
+            && verified.issued_at_ms < consent_deadline
             && initial_state
                 .identity()
                 .target_key_fingerprint()
@@ -600,7 +683,7 @@ impl WanSessionCoordinator {
         &self,
         state: WanSessionState,
     ) -> Result<TransitionResult, WanSessionCoordinatorError> {
-        if self.clock.now_unix_ms() >= state.identity().deadline_unix_ms() {
+        if self.clock.now_unix_ms() >= state.effective_deadline_unix_ms() {
             return Err(WanSessionCoordinatorError::DeadlineExceeded);
         }
         let session_id = state.identity().session_id().clone();
@@ -625,6 +708,7 @@ impl WanSessionCoordinator {
                 task_group: Mutex::new(SessionTaskGroup::default()),
                 budgets: Mutex::new(SessionBudgets::default()),
                 cleanup_receipt: OnceCell::new(),
+                same_account_auto_approval: AtomicBool::new(false),
             }),
         );
         registry.active_sessions += 1;
@@ -666,7 +750,7 @@ impl WanSessionCoordinator {
             if state.phase() != WanSessionPhase::Negotiating || state.role() != role {
                 return Err(WanSessionCoordinatorError::RoleOrPhaseMismatch);
             }
-            if now >= identity.deadline_unix_ms()
+            if now >= state.effective_deadline_unix_ms()
                 || now >= grant.grant_expires_at_ms()
                 || now >= grant.policy_expires_at_ms()
             {
@@ -711,7 +795,7 @@ impl WanSessionCoordinator {
         let (transition, terminal, failed, invalidated_error) = {
             let mut state = entry.state.lock().await;
             let now = self.clock.now_unix_ms();
-            let deadline_invalidated = now >= identity.deadline_unix_ms()
+            let deadline_invalidated = now >= state.effective_deadline_unix_ms()
                 || now >= grant.grant_expires_at_ms()
                 || now >= grant.policy_expires_at_ms();
             let binding_invalidated = state.phase() != WanSessionPhase::Negotiating
@@ -785,9 +869,9 @@ impl WanSessionCoordinator {
     }
 
     /// Expire all sessions whose effective authorization deadline has elapsed.
-    /// Once a grant is installed, its grant and policy deadlines can only
-    /// shorten the identity deadline. The service heartbeat should call this
-    /// even when no signaling arrives.
+    /// Before approval this is the signed intent deadline; after a grant is
+    /// installed it is the earliest backend grant/policy lease expiry. The
+    /// service heartbeat should call this even when no signaling arrives.
     pub async fn expire_due_sessions(&self) -> usize {
         let now = self.clock.now_unix_ms();
         let entries = self
@@ -802,16 +886,7 @@ impl WanSessionCoordinator {
         for (session_id, entry) in entries {
             let due = {
                 let state = entry.state.lock().await;
-                let deadline = state.grant().map_or_else(
-                    || state.identity().deadline_unix_ms(),
-                    |grant| {
-                        state
-                            .identity()
-                            .deadline_unix_ms()
-                            .min(grant.grant_expires_at_ms())
-                            .min(grant.policy_expires_at_ms())
-                    },
-                );
+                let deadline = state.effective_deadline_unix_ms();
                 !state.phase().is_terminal() && now >= deadline
             };
             if due {
@@ -893,6 +968,12 @@ impl WanSessionCoordinator {
         Ok(state)
     }
 
+    pub(crate) async fn is_same_account_target(&self, session_id: &SessionId) -> bool {
+        self.entry(session_id)
+            .await
+            .is_ok_and(|entry| entry.same_account_auto_approval.load(Ordering::Acquire))
+    }
+
     /// Return a deterministic bounded snapshot of every live or retained
     /// terminal WAN session. The coordinator remains the workflow source of
     /// truth; callers may project these states for IPC but must not infer
@@ -927,7 +1008,7 @@ impl WanSessionCoordinator {
         {
             let state = entry.state.lock().await;
             if state.phase().is_terminal()
-                || self.clock.now_unix_ms() >= state.identity().deadline_unix_ms()
+                || self.clock.now_unix_ms() >= state.effective_deadline_unix_ms()
             {
                 return Err(WanSessionCoordinatorError::SessionTerminal);
             }
@@ -1036,7 +1117,7 @@ impl WanSessionCoordinator {
         if state.phase().is_terminal() {
             return Err(WanSessionCoordinatorError::SessionTerminal);
         }
-        if now_unix_ms >= state.identity().deadline_unix_ms() {
+        if now_unix_ms >= state.effective_deadline_unix_ms() {
             return Err(WanSessionCoordinatorError::DeadlineExceeded);
         }
         drop(state);
@@ -1277,9 +1358,6 @@ impl VerifiedWanSessionGrant {
         let issued_at_ms = claims.issued_at_ms;
         let expires_at_ms = claims.expires_at_ms;
         let payload = message.payload;
-        if payload.policy_expires_at_ms > expires_at_ms {
-            return Err(WanSessionCoordinatorError::VerifiedGrantRequired);
-        }
         Ok(Self {
             session_id: payload.session_id,
             controller_device_id: payload.controller_device_id,
@@ -1471,6 +1549,7 @@ pub struct WanBackendSessionSnapshot {
     request_commitment: String,
     status: WanSessionStatus,
     grant: Option<GrantBinding>,
+    temporary_guest: bool,
 }
 
 impl std::fmt::Debug for WanBackendSessionSnapshot {
@@ -1547,7 +1626,17 @@ impl WanBackendSessionSnapshot {
             request_commitment,
             status,
             grant,
+            temporary_guest: false,
         })
+    }
+
+    pub(crate) fn with_temporary_guest(mut self, temporary_guest: bool) -> Self {
+        self.temporary_guest = temporary_guest;
+        self
+    }
+
+    pub fn is_temporary_guest(&self) -> bool {
+        self.temporary_guest
     }
 
     pub fn request(&self) -> &WanSessionRequestV3 {
@@ -1613,6 +1702,21 @@ pub trait WanSessionWorkflowBackend: Send + Sync {
         approval: &WanSessionApproval,
         absolute_deadline_unix_ms: u64,
     ) -> Result<WanBackendSessionSnapshot, WanSessionPortError>;
+    async fn same_account(
+        &self,
+        _identity: &WanSessionIdentity,
+        _deadline: u64,
+    ) -> Result<bool, WanSessionPortError> {
+        Ok(false)
+    }
+    async fn approve_same_account(
+        &self,
+        _identity: &WanSessionIdentity,
+        _approval: &WanSessionApproval,
+        _deadline: u64,
+    ) -> Result<WanBackendSessionSnapshot, WanSessionPortError> {
+        Err(WanSessionPortError::Rejected)
+    }
     async fn access_generation_zero(
         &self,
         binding: &WanSessionBinding,
@@ -1650,6 +1754,15 @@ pub trait WanSessionConsentPublisher: Send + Sync {
         request: &WanSessionRequestV3,
         absolute_deadline_unix_ms: u64,
     ) -> Result<(), WanSessionPortError>;
+    async fn publish_same_account_request(
+        &self,
+        _identity: &WanSessionIdentity,
+        _request: &WanSessionRequestV3,
+        _controller_public_key: &[u8; 32],
+        _deadline: u64,
+    ) -> Result<(), WanSessionPortError> {
+        Err(WanSessionPortError::Rejected)
+    }
     async fn load_attended_approval(
         &self,
         identity: &WanSessionIdentity,
@@ -1795,6 +1908,47 @@ pub enum WanSessionCoordinatorError {
     CleanupFailed,
     #[error("WAN session cleanup deadline exceeded")]
     CleanupTimeout,
+}
+
+/// Stable, secret-free coordinator error labels for operational diagnostics.
+/// Do not replace these with `Display`: nested port errors may gain details
+/// that are not safe to put in service logs.
+pub(crate) fn safe_error_category(error: &WanSessionCoordinatorError) -> &'static str {
+    match error {
+        WanSessionCoordinatorError::InvalidConfiguration => "invalid_configuration",
+        WanSessionCoordinatorError::SessionNotFound => "session_not_found",
+        WanSessionCoordinatorError::SessionConflict => "session_conflict",
+        WanSessionCoordinatorError::CapacityExceeded => "capacity_exceeded",
+        WanSessionCoordinatorError::TaskCapacityExceeded => "task_capacity_exceeded",
+        WanSessionCoordinatorError::BufferCapacityExceeded => "buffer_capacity_exceeded",
+        WanSessionCoordinatorError::RetryBudgetExceeded => "retry_budget_exceeded",
+        WanSessionCoordinatorError::DeadlineExceeded => "deadline_exceeded",
+        WanSessionCoordinatorError::SessionTerminal => "session_terminal",
+        WanSessionCoordinatorError::WorkflowUnavailable => "workflow_unavailable",
+        WanSessionCoordinatorError::RoleOrPhaseMismatch => "role_or_phase_mismatch",
+        WanSessionCoordinatorError::BackendBindingMismatch => "backend_binding_mismatch",
+        WanSessionCoordinatorError::Backend(error) => match error {
+            WanSessionPortError::Unavailable => "backend_unavailable",
+            WanSessionPortError::Rejected => "backend_rejected",
+            WanSessionPortError::DeadlineExceeded => "backend_deadline_exceeded",
+        },
+        WanSessionCoordinatorError::Signaling(error) => match error {
+            WanSessionPortError::Unavailable => "signaling_unavailable",
+            WanSessionPortError::Rejected => "signaling_rejected",
+            WanSessionPortError::DeadlineExceeded => "signaling_deadline_exceeded",
+        },
+        WanSessionCoordinatorError::Consent(error) => match error {
+            WanSessionPortError::Unavailable => "consent_unavailable",
+            WanSessionPortError::Rejected => "consent_rejected",
+            WanSessionPortError::DeadlineExceeded => "consent_deadline_exceeded",
+        },
+        WanSessionCoordinatorError::VerifiedIntentRequired => "verified_intent_required",
+        WanSessionCoordinatorError::VerifiedGrantRequired => "verified_grant_required",
+        WanSessionCoordinatorError::Transition(_) => "transition_failed",
+        WanSessionCoordinatorError::TaskJoinFailed => "task_join_failed",
+        WanSessionCoordinatorError::CleanupFailed => "cleanup_failed",
+        WanSessionCoordinatorError::CleanupTimeout => "cleanup_timeout",
+    }
 }
 
 impl From<WanSessionFailure> for WanSessionCoordinatorError {

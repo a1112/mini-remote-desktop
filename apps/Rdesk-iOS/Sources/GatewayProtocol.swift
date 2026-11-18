@@ -1,14 +1,19 @@
 import Foundation
 import CoreGraphics
+import CryptoKit
 
 enum GatewayError: LocalizedError {
-    case invalidAddress, invalidPort, invalidFrame, invalidMessage, invalidText
+    case invalidAddress, invalidPort, invalidFingerprint, invalidPairingToken, certificateMismatch
+    case invalidFrame, invalidMessage, invalidText
     case server(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidAddress: return "请输入受信局域网的 IPv4 地址，如 192.168.1.100。"
         case .invalidPort: return "端口必须是 1 到 65535 的整数。"
+        case .invalidFingerprint: return "请输入 Windows 网关显示的 64 位 SHA-256 证书指纹。"
+        case .invalidPairingToken: return "请输入与电脑网关一致的配对令牌（至少 32 字节）。"
+        case .certificateMismatch: return "网关证书指纹不匹配。请核对 Windows 网关当前显示的指纹。"
         case .invalidFrame: return "电脑返回了无效或过大的画面。"
         case .invalidMessage: return "电脑返回了无法识别的网关消息。"
         case .invalidText: return "文字不能为空，且不能超过 512 字节。"
@@ -21,7 +26,25 @@ enum GatewayError: LocalizedError {
     }
 }
 
-struct GatewayEndpoint: Equatable {
+struct GatewayFingerprint: Equatable, Sendable {
+    let hex: String
+
+    init(_ value: String) throws {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ":", with: "").lowercased()
+        guard normalized.utf8.count == 64,
+              normalized.utf8.allSatisfy({ (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }) else {
+            throw GatewayError.invalidFingerprint
+        }
+        hex = normalized
+    }
+
+    func matches(certificate: Data) -> Bool {
+        SHA256.hash(data: certificate).map { String(format: "%02x", $0) }.joined() == hex
+    }
+}
+
+struct GatewayEndpoint: Equatable, Sendable {
     let host: String
     let port: UInt16
 
@@ -48,7 +71,26 @@ struct GatewayEndpoint: Equatable {
         self.port = number
     }
 
-    var url: URL { URL(string: "ws://\(host):\(port)/mobile/desktop/ws")! }
+    var url: URL { URL(string: "wss://\(host):\(port)/mobile/desktop/ws")! }
+
+    func request(pairingToken: String) throws -> URLRequest {
+        guard pairingToken.utf8.count >= 32 else { throw GatewayError.invalidPairingToken }
+        if pairingToken.utf8.allSatisfy({ (0x21...0x7e).contains($0) }) {
+            var request = URLRequest(url: url)
+            request.setValue(pairingToken, forHTTPHeaderField: "X-MRD-Pairing-Token")
+            return request
+        }
+
+        // The gateway also accepts a query token for values HTTP headers cannot carry losslessly.
+        let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let encoded = pairingToken.addingPercentEncoding(withAllowedCharacters: unreserved) else {
+            throw GatewayError.invalidPairingToken
+        }
+        components.percentEncodedQuery = "token=\(encoded)"
+        guard let encodedURL = components.url else { throw GatewayError.invalidPairingToken }
+        return URLRequest(url: encodedURL)
+    }
 }
 
 enum GatewayProtocol {

@@ -31,7 +31,10 @@ impl Drop for PrivateFixtureDirectory {
 
 /// Use a real isolated transport server, rather than an ambient installed service.
 /// Production product-client/kernel authentication is covered by its own tests.
-async fn isolated_server(requests: Vec<IpcRequest>) -> (IpcClient, tokio::task::JoinHandle<()>) {
+async fn isolated_server(
+    requests: Vec<IpcRequest>,
+    send_replies: bool,
+) -> (IpcClient, tokio::task::JoinHandle<()>) {
     let id = format!(
         "{}-{:x}-{}",
         std::process::id(),
@@ -67,6 +70,13 @@ async fn isolated_server(requests: Vec<IpcRequest>) -> (IpcClient, tokio::task::
         for expected in requests {
             let request = stream.recv_request().await.unwrap();
             assert_eq!(request, expected);
+            if !send_replies {
+                assert!(
+                    stream.recv_request().await.is_err(),
+                    "client must close after timeout"
+                );
+                break;
+            }
             let response = match request {
                 IpcRequest::ListDevices => IpcResponse::DeviceList { devices: vec![] },
                 IpcRequest::ServiceHealth => IpcResponse::ServiceHealth {
@@ -110,7 +120,7 @@ fn test_device_id() -> DeviceId {
 /// Test basic client connection and ListDevices request
 #[tokio::test]
 async fn ipc_client_sends_list_devices_request() {
-    let (mut client, server) = isolated_server(vec![IpcRequest::ListDevices]).await;
+    let (mut client, server) = isolated_server(vec![IpcRequest::ListDevices], true).await;
     let response = tokio::time::timeout(
         FIXTURE_TIMEOUT,
         client.send_request(IpcRequest::ListDevices),
@@ -129,14 +139,11 @@ async fn ipc_client_sends_list_devices_request() {
 /// Test ServiceHealth request
 #[tokio::test]
 async fn ipc_client_sends_service_health_request() {
-    let (mut client, server) = isolated_server(vec![IpcRequest::ServiceHealth]).await;
-    let response = tokio::time::timeout(
-        FIXTURE_TIMEOUT,
-        client.send_request(IpcRequest::ServiceHealth),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let (client, server) = isolated_server(vec![IpcRequest::ServiceHealth], true).await;
+    let response = client
+        .send_request_with_timeout(IpcRequest::ServiceHealth, FIXTURE_TIMEOUT)
+        .await
+        .unwrap();
     assert_eq!(
         response,
         IpcResponse::ServiceHealth {
@@ -147,6 +154,20 @@ async fn ipc_client_sends_service_health_request() {
             },
         }
     );
+    tokio::time::timeout(FIXTURE_TIMEOUT, server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn ipc_client_times_out_and_closes_when_service_does_not_reply() {
+    let (client, server) = isolated_server(vec![IpcRequest::ServiceHealth], false).await;
+    let error = client
+        .send_request_with_timeout(IpcRequest::ServiceHealth, Duration::from_millis(250))
+        .await
+        .unwrap_err();
+    assert!(error.is::<tokio::time::error::Elapsed>());
     tokio::time::timeout(FIXTURE_TIMEOUT, server)
         .await
         .unwrap()
@@ -246,7 +267,7 @@ async fn ipc_client_handles_multiple_sequential_requests() {
         IpcRequest::ListDevices,
         IpcRequest::ServiceHealth,
     ];
-    let (mut client, server) = isolated_server(requests.clone()).await;
+    let (mut client, server) = isolated_server(requests.clone(), true).await;
     for request in requests {
         let response = tokio::time::timeout(FIXTURE_TIMEOUT, client.send_request(request.clone()))
             .await

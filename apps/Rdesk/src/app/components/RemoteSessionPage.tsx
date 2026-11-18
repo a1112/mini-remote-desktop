@@ -36,6 +36,7 @@ import {
 } from "../services/realtimeSessionService";
 import {
   closeRemoteDisplayWindow,
+  ipcMediaPipelineSnapshot,
   listRemoteDisplayWindows,
   openRemoteDisplayWindow,
   type RemoteDisplayWindowContext,
@@ -59,7 +60,7 @@ import {
 } from "../services/webRemoteSessionService";
 
 const BROWSER_REMOTE_UNSUPPORTED_MESSAGE =
-  "Secure remote sessions require the desktop client";
+  "此会话需要在桌面客户端中打开";
 // DEPRECATED: Rendering services removed - now managed by mrd-service
 // import {
 //   attachRenderHostSession,
@@ -171,6 +172,41 @@ function remotePresentationLabel(state: RemotePresentationState | undefined): st
   }
 }
 
+const authorizationLabels: Record<RemoteSessionSnapshot["authorization_state"], string> = {
+  discovered: "已发现设备",
+  authenticating: "正在验证身份",
+  authorizing: "正在检查权限",
+  awaiting_local_consent: "等待设备确认",
+  verifying_unattended_credential: "正在验证凭据",
+  granted: "已授权",
+  denied: "已拒绝",
+  expired: "授权已过期",
+  revoked: "授权已撤销",
+  locked_out: "暂时锁定",
+  policy_changed: "权限策略已更改",
+};
+
+const routeLabels: Record<RemoteSessionSnapshot["route_state"], string> = {
+  idle: "尚未连接",
+  gathering: "正在寻找可用路径",
+  connecting: "正在连接",
+  connected: "已连接",
+  migrating: "正在切换路径",
+  reconnecting: "正在重连",
+  failed: "连接失败",
+  closed: "已关闭",
+};
+
+const mediaLabels: Record<RemoteSessionSnapshot["media_state"], string> = {
+  idle: "尚未开始",
+  starting: "正在启动",
+  streaming: "传输中",
+  degraded: "画质下降",
+  paused: "已暂停",
+  stopped: "已停止",
+  failed: "传输失败",
+};
+
 export function RemoteSessionPage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -192,12 +228,14 @@ export function RemoteSessionPage() {
   const [ffmpegStatus, setFfmpegStatus] = useState<FfmpegProbeResult | null>(null);
   const [webrtcHostSnapshot, setWebrtcHostSnapshot] = useState<WebrtcHostSnapshot | null>(null);
   const [webRtcState, setWebRtcState] = useState<"idle" | "connecting" | "connected" | "failed">("idle");
-  const [webRtcMessage, setWebRtcMessage] = useState("WebRTC waiting");
+  const [webRtcMessage, setWebRtcMessage] = useState("等待 WebRTC 连接");
   const [displayWindows, setDisplayWindows] = useState<RemoteDisplayWindowContext[]>([]);
-  const [remoteSessionSnapshot, setRemoteSessionSnapshot] =
+  const [observedSessionSnapshot, setRemoteSessionSnapshot] =
     useState<RemoteSessionSnapshot | null>(null);
+  const remoteSessionSnapshot = observedSessionSnapshot?.session_id === id ? observedSessionSnapshot : null;
   const [remoteSessionError, setRemoteSessionError] = useState<string | null>(null);
   const [probeSnapshot, setProbeSnapshot] = useState<ProbeSnapshot | null>(null);
+  const [nativePresentation, setNativePresentation] = useState<{ sessionId: string; frames: number | null } | null>(null);
   const [displayLaunchState, setDisplayLaunchState] =
     useState<"idle" | "opening" | "open" | "failed">("idle");
   const [displayLaunchMessage, setDisplayLaunchMessage] =
@@ -237,7 +275,7 @@ export function RemoteSessionPage() {
     id && tauriRuntime && remoteSessionError
       ? {
           id,
-          name: "Remote session",
+          name: "远程会话",
           deviceId: id,
           os: "Unknown remote device",
           icon: Monitor,
@@ -271,11 +309,21 @@ export function RemoteSessionPage() {
   const isWebRemoteSession = Boolean(
     webRemoteSession?.mode === "web_to_local" && !tauriRuntime,
   );
+  const presentationState = remoteSessionSnapshot?.presentation_state;
+  const sessionIsTerminal = presentationState === "denied" ||
+    presentationState === "failed" || presentationState === "closed";
+  const browserConnectionFailed = isWebRemoteSession && webRtcState === "failed";
+  const canReturn = sessionIsTerminal || unsupportedBrowserPeerSession || browserConnectionFailed;
   const nativeStreaming =
-    tauriRuntime && remoteSessionSnapshot?.presentation_state === "streaming";
+    tauriRuntime && presentationState === "streaming";
   const mediaConnected = isWebRemoteSession
     ? webRtcState === "connected"
     : nativeStreaming;
+  const presentedFrames = nativeStreaming && nativePresentation && nativePresentation.sessionId === id
+    ? nativePresentation.frames
+    : null;
+  const hasPresentedFrame = presentedFrames !== null && presentedFrames > 0;
+  const firstFrameStatus = presentedFrames === null ? "首帧状态未知" : hasPresentedFrame ? "首帧已呈现" : "等待首帧";
   const effectiveDisplayLaunchMessage =
     isWebRemoteSession && displayLaunchMessage === "原生显示窗口将承载远程画面"
       ? "网页渲染将承载本机 mrd-service 采集画面"
@@ -306,8 +354,8 @@ export function RemoteSessionPage() {
     if (
       !id ||
       !tauriRuntime ||
-      !remoteSessionSnapshot ||
-      remoteSessionSnapshot.presentation_state === "streaming"
+      !presentationState ||
+      presentationState === "streaming"
     ) {
       return;
     }
@@ -315,7 +363,7 @@ export function RemoteSessionPage() {
     let cancelled = false;
     void (async () => {
       const windows = await listRemoteDisplayWindows(id);
-      if (cancelled || !windows.ok) return;
+      if (!windows.ok || (cancelled && !sessionIsTerminal)) return;
       await Promise.all(
         windows.value.map((window) => closeRemoteDisplayWindow(window.label)),
       );
@@ -323,7 +371,7 @@ export function RemoteSessionPage() {
     return () => {
       cancelled = true;
     };
-  }, [id, remoteSessionSnapshot?.presentation_state, tauriRuntime]);
+  }, [id, presentationState, sessionIsTerminal, tauriRuntime]);
 
   useEffect(() => {
     if (!mediaConnected) {
@@ -340,7 +388,7 @@ export function RemoteSessionPage() {
     if (!isWebRemoteSession || !webRemoteSession) return;
     if (typeof RTCPeerConnection === "undefined") {
       setWebRtcState("failed");
-      setWebRtcMessage("WebRTC is not available in this browser");
+      setWebRtcMessage("当前浏览器不支持 WebRTC");
       return;
     }
 
@@ -355,7 +403,7 @@ export function RemoteSessionPage() {
       setWebRtcMessage(message);
     };
 
-    setSafeState("connecting", "Creating browser WebRTC control channel");
+    setSafeState("connecting", "正在建立 WebRTC 连接");
 
     left.onicecandidate = (event) => {
       if (event.candidate) void right.addIceCandidate(event.candidate);
@@ -365,22 +413,22 @@ export function RemoteSessionPage() {
     };
     left.onconnectionstatechange = () => {
       if (left.connectionState === "connected") {
-        setSafeState("connected", "WebRTC control channel connected");
+        setSafeState("connected", "WebRTC 已连接");
       } else if (left.connectionState === "failed" || left.connectionState === "closed") {
-        setSafeState("failed", `WebRTC ${left.connectionState}`);
+        setSafeState("failed", "WebRTC 连接已中断");
       }
     };
     right.ondatachannel = (event) => {
-      event.channel.onmessage = (message) => {
-        setSafeState("connected", `WebRTC message: ${String(message.data)}`);
+      event.channel.onmessage = () => {
+        setSafeState("connected", "WebRTC 已连接");
       };
     };
     channel.onopen = () => {
       channel.send(`web-remote-ready:${webRemoteSession.sessionId}`);
-      setSafeState("connected", "WebRTC control channel connected");
+      setSafeState("connected", "WebRTC 已连接");
     };
     channel.onerror = () => {
-      setSafeState("failed", "WebRTC data channel error");
+      setSafeState("failed", "WebRTC 数据通道出错");
     };
 
     void (async () => {
@@ -394,7 +442,7 @@ export function RemoteSessionPage() {
       } catch (error) {
         setSafeState(
           "failed",
-          error instanceof Error ? error.message : "WebRTC setup failed"
+          error instanceof Error ? error.message : "无法建立 WebRTC 连接"
         );
       }
     })();
@@ -418,26 +466,31 @@ export function RemoteSessionPage() {
     if (!id || !tauriRuntime || !nativeStreaming) {
       setDisplayWindows([]);
       setProbeSnapshot(null);
+      setNativePresentation(null);
       return;
     }
 
     let cancelled = false;
+    let inFlight = false;
     const refreshNativeDisplayState = async () => {
-      const windowsResult = await listRemoteDisplayWindows(id);
-      if (!cancelled && windowsResult.ok) {
-        setDisplayWindows(windowsResult.value);
-        if (windowsResult.value.length > 0) {
+      if (inFlight) return;
+      inFlight = true;
+      const [windows, probe, pipeline] = await Promise.allSettled([
+        listRemoteDisplayWindows(id), getProbeSnapshot(id), ipcMediaPipelineSnapshot(id),
+      ]);
+      inFlight = false;
+      if (cancelled) return;
+
+      if (windows.status === "fulfilled" && windows.value.ok) {
+        setDisplayWindows(windows.value.value);
+        if (windows.value.value.length > 0) {
           setDisplayLaunchState("open");
-          setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+          setDisplayLaunchMessage("原生显示窗口已打开");
         }
       }
-
-      try {
-        const snapshot = await getProbeSnapshot(id);
-        if (!cancelled) setProbeSnapshot(snapshot);
-      } catch {
-        if (!cancelled) setProbeSnapshot(null);
-      }
+      setProbeSnapshot(probe.status === "fulfilled" ? probe.value : null);
+      const media = pipeline.status === "fulfilled" && pipeline.value.ok ? pipeline.value.value : null;
+      setNativePresentation({ sessionId: id, frames: media?.session_id === id ? media.render_presented_frames ?? null : null });
     };
 
     void refreshNativeDisplayState();
@@ -461,7 +514,7 @@ export function RemoteSessionPage() {
       if (existing.ok && existing.value.length > 0) {
         setDisplayWindows(existing.value);
         setDisplayLaunchState("open");
-        setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+        setDisplayLaunchMessage("原生显示窗口已打开");
         return;
       }
 
@@ -475,7 +528,7 @@ export function RemoteSessionPage() {
       if (result.ok) {
         setDisplayWindows([result.value]);
         setDisplayLaunchState("open");
-        setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+        setDisplayLaunchMessage("原生显示窗口已打开");
       } else {
         setDisplayLaunchState("failed");
         setDisplayLaunchMessage(result.error.message);
@@ -587,6 +640,10 @@ export function RemoteSessionPage() {
   };
 
   const handleDisconnect = () => {
+    if (canReturn) {
+      navigate("/devices", { replace: true });
+      return;
+    }
     if (isWebRemoteSession) {
       navigate("/devices");
       return;
@@ -619,7 +676,7 @@ export function RemoteSessionPage() {
       return [result.value, ...rest];
     });
     setDisplayLaunchState("open");
-    setDisplayLaunchMessage("原生显示窗口已接管画面输出");
+    setDisplayLaunchMessage("原生显示窗口已打开");
   };
 
   const handleOpenCurrentSurfaceWindow = async () => {
@@ -719,11 +776,11 @@ export function RemoteSessionPage() {
     })();
   };
 
-  if (
-    (loading && !webRemoteSession) ||
-    (tauriRuntime && id && !remoteSessionSnapshot && !remoteSessionError)
-  ) {
-    return <div className="flex items-center justify-center h-screen bg-[#1a1a1a] text-gray-400">加载设备中...</div>;
+  const waitingForSession = tauriRuntime && id && !remoteSessionSnapshot && !remoteSessionError;
+  if (waitingForSession || (loading && !device)) {
+    return <div role="status" className="flex items-center justify-center h-screen bg-[#1a1a1a] text-gray-400">
+      {waitingForSession ? "正在读取远程会话状态" : "正在加载设备"}
+    </div>;
   }
 
   if (!device) {
@@ -744,42 +801,36 @@ export function RemoteSessionPage() {
     );
   }
 
-  if (isMobile) {
-    const failureMessage = unsupportedBrowserPeerSession
-      ? BROWSER_REMOTE_UNSUPPORTED_MESSAGE
+  const failureMessage = unsupportedBrowserPeerSession
+    ? BROWSER_REMOTE_UNSUPPORTED_MESSAGE
+    : browserConnectionFailed
+      ? webRtcMessage
       : remoteSessionSnapshot?.failure?.message ?? remoteSessionError;
-    const status = unsupportedBrowserPeerSession
-      ? "会话不可用"
-      : isWebRemoteSession
-        ? webRtcMessage
-        : remotePresentationLabel(remoteSessionSnapshot?.presentation_state);
+  const suggestedAction = remoteSessionSnapshot?.failure?.suggested_action ?? null;
+  const presentationLabel = unsupportedBrowserPeerSession || browserConnectionFailed
+    ? "会话不可用"
+    : isWebRemoteSession
+      ? webRtcMessage
+      : remotePresentationLabel(presentationState);
+
+  if (isMobile) {
     return <MobileSessionView
       deviceName={device.name}
-      status={status}
-      awaitingApproval={remoteSessionSnapshot?.presentation_state === "incoming_approval_required"}
+      status={presentationLabel}
+      awaitingApproval={presentationState === "incoming_approval_required"}
       streaming={mediaConnected}
+      ended={canReturn}
       hasNativeDisplay={nativeStreaming && displayWindows.length > 0}
       canOpenDisplay={Boolean(nativeStreaming)}
-      error={failureMessage ?? null}
-      suggestedAction={remoteSessionSnapshot?.failure?.suggested_action ?? null}
+      firstFrameStatus={nativeStreaming ? firstFrameStatus : null}
+      error={failureMessage}
+      suggestedAction={suggestedAction}
       onDisconnect={handleDisconnect}
       onOpenDisplay={() => void handlePopOutWindow()}
     />;
   }
 
   if (!mediaConnected) {
-    const failureMessage =
-      (unsupportedBrowserPeerSession
-        ? BROWSER_REMOTE_UNSUPPORTED_MESSAGE
-        : remoteSessionSnapshot?.failure?.message ?? remoteSessionError);
-    const suggestedAction =
-      remoteSessionSnapshot?.failure?.suggested_action ?? null;
-    const presentationLabel = unsupportedBrowserPeerSession
-      ? "Secure remote session unavailable"
-      : isWebRemoteSession
-        ? webRtcMessage
-        : remotePresentationLabel(remoteSessionSnapshot?.presentation_state);
-
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-[#0b1020] px-6 text-gray-200">
         <div className="w-full max-w-xl rounded-xl border border-white/10 bg-[#171d2d] p-6 shadow-2xl">
@@ -791,7 +842,7 @@ export function RemoteSessionPage() {
               <div className="truncate text-base font-semibold text-white">
                 {device.name}
               </div>
-              <div className="mt-1 text-sm text-gray-400">
+              <div role="status" className="mt-1 text-sm text-gray-400">
                 {presentationLabel}
               </div>
             </div>
@@ -799,15 +850,15 @@ export function RemoteSessionPage() {
           <div className="mt-5 grid gap-3 sm:grid-cols-3">
             <DisplayMetric
               label="授权"
-              value={remoteSessionSnapshot?.authorization_state ?? "pending"}
+              value={remoteSessionSnapshot ? authorizationLabels[remoteSessionSnapshot.authorization_state] : "待验证"}
             />
             <DisplayMetric
               label="路由"
-              value={remoteSessionSnapshot?.route_state ?? "pending"}
+              value={remoteSessionSnapshot ? routeLabels[remoteSessionSnapshot.route_state] : "待连接"}
             />
             <DisplayMetric
               label="媒体"
-              value={remoteSessionSnapshot?.media_state ?? webRtcState}
+              value={remoteSessionSnapshot ? mediaLabels[remoteSessionSnapshot.media_state] : "尚未开始"}
             />
           </div>
           {failureMessage ? (
@@ -820,17 +871,18 @@ export function RemoteSessionPage() {
                 <div className="mt-1 text-xs text-red-200/70">{suggestedAction}</div>
               ) : null}
             </div>
-          ) : (
-            <div className="mt-5 h-1.5 overflow-hidden rounded-full bg-white/10">
+          ) : canReturn ? null : (
+            <div aria-hidden="true" className="mt-5 h-1.5 overflow-hidden rounded-full bg-white/10">
               <div className="h-full w-1/2 animate-pulse rounded-full bg-blue-400" />
             </div>
           )}
           <div className="mt-5 flex justify-end">
             <button
+              type="button"
               onClick={handleDisconnect}
               className="rounded-md bg-red-500/15 px-3 py-2 text-sm text-red-300 hover:bg-red-500/25"
             >
-              取消连接
+              {canReturn ? "返回设备列表" : "取消连接"}
             </button>
           </div>
         </div>
@@ -1011,10 +1063,9 @@ export function RemoteSessionPage() {
           </div>
         </div>
 
-        {/* Connection quality overlay */}
-        <div className="absolute top-3 right-3 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
-          <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
-          连接稳定
+        <div role="status" className="absolute top-3 right-3 flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm border border-white/10 text-gray-300" style={{ fontSize: 11 }}>
+          <span aria-hidden="true" className={`size-1.5 rounded-full ${hasPresentedFrame ? "bg-green-400" : "bg-gray-400"}`} />
+          {nativeStreaming ? firstFrameStatus : "请在显示窗口中查看画面"}
         </div>
 
         {isWebRemoteSession ? (

@@ -95,6 +95,7 @@ fn binding(request: &WanSessionRequestV3) -> WanSessionBinding {
 struct CapturedRequest {
     method: Method,
     path: String,
+    query: Option<String>,
     headers: HeaderMap,
     body: Vec<u8>,
 }
@@ -209,6 +210,7 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
         captured.push(CapturedRequest {
             method: parts.method.clone(),
             path: parts.uri.path().to_owned(),
+            query: parts.uri.query().map(str::to_owned),
             headers: parts.headers,
             body: body.clone(),
         });
@@ -241,7 +243,9 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
         | FakeMode::TemporaryAuthority(_) => {}
     }
 
-    let status = if parts.uri.path().ends_with("/approve") {
+    let status = if parts.uri.path().ends_with("/approve")
+        || parts.uri.path().ends_with("/approve-same-account")
+    {
         "approved"
     } else if parts.uri.path().ends_with("/reject") {
         "rejected"
@@ -252,7 +256,9 @@ async fn fake_backend(State(state): State<FakeState>, request: Request) -> Respo
     } else {
         "requested"
     };
-    let mut response = if parts.uri.path() == "/api/v1/relays/access" {
+    let mut response = if parts.uri.path().ends_with("/same-account") {
+        json!({"trusted": true})
+    } else if parts.uri.path() == "/api/v1/relays/access" {
         let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let requested_generation = request
             .get("generation")
@@ -507,6 +513,74 @@ async fn typed_operations_bind_ids_and_send_only_the_device_token_header() {
                 "generation": 0
             })
     );
+}
+
+#[tokio::test]
+async fn same_account_requests_bind_both_signed_keys_and_do_not_retry_approval() {
+    let canonical_request = request();
+    let binding = binding(&canonical_request);
+    let server = FakeBackend::spawn(canonical_request).await;
+    let backend =
+        HttpWanSessionBackend::new(client_config(&server.base_url, "target-token")).unwrap();
+    let controller_key = "a".repeat(64);
+    let target_key = "b".repeat(64);
+    assert!(backend
+        .same_account(&binding, &controller_key, &target_key)
+        .await
+        .unwrap());
+    let approval = WanSessionApproval::new(vec![WanPermissionScopeV3::ScreenView], None).unwrap();
+    assert_eq!(
+        backend
+            .approve_same_account(&binding, &approval, &controller_key, &target_key)
+            .await
+            .unwrap()
+            .status(),
+        WanSessionStatus::Approved
+    );
+    assert!(backend
+        .same_account(&binding, "bad", &target_key)
+        .await
+        .is_err());
+    let captured = server.requests();
+    assert_eq!(captured.len(), 2);
+    for (entry, suffix, method) in [
+        (&captured[0], "same-account", Method::GET),
+        (&captured[1], "approve-same-account", Method::POST),
+    ] {
+        assert_eq!(
+            entry.path,
+            format!("/api/v1/device-sessions/wan-session-1/{suffix}")
+        );
+        assert_eq!(entry.method, method);
+        assert_eq!(
+            entry.query.as_deref(),
+            Some(format!("controller_key_id={controller_key}&target_key_id={target_key}").as_str())
+        );
+        assert_eq!(
+            entry.headers.get("x-rdesk-device-authorization").unwrap(),
+            "Bearer target-token"
+        );
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&captured[1].body).unwrap(),
+        json!({"approved_scopes":["screen.view"],"approved_profile":null})
+    );
+
+    let failed = FakeBackend::spawn_with_mode(
+        request(),
+        FakeMode::AlwaysStatus(StatusCode::CONFLICT, "conflict".into()),
+    )
+    .await;
+    let backend =
+        HttpWanSessionBackend::new(client_config(&failed.base_url, "target-token")).unwrap();
+    assert_eq!(
+        backend
+            .approve_same_account(&binding, &approval, &controller_key, &target_key)
+            .await
+            .unwrap_err(),
+        WanSessionBackendError::Conflict
+    );
+    assert_eq!(failed.requests().len(), 1);
 }
 
 #[tokio::test]

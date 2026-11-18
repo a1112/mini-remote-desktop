@@ -280,6 +280,7 @@ async fn browser_revoke_during_negotiation_joins_owned_sibling_without_reenterin
             let failure = super::super::browser_authority::monitor_browser_authority(
                 &RevokedBackend,
                 &state,
+                false,
                 cancellation.into_receiver(),
                 Duration::from_millis(2),
                 Duration::from_millis(10),

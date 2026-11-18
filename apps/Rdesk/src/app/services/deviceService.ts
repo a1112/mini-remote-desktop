@@ -213,7 +213,7 @@ class DeviceRegistrationService {
 
   private async bindManagedDeviceIfLoggedIn(): Promise<void> {
     if (this.deviceInfo?.access_token === SERVICE_MANAGED_TOKEN && this.getUserAccessToken()) {
-      await this.bindDevice("");
+      await this.bindDevice();
     }
   }
 
@@ -385,10 +385,9 @@ class DeviceRegistrationService {
 
   /**
    * 用户登录时绑定设备
-   * @param userId 用户ID
    * @returns 绑定结果
    */
-  async bindDevice(userId: string): Promise<{
+  async bindDevice(): Promise<{
     success: boolean;
     message: string;
     kickedUser?: { user_id: string; kicked_at: string } | null;
@@ -396,7 +395,9 @@ class DeviceRegistrationService {
   }> {
     if (!this.deviceInfo && this.initPromise) await this.initPromise;
     if (!this.deviceInfo) {
-      return { success: false, message: "登记设备后将自动绑定当前登录账户" };
+      const message = "登记设备后将自动绑定当前登录账户";
+      this.recordBindingError(message);
+      return { success: false, message };
     }
     if (this.deviceInfo.access_token === SERVICE_MANAGED_TOKEN || this.shouldUseServiceManagedRegistration()) {
       const userToken = this.getUserAccessToken();
@@ -424,18 +425,22 @@ class DeviceRegistrationService {
         },
         body: JSON.stringify({
           device_id: this.deviceInfo.device_id,
-          user_id: userId,
         }),
       });
 
       if (!response.ok) {
-        return { success: false, message: "设备绑定失败，请重新登录后重试" };
+        const message = "设备绑定失败，请确认本机登记状态后重试";
+        this.recordBindingError(message);
+        return { success: false, message };
       }
 
       const data = await response.json();
+      this.recordBindingError(data.success ? null : data.message);
       return data;
     } catch {
-      return { success: false, message: "网络错误" };
+      const message = "网络错误，无法绑定本机设备";
+      this.recordBindingError(message);
+      return { success: false, message };
     }
   }
 

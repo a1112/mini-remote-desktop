@@ -36,6 +36,9 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[cfg(windows)]
+mod windows_public_device_admin;
+
+#[cfg(windows)]
 #[derive(Debug, Clone, Copy)]
 enum RuntimeControl {
     Stop,
@@ -124,6 +127,12 @@ fn main() -> Result<()> {
         if requests_existing_store_verification(&arguments)? {
             return run_existing_store_verification();
         }
+        #[cfg(windows)]
+        if let Some(command) =
+            windows_public_device_admin::PublicDeviceCommand::from_args(&arguments)?
+        {
+            return command.run();
+        }
     }
 
     // Set the process creation policy before the multi-thread runtime starts:
@@ -189,7 +198,31 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(run_service(RunMode::Console, None, StatusReporter::Console));
+    #[cfg(target_os = "macos")]
+    let recovery = result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<MacosRuntimeRecovery>())
+        .map(|recovery| recovery.attempt);
+    #[cfg(target_os = "macos")]
+    if recovery.is_some() {
+        // Cleanup is finished. Honor a system stop between the last async
+        // signal check and exec even after Tokio's signal receiver is gone.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+    }
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    #[cfg(target_os = "macos")]
+    if let Some(attempt) = recovery {
+        use std::os::unix::process::CommandExt;
+        let error = std::process::Command::new(std::env::current_exe()?)
+            .args(arguments)
+            .env(MACOS_RECOVERY_ATTEMPT_ENV, attempt.to_string())
+            .exec();
+        return Err(error).context("cannot restart the macOS resident runtime");
+    }
     result
 }
 
@@ -255,8 +288,6 @@ async fn run_service(
     match lan_discovery::start_lan_discovery(app_state.clone()).await {
         Ok(()) => info!("LAN peer discovery started"),
         Err(error) => {
-            let mut shell = app_state.shell.lock().await;
-            shell.last_error = Some(format!("LAN discovery failed: {error}"));
             warn!("LAN peer discovery unavailable: {error}");
         }
     }
@@ -561,6 +592,30 @@ async fn run_service(
 }
 
 #[cfg(target_os = "macos")]
+const MACOS_RECOVERY_ATTEMPT_ENV: &str = "MRD_MACOS_PUBLIC_RUNTIME_RECOVERY_ATTEMPT";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, thiserror::Error)]
+#[error("macOS public runtime requires a fresh resident process (attempt {attempt})")]
+struct MacosRuntimeRecovery {
+    attempt: u32,
+}
+
+#[cfg(target_os = "macos")]
+fn macos_recovery_plan(
+    previous_attempts: u32,
+    running_for: std::time::Duration,
+) -> Option<(u32, std::time::Duration)> {
+    use std::time::Duration;
+    let attempts = if running_for >= Duration::from_secs(300) {
+        0
+    } else {
+        previous_attempts
+    };
+    (attempts < 3).then(|| (attempts + 1, Duration::from_secs(1 << attempts)))
+}
+
+#[cfg(target_os = "macos")]
 async fn run_service(
     _mode: RunMode,
     _controls: Option<()>,
@@ -591,7 +646,6 @@ async fn run_service(
         .context("public device credential persistence initialization failed")?;
     initialize_application_state(&app_state, &tray).await;
     if let Err(error) = lan_discovery::start_lan_discovery(app_state.clone()).await {
-        app_state.shell.lock().await.last_error = Some(format!("LAN discovery failed: {error}"));
         warn!("LAN peer discovery unavailable: {error}");
     }
     if let Err(error) = tray.lock().unwrap().install(shell::TrayModel::default()) {
@@ -626,22 +680,26 @@ async fn run_service(
         result = &mut ipc_task => return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("IPC stopped during startup"))),
         result = &mut management_task => return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("Management IPC stopped during startup"))),
     }
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let mut expiry = tokio::time::interval(std::time::Duration::from_secs(1));
     expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     reporter.running()?;
+    let running_since = tokio::time::Instant::now();
     info!("mrd-service running in the macOS user session");
     let mut runtime_error = None;
     let mut management_available = true;
     let mut shutdown_mode = mrd_ipc::ShutdownMode::Graceful;
+    let mut os_stop_requested = false;
     loop {
         tokio::select! {
             requested = mrd_service::shutdown::wait_for_shutdown(&app_state) => {
                 shutdown_mode = requested;
                 break;
             }
-            _ = tokio::signal::ctrl_c() => break,
-            _ = terminate.recv() => break,
+            _ = interrupt.recv() => { os_stop_requested = true; break; }
+            _ = terminate.recv() => { os_stop_requested = true; break; }
             result = &mut ipc_task => {
                 runtime_error = Some(result.err().unwrap_or_else(|| anyhow::anyhow!("IPC server stopped")));
                 break;
@@ -692,6 +750,8 @@ async fn run_service(
     ));
     let timed_out = loop {
         tokio::select! {
+            _ = interrupt.recv() => { os_stop_requested = true; }
+            _ = terminate.recv() => { os_stop_requested = true; }
             result = &mut cleanup => break result.is_err(),
             result = &mut management_task, if management_available => {
                 warn!("Management IPC stopped during cleanup: {result:?}");
@@ -715,6 +775,30 @@ async fn run_service(
         cleanup_succeeded = runtime_error.is_none(),
         "mrd-service stopped"
     );
+    if app_state.shutdown.should_recover() && !os_stop_requested {
+        let previous_attempts = std::env::var(MACOS_RECOVERY_ATTEMPT_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default();
+        let error = runtime_error
+            .unwrap_or_else(|| anyhow::anyhow!("public resident runtime stopped unexpectedly"));
+        let Some((attempt, delay)) =
+            macos_recovery_plan(previous_attempts, running_since.elapsed())
+        else {
+            return Err(error.context("macOS public runtime recovery attempts exhausted"));
+        };
+        warn!(
+            attempt,
+            ?delay,
+            "restarting failed macOS public resident runtime"
+        );
+        tokio::select! {
+            biased;
+            _ = interrupt.recv() => return Ok(()),
+            _ = terminate.recv() => return Ok(()),
+            _ = tokio::time::sleep(delay) => return Err(error.context(MacosRuntimeRecovery { attempt })),
+        }
+    }
     runtime_error.map_or(Ok(()), Err)
 }
 
@@ -1104,5 +1188,26 @@ mod existing_store_preflight_tests {
         ] {
             assert!(!requests_existing_store_verification(&args(&arguments)).unwrap());
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_runtime_recovery_tests {
+    use super::macos_recovery_plan;
+    use std::time::Duration;
+
+    #[test]
+    fn public_runtime_recovery_backs_off_and_stops_after_three_short_runs() {
+        for (previous, delay_secs) in [(0, 1), (1, 2), (2, 4)] {
+            assert_eq!(
+                macos_recovery_plan(previous, Duration::from_secs(30)),
+                Some((previous + 1, Duration::from_secs(delay_secs))),
+            );
+        }
+        assert_eq!(macos_recovery_plan(3, Duration::from_secs(30)), None);
+        assert_eq!(
+            macos_recovery_plan(3, Duration::from_secs(300)),
+            Some((1, Duration::from_secs(1))),
+        );
     }
 }

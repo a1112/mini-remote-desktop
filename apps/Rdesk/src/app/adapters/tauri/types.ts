@@ -704,6 +704,7 @@ export interface LanDiscoverySnapshot {
   discovery_port: number;
   instance_id: string;
   last_probe_ms?: number | null;
+  error_code?: "socket_bind_failed" | "broadcast_setup_failed" | "probe_send_failed" | null;
   peers: LanPeerInfo[];
 }
 

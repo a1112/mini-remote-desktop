@@ -343,7 +343,7 @@ function Convert-SecureLanReportToQualityArtifact {
   $datagramPacketsSent = [Math]::Max(0, [int64](Select-CanaryObjectPropertyValue $senderTransport "datagram_fragments_sent" 0))
   $reliablePacketsSent = [Math]::Max(0, [int64](Select-CanaryObjectPropertyValue $senderTransport "reliable_fragments_sent" 0))
   $mediaPacketsSent = $datagramPacketsSent + $reliablePacketsSent
-  $firstFrameTimeMs = Get-CanaryReportFirstFrameTimeMs -Report $Report
+  $firstPresentedFrameTimeMs = Select-CanaryObjectPropertyValue $Report "firstPresentedFrameTimeMs" $null
   $maxZeroFrameWindowAfterFirstFrameMs = Select-CanaryObjectPropertyValue $Report "maxZeroFrameWindowAfterFirstFrameMs" $null
   $freezeCount = if (
     $null -ne $maxZeroFrameWindowAfterFirstFrameMs -and
@@ -391,7 +391,7 @@ function Convert-SecureLanReportToQualityArtifact {
       profile_downgraded = $profileDowngraded
     }
     present = [pscustomobject]@{
-      visible_first_frame_ms = $firstFrameTimeMs
+      visible_first_frame_ms = $firstPresentedFrameTimeMs
       input_to_photon_ms = @()
       fps_windows = $fpsWindows
       freeze_count = $freezeCount

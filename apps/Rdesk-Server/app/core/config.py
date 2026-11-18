@@ -1,9 +1,13 @@
 from pathlib import Path
 from typing import Literal
+import base64
+import re
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.client_ip import proxy_networks
 
 _DEV_DB_URL = "postgresql+asyncpg://postgres@127.0.0.1:5432/rdesk_server"
 _DEV_JWT_SECRET = "development-only-secret-change-before-production"
@@ -55,6 +59,15 @@ class Settings(BaseSettings):
     device_self_enrollment_key_per_minute: int = Field(default=5, ge=1, le=30)
     # Only these socket peers may supply one validated X-Real-IP value.
     device_self_enrollment_trusted_proxies: str = ""
+    # Optional independent Keycloak client. The R-Auth browser cookie is never
+    # accepted by this service; identity is established by this OIDC client.
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: SecretStr = SecretStr("")
+    oidc_redirect_uri: str = ""
+    oidc_transaction_key: SecretStr = SecretStr("")
+    oidc_trusted_proxies: str = ""
     password_pbkdf2_iterations: int = 600_000
     bootstrap_admin_enabled: bool = False
     bootstrap_admin_username: str = ""
@@ -110,6 +123,45 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_security_boundary(self) -> "Settings":
+        try:
+            proxies = proxy_networks(self.oidc_trusted_proxies)
+        except ValueError as exc:
+            raise ValueError("RDESK_OIDC_TRUSTED_PROXIES must contain IP addresses or CIDRs") from exc
+        if any(network.prefixlen == 0 for network in proxies):
+            raise ValueError("RDESK_OIDC_TRUSTED_PROXIES must name specific proxy addresses or subnets")
+
+        if self.oidc_enabled:
+            def valid_https_url(value: str) -> bool:
+                try:
+                    parsed = urlsplit(value)
+                    return bool(
+                        value and value == value.strip() and len(value) <= 512
+                        and re.fullmatch(r"[\x21-\x7e]+", value)
+                        and "\\" not in value and parsed.scheme == "https"
+                        and parsed.hostname and parsed.netloc == parsed.netloc.lower()
+                        and parsed.username is None and parsed.password is None
+                        and parsed.port != 0 and not parsed.query and not parsed.fragment
+                    )
+                except ValueError:
+                    return False
+
+            try:
+                key = self.oidc_transaction_key.get_secret_value()
+                decoded = base64.b64decode(key, altchars=b"-_", validate=True)
+                valid_key = len(decoded) == 32 and base64.urlsafe_b64encode(decoded).decode() == key
+            except (ValueError, TypeError):
+                valid_key = False
+            if (
+                not valid_https_url(self.oidc_issuer)
+                or self.oidc_issuer.endswith("/")
+                or not valid_https_url(self.oidc_redirect_uri)
+                or not urlsplit(self.oidc_redirect_uri).path.endswith("/api/v1/auth/oidc/callback")
+                or not re.fullmatch(r"[\x21-\x7e]{1,256}", self.oidc_client_id)
+                or len(self.oidc_client_secret.get_secret_value()) < 16
+                or not valid_key
+            ):
+                raise ValueError("RDESK_OIDC configuration is invalid")
+
         admin_fields = (
             self.initial_admin_username,
             self.initial_admin_email,

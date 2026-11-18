@@ -25,6 +25,7 @@ const mockOpenRemoteDisplayWindow = vi.hoisted(() => vi.fn());
 const mockCloseRemoteDisplayWindow = vi.hoisted(() => vi.fn());
 const mockGetSessionSnapshot = vi.hoisted(() => vi.fn());
 const mockGetProbeSnapshot = vi.hoisted(() => vi.fn());
+const mockMediaPipelineSnapshot = vi.hoisted(() => vi.fn());
 const mockStopSession = vi.hoisted(() => vi.fn());
 const mockMobileViewport = vi.hoisted(() => ({ value: false }));
 const mockGetDecodePolicy = vi.hoisted(() => vi.fn());
@@ -101,6 +102,7 @@ vi.mock('../services/realtimeSessionService', () => ({
 }));
 
 vi.mock('../adapters/tauri', () => ({
+  ipcMediaPipelineSnapshot: mockMediaPipelineSnapshot,
   listRemoteDisplayWindows: mockListRemoteDisplayWindows,
   openRemoteDisplayWindow: mockOpenRemoteDisplayWindow,
   closeRemoteDisplayWindow: mockCloseRemoteDisplayWindow,
@@ -246,6 +248,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       frames_decoded: 42,
       last_error: null,
     });
+    mockMediaPipelineSnapshot.mockReset().mockResolvedValue({ ok: true, value: { session_id: 'test-device-1', render_presented_frames: 1 } });
     mockStopSession.mockResolvedValue(undefined);
     mockGetDecodePolicy.mockResolvedValue({ decode_policy: 'auto' });
     mockSetDecodePolicy.mockResolvedValue({ decode_policy: 'nvdec' });
@@ -304,8 +307,27 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       );
 
       expect(await screen.findByText('正在认证远程会话')).toBeInTheDocument();
-      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(screen.getByText('正在验证身份')).toBeInTheDocument();
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
       expect(mockOpenRemoteDisplayWindow).not.toHaveBeenCalled();
+    });
+
+    it('returns immediately from a closed session in the phone layout', async () => {
+      mockMobileViewport.value = true;
+      mockObserveRemoteSession.mockImplementation(
+        (_sessionId, observer: { onSnapshot: (snapshot: RemoteSessionSnapshot) => void }) => {
+          observer.onSnapshot(remoteSnapshot('closed'));
+          return vi.fn();
+        },
+      );
+
+      render(<MemoryRouter initialEntries={['/session/test-device-1']}><RemoteSessionPage /></MemoryRouter>);
+
+      expect(await screen.findByText('远程会话已关闭')).toBeInTheDocument();
+      expect(screen.queryByText('等待远程画面')).not.toBeInTheDocument();
+      await userEvent.setup().click(screen.getByRole('button', { name: '返回设备列表' }));
+      expect(mockNavigate).toHaveBeenCalledWith('/devices', { replace: true });
+      expect(mockStopSession).not.toHaveBeenCalled();
     });
 
     it('opens and presents native media only after the authoritative snapshot streams', async () => {
@@ -317,7 +339,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
         </MemoryRouter>
       );
 
-      expect(await screen.findByText('连接稳定')).toBeInTheDocument();
+      expect(await screen.findByText('首帧已呈现')).toBeInTheDocument();
       await waitFor(() => {
         expect(mockOpenRemoteDisplayWindow).toHaveBeenCalledWith({
           sessionId: 'test-device-1',
@@ -325,7 +347,28 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       });
     });
 
-    it('closes native media windows when authoritative streaming is revoked', async () => {
+    it('keeps the display available before a frame is presented and reports presentation when rendering confirms it', async () => {
+      mockMediaPipelineSnapshot.mockResolvedValue({ ok: true, value: { session_id: 'test-device-1', render_presented_frames: 0 } });
+      render(<MemoryRouter><RemoteSessionPage /></MemoryRouter>);
+
+      expect(await screen.findByText('等待首帧')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开显示窗口' })).toBeEnabled();
+      expect(mockOpenRemoteDisplayWindow).toHaveBeenCalledWith({ sessionId: 'test-device-1' });
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
+
+      mockMediaPipelineSnapshot.mockResolvedValue({ ok: true, value: { session_id: 'test-device-1', render_presented_frames: 2 } });
+      expect(await screen.findByText('首帧已呈现', {}, { timeout: 2500 })).toBeInTheDocument();
+    });
+
+    it('leaves first-frame state unknown when renderer metrics are unavailable', async () => {
+      mockMediaPipelineSnapshot.mockResolvedValue({ ok: false, error: { message: 'metric unavailable' } });
+      render(<MemoryRouter><RemoteSessionPage /></MemoryRouter>);
+      expect(await screen.findByText('首帧状态未知')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '打开显示窗口' })).toBeEnabled();
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
+    });
+
+    it('closes revoked native media windows even when returning before enumeration finishes', async () => {
       mockRuntimeState.isTauri = true;
       let emitSnapshot!: (snapshot: RemoteSessionSnapshot) => void;
       mockObserveRemoteSession.mockImplementation(
@@ -336,7 +379,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
         },
       );
 
-      render(
+      const view = render(
         <MemoryRouter initialEntries={['/sessions/test-device-1']}>
           <RemoteSessionPage />
         </MemoryRouter>
@@ -345,7 +388,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       await waitFor(() => {
         expect(mockOpenRemoteDisplayWindow).toHaveBeenCalled();
       });
-      mockListRemoteDisplayWindows.mockResolvedValue({
+      const revokedWindows = {
         ok: true,
         value: [
           {
@@ -357,7 +400,11 @@ describe('RemoteSessionPage - Page Level Tests', () => {
             render_mode: 'd3d11_native',
           },
         ],
-      });
+      };
+      let publishWindows!: (windows: typeof revokedWindows) => void;
+      mockListRemoteDisplayWindows.mockImplementationOnce(
+        () => new Promise<typeof revokedWindows>((resolve) => { publishWindows = resolve; }),
+      );
 
       act(() => {
         emitSnapshot(
@@ -368,13 +415,16 @@ describe('RemoteSessionPage - Page Level Tests', () => {
           }),
         );
       });
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
+      await userEvent.setup().click(screen.getByRole('button', { name: '返回设备列表' }));
+      view.unmount();
+      publishWindows(revokedWindows);
 
       await waitFor(() => {
         expect(mockCloseRemoteDisplayWindow).toHaveBeenCalledWith(
           'web-test-device-1',
         );
       });
-      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
     });
 
     it('renders the exact terminal remote failure instead of connected media', async () => {
@@ -401,8 +451,11 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       expect(await screen.findByRole('alert')).toHaveTextContent(
         'Target denied attended access',
       );
-      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
       expect(mockOpenRemoteDisplayWindow).not.toHaveBeenCalled();
+      await userEvent.setup().click(screen.getByRole('button', { name: '返回设备列表' }));
+      expect(mockNavigate).toHaveBeenCalledWith('/devices', { replace: true });
+      expect(mockStopSession).not.toHaveBeenCalled();
     });
 
     it('preserves an initial service error when the route id is not a device id', async () => {
@@ -467,8 +520,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       );
 
       await waitFor(() => {
-        // Connection status
-        expect(screen.getByText('连接稳定')).toBeInTheDocument();
+        expect(screen.getByText('首帧已呈现')).toBeInTheDocument();
       });
     });
 
@@ -502,7 +554,7 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       );
 
       expect(await screen.findByText('正在读取远程会话状态')).toBeInTheDocument();
-      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
       expect(screen.queryByText('独立窗口')).not.toBeInTheDocument();
     });
 
@@ -531,10 +583,10 @@ describe('RemoteSessionPage - Page Level Tests', () => {
       );
 
       expect(
-        await screen.findByText('Secure remote sessions require the desktop client'),
+        await screen.findByText('此会话需要在桌面客户端中打开'),
       ).toBeInTheDocument();
-      expect(screen.queryByText('连接稳定')).not.toBeInTheDocument();
-      expect(screen.queryByText('WebRTC control channel connected')).not.toBeInTheDocument();
+      expect(screen.queryByText('首帧已呈现')).not.toBeInTheDocument();
+      expect(screen.queryByText('WebRTC 已连接')).not.toBeInTheDocument();
     });
 
     it('shows degraded state for rendering features', async () => {

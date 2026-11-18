@@ -1428,6 +1428,99 @@ async fn v3_controller_grant_never_reaches_bus_without_pending_authorization() {
 }
 
 #[tokio::test]
+async fn verified_v3_grant_after_local_cancellation_stays_session_local() {
+    use mrd_ipc::{
+        RemoteAccessMode, RemoteAuthorizationState, RemoteFailure, RemotePermissionScope,
+        RemoteReasonCode,
+    };
+    use mrd_service::session_authorization::VerifiedIncomingAuthorizationRequest;
+
+    let app_state = Arc::new(AppState::new());
+    let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));
+    let peer = identity();
+    let server = identity();
+    let peer_device_id = DeviceId("peer-device".into());
+    let session_id = SessionId("cancelled-wan-grant".into());
+    let mut subscription = app_state
+        .relay_signaling
+        .subscribe_authenticated_session(session_id.clone(), peer_device_id.clone());
+    let screen_view = vec![RemotePermissionScope::ScreenView];
+    app_state
+        .session_authorizations
+        .begin_outgoing(VerifiedIncomingAuthorizationRequest {
+            session_id: session_id.clone(),
+            peer_device_id,
+            peer_key_id: peer.key_id().into(),
+            peer_key_epoch: 1,
+            access_mode: RemoteAccessMode::Attended,
+            requested_scopes: screen_view.clone(),
+            peer_permission_ceiling: screen_view.clone(),
+            machine_permission_ceiling: screen_view.clone(),
+            runtime_capabilities: screen_view,
+            transport_kind: "webrtc_relay".into(),
+            request_nonce: [9; 16],
+            created_at_ms: NOW - 2,
+            expires_at_ms: NOW + 10_000,
+        })
+        .await
+        .unwrap();
+    app_state
+        .session_authorizations
+        .record_failure(
+            &session_id,
+            RemoteAuthorizationState::Revoked,
+            RemoteFailure {
+                code: RemoteReasonCode::GrantRevoked,
+                message: "local controller cancelled".into(),
+                suggested_action: None,
+            },
+            NOW - 1,
+        )
+        .await
+        .unwrap();
+
+    let mut runtime = SignalingRuntimeCore::new(
+        config_with_role_at(
+            &server,
+            BackendRole::Controller,
+            "ws://127.0.0.1:9532/realtime",
+        ),
+        identity(),
+    );
+    runtime
+        .accept_registered(registered(&server, 1), NOW)
+        .unwrap();
+    let grant = inbound_v3_grant(&peer, &session_id.0);
+    let InboundDisposition::Applied(event) = runtime
+        .handle_inbound(
+            SignalEnvelope::new(AuthenticatedSignalMessage::SessionGrantV3(grant)),
+            NOW + 1,
+        )
+        .unwrap()
+    else {
+        panic!("expected the signed envelope to reach local admission");
+    };
+    let error = mapper.apply_authenticated_signal(*event).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "WAN grant has no live pending controller authorization"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), subscription.recv())
+            .await
+            .is_err()
+    );
+    assert!(app_state
+        .session_authorizations
+        .snapshot_at(&session_id, NOW + 1)
+        .await
+        .is_some_and(|snapshot| {
+            snapshot.authorization_state == RemoteAuthorizationState::Revoked
+                && snapshot.granted_scopes.is_empty()
+        }));
+}
+
+#[tokio::test]
 async fn v3_initial_bus_routes_exact_session_and_peer_and_clears_on_close() {
     let app_state = Arc::new(AppState::new());
     let mapper = ServiceSignalingMapper::new(Arc::clone(&app_state));

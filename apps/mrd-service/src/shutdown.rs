@@ -10,6 +10,8 @@ struct State {
     runtime_bound: bool,
     requested: Option<ShutdownMode>,
     acknowledged: Option<ShutdownMode>,
+    client_stop_requested: bool,
+    recovery_requested: bool,
     admissions: usize,
     admission_epoch: u64,
 }
@@ -25,6 +27,15 @@ fn priority(mode: &ShutdownMode) -> u8 {
         ShutdownMode::AfterSessions => 0,
         ShutdownMode::Graceful => 1,
         ShutdownMode::Force => 2,
+    }
+}
+
+fn elevate_mode(current: &mut Option<ShutdownMode>, mode: ShutdownMode) {
+    if current
+        .as_ref()
+        .is_none_or(|current| priority(&mode) > priority(current))
+    {
+        *current = Some(mode);
     }
 }
 
@@ -46,32 +57,51 @@ impl ShutdownCoordinator {
     }
 
     pub fn request(&self, mode: ShutdownMode) -> anyhow::Result<()> {
+        self.request_inner(mode, false)
+    }
+
+    /// An explicit IPC stop prevents automatic resident recovery.
+    pub fn request_from_client(&self, mode: ShutdownMode) -> anyhow::Result<()> {
+        self.request_inner(mode, true)
+    }
+
+    fn request_inner(&self, mode: ShutdownMode, from_client: bool) -> anyhow::Result<()> {
         let mut state = self.state.lock().unwrap();
         anyhow::ensure!(
             state.runtime_bound,
             "service shutdown runtime is unavailable"
         );
-        if state
-            .requested
-            .as_ref()
-            .is_none_or(|current| priority(&mode) > priority(current))
-        {
-            state.requested = Some(mode);
+        if from_client && !state.client_stop_requested && state.recovery_requested {
+            state.requested = None;
         }
+        state.client_stop_requested |= from_client;
+        elevate_mode(&mut state.requested, mode);
         self.changed.notify_one();
         Ok(())
+    }
+
+    /// Fatal resident-runtime failure. There is no IPC reply to flush, so the
+    /// recovery fence can be set even while the runtime is binding listeners.
+    pub fn request_recovery(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.client_stop_requested {
+            return;
+        }
+        state.recovery_requested = true;
+        elevate_mode(&mut state.requested, ShutdownMode::Graceful);
+        self.changed.notify_one();
+    }
+
+    /// Check after cleanup so a client stop accepted during recovery takes precedence.
+    pub fn should_recover(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.recovery_requested && !state.client_stop_requested
     }
 
     /// Called only after the local IPC transport has attempted to flush the Ack.
     pub fn acknowledge(&self, mode: ShutdownMode) {
         let mut state = self.state.lock().unwrap();
-        if state
-            .acknowledged
-            .as_ref()
-            .is_none_or(|current| priority(&mode) > priority(current))
-        {
-            state.acknowledged = Some(mode);
-        }
+        elevate_mode(&mut state.acknowledged, mode);
         self.changed.notify_one();
     }
 
@@ -90,12 +120,14 @@ impl ShutdownCoordinator {
     ) -> Option<ShutdownMode> {
         let state = self.state.lock().unwrap();
         let mode = state.requested.as_ref()?;
-        if !state.runtime_bound
-            || state
-                .acknowledged
-                .as_ref()
-                .is_none_or(|ack| priority(ack) < priority(mode))
-        {
+        let internal_recovery = state.recovery_requested
+            && !state.client_stop_requested
+            && *mode == ShutdownMode::Graceful;
+        let acknowledged = state
+            .acknowledged
+            .as_ref()
+            .is_some_and(|ack| priority(ack) >= priority(mode));
+        if !state.runtime_bound || !(internal_recovery || acknowledged) {
             return None;
         }
         if *mode == ShutdownMode::AfterSessions

@@ -57,6 +57,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo = "0.30"
+tempfile = "3"
 tokio.workspace = true
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["cors"] }
@@ -73,7 +74,7 @@ mrd-decode-nvdec = { path = "../../crates/mrd-decode-nvdec" }
 mrd-encode-nvenc-av1 = { path = "../../crates/mrd-encode-nvenc-av1" }
 mrd-encode-nvenc = { path = "../../crates/mrd-encode-nvenc" }
 mrd-render-d3d11 = { path = "../../crates/mrd-render-d3d11" }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Environment", "Win32_System_EventLog", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_EventLog", "Win32_System_LibraryLoader", "Win32_System_Pipes", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows-service = "0.8.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -104,7 +105,6 @@ production-vvc-software-codec = [
 realtime-server = { path = "../realtime-server" }
 webrtc = "0.12"
 rusqlite.workspace = true
-tempfile = "3"
 
 [target.'cfg(windows)'.dev-dependencies]
 mrd-session-agent = { path = "../mrd-session-agent" }

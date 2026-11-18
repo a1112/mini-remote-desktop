@@ -62,11 +62,88 @@ these tests on Linux, Windows, and macOS.
 ## API
 
 - `POST /api/v1/auth/login`
+- `GET /api/v1/auth/oidc/capabilities`, `POST /api/v1/auth/oidc/start`,
+  `GET /api/v1/auth/oidc/callback`, `POST /api/v1/auth/oidc/complete`, and
+  authenticated `POST /api/v1/auth/oidc/link/start` (when enabled)
 - `GET /api/v1/devices`
 - `GET /api/v1/devices/{id}`
 - `POST /api/v1/sessions/request`
+- `GET /healthz` for API liveness and `GET /readyz` for database and realtime
+  readiness. Use readiness for routing or rollout checks. It returns HTTP 503
+  until PostgreSQL and compatible local signaling both respond.
 - Relay enrollment, heartbeat, directory, access, and migration endpoints under
   `/api/v1/relays`
+
+## R-Auth / Keycloak sign-in
+
+R-Auth and Rdesk use separate application sessions in the same Keycloak realm.
+Register Rdesk as a confidential client in that realm and configure
+`RDESK_OIDC_ENABLED=true`, the exact HTTPS realm issuer,
+client ID, a client secret of at least 16 characters, an independent Fernet
+transaction key, and an exact public HTTPS callback ending in
+`/api/v1/auth/oidc/callback`. Inject the two secrets outside source control.
+Register the exact callback with Keycloak and use authorization code flow with
+PKCE S256, RS256 ID tokens and `client_secret_basic`. The
+configured issuer's discovery, authorization, token and JWKS endpoints must
+all use HTTPS on the issuer origin. Rdesk checks discovery before each flow.
+When discovery advertises authorization-response issuer identification, the
+callback must include the exact configured issuer. Browser SSO depends on the
+system browser's existing Keycloak session and the realm's client policy.
+
+At startup with OIDC enabled, an advisory-locked, versioned PostgreSQL migration
+creates `oidc_identities` and `oidc_login_transactions`, leaving existing
+accounts and devices untouched. Back up the database and review runtime schema
+permissions before deployment. Rotating the transaction key invalidates any
+in-progress login (maximum five minutes). All workers must share the same key,
+database, issuer and client configuration. Admission limits are process-local
+and use the socket peer by default. Behind a reverse proxy, configure
+`RDESK_OIDC_TRUSTED_PROXIES` with its actual socket addresses or dedicated CIDRs.
+On each trusted proxy replace all inbound `X-Real-IP` headers with one verified
+client IP. Keep Uvicorn proxy-header rewriting disabled and configure an
+independent ingress rate limit. Test with two clients behind the proxy and
+confirm the clients receive separate IP budgets.
+Configure HTTPS and prevent reverse-proxy, platform and application logs from
+recording callback queries, request bodies, authorization headers or provider
+responses. The built-in `python -m app.main` redacts callback queries in its
+Uvicorn access log. Apply equivalent redaction to separately configured Uvicorn
+instances and external proxies. Set the exact redirect URI in server configuration.
+
+The client posts to `/start`, opens the returned `authorization_url`, and keeps
+the returned `completion_token` private in the initiating app. It posts that
+token to `/complete`. HTTP 202 means pending and HTTP 200 returns the Rdesk
+login response exactly once. An expired, failed or consumed flow returns HTTP
+400. The server stores the completion token as a hash and keeps provider tokens
+server-side. The callback uses single-use state and PKCE and verifies the
+signature, issuer, audience, nonce and time claims.
+
+The first verified `(issuer, subject)` gets an independent Rdesk user with a
+random internal username. Account association uses the issuer and subject. To attach an existing
+Rdesk account, first authenticate that account and call `/link/start` with its
+Rdesk bearer token, then perform the same OIDC callback and send that bearer to
+`/complete` as well. The callback stores the verified subject in encrypted form
+until the original authenticated account redeems the flow. Rdesk checks the
+local session version at callback and redemption. Each Rdesk user can link one
+OIDC identity. Use the realm's subject policy to verify equivalence across
+clients. Identity reassignment, revocation and issuer migration require an
+administrative process. Rdesk and Keycloak maintain separate session lifecycles,
+so revoke issued credentials in Rdesk when disabling a user at the identity provider.
+
+When both participants belong to the same verified R-Auth-linked account,
+the target may approve the session without a separate prompt. The approval is
+limited to the requested scopes and requires the signed controller and target
+keys to match registered machine keys, or the session's authenticated browser
+key. The server persists the original owner, issuer, key and device credential
+versions and rechecks them on session inspection and credential issuance.
+Unbinding either physical device revokes its automatically approved sessions.
+Other accounts, unlinked local accounts, unpinned devices and guest sessions
+continue to require the existing explicit approval.
+
+An independent versioned PostgreSQL migration adds the nullable session
+authorization snapshot on every startup, including when OIDC is disabled, so
+existing databases remain compatible with the session model. Setting
+`RDESK_OIDC_ENABLED=false` disables automatic approvals and ends existing
+same-account leases at their next authority revalidation. Credentials already
+issued to a session remain bounded by their original expiry.
 
 ## Automatic first-start device codes
 

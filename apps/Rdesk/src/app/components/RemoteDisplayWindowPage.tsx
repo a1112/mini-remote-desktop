@@ -3012,6 +3012,8 @@ export function RemoteDisplayWindowPage() {
   );
   const controlInputEnabled = pointerControlEnabled || keyboardControlEnabled;
   const hasRemoteFrames = remoteFramesReceived > 0 || remoteFramesDecoded > 0;
+  const remotePresentedFrames = mediaPipelineSnapshot?.session_id === sessionId ? mediaPipelineSnapshot.render_presented_frames : undefined;
+  const remoteFirstFrameStatus = remotePresentedFrames == null ? "首帧状态未知" : remotePresentedFrames > 0 ? "首帧已呈现" : "等待首帧";
   const remoteProbeTarget =
     probeSnapshot?.media_probe_width &&
     probeSnapshot?.media_probe_height &&
@@ -6390,6 +6392,9 @@ export function RemoteDisplayWindowPage() {
           className="flex shrink-0 items-center gap-2 px-3"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
         >
+          {!isLocalPipelinePreview && showDesktopWindowControls && (
+            <span role="status" className="hidden shrink-0 text-xs text-slate-300 sm:block">{remoteFirstFrameStatus}</span>
+          )}
           {!isLocalPipelinePreview && <SessionAudioControl sessionId={sessionId}
             authorized={remoteAuthorizationSnapshot?.authorization_state === "granted" &&
               remoteAuthorizationSnapshot.granted_scopes.includes("audio.listen")} />}

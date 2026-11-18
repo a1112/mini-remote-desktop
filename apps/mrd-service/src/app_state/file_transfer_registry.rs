@@ -1,10 +1,30 @@
 use mrd_ipc::{FileTransferStatus, FileTransferTaskSnapshot};
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use tokio::sync::watch;
+
+type TransferCompletion = watch::Receiver<Option<FileTransferTaskSnapshot>>;
+
+#[derive(Debug)]
+struct ActiveFileTransfer {
+    cancelled: Arc<AtomicBool>,
+    completion: TransferCompletion,
+}
+
+pub enum FileTransferCancellation {
+    Pending(TransferCompletion),
+    Finished(FileTransferTaskSnapshot),
+}
 
 /// Service-owned file transfer task snapshots.
 #[derive(Debug, Default)]
 pub struct FileTransferRegistry {
     next_transfer_seq: u64,
     transfers: Vec<FileTransferTaskSnapshot>,
+    active: HashMap<String, ActiveFileTransfer>,
 }
 
 impl FileTransferRegistry {
@@ -19,35 +39,58 @@ impl FileTransferRegistry {
             .iter_mut()
             .find(|candidate| candidate.transfer_id == transfer.transfer_id)
         {
-            *existing = transfer;
+            if matches!(
+                existing.status,
+                FileTransferStatus::Queued | FileTransferStatus::Running
+            ) {
+                *existing = transfer;
+            }
             return;
         }
         self.transfers.push(transfer);
+    }
+
+    pub fn begin(
+        &mut self,
+        transfer: FileTransferTaskSnapshot,
+        cancelled: Arc<AtomicBool>,
+        completion: TransferCompletion,
+    ) {
+        self.active.insert(
+            transfer.transfer_id.clone(),
+            ActiveFileTransfer {
+                cancelled,
+                completion,
+            },
+        );
+        self.upsert(transfer);
+    }
+
+    pub fn finish(&mut self, transfer: FileTransferTaskSnapshot) {
+        self.active.remove(&transfer.transfer_id);
+        self.upsert(transfer);
     }
 
     pub fn list(&self) -> Vec<FileTransferTaskSnapshot> {
         self.transfers.clone()
     }
 
-    pub fn cancel(&mut self, transfer_id: &str) -> Option<FileTransferTaskSnapshot> {
+    pub fn cancel(&self, transfer_id: &str) -> Option<FileTransferCancellation> {
+        if let Some(active) = self.active.get(transfer_id) {
+            active.cancelled.store(true, Ordering::Release);
+            return Some(FileTransferCancellation::Pending(active.completion.clone()));
+        }
         let transfer = self
             .transfers
-            .iter_mut()
+            .iter()
             .find(|candidate| candidate.transfer_id == transfer_id)?;
-        if matches!(
-            transfer.status,
-            FileTransferStatus::Queued | FileTransferStatus::Running
-        ) {
-            transfer.status = FileTransferStatus::Cancelled;
-        }
-        Some(transfer.clone())
+        Some(FileTransferCancellation::Finished(transfer.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mrd_ipc::FileTransferTaskSnapshot;
 
     fn transfer(transfer_id: String, status: FileTransferStatus) -> FileTransferTaskSnapshot {
         FileTransferTaskSnapshot {
@@ -68,11 +111,12 @@ mod tests {
     }
 
     #[test]
-    fn upsert_replaces_existing_transfer_snapshot() {
+    fn upsert_preserves_the_terminal_snapshot_after_late_progress() {
         let mut registry = FileTransferRegistry::default();
         let transfer_id = registry.allocate_transfer_id();
         registry.upsert(transfer(transfer_id.clone(), FileTransferStatus::Running));
         registry.upsert(transfer(transfer_id.clone(), FileTransferStatus::Completed));
+        registry.upsert(transfer(transfer_id.clone(), FileTransferStatus::Running));
 
         let transfers = registry.list();
 
@@ -82,14 +126,29 @@ mod tests {
     }
 
     #[test]
-    fn cancel_marks_active_transfer_cancelled() {
+    fn cancel_signals_the_worker_without_publishing_a_terminal_status() {
         let mut registry = FileTransferRegistry::default();
         let transfer_id = registry.allocate_transfer_id();
-        registry.upsert(transfer(transfer_id.clone(), FileTransferStatus::Running));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (_completion, receiver) = watch::channel(None);
+        registry.begin(
+            transfer(transfer_id.clone(), FileTransferStatus::Running),
+            cancelled.clone(),
+            receiver,
+        );
 
-        let cancelled = registry.cancel(&transfer_id).expect("cancel transfer");
+        assert!(matches!(
+            registry.cancel(&transfer_id),
+            Some(FileTransferCancellation::Pending(_))
+        ));
+        assert!(cancelled.load(Ordering::Acquire));
+        assert_eq!(registry.list()[0].status, FileTransferStatus::Running);
 
-        assert_eq!(cancelled.status, FileTransferStatus::Cancelled);
-        assert_eq!(registry.list()[0].status, FileTransferStatus::Cancelled);
+        registry.finish(transfer(transfer_id.clone(), FileTransferStatus::Completed));
+        let Some(FileTransferCancellation::Finished(snapshot)) = registry.cancel(&transfer_id)
+        else {
+            panic!("expected the actual terminal snapshot");
+        };
+        assert_eq!(snapshot.status, FileTransferStatus::Completed);
     }
 }

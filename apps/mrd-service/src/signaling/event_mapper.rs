@@ -45,6 +45,11 @@ enum RelayMigrationDirection {
     OutboundOffer,
 }
 
+/// The verified grant no longer has a pending authorization to receive it.
+#[derive(Debug, thiserror::Error)]
+#[error("WAN grant has no live pending controller authorization")]
+pub(super) struct StaleWanGrant;
+
 /// Applies verified WAN signaling to the service's authoritative aggregates.
 pub struct ServiceSignalingMapper {
     app_state: Arc<AppState>,
@@ -434,16 +439,24 @@ impl AuthenticatedSessionSignalPort for ServiceSignalingMapper {
                     .session_authorizations
                     .snapshot_at(&message.payload.session_id, event.sender.issued_at_ms)
                     .await
-                    .context("WAN grant has no pending controller authorization")?;
+                    .ok_or(StaleWanGrant)?;
                 if authorization.role != mrd_ipc::RemoteSessionRole::Controller
-                    || authorization.authorization_state
-                        != mrd_ipc::RemoteAuthorizationState::Authorizing
                     || authorization.peer_device_id != event.sender.device_id
-                    || authorization
-                        .authorization_expires_at_ms
-                        .is_none_or(|expires_at_ms| expires_at_ms < event.sender.expires_at_ms)
                 {
                     bail!("WAN grant does not match the pending controller authorization");
+                }
+                if authorization.authorization_state
+                    != mrd_ipc::RemoteAuthorizationState::Authorizing
+                {
+                    return Err(StaleWanGrant.into());
+                }
+                let expires_at_ms = authorization
+                    .authorization_expires_at_ms
+                    .context("WAN controller authorization has no deadline")?;
+                // The signed claims describe message freshness. The grant
+                // must have been issued before the intent's consent deadline.
+                if event.sender.issued_at_ms >= expires_at_ms {
+                    return Err(StaleWanGrant.into());
                 }
                 self.relay_signaling.publish(event).await;
                 Ok(())

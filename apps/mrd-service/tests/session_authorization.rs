@@ -195,7 +195,7 @@ async fn timeout_expires_request_and_late_consent_cannot_revive_it() {
 
     let expired = state
         .session_authorizations
-        .expire_pending(&pending.session_id, request.expires_at_ms + 1)
+        .expire_pending(&pending.session_id, request.expires_at_ms)
         .await
         .expect("timeout should win pending CAS");
     assert_eq!(
@@ -233,6 +233,42 @@ async fn timeout_expires_request_and_late_consent_cannot_revive_it() {
             .await
             .active_count(&pending.session_id),
         0
+    );
+}
+
+#[tokio::test]
+async fn consent_at_exact_request_expiry_is_rejected() {
+    let state = Arc::new(AppState::new());
+    let mut request = attended_request("consent-exact-expiry");
+    request.expires_at_ms = request.created_at_ms + 50;
+    let pending = state
+        .session_authorizations
+        .begin_verified_incoming(request.clone())
+        .await
+        .expect("pending consent");
+
+    let failure = state
+        .session_authorizations
+        .respond_to_consent(
+            ConsentResponse {
+                session_id: pending.session_id.clone(),
+                decision: ConsentDecision::Approve,
+                approved_scopes: vec![RemotePermissionScope::ScreenView],
+                expected_policy_revision: DecimalU64::new(1),
+            },
+            request.expires_at_ms,
+        )
+        .await
+        .expect_err("consent at the exact deadline must fail closed");
+    assert_eq!(failure.code, RemoteReasonCode::AuthorizationTimeout);
+    assert_eq!(
+        state
+            .session_authorizations
+            .snapshot(&pending.session_id)
+            .await
+            .expect("expired authorization remains queryable")
+            .authorization_state,
+        RemoteAuthorizationState::Expired
     );
 }
 

@@ -49,6 +49,34 @@ fn shutdown_escalation_never_downgrades_or_exits_before_its_ack() {
 }
 
 #[test]
+fn public_runtime_recovery_closes_admission_and_yields_to_client_shutdown() {
+    let coordinator = Arc::new(mrd_service::shutdown::ShutdownCoordinator::default());
+    coordinator.request_recovery();
+    assert!(coordinator.admit().is_err());
+    assert!(coordinator.should_recover());
+    let _runtime = coordinator.bind_runtime().unwrap();
+    let epoch = coordinator.admission_epoch();
+    assert_eq!(
+        coordinator.ready_mode_at_epoch(0, epoch),
+        Some(ShutdownMode::Graceful)
+    );
+
+    coordinator
+        .request_from_client(ShutdownMode::AfterSessions)
+        .unwrap();
+    assert!(!coordinator.should_recover());
+    assert_eq!(coordinator.ready_mode_at_epoch(0, epoch), None);
+    coordinator.acknowledge(ShutdownMode::AfterSessions);
+    coordinator.request_recovery();
+    assert!(!coordinator.should_recover());
+    assert_eq!(coordinator.ready_mode_at_epoch(1, epoch), None);
+    assert_eq!(
+        coordinator.ready_mode_at_epoch(0, epoch),
+        Some(ShutdownMode::AfterSessions)
+    );
+}
+
+#[test]
 fn runtime_registration_does_not_remain_available_after_drop() {
     let coordinator = Arc::new(mrd_service::shutdown::ShutdownCoordinator::default());
     let runtime = coordinator.bind_runtime().unwrap();

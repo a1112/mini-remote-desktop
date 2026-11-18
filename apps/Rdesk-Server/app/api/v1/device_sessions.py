@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Coroutine
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +58,15 @@ router = APIRouter(
     tags=["device-sessions"],
     route_class=DeviceSessionAPIRoute,
 )
+
+
+KeyId = Annotated[str, Query(pattern=r"^[0-9a-f]{64}$", min_length=64, max_length=64)]
+
+
+class SameAccountOut(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    trusted: bool
 
 
 def _service(db: AsyncSession) -> DeviceSessionService:
@@ -135,6 +146,71 @@ async def approve_device_session(
     db: AsyncSession = Depends(get_db),
     relay_access: RelayAccessService = Depends(get_relay_access_service),
 ) -> DeviceSessionOut:
+    return await _approve_device_session(
+        session_id=session_id,
+        payload=payload,
+        current_device=current_device,
+        db=db,
+        relay_access=relay_access,
+    )
+
+
+@router.get("/{session_id}/same-account", response_model=SameAccountOut)
+async def same_account_device_session(
+    session_id: DeviceSessionId,
+    controller_key_id: KeyId,
+    target_key_id: KeyId,
+    current_device: Device = Depends(get_current_device),
+    db: AsyncSession = Depends(get_db),
+) -> SameAccountOut:
+    auth_snapshot = capture_device_auth_snapshot(current_device)
+    try:
+        trusted = await _service(db).same_account(
+            session_id=session_id,
+            current_device=current_device,
+            auth_snapshot=auth_snapshot,
+            controller_key_id=controller_key_id,
+            target_key_id=target_key_id,
+        )
+        return SameAccountOut(trusted=trusted)
+    except DeviceSessionError as error:
+        await db.rollback()
+        _raise(error)
+
+
+@router.post("/{session_id}/approve-same-account", response_model=DeviceSessionOut)
+async def approve_same_account_device_session(
+    session_id: DeviceSessionId,
+    payload: DeviceSessionApprovalIn,
+    controller_key_id: KeyId,
+    target_key_id: KeyId,
+    current_device: Device = Depends(get_current_device),
+    db: AsyncSession = Depends(get_db),
+    relay_access: RelayAccessService = Depends(get_relay_access_service),
+) -> DeviceSessionOut:
+    return await _approve_device_session(
+        session_id=session_id,
+        payload=payload,
+        current_device=current_device,
+        db=db,
+        relay_access=relay_access,
+        same_account_only=True,
+        controller_key_id=controller_key_id,
+        target_key_id=target_key_id,
+    )
+
+
+async def _approve_device_session(
+    *,
+    session_id: str,
+    payload: DeviceSessionApprovalIn,
+    current_device: Device,
+    db: AsyncSession,
+    relay_access: RelayAccessService,
+    same_account_only: bool = False,
+    controller_key_id: str | None = None,
+    target_key_id: str | None = None,
+) -> DeviceSessionOut:
     auth_snapshot = capture_device_auth_snapshot(current_device)
     try:
         row = await _service(db).approve(
@@ -143,6 +219,9 @@ async def approve_device_session(
             auth_snapshot=auth_snapshot,
             payload=payload,
             relay_access=relay_access,
+            same_account_only=same_account_only,
+            controller_key_id=controller_key_id,
+            target_key_id=target_key_id,
         )
         response = device_session_out(row)
         await _commit(db)

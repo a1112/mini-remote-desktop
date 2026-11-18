@@ -1289,6 +1289,14 @@ impl AgentRuntime {
         identity: &RegisteredAgentIdentity,
         execute: &mrd_agent_ipc::ExecuteCommand,
     ) -> Result<(), AgentRuntimeError> {
+        if matches!(
+            execute.command,
+            mrd_agent_ipc::AgentCommand::AuthorizeSameAccount { .. }
+        ) {
+            return self
+                .handle_same_account_authorization(writer, identity, execute)
+                .await;
+        }
         let now_ms = self.clock.now_ms();
         let (authorized, start_input_blocked) = if self.authority.is_some() {
             let desktop = self.current_desktop_state()?;
@@ -1370,6 +1378,60 @@ impl AgentRuntime {
             None => CommandOutcome::Rejected,
         };
 
+        writer.enqueue(AgentToService::CommandResult(CommandResult {
+            request_token: execute.request_token,
+            registration_id: identity.registration_id,
+            command_id: execute.command_id,
+            outcome,
+            completed_at_ms: self.clock.now_ms(),
+        }))?;
+        Ok(())
+    }
+
+    async fn handle_same_account_authorization(
+        &mut self,
+        writer: &OutboundWriter,
+        identity: &RegisteredAgentIdentity,
+        execute: &mrd_agent_ipc::ExecuteCommand,
+    ) -> Result<(), AgentRuntimeError> {
+        let outcome = if self.authority.is_some() {
+            let desktop = self.current_desktop_state()?;
+            self.reconcile_desktop_authority(writer, desktop)?;
+            let context = self.trusted_consent_context(identity)?;
+            let claims = &execute.grant.claims;
+            let execution_context = ExecutionContext {
+                registration_id: identity.registration_id,
+                registration_epoch: identity.registration_epoch,
+                session_id: claims.session_id.clone(),
+                peer: claims.peer.clone(),
+                policy_revision: claims.policy_revision,
+                windows_session_id: identity.windows_session_id,
+                desktop_epoch: desktop.desktop_epoch,
+                desktop_kind: desktop.desktop_kind,
+                now_ms: context.now_ms,
+                expected_issuer_key_id: context.expected_issuer_key_id,
+                authorization_scopes: claims.scopes.clone(),
+                authorization_expires_at_ms: claims.expires_at_ms,
+            };
+            let authority = self
+                .authority
+                .as_ref()
+                .ok_or(AgentRuntimeError::ConsentStateUnavailable)?;
+            match validate_execute_command(execute, &execution_context, authority.verifier.as_ref())
+            {
+                Ok(authorized)
+                    if authority
+                        .manager
+                        .install_same_account(&authorized, context)
+                        .is_ok() =>
+                {
+                    CommandOutcome::Completed
+                }
+                _ => CommandOutcome::Rejected,
+            }
+        } else {
+            CommandOutcome::Rejected
+        };
         writer.enqueue(AgentToService::CommandResult(CommandResult {
             request_token: execute.request_token,
             registration_id: identity.registration_id,

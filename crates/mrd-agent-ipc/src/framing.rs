@@ -16,8 +16,11 @@ pub const AGENT_IPC_PROTOCOL_MAJOR: u16 = 1;
 /// adds authenticated render-boundary counters from the session agent. Minor 6
 /// binds StartCapture to exact approved encoder settings. Minor 7 authenticates
 /// the actual physical capture rectangle for product input-coordinate mapping.
-/// Minor 8 binds every input event to an exclusive injection deadline.
-pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 8;
+/// Minor 8 binds every input event to an exclusive injection deadline. Minor 9
+/// adds a service-signed, same-account-only local authorization command.
+pub const AGENT_IPC_PROTOCOL_MINOR: u16 = 9;
+/// Minimum negotiated version that understands signed same-account authority.
+pub const AGENT_IPC_SAME_ACCOUNT_PROTOCOL_MINOR: u16 = 9;
 /// Minimum negotiated minor version that enforces input event deadlines.
 pub const AGENT_IPC_INPUT_DEADLINE_PROTOCOL_MINOR: u16 = 8;
 /// Minimum negotiated minor version that carries real capture-source bounds.

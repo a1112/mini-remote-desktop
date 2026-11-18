@@ -1,15 +1,19 @@
+import asyncio
 from contextlib import asynccontextmanager
 import shlex
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 import uvicorn
 
 from app.api.v1.router import api_router
 from app.api.v1.relays import install_relay_openapi
 from app.core.config import settings
 from app.core.response_security import SensitiveResponseCacheMiddleware
+from app.core.uvicorn_logging import uvicorn_logging_config
 from app.db.init_db import seed_initial_data
 from app.db.migrate_add_relay_control import migrate as migrate_relay_control
 from app.db.migrate_add_relay_access import migrate as migrate_relay_access
@@ -19,6 +23,8 @@ from app.db.migrate_add_device_self_enrollment import (
     SELF_ENROLLMENT_TABLES, migrate as migrate_device_self_enrollment,
 )
 from app.db.migrate_add_guest_temporary_access import GUEST_TABLES, migrate as migrate_guest_temporary_access
+from app.db.migrate_add_oidc import OIDC_TABLES, migrate as migrate_oidc
+from app.db.migrate_add_same_account_authority import migrate as migrate_same_account_authority
 from app.db.session import AsyncSessionLocal, Base, engine
 from app.middleware.relay_node_boundary import RelayNodeBoundaryMiddleware
 from app.services.realtime_manager import RealtimeSidecarManager
@@ -35,13 +41,16 @@ async def lifespan(_: FastAPI):
         # migration, including on the first fresh database startup.
         await conn.run_sync(lambda sync: Base.metadata.create_all(
             sync, tables=[table for table in Base.metadata.sorted_tables
-                          if table.name not in SELF_ENROLLMENT_TABLES | GUEST_TABLES],
+                          if table.name not in SELF_ENROLLMENT_TABLES | GUEST_TABLES | OIDC_TABLES],
         ))
         await migrate_relay_access(conn, serial_pepper=settings.device_serial_pepper)
         await migrate_relay_redundancy(conn)
         await migrate_browser_controllers(conn)
         await migrate_device_self_enrollment(conn)
         await migrate_guest_temporary_access(conn)
+        if settings.oidc_enabled:
+            await migrate_oidc(conn)
+        await migrate_same_account_authority(conn)
     async with AsyncSessionLocal() as db:
         # Administrator creation is disabled unless every opt-in bootstrap
         # setting is explicitly supplied; no built-in credential exists.
@@ -130,6 +139,37 @@ async def healthz():
     return {"status": "ok"}
 
 
+async def _database_is_ready() -> bool:
+    try:
+        async with asyncio.timeout(2):
+            async with engine.connect() as connection:
+                await connection.execute(text("SELECT 1"))
+        return True
+    except (SQLAlchemyError, OSError, TimeoutError):
+        return False
+
+
+async def _realtime_is_ready(manager: RealtimeSidecarManager) -> bool:
+    try:
+        async with asyncio.timeout(2):
+            return await asyncio.to_thread(manager.probe_health) == "ok"
+    except TimeoutError:
+        return False
+
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz(request: Request):
+    database, realtime = await asyncio.gather(
+        _database_is_ready(), _realtime_is_ready(request.app.state.realtime_manager)
+    )
+    return JSONResponse(
+        {"status": "ok" if database and realtime else "unavailable",
+         "database": database, "realtime": realtime},
+        status_code=200 if database and realtime else 503,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
@@ -138,5 +178,6 @@ if __name__ == "__main__":
         reload=settings.development_reload,
         workers=1,
         proxy_headers=False,
+        log_config=uvicorn_logging_config(),
         reload_dirs=["app"] if settings.development_reload else None,
     )

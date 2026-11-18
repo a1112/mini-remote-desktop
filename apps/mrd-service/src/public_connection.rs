@@ -764,10 +764,7 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
             {
                 *state.public_connection.last_error.write().unwrap() =
                     Some("public_runtime_start_failed".into());
-                let mode = mrd_ipc::ShutdownMode::Graceful;
-                if state.shutdown.request(mode.clone()).is_ok() {
-                    state.shutdown.acknowledge(mode);
-                }
+                state.shutdown.request_recovery();
                 terminal_failure = Some(anyhow!(
                     "public signaling task exited; process restart required"
                 ));
@@ -910,12 +907,7 @@ pub async fn spawn(state: Arc<AppState>) -> Result<PublicConnectionTask> {
                             *state.public_connection.last_error.write().unwrap() =
                                 Some("public_runtime_start_failed".into());
                             if error.is::<StackInstallFailed>() {
-                                // This is an internal runtime failure, so no IPC
-                                // response needs flushing before shutdown.
-                                let mode = mrd_ipc::ShutdownMode::Graceful;
-                                if state.shutdown.request(mode.clone()).is_ok() {
-                                    state.shutdown.acknowledge(mode);
-                                }
+                                state.shutdown.request_recovery();
                                 terminal_failure = Some(anyhow!(
                                     "public runtime installation failed; process restart required"
                                 ));

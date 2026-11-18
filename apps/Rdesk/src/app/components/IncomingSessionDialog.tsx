@@ -21,8 +21,45 @@ export interface IncomingSessionDialogProps {
   onRespond: (response: ConsentResponse) => Promise<void>;
 }
 
-function defaultSelectedScopes(session: RemoteSessionSnapshot | null) {
-  return session?.requested_scopes.includes("screen.view")
+const permissionLabels: Record<RemotePermissionScope, string> = {
+  "screen.view": "查看本机屏幕",
+  "input.pointer": "控制本机鼠标",
+  "input.keyboard": "控制本机键盘",
+  "clipboard.read": "读取本机剪贴板",
+  "clipboard.write": "写入本机剪贴板",
+  "file.read": "读取本机文件",
+  "file.write": "写入本机文件",
+  "audio.listen": "收听本机系统声音",
+  "audio.talk": "语音通话",
+  "display.switch": "切换显示器",
+  "display.multi_view": "同时查看多个显示器",
+  "power.restart": "重启本机",
+  "power.shutdown": "关闭本机",
+  "terminal.open": "打开本机终端",
+  "privacy.block_local_input": "屏蔽本机键盘和鼠标操作",
+  "privacy.blank_screen": "将本机屏幕置黑",
+  "secure_desktop.view": "查看系统安全桌面",
+  "secure_desktop.control": "控制系统安全桌面",
+};
+
+/**
+ * Select the scopes shown in the attended-consent UI before the user edits
+ * the request. Development builds intentionally start with every requested
+ * scope selected so the browser-control fixture can exercise the complete
+ * input path. Release builds keep the conservative screen-only default.
+ *
+ * `defaultAllRequested` is injectable for tests; the application uses Vite's
+ * build-time DEV flag and never derives this policy from request data.
+ */
+export function defaultSelectedScopes(
+  session: RemoteSessionSnapshot | null,
+  defaultAllRequested = import.meta.env.DEV,
+) {
+  const requestedScopes = session?.requested_scopes ?? [];
+  if (defaultAllRequested) {
+    return new Set<RemotePermissionScope>(requestedScopes);
+  }
+  return requestedScopes.includes("screen.view")
     ? new Set<RemotePermissionScope>(["screen.view"])
     : new Set<RemotePermissionScope>();
 }
@@ -135,6 +172,7 @@ export function IncomingSessionDialog({
   return (
     <AlertDialog open>
       <AlertDialogContent
+        className="max-h-[calc(100dvh_-_2rem)] overflow-y-auto"
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           document.getElementById(denyButtonId)?.focus();
@@ -158,19 +196,22 @@ export function IncomingSessionDialog({
           </div>
         </dl>
 
-        <div aria-label="Requested permissions">
-          {session.requested_scopes.map((scope) => (
-            <label className="flex items-center gap-3 py-1" key={scope}>
-              <input
-                checked={selectedScopes.has(scope)}
-                disabled={isSubmitting || isExpired}
-                onChange={() => toggleScope(scope)}
-                type="checkbox"
-              />
-              <span className="text-sm">{scope === "audio.listen" ? "系统声音 (audio.listen)" : scope}</span>
-            </label>
-          ))}
-        </div>
+        <fieldset>
+          <legend className="mb-1 text-sm font-medium">本次请求的权限</legend>
+          <div className="max-h-[min(40dvh,16rem)] overflow-y-auto">
+            {session.requested_scopes.map((scope) => (
+              <label className="flex items-center gap-3 py-1" key={scope}>
+                <input
+                  checked={selectedScopes.has(scope)}
+                  disabled={isSubmitting || isExpired}
+                  onChange={() => toggleScope(scope)}
+                  type="checkbox"
+                />
+                <span className="text-sm">{permissionLabels[scope] ?? scope}</span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
 
         {isExpired ? (
           <p className="text-destructive text-sm" role="status">

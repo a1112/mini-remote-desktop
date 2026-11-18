@@ -248,10 +248,13 @@ impl ServiceManager {
         if self.probe_service_health().await?.is_none() {
             anyhow::bail!("Background service is unavailable");
         }
+        #[cfg(target_os = "macos")]
+        let mut client = mrd_ipc::client::IpcClient::new();
+        #[cfg(not(target_os = "macos"))]
         let mut client = one_attempt_ipc_client(&self.management_endpoint);
         let response = tokio::time::timeout(
             Duration::from_secs(10),
-            client.send_request(IpcRequest::ShutdownService { mode }),
+            client.send_request_no_reconnect(IpcRequest::ShutdownService { mode }),
         )
         .await
         .context("Background service shutdown request timed out")??;

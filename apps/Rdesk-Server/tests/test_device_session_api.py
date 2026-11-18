@@ -613,3 +613,10 @@ def test_device_session_openapi_uses_only_closed_device_auth_contract(
         "approved_scopes",
         "approved_profile",
     }
+    for suffix, method in (("same-account", "get"), ("approve-same-account", "post")):
+        operation = schema["paths"][f"/api/v1/device-sessions/{{session_id}}/{suffix}"][method]
+        assert operation["security"] == [{"DeviceBearer": []}]
+        assert {p["name"] for p in operation["parameters"] if p["required"]} == {
+            "session_id", "controller_key_id", "target_key_id"
+        }
+    assert schema["components"]["schemas"]["SameAccountOut"]["additionalProperties"] is False

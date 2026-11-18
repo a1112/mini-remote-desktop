@@ -9,7 +9,10 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import type { RemoteSessionSnapshot } from "../adapters/tauri/types";
-import { IncomingSessionDialog } from "./IncomingSessionDialog";
+import {
+  defaultSelectedScopes,
+  IncomingSessionDialog,
+} from "./IncomingSessionDialog";
 
 function makeSession(
   overrides: Partial<RemoteSessionSnapshot> = {},
@@ -36,10 +39,12 @@ function makeSession(
 }
 
 describe("IncomingSessionDialog", () => {
-  it("shows the exact peer identity and requested scope names", () => {
+  it("shows the exact peer identity and describes the requested permissions in Chinese", () => {
     render(
       <IncomingSessionDialog
-        session={makeSession()}
+        session={makeSession({ requested_scopes: [
+          "screen.view", "input.pointer", "clipboard.read", "audio.listen", "secure_desktop.control",
+        ] })}
         consentDeadlineMs={Date.now() + 30_000}
         onRespond={vi.fn()}
       />,
@@ -48,12 +53,15 @@ describe("IncomingSessionDialog", () => {
     expect(screen.getByRole("alertdialog")).toBeInTheDocument();
     expect(screen.getByText("device-living-room")).toBeInTheDocument();
     expect(screen.getByText("key-ed25519:a1b2c3")).toBeInTheDocument();
-    expect(screen.getByText("screen.view")).toBeInTheDocument();
-    expect(screen.getByText("input.pointer")).toBeInTheDocument();
-    expect(screen.getByText("clipboard.read")).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "本次请求的权限" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "查看本机屏幕" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "控制本机鼠标" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "读取本机剪贴板" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "收听本机系统声音" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "控制系统安全桌面" })).toBeInTheDocument();
   });
 
-  it("defaults to only the screen viewing permission", () => {
+  it("defaults to every requested permission in development builds", () => {
     render(
       <IncomingSessionDialog
         session={makeSession()}
@@ -62,13 +70,28 @@ describe("IncomingSessionDialog", () => {
       />,
     );
 
-    expect(screen.getByRole("checkbox", { name: "screen.view" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "查看本机屏幕" })).toBeChecked();
     expect(
-      screen.getByRole("checkbox", { name: "input.pointer" }),
-    ).not.toBeChecked();
+      screen.getByRole("checkbox", { name: "控制本机鼠标" }),
+    ).toBeChecked();
     expect(
-      screen.getByRole("checkbox", { name: "clipboard.read" }),
-    ).not.toBeChecked();
+      screen.getByRole("checkbox", { name: "读取本机剪贴板" }),
+    ).toBeChecked();
+  });
+
+  it("keeps the release default limited to screen viewing", () => {
+    const selected = defaultSelectedScopes(makeSession(), false);
+
+    expect([...selected]).toEqual(["screen.view"]);
+  });
+
+  it("does not select a non-screen permission by default in a release build", () => {
+    const selected = defaultSelectedScopes(
+      makeSession({ requested_scopes: ["input.pointer"] }),
+      false,
+    );
+
+    expect(selected.size).toBe(0);
   });
 
   it("submits only the explicitly selected permission subset", async () => {
@@ -83,7 +106,7 @@ describe("IncomingSessionDialog", () => {
     );
 
     await user.click(
-      screen.getByRole("checkbox", { name: "input.pointer" }),
+      screen.getByRole("checkbox", { name: "读取本机剪贴板" }),
     );
     await user.click(
       screen.getByRole("button", { name: "在本机确认" }),
@@ -118,8 +141,7 @@ describe("IncomingSessionDialog", () => {
     });
   });
 
-  it("requires an explicit selection when screen viewing was not requested", async () => {
-    const user = userEvent.setup();
+  it("enables approval for a requested non-screen scope in development", () => {
     render(
       <IncomingSessionDialog
         session={makeSession({ requested_scopes: ["input.pointer"] })}
@@ -131,11 +153,6 @@ describe("IncomingSessionDialog", () => {
     const approve = screen.getByRole("button", {
       name: "在本机确认",
     });
-    expect(approve).toBeDisabled();
-
-    await user.click(
-      screen.getByRole("checkbox", { name: "input.pointer" }),
-    );
     expect(approve).toBeEnabled();
   });
 
@@ -166,7 +183,7 @@ describe("IncomingSessionDialog", () => {
     expect(approve).toBeDisabled();
     expect(deny).toBeDisabled();
     expect(
-      screen.getByRole("checkbox", { name: "screen.view" }),
+      screen.getByRole("checkbox", { name: "查看本机屏幕" }),
     ).toBeDisabled();
 
     await act(async () => {
@@ -232,10 +249,10 @@ describe("IncomingSessionDialog", () => {
     );
 
     const pointerPermission = screen.getByRole("checkbox", {
-      name: "input.pointer",
+      name: "控制本机鼠标",
     });
     await user.click(pointerPermission);
-    expect(pointerPermission).toBeChecked();
+    expect(pointerPermission).not.toBeChecked();
 
     rerender(
       <IncomingSessionDialog
@@ -250,11 +267,11 @@ describe("IncomingSessionDialog", () => {
     );
 
     expect(
-      screen.getByRole("checkbox", { name: "screen.view" }),
+      screen.getByRole("checkbox", { name: "查看本机屏幕" }),
     ).toBeChecked();
     expect(
-      screen.getByRole("checkbox", { name: "input.pointer" }),
-    ).not.toBeChecked();
+      screen.getByRole("checkbox", { name: "控制本机鼠标" }),
+    ).toBeChecked();
   });
 
   it("shows a consent submission failure and allows the user to retry", async () => {

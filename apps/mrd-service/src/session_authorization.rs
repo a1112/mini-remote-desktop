@@ -71,7 +71,7 @@ pub(crate) struct SessionAuthorizationLease {
 impl SessionAuthorizationLease {
     pub(crate) async fn wait_until_invalid(mut self) {
         let now_ms = unix_time_ms();
-        if now_ms > self.expires_at_ms || *self.cancellation.borrow() {
+        if now_ms >= self.expires_at_ms || *self.cancellation.borrow() {
             return;
         }
         let deadline = tokio::time::sleep(Duration::from_millis(
@@ -296,8 +296,36 @@ impl SessionAuthorizationRegistry {
 
     pub async fn begin_verified_incoming(
         &self,
-        mut request: VerifiedIncomingAuthorizationRequest,
+        request: VerifiedIncomingAuthorizationRequest,
     ) -> Result<RemoteSessionSnapshot, RemoteFailure> {
+        self.begin_verified_incoming_inner(request, false, |_| true)
+            .await
+    }
+
+    /// Create an already-authorizing incoming request without publishing a
+    /// consent prompt. The caller must first verify the account authority and
+    /// must still obtain a backend grant that rechecks that authority.
+    pub(crate) async fn begin_same_account_incoming_with_audit<F>(
+        &self,
+        request: VerifiedIncomingAuthorizationRequest,
+        audit: F,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure>
+    where
+        F: FnOnce(&RemoteSessionSnapshot) -> bool,
+    {
+        self.begin_verified_incoming_inner(request, true, audit)
+            .await
+    }
+
+    async fn begin_verified_incoming_inner<F>(
+        &self,
+        mut request: VerifiedIncomingAuthorizationRequest,
+        same_account: bool,
+        audit: F,
+    ) -> Result<RemoteSessionSnapshot, RemoteFailure>
+    where
+        F: FnOnce(&RemoteSessionSnapshot) -> bool,
+    {
         normalize_scopes(&mut request.requested_scopes);
         normalize_scopes(&mut request.peer_permission_ceiling);
         normalize_scopes(&mut request.machine_permission_ceiling);
@@ -340,11 +368,37 @@ impl SessionAuthorizationRegistry {
             ));
         }
 
+        if same_account && request.access_mode != RemoteAccessMode::Attended {
+            return Err(failure(
+                RemoteReasonCode::PolicyChanged,
+                "invalid trusted session mode",
+            ));
+        }
+        let effective = if same_account {
+            let scopes = effective_scopes(
+                &request.requested_scopes,
+                &request.peer_permission_ceiling,
+                &request.machine_permission_ceiling,
+                &request.requested_scopes,
+                &request.runtime_capabilities,
+            );
+            if scopes.is_empty() {
+                return Err(failure(
+                    RemoteReasonCode::ScopeDenied,
+                    "no requested permission scope is allowed by current policy",
+                ));
+            }
+            scopes
+        } else {
+            Vec::new()
+        };
         let authorization_state = match request.access_mode {
+            RemoteAccessMode::Attended if same_account => RemoteAuthorizationState::Authorizing,
             RemoteAccessMode::Attended => RemoteAuthorizationState::AwaitingLocalConsent,
             RemoteAccessMode::Unattended => RemoteAuthorizationState::VerifyingUnattendedCredential,
         };
         let presentation_state = match request.access_mode {
+            RemoteAccessMode::Attended if same_account => RemotePresentationState::Authenticating,
             RemoteAccessMode::Attended => RemotePresentationState::IncomingApprovalRequired,
             RemoteAccessMode::Unattended => RemotePresentationState::Authenticating,
         };
@@ -360,13 +414,19 @@ impl SessionAuthorizationRegistry {
             media_state: RemoteMediaState::Idle,
             presentation_state,
             requested_scopes: request.requested_scopes.clone(),
-            granted_scopes: Vec::new(),
+            granted_scopes: effective,
             policy_revision: DecimalU64::new(1),
             failure: None,
             created_at_ms: request.created_at_ms,
             updated_at_ms: request.created_at_ms,
             authorization_expires_at_ms: Some(request.expires_at_ms),
         };
+        if same_account && !audit(&snapshot) {
+            return Err(failure(
+                RemoteReasonCode::PolicyChanged,
+                "trusted authorization could not be durably audited",
+            ));
+        }
         let instance_id = next_authorization_instance(&mut inner)?;
         #[cfg(any(windows, test))]
         {
@@ -379,7 +439,7 @@ impl SessionAuthorizationRegistry {
             request.session_id.clone(),
             new_authorization_record(request.clone(), snapshot.clone(), instance_id),
         );
-        if request.access_mode == RemoteAccessMode::Attended {
+        if request.access_mode == RemoteAccessMode::Attended && !same_account {
             push_event(
                 &mut inner,
                 request.created_at_ms,
@@ -719,7 +779,7 @@ impl SessionAuthorizationRegistry {
                 };
                 if grant.session_id != *session_id
                     || grant.issued_at_ms > now_ms
-                    || now_ms > grant.expires_at_ms
+                    || now_ms >= grant.expires_at_ms
                     || grant.policy_revision != record.snapshot.policy_revision.get()
                     || grant.granted_scopes != record.snapshot.granted_scopes
                 {
@@ -778,7 +838,7 @@ impl SessionAuthorizationRegistry {
             record.grant.as_ref().is_some_and(|grant| {
                 record.snapshot.authorization_state == RemoteAuthorizationState::Granted
                     && grant.issued_at_ms <= now_ms
-                    && now_ms <= grant.expires_at_ms
+                    && now_ms < grant.expires_at_ms
                     && grant.granted_scopes.contains(&scope)
             })
         });
@@ -797,7 +857,7 @@ impl SessionAuthorizationRegistry {
         let grant = record.grant.as_ref()?;
         if record.snapshot.authorization_state != RemoteAuthorizationState::Granted
             || now < grant.issued_at_ms
-            || now > grant.expires_at_ms
+            || now >= grant.expires_at_ms
             || !grant
                 .granted_scopes
                 .contains(&RemotePermissionScope::AudioListen)
@@ -827,7 +887,7 @@ impl SessionAuthorizationRegistry {
                 record.grant.as_ref().and_then(|grant| {
                     (record.snapshot.authorization_state == RemoteAuthorizationState::Granted
                         && grant.issued_at_ms <= now_ms
-                        && now_ms <= grant.expires_at_ms
+                        && now_ms < grant.expires_at_ms
                         && grant.granted_scopes.contains(&scope))
                     .then(|| SessionAuthorizationLease {
                         cancellation: record.cancellation.subscribe(),
@@ -909,8 +969,12 @@ impl SessionAuthorizationRegistry {
                     && record
                         .peer_public_key
                         .is_some_and(|key| public_key_id(&key) == record.request.peer_key_id)
+                    // The request expiry is the short-lived consent window;
+                    // the verified WAN grant carries the independent backend
+                    // session lease.  Installation must still happen before
+                    // consent expires, but the lease may legitimately outlive
+                    // that window.
                     && installed_at_ms < record.request.expires_at_ms
-                    && grant.expires_at_ms <= record.request.expires_at_ms
                     && grant.policy_revision > 0
             }
             None => {
@@ -928,7 +992,7 @@ impl SessionAuthorizationRegistry {
             || !scope_binding_is_valid
             || !policy_binding_is_valid
             || grant.issued_at_ms > installed_at_ms
-            || installed_at_ms > grant.expires_at_ms
+            || installed_at_ms >= grant.expires_at_ms
             || grant.route_constraint != record.request.transport_kind
             || grant
                 .transport_fingerprint_sha256
@@ -1179,10 +1243,10 @@ impl SessionAuthorizationRegistry {
                 "unattended authorization is no longer pending",
             ));
         }
-        if verified_at_ms > record.request.expires_at_ms
+        if verified_at_ms >= record.request.expires_at_ms
             || policy
                 .expires_at_ms
-                .is_some_and(|expires_at_ms| verified_at_ms > expires_at_ms)
+                .is_some_and(|expires_at_ms| verified_at_ms >= expires_at_ms)
         {
             return Err(failure(
                 RemoteReasonCode::AuthorizationTimeout,
@@ -1279,7 +1343,7 @@ impl SessionAuthorizationRegistry {
                 _ => {}
             }
             let now_ms = unix_time_ms();
-            if now_ms > deadline_ms {
+            if now_ms >= deadline_ms {
                 let expired = self.expire_pending(session_id, now_ms).await;
                 return Err(expired
                     .and_then(|snapshot| snapshot.failure)
@@ -1358,7 +1422,7 @@ impl SessionAuthorizationRegistry {
                 "remote consent policy revision changed",
             )));
         }
-        if decided_at_ms > record.request.expires_at_ms {
+        if decided_at_ms >= record.request.expires_at_ms {
             let expired = failure(
                 RemoteReasonCode::AuthorizationTimeout,
                 "remote authorization request expired before consent",
@@ -1466,7 +1530,7 @@ impl SessionAuthorizationRegistry {
         let mut inner = self.inner.lock().await;
         let record = inner.records.get_mut(session_id)?;
         if record.snapshot.authorization_state != RemoteAuthorizationState::AwaitingLocalConsent
-            || expired_at_ms <= record.request.expires_at_ms
+            || expired_at_ms < record.request.expires_at_ms
         {
             return None;
         }
@@ -1697,7 +1761,7 @@ fn expire_grant_locked(
             && record
                 .grant
                 .as_ref()
-                .is_some_and(|grant| now_ms > grant.expires_at_ms)
+                .is_some_and(|grant| now_ms >= grant.expires_at_ms)
     });
     if !should_expire {
         return false;
@@ -2003,7 +2067,7 @@ fn project_verified_route_evidence(
         || record.request.peer_key_id != record.snapshot.peer_key_id
         || grant.session_id != record.snapshot.session_id
         || grant.issued_at_ms > observed_at_ms
-        || observed_at_ms > grant.expires_at_ms
+        || observed_at_ms >= grant.expires_at_ms
         || grant.policy_revision != record.snapshot.policy_revision.get()
         || grant.granted_scopes != record.snapshot.granted_scopes
         || grant.route_constraint != record.request.transport_kind
@@ -2104,6 +2168,53 @@ mod tests {
 
     const CREATED_AT_MS: u64 = 1_000;
     const EXPIRES_AT_MS: u64 = 20_000;
+
+    #[tokio::test]
+    async fn same_account_authorization_intersects_ceilings_without_publishing_consent() {
+        let registry = SessionAuthorizationRegistry::default();
+        let mut request = control_request("same-account-intersection", &[7; 32]);
+        request
+            .machine_permission_ceiling
+            .retain(|scope| *scope == RemotePermissionScope::InputPointer);
+        let snapshot = registry
+            .begin_same_account_incoming_with_audit(request.clone(), |_| true)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot.authorization_state,
+            RemoteAuthorizationState::Authorizing
+        );
+        assert_eq!(
+            snapshot.presentation_state,
+            RemotePresentationState::Authenticating
+        );
+        assert_eq!(
+            snapshot.granted_scopes,
+            vec![RemotePermissionScope::InputPointer]
+        );
+        let events = registry
+            .subscribe(SessionEventSubscriptionQuery {
+                session_id: Some(request.session_id),
+                after_sequence: None,
+                limit: 16,
+                wait_timeout_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert!(events.events.is_empty());
+        assert!(events.pending_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_account_authorization_requires_durable_audit() {
+        let registry = SessionAuthorizationRegistry::default();
+        let request = control_request("same-account-audit", &[7; 32]);
+        assert!(registry
+            .begin_same_account_incoming_with_audit(request.clone(), |_| false)
+            .await
+            .is_err());
+        assert!(registry.snapshot(&request.session_id).await.is_none());
+    }
 
     #[tokio::test]
     async fn outgoing_birth_receipts_capture_only_the_first_real_insert() {
@@ -2701,14 +2812,24 @@ mod tests {
             .await
             .expect("mark session streaming");
 
+        assert!(
+            !registry
+                .allows_scope(
+                    &session_id,
+                    RemotePermissionScope::InputPointer,
+                    EXPIRES_AT_MS,
+                )
+                .await,
+            "a grant is not usable at its exact expiry millisecond"
+        );
         let failure = registry
-            .active_control_authorization(&session_id, EXPIRES_AT_MS + 1)
+            .active_control_authorization(&session_id, EXPIRES_AT_MS)
             .await
             .expect_err("expired grant cannot authorize control input");
 
         assert_eq!(failure.code, RemoteReasonCode::GrantExpired);
         let snapshot = registry
-            .snapshot_at(&session_id, EXPIRES_AT_MS + 1)
+            .snapshot_at(&session_id, EXPIRES_AT_MS)
             .await
             .expect("expired snapshot remains queryable");
         assert_eq!(
@@ -2747,6 +2868,61 @@ mod tests {
         assert_eq!(streaming.route_kind, Some(RemoteRouteKind::WebRtcRelay));
         assert_eq!(streaming.route_state, RemoteRouteState::Connected);
         assert_eq!(streaming.media_state, RemoteMediaState::Streaming);
+    }
+
+    #[tokio::test]
+    async fn target_wan_grant_lease_outlives_short_consent_window() {
+        let registry = SessionAuthorizationRegistry::default();
+        let peer_public_key = [7; 32];
+        let mut request = control_request("target-wan-lease", &peer_public_key);
+        request.transport_kind = "webrtc_relay".to_owned();
+        request.expires_at_ms = 60_000;
+        let session_id = request.session_id.clone();
+
+        registry
+            .begin_verified_incoming(request.clone())
+            .await
+            .expect("target consent request must be accepted");
+        registry
+            .bind_authenticated_peer_key(&session_id, &peer_public_key, CREATED_AT_MS + 1)
+            .await
+            .expect("target must bind the verified controller key");
+        registry
+            .respond_to_consent(
+                ConsentResponse {
+                    session_id: session_id.clone(),
+                    decision: ConsentDecision::Approve,
+                    approved_scopes: request.requested_scopes.clone(),
+                    expected_policy_revision: DecimalU64::new(1),
+                },
+                CREATED_AT_MS + 2,
+            )
+            .await
+            .expect("consent must finish before the short request deadline");
+
+        let mut grant = control_grant(&session_id);
+        grant.route_constraint = "webrtc_relay".to_owned();
+        grant.expires_at_ms = 600_000;
+        grant.granted_scopes = request.requested_scopes.clone();
+        registry
+            .install_verified_wan_target_grant(grant, 1, CREATED_AT_MS + 3)
+            .await
+            .expect("backend lease may outlive the consent window");
+        registry
+            .mark_streaming(&session_id, request.expires_at_ms + 1)
+            .await
+            .expect("stream may continue after intent claims expire");
+        let active = registry
+            .active_control_authorization(&session_id, request.expires_at_ms + 1)
+            .await
+            .expect("active control must use the backend lease, not consent expiry");
+        assert_eq!(active.expires_at_ms, 600_000);
+
+        let expired = registry
+            .active_control_authorization(&session_id, 600_000)
+            .await
+            .expect_err("control must stop at the backend lease expiry");
+        assert_eq!(expired.code, RemoteReasonCode::GrantExpired);
     }
 
     #[tokio::test]

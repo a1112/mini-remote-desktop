@@ -220,7 +220,7 @@ pub async fn refresh_autostart_state(
 /// Queue a runtime-owned shutdown; the local connection flushes Ack before exit.
 pub fn shutdown_service(app_state: &Arc<AppState>, mode: ShutdownMode) -> IpcResponse {
     tracing::info!("ShutdownService requested: mode={:?}", mode);
-    match app_state.shutdown.request(mode) {
+    match app_state.shutdown.request_from_client(mode) {
         Ok(()) => IpcResponse::Ack,
         Err(error) => IpcResponse::Error {
             code: "E_SERVICE_SHUTDOWN_UNAVAILABLE".to_string(),

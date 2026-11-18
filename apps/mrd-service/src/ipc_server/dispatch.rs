@@ -1139,10 +1139,9 @@ fn macos_sensitive_request_policy_denial(
 
 fn management_request_is_allowed(request: &IpcRequest) -> bool {
     // Unix management shares the same owner-only private socket boundary as
-    // core IPC. The Windows management pipe is intentionally read-only: its
-    // ACL grants interactive users data rights, so enrollment/recovery,
-    // autostart, and shutdown mutations must go through the verified product
-    // pipe or an explicitly elevated service administrator endpoint.
+    // core IPC. The Windows management ACL grants read requests to interactive
+    // users. connection.rs dispatches enrollment/recovery separately after
+    // checking the enabled Administrators SID on the last pipe message.
     #[cfg(unix)]
     if matches!(
         request,

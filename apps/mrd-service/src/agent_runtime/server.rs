@@ -923,6 +923,11 @@ impl AgentServer {
         }
         let minimum_protocol_minor = if matches!(
             &execute.command,
+            mrd_agent_ipc::AgentCommand::AuthorizeSameAccount { .. }
+        ) {
+            mrd_agent_ipc::AGENT_IPC_SAME_ACCOUNT_PROTOCOL_MINOR
+        } else if matches!(
+            &execute.command,
             mrd_agent_ipc::AgentCommand::StartRender { .. }
                 | mrd_agent_ipc::AgentCommand::StopRender { .. }
         ) {

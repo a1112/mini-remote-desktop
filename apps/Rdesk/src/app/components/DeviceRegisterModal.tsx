@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "./ThemeContext";
 import { deviceService } from "../services/deviceService";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./ui/dialog";
 
 interface HardwareInfo {
   motherboard_serial: string;
@@ -38,12 +39,16 @@ interface DeviceRegisterModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess?: (deviceId: string, deviceName: string, accessToken: string) => void;
+  serviceManaged?: boolean;
 }
+
+const windowsServiceCommand = '& "$env:ProgramFiles\\MiniRemoteDesktop\\mrd-service.exe"';
 
 export function DeviceRegisterModal({
   isOpen,
   onClose,
   onSuccess,
+  serviceManaged = false,
 }: DeviceRegisterModalProps) {
   const { isDark } = useTheme();
   const [step, setStep] = useState<"loading" | "register" | "success">("loading");
@@ -57,6 +62,7 @@ export function DeviceRegisterModal({
   const [error, setError] = useState<string | null>(null);
   const [registering, setRegistering] = useState(false);
   const [result, setResult] = useState<DeviceRegisterResponse | null>(null);
+  const windowsAdministrator = serviceManaged && /^(win|windows)/i.test(navigator.platform);
 
   // 获取硬件信息
   useEffect(() => {
@@ -65,10 +71,10 @@ export function DeviceRegisterModal({
     setError(null);
     setResult(null);
     setStep("loading");
-    if (isOpen) {
+    if (isOpen && !windowsAdministrator) {
       fetchHardwareInfo();
     }
-  }, [isOpen]);
+  }, [isOpen, windowsAdministrator]);
 
   const fetchHardwareInfo = async () => {
     try {
@@ -122,6 +128,32 @@ export function DeviceRegisterModal({
   };
 
   if (!isOpen) return null;
+
+  if (windowsAdministrator) {
+    return (
+      <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+        <DialogContent className={isDark ? "bg-[#232323] text-gray-100" : undefined}>
+          <DialogHeader>
+            <DialogTitle>Windows 设备登记与恢复</DialogTitle>
+            <DialogDescription>
+              Rdesk 后台服务会尝试自动登记。需要手动处理时，请管理员在本机以管理员身份打开 PowerShell。
+            </DialogDescription>
+          </DialogHeader>
+          <dl className="space-y-3 text-sm">
+            <div>
+              <dt>首次登记</dt>
+              <dd><code className="mt-1 block break-all rounded bg-muted p-2">{windowsServiceCommand} --enroll-public-device</code></dd>
+            </div>
+            <div>
+              <dt>恢复已有设备</dt>
+              <dd><code className="mt-1 block break-all rounded bg-muted p-2">{windowsServiceCommand} --recover-public-device</code></dd>
+            </div>
+          </dl>
+          <p className="text-sm">按终端提示输入凭据。成功后回到 Rdesk，点击「刷新登记状态」。</p>
+        </DialogContent>
+      </Dialog>
+    );
+  }
 
   const cardBg = isDark ? "bg-[#232323]" : "bg-white";
   const textPrimary = isDark ? "text-gray-100" : "text-gray-900";

@@ -2827,6 +2827,15 @@ mod wire {
         pub p2p_available: bool,
     }
 
+    /// Sanitized LAN discovery failure categories.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum LanDiscoveryErrorCode {
+        SocketBindFailed,
+        BroadcastSetupFailed,
+        ProbeSendFailed,
+    }
+
     /// LAN discovery state exposed over IPC.
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct LanDiscoverySnapshot {
@@ -2838,8 +2847,11 @@ mod wire {
         pub discovery_port: u16,
         /// Local discovery instance id.
         pub instance_id: String,
-        /// Last successful announce/probe timestamp in milliseconds since Unix epoch.
+        /// Last successful probe send in milliseconds since Unix epoch.
         pub last_probe_ms: Option<u64>,
+        /// Latest discovery failure, cleared after a successful startup or probe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub error_code: Option<LanDiscoveryErrorCode>,
         /// Currently known LAN peers.
         pub peers: Vec<LanPeerInfo>,
     }

@@ -6,7 +6,12 @@ import { launchRemoteDisplayForDevice } from '../services/remoteDisplayLauncher'
 import { closeBrowserRemoteSession } from '../services/browserRemoteSessionService';
 import { DEVICE_CODE_INPUT_ERROR, parseRemoteDeviceInput } from '../utils/deviceCode';
 
-export function GuestRemoteConnectForm() {
+type GuestRemoteConnectFormProps = {
+  target?: { deviceId: string } | null;
+  onBusyChange?: (busy: boolean) => void;
+};
+
+export function GuestRemoteConnectForm({ target, onBusyChange }: GuestRemoteConnectFormProps) {
   const navigate = useNavigate();
   const passwordId = useId();
   const [deviceCode, setDeviceCode] = useState('');
@@ -14,12 +19,22 @@ export function GuestRemoteConnectForm() {
   const [revealed, setRevealed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const passwordRef = useRef<HTMLInputElement>(null);
   const alive = useRef(true);
   const inFlight = useRef<AbortController | null>(null);
   useEffect(() => {
     alive.current = true;
-    return () => { alive.current = false; inFlight.current?.abort(); };
-  }, []);
+    return () => { alive.current = false; inFlight.current?.abort(); onBusyChange?.(false); };
+  }, [onBusyChange]);
+  useEffect(() => {
+    if (!target) return;
+    inFlight.current?.abort();
+    setDeviceCode(target.deviceId);
+    setPassword('');
+    setError(null);
+    setRevealed(false);
+    passwordRef.current?.focus();
+  }, [target]);
 
   const connect = async () => {
     if (inFlight.current) return;
@@ -29,6 +44,7 @@ export function GuestRemoteConnectForm() {
     const cancellation = new AbortController();
     inFlight.current = cancellation;
     setBusy(true); setError(null); setPassword(''); setRevealed(false);
+    onBusyChange?.(true);
     try {
       const result = await launchRemoteDisplayForDevice(target.deviceId, {
         temporaryPassword: password, signal: cancellation.signal,
@@ -43,7 +59,10 @@ export function GuestRemoteConnectForm() {
       if (alive.current && !cancellation.signal.aborted) setError(cause instanceof Error ? cause.message : '临时密码连接失败');
     } finally {
       if (inFlight.current === cancellation) inFlight.current = null;
-      if (alive.current) setBusy(false);
+      if (alive.current) {
+        setBusy(false);
+        onBusyChange?.(false);
+      }
     }
   };
 
@@ -54,7 +73,7 @@ export function GuestRemoteConnectForm() {
     </label>
     <div className="text-sm"><label htmlFor={passwordId}>远端临时密码</label>
       <span className="relative mt-1.5 block">
-        <input id={passwordId} aria-label="远端临时密码" type={revealed ? 'text' : 'password'} placeholder="输入 8 位临时密码" autoComplete="off" autoCapitalize="characters" spellCheck={false}
+        <input ref={passwordRef} id={passwordId} aria-label="远端临时密码" type={revealed ? 'text' : 'password'} placeholder="输入 8 位临时密码" autoComplete="off" autoCapitalize="characters" spellCheck={false}
           value={password} onChange={event => setPassword(event.target.value)} disabled={busy} maxLength={8}
           className="w-full rounded-lg border border-current/20 bg-transparent px-3 py-2.5 pr-12 outline-none focus:ring-2 focus:ring-blue-500/30" />
         <button type="button" onClick={() => setRevealed(value => !value)} disabled={busy} aria-label={revealed ? '隐藏输入密码' : '显示输入密码'} className="absolute inset-y-0 right-0 px-3 opacity-60 hover:opacity-100">

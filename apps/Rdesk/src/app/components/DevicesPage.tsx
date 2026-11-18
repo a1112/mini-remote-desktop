@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { useNavigate } from "react-router";
+import { Link, useNavigate, useSearchParams } from "react-router";
 import {
   Plus,
   Search,
@@ -22,68 +22,125 @@ import {
 } from "lucide-react";
 import { useDevices, Device } from "./deviceData";
 import { useTheme } from "./ThemeContext";
-import { NetworkGroupSelector } from "./NetworkGroupSelector";
+import { useAuth } from "./AuthContext";
+import { isTauriRuntime } from "../utils/runtime";
 import { NetworkGroupEditModal } from "./NetworkGroupEditModal";
 import { LanPairingPanel } from "./LanPairingPanel";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "./ui/context-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "./ui/dropdown-menu";
 import { useNetworkGroups } from "../hooks/useNetworkGroups";
 import { networkGroupService } from "../services/networkGroupService";
 import {
   launchLocalRemoteDisplayTest,
   launchRemoteDisplayForDevice,
 } from "../services/remoteDisplayLauncher";
+import { normalizeDeviceCode } from "../utils/deviceCode";
+
+const unavailableManagementActions = [
+  { icon: Edit2, label: "重命名" },
+  { icon: Star, label: "收藏设备" },
+  { icon: Power, label: "启用或禁用设备" },
+  { icon: Trash2, label: "移除设备" },
+  { icon: RotateCw, label: "重启" },
+  { icon: Power, label: "关机" },
+  { icon: Zap, label: "网络唤醒" },
+];
+
+type GroupMembership = {
+  groupId: string;
+  devices: Map<string, boolean>;
+  error: string | null;
+};
+
+function DeviceMenuItems({
+  Item,
+  connectionLabel,
+  unavailable,
+  onConnect,
+  detailPath,
+}: {
+  Item: typeof DropdownMenuItem | typeof ContextMenuItem;
+  connectionLabel: string;
+  unavailable: string | null;
+  onConnect: () => void;
+  detailPath: string;
+}) {
+  return <>
+    <Item disabled={Boolean(unavailable)} onSelect={onConnect}>
+      <Monitor aria-hidden="true" />
+      {connectionLabel}
+      {unavailable && <span className="ml-auto pl-4 text-xs">{unavailable}</span>}
+    </Item>
+    <Item asChild>
+      <Link to={`${detailPath}?tab=info`}>
+        <Info aria-hidden="true" />
+        设备信息
+      </Link>
+    </Item>
+    <div role="separator" className="my-1 border-t border-border" />
+    {unavailableManagementActions.map(({ icon: Icon, label }) => (
+      <Item key={label} disabled>
+        <Icon aria-hidden="true" />
+        {label}
+        <span className="ml-auto pl-4 text-xs">暂不可用</span>
+      </Item>
+    ))}
+  </>;
+}
 
 export function DevicesPage() {
+  const native = isTauriRuntime();
+  const { isLoggedIn, token, user } = useAuth();
   const { isDark } = useTheme();
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const search = searchParams.get("q") ?? "";
   const { devices, loading, error, refresh, lastUpdated, currentDeviceId } = useDevices({
     pollInterval: 30000,
     enabled: true,
   });
-  const { groups, refresh: refreshGroups } = useNetworkGroups({ pollInterval: 30000, enabled: true });
+  const {
+    groups,
+    error: groupListError,
+    lastUpdated: groupListUpdatedAt,
+    refresh: refreshGroups,
+  } = useNetworkGroups({ pollInterval: 30000, enabled: true });
 
   const [refreshing, setRefreshing] = useState(false);
-  const [search, setSearch] = useState("");
-  const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
-  const [menuOpen, setMenuOpen] = useState<string | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
-  const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
+  const [groupMembership, setGroupMembership] = useState<GroupMembership | null>(null);
+  const [membershipAttempt, setMembershipAttempt] = useState(0);
   const [createGroupModalOpen, setCreateGroupModalOpen] = useState(false);
   const [newGroupName, setNewGroupName] = useState("");
   const [newGroupDescription, setNewGroupDescription] = useState("");
   const [launchingDeviceId, setLaunchingDeviceId] = useState<string | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
+  const launchInFlight = useRef(false);
   const [lanPairingOpen, setLanPairingOpen] = useState(false);
 
-  // 右键菜单状态
-  const [contextMenu, setContextMenu] = useState<{
-    deviceId: string;
-    x: number;
-    y: number;
-  } | null>(null);
-  const [submenuOpen, setSubmenuOpen] = useState<string | null>(null);
-  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const accountGroups = isLoggedIn && token ? groups.filter((group) => group.user_id === user?.id) : [];
+  const currentGroup = accountGroups.find((group) => group.id === selectedGroupId);
+  const activeGroupId = currentGroup?.id ?? null;
+  const activeMembership = groupMembership?.groupId === activeGroupId ? groupMembership : null;
 
-  // 默认选择第一个分组
   useEffect(() => {
-    const firstGroup = groups[0];
-    if (firstGroup && !selectedGroupId) {
-      setSelectedGroupId(firstGroup.id);
-    }
-  }, [groups, selectedGroupId]);
-
-  // 点击外部关闭右键菜单
-  useEffect(() => {
-    const handleClickOutside = (e: MouseEvent) => {
-      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
-        setContextMenu(null);
-        setSubmenuOpen(null);
+    if (!activeGroupId || editingGroupId) return;
+    let cancelled = false;
+    void networkGroupService.getGroupDevices(activeGroupId).then((members) => {
+      if (cancelled) return;
+      setGroupMembership({
+        groupId: activeGroupId,
+        devices: new Map(members.map((member) => [normalizeDeviceCode(member.device_id), member.is_enabled])),
+        error: null,
+      });
+    }).catch((cause: unknown) => {
+      if (!cancelled) {
+        setGroupMembership({ groupId: activeGroupId, devices: new Map(), error: cause instanceof Error ? cause.message : "加载分组设备失败" });
       }
-    };
-    if (contextMenu) {
-      document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
-    }
-  }, [contextMenu]);
+    });
+    return () => { cancelled = true; };
+  }, [activeGroupId, editingGroupId, groupListUpdatedAt, membershipAttempt, token]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -94,20 +151,29 @@ export function DevicesPage() {
     }
   };
 
-  // 根据选中的分组筛选设备
-  const filteredDevices = devices.filter((d) => {
-    const matchSearch =
-      d.name.toLowerCase().includes(search.toLowerCase()) ||
-      d.deviceId.includes(search) ||
-      d.os.toLowerCase().includes(search.toLowerCase());
-
-    // TODO: 这里需要根据实际分组关系筛选，暂时返回所有设备
-    const matchGroup = true;
-
-    return matchSearch && matchGroup;
+  const query = search.trim().toLowerCase();
+  const codeQuery = normalizeDeviceCode(query);
+  const filteredDevices = devices.filter((device) => {
+    const deviceCode = normalizeDeviceCode(device.deviceId);
+    if (activeGroupId && !activeMembership?.devices.has(deviceCode)) return false;
+    return !query || deviceCode.toLowerCase().includes(codeQuery) ||
+      [device.name, device.os, device.ip].some((value) => value.toLowerCase().includes(query));
   });
 
-  const online = devices.filter((d) => d.status === "online").length;
+  const connectionUnavailable = (device: Device) => {
+    if (device.disabled) return "设备已禁用";
+    if (currentGroup?.is_enabled === false) return "分组已停用";
+    if (activeMembership?.devices.get(normalizeDeviceCode(device.deviceId)) === false) return "设备在此分组中已禁用";
+    if (device.status === "offline") return "设备离线";
+    return null;
+  };
+
+  const updateSearch = (value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value) next.set("q", value);
+    else next.delete("q");
+    setSearchParams(next, { replace: true });
+  };
 
   const card = isDark ? "bg-[#232323] border-gray-700" : "bg-white border-gray-200/70 shadow-sm";
   const cardHover = isDark ? "hover:border-gray-600 hover:shadow-sm" : "hover:border-gray-300 hover:shadow-md";
@@ -130,34 +196,6 @@ export function DevicesPage() {
     local: "本机",
     lan_p2p: "P2P 局域网",
     server: "服务器",
-  };
-
-  // 当前选中的分组
-  const currentGroup = groups.find((g) => g.id === selectedGroupId) || null;
-
-  // 右键菜单处理
-  const handleContextMenu = (e: React.MouseEvent, deviceId: string) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setContextMenu({ deviceId, x: e.clientX, y: e.clientY });
-  };
-
-  const contextMenuDevice = contextMenu ? devices.find((d) => d.id === contextMenu.deviceId) : null;
-  const isContextOnline = contextMenuDevice?.status === "online";
-
-  // 模拟管理操作
-  const handleManagementAction = (action: string) => {
-    console.log(`执行管理操作: ${action} on ${contextMenu?.deviceId}`);
-    setContextMenu(null);
-    setSubmenuOpen(null);
-    // TODO: 实际实现这些操作
-    alert(`${action} 功能为模拟操作`);
-  };
-
-  // 打开编辑弹窗
-  const handleOpenEditModal = (groupId: string | null) => {
-    setEditingGroupId(groupId);
-    setEditModalOpen(true);
   };
 
   // 创建新分组
@@ -188,74 +226,79 @@ export function DevicesPage() {
     setCreateGroupModalOpen(true);
   };
 
-  const handleOpenRemoteWindow = async (device: Device) => {
-    setLaunchingDeviceId(device.id);
-    try {
-      const result = await launchRemoteDisplayForDevice(device.deviceId, {
-        transportKind: device.p2pAvailable
-          ? "quic"
-          : device.os.toLowerCase().includes("quic")
-            ? "quic"
-            : "webrtc",
-        targetDeviceName: device.name,
-        targetOs: device.os,
-        targetIp: device.ip,
-        lanP2P: device.p2pAvailable && !device.isLocal,
-      });
-      if (result.mode === "route") navigate(result.routePath ?? `/session/${result.sessionId}`);
-    } catch (error) {
-      alert(error instanceof Error ? error.message : "Open remote display failed");
-    } finally {
-      setLaunchingDeviceId(null);
-      setContextMenu(null);
-    }
+  const closeGroupEditor = () => {
+    setEditingGroupId(null);
+    setGroupMembership(null);
   };
 
-  const handleOpenLocalTestWindow = async () => {
-    setLaunchingDeviceId("__local_test__");
+  const launchDisplay = async (device: Device | null) => {
+    if (launchInFlight.current || (device && connectionUnavailable(device))) return;
+    const localTest = !device || device.isLocal || device.deviceId === currentDeviceId;
+    launchInFlight.current = true;
+    setLaunchingDeviceId(device?.id ?? "__local_test__");
+    setLaunchError(null);
     try {
-      const result = await launchLocalRemoteDisplayTest();
-      if (result.mode === "route") navigate(`/display/${result.sessionId}`);
+      const result = device && !localTest
+        ? await launchRemoteDisplayForDevice(device.deviceId, {
+          transportKind: device.p2pAvailable || device.os.toLowerCase().includes("quic") ? "quic" : "webrtc",
+          targetDeviceName: device.name,
+          targetOs: device.os,
+          targetIp: device.ip,
+          lanP2P: device.p2pAvailable,
+        })
+        : await launchLocalRemoteDisplayTest();
+      if (result.mode === "route") {
+        const page = localTest ? "display" : "session";
+        navigate(result.routePath ?? `/${page}/${result.sessionId}`);
+      }
     } catch (error) {
-      alert(error instanceof Error ? error.message : "Open local test display failed");
+      const action = localTest ? "打开本机测试窗口失败" : `连接 ${device.name} 失败`;
+      const message = error instanceof Error ? error.message : "请稍后重试";
+      setLaunchError(`${action}。${message}`);
     } finally {
+      launchInFlight.current = false;
       setLaunchingDeviceId(null);
     }
   };
 
   return (
-    <div className="flex h-full">
-      {/* Main list */}
-      <div className="flex-1 p-8 overflow-y-auto">
+    <div className="flex min-h-full">
+      <div className="remote-devices-content min-w-0 flex-1">
+        <header className="remote-page-header"><h1>我的设备</h1></header>
         {/* Toolbar */}
-        <div className="flex items-center gap-3 mb-5">
+        <div className="mb-5 flex flex-wrap items-center gap-3">
           {/* 搜索框 */}
-          <div className="relative flex-1 max-w-xs">
+          <div className="relative min-w-44 max-w-xs flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
             <input
+              type="search"
+              aria-label="搜索设备"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="搜索设备..."
-              className={`w-full pl-9 pr-3 py-1.5 rounded-lg border outline-none transition-all ${inputBg}`}
+              onChange={(e) => updateSearch(e.target.value)}
+              placeholder="搜索设备、设备码或 IP"
+              className={`w-full pl-9 pr-3 py-1.5 rounded-lg border outline-none transition-all focus-visible:ring-2 focus-visible:ring-blue-500 ${inputBg}`}
               style={{ fontSize: 13 }}
             />
           </div>
 
-          {/* 网络分组选择器 - 只有有分组时显示 */}
-          {groups.length > 0 && (
-            <NetworkGroupSelector
-              groups={groups}
-              selectedGroupId={selectedGroupId}
-              onSelectGroup={setSelectedGroupId}
-              onCreateGroup={handleOpenCreateModal}
-              isDark={isDark}
-            />
+          {accountGroups.length > 0 && (
+            <select
+              aria-label="按网络分组筛选"
+              value={activeGroupId ?? ""}
+              onChange={(event) => {
+                setSelectedGroupId(event.target.value || null);
+                setGroupMembership(null);
+              }}
+              className={`max-w-48 rounded-lg border px-3 py-1.5 text-[13px] focus-visible:ring-2 focus-visible:ring-blue-500 ${inputBg}`}
+            >
+              <option value="">全部设备</option>
+              {accountGroups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}
+            </select>
           )}
 
-          {/* 编辑按钮 - 只有选中分组时显示 */}
-          {selectedGroupId && (
+          {activeGroupId && (
             <button
-              onClick={() => handleOpenEditModal(selectedGroupId)}
+              onClick={() => setEditingGroupId(activeGroupId)}
               className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-colors ${
                 isDark
                   ? "bg-[#232323] border-gray-600 text-gray-300 hover:border-gray-500"
@@ -264,12 +307,11 @@ export function DevicesPage() {
               style={{ fontSize: 13 }}
             >
               <Edit2 className="w-3.5 h-3.5" />
-              编辑
+              编辑分组
             </button>
           )}
 
-          {/* 添加分组按钮 - 没有分组时显示 */}
-          {groups.length === 0 && (
+          {isLoggedIn && (
             <button
               onClick={handleOpenCreateModal}
               className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm`}
@@ -300,53 +342,72 @@ export function DevicesPage() {
           >
             <RefreshCw className="w-5 h-5" />
           </button>
-          <button
-            onClick={handleOpenLocalTestWindow}
-            disabled={launchingDeviceId === "__local_test__"}
-            className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg border transition-colors ${
-              isDark
-                ? "bg-[#232323] border-gray-600 text-gray-200 hover:border-gray-500"
-                : "bg-white border-gray-200 text-gray-700 hover:border-gray-300"
-            } disabled:cursor-not-allowed disabled:opacity-60`}
-            style={{ fontSize: 13 }}
-          >
-            <Monitor className="w-3.5 h-3.5" />
-            {launchingDeviceId === "__local_test__" ? "Opening..." : "测试窗口"}
-          </button>
-          <button
-            aria-expanded={lanPairingOpen}
-            onClick={() => setLanPairingOpen(open => !open)}
-            className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"
-            style={{ fontSize: 13 }}
-          >
-            <Wifi className="w-3.5 h-3.5" />
-            局域网配对
-          </button>
+          {native && <>
+            <button
+              onClick={() => void launchDisplay(null)}
+              disabled={launchingDeviceId !== null}
+              className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg border transition-colors ${
+                isDark
+                  ? "bg-[#232323] border-gray-600 text-gray-200 hover:border-gray-500"
+                  : "bg-white border-gray-200 text-gray-700 hover:border-gray-300"
+              } disabled:cursor-not-allowed disabled:opacity-60`}
+              style={{ fontSize: 13 }}
+            >
+              <Monitor className="w-3.5 h-3.5" />
+              {launchingDeviceId === "__local_test__" ? "正在打开…" : "测试窗口"}
+            </button>
+            <button
+              aria-expanded={lanPairingOpen}
+              onClick={() => setLanPairingOpen(open => !open)}
+              className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors shadow-sm"
+              style={{ fontSize: 13 }}
+            >
+              <Wifi className="w-3.5 h-3.5" />
+              局域网配对
+            </button>
+          </>}
         </div>
 
-        {lanPairingOpen ? <LanPairingPanel isDark={isDark} onPaired={refresh} /> : null}
+        {native && lanPairingOpen ? <LanPairingPanel isDark={isDark} onPaired={refresh} /> : null}
 
         {loading ? <p role="status" className={`mb-3 ${textPrimary}`}>加载设备中...</p> : null}
         {error ? <p role="alert" className="mb-3 text-red-500">设备加载失败: {error}</p> : null}
+        {isLoggedIn && groupListError ? <p role="alert" className="mb-3 text-red-500">{groupListError}</p> : null}
+        {activeGroupId && !activeMembership ? <p role="status" className={`mb-3 ${textPrimary}`}>正在读取分组设备…</p> : null}
+        {activeMembership?.error ? (
+          <div role="alert" className="mb-3 flex items-center gap-3 text-red-500">
+            <span>{activeMembership.error}</span>
+            <button type="button" className="underline" onClick={() => {
+              setGroupMembership(null);
+              setMembershipAttempt((attempt) => attempt + 1);
+            }}>重试</button>
+          </div>
+        ) : null}
+        {launchError ? <p role="alert" className={`mb-3 ${isDark ? "text-red-300" : "text-red-700"}`}>{launchError}</p> : null}
+        {!loading && !error && (!activeGroupId || (activeMembership && !activeMembership.error)) && filteredDevices.length === 0 ? (
+          <p role="status" className={`rounded-xl border p-6 text-sm ${card} ${textPrimary}`}>
+            {query ? "没有符合条件的设备" : activeGroupId ? "此分组暂无可显示的设备" : "暂无设备"}
+          </p>
+        ) : null}
 
         {/* 设备列表 */}
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
           {filteredDevices.map((device) => {
             const Icon = device.icon;
-            const isSelected = selectedDevice === device.id;
             const isCurrentDevice = device.deviceId === currentDeviceId;
-            return (
-              <div
-                key={device.id}
-                onContextMenu={(e) => handleContextMenu(e, device.id)}
-                onClick={() => navigate(`/devices/${device.id}`)}
-                className={`relative p-4 rounded-xl border cursor-pointer transition-all ${
-                  isSelected
-                    ? isDark
-                      ? "bg-blue-900/20 border-blue-700 shadow-sm"
-                      : "bg-blue-50/70 border-blue-300 shadow-sm"
-                    : `${card} ${cardHover}`
-                }`}
+            const localTest = device.isLocal || isCurrentDevice;
+            const connectionLabel = localTest ? "测试本机" : device.p2pAvailable ? "P2P 连接" : "远程连接";
+            const unavailable = connectionUnavailable(device);
+            const menu = {
+              connectionLabel: localTest ? "测试本机" : "远程桌面",
+              unavailable: unavailable ?? (launchingDeviceId !== null ? "连接处理中" : null),
+              detailPath: `/devices/${encodeURIComponent(device.id)}`,
+              onConnect: () => void launchDisplay(device),
+            };
+            const deviceCard = (
+              <article
+                aria-label={device.name}
+                className={`relative p-4 rounded-xl border transition-all ${card} ${cardHover}`}
               >
                 <div className="flex items-start justify-between mb-3">
                   <div className="flex items-center gap-3">
@@ -403,53 +464,24 @@ export function DevicesPage() {
                     </div>
                   </div>
 
-                  <div className="relative">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setMenuOpen(menuOpen === device.id ? null : device.id);
-                      }}
-                      className={`p-1 rounded-md ${
-                        isDark
-                          ? "text-gray-500 hover:text-gray-300 hover:bg-gray-700"
-                          : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
-                      }`}
-                    >
-                      <MoreVertical className="w-4 h-4" />
-                    </button>
-                    {menuOpen === device.id && (
-                      <div
-                        className={`absolute right-0 top-7 w-36 py-1 rounded-lg border shadow-lg z-10 ${
-                          isDark ? "bg-[#2a2a2a] border-gray-600" : "bg-white border-gray-200"
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label={`${device.name}的更多操作`}
+                        className={`relative z-10 p-1 rounded-md ${
+                          isDark
+                            ? "text-gray-400 hover:text-gray-200 hover:bg-gray-700"
+                            : "text-gray-600 hover:text-gray-800 hover:bg-gray-100"
                         }`}
                       >
-                        {[
-                          { icon: Edit2, label: "重命名" },
-                          { icon: Star, label: "收藏" },
-                          { icon: Trash2, label: "删除", danger: true },
-                        ].map(({ icon: I, label, danger }) => (
-                          <button
-                            key={label}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setMenuOpen(null);
-                            }}
-                            className={`flex items-center gap-2 w-full px-3 py-2 text-left transition-colors ${
-                              danger
-                                ? "text-red-500"
-                                : isDark
-                                  ? "text-gray-300 hover:bg-gray-700"
-                                  : "text-gray-600 hover:bg-gray-50"
-                            }`}
-                            style={{ fontSize: 13 }}
-                          >
-                            <I className="w-3.5 h-3.5" />
-                            {label}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                        <MoreVertical aria-hidden="true" className="w-4 h-4" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="min-w-56">
+                      <DeviceMenuItems Item={DropdownMenuItem} {...menu} />
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
 
                 <div className="flex items-center gap-3 mb-3">
@@ -511,204 +543,76 @@ export function DevicesPage() {
                   </div>
                 )}
 
-                {device.status === "online" ? (
-                  <>
+                <div className="space-y-2">
+                  {unavailable ? (
+                    <div className={`flex items-center justify-center gap-1.5 rounded-lg py-2 text-center text-[13px] ${
+                      isDark ? "bg-gray-800 text-gray-400" : "bg-gray-50 text-gray-600"
+                    }`}>
+                      <WifiOff aria-hidden="true" className="w-3.5 h-3.5" />
+                      {unavailable}
+                    </div>
+                  ) : (
                     <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void handleOpenRemoteWindow(device);
-                      }}
-                      disabled={launchingDeviceId === device.id}
-                      className={`w-full mb-2 py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 ${
+                      type="button"
+                      onClick={menu.onConnect}
+                      disabled={launchingDeviceId !== null}
+                      aria-label={`${connectionLabel} ${device.name}`}
+                      aria-busy={launchingDeviceId === device.id}
+                      className={`relative z-10 w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 ${
                         isDark
                           ? "bg-emerald-900/30 hover:bg-emerald-900/50 text-emerald-300"
                           : "bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
                       } disabled:cursor-not-allowed disabled:opacity-60`}
                       style={{ fontSize: 13 }}
                     >
-                      <Monitor className="w-3.5 h-3.5" />
-                      {launchingDeviceId === device.id ? "Opening..." : "P2P 连接"}
+                      <Monitor aria-hidden="true" className="w-3.5 h-3.5" />
+                      {launchingDeviceId === device.id ? "正在打开…" : connectionLabel}
                     </button>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      navigate(`/devices/${device.id}`);
-                    }}
-                    className={`w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 ${
+                  )}
+                  <Link
+                    to={menu.detailPath}
+                    aria-label={`查看详情 ${device.name}`}
+                    className={`w-full py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 after:absolute after:inset-0 after:rounded-xl focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-blue-500 ${
                       isDark
                         ? "bg-blue-900/30 hover:bg-blue-900/50 text-blue-400"
                         : "bg-blue-50 hover:bg-blue-100 text-blue-600"
                     }`}
                     style={{ fontSize: 13 }}
                   >
-                    <ExternalLink className="w-3.5 h-3.5" />
+                    <ExternalLink aria-hidden="true" className="w-3.5 h-3.5" />
                     查看详情
-                  </button>
-                  </>
-                ) : (
-                  <div
-                    className={`w-full py-2 rounded-lg text-center flex items-center justify-center gap-1.5 ${
-                      isDark ? "bg-gray-800 text-gray-500" : "bg-gray-50 text-gray-400"
-                    }`}
-                    style={{ fontSize: 13 }}
-                  >
-                    <WifiOff className="w-3.5 h-3.5" />
-                    设备离线
-                  </div>
-                )}
-              </div>
+                  </Link>
+                </div>
+              </article>
+            );
+            return (
+              <ContextMenu key={device.id}>
+                <ContextMenuTrigger asChild>{deviceCard}</ContextMenuTrigger>
+                <ContextMenuContent className="min-w-56">
+                  <DeviceMenuItems Item={ContextMenuItem} {...menu} />
+                </ContextMenuContent>
+              </ContextMenu>
             );
           })}
         </div>
       </div>
 
-      {/* 右键菜单 */}
-      {contextMenu && contextMenuDevice && (
-        <div
-          ref={contextMenuRef}
-          className={`fixed z-50 min-w-[160px] rounded-lg border py-1 shadow-xl ${
-            isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"
-          }`}
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onMouseLeave={() => setSubmenuOpen(null)}
-        >
-          {/* 在线设备特有菜单 */}
-          {isContextOnline && (
-            <>
-              <button
-                onClick={() => {
-                  void handleOpenRemoteWindow(contextMenuDevice);
-                }}
-                className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-                  isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-                }`}
-                style={{ fontSize: 12 }}
-              >
-                <ExternalLink className="w-4 h-4" />
-                <span>远程桌面</span>
-              </button>
-              <div className={`h-px my-1 mx-2 ${isDark ? "bg-gray-700" : "bg-gray-100"}`} />
-            </>
-          )}
-
-          {/* 通用菜单 */}
-          <button
-            onClick={() => {
-              // TODO: 实现重命名
-              setContextMenu(null);
-            }}
-            className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-              isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-            }`}
-            style={{ fontSize: 12 }}
-          >
-            <Edit2 className="w-4 h-4" />
-            <span>重命名</span>
-          </button>
-          <button
-            onClick={() => setContextMenu(null)}
-            className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-              isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-            }`}
-            style={{ fontSize: 12 }}
-          >
-            <Star className="w-4 h-4" />
-            <span>收藏设备</span>
-          </button>
-          <div className={`h-px my-1 mx-2 ${isDark ? "bg-gray-700" : "bg-gray-100"}`} />
-
-          {/* 启用/禁用 */}
-          <button
-            onClick={() => handleManagementAction("toggle_device")}
-            className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-              isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-            }`}
-            style={{ fontSize: 12 }}
-          >
-            <Power className="w-4 h-4" />
-            <span>禁用设备</span>
-          </button>
-
-          <div className={`h-px my-1 mx-2 ${isDark ? "bg-gray-700" : "bg-gray-100"}`} />
-
-          {/* 移除设备和管理子菜单 */}
-          <button
-            onClick={() => setContextMenu(null)}
-            className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-              isDark ? "text-red-400 hover:bg-red-900/30" : "text-red-500 hover:bg-red-50"
-            }`}
-            style={{ fontSize: 12 }}
-          >
-            <Trash2 className="w-4 h-4" />
-            <span>移除设备</span>
-          </button>
-
-          {/* 管理子菜单 */}
-          <div className="relative">
-            <button
-              onMouseEnter={() => setSubmenuOpen("management")}
-              className={`w-full flex items-center justify-between gap-2.5 px-3 py-1.5 text-left transition-colors ${
-                isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-              }`}
-              style={{ fontSize: 12 }}
-            >
-              <span className="flex items-center gap-2.5">
-                <Power className="w-4 h-4" />
-                <span>管理</span>
-              </span>
-              <span className="text-xs">›</span>
-            </button>
-
-            {submenuOpen === "management" && (
-              <div
-                className={`absolute left-full top-0 ml-1 min-w-[140px] rounded-lg border py-1 shadow-xl ${
-                  isDark ? "bg-[#2a2a2a] border-gray-700" : "bg-white border-gray-200"
-                }`}
-                onMouseEnter={() => setSubmenuOpen("management")}
-              >
-                {[
-                  { icon: RotateCw, label: "重启", action: "restart" },
-                  { icon: Power, label: "关机", action: "shutdown" },
-                  { icon: Zap, label: "Wake-on-LAN", action: "wol" },
-                  { icon: Info, label: "设备信息", action: "info" },
-                ].map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <button
-                      key={item.label}
-                      onClick={() => handleManagementAction(item.action)}
-                      className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left transition-colors ${
-                        isDark ? "text-gray-300 hover:bg-gray-700" : "text-gray-600 hover:bg-gray-50"
-                      }`}
-                      style={{ fontSize: 12 }}
-                    >
-                      <Icon className="w-4 h-4" />
-                      <span>{item.label}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* 编辑弹窗 */}
-      {editModalOpen && (
+      {editingGroupId && (
         <NetworkGroupEditModal
-          group={groups.find((g) => g.id === editingGroupId) || null}
-          allDevices={devices.map((d) => ({
+          group={accountGroups.find((g) => g.id === editingGroupId) ?? null}
+          allDevices={devices.filter((d) => d.serverAvailable).map((d) => ({
             id: d.id,
             name: d.name,
             device_id: d.deviceId,
             status: d.status,
             ip: d.ip,
           }))}
-          isOpen={editModalOpen}
-          onClose={() => setEditModalOpen(false)}
-          onSave={async () => {
-            await refreshGroups();
-            setEditModalOpen(false);
+          isOpen
+          onClose={closeGroupEditor}
+          onSave={() => {
+            closeGroupEditor();
+            void refreshGroups();
           }}
           isDark={isDark}
         />

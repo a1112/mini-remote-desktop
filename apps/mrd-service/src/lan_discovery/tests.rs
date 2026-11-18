@@ -22,6 +22,51 @@ async fn discovery_keeps_service_available_when_initial_probe_is_denied() {
     let snapshot = state.lan_discovery.snapshot().await;
     assert!(snapshot.running);
     assert!(snapshot.last_probe_ms.is_none());
+    assert_eq!(
+        snapshot.error_code,
+        Some(LanDiscoveryErrorCode::ProbeSendFailed)
+    );
+}
+
+#[tokio::test]
+async fn discovery_reports_a_bind_failure_separately_from_service_liveness() {
+    let occupied = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let config = LanDiscoveryConfig {
+        discovery_port: occupied.local_addr().unwrap().port(),
+        ..LanDiscoveryConfig::default()
+    };
+    let state = Arc::new(AppState::with_tray_and_lan_discovery_config(
+        crate::shell::default_tray(),
+        config,
+    ));
+    assert!(start_lan_discovery(state.clone()).await.is_err());
+    let snapshot = state.lan_discovery.snapshot().await;
+    assert!(snapshot.enabled);
+    assert!(!snapshot.running);
+    assert_eq!(
+        snapshot.error_code,
+        Some(LanDiscoveryErrorCode::SocketBindFailed)
+    );
+    assert!(matches!(
+        crate::handlers::telemetry::service_health(&state),
+        mrd_ipc::IpcResponse::ServiceHealth { status } if status.running && status.healthy
+    ));
+}
+
+#[tokio::test]
+async fn discovery_clears_probe_failure_after_a_successful_send() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let state = LanDiscoveryState::new(LanDiscoveryConfig {
+        broadcast_enabled: false,
+        probe_endpoints: vec![receiver.local_addr().unwrap()],
+        ..LanDiscoveryConfig::default()
+    });
+    state.set_error(Some(LanDiscoveryErrorCode::ProbeSendFailed));
+    send_probe(&socket, 0, &state).await.unwrap();
+    let snapshot = state.snapshot().await;
+    assert!(snapshot.last_probe_ms.is_some());
+    assert_eq!(snapshot.error_code, None);
 }
 
 async fn install_test_screen_view_grant(

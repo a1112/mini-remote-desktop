@@ -71,17 +71,34 @@ impl IpcServer {
                 _ => break,
             };
             first_frame = false;
-            if !management_request_is_allowed_for_connection(&request) {
-                let response = mrd_ipc::IpcResponse::Error {
-                    code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
-                    message: "management endpoint is read-only".to_owned(),
+            let response = if management_request_is_allowed_for_connection(&request) {
+                self.handle_request(request).await
+            } else if management_request_is_administrator_identity_change(&request) {
+                let is_administrator = match &stream {
+                    transport::IpcStream::Server(pipe) => {
+                        crate::agent_runtime::connected_pipe_caller_is_administrator(pipe)
+                            .unwrap_or(false)
+                    }
+                    _ => false,
                 };
-                if stream.send_response(&response).await.is_err() {
-                    break;
+                if is_administrator {
+                    let mut elevated = self.clone();
+                    elevated.management_only = false;
+                    elevated.handle_request(request).await
+                } else {
+                    mrd_ipc::IpcResponse::Error {
+                        code: "E_WINDOWS_ADMIN_REQUIRED".to_owned(),
+                        message:
+                            "An elevated Windows administrator must enroll or recover this device"
+                                .to_owned(),
+                    }
                 }
-                continue;
-            }
-            let response = self.handle_request(request).await;
+            } else {
+                mrd_ipc::IpcResponse::Error {
+                    code: "E_MANAGEMENT_COMMAND_DENIED".to_owned(),
+                    message: "Management endpoint does not accept this command".to_owned(),
+                }
+            };
             if stream.send_response(&response).await.is_err() {
                 break;
             }
@@ -145,6 +162,15 @@ fn management_request_is_allowed_for_connection(request: &mrd_ipc::IpcRequest) -
     )
 }
 
+#[cfg(windows)]
+fn management_request_is_administrator_identity_change(request: &mrd_ipc::IpcRequest) -> bool {
+    matches!(
+        request,
+        mrd_ipc::IpcRequest::EnrollPublicDevice { .. }
+            | mrd_ipc::IpcRequest::RecoverPublicDevice { .. }
+    )
+}
+
 pub(super) fn is_connection_closed_error(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<std::io::Error>() {
         Some(io_error) => matches!(
@@ -160,6 +186,72 @@ pub(super) fn is_connection_closed_error(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_management_pipe_reads_administrator_membership_from_the_kernel_caller() {
+        use crate::agent_runtime::{
+            connected_pipe_caller_is_administrator, current_process_is_administrator,
+        };
+        use mrd_ipc::{
+            transport::{IpcClient, IpcEndpoint, IpcServer, IpcStream},
+            IpcRequest,
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let endpoint = IpcEndpoint::named_pipe(format!(
+            r"\\.\pipe\mrd-management-admin-fixture-{}-{suffix}",
+            std::process::id()
+        ));
+        let listener = IpcServer::bind_management_with_endpoint(endpoint.clone())
+            .await
+            .unwrap();
+        let mut client = IpcClient::connect_management_with_endpoint(&endpoint)
+            .await
+            .unwrap();
+        let mut stream = listener.accept().await.unwrap();
+        client
+            .send_request(&IpcRequest::ServiceHealth)
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.recv_request().await.unwrap(),
+            IpcRequest::ServiceHealth
+        ));
+        let IpcStream::Server(pipe) = &stream else {
+            panic!("Expected the server end of the pipe");
+        };
+        assert_eq!(
+            connected_pipe_caller_is_administrator(pipe).unwrap(),
+            current_process_is_administrator().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_management_exception_only_covers_device_identity_recovery() {
+        use super::{
+            management_request_is_administrator_identity_change as admin,
+            management_request_is_allowed_for_connection as read,
+        };
+        use mrd_ipc::IpcRequest;
+        let enroll = IpcRequest::EnrollPublicDevice {
+            enrollment_token: "fixture".to_owned().into(),
+            device_name: "test".into(),
+        };
+        let recover = IpcRequest::RecoverPublicDevice {
+            device_token: "fixture".to_owned().into(),
+        };
+        assert!(admin(&enroll) && !read(&enroll));
+        assert!(admin(&recover) && !read(&recover));
+        assert!(read(&IpcRequest::ServiceHealth) && !admin(&IpcRequest::ServiceHealth));
+        assert!(!admin(&IpcRequest::SetAutostart { enabled: true }));
+        assert!(!admin(&IpcRequest::ShutdownService {
+            mode: mrd_ipc::ShutdownMode::Force
+        }));
+    }
+
     #[test]
     fn connection_module_classifies_expected_closed_stream_errors() {
         let error = anyhow::Error::new(std::io::Error::new(

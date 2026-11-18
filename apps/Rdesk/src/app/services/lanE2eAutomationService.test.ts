@@ -2605,6 +2605,7 @@ describe("runLanE2EAutomation", () => {
     expect(result.status).toBe("completed");
     expect(result.sampleFramesDecoded).toBe(6);
     expect(result.sampleRenderFramesPresented).toBe(6);
+    expect(result.firstPresentedFrameTimeMs).toBeGreaterThan(result.firstFrameTimeMs!);
     expect(result.sampleFpsElapsedMs).toBe(100);
     expect(result.sampleObservedFps).toBe(60);
     expect(result.sampleObservedRenderFps).toBe(60);

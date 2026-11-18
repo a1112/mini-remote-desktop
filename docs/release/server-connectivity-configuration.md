@@ -1,8 +1,17 @@
 # Authenticated server connectivity
 
-Device enrollment requires an administrator-issued one-use token. The desktop's local-device card opens the enrollment form; the token is sent in `X-Rdesk-Device-Enrollment` and is never persisted. Later refresh uses `X-Rdesk-Device-Authorization: Bearer <device JWT>`. A refresh failure preserves the assigned remote device ID and reports an error.
+Manual device enrollment requires an administrator-issued one-use token. On macOS and in the desktop's custom-server registration flow, the local-device card opens the enrollment form. The token is sent in `X-Rdesk-Device-Enrollment` and is never persisted. Later refresh uses `X-Rdesk-Device-Authorization: Bearer <device JWT>`. A refresh failure preserves the assigned remote device ID and reports an error.
 
-For an already-enrolled device with an expired/revoked credential, an administrator uses `POST /api/v1/devices/{id}/credentials/admin-rotate` to issue a replacement device JWT. Enter it in the modal's **更新设备凭据** mode. The desktop validates it with the authenticated serial-refresh endpoint and checks the returned device ID before saving; a new first-enrollment code cannot recover an existing serial.
+For an already-enrolled device with an expired/revoked credential, an administrator uses `POST /api/v1/devices/{id}/credentials/admin-rotate` to issue a replacement device JWT. Where the recovery form is available, select **更新设备凭据** and enter the credential. The authenticated serial-refresh endpoint verifies the returned device ID before saving. The Windows installed service uses the console flow below.
+
+The installed Windows resident tries automatic registration first. If an administrator must enroll or recover its public identity, run the corresponding command from an elevated PowerShell after starting the MiniRemoteDesktop service:
+
+```powershell
+& "$env:ProgramFiles\MiniRemoteDesktop\mrd-service.exe" --enroll-public-device
+& "$env:ProgramFiles\MiniRemoteDesktop\mrd-service.exe" --recover-public-device
+```
+
+Enter the issued enrollment code or recovery credential at the hidden prompt. The command authenticates the running SCM service, and the resident checks for an enabled local Administrator group on the pipe message. The credential stays with the service. Click **刷新登记状态** in Rdesk after the command succeeds.
 
 Set `VITE_RDESK_SERVER_URL` to the HTTPS API base ending in `/api/v1` (including any reverse-proxy prefix), or set native `RDESK_SERVER_URL` to override it. Plain HTTP is accepted only for loopback development.
 

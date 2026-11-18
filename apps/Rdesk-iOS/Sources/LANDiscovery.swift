@@ -2,10 +2,27 @@ import Foundation
 import Network
 import Darwin
 
-struct DiscoveredGateway: Identifiable {
+struct DiscoveredGateway: Identifiable, Sendable {
     let endpoint: GatewayEndpoint
     let name: String
+    let fingerprint: GatewayFingerprint
     var id: String { "\(endpoint.host):\(endpoint.port)" }
+
+    static func decode(_ data: Data, from host: String) -> DiscoveredGateway? {
+        struct Reply: Decodable {
+            let type: String
+            let port: UInt16
+            let name: String?
+            let tls_sha256: String
+        }
+        guard data.count <= 512,
+              let reply = try? JSONDecoder().decode(Reply.self, from: data),
+              reply.type == "rdesk_gateway",
+              let endpoint = try? GatewayEndpoint(host: host, port: String(reply.port)),
+              let fingerprint = try? GatewayFingerprint(reply.tls_sha256) else { return nil }
+        let name = String((reply.name ?? "Rdesk 电脑").prefix(48))
+        return DiscoveredGateway(endpoint: endpoint, name: name, fingerprint: fingerprint)
+    }
 }
 
 @MainActor
@@ -56,7 +73,7 @@ final class LANDiscovery: ObservableObject {
             self.scanning = false
             self.message = self.gateways.isEmpty
                 ? "未发现电脑。请允许局域网访问、检查网关与防火墙，然后重新搜索；也可以手动连接。"
-                : "发现 \(self.gateways.count) 台电脑，点击即可连接。"
+                : "发现 \(self.gateways.count) 台电脑，选择后核对证书指纹。"
         }
     }
 
@@ -105,16 +122,7 @@ private final class DiscoveryProbe: @unchecked Sendable {
                             connection.send(content: Data("MRD_DISCOVER_V1".utf8), completion: .contentProcessed { error in
                                 if error != nil { self.finish(nil); return }
                                 connection.receiveMessage { data, _, _, _ in
-                                    guard let data, data.count <= 512,
-                                          let reply = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                                          reply["type"] as? String == "rdesk_gateway",
-                                          let port = reply["port"] as? Int,
-                                          let endpoint = try? GatewayEndpoint(host: self.host, port: String(port)) else {
-                                        self.finish(nil)
-                                        return
-                                    }
-                                    let name = String((reply["name"] as? String ?? "Rdesk 电脑").prefix(48))
-                                    self.finish(DiscoveredGateway(endpoint: endpoint, name: name))
+                                    self.finish(data.flatMap { DiscoveredGateway.decode($0, from: self.host) })
                                 }
                             })
                         case .failed, .cancelled: self.finish(nil)

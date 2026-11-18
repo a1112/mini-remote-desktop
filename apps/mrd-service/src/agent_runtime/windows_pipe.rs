@@ -24,9 +24,10 @@ use windows::{
             CheckTokenMembership, CreateWellKnownSid, GetLengthSid, GetTokenInformation,
             IsValidSecurityDescriptor, IsValidSid, RevertToSelf, SecurityAnonymous,
             TokenImpersonationLevel, TokenLogonSid, TokenSessionId, TokenUser, WinAnonymousSid,
-            WinInteractiveSid, WinNetworkSid, WinRemoteLogonIdSid, ACL, DACL_SECURITY_INFORMATION,
-            PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
-            SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, WELL_KNOWN_SID_TYPE,
+            WinBuiltinAdministratorsSid, WinInteractiveSid, WinNetworkSid, WinRemoteLogonIdSid,
+            ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+            SECURITY_IMPERSONATION_LEVEL, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
+            TOKEN_USER, WELL_KNOWN_SID_TYPE,
         },
         System::{
             Pipes::{
@@ -342,6 +343,23 @@ pub fn verify_connected_windows_interactive_peer(
     inspect_connected_peer(server)
 }
 
+/// Check the effective token of the last pipe message, including UAC filtering.
+/// The server never performs the enrollment itself under the impersonated token.
+pub(crate) fn connected_pipe_caller_is_administrator(
+    server: &NamedPipeServer,
+) -> Result<bool, WindowsAgentPipeError> {
+    unsafe { ImpersonateNamedPipeClient(HANDLE(server.as_raw_handle()))? };
+    let impersonation = ImpersonationGuard::new();
+    let token = open_thread_token()?;
+    let allowed = token_has_well_known_sid(&token, WinBuiltinAdministratorsSid)?;
+    impersonation.revert();
+    Ok(allowed)
+}
+
+pub fn current_process_is_administrator() -> Result<bool, WindowsAgentPipeError> {
+    effective_token_has_well_known_sid(None, WinBuiltinAdministratorsSid)
+}
+
 fn inspect_connected_peer(
     server: &NamedPipeServer,
 ) -> Result<VerifiedWindowsAgentPeer, WindowsAgentPipeError> {
@@ -561,12 +579,19 @@ fn token_has_well_known_sid(
     token: &Owned<HANDLE>,
     kind: WELL_KNOWN_SID_TYPE,
 ) -> Result<bool, WindowsAgentPipeError> {
+    effective_token_has_well_known_sid(Some(**token), kind)
+}
+
+fn effective_token_has_well_known_sid(
+    token: Option<HANDLE>,
+    kind: WELL_KNOWN_SID_TYPE,
+) -> Result<bool, WindowsAgentPipeError> {
     let mut sid = [0_u8; SECURITY_MAX_SID_SIZE];
     let mut sid_len = sid.len() as u32;
     let sid_ptr = PSID(sid.as_mut_ptr().cast());
     unsafe { CreateWellKnownSid(kind, None, Some(sid_ptr), &mut sid_len)? };
     let mut member = BOOL::default();
-    unsafe { CheckTokenMembership(Some(**token), sid_ptr, &mut member)? };
+    unsafe { CheckTokenMembership(token, sid_ptr, &mut member)? };
     Ok(member.as_bool())
 }
 

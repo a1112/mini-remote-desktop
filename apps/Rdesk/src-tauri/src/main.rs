@@ -2294,6 +2294,9 @@ async fn shell_get_autostart_status() -> Result<AutostartStatus, String> {
 
 #[tauri::command]
 async fn shell_set_autostart(enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut client = mrd_ipc::client::IpcClient::new();
+    #[cfg(not(target_os = "macos"))]
     let mut client = mrd_ipc::client::IpcClient::management();
     match client
         .send_request(mrd_ipc::IpcRequest::SetAutostart { enabled })
@@ -2436,11 +2439,10 @@ async fn ipc_update_device_preference(
 async fn ipc_lan_discovery_snapshot() -> Result<mrd_ipc::LanDiscoverySnapshot, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let mut client = mrd_ipc::client::IpcClient::new();
-    let response = client
-        .send_request(IpcRequest::LanDiscoverySnapshot)
+    let response = mrd_ipc::client::IpcClient::new()
+        .send_request_with_timeout(IpcRequest::LanDiscoverySnapshot, SERVICE_STATUS_IPC_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(status_ipc_error)?;
 
     match response {
         IpcResponse::LanDiscoverySnapshot { snapshot } => Ok(snapshot),
@@ -3139,20 +3141,63 @@ async fn ipc_secure_remote(request: mrd_ipc::IpcRequest) -> Result<mrd_ipc::IpcR
         .map_err(|error| error.to_string())
 }
 
-/// Get runtime snapshot via IPC (migrated version)
+// Allow the default IPC connection backoff while bounding the whole status read.
+const SERVICE_STATUS_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const SERVICE_STATUS_TIMEOUT_ERROR: &str = "E_SERVICE_STATUS_TIMEOUT: 读取后台服务状态超时";
+
+fn status_ipc_error(error: anyhow::Error) -> String {
+    if error.is::<tokio::time::error::Elapsed>() {
+        SERVICE_STATUS_TIMEOUT_ERROR.to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
+/// Get public connectivity status via the trusted management endpoint.
 #[tauri::command]
 async fn ipc_public_server_status() -> Result<mrd_ipc::PublicServerStatus, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
-    let mut client = mrd_ipc::client::IpcClient::trusted_management();
-    match client
-        .send_request(IpcRequest::GetPublicServerStatus)
+    let response = mrd_ipc::client::IpcClient::trusted_management()
+        .send_request_with_timeout(
+            IpcRequest::GetPublicServerStatus,
+            SERVICE_STATUS_IPC_TIMEOUT,
+        )
         .await
-        .map_err(|_| "无法读取后台公网连接状态".to_owned())?
-    {
+        .map_err(|error| {
+            if error.is::<tokio::time::error::Elapsed>() {
+                SERVICE_STATUS_TIMEOUT_ERROR.to_owned()
+            } else {
+                "无法读取后台公网连接状态".to_owned()
+            }
+        })?;
+    match response {
         IpcResponse::PublicServerStatus { status } => Ok(status),
         IpcResponse::Error { code, message } => Err(format!("{code}: {message}")),
         _ => Err("后台返回的公网连接状态无效".into()),
     }
+}
+
+#[tauri::command]
+#[allow(deprecated)]
+fn open_r_auth_login(window: tauri::WebviewWindow, url: String) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    if window.label() != "main" || url.len() > 8192 {
+        return Err("R-AUTH 登录地址无效".into());
+    }
+    let url = reqwest::Url::parse(&url).map_err(|_| "R-AUTH 登录地址无效".to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("R-AUTH 登录地址无效".into());
+    }
+    window
+        .shell()
+        .open(url.to_string(), None)
+        .map_err(|_| "无法打开系统浏览器".to_owned())
 }
 
 /// This command reads a secret-free status over the protected local IPC channel.
@@ -3350,11 +3395,10 @@ async fn ipc_peer_capability_snapshot(
 async fn ipc_service_health() -> Result<mrd_ipc::ServiceStatus, String> {
     use mrd_ipc::{IpcRequest, IpcResponse};
 
-    let mut client = mrd_ipc::client::IpcClient::management();
-    let response = client
-        .send_request(IpcRequest::ServiceHealth)
+    let response = mrd_ipc::client::IpcClient::management()
+        .send_request_with_timeout(IpcRequest::ServiceHealth, SERVICE_STATUS_IPC_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(status_ipc_error)?;
 
     match response {
         IpcResponse::ServiceHealth { status } => Ok(status),
@@ -3455,6 +3499,9 @@ async fn register_device(
         .or(api_base)
         .unwrap_or_else(|| "https://175.178.16.90/rdesk/api/v1".to_owned());
     if api_base.trim_end_matches('/') == "https://175.178.16.90/rdesk/api/v1" {
+        if cfg!(windows) {
+            return Err("请在提升权限的 Windows 终端使用 mrd-service 的登记或恢复命令".into());
+        }
         use mrd_ipc::{IpcRequest, IpcResponse};
         let request = match (enrollment_token, device_token) {
             (Some(enrollment_token), None) => IpcRequest::EnrollPublicDevice {
@@ -4954,6 +5001,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
+            open_r_auth_login,
             // Hardware and decode policy (local-only)
             get_hardware_info,
             get_system_resource_snapshot,

@@ -541,6 +541,110 @@ impl ConsentAuthorityRegistry {
         }))
     }
 
+    // Only a command that passed the pinned issuer's signature check may
+    // reach this method. It cannot replace an existing or pending authority.
+    fn install_same_account(
+        &self,
+        authorized: &mrd_agent_ipc::AuthorizedCommand,
+        context: TrustedConsentContext,
+    ) -> Result<(), ConsentRegistryError> {
+        let claims = authorized.grant().claims();
+        if !matches!(authorized.command(), mrd_agent_ipc::AgentCommand::AuthorizeSameAccount { scopes, .. } if scopes == &claims.scopes)
+        {
+            return Err(ConsentRegistryError::InvalidRequest);
+        }
+        let request = ConsentRequest {
+            request_token: 1,
+            request_id: *authorized.command_id(),
+            session_id: claims.session_id.clone(),
+            peer: claims.peer.clone(),
+            requested_scopes: claims.scopes.clone(),
+            policy_revision: claims.policy_revision,
+            windows_session_id: claims.windows_session_id,
+            issued_at_ms: claims.issued_at_ms,
+            expires_at_ms: claims.expires_at_ms,
+            authorization_expires_at_ms: claims.expires_at_ms,
+        };
+        if !valid_request_shape(&request)
+            || !context.is_valid_for(&request)
+            || claims.registration_id != context.registration_id
+            || claims.registration_epoch != context.registration_epoch
+            || claims.desktop_epoch != context.desktop_epoch
+            || claims.desktop_kind != context.desktop_kind
+            || context.now_ms < claims.not_before_ms
+            || context.now_ms >= claims.expires_at_ms
+        {
+            return Err(ConsentRegistryError::InvalidLocalContext);
+        }
+        let deadline = checked_authority_deadline(
+            Instant::now(),
+            claims.expires_at_ms.saturating_sub(context.now_ms),
+        )?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ConsentRegistryError::Unavailable)?;
+        state.prune_for_capacity(context.now_ms);
+        if state.bindings.contains_key(&request.session_id)
+            || state
+                .pending
+                .values()
+                .any(|pending| pending.request.session_id == request.session_id)
+            || state.pending.contains_key(&request.request_id)
+            || state.tombstones.contains_key(&request.request_id)
+        {
+            return Err(ConsentRegistryError::ConsentReplayConflict);
+        }
+        if state.bindings.len() >= self.limits.active_bindings {
+            return Err(ConsentRegistryError::PendingCapacityExceeded);
+        }
+        if state.tombstones.len().saturating_add(state.pending.len())
+            >= self.limits.consent_tombstones
+        {
+            return Err(ConsentRegistryError::TombstoneCapacityExceeded);
+        }
+        let attempt_id = state.allocate_attempt_id()?;
+        let result = ConsentResult {
+            request_token: 1,
+            request_id: request.request_id,
+            session_id: request.session_id.clone(),
+            peer: request.peer.clone(),
+            policy_revision: request.policy_revision,
+            windows_session_id: request.windows_session_id,
+            decision: ConsentDecision::Approved,
+            approved_scopes: request.requested_scopes.clone(),
+            decided_at_ms: context.now_ms,
+        };
+        state.bindings.insert(
+            request.session_id.clone(),
+            TrustedSessionBinding {
+                authority_generation: attempt_id,
+                consent_request_id: request.request_id,
+                registration_id: context.registration_id,
+                registration_epoch: context.registration_epoch,
+                session_id: request.session_id.clone(),
+                peer: request.peer.clone(),
+                approved_scopes: request.requested_scopes.clone(),
+                policy_revision: request.policy_revision,
+                windows_session_id: context.windows_session_id,
+                desktop_epoch: context.desktop_epoch,
+                desktop_kind: context.desktop_kind,
+                authorization_expires_at_ms: claims.expires_at_ms,
+                authorization_deadline: deadline,
+                expected_issuer_key_id: context.expected_issuer_key_id,
+            },
+        );
+        state.tombstones.insert(
+            request.request_id,
+            ConsentTombstone {
+                fingerprint: ConsentFingerprint::from(&request),
+                result,
+                retain_until_ms: claims.expires_at_ms,
+            },
+        );
+        Ok(())
+    }
+
     pub(crate) fn take_due(
         &self,
         now: Instant,
@@ -838,6 +942,17 @@ impl ConsentManager {
         now_ms: u64,
     ) -> Result<Option<TrustedSessionBinding>, ConsentRegistryError> {
         self.registry.resolve(session_id, now_ms)
+    }
+
+    pub(crate) fn install_same_account(
+        &self,
+        authorized: &mrd_agent_ipc::AuthorizedCommand,
+        context: TrustedConsentContext,
+    ) -> Result<(), ConsentRegistryError> {
+        if self.has_active_prompt() {
+            return Err(ConsentRegistryError::ConsentAlreadyPending);
+        }
+        self.registry.install_same_account(authorized, context)
     }
 
     pub(crate) fn admit(

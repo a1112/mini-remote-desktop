@@ -181,6 +181,7 @@ export interface LanE2EAutomationReport {
   sampleObservedFpsAtTargetDuration?: number;
   firstFrameAt?: number;
   firstFrameTimeMs?: number;
+  firstPresentedFrameTimeMs?: number;
   maxZeroFrameWindowAfterFirstFrameMs?: number;
   sampleRenderFramesPresented: number;
   sampleObservedRenderFps?: number;
@@ -517,6 +518,7 @@ export async function runLanE2EAutomation(
   let sampleObservedFpsAtTargetDuration: number | undefined;
   let firstFrameAt: number | undefined;
   let firstFrameTimeMs: number | undefined;
+  let firstPresentedFrameTimeMs: number | undefined;
   let maxZeroFrameWindowAfterFirstFrameMs: number | undefined;
   let lastFrameProgressAt: number | undefined;
   let lastFrameProgressDecodedCount = 0;
@@ -610,6 +612,7 @@ export async function runLanE2EAutomation(
       sampleObservedFpsAtTargetDuration,
       firstFrameAt,
       firstFrameTimeMs,
+      firstPresentedFrameTimeMs,
       maxZeroFrameWindowAfterFirstFrameMs,
       sampleRenderFramesPresented,
       sampleObservedRenderFps,
@@ -1027,6 +1030,7 @@ export async function runLanE2EAutomation(
         sampleObservedFpsAtTargetDuration = undefined;
         firstFrameAt = undefined;
         firstFrameTimeMs = undefined;
+        firstPresentedFrameTimeMs = undefined;
         maxZeroFrameWindowAfterFirstFrameMs = undefined;
         lastFrameProgressAt = undefined;
         lastFrameProgressDecodedCount = 0;
@@ -1078,6 +1082,9 @@ export async function runLanE2EAutomation(
           mediaPipelineSnapshot.sender_transport?.repeated_latest_frames ?? 0,
         reliableHolRecoveries: mediaPipelineSnapshot.reliable_hol_recoveries ?? 0,
       };
+      if (displayWindow && currentMetricCounters.renderPresentedFrames > 0) {
+        firstPresentedFrameTimeMs ??= Math.max(0, sampleObservedAt - startedAt);
+      }
       if (lastMetricCounters) {
         const intervalMs = Math.max(1, sampleObservedAt - lastMetricCounters.timestamp);
         const framesDecoded = counterDelta(

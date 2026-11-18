@@ -28,6 +28,20 @@ describe("DeviceRegisterModal enrollment", () => {
   });
   afterEach(cleanup);
 
+  it("directs installed Windows registration to the elevated administrator console", () => {
+    const platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+    try {
+      render(<DeviceRegisterModal isOpen serviceManaged onClose={vi.fn()} />);
+      expect(screen.getByRole("dialog", { name: "Windows 设备登记与恢复" })).toBeInTheDocument();
+      expect(screen.getByText(/--enroll-public-device/)).toBeInTheDocument();
+      expect(screen.getByText(/--recover-public-device/)).toBeInTheDocument();
+      expect(window.__TAURI__?.invoke).not.toHaveBeenCalled();
+      expect(screen.queryByLabelText("设备登记码")).not.toBeInTheDocument();
+    } finally {
+      platform.mockRestore();
+    }
+  });
+
   it("requires a one-time enrollment code before submitting registration", async () => {
     render(<DeviceRegisterModal isOpen onClose={vi.fn()} />);
     const register = await screen.findByRole("button", { name: "注册设备" });

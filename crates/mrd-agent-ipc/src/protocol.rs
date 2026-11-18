@@ -799,6 +799,14 @@ impl AgentCaptureProfile {
     deny_unknown_fields
 )]
 pub enum AgentCommand {
+    /// Install a bounded same-account session authority signed by the pinned
+    /// machine service, without displaying an attended-consent prompt.
+    AuthorizeSameAccount {
+        /// Unique authorization identity for replay protection.
+        resource_id: [u8; 16],
+        /// Exact effective scopes approved by the machine service.
+        scopes: PermissionScopes,
+    },
     /// Start screen capture for one display.
     StartCapture {
         /// Resource identity used for idempotency and cleanup.
@@ -883,6 +891,12 @@ impl AgentCommand {
         context.update(b"mrd-agent-command-v1\0");
 
         let (kind, resource_id, display_id, direction) = match self {
+            Self::AuthorizeSameAccount { resource_id, .. } => (
+                b"authorize_same_account".as_slice(),
+                resource_id,
+                None,
+                None,
+            ),
             Self::StartCapture {
                 resource_id,
                 display_id,
@@ -980,6 +994,12 @@ impl AgentCommand {
             context.update(&(encoded_scopes.len() as u64).to_le_bytes());
             context.update(&encoded_scopes);
         }
+        if let Self::AuthorizeSameAccount { scopes, .. } = self {
+            let encoded_scopes =
+                serde_json::to_vec(scopes).expect("permission scopes are serializable");
+            context.update(&(encoded_scopes.len() as u64).to_le_bytes());
+            context.update(&encoded_scopes);
+        }
 
         let digest = context.finish();
         let mut output = [0_u8; 32];
@@ -995,6 +1015,7 @@ impl AgentCommand {
     /// Desktop capability required to execute this command family.
     pub fn required_capability(&self) -> AgentCapability {
         match self {
+            Self::AuthorizeSameAccount { .. } => AgentCapability::Consent,
             Self::StartCapture { .. } | Self::StopCapture { .. } => AgentCapability::Capture,
             Self::StartInput { .. } | Self::StopInput { .. } => AgentCapability::Input,
             Self::StartAudio { .. } | Self::StopAudio { .. } => AgentCapability::Audio,
@@ -1008,6 +1029,9 @@ impl AgentCommand {
     pub fn required_scopes(&self) -> PermissionScopes {
         let mut scopes = PermissionScopes::new();
         match self {
+            Self::AuthorizeSameAccount {
+                scopes: authorized, ..
+            } => scopes.extend(authorized.iter().copied()),
             Self::StartCapture { .. } | Self::StartRender { .. } => {
                 scopes.insert(PermissionScope::ScreenView);
             }
@@ -1066,7 +1090,8 @@ impl AgentCommand {
     /// Resource identity bound by the command digest.
     pub fn resource_id(&self) -> &[u8; 16] {
         match self {
-            Self::StartCapture { resource_id, .. }
+            Self::AuthorizeSameAccount { resource_id, .. }
+            | Self::StartCapture { resource_id, .. }
             | Self::StopCapture { resource_id }
             | Self::StartInput { resource_id, .. }
             | Self::StopInput { resource_id }

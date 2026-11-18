@@ -27,12 +27,16 @@ const tabs = [
 ];
 
 function MobileHomePage() {
+  const native = isTauriRuntime();
   const navigate = useNavigate();
+  const { isLoggedIn } = useAuth();
   const { devices } = useDevices();
   const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const history = useConnectionHistory();
   const [targetId, setTargetId] = useState("");
   const [busy, setBusy] = useState(false);
+  const [guestTarget, setGuestTarget] = useState<{ deviceId: string } | null>(null);
+  const [guestBusy, setGuestBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const recent = history.filter((entry, index, entries) =>
@@ -40,7 +44,7 @@ function MobileHomePage() {
   ).slice(0, 3);
 
   const connect = async (rawId: string) => {
-    if (!rawId.trim() || busy) return;
+    if (!rawId.trim() || busy || guestBusy) return;
     const parsed = parseRemoteDeviceInput(rawId);
     if (!parsed) { setError(DEVICE_CODE_INPUT_ERROR); return; }
     const deviceId = parsed.deviceId;
@@ -62,6 +66,15 @@ function MobileHomePage() {
     }
   };
 
+  const reconnect = (deviceId: string) => {
+    if (native || isLoggedIn) {
+      void connect(deviceId);
+      return;
+    }
+    setError(null);
+    setGuestTarget({ deviceId });
+  };
+
   const copyMyId = async () => {
     if (!myDeviceId) return;
     try {
@@ -77,11 +90,11 @@ function MobileHomePage() {
     <div className="mobile-intro">
       <p className="mobile-eyebrow">安全远程访问</p>
       <h1>连接远程设备</h1>
-      <p>{isTauriRuntime() ? '输入远程设备码，发起连接请求' : '设备码与临时密码连接，无需登录'}</p>
+      <p>{native ? '输入远程设备码，发起连接请求' : '设备码与临时密码连接，无需登录'}</p>
     </div>
 
     <section className="mobile-card mobile-connect-card" aria-label="连接远程设备">
-      {isTauriRuntime() ? <><label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
+      {native ? <><label htmlFor="mobile-target-id" className="mobile-field-label">远程设备码</label>
       <div className="mobile-input-wrap">
         <Monitor size={20} aria-hidden="true" />
         <input id="mobile-target-id" inputMode="text" autoComplete="off" placeholder="输入 10 位设备码"
@@ -94,7 +107,11 @@ function MobileHomePage() {
         {busy ? "连接中…" : "发起连接"}
         {!busy ? <ArrowRight size={20} aria-hidden="true" /> : null}
       </button>
-      {error ? <p className="mobile-error" role="alert">{error}</p> : null}</> : <GuestRemoteConnectForm />}
+      {error ? <p className="mobile-error" role="alert">{error}</p> : null}</> : (
+        <fieldset className="min-w-0" disabled={busy}>
+          <GuestRemoteConnectForm target={guestTarget} onBusyChange={setGuestBusy} />
+        </fieldset>
+      )}
     </section>
 
     <section className="mobile-card mobile-recent-card" aria-labelledby="mobile-recent-heading">
@@ -102,13 +119,15 @@ function MobileHomePage() {
         <h2 id="mobile-recent-heading"><Clock3 size={20} />最近连接</h2>
         <Link to="/connections">查看更多 <ChevronRight size={15} /></Link>
       </div>
+      {!native && busy ? <p className="mobile-state-text" role="status">正在发起连接…</p> : null}
+      {!native && error ? <p className="mobile-error" role="alert">{error}</p> : null}
       {recent.length === 0 ? <div className="mobile-empty mobile-recent-empty">
         <FileClock size={46} strokeWidth={1.35} aria-hidden="true" />
         <strong>暂无连接记录</strong>
         <span>连接过的设备将显示在这里</span>
       </div> : <div className="mobile-recent-list">{recent.map((entry) => {
         const device = devices.find((item) => item.deviceId === entry.peerDeviceId);
-        return <button key={entry.sessionId} className="mobile-recent-item" onClick={() => void connect(entry.peerDeviceId)} disabled={busy}>
+        return <button key={entry.sessionId} className="mobile-recent-item" onClick={() => reconnect(entry.peerDeviceId)} disabled={busy || guestBusy}>
           <span className="mobile-device-icon"><Monitor size={20} /></span>
           <span className="mobile-recent-copy"><strong>{device?.name ?? entry.peerDeviceId}</strong><small>{new Date(entry.startedAt).toLocaleString("zh-CN")}</small></span>
           <ChevronRight size={18} aria-hidden="true" />
@@ -116,7 +135,7 @@ function MobileHomePage() {
       })}</div>}
     </section>
 
-    {isTauriRuntime() ? <><section className="mobile-local-device" aria-label="本机设备">
+    {native ? <><section className="mobile-local-device" aria-label="本机设备">
       <span><small>{/^\d{10}$/.test(myDeviceId ?? "") ? "本机 10 位设备码" : "本机设备"}</small><strong>{myDeviceName || "设备码未就绪"}</strong><code>{myDeviceId ? formatDeviceCode(myDeviceId) : "等待设备登记"}</code></span>
       <button onClick={() => void copyMyId()} disabled={!myDeviceId} aria-label={copied ? "已复制设备 ID" : "复制本机设备 ID"}>
         {copied ? <Check size={19} /> : <Copy size={19} />}

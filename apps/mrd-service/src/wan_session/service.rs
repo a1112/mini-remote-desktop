@@ -15,7 +15,9 @@ use super::{
         WanMediaActivationPort, WanMediaActivationReceipt, WanMediaAuthority,
     },
     media_runtime::{start_controller_runtime, start_target_runtime},
-    model::{WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState},
+    model::{
+        TransitionResult, WanSessionFailure, WanSessionPhase, WanSessionRole, WanSessionState,
+    },
     signaling::ServiceWanSessionWorkflowSignaling,
     webrtc::{
         GenerationZeroNegotiationContext, GenerationZeroNegotiationError, GenerationZeroNegotiator,
@@ -29,7 +31,8 @@ use mrd_application::{
     AuthenticatedSessionSignal, VerifiedSignalingEvent,
 };
 use mrd_ipc::{
-    RemoteAuthorizationState, RemoteFailure, RemotePermissionScope, RemoteReasonCode, SessionInfo,
+    RemoteAuthorizationState, RemoteFailure,
+    RemotePermissionScope, RemoteReasonCode, SessionInfo,
 };
 use mrd_proto::{DeviceId, SessionId};
 use mrd_signal_proto::{WanMediaProfileV3, WanPermissionScopeV3, WanSessionRequestV3};
@@ -705,6 +708,7 @@ impl super::coordinator::WanSessionCleanup for ServiceWanSessionCleanup {
 /// the matching local decision is consumed.
 pub struct ServiceWanSessionConsentPublisher {
     authorizations: Arc<crate::session_authorization::SessionAuthorizationRegistry>,
+    app_state: Option<Weak<crate::AppState>>,
     requested_profiles: Mutex<HashMap<SessionId, Option<WanMediaProfileV3>>>,
 }
 
@@ -722,22 +726,27 @@ impl ServiceWanSessionConsentPublisher {
     ) -> Self {
         Self {
             authorizations,
+            app_state: None,
             requested_profiles: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn with_app_state(mut self, app_state: &Arc<crate::AppState>) -> Self {
+        self.app_state = Some(Arc::downgrade(app_state));
+        self
     }
 
     async fn discard(&self, session_id: &SessionId) {
         self.requested_profiles.lock().await.remove(session_id);
     }
-}
 
-#[async_trait]
-impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
-    async fn publish_attended_request(
+    async fn publish_request(
         &self,
         identity: &super::model::WanSessionIdentity,
         request: &WanSessionRequestV3,
         absolute_deadline_unix_ms: u64,
+        same_account: bool,
+        controller_public_key: Option<&[u8; 32]>,
     ) -> Result<(), WanSessionPortError> {
         let now = now_unix_ms();
         if now >= absolute_deadline_unix_ms
@@ -753,30 +762,146 @@ impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
             .copied()
             .map(ipc_scope)
             .collect::<Vec<_>>();
-        let authorization = crate::session_authorization::VerifiedIncomingAuthorizationRequest {
-            session_id: request.session_id.clone(),
-            peer_device_id: request.controller_device_id.clone(),
-            peer_key_id: identity.controller_key_fingerprint().to_owned(),
-            peer_key_epoch: 1,
-            access_mode: mrd_ipc::RemoteAccessMode::Attended,
-            requested_scopes: scopes.clone(),
-            peer_permission_ceiling: scopes.clone(),
-            machine_permission_ceiling: scopes.clone(),
-            runtime_capabilities: scopes,
-            transport_kind: "webrtc_relay".to_owned(),
-            request_nonce: request.idempotency_key,
-            created_at_ms: now,
-            expires_at_ms: absolute_deadline_unix_ms,
-        };
-        self.authorizations
-            .begin_verified_incoming(authorization)
-            .await
-            .map_err(|_| WanSessionPortError::Rejected)?;
+        let mut authorization =
+            crate::session_authorization::VerifiedIncomingAuthorizationRequest {
+                session_id: request.session_id.clone(),
+                peer_device_id: request.controller_device_id.clone(),
+                peer_key_id: identity.controller_key_fingerprint().to_owned(),
+                peer_key_epoch: 1,
+                access_mode: mrd_ipc::RemoteAccessMode::Attended,
+                requested_scopes: scopes.clone(),
+                peer_permission_ceiling: scopes.clone(),
+                machine_permission_ceiling: scopes.clone(),
+                runtime_capabilities: scopes,
+                transport_kind: "webrtc_relay".to_owned(),
+                request_nonce: request.idempotency_key,
+                created_at_ms: now,
+                expires_at_ms: absolute_deadline_unix_ms,
+            };
+        if same_account {
+            let owner = self
+                .app_state
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .ok_or(WanSessionPortError::Unavailable)?;
+            if !owner.security_is_healthy() {
+                return Err(WanSessionPortError::Unavailable);
+            }
+            let _authorization_guard = owner.authorization_security_gate.lock().await;
+            let public_key = controller_public_key.ok_or(WanSessionPortError::Rejected)?;
+            let trust = owner
+                .device_identities
+                .authenticated_peer_trust_current_key(
+                    identity.controller_key_fingerprint(),
+                    public_key,
+                )
+                .map_err(|_| {
+                    owner.mark_security_unhealthy();
+                    WanSessionPortError::Unavailable
+                })?;
+            authorization.peer_permission_ceiling = match trust {
+                crate::app_state::AuthenticatedPeerTrust::Untrusted => {
+                    authorization.requested_scopes.clone()
+                }
+                crate::app_state::AuthenticatedPeerTrust::Trusted => owner
+                    .device_identities
+                    .permission_ceiling(identity.controller_key_fingerprint())
+                    .map_err(|_| {
+                        owner.mark_security_unhealthy();
+                        WanSessionPortError::Unavailable
+                    })?,
+                _ => return Err(WanSessionPortError::Rejected),
+            };
+            let control_input = owner.control_input();
+            let input_available = control_input.lock().await.is_available();
+            #[cfg(windows)]
+            let input_available = if owner.console_capture.is_enabled() {
+                crate::console_capture::active_console()
+                    .ok()
+                    .is_some_and(|active| {
+                        owner
+                            .agent_registry
+                            .bind_active_session(active, mrd_agent_ipc::AgentCapability::Input, now)
+                            .is_ok()
+                    })
+            } else {
+                input_available
+            };
+            let mut capabilities = vec![RemotePermissionScope::ScreenView];
+            if input_available {
+                capabilities.extend([
+                    RemotePermissionScope::InputPointer,
+                    RemotePermissionScope::InputKeyboard,
+                ]);
+            }
+            authorization.machine_permission_ceiling = capabilities.clone();
+            authorization.runtime_capabilities = capabilities;
+            self.authorizations
+                .begin_same_account_incoming_with_audit(authorization, |snapshot| {
+                    let recorded = owner
+                        .audit_log
+                        .record(
+                            "session.same_account_authorization",
+                            "attempted",
+                            Some(snapshot.session_id.clone()),
+                            None,
+                            Some(snapshot.peer_device_id.clone()),
+                            Some("webrtc_relay".to_owned()),
+                            None,
+                            vec![(
+                                "approved_scope_count".to_owned(),
+                                snapshot.granted_scopes.len().to_string(),
+                            )],
+                        )
+                        .is_ok();
+                    if !recorded {
+                        owner.mark_security_unhealthy();
+                    }
+                    recorded
+                })
+                .await
+                .map_err(|_| WanSessionPortError::Rejected)?;
+        } else {
+            self.authorizations
+                .begin_verified_incoming(authorization)
+                .await
+                .map_err(|_| WanSessionPortError::Rejected)?;
+        }
         self.requested_profiles.lock().await.insert(
             request.session_id.clone(),
             request.requested_profile.clone(),
         );
         Ok(())
+    }
+}
+
+#[async_trait]
+impl WanSessionConsentPublisher for ServiceWanSessionConsentPublisher {
+    async fn publish_attended_request(
+        &self,
+        identity: &super::model::WanSessionIdentity,
+        request: &WanSessionRequestV3,
+        absolute_deadline_unix_ms: u64,
+    ) -> Result<(), WanSessionPortError> {
+        self.publish_request(identity, request, absolute_deadline_unix_ms, false, None)
+            .await
+    }
+
+    async fn publish_same_account_request(
+        &self,
+        identity: &super::model::WanSessionIdentity,
+        request: &WanSessionRequestV3,
+        controller_public_key: &[u8; 32],
+        absolute_deadline_unix_ms: u64,
+    ) -> Result<(), WanSessionPortError> {
+        self.publish_request(
+            identity,
+            request,
+            absolute_deadline_unix_ms,
+            true,
+            Some(controller_public_key),
+        )
+        .await
     }
 
     async fn load_attended_approval(
@@ -1075,9 +1200,10 @@ pub async fn bind_and_spawn_wan_session_service(
     let signaling = Arc::new(ServiceWanSessionWorkflowSignaling::new(Arc::clone(
         &app_state.relay_signaling,
     )));
-    let consent = Arc::new(ServiceWanSessionConsentPublisher::new(Arc::clone(
-        &app_state.session_authorizations,
-    )));
+    let consent = Arc::new(
+        ServiceWanSessionConsentPublisher::new(Arc::clone(&app_state.session_authorizations))
+            .with_app_state(&app_state),
+    );
     let cleanup = Arc::new(ServiceWanSessionCleanup::new(
         &app_state,
         Arc::clone(&workflow_backend),
@@ -1250,10 +1376,11 @@ async fn handle_target_intent(
     )
     .map_err(|_| ())?;
     let session_id = verified.identity().session_id().clone();
-    coordinator
+    let acceptance = coordinator
         .accept_verified_target_intent(verified.clone())
         .await
         .map_err(|_| ())?;
+    let state_after_accept = coordinator.snapshot(&session_id).await.map_err(|_| ())?;
     // Capture the local consent policy before any backend approval/signaling
     // awaits. The server policy revision is independently versioned.
     let approval = async {
@@ -1269,14 +1396,41 @@ async fn handle_target_intent(
             return Err(());
         }
         let local_policy_revision = local.policy_revision.get();
-        coordinator
-            .approve_target(&session_id)
-            .await
-            .map_err(|_| ())?;
+        // The coordinator deliberately accepts a retransmitted intent as a
+        // duplicate. Once that session has progressed beyond consent, the
+        // authorization registry is already Authorizing/Granted and a second
+        // consent response would be rejected; treating that rejection as a
+        // policy failure would tear down an otherwise healthy session.
+        let duplicate_has_existing_authority = acceptance == TransitionResult::Duplicate
+            && matches!(
+                state_after_accept.phase(),
+                WanSessionPhase::AccessBound
+                    | WanSessionPhase::Negotiating
+                    | WanSessionPhase::RelayVerified
+                    | WanSessionPhase::Streaming
+            );
+        if !duplicate_has_existing_authority {
+            coordinator
+                .approve_target(&session_id)
+                .await
+                .map_err(|_| ())?;
+        }
         let state = coordinator.snapshot(&session_id).await.map_err(|_| ())?;
         install_target_authorization(app_state, &state, &verified, local_policy_revision)
             .await
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        #[cfg(windows)]
+        if coordinator.is_same_account_target(&session_id).await
+            && app_state.console_capture.is_enabled()
+        {
+            let _guard = app_state.authorization_security_gate.lock().await;
+            app_state
+                .console_capture
+                .bind_verified_same_account_target(app_state, &session_id)
+                .await
+                .map_err(|_| ())?;
+        }
+        Ok(())
     }
     .await;
     if approval.is_err() {
@@ -1338,8 +1492,6 @@ async fn install_target_authorization(
         || decode_sha256(commitment).is_none()
         || now >= grant.grant_expires_at_ms()
         || now >= grant.policy_expires_at_ms()
-        || grant.grant_expires_at_ms() > identity.deadline_unix_ms()
-        || grant.policy_expires_at_ms() > identity.deadline_unix_ms()
     {
         return Err(controller_grant_mismatch());
     }
@@ -1350,6 +1502,22 @@ async fn install_target_authorization(
         .map(ipc_scope)
         .collect::<Vec<_>>();
     scopes.sort_unstable();
+    if trust == crate::app_state::AuthenticatedPeerTrust::Trusted {
+        if let Some(coordinator) = app_state.wan_session_coordinator() {
+            if coordinator
+                .is_same_account_target(identity.session_id())
+                .await
+            {
+                let ceiling = app_state
+                    .device_identities
+                    .permission_ceiling(identity.controller_key_fingerprint())
+                    .map_err(|_| controller_grant_trust_invalid())?;
+                if scopes.iter().any(|scope| !ceiling.contains(scope)) {
+                    return Err(controller_grant_trust_invalid());
+                }
+            }
+        }
+    }
     let existing = app_state
         .session_authorizations
         .snapshot_at(identity.session_id(), now)
@@ -1509,8 +1677,6 @@ async fn install_controller_authorization(
             || identity.target_device_id() != verified.target_device_id()
             || identity.target_key_fingerprint() != Some(verified.target_key_fingerprint())
             || grant.grant_commitment() != Some(verified.grant_commitment())
-            || grant.policy_expires_at_ms() > verified.expires_at_ms()
-            || verified.expires_at_ms() > identity.deadline_unix_ms()
         {
             return Err(controller_grant_mismatch());
         }
@@ -1697,7 +1863,8 @@ async fn spawn_generation_zero(
         WAN_NEGOTIATION_TIMEOUT,
     )
     .map_err(|_| ())?;
-    if super::browser_authority::requires_browser_authority_watch(&state) {
+    let same_account_target = coordinator.is_same_account_target(session_id).await;
+    if super::browser_authority::requires_browser_authority_watch(&state) || same_account_target {
         let watch_app = Arc::clone(&app_state);
         let watch_session = session_id.clone();
         let watch_backend = Arc::clone(&backend);
@@ -1708,6 +1875,7 @@ async fn spawn_generation_zero(
                 if let Some(failure) = super::browser_authority::monitor_browser_authority(
                     watch_backend.as_ref(),
                     &state,
+                    same_account_target,
                     owned_cancellation.clone(),
                     Duration::from_secs(2),
                     Duration::from_secs(2),

@@ -5,9 +5,6 @@ import {
   Square,
   X,
   Search,
-  Bell,
-  Signal,
-  Lock,
   History,
   Settings,
   PanelLeftClose,
@@ -17,18 +14,7 @@ import {
   ArrowLeft,
   Monitor,
   Smartphone,
-  Pause,
-  CheckCircle2,
-  ArrowUpFromLine,
-  ArrowDownToLine,
-  ShieldAlert,
   Wifi,
-  WifiOff,
-  FolderCheck,
-  Download,
-  AlertTriangle,
-  Info,
-  UserPlus,
   Check,
   User,
   LogOut,
@@ -43,21 +29,24 @@ import { withTauriWindow } from "../utils/tauriWindow";
 import { useAuth } from './AuthContext';
 import { useFileTransfers, transferName, formatTransferBytes, transferStatusLabel } from "../services/fileTransferListService";
 import { PermissionStatus } from "./PermissionStatus";
+import { isTauriRuntime } from "../utils/runtime";
 
 interface TitleBarProps {
   onOpenConnections?: () => void;
   onOpenSettings?: () => void;
   onOpenTransfers?: () => void;
   onOpenAuth?: () => void;
+  onSearchDevices?: (query: string) => void;
   collapsed?: boolean;
   onToggleSidebar?: () => void;
 }
 
-export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, onOpenAuth, collapsed, onToggleSidebar }: TitleBarProps) {
+export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, onOpenAuth, onSearchDevices, collapsed, onToggleSidebar }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
-  const [searchFocused, setSearchFocused] = useState(false);
+  const native = isTauriRuntime();
+  const searchRef = useRef<HTMLInputElement>(null);
+  const appleShortcut = /Mac|iPad|iPhone/.test(navigator.platform);
   const [transferOpen, setTransferOpen] = useState(false);
-  const [notifOpen, setNotifOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [userInitial, setUserInitial] = useState("U");
@@ -66,7 +55,6 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [userData, setUserData] = useState<{ id: string; username: string; email: string; role: string; avatar_url?: string } | null>(null);
   const transferRef = useRef<HTMLDivElement>(null);
-  const notifRef = useRef<HTMLDivElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
   const { isDark } = useTheme();
   const { logout: logoutAccount, logoutError } = useAuth();
@@ -81,18 +69,27 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
       if (transferRef.current && !transferRef.current.contains(e.target as Node)) {
         setTransferOpen(false);
       }
-      if (notifRef.current && !notifRef.current.contains(e.target as Node)) {
-        setNotifOpen(false);
-      }
       if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
         setUserMenuOpen(false);
       }
     };
-    if (transferOpen || notifOpen || userMenuOpen) {
+    if (transferOpen || userMenuOpen) {
       document.addEventListener("mousedown", handler);
     }
     return () => document.removeEventListener("mousedown", handler);
-  }, [transferOpen, notifOpen, userMenuOpen]);
+  }, [transferOpen, userMenuOpen]);
+
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.altKey || event.shiftKey || !(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "k" || !searchRef.current) return;
+      if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+      event.preventDefault();
+      searchRef.current.focus();
+      searchRef.current.select();
+    };
+    window.addEventListener("keydown", onShortcut);
+    return () => window.removeEventListener("keydown", onShortcut);
+  }, []);
 
   useEffect(() => {
     const loadUser = () => {
@@ -187,12 +184,10 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
 
   return (
     <div
-      className={`flex items-center h-11 border-b shrink-0 select-none ${
-        isDark ? "bg-[#222] border-gray-700" : "bg-white border-gray-200/70"
-      }`}
+      className="remote-titlebar flex items-center h-12 border-b shrink-0 select-none"
       style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
-      onMouseDown={handleTauriDragStart}
-      onDoubleClick={handleDragDoubleClick}
+      onMouseDown={native ? handleTauriDragStart : undefined}
+      onDoubleClick={native ? handleDragDoubleClick : undefined}
     >
       {logoutError && <p role="alert" className="absolute right-3 top-12 z-50 max-w-sm rounded-lg border border-red-400/30 bg-red-950 px-4 py-3 text-xs leading-relaxed text-red-100 shadow-lg">{logoutError}</p>}
       {/* Left: Sidebar toggle + Quick search */}
@@ -214,39 +209,16 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
           )}
         </button>
 
-        <div
-          className={`flex min-w-0 max-w-full items-center gap-2 px-3 py-1 rounded-md transition-all cursor-text ${
-            searchFocused
-              ? isDark
-                ? "bg-[#2a2a2a] border border-blue-500 shadow-sm ring-2 ring-blue-500/20 w-80"
-                : "bg-white border border-blue-300 shadow-sm ring-2 ring-blue-100 w-80"
-              : isDark
-              ? "bg-[#2a2a2a] border border-transparent hover:bg-[#333] hover:border-gray-600 w-64"
-              : "bg-gray-100 border border-transparent hover:bg-gray-50 hover:border-gray-200 w-64"
-          }`}
+        {onSearchDevices && <form className="remote-device-search" role="search" aria-label="查找设备"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
-        >
-          <Search className="w-3 h-3 text-gray-400 shrink-0" />
-          <input
-            placeholder="搜索设备、IP 地址或 ID..."
-            className={`bg-transparent outline-none placeholder-gray-500 flex-1 min-w-0 ${
-              isDark ? "text-gray-200" : "text-gray-700"
-            }`}
-            style={{ fontSize: 12 }}
-            onFocus={() => setSearchFocused(true)}
-            onBlur={() => setSearchFocused(false)}
-          />
-          <div
-            className={`flex items-center gap-0.5 px-1 py-0.5 rounded shrink-0 ${
-              isDark ? "bg-gray-700 text-gray-400" : "bg-gray-200/70 text-gray-400"
-            }`}
-            style={{ fontSize: 10 }}
-          >
-            <span>Ctrl</span>
-            <span>+</span>
-            <span>K</span>
-          </div>
-        </div>
+          onSubmit={(event) => { event.preventDefault(); onSearchDevices(searchRef.current?.value.trim() ?? ""); }}>
+          <button type="submit" className="shrink-0 rounded-sm" aria-label="查看搜索结果">
+            <Search size={15} aria-hidden="true" />
+          </button>
+          <input ref={searchRef} type="search" aria-label="搜索设备" aria-keyshortcuts="Control+K Meta+K" autoComplete="off" spellCheck={false}
+            placeholder="搜索设备、IP 或设备码" />
+          <kbd className="hidden sm:inline" aria-hidden="true">{appleShortcut ? "⌘ K" : "Ctrl K"}</kbd>
+        </form>}
 
         {/* Device detail bar (collapsed mode) — after search */}
         {detailBar.collapsed && detailBar.payload && (
@@ -330,9 +302,9 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
         >
           <History className="w-3.5 h-3.5" />
         </button>
-        <div ref={transferRef} className="relative h-full">
+        {native && <div ref={transferRef} className="relative h-full">
           <button
-            onClick={() => { setTransferOpen(!transferOpen); if (notifOpen) setNotifOpen(false); }}
+            onClick={() => { setTransferOpen(!transferOpen); setUserMenuOpen(false); }}
             className={iconBtn}
             title="传输列表"
           >
@@ -350,7 +322,8 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
             </div>)}
             <button onClick={() => { setTransferOpen(false); onOpenTransfers?.(); }} className="text-blue-500 text-xs mt-2">查看传输管理</button>
           </div>}
-        </div>        <button
+        </div>}
+        <button
           onClick={onOpenSettings}
           className={iconBtn}
           title="设置"
@@ -361,20 +334,6 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
         {/* Divider */}
         <div className={`w-px h-4 mx-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
 
-        {/* Notification bell */}
-        <div ref={notifRef} className="relative h-full">
-          <button
-            onClick={() => { setNotifOpen(!notifOpen); if (transferOpen) setTransferOpen(false); }}
-            className={iconBtn}
-            title="通知"
-          >
-            <Bell className="w-3.5 h-3.5" />
-          </button>
-          {notifOpen && <div className={isDark ? "absolute top-full right-0 z-50 w-72 rounded-lg border border-gray-700 bg-[#1e1e1e] p-4 shadow-xl" : "absolute top-full right-0 z-50 w-72 rounded-lg border border-gray-200 bg-white p-4 shadow-xl"}>
-            <div className="text-sm mb-3">消息通知</div>
-            <p className="text-xs opacity-60 text-center py-6">暂无真实通知</p>
-          </div>}
-        </div>
         {/* User avatar with dropdown */}
         <div ref={userMenuRef} className="relative h-full">
           <button
@@ -383,14 +342,13 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
                 onOpenAuth?.();
               } else {
                 setUserMenuOpen(!userMenuOpen);
-                if (notifOpen) setNotifOpen(false);
                 if (transferOpen) setTransferOpen(false);
               }
             }}
             className={`${iconBtn} w-auto px-2 gap-2 ${userMenuOpen ? (isDark ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700") : ""}`}
             title={isLoggedIn ? "用户菜单" : "登录"}
           >
-            <span className={`max-w-[160px] truncate ${isDark ? "text-gray-300" : "text-gray-700"}`} style={{ fontSize: 12 }}>
+            <span className={`hidden min-[950px]:block max-w-[120px] truncate ${isDark ? "text-gray-300" : "text-gray-700"}`} style={{ fontSize: 12 }}>
               {userLabel}
             </span>
             {userAvatarUrl ? (
@@ -512,7 +470,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
           )}
         </div>
 
-        {/* Divider before window controls */}
+        {native && <>
         <div className={`w-px h-4 mx-1 ${isDark ? "bg-gray-700" : "bg-gray-200"}`} />
 
         {/* Window controls — Windows style */}
@@ -572,6 +530,7 @@ export function TitleBar({ onOpenConnections, onOpenSettings, onOpenTransfers, o
             <X className="w-4 h-4" />
           </button>
         </div>
+        </>}
       </div>
 
       {/* Profile Modal */}

@@ -222,7 +222,7 @@ jobs:
           fi
 
   windows-release-policy:
-    name: Windows 1080p60 release policy
+    name: Windows 1080p60 policy fixture contract
     needs: quality-gate
     if: ${{ always() && needs.quality-gate.result == 'success' }}
     runs-on: windows-latest
@@ -230,19 +230,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
-      - name: Evaluate Windows required row
+      - name: Evaluate the checked-in synthetic row
         shell: powershell
         run: |
           cargo run -p mrd-quality-gate --bin mrd-quality-gate -- `
             --artifact tests/quality-gates/fixtures/valid-direct.json `
             --policy tests/quality-gates/policies/windows-1080p60-direct.v1.json `
-            --output windows-1080p60-direct.evaluation.json
-      - name: Upload Windows policy evidence
+            --output windows-1080p60-direct.fixture.evaluation.json
+      - name: Upload synthetic policy result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-1080p60-release-policy
-          path: windows-1080p60-direct.evaluation.json
+          name: windows-1080p60-policy-fixture
+          path: windows-1080p60-direct.fixture.evaluation.json
 
   windows-gpu-smoke:
     name: Windows GPU L0/L3 smoke

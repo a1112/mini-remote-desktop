@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useId, useRef } from "react";
 import { useNavigate } from "react-router";
 import {
   Monitor,
@@ -11,10 +11,15 @@ import {
   Loader2,
   Pencil,
   AlertCircle,
+  ArrowDownLeft,
+  ArrowUpRight,
+  Globe,
+  ShieldCheck,
 } from "lucide-react";
-import { useTheme } from "./ThemeContext";
+import { useAuth } from "./AuthContext";
 import { useDeviceRegistration, deviceService } from "../services/deviceService";
 import { launchRemoteDisplayForDevice } from "../services/remoteDisplayLauncher";
+import { closeBrowserRemoteSession } from "../services/browserRemoteSessionService";
 import { useDevices } from "./deviceData";
 import { useConnectionHistory } from "../services/connectionHistoryService";
 import { DeviceRegisterModal } from "./DeviceRegisterModal";
@@ -25,8 +30,9 @@ import { TemporaryAccessPasswordCard } from './TemporaryAccessPasswordCard';
 
 export function HomePage() {
   const native = isTauriRuntime();
-  const { isDark } = useTheme();
+  const { isLoggedIn, token } = useAuth();
   const navigate = useNavigate();
+  const deviceCodeInputId = useId();
   const { devices } = useDevices();
   const history = useConnectionHistory();
   const recentConnections = history
@@ -41,69 +47,79 @@ export function HomePage() {
         os: device?.os ?? "",
         icon: device?.icon ?? Monitor,
         status: device?.status,
-        lastConnected: new Date(entry.startedAt).toLocaleString("zh-CN"),
+        lastConnected: new Date(entry.startedAt),
       };
     });
   const { deviceId: myDeviceId, deviceName: myDeviceName, registrationError, refresh, reregister, serviceManagedRegistration } = useDeviceRegistration();
   const [registrationOpen, setRegistrationOpen] = useState(false);
   const [connectId, setConnectId] = useState("");
-  const [copied, setCopied] = useState(false);
-  const [connectingDeviceId, setConnectingDeviceId] = useState<string | null>(null);
-  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<"copied" | "failed" | null>(null);
+  const [guestTarget, setGuestTarget] = useState<{ deviceId: string } | null>(null);
+  const [guestBusy, setGuestBusy] = useState(false);
+  const [connecting, setConnecting] = useState<{ id: string; source: "form" | "recent" } | null>(null);
+  const [connectionError, setConnectionError] = useState<{ message: string; source: "form" | "recent" } | null>(null);
+  const [useTemporaryPassword, setUseTemporaryPassword] = useState(false);
   const connectionInFlightRef = useRef(false);
+  const browserConnection = useRef<AbortController | null>(null);
+  const showDeviceCodeForm = native || (isLoggedIn && !useTemporaryPassword);
 
-  // 设备名称编辑状态
+  useEffect(() => () => browserConnection.current?.abort(), [token]);
+
   const [editingDeviceName, setEditingDeviceName] = useState(false);
   const [deviceNameEdit, setDeviceNameEdit] = useState("");
+  const [savedName, setSavedName] = useState<{ id: string; name: string } | null>(null);
+  const [renameError, setRenameError] = useState(false);
+  const [savingName, setSavingName] = useState(false);
   const deviceInputRef = useRef<HTMLInputElement>(null);
+  const renameInFlight = useRef(false);
+  const displayDeviceName = savedName && savedName.id === myDeviceId ? savedName.name : myDeviceName;
 
-  const handleCopy = () => {
+  useEffect(() => {
+    if (!copyStatus) return;
+    const timer = window.setTimeout(() => setCopyStatus(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [copyStatus]);
+
+  const handleCopy = async () => {
     if (!myDeviceId) return;
-    navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  // 开始编辑设备名称
-  const handleStartEditDeviceName = () => {
-    setEditingDeviceName(true);
-    setDeviceNameEdit(myDeviceName || "未命名设备");
-    setTimeout(() => deviceInputRef.current?.focus(), 0);
-  };
-
-  // 确认编辑设备名称
-  const handleConfirmEditDeviceName = async () => {
-    if (deviceNameEdit.trim() && myDeviceId) {
-      const success = await deviceService.renameDevice(myDeviceId, deviceNameEdit.trim());
-      if (success) {
-        // 刷新设备信息会通过重新获取来更新
-        window.location.reload(); // 简单刷新页面来更新
-      }
+    try {
+      await navigator.clipboard.writeText(normalizeDeviceCode(myDeviceId));
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
     }
-    setEditingDeviceName(false);
   };
 
-  // 取消编辑设备名称
-  const handleCancelEditDeviceName = () => {
-    setEditingDeviceName(false);
-    setDeviceNameEdit("");
+  const handleStartEditDeviceName = () => {
+    setRenameError(false);
+    setDeviceNameEdit(displayDeviceName ?? "");
+    setEditingDeviceName(true);
   };
 
-  // 设备名称键盘事件
-  const handleDeviceNameKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      handleConfirmEditDeviceName();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      handleCancelEditDeviceName();
+  const handleConfirmEditDeviceName = async () => {
+    const name = deviceNameEdit.trim();
+    if (!name || !myDeviceId || renameInFlight.current) return;
+    renameInFlight.current = true;
+    setSavingName(true);
+    setRenameError(false);
+    try {
+      if (await deviceService.renameDevice(myDeviceId, name)) {
+        setSavedName({ id: myDeviceId, name });
+        setEditingDeviceName(false);
+      } else {
+        setRenameError(true);
+      }
+    } catch {
+      setRenameError(true);
+    } finally {
+      setSavingName(false);
+      renameInFlight.current = false;
     }
   };
 
   const myId = formatDeviceCode(myDeviceId);
   const hasTenDigitCode = /^\d{10}$/.test(normalizeDeviceCode(myDeviceId ?? ""));
 
-  // 自动聚焦设备名称输入框
   useEffect(() => {
     if (editingDeviceName) {
       deviceInputRef.current?.focus();
@@ -116,11 +132,17 @@ export function HomePage() {
     name: string;
     deviceId: string;
     os: string;
-  }) => {
+  }, source: "form" | "recent") => {
     if (connectionInFlightRef.current) return;
+    if (native && myDeviceId && normalizeDeviceCode(target.deviceId) === normalizeDeviceCode(myDeviceId)) {
+      setConnectionError({ message: "这是本机设备码。请输入要控制的设备码。", source });
+      return;
+    }
     connectionInFlightRef.current = true;
+    const cancellation = native ? null : new AbortController();
+    browserConnection.current = cancellation;
     const targetDeviceId = target.deviceId.replace(/\s/g, "");
-    setConnectingDeviceId(target.id);
+    setConnecting({ id: target.id, source });
     setConnectionError(null);
     try {
       const result = await launchRemoteDisplayForDevice(targetDeviceId, {
@@ -128,15 +150,22 @@ export function HomePage() {
         targetDeviceName: target.name,
         targetOs: target.os,
         routePreference: "auto",
+        ...(cancellation ? { signal: cancellation.signal } : {}),
       });
+      if (cancellation?.signal.aborted) {
+        await closeBrowserRemoteSession(result.sessionId, 'connection_form_left');
+        return;
+      }
+      browserConnection.current = null;
       navigate(result.routePath ?? `/session/${result.sessionId}`);
     } catch (error) {
-      setConnectionError(
-        error instanceof Error ? error.message : "安全远程会话请求失败",
-      );
+      if (!cancellation?.signal.aborted) {
+        setConnectionError({ message: error instanceof Error ? error.message : "无法发起连接，请重试。", source });
+      }
     } finally {
+      browserConnection.current = null;
       connectionInFlightRef.current = false;
-      setConnectingDeviceId(null);
+      setConnecting(null);
     }
   };
 
@@ -144,281 +173,203 @@ export function HomePage() {
     if (!connectId.trim()) return;
     const parsed = parseRemoteDeviceInput(connectId);
     if (!parsed) {
-      setConnectionError(DEVICE_CODE_INPUT_ERROR);
+      setConnectionError({ message: DEVICE_CODE_INPUT_ERROR, source: "form" });
       return;
     }
     const found = devices.find((device) => normalizeDeviceCode(device.deviceId) === parsed.deviceId);
     if (found) {
-      void launchSecureRemote(found);
+      void launchSecureRemote(found, "form");
     } else {
       void launchSecureRemote({
         id: "custom",
         name: "远程设备",
         deviceId: parsed.deviceId,
         os: "Unknown",
-      });
+      }, "form");
     }
   };
 
-  // Reusable dark-aware classes
-  const card = isDark ? "bg-[#232323] border-gray-700" : "bg-white border-gray-200/70 shadow-sm";
-  const textPrimary = isDark ? "text-gray-100" : "text-gray-900";
-  const textSecondary = isDark ? "text-gray-400" : "text-gray-500";
-  const textTertiary = isDark ? "text-gray-500" : "text-gray-400";
-  const textBody = isDark ? "text-gray-300" : "text-gray-700";
-  const inputBg = isDark
-    ? "bg-[#2a2a2a] border-gray-600 text-gray-200 placeholder-gray-500 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
-    : "bg-gray-50 border-gray-200 text-gray-900 placeholder-gray-400 focus:border-blue-400 focus:ring-2 focus:ring-blue-100";
-  const btnSecondary = isDark
-    ? "border-gray-600 text-gray-400 hover:bg-gray-800 hover:text-gray-200"
-    : "border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-800";
+  const reconnect = (device: (typeof recentConnections)[number]) => {
+    if (showDeviceCodeForm) {
+      void launchSecureRemote(device, "recent");
+    } else {
+      setGuestTarget({ deviceId: device.deviceId });
+    }
+  };
+
+  const connectionPending = connecting !== null || guestBusy;
+  const errorMessage = (source: "form" | "recent") => connectionError?.source === source && (
+    <p className="remote-home-error" role="alert">
+      <AlertCircle size={16} aria-hidden="true" />
+      <span>{connectionError.message}</span>
+    </p>
+  );
 
   return (
-    <div className="p-8 max-w-6xl mx-auto">
+    <div className="remote-home">
       {native && <DeviceRegisterModal
         isOpen={registrationOpen}
+        serviceManaged={serviceManagedRegistration}
         onClose={() => setRegistrationOpen(false)}
-        onSuccess={() => refresh()}
+        onSuccess={refresh}
       />}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
-        {/* Left: ID + Connect */}
-        <div className="space-y-5 lg:col-span-2">
-          {/* My Device card */}
-          {native ? <div className={`p-5 rounded-xl border ${card}`}>
-            {/* 设备名称 + 编辑按钮 */}
-            <div className="flex items-center justify-center gap-2 mb-2">
-              {editingDeviceName ? (
-                <div className="flex items-center gap-2 w-full">
-                  <input
-                    ref={deviceInputRef}
-                    type="text"
-                    value={deviceNameEdit}
-                    onChange={(e) => setDeviceNameEdit(e.target.value)}
-                    onKeyDown={handleDeviceNameKeyDown}
-                    className={`flex-1 px-2 py-1 rounded-md border text-center outline-none transition-colors ${
-                      isDark
-                        ? "bg-[#1a1a1a] border-blue-500 text-gray-200 placeholder-gray-500 focus:ring-1 focus:ring-blue-500"
-                        : "bg-white border-blue-400 text-gray-900 placeholder-gray-400 focus:ring-1 focus:ring-blue-400"
-                    }`}
-                    style={{ fontSize: 15 }}
-                  />
-                  <button
-                    onClick={handleConfirmEditDeviceName}
-                    disabled={!deviceNameEdit.trim()}
-                    className={`px-2 py-1 rounded-md text-xs font-medium transition-colors ${
-                      !deviceNameEdit.trim()
-                        ? isDark
-                          ? "bg-gray-700 text-gray-500 cursor-not-allowed"
-                          : "bg-gray-100 text-gray-400 cursor-not-allowed"
-                        : isDark
-                          ? "bg-blue-600 text-white hover:bg-blue-500"
-                          : "bg-blue-600 text-white hover:bg-blue-500"
-                    }`}
-                  >
-                    <Check className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={handleCancelEditDeviceName}
-                    className={`p-1 rounded-md transition-colors ${isDark ? "text-gray-400 hover:bg-gray-700" : "text-gray-400 hover:bg-gray-100"}`}
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ) : (
-                <>
-                  <span className={`text-lg font-medium ${textPrimary}`} style={{ fontSize: 16 }}>
-                    {myDeviceName || "未命名设备"}
-                  </span>
-                  <button
-                    onClick={handleStartEditDeviceName}
-                    className={`p-1 rounded transition-colors ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"}`}
-                    title="编辑设备名称"
-                  >
-                    <Pencil className="w-3 h-3" />
-                  </button>
-                </>
-              )}
+      <header className="remote-page-header">
+        <h1>远程控制</h1>
+        <p>{native ? "连接另一台设备，或将本机设备码分享给需要协助你的人。" : "输入设备码，发起远程控制。"}</p>
+      </header>
+
+      <div className="remote-home-grid">
+        <section className="remote-home-card remote-home-connect" aria-label="连接远程设备">
+          <div className="remote-home-card-heading">
+            <span className="remote-home-icon remote-home-icon-accent"><ArrowUpRight size={21} aria-hidden="true" /></span>
+            <div>
+              <h2>连接远程设备</h2>
+              <p>{native ? "输入对方的设备码以发起连接" : "通过浏览器控制对方的设备"}</p>
             </div>
+          </div>
 
-            <div className={`mb-1 text-center text-xs ${textSecondary}`}>{hasTenDigitCode ? "10 位设备码" : "当前设备标识"}</div>
-            {/* 设备码 + 复制图标 */}
-            <div className="flex items-center justify-center gap-1.5 mb-4">
-              <div className={`text-2xl font-mono tracking-widest ${textPrimary}`} style={{ fontSize: 18 }}>
-                {myId}
-              </div>
-              <button
-                onClick={handleCopy}
-                disabled={!myDeviceId}
-                className={`p-1 rounded transition-colors ${copied
-                    ? "text-green-600"
-                    : isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-400 hover:text-gray-600"
-                }`}
-                title={copied ? "已复制" : "复制设备码"}
-              >
-                <Copy className="w-3.5 h-3.5" />
-              </button>
-            </div>
-            {registrationError && <p role="alert" className="mb-3 text-sm text-amber-600">{registrationError}</p>}
-            {serviceManagedRegistration && <button onClick={() => { void reregister(); }} className={`mb-2 w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
-              刷新登记状态
-            </button>}
-            <button onClick={() => setRegistrationOpen(true)} className={`w-full py-2 rounded-lg border text-sm ${btnSecondary}`}>
-              {serviceManagedRegistration ? "管理员登记或恢复" : "登记到服务器"}
-            </button>
-            <TemporaryAccessPasswordCard />
-          </div> : <section aria-label="网页控制端" className={`p-5 rounded-xl border ${card}`}><Monitor className="mb-3 h-7 w-7 text-blue-500" /><h2 className={`text-base font-semibold ${textPrimary}`}>网页控制端</h2><p className={`mt-2 text-sm leading-relaxed ${textSecondary}`}>无需安装客户端或登记本机。使用设备码和临时密码即可发起连接，双方无需登录；对方确认后查看画面并控制已授权的键鼠。</p></section>}
+          {!native && isLoggedIn && <button type="button" disabled={connectionPending}
+            onClick={() => { setUseTemporaryPassword(value => !value); setGuestTarget(null); setConnectionError(null); }}
+            className="remote-home-link">
+            {useTemporaryPassword ? "使用当前账号连接" : "使用远端临时密码"}
+          </button>}
 
-          {/* Connect card */}
-          <div className={`p-5 rounded-xl border ${card}`}>
-            <h3 className={`mb-4 ${textPrimary}`} style={{ fontSize: 15 }}>连接到远程设备</h3>
-
-            {native ? <div className="space-y-3">
-              <div>
-                <label className={`block mb-1.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  远程设备码
-                </label>
-                <input
-                  type="text"
-                  inputMode="text"
-                  autoComplete="off"
-                  aria-label="远程设备码"
-                  value={connectId}
-                  onChange={(e) => setConnectId(e.target.value)}
-                  placeholder="输入 10 位设备码"
-                  onKeyDown={(e) => e.key === "Enter" && handleConnect()}
-                  className={`w-full px-3 py-2.5 rounded-lg border outline-none transition-all ${inputBg}`}
-                  style={{ fontSize: 14 }}
-                />
-                <p className={`mt-1.5 text-xs ${textTertiary}`}>支持带空格的设备码；已有的旧码和局域网标识仍可连接。</p>
-              </div>
-
-              <div
-                className={`rounded-lg border px-3 py-2.5 ${
-                  isDark
-                    ? "border-blue-500/20 bg-blue-500/10 text-blue-200"
-                    : "border-blue-100 bg-blue-50 text-blue-700"
-                }`}
-              >
-                <div className="font-medium" style={{ fontSize: 12 }}>
-                  目标设备确认授权
-                </div>
-                <div className="mt-1 opacity-75" style={{ fontSize: 11 }}>
-                  当前安全会话仅支持目标端现场确认；不会使用密码绕过确认。
-                </div>
-              </div>
-
-              <button
-                onClick={handleConnect}
-                disabled={!connectId.trim() || connectingDeviceId !== null}
-                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors shadow-sm"
-                style={{ fontSize: 14 }}
-              >
-                <span>立即连接</span>
-                {connectingDeviceId === "custom" ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
+          {showDeviceCodeForm ? (
+            <form className="remote-home-form" onSubmit={(event) => { event.preventDefault(); handleConnect(); }}>
+              <label htmlFor={deviceCodeInputId}>远程设备码</label>
+              <input
+                id={deviceCodeInputId}
+                className="remote-home-input"
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={connectId}
+                onChange={(event) => {
+                  setConnectId(event.target.value);
+                  if (connectionError?.source === "form") setConnectionError(null);
+                }}
+                aria-invalid={connectionError?.source === "form" || undefined}
+                aria-describedby={`${deviceCodeInputId}-hint`}
+                placeholder="输入 10 位设备码"
+                disabled={connectionPending}
+              />
+              <p id={`${deviceCodeInputId}-hint`} className="remote-home-hint">{native
+                ? "也支持旧设备码和局域网标识。"
+                : "也支持已有的 9 位设备码。"}</p>
+              <button type="submit" className="remote-home-primary" disabled={!connectId.trim() || connectionPending}>
+                {connecting?.source === "form" ? (
+                  <><Loader2 size={16} className="animate-spin" aria-hidden="true" /> 正在发起连接</>
                 ) : (
-                  <ArrowRight className="w-4 h-4" />
+                  <>立即连接 <ArrowRight size={16} aria-hidden="true" /></>
                 )}
               </button>
-              {connectionError ? (
-                <div
-                  role="alert"
-                  className="mt-3 flex items-start gap-2 rounded-md border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-500"
-                >
-                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>{connectionError}</span>
-                </div>
-              ) : null}
-            </div> : <GuestRemoteConnectForm />}
-          </div>
-        </div>
+              {errorMessage("form")}
+              {native && <p className="remote-home-policy">
+                <ShieldCheck size={16} aria-hidden="true" />
+                <span><strong>目标设备授权策略</strong>决定此次连接允许的权限。</span>
+              </p>}
+            </form>
+          ) : <GuestRemoteConnectForm target={guestTarget} onBusyChange={setGuestBusy} />}
+        </section>
 
-        {/* Right: Recent connections */}
-        <div className="lg:col-span-3">
-          <div className={`p-5 rounded-xl border h-full ${card}`}>
-            <div className="flex items-center justify-between mb-4">
-              <h3 className={textPrimary} style={{ fontSize: 15 }}>最近连接</h3>
-              <button onClick={() => navigate("/connections")} className="flex items-center gap-1 text-blue-600 hover:text-blue-500 transition-colors" style={{ fontSize: 13 }}>
-                查看全部 <ChevronRight className="w-3.5 h-3.5" />
-              </button>
-            </div>
-
-            <div className="space-y-2">
-              {recentConnections.map((device) => {
-                const Icon = device.icon;
-                return (
-                  <div
-                    key={device.id}
-                    className={`flex items-center gap-3 p-3.5 rounded-lg border border-transparent transition-all group cursor-pointer ${
-                      isDark
-                        ? "bg-[#2a2a2a]/60 hover:bg-[#333] hover:border-gray-600"
-                        : "bg-gray-50/60 hover:bg-gray-100 hover:border-gray-200"
-                    }`}
-                    onClick={() => void launchSecureRemote(device)}
-                  >
-                    <div className={`relative w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
-                      device.status === "online"
-                        ? isDark ? "bg-blue-900/30" : "bg-blue-50"
-                        : isDark ? "bg-gray-800" : "bg-gray-100"
-                    }`}>
-                      <Icon className={`w-4.5 h-4.5 ${device.status === "online" ? "text-blue-600" : "text-gray-400"}`} style={{ width: 18, height: 18 }} />
-                      {device.status && <div className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 ${
-                        isDark ? "border-[#232323]" : "border-white"
-                      } ${device.status === "online" ? "bg-green-500" : "bg-gray-300"}`} />}
-                    </div>
-
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className={`font-medium truncate ${isDark ? "text-gray-200" : "text-gray-800"}`} style={{ fontSize: 14 }}>
-                          {device.name}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-2 mt-0.5">
-                        <span className={`font-mono ${textTertiary}`} style={{ fontSize: 11 }}>{device.deviceId}</span>
-                        {device.os && <span className={textTertiary} style={{ fontSize: 11 }}>· {device.os}</span>}
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-3 text-right">
-                      <span className={textTertiary} style={{ fontSize: 12 }}>{device.lastConnected}</span>
-                      {(
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void launchSecureRemote(device);
-                          }}
-                          disabled={connectingDeviceId !== null}
-                          className={`flex items-center gap-1 px-2.5 py-1 rounded-md transition-colors opacity-0 group-hover:opacity-100 ${
-                            isDark ? "bg-blue-900/30 text-blue-400 hover:bg-blue-900/50" : "bg-blue-50 text-blue-600 hover:bg-blue-100"
-                          }`}
-                          style={{ fontSize: 12 }}
-                        >
-                          连接
-                          <ArrowRight className="w-3 h-3" />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-              {recentConnections.length === 0 && <div className={`py-16 text-center text-sm ${textSecondary}`}>暂无真实连接记录</div>}
-            </div>
-
-            {/* Quick tips */}
-            <div className={`mt-4 p-3 rounded-lg border flex items-start gap-3 ${
-              isDark ? "bg-blue-900/20 border-blue-800" : "bg-blue-50 border-blue-100"
-            }`}>
-              <Clock className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+        {native ? (
+          <section className="remote-home-card remote-home-local" aria-label="允许远程访问本机">
+            <div className="remote-home-card-heading">
+              <span className="remote-home-icon"><ArrowDownLeft size={21} aria-hidden="true" /></span>
               <div>
-                <div className={isDark ? "text-blue-400" : "text-blue-700"} style={{ fontSize: 13 }}>提示</div>
-                <div className={`mt-0.5 ${textSecondary}`} style={{ fontSize: 12 }}>
-                  连接记录仅在远程会话实际开始后显示。点击设备可以再次发起连接。
-                </div>
+                <h2>允许远程访问本机</h2>
+                {!editingDeviceName && <div className="remote-home-device-name">
+                  <p title={displayDeviceName ?? undefined}>{displayDeviceName || "本机设备"}</p>
+                  {isLoggedIn && myDeviceId && <button type="button" className="remote-home-icon-button" onClick={handleStartEditDeviceName} aria-label="编辑设备名称">
+                    <Pencil size={13} aria-hidden="true" />
+                  </button>}
+                </div>}
               </div>
             </div>
-          </div>
-        </div>
+            {editingDeviceName && <form className="remote-home-rename" onSubmit={(event) => { event.preventDefault(); void handleConfirmEditDeviceName(); }}>
+              <input ref={deviceInputRef} className="remote-home-input" aria-label="设备名称" value={deviceNameEdit}
+                onChange={(event) => { setDeviceNameEdit(event.target.value); setRenameError(false); }}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape" && !savingName) setEditingDeviceName(false);
+                }} disabled={savingName} />
+              <button type="submit" className="remote-home-icon-button" aria-label="保存设备名称" disabled={!deviceNameEdit.trim() || savingName}>
+                <Check size={16} aria-hidden="true" />
+              </button>
+              <button type="button" className="remote-home-icon-button" aria-label="取消编辑设备名称" onClick={() => setEditingDeviceName(false)} disabled={savingName}>
+                <X size={16} aria-hidden="true" />
+              </button>
+            </form>}
+            {editingDeviceName && renameError && <p className="remote-home-error" role="alert">无法更新设备名称，请检查设备绑定或稍后重试。</p>}
+            <div className="remote-home-device-code">
+              <div>
+                <span className="remote-home-hint">{hasTenDigitCode ? "10 位设备码" : "当前设备标识"}</span>
+                <p className={myDeviceId ? "remote-home-code-value" : "remote-home-code-pending"}>{myId}</p>
+              </div>
+              <button type="button" className="remote-home-icon-button" aria-label={copyStatus === "copied" ? "已复制" : "复制设备码"}
+                title={copyStatus === "copied" ? "已复制" : "复制设备码"} onClick={() => void handleCopy()} disabled={!myDeviceId}>
+                {copyStatus === "copied" ? <Check size={17} aria-hidden="true" /> : <Copy size={17} aria-hidden="true" />}
+              </button>
+            </div>
+            {copyStatus === "copied" && <span className="sr-only" role="status">已复制设备码</span>}
+            {copyStatus === "failed" && <p className="remote-home-error" role="alert">无法写入剪贴板，请手动复制设备码。</p>}
+            <TemporaryAccessPasswordCard />
+            {registrationError && <p role="alert" className="remote-home-error">{registrationError}</p>}
+            <div className="remote-home-registration">
+              {serviceManagedRegistration && <button type="button" onClick={() => { void reregister(); }} className="remote-home-link">刷新登记状态</button>}
+              <button type="button" onClick={() => setRegistrationOpen(true)} className="remote-home-link">
+                {serviceManagedRegistration ? "管理员登记或恢复" : "登记到服务器"}
+              </button>
+            </div>
+          </section>
+        ) : (
+          <section className="remote-home-card remote-home-web" aria-label="网页控制端">
+            <div className="remote-home-card-heading">
+              <span className="remote-home-icon"><Globe size={21} aria-hidden="true" /></span>
+              <div><h2>网页控制端</h2><p>当前浏览器可发起远程连接</p></div>
+            </div>
+            <p>无需安装客户端或登记本机。{isLoggedIn
+              ? "使用当前账号连接你可访问的设备，或改用对方提供的临时密码。"
+              : "请向对方索取设备码和临时密码，或登录账号访问你的设备。"}</p>
+          </section>
+        )}
       </div>
+
+      <section className="remote-home-card remote-home-history" aria-label="最近连接">
+        <div className="remote-home-history-heading">
+          <h2><Clock size={19} aria-hidden="true" /> 最近连接</h2>
+          <button type="button" className="remote-home-link" onClick={() => navigate("/connections")}>
+            查看全部 <ChevronRight size={15} aria-hidden="true" />
+          </button>
+        </div>
+        {errorMessage("recent")}
+        {recentConnections.length > 0 ? <ul>
+          {recentConnections.map((device) => {
+            const Icon = device.icon;
+            return (
+              <li key={device.deviceId}>
+                <button type="button" className="remote-home-history-row" onClick={() => reconnect(device)} disabled={connectionPending}>
+                  <span className="remote-home-icon"><Icon size={18} aria-hidden="true" /></span>
+                  <span className="remote-home-history-name">
+                    <strong>{device.name}</strong>
+                    <small>{formatDeviceCode(device.deviceId)}{device.os ? ` · ${device.os}` : ""}</small>
+                  </span>
+                  {device.status && <span className="remote-home-history-status" data-online={device.status === "online"}>{device.status === "online" ? "在线" : "离线"}</span>}
+                  {Number.isFinite(device.lastConnected.getTime()) && <time dateTime={device.lastConnected.toISOString()}>{device.lastConnected.toLocaleString("zh-CN")}</time>}
+                  <span className="remote-home-history-action">
+                    {connecting?.source === "recent" && connecting.id === device.id ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <ArrowRight size={16} aria-hidden="true" />}
+                    <span className="sr-only">{connecting?.source === "recent" && connecting.id === device.id ? "正在发起连接" : "再次连接"}</span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul> : (
+          <div className="remote-home-empty">
+            <span className="remote-home-icon"><Clock size={20} aria-hidden="true" /></span>
+            <div><strong>暂无连接记录</strong><p>成功建立的远程连接会显示在这里。</p></div>
+          </div>
+        )}
+      </section>
     </div>
   );
 }

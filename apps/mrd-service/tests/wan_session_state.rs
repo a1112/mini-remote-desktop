@@ -262,6 +262,80 @@ fn deadline_generation_and_route_proof_are_fail_closed() {
     assert_eq!(state.failure(), Some(WanSessionFailure::RouteMismatch));
 }
 
+#[test]
+fn backend_lease_outlives_intent_consent_window_but_expired_intent_cannot_grant() {
+    let mut state = WanSessionState::new(WanSessionRole::Target, identity("lease-split"));
+    state
+        .apply(
+            WanSessionEvent::BackendBound {
+                request_commitment: REQUEST_COMMITMENT.to_owned(),
+            },
+            1_000,
+        )
+        .unwrap();
+    state
+        .apply(
+            WanSessionEvent::AwaitingConsent {
+                intent_commitment: INTENT_COMMITMENT.to_owned(),
+            },
+            1_001,
+        )
+        .unwrap();
+    let long_lease = GrantBinding::new(
+        REQUEST_COMMITMENT.to_owned(),
+        vec![WanPermissionScopeV3::ScreenView],
+        7,
+        100_000,
+        90_000,
+        WanRoutePolicyV3::RelayOnly,
+    )
+    .unwrap();
+    state
+        .apply(WanSessionEvent::Granted(long_lease), 19_999)
+        .unwrap();
+    assert_eq!(state.identity().deadline_unix_ms(), 20_000);
+    assert_eq!(state.lease_deadline_unix_ms(), Some(90_000));
+    assert_eq!(state.effective_deadline_unix_ms(), 90_000);
+    state
+        .apply(WanSessionEvent::AccessBound(access(7)), 25_000)
+        .unwrap();
+    assert_eq!(state.phase(), WanSessionPhase::AccessBound);
+
+    let mut expired = WanSessionState::new(WanSessionRole::Target, identity("lease-expired"));
+    expired
+        .apply(
+            WanSessionEvent::BackendBound {
+                request_commitment: REQUEST_COMMITMENT.to_owned(),
+            },
+            1_000,
+        )
+        .unwrap();
+    expired
+        .apply(
+            WanSessionEvent::AwaitingConsent {
+                intent_commitment: INTENT_COMMITMENT.to_owned(),
+            },
+            1_001,
+        )
+        .unwrap();
+    let result = expired.apply(
+        WanSessionEvent::Granted(
+            GrantBinding::new(
+                REQUEST_COMMITMENT.to_owned(),
+                vec![WanPermissionScopeV3::ScreenView],
+                7,
+                100_000,
+                90_000,
+                WanRoutePolicyV3::RelayOnly,
+            )
+            .unwrap(),
+        ),
+        20_000,
+    );
+    assert!(result.is_err());
+    assert_eq!(expired.failure(), Some(WanSessionFailure::DeadlineExceeded));
+}
+
 #[derive(Default)]
 struct RecordingCleanup {
     calls: Mutex<Vec<&'static str>>,
@@ -636,6 +710,67 @@ async fn streaming_session_expires_at_the_earliest_grant_or_policy_deadline() {
     assert_eq!(cleanup.calls().len(), 6);
 }
 
+#[tokio::test]
+async fn streaming_session_survives_intent_expiry_until_backend_lease_expires() {
+    let clock = Arc::new(FakeClock::default());
+    let cleanup = Arc::new(RecordingCleanup::default());
+    let coordinator = coordinator_with_clock(cleanup, 1, clock.clone());
+    let identity = WanSessionIdentity::new(
+        SessionId("wan-session-streaming-lease".to_owned()),
+        DeviceId("controller-streaming-lease".to_owned()),
+        DeviceId("target-streaming-lease".to_owned()),
+        CONTROLLER_KEY.to_owned(),
+        TARGET_KEY.to_owned(),
+        60_000,
+    )
+    .unwrap();
+    let session_id = identity.session_id().clone();
+    let mut state = WanSessionState::new(WanSessionRole::Controller, identity);
+    let long_lease = GrantBinding::new(
+        REQUEST_COMMITMENT.to_owned(),
+        vec![WanPermissionScopeV3::ScreenView],
+        7,
+        600_000,
+        600_000,
+        WanRoutePolicyV3::RelayOnly,
+    )
+    .unwrap();
+    let events = [
+        WanSessionEvent::BackendBound {
+            request_commitment: REQUEST_COMMITMENT.to_owned(),
+        },
+        WanSessionEvent::AwaitingConsent {
+            intent_commitment: INTENT_COMMITMENT.to_owned(),
+        },
+        WanSessionEvent::Granted(long_lease),
+        WanSessionEvent::AccessBound(access(7)),
+        WanSessionEvent::Negotiating,
+        WanSessionEvent::RelayVerified(RelayRouteProof::for_test(&access(7), true, true).unwrap()),
+        WanSessionEvent::Streaming,
+    ];
+    for (offset, event) in events.into_iter().enumerate() {
+        state.apply(event, 1_000 + offset as u64).unwrap();
+    }
+    assert_eq!(state.phase(), WanSessionPhase::Streaming);
+    assert_eq!(state.identity().deadline_unix_ms(), 60_000);
+    assert_eq!(state.effective_deadline_unix_ms(), 600_000);
+    clock.0.store(60_001, Ordering::SeqCst);
+    coordinator.begin(state).await.unwrap();
+
+    assert_eq!(coordinator.expire_due_sessions().await, 0);
+    assert_eq!(
+        coordinator.snapshot(&session_id).await.unwrap().phase(),
+        WanSessionPhase::Streaming,
+        "intent freshness expiry must not stop an already authorized stream"
+    );
+
+    clock.0.store(600_001, Ordering::SeqCst);
+    assert_eq!(coordinator.expire_due_sessions().await, 1);
+    let expired = coordinator.snapshot(&session_id).await.unwrap();
+    assert_eq!(expired.phase(), WanSessionPhase::Failed);
+    assert_eq!(expired.failure(), Some(WanSessionFailure::DeadlineExceeded));
+}
+
 #[test]
 fn app_state_binds_the_process_wide_coordinator_exactly_once() {
     let state = AppState::new();
@@ -714,12 +849,22 @@ fn verified_controller_grant(
     controller_key: &DeviceIdentity,
     target_key: &DeviceIdentity,
 ) -> VerifiedWanSessionGrant {
+    verified_controller_grant_with_expiry(identity, controller_key, target_key, 19_000, 18_000)
+}
+
+fn verified_controller_grant_with_expiry(
+    identity: &WanSessionIdentity,
+    controller_key: &DeviceIdentity,
+    target_key: &DeviceIdentity,
+    claims_expires_at_ms: u64,
+    policy_expires_at_ms: u64,
+) -> VerifiedWanSessionGrant {
     let claims = AuthClaims {
         issuer_device_id: identity.target_device_id().clone(),
         issuer_key_id: target_key.key_id().to_owned(),
         intended_peer_device_id: identity.controller_device_id().clone(),
         issued_at_ms: 1_000,
-        expires_at_ms: 19_000,
+        expires_at_ms: claims_expires_at_ms,
         counter: 1,
         nonce: [8; 16],
     };
@@ -734,7 +879,7 @@ fn verified_controller_grant(
             approved_scopes: vec![WanPermissionScopeV3::ScreenView],
             approved_profile: None,
             backend_policy_revision: 7,
-            policy_expires_at_ms: 18_000,
+            policy_expires_at_ms,
             relay_generation: 0,
             relay_directory_id: "directory-cn-east".to_owned(),
             primary_relay_node_id: "relay-cn-east-1".to_owned(),
@@ -1018,6 +1163,19 @@ async fn controller_creates_backend_before_intent_and_installs_exact_approved_ge
         .unwrap()
         .iter()
         .all(|deadline| *deadline == 20_000));
+}
+
+#[test]
+fn grant_message_freshness_does_not_bound_backend_policy_lease() {
+    let (identity, controller_key, target_key) = controller_identity_with_keys("grant-lease");
+    let verified = verified_controller_grant_with_expiry(
+        &identity,
+        &controller_key,
+        &target_key,
+        30_000,
+        600_000,
+    );
+    assert_eq!(verified.expires_at_ms(), 30_000);
 }
 
 #[tokio::test]

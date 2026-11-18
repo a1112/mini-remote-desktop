@@ -1237,10 +1237,12 @@ def test_model_repr_does_not_expose_credential_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(monkeypatch) -> None:
+@pytest.mark.parametrize("oidc_enabled", [False, True])
+async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(monkeypatch, oidc_enabled) -> None:
     from app import main
     from app.db.migrate_add_device_self_enrollment import SELF_ENROLLMENT_TABLES
     from app.db.migrate_add_guest_temporary_access import GUEST_TABLES
+    from app.db.migrate_add_oidc import OIDC_TABLES
 
     calls = []
     bootstrapped = []
@@ -1271,6 +1273,7 @@ async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(mon
 
     monkeypatch.setattr(main, "engine", Engine())
     monkeypatch.setattr(main, "AsyncSessionLocal", session_scope)
+    monkeypatch.setattr(main.settings, "oidc_enabled", oidc_enabled)
     monkeypatch.setattr(main.Base.metadata, "create_all", metadata)
     for name, label in (
         ("migrate_relay_control", "relay_control"),
@@ -1279,11 +1282,13 @@ async def test_startup_runs_relay_migration_before_legacy_metadata_bootstrap(mon
         ("migrate_browser_controllers", "browser_controllers"),
         ("migrate_device_self_enrollment", "device_self_enrollment"),
         ("migrate_guest_temporary_access", "guest_temporary_access"),
+        ("migrate_oidc", "oidc"),
+        ("migrate_same_account_authority", "same_account_authority"),
         ("seed_initial_data", "seed"),
     ):
         monkeypatch.setattr(main, name, migration(label))
     async with main.lifespan(main.app):
         pass
-    assert calls == ["relay_control", "legacy_metadata", "relay_access", "relay_redundancy", "browser_controllers", "device_self_enrollment", "guest_temporary_access", "seed"]
+    assert calls == ["relay_control", "legacy_metadata", "relay_access", "relay_redundancy", "browser_controllers", "device_self_enrollment", "guest_temporary_access"] + (["oidc"] if oidc_enabled else []) + ["same_account_authority", "seed"]
     assert "devices" in bootstrapped
-    assert not (SELF_ENROLLMENT_TABLES | GUEST_TABLES).intersection(bootstrapped)
+    assert not (SELF_ENROLLMENT_TABLES | GUEST_TABLES | OIDC_TABLES).intersection(bootstrapped)

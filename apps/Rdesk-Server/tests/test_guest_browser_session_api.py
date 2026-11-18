@@ -293,6 +293,32 @@ def _unbound_relay_guest(api):
     return response.json()
 
 
+def test_guest_never_qualifies_for_same_account_auto_approval(wan_relay_api, monkeypatch):
+    api = wan_relay_api
+    monkeypatch.setitem(settings.__dict__, "oidc_enabled", True)
+    monkeypatch.setitem(settings.__dict__, "oidc_issuer", "https://r-auth.example.test")
+    target = api.devices["controller-1"]
+    target.is_bound = False
+    target.bound_user_id = None
+    api.session.commit()
+    api.tokens["controller-1"] = create_device_access_token(target)
+    assert _publish(api, target="controller-1").status_code == 200
+    created = _guest(api, target_device_id="controller-1")
+    assert created.status_code == 200, created.text
+    params = {"controller_key_id": created.json()["controller_key_id"], "target_key_id": KEY_ID}
+    headers = _headers(api, "controller-1")
+    path = "/api/v1/device-sessions/guest-session-1"
+    assert api.client.get(path + "/same-account", headers=headers, params=params).json() == {"trusted": False}
+    denied = api.client.post(path + "/approve-same-account", headers=headers, params=params,
+        json={"approved_scopes": ["screen.view"], "approved_profile": None})
+    assert denied.status_code == 403
+    assert api.session.get(SessionRequest, "guest-session-1").status == "requested"
+    # Guest still follows its original explicit-consent path.
+    allowed = api.client.post(path + "/approve", headers=headers,
+        json={"approved_scopes": ["screen.view"], "approved_profile": None})
+    assert allowed.status_code == 200, allowed.text
+
+
 def test_guest_approval_keeps_local_consent_and_issues_real_scoped_relay(wan_relay_api):
     api = wan_relay_api
     body = _unbound_relay_guest(api)

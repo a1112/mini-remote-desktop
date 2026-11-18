@@ -41,7 +41,7 @@ pub use device_identity_registry::{
 pub use device_preference_registry::DevicePreferenceRegistry;
 pub use device_registry::DeviceRegistry;
 pub use display_mode_registry::DisplayModeRegistry;
-pub use file_transfer_registry::FileTransferRegistry;
+pub use file_transfer_registry::{FileTransferCancellation, FileTransferRegistry};
 pub use lan_identity::default_lan_device_identity;
 #[cfg(test)]
 pub(crate) use lan_identity::lan_device_identity_from;

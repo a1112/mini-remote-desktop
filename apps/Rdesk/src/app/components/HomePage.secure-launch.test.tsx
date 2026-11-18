@@ -11,8 +11,10 @@ const mocks = vi.hoisted(() => ({
   refreshRegistration: vi.fn(),
   localDeviceId: "0123456789",
   native: true,
+  loggedIn: false,
 }));
 vi.mock('../utils/runtime', () => ({ isTauriRuntime: () => mocks.native }));
+vi.mock('./AuthContext', () => ({ useAuth: () => ({ isLoggedIn: mocks.loggedIn, token: mocks.loggedIn ? 'account-token' : null }) }));
 
 vi.mock("react-router", () => ({
   useNavigate: () => mocks.navigate,
@@ -63,6 +65,7 @@ describe("HomePage secure remote launch", () => {
     vi.clearAllMocks();
     mocks.enrollmentRequired = false;
     mocks.native = true;
+    mocks.loggedIn = false;
     mocks.launchRemoteDisplayForDevice.mockResolvedValue({
       sessionId: "secure-session",
       windowLabel: null,
@@ -82,6 +85,7 @@ describe("HomePage secure remote launch", () => {
 
   it('shows browser controller mode without offering host device enrollment and follows its independent route', async () => {
     mocks.native = false;
+    mocks.loggedIn = true;
     mocks.launchRemoteDisplayForDevice.mockResolvedValue({ sessionId: 'browser-session', mode: 'route', routePath: '/browser-session/browser-session' });
     render(<HomePage />);
     expect(screen.getByText('网页控制端')).toBeInTheDocument();
@@ -89,6 +93,27 @@ describe("HomePage secure remote launch", () => {
     expect(screen.queryByRole('button', { name: '登记到服务器' })).not.toBeInTheDocument();
     await userEvent.click(screen.getByText('办公室电脑'));
     expect(mocks.navigate).toHaveBeenCalledWith('/browser-session/browser-session');
+  });
+
+  it('connects from the browser home with the signed-in account and no temporary password', async () => {
+    mocks.native = false;
+    mocks.loggedIn = true;
+    mocks.launchRemoteDisplayForDevice.mockResolvedValue({ sessionId: 'account-session', routePath: '/browser-session/account-session' });
+    const user = userEvent.setup();
+    render(<HomePage />);
+
+    await user.click(screen.getByRole('button', { name: '使用远端临时密码' }));
+    expect(screen.getByLabelText('远端临时密码')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: '使用当前账号连接' }));
+    expect(screen.queryByLabelText('远端临时密码')).toBeNull();
+    await user.type(screen.getByRole('textbox', { name: '远程设备码' }), '150 151 5774');
+    await user.click(screen.getByRole('button', { name: '立即连接' }));
+
+    expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith('1501515774', {
+      transportKind: 'webrtc', targetDeviceName: '远程设备', targetOs: 'Unknown',
+      routePreference: 'auto', signal: expect.any(AbortSignal),
+    });
+    expect(mocks.navigate).toHaveBeenCalledWith('/browser-session/account-session');
   });
 
   it("shows a ten digit device code in readable groups without losing its leading zero", () => {
@@ -100,9 +125,9 @@ describe("HomePage secure remote launch", () => {
   it("preserves leading zeroes when connecting with a grouped ten digit code", async () => {
     const user = userEvent.setup();
     render(<HomePage />);
-    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "012 345 6789");
+    await user.type(screen.getByPlaceholderText("输入 10 位设备码"), "012 345 6790");
     await user.click(screen.getByRole("button", { name: "立即连接" }));
-    expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith("0123456789", expect.anything());
+    expect(mocks.launchRemoteDisplayForDevice).toHaveBeenCalledWith("0123456790", expect.anything());
   });
 
   it("copies all ten device digits without display separators", async () => {
@@ -143,7 +168,25 @@ describe("HomePage secure remote launch", () => {
     render(<HomePage />);
 
     expect(screen.queryByText("密码（可选）")).not.toBeInTheDocument();
-    expect(screen.getByText("目标设备确认授权")).toBeInTheDocument();
+    expect(screen.getByText("目标设备授权策略")).toBeInTheDocument();
+  });
+
+  it("rejects the local device code without starting a display test", async () => {
+    const user = userEvent.setup();
+    render(<HomePage />);
+    await user.type(screen.getByLabelText("远程设备码"), "012 345 6789");
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("alert")).toHaveTextContent("这是本机设备码");
+    expect(mocks.launchRemoteDisplayForDevice).not.toHaveBeenCalled();
+  });
+
+  it("fills the guest form from history and waits for the remote password", async () => {
+    mocks.native = false;
+    render(<HomePage />);
+    await userEvent.click(screen.getByRole("button", { name: /办公室电脑/ }));
+    expect(screen.getByLabelText("远程设备码")).toHaveValue("821456789");
+    expect(screen.getByLabelText("远端临时密码")).toHaveFocus();
+    expect(mocks.launchRemoteDisplayForDevice).not.toHaveBeenCalled();
   });
 
   it("never turns a custom device id into a direct session route", async () => {

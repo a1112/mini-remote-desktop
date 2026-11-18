@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveMacOSSigningIdentity } from './macos-signing-identity.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const appDir = resolve(scriptDir, '..');
@@ -100,6 +101,7 @@ if (!existsSync(serviceExe)) {
 }
 
 if (process.platform === 'darwin') {
+  const signingIdentity = resolveMacOSSigningIdentity(workspaceRoot, process.env);
   const serviceBundle = join(profileDir, 'MrdService.app');
   const contentsDir = join(serviceBundle, 'Contents');
   const executableDir = join(contentsDir, 'MacOS');
@@ -118,7 +120,7 @@ if (process.platform === 'darwin') {
       '--force',
       '--deep',
       '--sign',
-      '-',
+      signingIdentity,
       '--identifier',
       'com.a1112.rdesk.service',
       serviceBundle,
@@ -129,7 +131,7 @@ if (process.platform === 'darwin') {
     throw codesign.error;
   }
   if (codesign.status !== 0) {
-    throw new Error(`failed to ad-hoc sign ${serviceBundle}`);
+    throw new Error(`failed to sign ${serviceBundle}`);
   }
 
   console.log(`mrd-service macOS bundle ready: ${serviceBundle}`);

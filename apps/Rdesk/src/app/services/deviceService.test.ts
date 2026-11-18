@@ -268,7 +268,7 @@ describe("service-managed public device identity", () => {
     await deviceService.initialize();
     localStorage.setItem("rdesk_access_token", "user.access.token");
     const fetchSpy = vi.spyOn(globalThis, "fetch");
-    expect((await deviceService.bindDevice("user-1")).success).toBe(true);
+    expect((await deviceService.bindDevice()).success).toBe(true);
     expect(mockBindPublicDevice).toHaveBeenCalledWith("user.access.token");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
@@ -302,7 +302,7 @@ describe("service-managed public device identity", () => {
     await deviceService.initialize();
     localStorage.setItem("rdesk_access_token", "user.access.token");
     mockBindPublicDevice.mockResolvedValue({ ok: false, error: { message: "登录已过期，请重新登录后重试" } });
-    expect((await deviceService.bindDevice("user-1")).success).toBe(false);
+    expect((await deviceService.bindDevice()).success).toBe(false);
     expect(deviceService.getRegistrationError()).toContain("登录已过期");
     expect(deviceService.getDeviceId()).toBe(registeredStatus.device_id);
     expect(localStorage.getItem("rdesk_device_info")).not.toContain("user.access.token");
