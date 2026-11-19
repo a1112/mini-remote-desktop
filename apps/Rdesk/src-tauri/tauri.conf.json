@@ -16,11 +16,12 @@
       {
         "label": "main",
         "title": "Rdesk",
-        "width": 1100,
+        "width": 980,
         "height": 600,
         "minWidth": 720,
         "minHeight": 480,
         "center": true,
+        "visible": false,
         "resizable": true,
         "maximizable": true,
         "minimizable": true,

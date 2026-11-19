@@ -4931,6 +4931,7 @@ fn main() {
             }
         })
         .setup(move |app| {
+            window_placement::install(app.handle(), "main", (980.0, 600.0), (720.0, 480.0));
             spawn_single_instance_listener(single_instance_listener, app.handle().clone());
             setup_system_tray(app.handle())?;
 
@@ -5129,3 +5130,6 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+mod window_geometry;
+mod window_placement;
